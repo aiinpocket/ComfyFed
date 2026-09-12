@@ -17,7 +17,7 @@ _ADMIN_PASSWORD_HASH_KEY = "admin_password_hash"
 _LANG_KEY = "lang"
 _PLATFORM_URL_KEY = "platform_url"
 
-_COOKIE_NAME = "cf_session"
+SESSION_COOKIE_NAME = "cf_session"
 _COOKIE_MAX_AGE = 7 * 24 * 3600  # 7 days
 _SESSION_SALT = "comfyfed.session"
 
@@ -94,7 +94,18 @@ def _error(status_code: int, code: str, message: str = "") -> HTTPException:
     return HTTPException(status_code=status_code, detail={"code": code, "message": message or code})
 
 
-def _read_session_payload(session_cookie: Optional[str]):
+def read_session_payload(session_cookie: Optional[str]) -> Optional[dict]:
+    """Decode and verify a session cookie value. `None` if absent or invalid.
+
+    Public, alongside `SESSION_COOKIE_NAME`, because the two callers that
+    cannot express their auth as a `Depends(require_admin)` -- the
+    conditionally-public `/metrics` route and the `/comfy` static gate, both
+    in app.py, plus comfyapi's panel WebSocket, which must answer a failure
+    with a close code rather than an HTTPException -- have to run exactly
+    this check by hand. They previously reached into `auth._read_session_payload`
+    and hard-coded the cookie name, which made the session format three
+    modules' business instead of this one's.
+    """
     if not session_cookie:
         return None
     with db.get_session() as db_session:
@@ -109,7 +120,7 @@ def _read_session_payload(session_cookie: Optional[str]):
 async def require_admin(
     cf_session: Optional[str] = Cookie(default=None),
 ) -> dict:
-    payload = _read_session_payload(cf_session)
+    payload = read_session_payload(cf_session)
     if not payload or not payload.get("authenticated"):
         raise _error(401, "auth.required", "Login required.")
     return payload
@@ -164,7 +175,7 @@ def login(body: LoginBody, response: Response):
     token = serializer.dumps({"authenticated": True, "csrf": csrf})
 
     response.set_cookie(
-        key=_COOKIE_NAME,
+        key=SESSION_COOKIE_NAME,
         value=token,
         max_age=_COOKIE_MAX_AGE,
         httponly=True,
@@ -175,13 +186,13 @@ def login(body: LoginBody, response: Response):
 
 @router.post("/logout")
 def logout(response: Response):
-    response.delete_cookie(_COOKIE_NAME)
+    response.delete_cookie(SESSION_COOKIE_NAME)
     return {"ok": True}
 
 
 @router.get("/me")
 def me(cf_session: Optional[str] = Cookie(default=None)):
-    payload = _read_session_payload(cf_session)
+    payload = read_session_payload(cf_session)
     authenticated = bool(payload and payload.get("authenticated"))
     with db.get_session() as db_session:
         lang = _get_setting(db_session, _LANG_KEY) or "en"

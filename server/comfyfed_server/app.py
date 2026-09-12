@@ -166,7 +166,7 @@ def create_app(data_dir: str) -> FastAPI:
             # Conditional auth: whether admin is required depends on a DB
             # setting, so this can't be a static `Depends(auth.require_admin)`
             # on the route. Reuse the same session-payload check it uses.
-            payload = auth._read_session_payload(request.cookies.get("cf_session"))
+            payload = auth.read_session_payload(request.cookies.get(auth.SESSION_COOKIE_NAME))
             if not payload or not payload.get("authenticated"):
                 raise auth._error(401, "auth.required", "Login required.")
 
@@ -196,7 +196,7 @@ def create_app(data_dir: str) -> FastAPI:
         in_panel = path == _COMFY_PREFIX or path.startswith(_COMFY_PREFIX + "/")
         in_api = path == _COMFY_API_PREFIX or path.startswith(_COMFY_API_PREFIX + "/")
         if in_panel and not in_api:
-            payload = auth._read_session_payload(request.cookies.get("cf_session"))
+            payload = auth.read_session_payload(request.cookies.get(auth.SESSION_COOKIE_NAME))
             if not payload or not payload.get("authenticated"):
                 return RedirectResponse("/", status_code=302)
         return await call_next(request)

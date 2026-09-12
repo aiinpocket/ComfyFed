@@ -186,3 +186,56 @@ def test_update_settings_requires_csrf(client):
 def test_update_settings_requires_login(client):
     r = client.post("/api/settings", json={"lang": "en"}, headers={"X-CSRF": "x"})
     assert r.status_code == 401
+
+
+# --- the public session-reading surface (M4) -----------------------------------
+
+
+def test_session_cookie_name_and_reader_are_public_and_agree(client):
+    """M4: the three callers that cannot use `Depends(require_admin)` -- the
+    conditionally-public `/metrics` route, the `/comfy` static gate, and
+    comfyapi's panel WebSocket -- must read the session through auth's own
+    public surface rather than reaching into a private helper with the cookie
+    name hard-coded in three places.
+    """
+    from comfyfed_server import auth
+
+    assert auth.SESSION_COOKIE_NAME == "cf_session"
+    assert callable(auth.read_session_payload)
+
+    csrf = _csrf(client)
+    cookie = client.cookies.get(auth.SESSION_COOKIE_NAME)
+    assert cookie
+
+    payload = auth.read_session_payload(cookie)
+    assert payload["authenticated"] is True
+    assert payload["csrf"] == csrf
+
+
+def test_read_session_payload_rejects_absent_and_tampered_cookies(client):
+    from comfyfed_server import auth
+
+    _csrf(client)
+    good = client.cookies.get(auth.SESSION_COOKIE_NAME)
+
+    assert auth.read_session_payload(None) is None
+    assert auth.read_session_payload("") is None
+    assert auth.read_session_payload("not-a-token") is None
+    # Flip a character in the signed value: the signature must stop matching.
+    tampered = good[:-1] + ("A" if good[-1] != "A" else "B")
+    assert auth.read_session_payload(tampered) is None
+
+
+def test_no_module_hard_codes_the_session_cookie_name(client):
+    """The cookie name lives in auth.py and nowhere else."""
+    import pathlib
+
+    import comfyfed_server
+
+    package_dir = pathlib.Path(comfyfed_server.__file__).parent
+    offenders = [
+        path.name
+        for path in package_dir.glob("*.py")
+        if path.name != "auth.py" and '"cf_session"' in path.read_text(encoding="utf-8")
+    ]
+    assert offenders == []

@@ -646,7 +646,7 @@ def create_ws_router() -> APIRouter:
     async def panel_ws(websocket: WebSocket) -> None:
         await websocket.accept()
 
-        payload = auth._read_session_payload(websocket.cookies.get("cf_session"))
+        payload = auth.read_session_payload(websocket.cookies.get(auth.SESSION_COOKIE_NAME))
         if not payload or not payload.get("authenticated"):
             await websocket.close(code=_CLOSE_UNAUTHORIZED)
             return
