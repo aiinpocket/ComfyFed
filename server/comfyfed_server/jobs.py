@@ -7,7 +7,7 @@ import os
 from typing import Optional
 
 from fastapi import APIRouter, Depends, File, Form, HTTPException, Request, UploadFile
-from fastapi.responses import FileResponse, Response
+from fastapi.responses import FileResponse
 
 from . import assess, auth, db, storage
 from .workers import verify_agent
@@ -70,8 +70,11 @@ def create_router(data_dir: str) -> APIRouter:
 
         uploaded_names = []
         for upload in assets:
-            filename = os.path.basename(upload.filename or "")
-            if not filename or filename != upload.filename:
+            try:
+                filename = storage.sanitize_path_component(
+                    upload.filename or "", what="asset filename"
+                )
+            except ValueError:
                 raise _error(400, "jobs.bad_asset_name", f"Invalid asset filename: {upload.filename!r}")
             uploaded_names.append(filename)
 
@@ -101,8 +104,7 @@ def create_router(data_dir: str) -> APIRouter:
 
         job_dir = os.path.join(data_dir, _JOB_INPUTS_DIRNAME, job_id)
         os.makedirs(job_dir, exist_ok=True)
-        for upload in assets:
-            filename = os.path.basename(upload.filename or "")
+        for upload, filename in zip(assets, uploaded_names):
             dest = os.path.join(job_dir, filename)
             content = await upload.read()
             with open(dest, "wb") as f:
@@ -136,15 +138,7 @@ def create_router(data_dir: str) -> APIRouter:
             if job is None:
                 raise _error(404, "jobs.not_found", "Job not found.")
 
-            try:
-                nodes = set(json.loads(job.required_nodes or "[]"))
-            except (TypeError, ValueError):
-                nodes = set()
-            try:
-                models = set(json.loads(job.required_models or "[]"))
-            except (TypeError, ValueError):
-                models = set()
-            needs = assess.JobNeeds(nodes=nodes, models=models, est_vram_gb=job.est_vram_gb, assets=set())
+            needs = assess.needs_from_job(job)
 
             try:
                 requirements_override = json.loads(job.requirements or "{}")
@@ -212,11 +206,15 @@ def create_router(data_dir: str) -> APIRouter:
         if file is None or not hasattr(file, "file"):
             raise _error(400, "jobs.bad_asset_name", "Missing 'file' field.")
 
-        store = storage.get_store(data_dir)
         try:
-            stored = store.put(job_id, file.filename or "", file.file)
+            artifact_name = storage.sanitize_path_component(
+                file.filename or "", what="artifact filename"
+            )
         except ValueError:
             raise _error(400, "jobs.bad_asset_name", f"Invalid artifact filename: {file.filename!r}")
+
+        store = storage.get_store(data_dir)
+        stored = store.put(job_id, artifact_name, file.file)
 
         return {"stored": stored}
 
@@ -229,11 +227,38 @@ def create_router(data_dir: str) -> APIRouter:
 
         store = storage.get_store(data_dir)
         try:
-            f = store.open(job_id, filename)
+            # Streamed rather than read into memory: a job's artifact can be a
+            # multi-hundred-MB video, and FileResponse also gives the browser
+            # range requests and a correct Content-Length for free.
+            path = store.path(job_id, filename)
         except (FileNotFoundError, ValueError):
             raise _error(404, "jobs.artifact_not_found", "Artifact not found.")
-        with f:
-            content = f.read()
-        return Response(content=content, media_type="application/octet-stream")
+        return FileResponse(
+            path, media_type="application/octet-stream", filename=os.path.basename(path)
+        )
+
+    @r.post("/api/jobs/{job_id}/retry")
+    def retry_job(job_id: str, _payload: dict = Depends(auth.require_csrf)):
+        """Requeue a failed job, clearing the previous attempt's outcome.
+
+        Only `failed` jobs are retryable: anything queued/assigned/running is
+        still in flight, and re-running a `done` job would orphan its receipt.
+        """
+        with db.get_session() as session:
+            job = session.get(db.Job, job_id)
+            if job is None:
+                raise _error(404, "jobs.not_found", "Job not found.")
+            if job.status != "failed":
+                raise _error(409, "jobs.not_retryable", "Only failed jobs can be retried.")
+
+            job.status = "queued"
+            job.worker_id = None
+            job.error = None
+            job.progress = 0
+            job.started_at = None
+            job.finished_at = None
+            session.commit()
+
+        return {"ok": True, "job_id": job_id}
 
     return r

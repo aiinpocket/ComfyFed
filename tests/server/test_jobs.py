@@ -1,5 +1,6 @@
 import io
 import json
+import os
 from datetime import datetime, timedelta, timezone
 
 import pytest
@@ -139,7 +140,7 @@ def test_requeue_stale_returns_job_to_queue_and_it_can_be_repicked(client):
 
     picked = dispatch.pick_job_for(w1)
     assert picked is not None and picked.id == job_id
-    dispatch.mark_running(job_id)
+    dispatch.mark_running(job_id, w1)
 
     stale_time = datetime.now(timezone.utc).replace(tzinfo=None) - timedelta(seconds=91)
     with db.get_session() as session:
@@ -234,3 +235,195 @@ def test_asset_download_only_for_assigned_worker(client):
     forbidden = sign_and_get(w2_id, w2_key, path)
     assert forbidden.status_code == 403
     assert forbidden.json()["error"]["code"] == "jobs.not_assigned"
+
+
+def test_requeue_stale_requeues_a_worker_that_never_heartbeated(client):
+    """I1: a handshaked-but-dead agent's job must not be stranded.
+
+    `last_seen` is None until the first heartbeat, so a worker that took a job
+    push and then died was previously skipped by the staleness sweep forever.
+    """
+    csrf = _login(client)
+    w1 = _register_worker(client, csrf, "w1")
+    w2 = _register_worker(client, csrf, "w2")
+
+    r = _submit(client, csrf)
+    job_id = r.json()["job_id"]
+
+    picked = dispatch.pick_job_for(w1)
+    assert picked is not None and picked.id == job_id
+
+    old = datetime.now(timezone.utc).replace(tzinfo=None) - timedelta(seconds=200)
+    with db.get_session() as session:
+        worker = session.get(db.Worker, w1)
+        worker.last_seen = None
+        worker.created_at = old  # registered long ago, never checked in
+        # Keep w2 fresh so the sweep doesn't take it offline too.
+        session.get(db.Worker, w2).last_seen = datetime.now(timezone.utc).replace(tzinfo=None)
+        session.commit()
+
+    count = dispatch.requeue_stale(datetime.now(timezone.utc).replace(tzinfo=None))
+    assert count == 1
+
+    with db.get_session() as session:
+        job = session.get(db.Job, job_id)
+        assert job.status == "queued"
+        assert job.worker_id is None
+        assert session.get(db.Worker, w1).status == "offline"
+
+
+def test_requeue_stale_leaves_a_freshly_registered_worker_alone(client):
+    """The created_at fallback must not requeue a worker that just joined."""
+    csrf = _login(client)
+    w1 = _register_worker(client, csrf, "w1")
+
+    r = _submit(client, csrf)
+    job_id = r.json()["job_id"]
+    assert dispatch.pick_job_for(w1) is not None
+
+    assert dispatch.requeue_stale(datetime.now(timezone.utc).replace(tzinfo=None)) == 0
+    with db.get_session() as session:
+        assert session.get(db.Job, job_id).status == "assigned"
+
+
+def test_upload_with_dot_dot_filename_is_400_not_500(client):
+    """M1: a bare '..' asset name used to reach os.path.basename and blow up."""
+    csrf = _login(client)
+    workflow = {"1": {"class_type": "LoadImage", "inputs": {"image": ".."}}}
+    files = [("assets", ("..", io.BytesIO(b"evil"), "application/octet-stream"))]
+    r = _submit(client, csrf, workflow=workflow, files=files)
+
+    assert r.status_code == 400
+    assert r.json()["error"]["code"] == "jobs.bad_asset_name"
+
+
+def test_upload_with_traversal_filename_is_400(client):
+    csrf = _login(client)
+    files = [("assets", ("../../etc/passwd", io.BytesIO(b"evil"), "application/octet-stream"))]
+    r = _submit(client, csrf, files=files)
+
+    assert r.status_code == 400
+    assert r.json()["error"]["code"] == "jobs.bad_asset_name"
+
+
+def _fail_job(job_id, worker_id):
+    with db.get_session() as session:
+        job = session.get(db.Job, job_id)
+        job.status = "failed"
+        job.worker_id = worker_id
+        job.error = "boom"
+        job.progress = 0.4
+        job.started_at = datetime.now(timezone.utc).replace(tzinfo=None)
+        job.finished_at = datetime.now(timezone.utc).replace(tzinfo=None)
+        session.commit()
+
+
+def test_retry_requeues_a_failed_job_and_clears_the_last_attempt(client):
+    csrf = _login(client)
+    w1 = _register_worker(client, csrf, "w1")
+    job_id = _submit(client, csrf).json()["job_id"]
+    _fail_job(job_id, w1)
+
+    r = client.post(f"/api/jobs/{job_id}/retry", headers={"X-CSRF": csrf})
+    assert r.status_code == 200
+
+    with db.get_session() as session:
+        job = session.get(db.Job, job_id)
+        assert job.status == "queued"
+        assert job.worker_id is None
+        assert job.error is None
+        assert job.progress == 0
+        assert job.started_at is None
+        assert job.finished_at is None
+
+    # And it is dispatchable again.
+    assert dispatch.pick_job_for(w1) is not None
+
+
+def test_retry_on_a_non_failed_job_is_409(client):
+    csrf = _login(client)
+    job_id = _submit(client, csrf).json()["job_id"]  # still queued
+
+    r = client.post(f"/api/jobs/{job_id}/retry", headers={"X-CSRF": csrf})
+    assert r.status_code == 409
+    assert r.json()["error"]["code"] == "jobs.not_retryable"
+
+
+def test_retry_unknown_job_is_404(client):
+    csrf = _login(client)
+    r = client.post("/api/jobs/does-not-exist/retry", headers={"X-CSRF": csrf})
+    assert r.status_code == 404
+    assert r.json()["error"]["code"] == "jobs.not_found"
+
+
+def test_retry_requires_csrf(client):
+    csrf = _login(client)
+    job_id = _submit(client, csrf).json()["job_id"]
+    r = client.post(f"/api/jobs/{job_id}/retry")
+    assert r.status_code == 403
+    assert r.json()["error"]["code"] == "auth.csrf"
+
+
+def test_artifact_download_streams_the_stored_file(client):
+    from comfyfed_server import storage
+
+    csrf = _login(client)
+    job_id = _submit(client, csrf).json()["job_id"]
+
+    store = storage.get_store(client.data_dir)
+    store.put(job_id, "out.png", io.BytesIO(b"RESULT-BYTES"))
+
+    r = client.get(f"/api/jobs/{job_id}/artifacts/out.png", headers={"X-CSRF": csrf})
+    assert r.status_code == 200
+    assert r.content == b"RESULT-BYTES"
+    assert r.headers["content-length"] == str(len(b"RESULT-BYTES"))
+
+
+def test_artifact_download_missing_file_is_404(client):
+    csrf = _login(client)
+    job_id = _submit(client, csrf).json()["job_id"]
+    r = client.get(f"/api/jobs/{job_id}/artifacts/nope.png", headers={"X-CSRF": csrf})
+    assert r.status_code == 404
+    assert r.json()["error"]["code"] == "jobs.artifact_not_found"
+
+
+def test_artifact_store_path_rejects_traversal_and_missing_files(client):
+    """`path()` is what the download route hands to FileResponse, so it must
+    apply the same sanitising as `open()` (and not exist-check its way out)."""
+    import pytest as _pytest
+
+    from comfyfed_server import storage
+
+    csrf = _login(client)
+    job_id = _submit(client, csrf).json()["job_id"]
+    store = storage.get_store(client.data_dir)
+
+    with _pytest.raises(ValueError):
+        store.path(job_id, "../../secrets.txt")
+    with _pytest.raises(ValueError):
+        store.path(job_id, "..")
+    with _pytest.raises(FileNotFoundError):
+        store.path(job_id, "never-written.png")
+
+    store.put(job_id, "ok.png", io.BytesIO(b"x"))
+    assert os.path.isfile(store.path(job_id, "ok.png"))
+
+
+def test_artifact_store_base_path_is_not_implemented_by_default():
+    """A non-local backend must raise, so its route can redirect instead."""
+    import pytest as _pytest
+
+    from comfyfed_server import storage
+
+    class _Remote(storage.ArtifactStore):
+        def put(self, job_id, filename, stream):
+            return filename
+
+        def open(self, job_id, filename):
+            raise FileNotFoundError
+
+        def url(self, job_id, filename):
+            return "https://example.invalid/x"
+
+    with _pytest.raises(NotImplementedError):
+        _Remote().path("j", "f.png")

@@ -63,3 +63,12 @@ class AgentConfig:
         with open(tmp_path, "w", encoding="utf-8") as f:
             json.dump(data, f, indent=2, ensure_ascii=False)
         os.replace(tmp_path, path)
+
+        # This file holds every platform's Ed25519 signing key in the clear,
+        # so it must not be world- or group-readable. Best-effort: chmod is a
+        # no-op for permissions on Windows and can fail on exotic filesystems,
+        # and neither case is worth failing a config write over.
+        try:
+            os.chmod(path, 0o600)
+        except OSError:
+            pass

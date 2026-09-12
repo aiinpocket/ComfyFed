@@ -18,13 +18,17 @@ _ARTIFACTS_DIRNAME = "artifacts"
 _ARTIFACT_STORE_SETTING_KEY = "artifact_store"
 
 
-def _sanitize_path_component(value: str, *, what: str) -> str:
-    """Reduce `value` to a single, safe path segment.
+def sanitize_path_component(value: str, *, what: str = "path component") -> str:
+    """Reduce `value` to a single, safe path segment, or raise ValueError.
 
     Rejects empty strings, `.`/`..`, and anything containing a path
     separator (including a disguised traversal like `../../etc/passwd`,
     whose basename would otherwise be accepted as `passwd`). Idempotent:
     sanitizing an already-sanitized value returns it unchanged.
+
+    Public because every place that turns a client-supplied name into a path
+    segment -- artifact storage here, and job-input uploads in jobs.py --
+    must use exactly this rule, so there is only one definition of "safe".
     """
     if not value:
         raise ValueError(f"Invalid {what}: {value!r}")
@@ -35,11 +39,11 @@ def _sanitize_path_component(value: str, *, what: str) -> str:
 
 
 def _sanitize_filename(filename: str) -> str:
-    return _sanitize_path_component(filename or "", what="artifact filename")
+    return sanitize_path_component(filename or "", what="artifact filename")
 
 
 def _sanitize_job_id(job_id: str) -> str:
-    return _sanitize_path_component(job_id or "", what="job id")
+    return sanitize_path_component(job_id or "", what="job id")
 
 
 class ArtifactStore(ABC):
@@ -56,6 +60,23 @@ class ArtifactStore(ABC):
     @abstractmethod
     def url(self, job_id: str, filename: str) -> str:
         """Return the (Phase 1: API) URL clients should use to fetch this artifact."""
+
+    def path(self, job_id: str, filename: str) -> str:
+        """Return a local filesystem path the server can stream directly.
+
+        Only meaningful for backends whose artifacts are local files: it lets
+        the download route hand the file to `FileResponse` (sendfile, ranged
+        requests, no whole-file read into memory) instead of buffering bytes.
+
+        Backends without local files must not implement it -- a future S3
+        store will redirect the client to a presigned URL instead, so its
+        download route branches on this NotImplementedError rather than
+        pretending a path exists. Raises FileNotFoundError if the artifact is
+        absent, matching `open`.
+        """
+        raise NotImplementedError(
+            f"{type(self).__name__} has no local path for artifacts; serve them by URL instead."
+        )
 
 
 class LocalStore(ArtifactStore):
@@ -81,6 +102,12 @@ class LocalStore(ArtifactStore):
     def open(self, job_id: str, filename: str) -> IO[bytes]:
         path = self._path(job_id, filename)
         return open(path, "rb")
+
+    def path(self, job_id: str, filename: str) -> str:
+        path = self._path(job_id, filename)
+        if not os.path.isfile(path):
+            raise FileNotFoundError(path)
+        return path
 
     def url(self, job_id: str, filename: str) -> str:
         job = _sanitize_job_id(job_id)

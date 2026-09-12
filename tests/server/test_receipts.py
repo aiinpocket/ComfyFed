@@ -1,6 +1,7 @@
 import io
 import json
 from datetime import datetime, timedelta, timezone
+from urllib.parse import quote
 
 import httpx
 import pytest
@@ -186,7 +187,7 @@ def test_job_done_creates_dual_signed_receipt_over_ws(client):
         job_msg = ws.receive_json()
         assert job_msg["type"] == "job"
 
-        dispatch.mark_running(job_id)
+        dispatch.mark_running(job_id, worker_id)
 
         ws.send_json({"type": "job_done", "job_id": job_id, "result_files": ["out.png"]})
         agentws.dispatch_once(worker_id)
@@ -230,7 +231,7 @@ def test_receipt_ack_with_bad_signature_is_ignored(client):
         agentws.dispatch_once(worker_id)
         ws.receive_json()  # job push
 
-        dispatch.mark_running(job_id)
+        dispatch.mark_running(job_id, worker_id)
         ws.send_json({"type": "job_done", "job_id": job_id, "result_files": []})
         agentws.dispatch_once(worker_id)
         receipt_msg = ws.receive_json()
@@ -287,3 +288,36 @@ def test_contributions_report_filters_by_date_range(client):
     assert len(rows_all) == 1
     assert rows_all[0]["jobs"] == 2
     assert rows_all[0]["gpu_seconds"] == 30.0
+
+
+def test_contributions_rejects_an_unparseable_date(client):
+    """M5: a bad `from`/`to` is the caller's mistake -> 400, not a 500."""
+    _login(client)
+    r = client.get("/api/reports/contributions?from=not-a-date")
+    assert r.status_code == 400
+    assert r.json()["error"]["code"] == "reports.bad_date"
+
+    r = client.get("/api/reports/contributions?to=13/07/2026")
+    assert r.status_code == 400
+    assert r.json()["error"]["code"] == "reports.bad_date"
+
+
+def test_contributions_accepts_a_timezone_aware_date(client):
+    """An aware bound is converted to naive UTC; receipts are stored naive."""
+    _login(client)
+    with db.get_session() as session:
+        session.add(
+            db.Receipt(job_id="j1", worker_id="w1", gpu_seconds=10.0, platform_sig="sig")
+        )
+        session.commit()
+
+    # 08:00+08:00 == 00:00Z, so a receipt written "now" (UTC) is after it.
+    yesterday = (datetime.now(timezone.utc) - timedelta(days=1)).strftime("%Y-%m-%dT%H:%M:%S+08:00")
+    r = client.get(f"/api/reports/contributions?from={quote(yesterday)}")
+    assert r.status_code == 200
+    assert r.json()[0]["gpu_seconds"] == 10.0
+
+    tomorrow = (datetime.now(timezone.utc) + timedelta(days=1)).strftime("%Y-%m-%dT%H:%M:%S+00:00")
+    r = client.get(f"/api/reports/contributions?from={quote(tomorrow)}")
+    assert r.status_code == 200
+    assert r.json() == []

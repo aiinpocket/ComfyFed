@@ -51,6 +51,25 @@ def _json_or(raw: Optional[str], default):
     return value
 
 
+def _canonical_message(
+    method: str, path: str, query: str, ts: str, nonce: str, body: bytes
+) -> bytes:
+    """Build the exact byte string an agent request's signature covers.
+
+    Format (must stay identical to `comfyfed_agent.signing.signed_headers`):
+
+        {METHOD}\\n{path}[?{query}]\\n{ts}\\n{nonce}\\n{body}
+
+    The query string is part of the signed request target: without it, a
+    signature captured for `?from=A` could be replayed against `?from=B`
+    within the timestamp window on any route that reads query parameters.
+    It is appended only when non-empty, so paths without a query sign
+    byte-for-byte the same string they always did.
+    """
+    target = f"{path}?{query}" if query else path
+    return f"{method.upper()}\n{target}\n{ts}\n{nonce}\n".encode() + body
+
+
 def _prune_nonces(now_monotonic: float) -> None:
     expired = [key for key, expiry in _seen_nonces.items() if expiry <= now_monotonic]
     for key in expired:
@@ -89,7 +108,9 @@ async def verify_agent(
             raise _error(401, "agent.bad_signature", "Invalid signature.")
 
         body = await request.body()
-        message = f"{request.method.upper()}\n{request.url.path}\n{x_ts}\n{x_nonce}\n".encode() + body
+        message = _canonical_message(
+            request.method, request.url.path, request.url.query, x_ts, x_nonce, body
+        )
 
         # Signature must be validated BEFORE any disabled-worker check: if we
         # returned 403 for a disabled worker without checking the signature

@@ -7,18 +7,35 @@ receipt_ack exchange). This module just reports on the resulting rows.
 
 from __future__ import annotations
 
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import Optional
 
-from fastapi import APIRouter, Depends, Query
+from fastapi import APIRouter, Depends, HTTPException, Query
 
 from . import auth, db
 
 
+def _error(status_code: int, code: str, message: str = "") -> HTTPException:
+    return HTTPException(status_code=status_code, detail={"code": code, "message": message or code})
+
+
 def _parse_date(value: Optional[str]) -> Optional[datetime]:
+    """Parse an ISO-8601 `from`/`to` query parameter into a naive-UTC datetime.
+
+    Receipt timestamps are stored naive-UTC, so an offset-aware input is
+    converted to UTC and stripped -- comparing aware to naive would otherwise
+    raise a TypeError inside the query. An unparseable value is the caller's
+    mistake, so it becomes a 400 rather than a 500.
+    """
     if not value:
         return None
-    return datetime.fromisoformat(value)
+    try:
+        parsed = datetime.fromisoformat(value)
+    except ValueError:
+        raise _error(400, "reports.bad_date", f"Not a valid ISO-8601 date: {value!r}")
+    if parsed.tzinfo is not None:
+        parsed = parsed.astimezone(timezone.utc).replace(tzinfo=None)
+    return parsed
 
 
 def create_router() -> APIRouter:

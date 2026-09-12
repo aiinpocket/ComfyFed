@@ -150,3 +150,61 @@ def test_verdict_ineligible_on_vram_override():
     v = assess.verdict(worker, needs, {"min_vram_gb": 16}, [worker])
     assert v.kind == "ineligible"
     assert "override:min_vram_gb" in v.reasons
+
+
+def test_extract_treats_loadaudio_audio_input_as_an_asset():
+    # Mirrored client-side in web/src/lib/workflow.ts.
+    workflow = {
+        "1": {"class_type": "LoadAudio", "inputs": {"audio": "voice.wav"}},
+        "2": {"class_type": "LoadImage", "inputs": {"image": "ref.png"}},
+    }
+    needs = assess.extract(workflow)
+    assert needs.assets == {"voice.wav", "ref.png"}
+
+
+def test_verdict_backend_override_mismatch_is_ineligible():
+    worker = _worker("w1")
+    worker.backend = "rocm"
+    needs = assess.JobNeeds(nodes=set(), models=set(), est_vram_gb=None, assets=set())
+
+    v = assess.verdict(worker, needs, {"backend": "cuda"}, [worker])
+    assert v.kind == "ineligible"
+    assert "backend:cuda!=rocm" in v.reasons
+
+
+def test_verdict_backend_override_match_is_eligible():
+    worker = _worker("w1")
+    worker.backend = "cuda"
+    needs = assess.JobNeeds(nodes=set(), models=set(), est_vram_gb=None, assets=set())
+
+    assert assess.verdict(worker, needs, {"backend": "cuda"}, [worker]).kind == "eligible"
+
+
+def test_verdict_without_backend_override_ignores_worker_backend():
+    """Phase 1 derives nothing: with no override, backend never gates dispatch."""
+    worker = _worker("w1")
+    worker.backend = "cpu"
+    needs = assess.JobNeeds(nodes=set(), models=set(), est_vram_gb=None, assets=set())
+
+    assert assess.verdict(worker, needs, {}, [worker]).kind == "eligible"
+
+
+def test_needs_from_job_reparses_persisted_requirements():
+    job = db.Job(
+        workflow_json="{}",
+        required_nodes=json.dumps(["KSampler"]),
+        required_models=json.dumps(["ckpt.safetensors"]),
+        est_vram_gb=7.5,
+    )
+    needs = assess.needs_from_job(job)
+    assert needs.nodes == {"KSampler"}
+    assert needs.models == {"ckpt.safetensors"}
+    assert needs.est_vram_gb == 7.5
+    assert needs.assets == set()
+
+
+def test_needs_from_job_survives_corrupt_json_columns():
+    job = db.Job(workflow_json="{}", required_nodes="not json", required_models=None, est_vram_gb=None)
+    needs = assess.needs_from_job(job)
+    assert needs.nodes == set()
+    assert needs.models == set()

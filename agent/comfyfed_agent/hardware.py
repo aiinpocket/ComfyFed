@@ -112,7 +112,17 @@ def collect_dynamic(model_dir_or_none: str | None) -> dict:
 
 
 def scan_models(models_dir: str) -> list[dict]:
-    """Walk `models_dir` and return [{"name": relative/posix/path, "size": bytes}, ...]."""
+    """Walk `models_dir` and return the local model inventory.
+
+    Returns `[{"name": "relative/posix/path", "size": <GB>}, ...]` where
+    `size` is the file size in **gigabytes**, rounded to 3 decimal places
+    (~1 MB resolution) -- NOT bytes.
+
+    The unit matters: this list goes out as the WS `inventory` message, and
+    the server's VRAM estimate and free-disk headroom checks all work in GB
+    (as do `collect_hardware`'s vram_gb/ram_gb and `collect_dynamic`'s
+    free_*_gb). Reporting bytes here would inflate every estimate by ~10^9.
+    """
     results: list[dict] = []
     if not models_dir or not os.path.isdir(models_dir):
         return results
@@ -121,10 +131,15 @@ def scan_models(models_dir: str) -> list[dict]:
         for filename in files:
             full_path = os.path.join(root, filename)
             try:
-                size = os.path.getsize(full_path)
+                size_bytes = os.path.getsize(full_path)
             except OSError:
                 continue
             rel_path = os.path.relpath(full_path, models_dir)
-            results.append({"name": rel_path.replace(os.sep, "/"), "size": size})
+            results.append(
+                {
+                    "name": rel_path.replace(os.sep, "/"),
+                    "size": round(size_bytes / (1024 ** 3), 3),
+                }
+            )
 
     return results

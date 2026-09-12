@@ -97,7 +97,7 @@ def test_apply_update_bad_signature_rejected_and_pip_not_called():
 
     wheel_bytes = b"fake wheel contents"
     sha256 = hashlib.sha256(wheel_bytes).hexdigest()
-    bad_sig = other_key.sign(sha256.encode()).signature.hex()
+    bad_sig = other_key.sign(f"0.2.0|{sha256}".encode()).signature.hex()
 
     decision = UpdateDecision(
         action="update",
@@ -130,7 +130,7 @@ def test_apply_update_good_signature_installs_and_restarts():
 
     wheel_bytes = b"fake wheel contents"
     sha256 = hashlib.sha256(wheel_bytes).hexdigest()
-    good_sig = signing_key.sign(sha256.encode()).signature.hex()
+    good_sig = signing_key.sign(f"0.2.0|{sha256}".encode()).signature.hex()
 
     decision = UpdateDecision(
         action="update",
@@ -172,7 +172,7 @@ def test_apply_update_pip_install_raises_returns_false_and_no_restart():
 
     wheel_bytes = b"fake wheel contents"
     sha256 = hashlib.sha256(wheel_bytes).hexdigest()
-    good_sig = signing_key.sign(sha256.encode()).signature.hex()
+    good_sig = signing_key.sign(f"0.2.0|{sha256}".encode()).signature.hex()
 
     decision = UpdateDecision(
         action="update",
@@ -208,6 +208,63 @@ def test_apply_update_missing_wheel_info_rejected():
 
     pip_calls = []
     ok = apply_update(entry, decision, client, pip_install=lambda path: pip_calls.append(path))
+
+    assert ok is False
+    assert pip_calls == []
+
+
+def test_parse_version_non_numeric_segment_returns_sentinel_instead_of_raising():
+    assert parse_version("0.2.0rc1") == (0,)
+    assert parse_version("") == (0,)
+    assert parse_version("0.2.0rc1") < parse_version("0.1.0")
+
+
+def test_check_with_unparseable_latest_is_ok_not_a_crash():
+    entry = _entry()
+    client = _FakeClient(
+        version_body={
+            "latest": "0.2.0rc1",
+            "min_supported": "0.1.0",
+            "wheel_url": "http://testplatform/api/agent/releases/agent-0.2.0rc1.whl",
+            "sha256": "deadbeef",
+            "platform_sig": "abcd",
+        }
+    )
+    decision = check(entry, "0.1.0", client)
+    assert decision.action == "ok"
+
+
+def test_apply_update_rejects_a_signature_bound_to_another_version():
+    """A (sha256, sig) pair from release 0.1.5 must not validate as 0.2.0.
+
+    Without the version in the signed payload an attacker who controls the
+    version endpoint could replay an old release's signature under a newer
+    version number and force a downgrade.
+    """
+    signing_key = SigningKey.generate()
+    entry = _entry(platform_pubkey=bytes(signing_key.verify_key).hex())
+
+    wheel_bytes = b"old vulnerable wheel"
+    sha256 = hashlib.sha256(wheel_bytes).hexdigest()
+    sig_for_old_version = signing_key.sign(f"0.1.5|{sha256}".encode()).signature.hex()
+
+    decision = UpdateDecision(
+        action="update",
+        latest="0.2.0",  # advertised as something newer
+        min_supported="0.1.0",
+        wheel_url="http://testplatform/api/agent/releases/agent-0.2.0.whl",
+        sha256=sha256,
+        platform_sig=sig_for_old_version,
+    )
+
+    pip_calls = []
+    ok = apply_update(
+        entry,
+        decision,
+        _FakeClient(wheel_bytes=wheel_bytes),
+        pip_install=lambda path: pip_calls.append(path),
+        restart=lambda: None,
+    )
 
     assert ok is False
     assert pip_calls == []

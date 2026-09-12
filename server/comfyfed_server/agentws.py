@@ -4,6 +4,22 @@ Handles the challenge/response handshake, the agent->server hello/heartbeat/
 inventory/job_done/job_failed messages, server->agent job push, and the
 background loop that requeues stale jobs and dispatches queued work to idle
 connections.
+
+Agent -> server message contract (all JSON):
+
+  {"type": "hello", "hardware": {...}, "backend": str, "torch_version": str,
+   "node_classes": [str]}
+  {"type": "heartbeat", "state": "idle"|"busy", "progress": float,
+   "job_id": str|null, "dynamic": {...}}
+  {"type": "inventory", "models": [{"name": str, "size": float}]}
+      -- `size` is the model file size in GIGABYTES (not bytes); the server
+         compares it against VRAM and free-disk figures that are also in GB.
+  {"type": "job_done", "job_id": str, "result_files": [str]}
+  {"type": "job_failed", "job_id": str, "error": str}
+  {"type": "receipt_ack", "receipt_id": str, "worker_sig": hex}
+
+A `job_id` in any of these is only acted on when the authenticated worker
+actually owns that job (see dispatch._owned_job).
 """
 
 from __future__ import annotations
@@ -147,10 +163,13 @@ async def _handle_message(worker_id: str, conn: _Connection, message: dict) -> N
             _handle_inventory(worker_id, message)
         elif msg_type == "job_done":
             job_id = message.get("job_id")
-            dispatch.mark_done(job_id, message.get("result_files") or [])
-            await _create_and_push_receipt(worker_id, conn, job_id)
+            # A receipt is only ever written for a transition we actually
+            # applied, so a worker cannot mint contribution records for jobs
+            # it does not own by sending someone else's job_id.
+            if dispatch.mark_done(job_id, worker_id, message.get("result_files") or []):
+                await _create_and_push_receipt(worker_id, conn, job_id)
         elif msg_type == "job_failed":
-            dispatch.mark_failed(message.get("job_id"), message.get("error") or "")
+            dispatch.mark_failed(message.get("job_id"), worker_id, message.get("error") or "")
         elif msg_type == "receipt_ack":
             _handle_receipt_ack(worker_id, message)
         else:
@@ -195,11 +214,20 @@ def _handle_heartbeat(worker_id: str, conn: _Connection, message: dict) -> None:
         job_id = message.get("job_id")
         if job_id:
             job = session.get(db.Job, job_id)
-            if job is not None:
+            if job is not None and job.worker_id == worker_id:
                 progress = message.get("progress")
                 if isinstance(progress, (int, float)):
                     job.progress = float(progress)
                     session.commit()
+
+    # The agent broadcasts a busy heartbeat carrying the job_id the moment it
+    # picks the job up (see agent runner.handle_job), and that is the only
+    # signal the server gets that execution actually started -- so this is
+    # where "assigned" becomes "running" (and started_at gets set, which the
+    # job_done receipt's gpu_seconds is computed from). Ownership and status
+    # are gated inside dispatch.mark_running.
+    if state == "busy" and message.get("job_id"):
+        dispatch.mark_running(message["job_id"], worker_id)
 
     try:
         m = metrics.get_metrics()
@@ -209,12 +237,45 @@ def _handle_heartbeat(worker_id: str, conn: _Connection, message: dict) -> None:
         logger.exception("agentws: failed to update heartbeat metrics for worker %s", worker_id)
 
 
+# A single model file larger than this many GB is not plausible; a "size"
+# that big is an old agent still reporting raw bytes (see _normalize_models).
+_MAX_PLAUSIBLE_MODEL_GB = 10000
+
+
+def _normalize_models(models) -> list:
+    """Normalize an `inventory` message's model list to the wire contract.
+
+    Contract: `{"type": "inventory", "models": [{"name": str, "size": GB}]}` --
+    `size` is the file size in **gigabytes** (float, 3 dp), not bytes. The
+    server's VRAM estimate and free-disk checks all work in GB, so a byte-scale
+    number would inflate an estimate by ~10^9 and make every worker ineligible.
+
+    Agents older than this contract sent bytes. Rather than trusting the
+    version handshake, any size above `_MAX_PLAUSIBLE_MODEL_GB` is treated as
+    bytes and converted -- no real single model file is 10000 GB, while a
+    byte-scale value for even a 1 MB file exceeds it.
+    """
+    if not isinstance(models, list):
+        return []
+
+    normalized = []
+    for entry in models:
+        if not isinstance(entry, dict):
+            continue
+        size = entry.get("size")
+        if isinstance(size, (int, float)) and not isinstance(size, bool):
+            if size > _MAX_PLAUSIBLE_MODEL_GB:
+                entry = {**entry, "size": round(size / (1024 ** 3), 3)}
+        normalized.append(entry)
+    return normalized
+
+
 def _handle_inventory(worker_id: str, message: dict) -> None:
     with db.get_session() as session:
         worker = session.get(db.Worker, worker_id)
         if worker is None:
             return
-        worker.model_inventory = json.dumps(message.get("models") or [])
+        worker.model_inventory = json.dumps(_normalize_models(message.get("models") or []))
         session.commit()
 
 

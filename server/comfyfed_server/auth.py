@@ -204,6 +204,58 @@ def change_password(
 
         new_hash = security.hash_password(body.new)
         _set_setting(db_session, _ADMIN_PASSWORD_HASH_KEY, new_hash)
+
+        # Rotate the cookie-signing secret so every session issued under the
+        # old password stops validating -- including this one. Changing a
+        # password that someone else may know is worthless if their existing
+        # session keeps working; the UI already tells the admin to sign in
+        # again afterwards.
+        _set_setting(db_session, _SESSION_SECRET_KEY, secrets.token_hex(32))
         db_session.commit()
 
     return {"ok": True}
+
+
+class SettingsBody(BaseModel):
+    platform_url: Optional[str] = None
+    lang: Optional[str] = None
+
+
+settings_router = APIRouter()
+
+
+@settings_router.post("/api/settings")
+def update_settings(
+    body: SettingsBody,
+    _payload: dict = Depends(require_csrf),
+):
+    """Update server-level settings. Only the keys present in the body change.
+
+    `platform_url` is validated as an absolute http(s) URL because it is baked
+    verbatim into every worker registration bundle -- a relative or malformed
+    value would silently produce agents that can never connect back.
+    """
+    updates: dict[str, str] = {}
+
+    if body.platform_url is not None:
+        url = body.platform_url.strip()
+        if url and not (url.startswith("http://") or url.startswith("https://")):
+            raise _error(
+                400, "settings.bad_platform_url", "Platform URL must start with http:// or https://."
+            )
+        updates[_PLATFORM_URL_KEY] = url
+
+    if body.lang is not None:
+        if body.lang not in ("zh-TW", "en"):
+            raise _error(400, "settings.bad_lang", "Language must be one of: zh-TW, en.")
+        updates[_LANG_KEY] = body.lang
+
+    with db.get_session() as db_session:
+        for key, value in updates.items():
+            _set_setting(db_session, key, value)
+        db_session.commit()
+
+        return {
+            "platform_url": _get_setting(db_session, _PLATFORM_URL_KEY) or "",
+            "lang": _get_setting(db_session, _LANG_KEY) or "en",
+        }

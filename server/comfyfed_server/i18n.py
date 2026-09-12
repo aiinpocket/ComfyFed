@@ -27,6 +27,20 @@ _DICT: dict[str, dict[str, str]] = {
         "zh-TW": "接下來：執行 `comfyfed-server run` 啟動伺服器，然後用上面的密碼登入。",
         "en": "Next: run `comfyfed-server run` to start the server, then log in with the password above.",
     },
+    "publish.done": {
+        "zh-TW": "已發布 agent 版本，設定如下：",
+        "en": "Agent release published; settings written:",
+    },
+    "publish.offline_key_note": {
+        "zh-TW": (
+            "注意：平台簽章金鑰可以離線保管。若要離線簽章，請自行對 "
+            "\"{版本}|{sha256}\" 簽名，再手動寫入上述 agent_* 設定。"
+        ),
+        "en": (
+            "Note: the platform signing key may be kept offline. To sign offline, sign "
+            '"{version}|{sha256}" yourself and set the agent_* settings above by hand.'
+        ),
+    },
     "install.password_box_title": {
         "zh-TW": "管理員密碼（僅顯示一次，請立即保存）",
         "en": "Admin password (shown once, save it now)",

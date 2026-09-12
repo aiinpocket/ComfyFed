@@ -9,6 +9,7 @@ import os
 from contextlib import asynccontextmanager
 
 from fastapi import FastAPI, HTTPException, Request
+from fastapi.exceptions import RequestValidationError
 from fastapi.responses import FileResponse, JSONResponse, Response
 from fastapi.staticfiles import StaticFiles
 from prometheus_client import CONTENT_TYPE_LATEST, generate_latest
@@ -31,6 +32,22 @@ async def _http_exception_handler(request: Request, exc: HTTPException) -> JSONR
     else:
         body = _error_body("http_error", str(detail))
     return JSONResponse(status_code=exc.status_code, content=body)
+
+
+async def _validation_exception_handler(request: Request, exc: RequestValidationError) -> JSONResponse:
+    """Render FastAPI's request-validation errors in the same error envelope.
+
+    Without this, a malformed body/query returns FastAPI's default
+    `{"detail": [...]}` shape, which the console's `parseError` cannot read --
+    so a validation failure surfaced as a bare "http_error" with no message.
+    """
+    try:
+        first = exc.errors()[0]
+        location = ".".join(str(part) for part in first.get("loc", ()) if part != "body")
+        message = f"{location}: {first.get('msg', 'invalid')}" if location else str(first.get("msg", "invalid"))
+    except Exception:
+        message = "Request validation failed."
+    return JSONResponse(status_code=422, content=_error_body("validation_error", message))
 
 
 def _find_web_dist() -> str | None:
@@ -86,7 +103,9 @@ def create_app(data_dir: str) -> FastAPI:
 
     app = FastAPI(title="ComfyFed", lifespan=lifespan)
     app.add_exception_handler(HTTPException, _http_exception_handler)
+    app.add_exception_handler(RequestValidationError, _validation_exception_handler)
     app.include_router(auth.router)
+    app.include_router(auth.settings_router)
     app.include_router(workers.create_router(data_dir))
     app.include_router(jobs.create_router(data_dir))
     app.include_router(receipts.create_router())

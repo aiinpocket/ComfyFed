@@ -145,8 +145,14 @@ class AgentLoop:
                 await self.broadcast_heartbeat("busy", progress=0.0, job_id=job_id)
 
                 workflow = json.loads(job_msg["workflow_json"])
-                allowed = whitelist.allowed_classes(
-                    self.config.node_policy, self.config.comfy_url, self.config.whitelist_extra
+                # allowed_classes does a blocking HTTP call to ComfyUI's
+                # /object_info; running it inline would stall this connection's
+                # heartbeats (and every other platform's, they share the loop).
+                allowed = await asyncio.to_thread(
+                    whitelist.allowed_classes,
+                    self.config.node_policy,
+                    self.config.comfy_url,
+                    self.config.whitelist_extra,
                 )
                 whitelist.check(workflow, allowed)
 
@@ -233,8 +239,12 @@ class AgentLoop:
 
                 hw = hardware.collect_hardware(self.config.comfy_url)
                 backend, torch_version = hardware.detect_backend()
-                allowed = whitelist.allowed_classes(
-                    self.config.node_policy, self.config.comfy_url, self.config.whitelist_extra
+                # Blocking (HTTP to ComfyUI) -- see handle_job.
+                allowed = await asyncio.to_thread(
+                    whitelist.allowed_classes,
+                    self.config.node_policy,
+                    self.config.comfy_url,
+                    self.config.whitelist_extra,
                 )
                 await conn.send_hello(hw, backend, torch_version, allowed)
 

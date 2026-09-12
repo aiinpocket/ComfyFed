@@ -5,7 +5,7 @@ from __future__ import annotations
 import os
 
 from argon2 import PasswordHasher
-from argon2.exceptions import VerifyMismatchError
+from argon2.exceptions import InvalidHash, VerificationError, VerifyMismatchError
 from nacl.signing import SigningKey, VerifyKey
 
 _hasher = PasswordHasher()
@@ -19,9 +19,16 @@ def hash_password(pw: str) -> str:
 
 
 def verify_password(pw: str, hashed: str) -> bool:
+    """Check `pw` against an argon2 hash, returning False instead of raising.
+
+    A corrupt or truncated stored hash raises InvalidHash/VerificationError
+    rather than VerifyMismatchError. Those must also read as "wrong password"
+    -- otherwise a damaged settings row turns every login attempt into a 500
+    and locks the admin out with no way back in through the UI.
+    """
     try:
         return _hasher.verify(hashed, pw)
-    except VerifyMismatchError:
+    except (VerifyMismatchError, VerificationError, InvalidHash):
         return False
 
 

@@ -14,11 +14,17 @@ config = context.config
 if config.config_file_name is not None:
     fileConfig(config.config_file_name)
 
-# add your model's MetaData object here
-# for 'autogenerate' support
-# from myapp import mymodel
-# target_metadata = mymodel.Base.metadata
-target_metadata = None
+# The ORM metadata, so `alembic revision --autogenerate` can diff the models
+# against the live schema. Guarded: migrations must still run when this env is
+# invoked without `comfyfed_server` importable (e.g. a bare `alembic upgrade`
+# from a checkout that hasn't been pip-installed) -- autogenerate is the only
+# thing that needs it.
+try:
+    from comfyfed_server.db import Base
+
+    target_metadata = Base.metadata
+except ImportError:  # pragma: no cover - depends on how alembic was invoked
+    target_metadata = None
 
 # other values from the config, defined by the needs of env.py,
 # can be acquired:

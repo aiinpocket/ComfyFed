@@ -152,7 +152,7 @@ def test_job_lifecycle_updates_histograms(client):
         agentws.dispatch_once(worker_id)
         ws.receive_json()  # the pushed job message
 
-        dispatch.mark_running(job_id)
+        dispatch.mark_running(job_id, worker_id)
         ws.send_json({"type": "job_done", "job_id": job_id, "result_files": ["out.png"]})
         agentws.dispatch_once(worker_id)
 

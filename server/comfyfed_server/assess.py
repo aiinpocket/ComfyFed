@@ -7,6 +7,7 @@ worker can run it.
 
 from __future__ import annotations
 
+import json
 from dataclasses import dataclass, field
 
 _MODEL_FIELD_NAMES = {
@@ -25,7 +26,13 @@ _MODEL_FIELD_NAMES = {
 
 _MODEL_EXTENSIONS = (".safetensors", ".ckpt", ".pt", ".sft", ".gguf")
 
-_ASSET_NODE_CLASSES = {"LoadImage", "LoadImageMask"}
+# Node classes whose inputs name a file the submitter must upload with the job.
+# Mirrored client-side in web/src/lib/workflow.ts -- keep the two lists in step.
+_ASSET_NODE_CLASSES = {"LoadImage", "LoadImageMask", "LoadAudio"}
+
+# Input fields on those classes that carry an asset filename. The spec calls
+# for image/audio/video fields; ComfyUI's core LoadAudio uses `audio`.
+_ASSET_FIELD_NAMES = ("image", "audio", "video")
 
 _VRAM_FUDGE_FACTOR = 1.15
 
@@ -78,11 +85,32 @@ def extract(workflow: dict) -> JobNeeds:
                 models.add(value)
 
         if class_type in _ASSET_NODE_CLASSES:
-            image = inputs.get("image")
-            if isinstance(image, str):
-                assets.add(image)
+            for asset_field in _ASSET_FIELD_NAMES:
+                value = inputs.get(asset_field)
+                if isinstance(value, str):
+                    assets.add(value)
 
     return JobNeeds(nodes=nodes, models=models, est_vram_gb=None, assets=assets)
+
+
+def needs_from_job(job) -> JobNeeds:
+    """Rebuild a `JobNeeds` from the requirements already persisted on a Job row.
+
+    Single code path for dispatch and the assessment API: both need the same
+    reparse of the job's `required_nodes` / `required_models` JSON columns plus
+    its stored `est_vram_gb`. Bad/empty JSON degrades to an empty set rather
+    than raising. `assets` is deliberately empty: input assets are uploaded at
+    submission time and play no part in worker eligibility.
+    """
+    try:
+        nodes = set(json.loads(job.required_nodes or "[]"))
+    except (TypeError, ValueError):
+        nodes = set()
+    try:
+        models = set(json.loads(job.required_models or "[]"))
+    except (TypeError, ValueError):
+        models = set()
+    return JobNeeds(nodes=nodes, models=models, est_vram_gb=job.est_vram_gb, assets=set())
 
 
 def _model_inventory(worker) -> list[dict]:
@@ -149,7 +177,12 @@ def verdict(worker, needs: JobNeeds, requirements_override: dict, all_workers: l
     """Judge whether `worker` can run a job needing `needs`.
 
     `requirements_override` is the job's advanced-override dict (optional
-    keys: min_vram_gb, min_free_disk_gb, gpu_name_contains).
+    keys: min_vram_gb, min_free_disk_gb, gpu_name_contains, backend).
+
+    The `backend` key is compared against the worker's reported compute
+    backend ("cuda"/"rocm"/"mps"/"cpu"). Phase 1 derives nothing automatically
+    -- a workflow is never inspected for backend hints, so this check only
+    fires when the submitter set the override explicitly.
     `all_workers` is the full federation worker list, used to determine
     whether a model missing from `worker`'s inventory is fetchable from
     another worker.
@@ -184,6 +217,12 @@ def verdict(worker, needs: JobNeeds, requirements_override: dict, all_workers: l
         free_disk_gb = dynamic.get("free_disk_gb")
         if not isinstance(free_disk_gb, (int, float)) or free_disk_gb < min_free_disk_gb:
             reasons.append("override:min_free_disk_gb")
+
+    want_backend = requirements_override.get("backend")
+    if isinstance(want_backend, str) and want_backend:
+        have_backend = getattr(worker, "backend", "") or ""
+        if want_backend != have_backend:
+            reasons.append(f"backend:{want_backend}!={have_backend}")
 
     gpu_name_contains = requirements_override.get("gpu_name_contains")
     if gpu_name_contains:

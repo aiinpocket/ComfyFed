@@ -118,6 +118,11 @@ def _alembic_dir() -> str:
 def _set_sqlite_pragma(dbapi_connection, connection_record) -> None:
     cursor = dbapi_connection.cursor()
     cursor.execute("PRAGMA journal_mode=WAL")
+    # WAL lets readers run alongside a writer, but writers still serialize.
+    # Without a busy timeout a concurrent write (the dispatch loop committing
+    # while a request handler commits) fails instantly with "database is
+    # locked"; 5s of retry absorbs that contention.
+    cursor.execute("PRAGMA busy_timeout=5000")
     cursor.close()
 
 

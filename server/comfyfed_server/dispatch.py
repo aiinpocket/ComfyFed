@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import logging
 from datetime import datetime, timedelta, timezone
 from typing import Optional
 
@@ -10,23 +11,16 @@ from sqlalchemy import update
 
 from . import assess, db, metrics
 
+logger = logging.getLogger(__name__)
+
 _STALE_SECONDS = 90
+
+# Statuses a worker is allowed to transition out of by reporting on a job.
+_OWNED_STATUSES = ("assigned", "running")
 
 
 def _utcnow() -> datetime:
     return datetime.now(timezone.utc).replace(tzinfo=None)
-
-
-def _job_needs(job: db.Job) -> assess.JobNeeds:
-    try:
-        nodes = set(json.loads(job.required_nodes or "[]"))
-    except (TypeError, ValueError):
-        nodes = set()
-    try:
-        models = set(json.loads(job.required_models or "[]"))
-    except (TypeError, ValueError):
-        models = set()
-    return assess.JobNeeds(nodes=nodes, models=models, est_vram_gb=job.est_vram_gb, assets=set())
 
 
 def pick_job_for(worker_id: str) -> Optional[db.Job]:
@@ -56,7 +50,7 @@ def pick_job_for(worker_id: str) -> Optional[db.Job]:
             except (TypeError, ValueError):
                 requirements_override = {}
 
-            needs = _job_needs(job)
+            needs = assess.needs_from_job(job)
             v = assess.verdict(worker, needs, requirements_override, all_workers)
             if v.kind != "eligible":
                 continue
@@ -84,16 +78,22 @@ def pick_job_for(worker_id: str) -> Optional[db.Job]:
 def requeue_stale(now: datetime) -> int:
     """Requeue assigned/running jobs of workers that haven't checked in recently.
 
-    A worker is stale if `now - worker.last_seen > 90s` (or last_seen is
-    unset). Its assigned/running jobs go back to queued (worker_id cleared,
-    progress reset), and the worker itself is marked offline.
+    A worker is stale if it hasn't checked in for more than 90s. A worker that
+    has never heartbeated at all (`last_seen is None`) falls back to its
+    `created_at` as the clock: an agent that completed the handshake, was
+    pushed a job, and then died before its first heartbeat must still have
+    that job requeued rather than stranding it forever.
+
+    A stale worker's assigned/running jobs go back to queued (worker_id
+    cleared, progress reset), and the worker itself is marked offline.
     """
     cutoff = now - timedelta(seconds=_STALE_SECONDS)
     count = 0
     with db.get_session() as session:
         workers = session.query(db.Worker).all()
         for worker in workers:
-            if worker.last_seen is None or worker.last_seen >= cutoff:
+            reference = worker.last_seen if worker.last_seen is not None else worker.created_at
+            if reference is None or reference >= cutoff:
                 continue
 
             jobs = (
@@ -115,23 +115,54 @@ def requeue_stale(now: datetime) -> int:
     return count
 
 
-def mark_running(job_id: str) -> None:
+def _owned_job(session, job_id: Optional[str], worker_id: str, statuses) -> Optional[db.Job]:
+    """Fetch `job_id` only if `worker_id` currently owns it in one of `statuses`.
+
+    Every worker-driven status transition goes through this gate: the agent
+    WebSocket carries an authenticated worker identity, but the job_id inside
+    a message is attacker-controlled, so a worker must never be able to move a
+    job it doesn't own (or one already finished). Mismatches are logged and
+    dropped rather than raising -- a compromised or buggy agent shouldn't be
+    able to tear down the message loop.
+    """
+    if not job_id:
+        return None
+    job = session.get(db.Job, job_id)
+    if job is None:
+        logger.warning("dispatch: worker %s referenced unknown job %s", worker_id, job_id)
+        return None
+    if job.worker_id != worker_id or job.status not in statuses:
+        logger.warning(
+            "dispatch: worker %s may not transition job %s (owner=%s, status=%s)",
+            worker_id,
+            job_id,
+            job.worker_id,
+            job.status,
+        )
+        return None
+    return job
+
+
+def mark_running(job_id: str, worker_id: str) -> bool:
+    """Move an assigned job of `worker_id` to running. Returns whether it acted."""
     with db.get_session() as session:
-        job = session.get(db.Job, job_id)
+        job = _owned_job(session, job_id, worker_id, ("assigned",))
         if job is None:
-            return
+            return False
         job.status = "running"
         job.started_at = _utcnow()
         wait_seconds = (job.started_at - job.created_at).total_seconds()
         session.commit()
     metrics.get_metrics().job_wait_seconds.observe(max(wait_seconds, 0.0))
+    return True
 
 
-def mark_done(job_id: str, result_files: list) -> None:
+def mark_done(job_id: str, worker_id: str, result_files: list) -> bool:
+    """Complete an assigned/running job of `worker_id`. Returns whether it acted."""
     with db.get_session() as session:
-        job = session.get(db.Job, job_id)
+        job = _owned_job(session, job_id, worker_id, _OWNED_STATUSES)
         if job is None:
-            return
+            return False
         job.status = "done"
         job.result_files = json.dumps(result_files)
         job.finished_at = _utcnow()
@@ -139,13 +170,15 @@ def mark_done(job_id: str, result_files: list) -> None:
         session.commit()
     if run_seconds is not None:
         metrics.get_metrics().job_run_seconds.observe(max(run_seconds, 0.0))
+    return True
 
 
-def mark_failed(job_id: str, error: str) -> None:
+def mark_failed(job_id: str, worker_id: str, error: str) -> bool:
+    """Fail an assigned/running job of `worker_id`. Returns whether it acted."""
     with db.get_session() as session:
-        job = session.get(db.Job, job_id)
+        job = _owned_job(session, job_id, worker_id, _OWNED_STATUSES)
         if job is None:
-            return
+            return False
         job.status = "failed"
         job.error = error
         job.finished_at = _utcnow()
@@ -153,3 +186,4 @@ def mark_failed(job_id: str, error: str) -> None:
         session.commit()
     if run_seconds is not None:
         metrics.get_metrics().job_run_seconds.observe(max(run_seconds, 0.0))
+    return True

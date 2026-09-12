@@ -140,3 +140,35 @@ def test_disabled_worker_with_invalid_signature_401_not_403(client):
     r = client.post("/api/agent/ping", headers=headers, content=b"tampered")
     assert r.status_code == 401
     assert r.json()["error"]["code"] == "agent.bad_signature"
+
+
+def test_query_string_is_covered_by_the_signature(client):
+    """M14: a signature issued for one query must not validate for another.
+
+    The agent signs `{METHOD}\n{path}?{query}\n...`; the server rebuilds the
+    same string from the live request, so swapping the parameters after
+    signing invalidates it.
+    """
+    entry = _register_worker(client)
+
+    headers = signing.signed_headers(entry, "POST", "/api/agent/ping", b"", query="scope=read")
+    ok = client.post("/api/agent/ping?scope=read", headers=headers, content=b"")
+    assert ok.status_code == 200
+
+    headers = signing.signed_headers(entry, "POST", "/api/agent/ping", b"", query="scope=read")
+    swapped = client.post("/api/agent/ping?scope=admin", headers=headers, content=b"")
+    assert swapped.status_code == 401
+    assert swapped.json()["error"]["code"] == "agent.bad_signature"
+
+
+def test_signature_without_a_query_is_unchanged(client):
+    """A request with no query signs the bare path, exactly as before."""
+    entry = _register_worker(client)
+
+    headers = signing.signed_headers(entry, "POST", "/api/agent/ping", b"")
+    assert client.post("/api/agent/ping", headers=headers, content=b"").status_code == 200
+
+    # A signature omitting the query cannot be used on a request that has one.
+    headers = signing.signed_headers(entry, "POST", "/api/agent/ping", b"")
+    r = client.post("/api/agent/ping?x=1", headers=headers, content=b"")
+    assert r.status_code == 401

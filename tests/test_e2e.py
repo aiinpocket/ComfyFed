@@ -189,7 +189,7 @@ def test_full_job_lifecycle_over_the_wire(server, mock_comfy, tmp_path):
             job = session.get(db.Job, job_id)
             assert job.status == "assigned"
 
-        dispatch.mark_running(job_id)
+        dispatch.mark_running(job_id, entry.worker_id)
 
         # 7. Agent-side: download the input asset via a signed GET...
         input_path = f"/api/agent/jobs/{job_id}/inputs/ref.png"

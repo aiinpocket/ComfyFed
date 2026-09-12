@@ -20,13 +20,24 @@ from .config import PlatformEntry
 logger = logging.getLogger(__name__)
 
 
+# Sort-lowest sentinel for a version string this parser cannot read.
+_UNPARSEABLE_VERSION = (0,)
+
+
 def parse_version(s: str) -> tuple[int, ...]:
     """Parse a simple dotted-int version string, e.g. "0.1.0" -> (0, 1, 0).
 
     No `packaging` dependency needed for the plain `major.minor.patch` scheme
-    used by this project.
+    used by this project. A string this scheme cannot express (a pre-release
+    like "0.2.0rc1", or anything non-numeric) logs a warning and returns the
+    lowest-sorting sentinel `(0,)` rather than raising -- a stray value in a
+    server setting must never crash the agent's startup version check.
     """
-    return tuple(int(part) for part in s.split("."))
+    try:
+        return tuple(int(part) for part in s.split("."))
+    except (AttributeError, ValueError):
+        logger.warning("Unparseable version string %r; treating it as unknown.", s)
+        return _UNPARSEABLE_VERSION
 
 
 @dataclass
@@ -93,10 +104,20 @@ def apply_update(
 ) -> bool:
     """Download, verify, and install the wheel described by `decision`.
 
-    Verification (sha256 of the downloaded bytes, then the platform's Ed25519
-    signature over the sha256 hex string) must both succeed before anything is
-    installed. Any failure returns False and leaves the current install
-    untouched -- the caller should keep running the old version.
+    Verification must fully succeed before anything is installed: the sha256
+    of the downloaded bytes must match, and the platform's Ed25519 signature
+    must verify over `f"{version}|{sha256hex}"`.
+
+    The version is part of the signed payload deliberately. A signature over
+    the digest alone is transferable between releases: an attacker who can
+    answer /api/agent/version could pair an old release's still-valid
+    (sha256, signature) pair with a *newer* advertised version number and
+    force a silent downgrade to a known-vulnerable build. Binding the two
+    together makes each signature usable for exactly one release.
+    (`comfyfed-server publish-agent` produces this format.)
+
+    Any failure returns False and leaves the current install untouched -- the
+    caller should keep running the old version.
     """
     if decision.action != "update":
         logger.warning("apply_update called with action=%r; refusing to update.", decision.action)
@@ -119,9 +140,10 @@ def apply_update(
         logger.warning("Wheel sha256 mismatch; refusing to update.")
         return False
 
+    signed_payload = f"{decision.latest}|{decision.sha256}"
     try:
         verify_key = VerifyKey(bytes.fromhex(entry.platform_pubkey))
-        verify_key.verify(decision.sha256.encode(), bytes.fromhex(decision.platform_sig))
+        verify_key.verify(signed_payload.encode(), bytes.fromhex(decision.platform_sig))
     except (BadSignatureError, ValueError):
         logger.warning("Wheel platform signature invalid; refusing to update.")
         return False
