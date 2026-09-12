@@ -607,6 +607,43 @@ _TOP_LEVEL_MODELS_WORKFLOW = {
 }
 
 
+# A subgraph-based workflow: the library nests whole node graphs (with their
+# own `properties.models`) under `definitions.subgraphs[]` -- the shape
+# `image_z_image_turbo` ships and the one live verification caught slipping
+# through a location-enumerating strip. The recursive strip must reach it.
+_SUBGRAPH_WORKFLOW = {
+    "id": "z_image",
+    "revision": 0,
+    "nodes": [{"id": 1, "type": "SaveImage", "properties": {"Node name for S&R": "SaveImage"}}],
+    "links": [],
+    "definitions": {
+        "subgraphs": [
+            {
+                "id": "sg-1",
+                "nodes": [
+                    {
+                        "id": 62,
+                        "type": "CLIPLoader",
+                        "properties": {
+                            "Node name for S&R": "CLIPLoader",
+                            "models": [
+                                {
+                                    "name": "qwen_3_4b.safetensors",
+                                    "url": "https://huggingface.co/Comfy-Org/z_image_turbo/resolve/main/split_files/text_encoders/qwen_3_4b.safetensors",
+                                    "directory": "text_encoders",
+                                }
+                            ],
+                        },
+                        "widgets_values": ["qwen_3_4b.safetensors", "lumina2", "default"],
+                    }
+                ],
+            }
+        ]
+    },
+    "version": 0.4,
+}
+
+
 def _seed_official_dir(data_dir, *, index_extra=None, localized=None, logo=None):
     official_dir = official_templates.official_dir(data_dir)
     os.makedirs(official_dir, exist_ok=True)
@@ -616,6 +653,8 @@ def _seed_official_dir(data_dir, *, index_extra=None, localized=None, logo=None)
         json.dump(_FLUX_WORKFLOW, f)
     with open(os.path.join(official_dir, "legacy_top_level.json"), "w", encoding="utf-8") as f:
         json.dump(_TOP_LEVEL_MODELS_WORKFLOW, f)
+    with open(os.path.join(official_dir, "z_image.json"), "w", encoding="utf-8") as f:
+        json.dump(_SUBGRAPH_WORKFLOW, f)
     with open(os.path.join(official_dir, "flux_dev-1.webp"), "wb") as f:
         f.write(b"RIFF" + b"\x00" * 8 + b"WEBP")
     if localized is not None:
@@ -682,6 +721,24 @@ def test_official_workflow_json_has_top_level_download_metadata_stripped(client)
     models = r.json()["models"]
     assert len(models) == 1
     assert models[0] == {"name": "ae.safetensors", "directory": "vae"}
+
+
+def test_official_workflow_json_has_subgraph_download_metadata_stripped(client):
+    """Model metadata nested under `definitions.subgraphs[]` is stripped too."""
+    _login(client)
+    _seed_official_dir(client.data_dir)
+
+    r = client.get("/comfy/templates/z_image.json")
+    assert r.status_code == 200
+    body = r.json()
+
+    loader = body["definitions"]["subgraphs"][0]["nodes"][0]
+    assert loader["properties"]["models"] == [
+        {"name": "qwen_3_4b.safetensors", "directory": "text_encoders"}
+    ]
+    # The rest of the subgraph node is untouched.
+    assert loader["widgets_values"] == ["qwen_3_4b.safetensors", "lumina2", "default"]
+    assert "huggingface.co" not in json.dumps(body)
 
 
 def test_own_template_workflow_still_served_byte_identical(client):

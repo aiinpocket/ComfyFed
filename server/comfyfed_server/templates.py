@@ -188,47 +188,37 @@ def _load_json(path: str) -> list | dict | None:
 _DOWNLOAD_KEYS = ("url", "hash", "hash_type")
 
 
-def _stripped_models(models) -> list | None:
-    """`models` with the download keys removed from every dict entry, or None
-    when it is not a list (i.e. there is nothing to strip here)."""
-    if not isinstance(models, list):
-        return None
-    return [
-        {k: v for k, v in entry.items() if k not in _DOWNLOAD_KEYS}
-        if isinstance(entry, dict)
-        else entry
-        for entry in models
-    ]
-
-
-def _strip_download_metadata(workflow: dict) -> dict:
+def _strip_download_metadata(workflow):
     """Drop `url`/`hash`/`hash_type` from every model entry the frontend could
     turn into a Download button, keeping `name` + `directory`.
 
-    Both locations are handled: `nodes[].properties.models`, which is what the
-    real official library emits and what `getEmbeddedModels` reads, and a
-    top-level `models` list, which the library does not currently use but
-    which costs nothing to cover. See the module docstring for why.
+    The walk is fully recursive rather than enumerating known locations,
+    because the real library keeps model metadata in more places than the
+    obvious ones: `nodes[].properties.models` for plain graphs, a top-level
+    `models` list in the documented schema, and -- the one live verification
+    caught after the enumerating version shipped -- inside
+    `definitions.subgraphs[].nodes[].properties.models` for workflows built
+    around subgraphs (e.g. `image_z_image_turbo`). Any dict's `models` key
+    whose value is a list gets its dict entries stripped; entries without a
+    `name` are left untouched (they are not model records), and non-dict
+    entries (the index's plain-string model *names*) pass through unchanged.
     """
-    result = dict(workflow)
+    if isinstance(workflow, list):
+        return [_strip_download_metadata(item) for item in workflow]
+    if not isinstance(workflow, dict):
+        return workflow
 
-    top_level = _stripped_models(workflow.get("models"))
-    if top_level is not None:
-        result["models"] = top_level
-
-    nodes = workflow.get("nodes")
-    if isinstance(nodes, list):
-        stripped_nodes = []
-        for node in nodes:
-            properties = node.get("properties") if isinstance(node, dict) else None
-            if isinstance(properties, dict):
-                models = _stripped_models(properties.get("models"))
-                if models is not None:
-                    node = dict(node)
-                    node["properties"] = {**properties, "models": models}
-            stripped_nodes.append(node)
-        result["nodes"] = stripped_nodes
-
+    result = {}
+    for key, value in workflow.items():
+        if key == "models" and isinstance(value, list):
+            result[key] = [
+                {k: v for k, v in entry.items() if k not in _DOWNLOAD_KEYS}
+                if isinstance(entry, dict) and "name" in entry
+                else entry
+                for entry in value
+            ]
+        else:
+            result[key] = _strip_download_metadata(value)
     return result
 
 

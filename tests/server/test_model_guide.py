@@ -123,6 +123,48 @@ def test_harvest_also_reads_a_top_level_models_list(tmp_path):
     }
 
 
+def test_harvest_reads_subgraph_definitions(tmp_path):
+    """Subgraph-based workflows keep their model metadata under
+    `definitions.subgraphs[].nodes[].properties.models` (the shape
+    `image_z_image_turbo` ships) -- harvest's recursive walk must reach it."""
+    data_dir = str(tmp_path)
+    official_dir = os.path.join(data_dir, "comfy_templates_official")
+    os.makedirs(official_dir, exist_ok=True)
+    workflow = {
+        "id": "z_image",
+        "nodes": [],
+        "definitions": {
+            "subgraphs": [
+                {
+                    "id": "sg-1",
+                    "nodes": [
+                        {
+                            "id": 62,
+                            "type": "CLIPLoader",
+                            "properties": {
+                                "models": [
+                                    {
+                                        "name": "qwen_3_4b.safetensors",
+                                        "url": "https://example.com/qwen_3_4b.safetensors",
+                                        "directory": "text_encoders",
+                                    }
+                                ]
+                            },
+                        }
+                    ],
+                }
+            ]
+        },
+    }
+    with open(os.path.join(official_dir, "z_image.json"), "w", encoding="utf-8") as f:
+        json.dump(workflow, f)
+
+    assert model_guide.harvest(data_dir)["qwen_3_4b.safetensors"] == {
+        "url": "https://example.com/qwen_3_4b.safetensors",
+        "directory": "text_encoders",
+    }
+
+
 def test_harvest_gathers_models_from_several_nodes(tmp_path):
     data_dir = str(tmp_path)
     official_dir = os.path.join(data_dir, "comfy_templates_official")

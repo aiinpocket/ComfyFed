@@ -187,38 +187,32 @@ def _is_template_file(filename: str) -> bool:
     return True
 
 
-def _model_entries(data: dict):
-    """Every model-metadata dict in one workflow JSON, from both places the
-    format puts them.
+def _model_entries(data):
+    """Every model-metadata dict in one workflow JSON, wherever it hides.
 
-    The official library carries its download metadata per node, at
-    `nodes[].properties.models` -- that is what the frontend's
-    `getEmbeddedModels` reads and what all 550 workflow JSONs in
-    `comfyui-workflow-templates-json` actually use. A top-level `models`
-    list is also accepted so a hand-authored workflow that uses it is not
-    silently ignored; the two are simply chained.
+    The walk is fully recursive because the official library keeps model
+    metadata in more places than the documented ones: per node at
+    `nodes[].properties.models` for plain graphs, a top-level `models` list
+    in the schema, and inside `definitions.subgraphs[].nodes[].properties.
+    models` for subgraph-based workflows (`image_z_image_turbo` is one) --
+    live verification caught that last shape slipping through an
+    enumerating version of this walk. Mirror of the recursive strip in
+    `templates._strip_download_metadata`: any dict's `models` key whose
+    value is a list yields its dict entries.
     """
-    top_level = data.get("models")
-    if isinstance(top_level, list):
-        for entry in top_level:
-            if isinstance(entry, dict):
-                yield entry
-
-    nodes = data.get("nodes")
-    if not isinstance(nodes, list):
+    if isinstance(data, list):
+        for item in data:
+            yield from _model_entries(item)
         return
-    for node in nodes:
-        if not isinstance(node, dict):
-            continue
-        properties = node.get("properties")
-        if not isinstance(properties, dict):
-            continue
-        models = properties.get("models")
-        if not isinstance(models, list):
-            continue
-        for entry in models:
-            if isinstance(entry, dict):
-                yield entry
+    if not isinstance(data, dict):
+        return
+    for key, value in data.items():
+        if key == "models" and isinstance(value, list):
+            for entry in value:
+                if isinstance(entry, dict):
+                    yield entry
+        else:
+            yield from _model_entries(value)
 
 
 def harvest(data_dir: str) -> dict[str, dict]:
