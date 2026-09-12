@@ -147,8 +147,14 @@ def _queue_placement(comfy_url: str, prompt_id: str, client: httpx.Client) -> st
 
     Returns `"running"` (it is the prompt actually executing on the GPU),
     `"pending"` (queued behind other work), `"absent"` (on neither list --
-    it already finished, or was never accepted) or `"unknown"` (`/queue`
-    unreachable or shaped unexpectedly).
+    it already finished, was never accepted, or `/queue` answered in a shape
+    this cannot read) or `"unknown"` (`/queue` unreachable or non-2xx).
+
+    Note the split: only a `/queue` we could not *talk to* reports
+    `"unknown"` (whose caller falls back to `/interrupt`). A 200 we merely
+    could not interpret reports `"absent"`, i.e. do nothing -- guessing
+    `/interrupt` off an unreadable answer risks aborting an unrelated
+    prompt on a shared worker.
     """
     try:
         resp = client.get(f"{comfy_url.rstrip('/')}/queue")

@@ -312,6 +312,11 @@ class _JobHandle:
     cancel_event: asyncio.Event = field(default_factory=asyncio.Event)
     prompt_id: Optional[str] = None
     task: Optional[asyncio.Task] = None
+    # The prompt id ComfyUI has already been told to stop, so the wind-down
+    # re-check never fires a second `/interrupt` for a prompt the receive
+    # loop already handled -- on a shared worker that second call could land
+    # on somebody else's render.
+    interrupted_prompt_id: Optional[str] = None
 
     def set_prompt_id(self, prompt_id: str) -> None:
         # Called from `run_workflow`'s worker thread; a plain attribute
@@ -459,15 +464,17 @@ class AgentLoop:
                     {"filename": filename, "subfolder": subfolder} for filename, _content, subfolder in files
                 ]
 
-                # A cancel that lands between the run finishing and the
-                # upload starting still means the platform wants nothing:
-                # uploading artifacts for a cancelled job would push bytes
-                # the server will reject anyway.
-                raise_if_cancelled()
-
+                # The upload loop is the longest NETWORK phase of a job
+                # (minutes, for video), so the cancel event is re-read before
+                # every file and once more before reporting completion:
+                # uploading artifacts for a cancelled job pushes bytes the
+                # server rejects (its artifact gate wants assigned/running,
+                # and the job is `cancelled` by then).
                 for filename, content, _subfolder in files:
+                    raise_if_cancelled()
                     await self._upload_artifact(conn.entry, job_id, filename, content)
 
+                raise_if_cancelled()
                 await conn.send_job_done(
                     job_id, [filename for filename, _content, _subfolder in files], exec_seconds
                 )
@@ -479,9 +486,28 @@ class AgentLoop:
                 cancelled = True
                 logger.info("runner: job %s cancelled by the platform, aborting the run", job_id)
             except Exception as exc:
-                logger.exception("runner: job %s failed", job_id)
-                await conn.send_job_failed(job_id, str(exc))
+                if handle.cancel_event.is_set():
+                    # The failure IS the cancellation, seen from the wrong
+                    # end: a cancel landing mid-upload makes the server
+                    # reject the bytes, which surfaces here as an upload
+                    # error. Reporting job_failed for it would break the
+                    # "a cancelled run sends nothing" contract, and worse,
+                    # would select CleanupMode.FAILURE and leak the very
+                    # files cancel cleanup exists to remove. Every route out
+                    # of a cancelled run converges on the cancelled one.
+                    cancelled = True
+                    logger.info(
+                        "runner: job %s failed while already cancelled (%s), winding down as cancelled",
+                        job_id, exc,
+                    )
+                else:
+                    logger.exception("runner: job %s failed", job_id)
+                    await conn.send_job_failed(job_id, str(exc))
             finally:
+                if cancelled:
+                    # Last look at the prompt id: a cancel that raced the
+                    # `/prompt` POST had nothing to stop when it arrived.
+                    await self._stop_comfy_prompt(handle)
                 if cancelled:
                     mode = CleanupMode.CANCELLED
                 elif success:
@@ -500,6 +526,9 @@ class AgentLoop:
                     logger.exception("runner: job %s cleanup raised unexpectedly", job_id)
                 if self._jobs.get(job_id) is handle:
                     del self._jobs[job_id]
+                    if self._current_job_id == job_id:
+                        self._current_job_id = None
+                        self._current_job_task = None
                 await self.broadcast_heartbeat("idle", progress=0.0, job_id=None)
 
     async def _download_input(self, entry: PlatformEntry, job_id: str, filename: str) -> bytes:
@@ -605,23 +634,44 @@ class AgentLoop:
 
         logger.info("runner: platform cancelled job %s", job_id)
         handle.cancel_event.set()
+        await self._stop_comfy_prompt(handle)
 
+    async def _stop_comfy_prompt(self, handle: _JobHandle) -> None:
+        """Tell ComfyUI to stop this job's prompt, at most once per prompt.
+
+        Called from two places on purpose. The receive loop calls it the
+        instant a cancel arrives -- but the cancel can arrive while the
+        `/prompt` POST is still in flight, when there is no prompt id to
+        stop yet. `handle_job`'s wind-down therefore calls it again once the
+        run has actually unwound, by which point `on_prompt_id` has reported
+        whatever ComfyUI accepted. Without that second look the agent would
+        go idle while ComfyUI kept rendering a prompt nobody will collect.
+
+        `interrupted_prompt_id` makes the pair idempotent. It is checked and
+        set with no `await` between the two, so the two callers cannot both
+        get through on the same prompt.
+        """
         prompt_id = handle.prompt_id
         if prompt_id is None:
-            # Cancelled before ComfyUI ever accepted the prompt -- there is
-            # nothing running to interrupt; the event alone ends the job.
-            logger.debug("runner: job %s cancelled before submission, nothing to interrupt", job_id)
+            # Nothing has been submitted (yet): the cancel event alone ends
+            # the job, and the wind-down will look again.
+            logger.debug("runner: job %s has no ComfyUI prompt to stop (yet)", handle.job_id)
             return
+        if handle.interrupted_prompt_id == prompt_id:
+            return
+        handle.interrupted_prompt_id = prompt_id
 
         try:
             outcome = await asyncio.to_thread(
                 comfy.interrupt_or_dequeue, self.config.comfy_url, prompt_id
             )
-            logger.info("runner: job %s prompt %s -> %s", job_id, prompt_id, outcome)
+            logger.info("runner: job %s prompt %s -> %s", handle.job_id, prompt_id, outcome)
         except Exception:
             # The cancel event still stops us waiting on it, so a failure
             # here degrades to "ComfyUI finishes a run nobody collects".
-            logger.exception("runner: failed to stop ComfyUI prompt %s for job %s", prompt_id, job_id)
+            logger.exception(
+                "runner: failed to stop ComfyUI prompt %s for job %s", prompt_id, handle.job_id
+            )
 
     async def shutdown(self, timeout: float = 30.0) -> None:
         """Wind down every in-flight job task and wait for it.
@@ -635,8 +685,14 @@ class AgentLoop:
         joins it. Anything still alive after `timeout` is then cancelled
         outright.
         """
-        for handle in list(self._jobs.values()):
+        handles = list(self._jobs.values())
+        for handle in handles:
             handle.cancel_event.set()
+        # Stopping ourselves is not enough: an agent that exits while ComfyUI
+        # renders on would come back, advertise idle, and get dispatched work
+        # that then queues behind the ghost prompt of the job it abandoned.
+        for handle in handles:
+            await self._stop_comfy_prompt(handle)
 
         tasks = list(self._job_tasks)
         if tasks:

@@ -639,11 +639,12 @@ async def test_job_cancelled_mid_run_interrupts_cleans_up_and_reports_nothing(
     monkeypatch.setattr(comfy, "upload_input", lambda *a, **k: None)
 
     await loop._handle_message(conn_a, _job_message("job-cancel", ["ref.png"]))
+    task = loop._current_job_task
     await _await_flag(loop.test_started)
 
     # The receive loop is still free to process this while the job runs.
     await loop._handle_message(conn_a, {"type": "job_cancelled", "job_id": "job-cancel"})
-    await asyncio.wait_for(loop._current_job_task, timeout=10)
+    await asyncio.wait_for(task, timeout=10)
 
     assert loop.test_interrupts == [(loop.config.comfy_url, "p-slow")]
     assert conn_a.job_done is None, "a cancelled job must not report job_done"
@@ -680,16 +681,17 @@ async def test_job_cancelled_for_unknown_job_is_ignored_quietly(cancellable_loop
     conn_a = loop.connections["worker-a"]
 
     await loop._handle_message(conn_a, _job_message("job-live"))
+    task = loop._current_job_task
     await _await_flag(loop.test_started)
 
     await loop._handle_message(conn_a, {"type": "job_cancelled", "job_id": "some-other-job"})
 
     assert loop.test_interrupts == []
-    assert not loop._current_job_task.done(), "the running job must be untouched"
+    assert not task.done(), "the running job must be untouched"
 
     # Unwind.
     await loop._handle_message(conn_a, {"type": "job_cancelled", "job_id": "job-live"})
-    await asyncio.wait_for(loop._current_job_task, timeout=10)
+    await asyncio.wait_for(task, timeout=10)
 
 
 async def test_receipt_message_is_processed_while_a_job_is_running(cancellable_loop):
@@ -697,6 +699,7 @@ async def test_receipt_message_is_processed_while_a_job_is_running(cancellable_l
     conn_a = loop.connections["worker-a"]
 
     await loop._handle_message(conn_a, _job_message("job-concurrent"))
+    task = loop._current_job_task
     await _await_flag(loop.test_started)
 
     await loop._handle_message(conn_a, {"type": "receipt", "receipt_id": "r-1", "payload": "p"})
@@ -704,7 +707,7 @@ async def test_receipt_message_is_processed_while_a_job_is_running(cancellable_l
     assert conn_a.receipt_acks == [("r-1", "sig:p")]
 
     await loop._handle_message(conn_a, {"type": "job_cancelled", "job_id": "job-concurrent"})
-    await asyncio.wait_for(loop._current_job_task, timeout=10)
+    await asyncio.wait_for(task, timeout=10)
 
 
 async def test_normal_completion_through_the_spawned_task_is_unchanged(
@@ -723,7 +726,8 @@ async def test_normal_completion_through_the_spawned_task_is_unchanged(
     monkeypatch.setattr(AgentLoop, "_upload_artifact", lambda self, *a, **k: _noop_coro())
 
     await loop._handle_message(conn_a, _job_message("job-normal"))
-    await asyncio.wait_for(loop._current_job_task, timeout=10)
+    task = loop._current_job_task
+    await asyncio.wait_for(task, timeout=10)
 
     assert conn_a.job_done == ("job-normal", ["result.png"], 1.0)
     assert not out_file.exists()
@@ -742,3 +746,195 @@ async def test_shutdown_reaps_a_still_running_job_task(cancellable_loop):
 
     assert task.done()
     assert not loop._job_tasks
+
+
+# --- Cancels that land in the narrow windows (review M1 / M2) ---------------
+
+
+async def test_cancel_during_artifact_upload_winds_down_as_cancelled(
+    two_platform_loop, monkeypatch, tmp_path
+):
+    """A cancel landing while artifacts upload must NOT become a job_failed.
+
+    The server rejects the upload (the job is `cancelled`, the artifact gate
+    wants assigned/running), `_upload_artifact` raises, and the naive path
+    would report job_failed for a cancelled job AND pick CleanupMode.FAILURE,
+    leaking exactly the files cancel cleanup exists to remove.
+    """
+    loop = two_platform_loop
+    conn_a = loop.connections["worker-a"]
+
+    output_dir = tmp_path / "output"
+    input_dir = tmp_path / "input"
+    output_dir.mkdir()
+    input_dir.mkdir()
+    out_file = output_dir / "result.png"
+    out_file.write_bytes(b"x")
+    in_file = input_dir / "ref.png"
+    in_file.write_bytes(b"y")
+    loop.config.comfy_output_dir = str(output_dir)
+    loop.config.comfy_input_dir = str(input_dir)
+
+    monkeypatch.setattr(AgentLoop, "_download_input", lambda self, *a, **k: _bytes_coro(b"ref-bytes"))
+    monkeypatch.setattr(comfy, "upload_input", lambda *a, **k: None)
+    monkeypatch.setattr(comfy, "interrupt_or_dequeue", lambda *a, **k: "absent")
+    monkeypatch.setattr(
+        comfy, "run_workflow", lambda *a, **k: ([("result.png", b"bytes", "")], 1.0)
+    )
+
+    upload_started = asyncio.Event()
+    release = asyncio.Event()
+
+    async def _blocking_upload(self, entry, job_id, filename, content):
+        upload_started.set()
+        await release.wait()
+        raise RuntimeError("artifact upload failed")
+
+    monkeypatch.setattr(AgentLoop, "_upload_artifact", _blocking_upload)
+
+    await loop._handle_message(conn_a, _job_message("job-upload-cancel", ["ref.png"]))
+    task = loop._current_job_task
+    await asyncio.wait_for(upload_started.wait(), timeout=10)
+
+    await loop._handle_message(conn_a, {"type": "job_cancelled", "job_id": "job-upload-cancel"})
+    release.set()
+    await asyncio.wait_for(task, timeout=10)
+
+    assert conn_a.job_failed is None, "a cancelled job must not report job_failed"
+    assert conn_a.job_done is None
+    assert not out_file.exists(), "cancel cleanup must remove produced outputs"
+    assert not in_file.exists(), "cancel cleanup must remove staged inputs"
+    assert conn_a.heartbeats[-1]["state"] == "idle"
+
+
+async def test_cancel_during_artifact_upload_stops_before_the_next_file(
+    two_platform_loop, monkeypatch, tmp_path
+):
+    """Once cancelled, the upload loop must not keep pushing further files."""
+    loop = two_platform_loop
+    conn_a = loop.connections["worker-a"]
+
+    monkeypatch.setattr(comfy, "interrupt_or_dequeue", lambda *a, **k: "absent")
+    monkeypatch.setattr(
+        comfy,
+        "run_workflow",
+        lambda *a, **k: ([("a.png", b"a", ""), ("b.png", b"b", "")], 1.0),
+    )
+
+    uploaded: list[str] = []
+    first_upload = asyncio.Event()
+    release = asyncio.Event()
+
+    async def _record_upload(self, entry, job_id, filename, content):
+        if not uploaded:
+            uploaded.append(filename)
+            first_upload.set()
+            await release.wait()
+            return
+        uploaded.append(filename)
+
+    monkeypatch.setattr(AgentLoop, "_upload_artifact", _record_upload)
+
+    await loop._handle_message(conn_a, _job_message("job-upload-stop"))
+    task = loop._current_job_task
+    await asyncio.wait_for(first_upload.wait(), timeout=10)
+
+    await loop._handle_message(conn_a, {"type": "job_cancelled", "job_id": "job-upload-stop"})
+    release.set()
+    await asyncio.wait_for(task, timeout=10)
+
+    assert uploaded == ["a.png"], "the second artifact must not be uploaded after a cancel"
+    assert conn_a.job_done is None
+    assert conn_a.job_failed is None
+
+
+async def test_cancel_racing_prompt_submission_still_interrupts_comfyui(
+    two_platform_loop, monkeypatch
+):
+    """Cancel while `/prompt` is in flight: prompt_id appears only afterwards.
+
+    Taking "nothing to interrupt" and never revisiting would leave ComfyUI
+    rendering a ghost prompt while the agent advertises idle.
+    """
+    loop = two_platform_loop
+    conn_a = loop.connections["worker-a"]
+
+    interrupts: list[tuple[str, str]] = []
+    monkeypatch.setattr(
+        comfy,
+        "interrupt_or_dequeue",
+        lambda comfy_url, prompt_id, **k: (interrupts.append((comfy_url, prompt_id)), "interrupted")[1],
+    )
+
+    submitting = threading.Event()
+    cancel_sent = threading.Event()
+
+    def _run(*args, cancel_event=None, on_prompt_id=None, **kwargs):
+        # The /prompt POST is on the wire: ComfyUI will accept it, but no
+        # prompt_id has been reported back yet.
+        submitting.set()
+        if not cancel_sent.wait(10):  # pragma: no cover - test safety net
+            raise AssertionError("cancel was never sent")
+        on_prompt_id("p-late")
+        while not cancel_event.is_set():
+            time.sleep(0.01)
+        raise comfy.JobCancelled()
+
+    monkeypatch.setattr(comfy, "run_workflow", _run)
+
+    await loop._handle_message(conn_a, _job_message("job-race"))
+    task = loop._current_job_task
+    await _await_flag(submitting)
+
+    await loop._handle_message(conn_a, {"type": "job_cancelled", "job_id": "job-race"})
+    cancel_sent.set()
+    await asyncio.wait_for(task, timeout=10)
+
+    assert interrupts == [(loop.config.comfy_url, "p-late")]
+    assert conn_a.job_done is None
+    assert conn_a.job_failed is None
+    assert conn_a.heartbeats[-1]["state"] == "idle"
+
+
+async def test_shutdown_interrupts_the_in_flight_comfyui_prompt(cancellable_loop):
+    """Stopping the agent mid-run must not leave ComfyUI burning GPU."""
+    loop = cancellable_loop
+    conn_a = loop.connections["worker-a"]
+
+    await loop._handle_message(conn_a, _job_message("job-shutdown-interrupt"))
+    await _await_flag(loop.test_started)
+
+    await asyncio.wait_for(loop.shutdown(), timeout=10)
+
+    assert loop.test_interrupts == [(loop.config.comfy_url, "p-slow")]
+
+
+async def test_cancel_interrupts_comfyui_exactly_once(cancellable_loop):
+    """The wind-down re-check must not fire a second /interrupt for a prompt
+    the receive loop already stopped -- on a shared worker that second call
+    could land on somebody else's render."""
+    loop = cancellable_loop
+    conn_a = loop.connections["worker-a"]
+
+    await loop._handle_message(conn_a, _job_message("job-once"))
+    task = loop._current_job_task
+    await _await_flag(loop.test_started)
+    await loop._handle_message(conn_a, {"type": "job_cancelled", "job_id": "job-once"})
+    await asyncio.wait_for(task, timeout=10)
+
+    assert loop.test_interrupts == [(loop.config.comfy_url, "p-slow")]
+
+
+async def test_current_job_pointers_are_cleared_when_the_job_ends(two_platform_loop, monkeypatch):
+    loop = two_platform_loop
+    conn_a = loop.connections["worker-a"]
+
+    monkeypatch.setattr(comfy, "run_workflow", lambda *a, **k: ([], 1.0))
+
+    await loop._handle_message(conn_a, _job_message("job-pointer"))
+    task = loop._current_job_task
+    await asyncio.wait_for(task, timeout=10)
+
+    assert loop._current_job_id is None
+    assert loop._current_job_task is None
+    assert loop._jobs == {}
