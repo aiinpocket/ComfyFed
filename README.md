@@ -164,6 +164,19 @@ comfyfed-server fetch-comfy-ui --data-dir ./data
 - 還沒抓的時候，`/comfy` 會顯示一頁雙語說明，告訴你跑上面那行指令。
 - `/comfy` 跟它的靜態檔都要**管理員 session**，沒登入一律導回 `/`（Console 登入頁）。
 
+**再抓一次官方範本庫**（選用，但建議）：前端的 wheel 只有介面，不含 ComfyUI 官方那一整包起手式工作流。要的話再跑一行：
+
+```bash
+comfyfed-server fetch-comfy-templates --data-dir ./data
+```
+
+這會從 PyPI 讀 `comfyui-workflow-templates` 這個 meta 套件的相依，抓出對應版本的 `-json` 與 `-media-*` 子套件 wheel（每個都先比對 PyPI 自己回報的 sha256 才解壓），把裡面的 `templates/` 攤平到 `<data-dir>/comfy_templates_official/`。一次大約 **475 MB**，解出來約 105 MB，請留好硬碟空間與時間。
+
+- `--version X` 可以指定別的 release，預設抓 PyPI 上最新的。
+- 抓完**要重啟伺服器**（範本目錄在啟動時才會被讀到）。之後範本瀏覽器的側邊欄就會是「ComfyFed 自己的分類在前、官方分類在後」。
+- 沒跑這行也不會壞：範本瀏覽器照樣開得起來，只是裡面只有 ComfyFed 內建的三支範本。
+- 官方範本 JSON 送到瀏覽器之前，平台會**拿掉模型的下載網址與雜湊**。那些「Download」按鈕在單機 ComfyUI 是下載到跑圖的機器上，在 ComfyFed 卻是下載到**你自己的筆電**，對聯邦一點用都沒有。真的缺模型的時候，按下 Run 會被擋下來並附上「該去哪台 worker 放哪個檔」的中文指引。
+
 抓完之後，登入 Console →「工作」頁，按主要按鈕「**開啟工作流編輯器**」就會在新分頁打開。原本貼 API JSON 的表單還在，收進同一頁的「改用貼上 API JSON」摺疊區。
 
 ⚠ **編輯器裡至少要有一台 worker 在線才會出現節點**：節點清單不是平台自己編的，而是所有**在線且未停用** worker 回報的 `/object_info` 聯集。全部離線的話節點面板會是空的——這是正常的，不是壞掉。
@@ -172,7 +185,7 @@ comfyfed-server fetch-comfy-ui --data-dir ./data
 
 ⚠ **編輯器上方工具列有幾顆按鈕沒有後端**：**取消／中斷（Cancel、Interrupt）、清空佇列（Clear queue）、刪除歷史紀錄**這些動作在 ComfyFed 上都沒有對應的 API，按下去只會拿到 404。Phase 1.5 的相容層是唯讀的佇列與歷史：工作一旦送出就只能等它跑完或失敗。要停掉一個工作，目前得從 Console 或直接改資料庫處理。
 
-目前的相容層只做到「拉圖 → 送工作 → 看結果」這條主線。編輯器裡幾個依賴單機 ComfyUI 的功能不會動：**存工作流到伺服器、Manager／自訂節點擴充、模型清單瀏覽**（模型在各個 worker 上，平台自己沒有）。工作流請用瀏覽器的匯出／匯入，或用 Console 的「貼上 API JSON」。編輯器的介面偏好（主題等）會存在 `<data-dir>/comfy_settings.json`。範本瀏覽器則是通的，只是裡面裝的是 ComfyFed 自己的範本（見下一節），不是 ComfyUI 官方那一整包。
+目前的相容層只做到「拉圖 → 送工作 → 看結果」這條主線。編輯器裡幾個依賴單機 ComfyUI 的功能不會動：**存工作流到伺服器、Manager／自訂節點擴充、模型清單瀏覽**（模型在各個 worker 上，平台自己沒有）。工作流請用瀏覽器的匯出／匯入，或用 Console 的「貼上 API JSON」。編輯器的介面偏好（主題等）會存在 `<data-dir>/comfy_settings.json`。範本瀏覽器則是通的：預設裝的是 ComfyFed 自己的範本（見下一節），跑過 `fetch-comfy-templates` 之後，ComfyUI 官方那一整包也會併進同一個側邊欄。
 
 **跟自備 ComfyUI 的關係**：兩者不衝突，是兩個入口。內嵌編輯器是「我沒有 ComfyUI，或懶得開」的路；如果你本機已經有 ComfyUI，照樣可以在自己那邊拉好工作流、用「Save (API format)」匯出，再貼進 Console 送出。真正跑圖的一律是聯邦裡的 worker（也就是各成員自己的 ComfyUI），平台本身不裝 ComfyUI、也不跑推論——`/comfy` 只是一層把官方前端的動作翻譯成聯邦工作的相容 API。
 
@@ -198,19 +211,19 @@ comfyfed-server fetch-comfy-ui --data-dir ./data
 
 ### 模型下載
 
-全新安裝的 worker 沒有任何模型檔，範本等於是廢的。模型太大不會進 git，改放 Cloudflare R2 公開鏡像，目錄結構鏡射 ComfyUI 的 `models/` 資料夾——下載後照「放置路徑」欄放進 worker 的 `ComfyUI/models/` 底下對應子資料夾即可。
+全新安裝的 worker 沒有任何模型檔，範本等於是廢的。模型太大不會進 git，所以下面每個檔案都給兩條路：**官方載點**（HuggingFace 原始出處，優先用這條）與 **備份載點**（我們自己的 GCS 公開鏡像 `https://storage.googleapis.com/comfyfed-models/models/`，目錄結構鏡射 ComfyUI 的 `models/` 資料夾，官方站掛掉或要登入時的退路）。下載後照「放置路徑」欄放進 worker 的 `ComfyUI/models/` 底下對應子資料夾即可。
 
-| 檔案 | 大小 | 放置路徑 | 下載 |
-| --- | --- | --- | --- |
-| `flux1-dev.safetensors` | 22.17 GB | `models/diffusion_models/` | [R2](https://models.aiinpocket.com/models/diffusion_models/flux1-dev.safetensors) |
-| `clip_l.safetensors` | 0.23 GB | `models/text_encoders/` | [R2](https://models.aiinpocket.com/models/text_encoders/clip_l.safetensors) |
-| `t5xxl_fp16.safetensors` | 9.12 GB | `models/text_encoders/` | [R2](https://models.aiinpocket.com/models/text_encoders/t5xxl_fp16.safetensors) |
-| `ae.safetensors` | 0.31 GB | `models/vae/` | [R2](https://models.aiinpocket.com/models/vae/ae.safetensors) |
-| `minimax_h3_ref2va_pruned_int8_convrot.safetensors` | 19.53 GB | `models/diffusion_models/` | [R2](https://models.aiinpocket.com/models/diffusion_models/minimax_h3_ref2va_pruned_int8_convrot.safetensors) |
-| `qwen3vl_32b_heretic_minimax_h3_nvfp4.safetensors` | 14.61 GB | `models/text_encoders/` | [R2](https://models.aiinpocket.com/models/text_encoders/qwen3vl_32b_heretic_minimax_h3_nvfp4.safetensors) |
-| `minimax_h3_video_vae_fp16.safetensors` | 4.85 GB | `models/vae/` | [R2](https://models.aiinpocket.com/models/vae/minimax_h3_video_vae_fp16.safetensors) |
-| `minimax_h3_audio_vae_fp32.safetensors` | 0.56 GB | `models/vae/` | [R2](https://models.aiinpocket.com/models/vae/minimax_h3_audio_vae_fp32.safetensors) |
-| `minimax_h3_ref2v_turbo_8step_v1.0_768p_comfyui_resized_avg_rank_64_bf16.safetensors` | 0.91 GB | `models/loras/` | [R2](https://models.aiinpocket.com/models/loras/minimax_h3_ref2v_turbo_8step_v1.0_768p_comfyui_resized_avg_rank_64_bf16.safetensors) |
+| 檔案 | 大小 | 放置路徑 | 官方載點 | 備份載點 |
+| --- | --- | --- | --- | --- |
+| `flux1-dev.safetensors` | 22.17 GB | `models/diffusion_models/` | [官方](https://huggingface.co/black-forest-labs/FLUX.1-dev/resolve/main/flux1-dev.safetensors)（需登入 HuggingFace 並同意 FLUX.1-dev 授權） | [備份](https://storage.googleapis.com/comfyfed-models/models/diffusion_models/flux1-dev.safetensors) |
+| `clip_l.safetensors` | 0.23 GB | `models/text_encoders/` | [官方](https://huggingface.co/comfyanonymous/flux_text_encoders/resolve/main/clip_l.safetensors) | [備份](https://storage.googleapis.com/comfyfed-models/models/text_encoders/clip_l.safetensors) |
+| `t5xxl_fp16.safetensors` | 9.12 GB | `models/text_encoders/` | [官方](https://huggingface.co/comfyanonymous/flux_text_encoders/resolve/main/t5xxl_fp16.safetensors) | [備份](https://storage.googleapis.com/comfyfed-models/models/text_encoders/t5xxl_fp16.safetensors) |
+| `ae.safetensors` | 0.31 GB | `models/vae/` | [官方](https://huggingface.co/black-forest-labs/FLUX.1-dev/resolve/main/ae.safetensors)（需登入 HuggingFace 並同意 FLUX.1-dev 授權） | [備份](https://storage.googleapis.com/comfyfed-models/models/vae/ae.safetensors) |
+| `minimax_h3_ref2va_pruned_int8_convrot.safetensors` | 19.53 GB | `models/diffusion_models/` | [官方](https://huggingface.co/Comfy-Org/MiniMax-H3/resolve/main/diffusion_models/minimax_h3_ref2va_pruned_int8_convrot.safetensors) | [備份](https://storage.googleapis.com/comfyfed-models/models/diffusion_models/minimax_h3_ref2va_pruned_int8_convrot.safetensors) |
+| `qwen3vl_32b_heretic_minimax_h3_nvfp4.safetensors` | 14.61 GB | `models/text_encoders/` | [官方](https://huggingface.co/sakamakismile/Qwen3-VL-32B-Heretic-MiniMax-H3-NVFP4/resolve/main/qwen3vl_32b_heretic_minimax_h3_nvfp4.safetensors) | [備份](https://storage.googleapis.com/comfyfed-models/models/text_encoders/qwen3vl_32b_heretic_minimax_h3_nvfp4.safetensors) |
+| `minimax_h3_video_vae_fp16.safetensors` | 4.85 GB | `models/vae/` | [官方](https://huggingface.co/Comfy-Org/MiniMax-H3/resolve/main/vae/minimax_h3_video_vae_fp16.safetensors) | [備份](https://storage.googleapis.com/comfyfed-models/models/vae/minimax_h3_video_vae_fp16.safetensors) |
+| `minimax_h3_audio_vae_fp32.safetensors` | 0.56 GB | `models/vae/` | [官方](https://huggingface.co/Comfy-Org/MiniMax-H3/resolve/main/vae/minimax_h3_audio_vae_fp32.safetensors) | [備份](https://storage.googleapis.com/comfyfed-models/models/vae/minimax_h3_audio_vae_fp32.safetensors) |
+| `minimax_h3_ref2v_turbo_8step_v1.0_768p_comfyui_resized_avg_rank_64_bf16.safetensors` | 0.91 GB | `models/loras/` | [官方](https://huggingface.co/drbaph/MiniMax-H3-Turbo-Lora-ComfyUI/resolve/main/minimax_h3_ref2v_turbo_8step_v1.0_768p_comfyui_resized_avg_rank_64_bf16.safetensors) | [備份](https://storage.googleapis.com/comfyfed-models/models/loras/minimax_h3_ref2v_turbo_8step_v1.0_768p_comfyui_resized_avg_rank_64_bf16.safetensors) |
 
 全部裝齊約 **72 GB**；只跑武俠文生圖／角色立繪兩支 Flux 範本約 **31.8 GB**，只跑參考圖生影片約 **40.5 GB**。每支範本的畫布上也有一則「⓪ 缺模型？」便條紙，列出該範本自己需要哪幾個檔案。
 
@@ -428,6 +441,34 @@ server** afterwards so `/comfy` gets mounted.
 - `/comfy` and all of its assets require an **admin session**; without one you
   are redirected to `/` (the console login).
 
+**Then fetch the official template library** (optional, but recommended): the
+frontend wheel is just the UI — it does not carry ComfyUI's official starter
+workflows. One more command:
+
+```bash
+comfyfed-server fetch-comfy-templates --data-dir ./data
+```
+
+That reads the `comfyui-workflow-templates` meta package's dependencies on
+PyPI, downloads the matching `-json` and `-media-*` sub-package wheels (each
+verified against the sha256 PyPI itself reports before anything is extracted)
+and flattens their `templates/` trees into
+`<data-dir>/comfy_templates_official/`. Budget roughly **475 MB** of download
+for ~105 MB on disk, and a few minutes.
+
+- `--version X` fetches a specific release; the default is the newest on PyPI.
+- **Restart the server** afterwards — the library is picked up at startup.
+  The template browser's sidebar then lists ComfyFed's own categories first
+  and the official ones after them.
+- Skipping this breaks nothing: the browser still opens, it just contains
+  only ComfyFed's three built-in templates.
+- Official template JSONs have their **model download URLs and hashes
+  stripped** before they reach the browser. Those "Download" buttons fetch to
+  the machine running the browser, which on a stock ComfyUI is the machine
+  running the graph and here is **your laptop** — useless to the federation.
+  When a model really is missing, pressing Run is refused with zh-TW
+  guidance naming the file and the worker folder it belongs in.
+
 Once it's there, log into the console, go to **Jobs**, and hit the primary
 **Open workflow editor** button — it opens in a new tab. The old paste-the-API-JSON
 form is still on that page, tucked into the "Paste API JSON instead" section.
@@ -459,9 +500,10 @@ do not work — **saving workflows to the server, Manager / custom-node
 extensions, and model browsing** (models live on the workers; the platform has
 none). Export/import workflows through the browser instead, or paste the API
 JSON into the console. Editor UI preferences (theme and so on) persist to
-`<data-dir>/comfy_settings.json`. The template browser *does* work, but it is
-stocked with ComfyFed's own templates (next section) rather than ComfyUI's
-upstream gallery.
+`<data-dir>/comfy_settings.json`. The template browser *does* work: out of
+the box it is stocked with ComfyFed's own templates (next section), and once
+you have run `fetch-comfy-templates` ComfyUI's upstream gallery is merged into
+the same sidebar.
 
 **How this relates to bringing your own ComfyUI**: they are two doors into the
 same federation, not alternatives. The embedded editor is for "I don't have
@@ -514,22 +556,25 @@ in the queue; the Jobs page's ineligibility reasons say what is missing.
 ### Model downloads
 
 A fresh worker has none of these files, which makes the templates dead on
-arrival. They are too large for git, so they are mirrored on a public
-Cloudflare R2 bucket whose layout mirrors ComfyUI's `models/` directory —
-download a file and drop it under the matching subfolder of the worker's
-`ComfyUI/models/`.
+arrival. They are too large for git, so every file below comes with two
+links: the **official** one (its HuggingFace home — prefer this), and a
+**backup** on our public GCS mirror at
+`https://storage.googleapis.com/comfyfed-models/models/`, whose layout
+mirrors ComfyUI's `models/` directory and which is there for when the
+official source is down or gated. Download a file and drop it under the
+matching subfolder of the worker's `ComfyUI/models/`.
 
-| File | Size | Target path | Download |
-| --- | --- | --- | --- |
-| `flux1-dev.safetensors` | 22.17 GB | `models/diffusion_models/` | [R2](https://models.aiinpocket.com/models/diffusion_models/flux1-dev.safetensors) |
-| `clip_l.safetensors` | 0.23 GB | `models/text_encoders/` | [R2](https://models.aiinpocket.com/models/text_encoders/clip_l.safetensors) |
-| `t5xxl_fp16.safetensors` | 9.12 GB | `models/text_encoders/` | [R2](https://models.aiinpocket.com/models/text_encoders/t5xxl_fp16.safetensors) |
-| `ae.safetensors` | 0.31 GB | `models/vae/` | [R2](https://models.aiinpocket.com/models/vae/ae.safetensors) |
-| `minimax_h3_ref2va_pruned_int8_convrot.safetensors` | 19.53 GB | `models/diffusion_models/` | [R2](https://models.aiinpocket.com/models/diffusion_models/minimax_h3_ref2va_pruned_int8_convrot.safetensors) |
-| `qwen3vl_32b_heretic_minimax_h3_nvfp4.safetensors` | 14.61 GB | `models/text_encoders/` | [R2](https://models.aiinpocket.com/models/text_encoders/qwen3vl_32b_heretic_minimax_h3_nvfp4.safetensors) |
-| `minimax_h3_video_vae_fp16.safetensors` | 4.85 GB | `models/vae/` | [R2](https://models.aiinpocket.com/models/vae/minimax_h3_video_vae_fp16.safetensors) |
-| `minimax_h3_audio_vae_fp32.safetensors` | 0.56 GB | `models/vae/` | [R2](https://models.aiinpocket.com/models/vae/minimax_h3_audio_vae_fp32.safetensors) |
-| `minimax_h3_ref2v_turbo_8step_v1.0_768p_comfyui_resized_avg_rank_64_bf16.safetensors` | 0.91 GB | `models/loras/` | [R2](https://models.aiinpocket.com/models/loras/minimax_h3_ref2v_turbo_8step_v1.0_768p_comfyui_resized_avg_rank_64_bf16.safetensors) |
+| File | Size | Target path | Official | Backup |
+| --- | --- | --- | --- | --- |
+| `flux1-dev.safetensors` | 22.17 GB | `models/diffusion_models/` | [Official](https://huggingface.co/black-forest-labs/FLUX.1-dev/resolve/main/flux1-dev.safetensors) (requires HuggingFace login + accepting the FLUX.1-dev license) | [Backup](https://storage.googleapis.com/comfyfed-models/models/diffusion_models/flux1-dev.safetensors) |
+| `clip_l.safetensors` | 0.23 GB | `models/text_encoders/` | [Official](https://huggingface.co/comfyanonymous/flux_text_encoders/resolve/main/clip_l.safetensors) | [Backup](https://storage.googleapis.com/comfyfed-models/models/text_encoders/clip_l.safetensors) |
+| `t5xxl_fp16.safetensors` | 9.12 GB | `models/text_encoders/` | [Official](https://huggingface.co/comfyanonymous/flux_text_encoders/resolve/main/t5xxl_fp16.safetensors) | [Backup](https://storage.googleapis.com/comfyfed-models/models/text_encoders/t5xxl_fp16.safetensors) |
+| `ae.safetensors` | 0.31 GB | `models/vae/` | [Official](https://huggingface.co/black-forest-labs/FLUX.1-dev/resolve/main/ae.safetensors) (requires HuggingFace login + accepting the FLUX.1-dev license) | [Backup](https://storage.googleapis.com/comfyfed-models/models/vae/ae.safetensors) |
+| `minimax_h3_ref2va_pruned_int8_convrot.safetensors` | 19.53 GB | `models/diffusion_models/` | [Official](https://huggingface.co/Comfy-Org/MiniMax-H3/resolve/main/diffusion_models/minimax_h3_ref2va_pruned_int8_convrot.safetensors) | [Backup](https://storage.googleapis.com/comfyfed-models/models/diffusion_models/minimax_h3_ref2va_pruned_int8_convrot.safetensors) |
+| `qwen3vl_32b_heretic_minimax_h3_nvfp4.safetensors` | 14.61 GB | `models/text_encoders/` | [Official](https://huggingface.co/sakamakismile/Qwen3-VL-32B-Heretic-MiniMax-H3-NVFP4/resolve/main/qwen3vl_32b_heretic_minimax_h3_nvfp4.safetensors) | [Backup](https://storage.googleapis.com/comfyfed-models/models/text_encoders/qwen3vl_32b_heretic_minimax_h3_nvfp4.safetensors) |
+| `minimax_h3_video_vae_fp16.safetensors` | 4.85 GB | `models/vae/` | [Official](https://huggingface.co/Comfy-Org/MiniMax-H3/resolve/main/vae/minimax_h3_video_vae_fp16.safetensors) | [Backup](https://storage.googleapis.com/comfyfed-models/models/vae/minimax_h3_video_vae_fp16.safetensors) |
+| `minimax_h3_audio_vae_fp32.safetensors` | 0.56 GB | `models/vae/` | [Official](https://huggingface.co/Comfy-Org/MiniMax-H3/resolve/main/vae/minimax_h3_audio_vae_fp32.safetensors) | [Backup](https://storage.googleapis.com/comfyfed-models/models/vae/minimax_h3_audio_vae_fp32.safetensors) |
+| `minimax_h3_ref2v_turbo_8step_v1.0_768p_comfyui_resized_avg_rank_64_bf16.safetensors` | 0.91 GB | `models/loras/` | [Official](https://huggingface.co/drbaph/MiniMax-H3-Turbo-Lora-ComfyUI/resolve/main/minimax_h3_ref2v_turbo_8step_v1.0_768p_comfyui_resized_avg_rank_64_bf16.safetensors) | [Backup](https://storage.googleapis.com/comfyfed-models/models/loras/minimax_h3_ref2v_turbo_8step_v1.0_768p_comfyui_resized_avg_rank_64_bf16.safetensors) |
 
 Everything together is about **72 GB**; the two Flux templates (wuxia,
 character portrait) need about **31.8 GB**; the reference-to-video template

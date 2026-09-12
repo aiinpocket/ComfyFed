@@ -15,32 +15,174 @@ import pytest
 from fastapi.testclient import TestClient
 
 from comfyfed_server import app as app_module
-from comfyfed_server import bootstrap, comfyapi, db, templates
+from comfyfed_server import bootstrap, comfyapi, db, official_templates, templates
 
-# Task 8: the R2 model mirror. This is the single ground truth the anti-drift
-# tests below check everything against -- every model filename the packaged
-# workflow JSONs reference, and every download link in the "Missing models?"
-# notes and the README, must trace back to one of these entries.
-R2_MODEL_BASE = "https://models.aiinpocket.com/models/"
-MODEL_INVENTORY = {
-    "flux1-dev.safetensors",
-    "clip_l.safetensors",
-    "t5xxl_fp16.safetensors",
-    "ae.safetensors",
-    "minimax_h3_ref2va_pruned_int8_convrot.safetensors",
-    "qwen3vl_32b_heretic_minimax_h3_nvfp4.safetensors",
-    "minimax_h3_video_vae_fp16.safetensors",
-    "minimax_h3_audio_vae_fp32.safetensors",
-    "minimax_h3_ref2v_turbo_8step_v1.0_768p_comfyui_resized_avg_rank_64_bf16.safetensors",
+# Task 5: dual official/GCS-backup links. This is the single ground truth the
+# anti-drift tests below check everything against -- every model filename the
+# packaged workflow JSONs reference, and every download link in the "Missing
+# models?" notes and the README, must trace back to one of these entries.
+# The old Cloudflare R2 mirror (models.aiinpocket.com) is decommissioned;
+# every mention of it anywhere under server/ or docs/ must be gone.
+GCS_MODEL_BASE = "https://storage.googleapis.com/comfyfed-models/models/"
+DECOMMISSIONED_MIRROR_DOMAIN = "models.aiinpocket.com"
+MODEL_SOURCES = {
+    "flux1-dev.safetensors": {
+        "dir": "diffusion_models",
+        "official": "https://huggingface.co/black-forest-labs/FLUX.1-dev/resolve/main/flux1-dev.safetensors",
+        "gated": True,
+    },
+    "clip_l.safetensors": {
+        "dir": "text_encoders",
+        "official": "https://huggingface.co/comfyanonymous/flux_text_encoders/resolve/main/clip_l.safetensors",
+        "gated": False,
+    },
+    "t5xxl_fp16.safetensors": {
+        "dir": "text_encoders",
+        "official": "https://huggingface.co/comfyanonymous/flux_text_encoders/resolve/main/t5xxl_fp16.safetensors",
+        "gated": False,
+    },
+    "ae.safetensors": {
+        "dir": "vae",
+        "official": "https://huggingface.co/black-forest-labs/FLUX.1-dev/resolve/main/ae.safetensors",
+        "gated": True,
+    },
+    "minimax_h3_ref2va_pruned_int8_convrot.safetensors": {
+        "dir": "diffusion_models",
+        "official": "https://huggingface.co/Comfy-Org/MiniMax-H3/resolve/main/diffusion_models/minimax_h3_ref2va_pruned_int8_convrot.safetensors",
+        "gated": False,
+    },
+    "qwen3vl_32b_heretic_minimax_h3_nvfp4.safetensors": {
+        "dir": "text_encoders",
+        "official": "https://huggingface.co/sakamakismile/Qwen3-VL-32B-Heretic-MiniMax-H3-NVFP4/resolve/main/qwen3vl_32b_heretic_minimax_h3_nvfp4.safetensors",
+        "gated": False,
+    },
+    "minimax_h3_video_vae_fp16.safetensors": {
+        "dir": "vae",
+        "official": "https://huggingface.co/Comfy-Org/MiniMax-H3/resolve/main/vae/minimax_h3_video_vae_fp16.safetensors",
+        "gated": False,
+    },
+    "minimax_h3_audio_vae_fp32.safetensors": {
+        "dir": "vae",
+        "official": "https://huggingface.co/Comfy-Org/MiniMax-H3/resolve/main/vae/minimax_h3_audio_vae_fp32.safetensors",
+        "gated": False,
+    },
+    "minimax_h3_ref2v_turbo_8step_v1.0_768p_comfyui_resized_avg_rank_64_bf16.safetensors": {
+        "dir": "loras",
+        "official": "https://huggingface.co/drbaph/MiniMax-H3-Turbo-Lora-ComfyUI/resolve/main/minimax_h3_ref2v_turbo_8step_v1.0_768p_comfyui_resized_avg_rank_64_bf16.safetensors",
+        "gated": False,
+    },
 }
+MODEL_INVENTORY = set(MODEL_SOURCES)
+FLUX_GATED_CAVEAT = "（需登入 HuggingFace 並同意 FLUX.1-dev 授權）"
 MISSING_MODELS_NOTE_TITLE = "⓪ 缺模型？/ Missing models?"
 
-_R2_URL_RE = re.compile(re.escape(R2_MODEL_BASE) + r"\S+")
+
+def _backup_url(name):
+    return GCS_MODEL_BASE + MODEL_SOURCES[name]["dir"] + "/" + name
 
 
-def _r2_urls_in(text):
+# A model link, i.e. the mirror base plus at least one path character. URL
+# characters only, so prose that quotes the bare base in backticks (the
+# README's "the mirror lives at `<base>/`" sentences) is not mistaken for a
+# link to a file called 「，目錄結構…」.
+_GCS_URL_RE = re.compile(re.escape(GCS_MODEL_BASE) + r"[A-Za-z0-9._/~%+-]+")
+
+
+def _gcs_urls_in(text):
     # Trailing markdown/punctuation (`)`, `.`, etc.) never belongs to the URL.
-    return [u.rstrip(").,;。）") for u in _R2_URL_RE.findall(text)]
+    return [u.rstrip(").,;。）") for u in _GCS_URL_RE.findall(text)]
+
+
+def _repo_root():
+    return os.path.normpath(os.path.join(os.path.dirname(__file__), "..", ".."))
+
+
+# Trees that hold no shipped prose: build artifacts, VCS metadata, review
+# notes (which legitimately quote the decommissioned domain when recording
+# that it WAS decommissioned), and anything not under version control.
+_UNSCANNED_DIRS = {
+    ".git",
+    ".venv",
+    "venv",
+    "node_modules",
+    "__pycache__",
+    ".pytest_cache",
+    ".mypy_cache",
+    "build",
+    "dist",
+    ".superpowers",
+    ".egg-info",
+}
+
+
+def _iter_repo_text_files(*subdirs):
+    """Every readable text file in the repo, or only under `subdirs`."""
+    roots = [os.path.join(_repo_root(), s) for s in subdirs] or [_repo_root()]
+    for root in roots:
+        for dirpath, dirnames, filenames in os.walk(root):
+            dirnames[:] = [
+                d for d in dirnames
+                if d not in _UNSCANNED_DIRS and not d.endswith(".egg-info")
+            ]
+            for filename in filenames:
+                path = os.path.join(dirpath, filename)
+                try:
+                    with open(path, encoding="utf-8") as f:
+                        yield path, f.read()
+                except (UnicodeDecodeError, OSError):
+                    continue
+
+
+def test_decommissioned_mirror_domain_appears_nowhere_in_the_repo():
+    """The old Cloudflare R2 mirror's domain is gone from every shipped tree.
+
+    Widened past `server/` + `docs/` after the branch's README kept pointing
+    at the dead bucket while the tables underneath already said GCS: the
+    README lives at the repo root and was never scanned.
+    """
+    tests_root = os.path.join(_repo_root(), "tests") + os.sep
+    offenders = [
+        path
+        for path, text in _iter_repo_text_files()
+        # The test suite itself has to spell the domain out in order to guard
+        # against it; everything else is shipped material.
+        if DECOMMISSIONED_MIRROR_DOMAIN in text and not path.startswith(tests_root)
+    ]
+    assert not offenders, offenders
+
+
+# "R2" alone is a false-positive magnet: the README's roadmap legitimately
+# names Cloudflare R2 as a possible future artifact store, which is not a
+# claim about today's model mirror. So the guard is scoped to the sections
+# that actually describe the mirror -- the two 模型下載 / "Model downloads"
+# headings -- where any mention of R2 is by definition the stale prose.
+_MODEL_SECTION_HEADINGS = ("### 模型下載", "### Model downloads")
+
+
+def _readme_text():
+    with open(os.path.join(_repo_root(), "README.md"), encoding="utf-8") as f:
+        return f.read()
+
+
+def _readme_sections(text, headings):
+    for heading in headings:
+        start = text.index(heading)
+        end = text.find("\n## ", start)
+        next_sub = text.find("\n### ", start + len(heading))
+        if next_sub != -1 and (end == -1 or next_sub < end):
+            end = next_sub
+        yield heading, text[start : end if end != -1 else len(text)]
+
+
+def test_readme_model_download_sections_do_not_name_the_dead_r2_mirror():
+    for heading, section in _readme_sections(_readme_text(), _MODEL_SECTION_HEADINGS):
+        assert "R2" not in section, heading
+        assert "Cloudflare" not in section, heading
+
+
+def test_readme_model_download_sections_describe_the_gcs_mirror():
+    for heading, section in _readme_sections(_readme_text(), _MODEL_SECTION_HEADINGS):
+        assert "storage.googleapis.com/comfyfed-models" in section, heading
 
 
 @pytest.fixture()
@@ -373,13 +515,255 @@ def test_missing_models_note_mentions_every_model_the_graph_actually_uses(name):
 
 
 @pytest.mark.parametrize("name", templates.TEMPLATE_NAMES)
-def test_missing_models_note_links_are_valid_r2_urls(name):
+def test_missing_models_note_links_are_dual_official_and_gcs_backup(name):
     note_text = _missing_models_note_text(name)
-    urls = _r2_urls_in(note_text)
-    assert urls, f"{name}'s missing-models note has no R2 links"
+
+    urls = _gcs_urls_in(note_text)
+    assert urls, f"{name}'s missing-models note has no GCS backup links"
     for url in urls:
-        assert url.startswith(R2_MODEL_BASE), url
+        assert url.startswith(GCS_MODEL_BASE), url
         assert url.rsplit("/", 1)[-1] in MODEL_INVENTORY, url
+
+    referenced = {
+        filename for filename in MODEL_INVENTORY if filename in note_text
+    }
+    assert referenced, f"{name}'s missing-models note references no curated model"
+
+    for filename in referenced:
+        source = MODEL_SOURCES[filename]
+        assert f"官方載點：{source['official']}" in note_text, (name, filename)
+        assert f"備份載點：{_backup_url(filename)}" in note_text, (name, filename)
+        if source["gated"]:
+            assert f"官方載點：{source['official']}{FLUX_GATED_CAVEAT}" in note_text, (name, filename)
+
+
+# --- Task 2: merged official template library --------------------------
+
+
+_FLUX_CATEGORY = {
+    "moduleName": "default",
+    "title": "Flux",
+    "templates": [{"name": "flux_dev", "mediaType": "image", "mediaSubtype": "webp"}],
+}
+
+# The shape the REAL official library uses: download metadata hangs off each
+# node's `properties.models`, never a top-level `models` key. Verified against
+# every one of the 550 workflow JSONs in `comfyui-workflow-templates-json`
+# 0.1.74 (287 model-bearing nodes, 0 top-level `models` lists) and against the
+# pinned frontend bundle, whose `getEmbeddedModels(node)` reads exactly
+# `node.properties?.models` before `hasDownloadMetadata` decides whether to
+# render a Download button.
+_FLUX_WORKFLOW = {
+    "id": "flux_dev",
+    "revision": 0,
+    "last_node_id": 2,
+    "nodes": [
+        {
+            "id": 1,
+            "type": "UNETLoader",
+            "pos": [0, 0],
+            "properties": {
+                "Node name for S&R": "UNETLoader",
+                "models": [
+                    {
+                        "name": "flux1-dev.safetensors",
+                        "url": "https://huggingface.co/black-forest-labs/FLUX.1-dev/resolve/main/flux1-dev.safetensors",
+                        "directory": "diffusion_models",
+                        "hash": "h",
+                        "hash_type": "SHA256",
+                    }
+                ],
+            },
+            "widgets_values": ["flux1-dev.safetensors", "default"],
+        },
+        {
+            "id": 2,
+            "type": "SaveImage",
+            "pos": [400, 0],
+            "properties": {"Node name for S&R": "SaveImage"},
+            "widgets_values": ["ComfyUI"],
+        },
+    ],
+    "links": [],
+    "version": 0.4,
+}
+
+# A workflow using the top-level `models` key instead. The official library
+# does not emit this shape, but stripping covers it as a superset, and a
+# hand-authored workflow could.
+_TOP_LEVEL_MODELS_WORKFLOW = {
+    "version": 0.4,
+    "nodes": [],
+    "links": [],
+    "models": [
+        {
+            "name": "ae.safetensors",
+            "url": "https://x/y",
+            "directory": "vae",
+            "hash": "h",
+            "hash_type": "SHA256",
+        }
+    ],
+}
+
+
+def _seed_official_dir(data_dir, *, index_extra=None, localized=None, logo=None):
+    official_dir = official_templates.official_dir(data_dir)
+    os.makedirs(official_dir, exist_ok=True)
+    with open(os.path.join(official_dir, "index.json"), "w", encoding="utf-8") as f:
+        json.dump([_FLUX_CATEGORY], f)
+    with open(os.path.join(official_dir, "flux_dev.json"), "w", encoding="utf-8") as f:
+        json.dump(_FLUX_WORKFLOW, f)
+    with open(os.path.join(official_dir, "legacy_top_level.json"), "w", encoding="utf-8") as f:
+        json.dump(_TOP_LEVEL_MODELS_WORKFLOW, f)
+    with open(os.path.join(official_dir, "flux_dev-1.webp"), "wb") as f:
+        f.write(b"RIFF" + b"\x00" * 8 + b"WEBP")
+    if localized is not None:
+        with open(os.path.join(official_dir, "index.zh.json"), "w", encoding="utf-8") as f:
+            json.dump(localized, f)
+    if logo is not None:
+        with open(os.path.join(official_dir, "index_logo.json"), "w", encoding="utf-8") as f:
+            json.dump(logo, f)
+    return official_dir
+
+
+def test_index_json_merges_official_categories_after_comfyfed(client):
+    _login(client)
+    _seed_official_dir(client.data_dir)
+
+    r = client.get("/comfy/templates/index.json")
+    assert r.status_code == 200
+    categories = r.json()
+    assert len(categories) == 2
+    assert [t["name"] for t in categories[0]["templates"]] == list(templates.TEMPLATE_NAMES)
+    assert categories[1] == _FLUX_CATEGORY
+
+
+def test_index_json_is_comfyfed_alone_when_official_dir_absent(client):
+    _login(client)
+    r = client.get("/comfy/templates/index.json")
+    assert r.status_code == 200
+    categories = r.json()
+    assert len(categories) == 1
+    assert [t["name"] for t in categories[0]["templates"]] == list(templates.TEMPLATE_NAMES)
+
+
+def test_official_workflow_json_has_per_node_download_metadata_stripped(client):
+    """The real library's shape: `nodes[].properties.models`."""
+    _login(client)
+    _seed_official_dir(client.data_dir)
+
+    r = client.get("/comfy/templates/flux_dev.json")
+    assert r.status_code == 200
+    body = r.json()
+
+    loader = body["nodes"][0]
+    models = loader["properties"]["models"]
+    assert len(models) == 1
+    # name + directory survive (the missing-model panel still names the file);
+    # everything hasDownloadMetadata() needs is gone.
+    assert models[0] == {"name": "flux1-dev.safetensors", "directory": "diffusion_models"}
+    # Nothing else about the node or the graph was disturbed.
+    assert loader["properties"]["Node name for S&R"] == "UNETLoader"
+    assert loader["widgets_values"] == ["flux1-dev.safetensors", "default"]
+    assert body["nodes"][1] == _FLUX_WORKFLOW["nodes"][1]
+    assert body["id"] == "flux_dev"
+    # And no url survives anywhere in the served document.
+    assert "huggingface.co" not in json.dumps(body)
+
+
+def test_official_workflow_json_has_top_level_download_metadata_stripped(client):
+    """Stripping stays a superset: a top-level `models` list is covered too."""
+    _login(client)
+    _seed_official_dir(client.data_dir)
+
+    r = client.get("/comfy/templates/legacy_top_level.json")
+    assert r.status_code == 200
+    models = r.json()["models"]
+    assert len(models) == 1
+    assert models[0] == {"name": "ae.safetensors", "directory": "vae"}
+
+
+def test_own_template_workflow_still_served_byte_identical(client):
+    _login(client)
+    _seed_official_dir(client.data_dir)
+
+    packaged_path = os.path.join(templates.templates_dir(), "comfyfed-wuxia-t2i.json")
+    with open(packaged_path, "rb") as f:
+        expected = f.read()
+
+    r = client.get("/comfy/templates/comfyfed-wuxia-t2i.json")
+    assert r.status_code == 200
+    assert r.content == expected
+
+
+def test_official_media_file_is_served(client):
+    _login(client)
+    _seed_official_dir(client.data_dir)
+
+    r = client.get("/comfy/templates/flux_dev-1.webp")
+    assert r.status_code == 200
+    assert r.headers["content-type"] == "image/webp"
+
+
+def test_localized_index_merges_when_official_localized_file_present(client):
+    _login(client)
+    localized_flux = {**_FLUX_CATEGORY, "title": "Flux (中文)"}
+    _seed_official_dir(client.data_dir, localized=[localized_flux])
+
+    r = client.get("/comfy/templates/index.zh.json")
+    assert r.status_code == 200
+    categories = r.json()
+    assert len(categories) == 2
+    assert [t["name"] for t in categories[0]["templates"]] == list(templates.TEMPLATE_NAMES)
+    assert categories[1] == localized_flux
+
+
+def test_localized_index_404s_without_official_localized_file(client):
+    _login(client)
+    assert client.get("/comfy/templates/index.zh.json").status_code == 404
+
+    _seed_official_dir(client.data_dir)  # official dir present, but no index.zh.json
+    assert client.get("/comfy/templates/index.zh.json").status_code == 404
+
+
+def test_index_logo_json_served_from_official_dir_or_404s(client):
+    _login(client)
+    assert client.get("/comfy/templates/index_logo.json").status_code == 404
+
+    logo = {"logo": "flux"}
+    _seed_official_dir(client.data_dir, logo=logo)
+    r = client.get("/comfy/templates/index_logo.json")
+    assert r.status_code == 200
+    assert r.json() == logo
+
+
+def test_traversal_filenames_still_404_with_official_dir_present(client):
+    _login(client)
+    _seed_official_dir(client.data_dir)
+    assert client.get("/comfy/templates/..%2F..%2Fcomfyfed.db").status_code == 404
+    # Windows drive-relative: os.path.join(dir, "C:x.json") == "C:x.json".
+    assert client.get("/comfy/templates/C:x.json").status_code == 404
+
+
+def test_manifest_json_is_not_served_as_a_template(client):
+    _login(client)
+    official_dir = _seed_official_dir(client.data_dir)
+    with open(os.path.join(official_dir, "manifest.json"), "w", encoding="utf-8") as f:
+        json.dump({"meta_version": "1.0", "sub_packages": {"json": "0.1.74"}}, f)
+
+    assert client.get("/comfy/templates/manifest.json").status_code == 404
+
+
+def test_mp3_thumbnail_is_served_as_audio(client):
+    _login(client)
+    official_dir = _seed_official_dir(client.data_dir)
+    with open(os.path.join(official_dir, "audio_tpl-1.mp3"), "wb") as f:
+        f.write(b"ID3")
+
+    r = client.get("/comfy/templates/audio_tpl-1.mp3")
+    assert r.status_code == 200
+    assert r.headers["content-type"] == "audio/mpeg"
 
 
 def test_readme_model_downloads_section_covers_the_whole_inventory():
@@ -387,13 +771,17 @@ def test_readme_model_downloads_section_covers_the_whole_inventory():
     with open(readme_path, encoding="utf-8") as f:
         readme = f.read()
 
-    urls = _r2_urls_in(readme)
-    assert urls, "README has no R2 model links"
+    urls = _gcs_urls_in(readme)
+    assert urls, "README has no GCS backup model links"
     for url in urls:
-        assert url.startswith(R2_MODEL_BASE), url
+        assert url.startswith(GCS_MODEL_BASE), url
         assert url.rsplit("/", 1)[-1] in MODEL_INVENTORY, url
 
     # Every model in the shared inventory shows up at least once in the README
     # (bilingual tables both reference the same nine files).
     seen = {url.rsplit("/", 1)[-1] for url in urls}
     assert seen == MODEL_INVENTORY
+
+    # And every model's official source link is present too.
+    for filename, source in MODEL_SOURCES.items():
+        assert source["official"] in readme, filename

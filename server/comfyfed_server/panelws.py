@@ -67,6 +67,23 @@ def clear() -> None:
 _QUEUE_REMAINING_STATUSES = ("queued", "assigned", "running")
 
 
+# Sent once, right after the initial `status` message, on every panel
+# connection. All false is the truthful answer for every one of these --
+# ComfyFed has no asset browser, no node-replacement suggestions, no sign-in
+# button (single admin, cookie session only), and the pinned frontend's
+# manager-v4/CSRF-POST UI has nothing on this server to talk to. Sending them
+# unprompted (rather than only in response to `GET /features`, which upstream
+# also exposes) matches what the stock frontend's own server does on connect,
+# and avoids the frontend falling back to feature-detection guesses.
+FEATURE_FLAGS: dict = {
+    "assets": False,
+    "node_replacements": False,
+    "show_signin_button": False,
+    "extension.manager.supports_v4": False,
+    "extension.manager.supports_csrf_post": False,
+}
+
+
 def queue_status() -> dict:
     """Build the `status.exec_info` payload for the initial/refreshed `status` message.
 

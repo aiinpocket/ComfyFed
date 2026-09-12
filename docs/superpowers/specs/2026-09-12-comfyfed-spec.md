@@ -97,3 +97,16 @@ worker 斷線（>90s 無心跳）→ assigned/running 的任務自動回 queued 
 - Agent：Python 3.12 單套件（同 repo `agent/`）、httpx、websockets、PyNaCl
 - 前端：React 18 + TypeScript + Vite + react-i18next（元件庫用 Mantine）
 - Repo：單一 monorepo `ComfyFed/`，`server/`＋`agent/`＋`web/`
+
+---
+
+## Phase 1.6 addendum: official template library + missing-model guidance (2026-09-13)
+
+User directives: (1) 官方範本要引入，但保留 ComfyFed 平台專用分類；(2) 審視原生 ComfyUI 介面中在聯邦架構下不適用的項目，拿掉或遮蔽——特別是缺模型時的「直接下載」（網頁模式下那只是瀏覽器端 `<a href>` 下載到看網頁的電腦，模型根本到不了 worker）；改為提示「因缺少 XX 模型無法執行」並提供下載連結與引導；(3) 模型鏡像從 R2 改回 GCS（bucket `comfyfed-models`，公開讀取），提示一律「官方載點（原始來源）＋備份載點（GCS）」雙連結以降低我方流量費。
+
+Decisions of record:
+- Official templates come from the PyPI `comfyui-workflow-templates` split packages (`-json` + `-media-*`; `-core` skipped), fetched by a new `fetch-comfy-templates` CLI into `data/comfy_templates_official/`, merged after ComfyFed's own categories in the served `/comfy/templates/index*.json`.
+- Served official workflow JSONs get `models[].url/hash/hash_type` stripped server-side (frontend's Download button requires url+directory) — the frontend bundle itself is never patched.
+- Guidance lives in a POST /prompt 400 (`prompt.missing_models`) raised when every online worker is ineligible due to missing models: per-model zh-TW block with 放置路徑 models/<dir>/、官方載點（flux/ae 加註需登入 HuggingFace 同意授權）、備份載點（GCS）、「10 分鐘自動掃描、不需重啟」. No workers online → unchanged queueing behavior.
+- Panel WS sends explicit `feature_flags` all-false (assets, node_replacements, show_signin_button, extension.manager.supports_v4/.supports_csrf_post) so Manager/Asset-Browser/sign-in UI stays dormant; incoming client feature_flags frames are consumed silently. `GET /api/folder_paths` stubbed `{}`.
+- R2 (the former model-mirror custom domain) is decommissioned: worker, custom domain, bucket contents deleted 2026-09-13. Canonical mirror base: `https://storage.googleapis.com/comfyfed-models/models/`.

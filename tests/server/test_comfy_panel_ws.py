@@ -113,6 +113,60 @@ def test_authenticated_connection_gets_initial_status(client):
         assert isinstance(msg["data"]["sid"], str) and msg["data"]["sid"]
 
 
+def test_connection_gets_explicit_feature_flags_right_after_status(client):
+    """The pinned frontend gates several UI affordances (asset browser, node
+    replacement suggestions, the sign-in button, manager v4 UI, manager CSRF
+    POST support) on these flags; answering false for all of them is the
+    truthful answer for a platform that supports none of them yet, and it is
+    sent unprompted -- ComfyUI's own server does the same on connect rather
+    than waiting to be asked."""
+    _login(client)
+    with client.websocket_connect("/comfy/api/ws") as ws:
+        ws.receive_json()  # initial status
+
+        msg = ws.receive_json()
+        assert msg == {
+            "type": "feature_flags",
+            "data": {
+                "assets": False,
+                "node_replacements": False,
+                "show_signin_button": False,
+                "extension.manager.supports_v4": False,
+                "extension.manager.supports_csrf_post": False,
+            },
+        }
+
+
+def test_client_feature_flags_message_is_consumed_without_disrupting_the_socket(client):
+    """The frontend announces its own capabilities (`supports_manager_v4_ui`
+    etc.) as a `feature_flags` message right after opening the socket. This
+    is expected chatter, not an error -- the panel socket only ever listens,
+    so it must swallow this silently and stay usable for subsequent relayed
+    events."""
+    csrf = _login(client)
+    job_id = _post_prompt(client)
+    worker_id = _register_worker(client, csrf, "runner")
+    dispatch.pick_job_for(worker_id)
+
+    with client.websocket_connect("/comfy/api/ws") as ws:
+        ws.receive_json()  # initial status
+        ws.receive_json()  # feature_flags
+
+        ws.send_json({"type": "feature_flags", "data": {"supports_manager_v4_ui": True}})
+
+        relay(panelws.job_running(job_id))
+
+        msg = ws.receive_json()
+        assert msg == {
+            "type": "executing",
+            "data": {
+                "node": "comfyfed",
+                "prompt_id": job_id,
+                "display_node": "comfyfed",
+            },
+        }
+
+
 def test_initial_status_reports_queue_remaining(client):
     _login(client)
     _post_prompt(client)
@@ -149,6 +203,7 @@ def test_progress_event_relayed_to_panel_client(client):
 
     with client.websocket_connect("/comfy/api/ws") as ws:
         ws.receive_json()  # initial status
+        ws.receive_json()  # feature_flags
 
         relay(panelws.job_progress(job_id, 0.42))
 
@@ -167,6 +222,7 @@ def test_executing_event_on_job_running(client):
 
     with client.websocket_connect("/comfy/api/ws") as ws:
         ws.receive_json()  # initial status
+        ws.receive_json()  # feature_flags
 
         relay(panelws.job_running(job_id))
 
@@ -193,6 +249,7 @@ def test_job_done_sends_executed_then_executing_none_then_status(client):
         job = session.get(db.Job, job_id)
         with client.websocket_connect("/comfy/api/ws") as ws:
             ws.receive_json()  # initial status
+            ws.receive_json()  # feature_flags
 
             relay(panelws.job_done(job))
 
@@ -232,6 +289,7 @@ def test_job_failed_sends_execution_error(client):
 
     with client.websocket_connect("/comfy/api/ws") as ws:
         ws.receive_json()  # initial status
+        ws.receive_json()  # feature_flags
 
         relay(panelws.job_failed(job_id, "boom"))
 
@@ -259,8 +317,10 @@ def test_broadcast_reaches_multiple_connected_clients(client):
     with client.websocket_connect("/comfy/api/ws") as ws1, client.websocket_connect(
         "/comfy/api/ws"
     ) as ws2:
-        ws1.receive_json()
-        ws2.receive_json()
+        ws1.receive_json()  # initial status
+        ws1.receive_json()  # feature_flags
+        ws2.receive_json()  # initial status
+        ws2.receive_json()  # feature_flags
 
         relay(panelws.job_running(job_id))
 
@@ -310,6 +370,7 @@ def test_agent_heartbeat_progress_relayed_through_real_agentws_handler(client):
 
     with client.websocket_connect("/comfy/api/ws") as panel_ws:
         panel_ws.receive_json()  # initial status
+        panel_ws.receive_json()  # feature_flags
 
         with client.websocket_connect("/api/agent/ws") as agent_ws:
             challenge = agent_ws.receive_json()

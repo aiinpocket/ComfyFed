@@ -50,7 +50,7 @@ from typing import Callable, Optional
 from fastapi import APIRouter, Depends, File, Form, Request, UploadFile, WebSocket, WebSocketDisconnect
 from fastapi.responses import FileResponse, JSONResponse, Response
 
-from . import assess, auth, db, jobs, panelws, storage, workers
+from . import assess, auth, db, jobs, model_guide, panelws, storage, workers
 
 # Node classes whose id keys a history entry's `outputs`. The ComfyUI frontend
 # looks up the images it should display under the id of the node that saved
@@ -267,6 +267,60 @@ def _online_worker_hashes(session) -> list[tuple[str, str]]:
     return [(w.id, w.object_info_hash or "") for w in rows]
 
 
+def _fleet_wide_gaps(needs: assess.JobNeeds) -> tuple[set[str], set[str]]:
+    """`(models, node classes)` that NOT ONE registered worker can supply.
+
+    Deliberately fleet-wide rather than "every worker that happens to be
+    online right now": the classic home federation is one big GPU box holding
+    every model plus a small always-on box holding none, and refusing a prompt
+    during the GPU box's ten-minute reboot -- for models the user already owns
+    -- is strictly worse than queueing it. Every registered worker row counts,
+    whatever its `status` and whether or not it is disabled, so a sleeping or
+    temporarily-disabled machine still vouches for its inventory. Only a model
+    that exists nowhere in the federation is a real dead end, and that is what
+    the admin can actually act on.
+
+    Matching is `assess.find_model`, i.e. `assess.matches_model_name`
+    semantics, so a worker's `diffusion_models/flux1-dev.safetensors`
+    satisfies a workflow's `flux1-dev.safetensors`.
+
+    Node classes are computed the same way and returned alongside, because a
+    fleet missing both would otherwise send the admin off to download 22 GB
+    for a job that still cannot run (see `post_prompt`, which appends a
+    節點 line to the guidance). A worker reporting an EMPTY `node_classes`
+    list means "unknown", not "supports nothing" -- same rule as
+    `assess.verdict` -- so such workers are skipped for the node check, and
+    if that leaves no informative worker the node set comes back empty.
+
+    With zero workers registered both sets are empty: an install that has
+    never had an agent connect keeps today's queue-and-wait behavior.
+    """
+    with db.get_session() as session:
+        all_workers = session.query(db.Worker).all()
+        if not all_workers:
+            return set(), set()
+        inventories = [assess.model_inventory(w) for w in all_workers]
+        node_class_sets = [
+            classes for classes in (set(assess.worker_node_classes(w)) for w in all_workers)
+            if classes
+        ]
+
+    missing_models = {
+        name
+        for name in needs.models
+        if not any(assess.find_model(inventory, name)[0] for inventory in inventories)
+    }
+
+    missing_nodes: set[str] = set()
+    if node_class_sets:
+        missing_nodes = {
+            node for node in needs.nodes
+            if not any(node in classes for classes in node_class_sets)
+        }
+
+    return missing_models, missing_nodes
+
+
 def staged_image_names(data_dir: str) -> list[str]:
     """Sorted filenames currently sitting in the panel's staging directory."""
     try:
@@ -431,6 +485,24 @@ def create_router(
             return _comfy_error("invalid_prompt", "Prompt must be a non-empty API-format object")
 
         needs = assess.extract(prompt)
+
+        blocking, missing_nodes = _fleet_wide_gaps(needs)
+        if blocking:
+            names = sorted(blocking)
+            guidance = model_guide.guidance_message(names, data_dir)
+            if missing_nodes:
+                guidance += "\n\n" + model_guide.missing_nodes_note(sorted(missing_nodes))
+            # message = one-line summary, details = the full guidance. The
+            # official frontend uses `message` as the Errors-panel card title
+            # and as the leading half of the dialog's `message + ": " +
+            # details`, so a multi-line blob in `message` renders either as a
+            # collapsed one-line headline or twice over.
+            return _comfy_error(
+                "prompt.missing_models",
+                model_guide.guidance_summary(names),
+                guidance,
+            )
+
         resolved: dict[str, str] = {}
         for name in sorted(needs.assets):
             path = resolver(name)
@@ -643,6 +715,14 @@ def create_router(
     def global_subgraphs() -> Response:
         return JSONResponse(content={})
 
+    @r.get("/folder_paths")
+    def folder_paths() -> Response:
+        # The missing-model locate-flow calls this to suggest which folder a
+        # model might belong in; there are no model folders on the platform
+        # (models live on the workers), so an empty dict -- no suggestions --
+        # is the truthful answer, same rationale as `/models` above.
+        return JSONResponse(content={})
+
     @r.get("/system_stats")
     def system_stats() -> Response:
         """Upstream's shape, filled in for a platform that owns no GPU.
@@ -754,10 +834,18 @@ def create_ws_router() -> APIRouter:
             await websocket.send_json(
                 {"type": "status", "data": {"status": panelws.queue_status(), "sid": sid}}
             )
+            # Right after the initial status: the pinned frontend gates a
+            # handful of UI affordances on these, and answering unprompted
+            # (rather than waiting for a request) matches upstream's own
+            # connect behavior. See `panelws.FEATURE_FLAGS` for what each
+            # one means and why every one of them is false here.
+            await websocket.send_json({"type": "feature_flags", "data": panelws.FEATURE_FLAGS})
             while True:
-                # The panel client only ever listens; any inbound message (or
-                # the disconnect it eventually raises) just keeps this
-                # coroutine alive until the connection ends.
+                # The panel client only ever listens; any inbound message --
+                # including the `feature_flags` frame the frontend announces
+                # its own capabilities with on open -- is simply discarded
+                # here, same as everything else. The disconnect this
+                # eventually raises just ends the loop.
                 await websocket.receive_text()
         except WebSocketDisconnect:
             pass
