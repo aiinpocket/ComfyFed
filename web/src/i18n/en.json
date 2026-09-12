@@ -96,6 +96,12 @@
   "jobs": {
     "title": "Jobs",
     "subtitle": "Submit ComfyUI workflows and follow them through the federation.",
+    "editor_heading": "Build a workflow",
+    "editor_hint": "Open the embedded ComfyUI editor, wire up your graph, and press Queue — the job goes straight into the federation.",
+    "open_editor": "Open workflow editor",
+    "editor_workers_note": "Nodes only appear once at least one worker is online; the editor shows the union of what the online workers have installed.",
+    "paste_section": "Paste API JSON instead",
+    "paste_section_hint": "For a workflow you already exported with “Save (API format)”.",
     "submit_heading": "Submit a workflow",
     "submit_hint": "Paste ComfyUI API-format JSON, or upload a .json file. Requirements are detected automatically.",
     "upload_json": "Upload workflow .json",

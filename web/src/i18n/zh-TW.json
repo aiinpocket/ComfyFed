@@ -96,6 +96,12 @@
   "jobs": {
     "title": "任務",
     "subtitle": "送出 ComfyUI 工作流，並追蹤它在聯邦裡的進度。",
+    "editor_heading": "組工作流",
+    "editor_hint": "開啟內嵌的 ComfyUI 編輯器拉節點，按 Queue 就直接派進聯邦跑。",
+    "open_editor": "開啟工作流編輯器",
+    "editor_workers_note": "至少要有一台 Worker 在線，編輯器裡才會出現節點；節點清單是所有在線 Worker 已安裝節點的聯集。",
+    "paste_section": "改用貼上 API JSON",
+    "paste_section_hint": "已經用「Save (API format)」匯出好的工作流走這裡。",
     "submit_heading": "送出工作流",
     "submit_hint": "貼上 ComfyUI API 格式的 JSON，或上傳 .json 檔。需求會自動評估。",
     "upload_json": "上傳工作流 .json",

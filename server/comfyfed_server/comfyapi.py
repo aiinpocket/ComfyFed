@@ -67,6 +67,11 @@ FALLBACK_OUTPUT_KEY = "comfyfed"
 # to the admin.
 _STAGING_DIRNAME = "comfy_staging"
 
+# Panel UI preferences (theme, canvas options, ...), the ComfyFed stand-in for
+# upstream's per-user `comfy.settings.json`. One file, because ComfyFed has
+# exactly one admin.
+_SETTINGS_FILENAME = "comfy_settings.json"
+
 # WebSocket close code for an unauthenticated `/ws` connection, mirroring
 # agentws's convention for its own agent socket.
 _CLOSE_UNAUTHORIZED = 4401
@@ -74,6 +79,25 @@ _CLOSE_UNAUTHORIZED = 4401
 
 def staging_dir(data_dir: str) -> str:
     return os.path.join(data_dir, _STAGING_DIRNAME)
+
+
+def _settings_path(data_dir: str) -> str:
+    return os.path.join(data_dir, _SETTINGS_FILENAME)
+
+
+def _load_settings(data_dir: str) -> dict:
+    try:
+        with open(_settings_path(data_dir), "r", encoding="utf-8") as f:
+            loaded = json.load(f)
+    except (OSError, ValueError):
+        return {}
+    return loaded if isinstance(loaded, dict) else {}
+
+
+def _save_settings(data_dir: str, values: dict) -> None:
+    os.makedirs(data_dir, exist_ok=True)
+    with open(_settings_path(data_dir), "w", encoding="utf-8") as f:
+        json.dump(values, f, ensure_ascii=False, indent=1, sort_keys=True)
 
 
 def _default_resolve_asset(data_dir: str, name: str) -> Optional[str]:
@@ -431,11 +455,123 @@ def create_router(
         media_type = mimetypes.guess_type(safe_name)[0] or "application/octet-stream"
         return FileResponse(path, media_type=media_type, filename=safe_name)
 
+    # --- panel bootstrap ------------------------------------------------
+    #
+    # The stock frontend calls all of the following before it will render a
+    # canvas at all, and it does not degrade gracefully when they 404: an
+    # error body where it expects a list makes `GraphView` throw and the page
+    # stays blank. They are answered here with the *empty* form of each
+    # upstream shape, because none of them describes anything a federation
+    # has: there is no single machine to report stats for, no `web/extensions`
+    # directory, no model folders on the platform (models live on the
+    # workers), and no bundled locale packs.
+    #
+    # Only panel settings are real, and only because a preference the editor
+    # forgets on every reload is worse than useless. They persist to one JSON
+    # file next to the database -- ComfyFed has a single admin, so upstream's
+    # per-user split buys nothing.
+
+    @r.get("/features")
+    def features() -> Response:
+        # Server feature flags; empty means "supports nothing optional",
+        # which is the truthful answer and the one the frontend defaults to.
+        return JSONResponse(content={})
+
+    @r.get("/users")
+    def users() -> Response:
+        # Single-user mode: the frontend then never shows a user picker.
+        return JSONResponse(content={"storage": "server", "migrated": False})
+
+    @r.get("/extensions")
+    def extensions() -> Response:
+        return JSONResponse(content=[])
+
+    @r.get("/embeddings")
+    def embeddings() -> Response:
+        return JSONResponse(content=[])
+
+    @r.get("/models")
+    def models() -> Response:
+        return JSONResponse(content=[])
+
+    @r.get("/i18n")
+    def custom_node_i18n() -> Response:
+        return JSONResponse(content={})
+
+    @r.get("/global_subgraphs")
+    def global_subgraphs() -> Response:
+        return JSONResponse(content={})
+
+    @r.get("/system_stats")
+    def system_stats() -> Response:
+        """Upstream's shape, filled in for a platform that owns no GPU.
+
+        `devices: []` is honest -- the compute is on the workers, and the
+        console's own Workers page is where a human should look for it.
+        """
+        with db.get_session() as session:
+            online = (
+                session.query(db.Worker)
+                .filter(db.Worker.disabled == False)  # noqa: E712
+                .filter(db.Worker.status != "offline")
+                .count()
+            )
+        return JSONResponse(
+            content={
+                "system": {
+                    "os": "comfyfed",
+                    "comfyui_version": "comfyfed",
+                    "python_version": "",
+                    "pytorch_version": "",
+                    "embedded_python": False,
+                    "argv": [],
+                    "comfyfed_online_workers": online,
+                },
+                "devices": [],
+            }
+        )
+
+    @r.get("/prompt")
+    def prompt_status() -> Response:
+        # Polled roughly once a second by the frontend for its queue badge.
+        return JSONResponse(content=panelws.queue_status())
+
+    @r.get("/settings")
+    def get_settings() -> Response:
+        return JSONResponse(content=_load_settings(data_dir))
+
+    @r.get("/settings/{setting_id}")
+    def get_setting(setting_id: str) -> Response:
+        # Upstream answers `null` (not 404) for a setting never written.
+        return JSONResponse(content=_load_settings(data_dir).get(setting_id))
+
+    @r.post("/settings")
+    async def post_settings(request: Request) -> Response:
+        try:
+            incoming = await request.json()
+        except (ValueError, TypeError):
+            return Response(status_code=400)
+        if not isinstance(incoming, dict):
+            return Response(status_code=400)
+        _save_settings(data_dir, {**_load_settings(data_dir), **incoming})
+        return Response(status_code=200)
+
+    @r.post("/settings/{setting_id}")
+    async def post_setting(setting_id: str, request: Request) -> Response:
+        try:
+            value = await request.json()
+        except (ValueError, TypeError):
+            return Response(status_code=400)
+        settings = _load_settings(data_dir)
+        settings[setting_id] = value
+        _save_settings(data_dir, settings)
+        return Response(status_code=200)
+
     return r
 
 
 def create_ws_router() -> APIRouter:
-    """Build the `/comfy/api/ws` panel WebSocket router.
+    """Build the panel WebSocket router (`/comfy/ws`, `/comfy/api/ws`).
 
     Deliberately a SEPARATE router from `create_router`, not another route on
     it: FastAPI applies a router's `dependencies` to its websocket routes too
@@ -451,10 +587,19 @@ def create_ws_router() -> APIRouter:
     `server.py`'s `websocket_handler`) and then every federation job event
     `panelws.post_event` broadcasts -- this router never reads anything back
     from the socket beyond noticing it closed.
-    """
-    r = APIRouter(prefix="/comfy/api")
 
-    @r.websocket("/ws")
+    Served at BOTH `/comfy/api/ws` and `/comfy/ws`. The stock frontend builds
+    its socket URL as `api_base + "/ws"` -- not via `apiURL()`, which is what
+    prefixes `/api` onto every other call -- so a panel served at `/comfy/`
+    connects to `/comfy/ws`. Upstream ComfyUI has the same split (its `/ws`
+    lives at the root while `/api/ws` is the mirrored alias); here `/comfy/ws`
+    is the one the frontend actually uses and `/comfy/api/ws` is kept as the
+    explicit, documented address.
+    """
+    r = APIRouter()
+
+    @r.websocket("/comfy/api/ws")
+    @r.websocket("/comfy/ws")
     async def panel_ws(websocket: WebSocket) -> None:
         await websocket.accept()
 

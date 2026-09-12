@@ -129,6 +129,30 @@ comfyfed-agent run
 - `eligible_after_fetch`：worker 缺少的模型可以在聯邦內其他 worker 上取得（Phase 2 才會落地實際傳輸機制），且磁碟空間足夠容納。
 - `ineligible`：附上白話原因，例如缺少節點類別、VRAM 不足、缺的模型在聯邦裡也找不到等。
 
+### 內嵌工作流編輯器（`/comfy`）
+
+不想自備 ComfyUI 也能拉工作流：平台可以直接把**官方 ComfyUI 前端**掛在 `/comfy`，你在瀏覽器裡拉好圖、按 Queue，工作就直接進聯邦排隊，跑完的圖也在同一個介面看。
+
+前端靜態檔不隨套件安裝（那是 20 幾 MB 的 JS，API-only 的部署根本用不到），要先抓一次：
+
+```bash
+comfyfed-server fetch-comfy-ui --data-dir ./data
+```
+
+這個指令會去 PyPI 抓 `comfyui-frontend-package` 的 wheel（**版本與 sha256 都釘死在程式碼裡**，下載後先驗雜湊才解壓），把裡面的 `static/` 解到 `<data-dir>/comfy_frontend/`。已經抓過就直接跳過。抓完**要重啟伺服器**，`/comfy` 才會掛上去。
+
+- `--version X` 可以指定別的版本，但那樣就**不驗 sha256**，也不保證跟本平台的 `/comfy/api` 相容（指令會警告你）。
+- 還沒抓的時候，`/comfy` 會顯示一頁雙語說明，告訴你跑上面那行指令。
+- `/comfy` 跟它的靜態檔都要**管理員 session**，沒登入一律導回 `/`（Console 登入頁）。
+
+抓完之後，登入 Console →「工作」頁，按主要按鈕「**開啟工作流編輯器**」就會在新分頁打開。原本貼 API JSON 的表單還在，收進同一頁的「改用貼上 API JSON」摺疊區。
+
+⚠ **編輯器裡至少要有一台 worker 在線才會出現節點**：節點清單不是平台自己編的，而是所有**在線且未停用** worker 回報的 `/object_info` 聯集。全部離線的話節點面板會是空的——這是正常的，不是壞掉。
+
+目前的相容層只做到「拉圖 → 送工作 → 看結果」這條主線。編輯器裡幾個依賴單機 ComfyUI 的功能不會動：**存工作流到伺服器、官方範本、Manager／自訂節點擴充、模型清單瀏覽**（模型在各個 worker 上，平台自己沒有）。工作流請用瀏覽器的匯出／匯入，或用 Console 的「貼上 API JSON」。編輯器的介面偏好（主題等）會存在 `<data-dir>/comfy_settings.json`。
+
+**跟自備 ComfyUI 的關係**：兩者不衝突，是兩個入口。內嵌編輯器是「我沒有 ComfyUI，或懶得開」的路；如果你本機已經有 ComfyUI，照樣可以在自己那邊拉好工作流、用「Save (API format)」匯出，再貼進 Console 送出。真正跑圖的一律是聯邦裡的 worker（也就是各成員自己的 ComfyUI），平台本身不裝 ComfyUI、也不跑推論——`/comfy` 只是一層把官方前端的動作翻譯成聯邦工作的相容 API。
+
 ### 發布 agent 新版本
 
 伺服器端有一個發布指令，會把 wheel 複製到 `<data-dir>/releases/`、算好 sha256、用平台金鑰簽章，並把 `agent_*` 設定一次寫好：
@@ -292,6 +316,60 @@ When a job arrives, the server automatically extracts the node classes, model fi
 - `eligible`: the worker already has every required node and model — dispatch directly.
 - `eligible_after_fetch`: models missing on this worker are available from another worker in the federation (actual transfer lands in Phase 2), and there's enough free disk to hold them.
 - `ineligible`: with plain-language reasons, e.g. missing node classes, insufficient VRAM, or missing models that no one else in the federation has either.
+
+### Embedded workflow editor (`/comfy`)
+
+You don't need your own ComfyUI to build a workflow: the platform can serve
+the **official ComfyUI frontend** at `/comfy`. Wire up your graph in the
+browser, press Queue, and the job goes straight into the federation's queue —
+the results come back in the same interface.
+
+The static bundle is not installed with the package (it's ~24 MB of
+JavaScript that an API-only deployment never touches), so fetch it once:
+
+```bash
+comfyfed-server fetch-comfy-ui --data-dir ./data
+```
+
+That downloads the `comfyui-frontend-package` wheel from PyPI — **both the
+version and its sha256 are pinned in the source**, and the digest is verified
+before anything is extracted — and unpacks its `static/` tree into
+`<data-dir>/comfy_frontend/`. Already fetched: it's a no-op. **Restart the
+server** afterwards so `/comfy` gets mounted.
+
+- `--version X` fetches a different release, but then the sha256 check is
+  **skipped** and compatibility with this platform's `/comfy/api` is not
+  guaranteed (the command warns about both).
+- Until you fetch it, `/comfy` serves a bilingual notice page telling you to
+  run the command above.
+- `/comfy` and all of its assets require an **admin session**; without one you
+  are redirected to `/` (the console login).
+
+Once it's there, log into the console, go to **Jobs**, and hit the primary
+**Open workflow editor** button — it opens in a new tab. The old paste-the-API-JSON
+form is still on that page, tucked into the "Paste API JSON instead" section.
+
+⚠ **Nodes only appear when at least one worker is online.** The node catalogue
+is not something the platform invents: it is the union of the `/object_info`
+snapshots reported by every **online, enabled** worker. With the whole fleet
+offline the node panel is empty — that's expected, not a bug.
+
+The compatibility layer currently covers the main line only: build a graph,
+queue it, see the results. Editor features that assume a single local ComfyUI
+do not work — **saving workflows to the server, the official template
+gallery, Manager / custom-node extensions, and model browsing** (models live
+on the workers; the platform has none). Export/import workflows through the
+browser instead, or paste the API JSON into the console. Editor UI
+preferences (theme and so on) persist to `<data-dir>/comfy_settings.json`.
+
+**How this relates to bringing your own ComfyUI**: they are two doors into the
+same federation, not alternatives. The embedded editor is for "I don't have
+ComfyUI here, or don't feel like launching it". If you already run ComfyUI
+locally, keep building there, export with "Save (API format)", and paste it
+into the console. Either way the actual rendering happens on federation
+workers — each member's own ComfyUI. The platform itself never installs
+ComfyUI and never runs inference; `/comfy` is only a compatibility layer that
+translates the official frontend's actions into federation jobs.
 
 ### Publishing an agent release
 

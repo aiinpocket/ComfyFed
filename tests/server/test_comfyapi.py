@@ -418,3 +418,77 @@ def test_prompt_copies_staged_asset_into_job_inputs(client):
     with db.get_session() as session:
         job = session.get(db.Job, job_id)
         assert json.loads(job.input_assets) == ["ref.png"]
+
+
+# ------------------------------------------------------------ panel bootstrap
+#
+# The stock frontend calls all of these before it will render a canvas, and it
+# does not degrade when they 404 -- an error body where it expects a list makes
+# GraphView throw and the page stays blank. What matters is the JSON *type* of
+# each response, so that is what these assert.
+
+
+@pytest.mark.parametrize(
+    "path,expected",
+    [
+        ("/comfy/api/features", {}),
+        ("/comfy/api/users", {"storage": "server", "migrated": False}),
+        ("/comfy/api/extensions", []),
+        ("/comfy/api/embeddings", []),
+        ("/comfy/api/models", []),
+        ("/comfy/api/i18n", {}),
+        ("/comfy/api/global_subgraphs", {}),
+    ],
+)
+def test_bootstrap_routes_return_the_empty_upstream_shape(client, path, expected):
+    _login(client)
+    r = client.get(path)
+    assert r.status_code == 200
+    assert r.json() == expected
+
+
+def test_bootstrap_routes_require_a_session(client):
+    assert client.get("/comfy/api/features").status_code == 401
+
+
+def test_system_stats_reports_no_local_devices(client):
+    _login(client)
+    r = client.get("/comfy/api/system_stats")
+    assert r.status_code == 200
+    body = r.json()
+    # The platform owns no GPU; compute lives on the workers.
+    assert body["devices"] == []
+    assert body["system"]["comfyfed_online_workers"] == 0
+
+
+def test_get_prompt_reports_queue_remaining(client):
+    csrf = _login(client)
+    _register_worker(client, csrf, "w1", object_info={"KSampler": {}})
+
+    before = client.get("/comfy/api/prompt")
+    assert before.status_code == 200
+    assert before.json() == {"exec_info": {"queue_remaining": 0}}
+
+    assert _post_prompt(client).status_code == 200
+    assert client.get("/comfy/api/prompt").json()["exec_info"]["queue_remaining"] == 1
+
+
+def test_panel_settings_round_trip_and_persist(client):
+    _login(client)
+
+    # Never written: upstream answers `null`, not 404.
+    assert client.get("/comfy/api/settings").json() == {}
+    assert client.get("/comfy/api/settings/Comfy.ColorPalette").json() is None
+
+    assert client.post("/comfy/api/settings/Comfy.ColorPalette", json="dark").status_code == 200
+    assert client.post("/comfy/api/settings", json={"Comfy.Zoom": 1.25}).status_code == 200
+
+    assert client.get("/comfy/api/settings/Comfy.ColorPalette").json() == "dark"
+    assert client.get("/comfy/api/settings").json() == {
+        "Comfy.ColorPalette": "dark",
+        "Comfy.Zoom": 1.25,
+    }
+
+    # Written through to disk, so a restart keeps the panel's preferences.
+    with open(os.path.join(client.data_dir, "comfy_settings.json"), encoding="utf-8") as f:
+        assert json.load(f)["Comfy.ColorPalette"] == "dark"

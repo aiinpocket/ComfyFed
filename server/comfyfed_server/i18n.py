@@ -41,6 +41,26 @@ _DICT: dict[str, dict[str, str]] = {
             '"{version}|{sha256}" yourself and set the agent_* settings above by hand.'
         ),
     },
+    "fetch_ui.start": {
+        "zh-TW": "正在下載官方 ComfyUI 前端（{version}）…",
+        "en": "Downloading the official ComfyUI frontend ({version})…",
+    },
+    "fetch_ui.already_present": {
+        "zh-TW": "已經有前端檔案了，不重複下載。要重抓請先刪掉這個目錄：",
+        "en": "The frontend is already installed; nothing to download. Delete this directory to re-fetch:",
+    },
+    "fetch_ui.done": {
+        "zh-TW": "前端安裝完成（{files} 個檔案）。重啟伺服器後，登入 Console 即可從「工作」頁開啟 /comfy。",
+        "en": "Frontend installed ({files} files). Restart the server, then open /comfy from the console's Jobs page.",
+    },
+    "fetch_ui.unpinned_warning": {
+        "zh-TW": "⚠ 你指定了 --version，這不是本版內建的釘選版本，因此**略過 sha256 驗證**，且不保證與本平台的 /comfy/api 相容。",
+        "en": "⚠ --version was given, so this is not the build pinned by this release: the sha256 check is SKIPPED and compatibility with this platform's /comfy/api is not guaranteed.",
+    },
+    "fetch_ui.failed": {
+        "zh-TW": "下載失敗：",
+        "en": "Fetch failed:",
+    },
     "install.password_box_title": {
         "zh-TW": "管理員密碼（僅顯示一次，請立即保存）",
         "en": "Admin password (shown once, save it now)",

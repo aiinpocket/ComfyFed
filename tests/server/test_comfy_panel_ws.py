@@ -69,6 +69,25 @@ def test_unauthenticated_connection_is_closed_4401(client):
         assert exc_info.value.code == 4401
 
 
+def test_frontend_ws_path_alias_is_served(client):
+    """`/comfy/ws` is the address the stock frontend actually dials.
+
+    It builds its socket URL as `api_base + "/ws"` -- bypassing the `apiURL()`
+    helper that prefixes `/api` onto everything else -- so a panel served at
+    `/comfy/` connects to `/comfy/ws`, not `/comfy/api/ws`. Both answer.
+    """
+    _login(client)
+    with client.websocket_connect("/comfy/ws?clientId=panel-1") as ws:
+        assert ws.receive_json()["type"] == "status"
+
+
+def test_unauthenticated_frontend_ws_alias_is_also_closed_4401(client):
+    with client.websocket_connect("/comfy/ws") as ws:
+        with pytest.raises(WebSocketDisconnect) as exc_info:
+            ws.receive_json()
+        assert exc_info.value.code == 4401
+
+
 def test_authenticated_connection_gets_initial_status(client):
     _login(client)
     with client.websocket_connect("/comfy/api/ws") as ws:

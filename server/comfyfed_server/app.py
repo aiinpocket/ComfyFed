@@ -10,15 +10,60 @@ from contextlib import asynccontextmanager
 
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.exceptions import RequestValidationError
-from fastapi.responses import FileResponse, JSONResponse, Response
+from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, RedirectResponse, Response
 from fastapi.staticfiles import StaticFiles
 from prometheus_client import CONTENT_TYPE_LATEST, generate_latest
 
-from . import agentws, auth, bootstrap, comfyapi, db, jobs, metrics, receipts, workers
+from . import (
+    agentws,
+    auth,
+    bootstrap,
+    comfy_frontend,
+    comfyapi,
+    db,
+    jobs,
+    metrics,
+    receipts,
+    workers,
+)
 
 logger = logging.getLogger(__name__)
 
 _WEB_DIST_ENV_VAR = "COMFYFED_WEB_DIST"
+
+_COMFY_PREFIX = "/comfy"
+_COMFY_API_PREFIX = "/comfy/api"
+
+# Shown at `/comfy` when the operator has not fetched the frontend bundle yet.
+# Deliberately a self-contained, dependency-free page: the console's own SPA
+# is a different app, and this has to render even if `web/dist` is missing.
+_COMFY_NOTICE_HTML = """<!doctype html>
+<html lang="zh-TW"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>ComfyFed — 工作流編輯器尚未安裝 / Workflow editor not installed</title>
+<style>
+ body{margin:0;min-height:100vh;display:flex;align-items:center;justify-content:center;
+      background:#0f1115;color:#e6e8ec;font:15px/1.65 system-ui,"Noto Sans TC",sans-serif}
+ main{max-width:44rem;padding:2.5rem}
+ h1{font-size:1.3rem;margin:0 0 1.2rem}
+ h2{font-size:1rem;margin:1.8rem 0 .5rem;color:#9aa4b2;font-weight:600}
+ code,pre{font-family:ui-monospace,SFMono-Regular,Menlo,monospace}
+ pre{background:#171a21;border:1px solid #262b36;border-radius:8px;padding:.9rem 1rem;overflow-x:auto}
+ a{color:#7aa2f7}
+ p{margin:.5rem 0}
+</style></head><body><main>
+<h1>工作流編輯器尚未安裝 / Workflow editor not installed</h1>
+<h2>繁體中文</h2>
+<p>內嵌的 ComfyUI 工作流編輯器需要先把官方前端靜態檔抓下來。請在伺服器上執行：</p>
+<pre>comfyfed-server fetch-comfy-ui --data-dir &lt;你的 data 目錄&gt;</pre>
+<p>抓完之後<strong>重新啟動伺服器</strong>，再回到這一頁即可。</p>
+<h2>English</h2>
+<p>The embedded ComfyUI workflow editor needs the official frontend bundle. On the server, run:</p>
+<pre>comfyfed-server fetch-comfy-ui --data-dir &lt;your data dir&gt;</pre>
+<p>Then <strong>restart the server</strong> and reload this page.</p>
+<p><a href="/">&larr; 回到 Console / Back to the console</a></p>
+</main></body></html>
+"""
 
 
 def _error_body(code: str, message: str) -> dict:
@@ -128,6 +173,61 @@ def create_app(data_dir: str) -> FastAPI:
         data = generate_latest(metrics.get_metrics().registry)
         return Response(content=data, media_type=CONTENT_TYPE_LATEST)
 
+    # --- embedded ComfyUI workflow editor (`/comfy`) --------------------
+    #
+    # Registered after every router so `/comfy/api/*` (which authenticates
+    # itself) is matched by `comfyapi`'s routes, never by the static mount,
+    # and before the SPA mount at `/` so `/comfy` is not swallowed by it.
+    comfy_root = comfy_frontend.frontend_dir(data_dir)
+    comfy_present = comfy_frontend.is_populated(data_dir)
+
+    @app.middleware("http")
+    async def _comfy_session_gate(request: Request, call_next):
+        """Require an admin session for the panel and its static assets.
+
+        `/comfy/api/*` is excluded: those routes carry their own
+        `require_admin` dependency and must answer with JSON/401 rather than
+        a redirect, because the ComfyUI frontend's fetches cannot follow a
+        login redirect meaningfully. Everything else under `/comfy` is a page
+        or asset a browser is loading directly, so an unauthenticated hit is
+        sent to the console login at `/`.
+        """
+        path = request.url.path
+        in_panel = path == _COMFY_PREFIX or path.startswith(_COMFY_PREFIX + "/")
+        in_api = path == _COMFY_API_PREFIX or path.startswith(_COMFY_API_PREFIX + "/")
+        if in_panel and not in_api:
+            payload = auth._read_session_payload(request.cookies.get("cf_session"))
+            if not payload or not payload.get("authenticated"):
+                return RedirectResponse("/", status_code=302)
+        return await call_next(request)
+
+    @app.get("/comfy", include_in_schema=False)
+    async def _comfy_root() -> Response:
+        """Send `/comfy` to `/comfy/` -- the trailing slash is load-bearing.
+
+        The ComfyUI frontend derives its API base from its own location:
+        `api_base = location.pathname.split('/').slice(0, -1).join('/')`. At
+        `/comfy/` that yields `/comfy`, so every call becomes
+        `/comfy/api/...` and lands on our compat router. At `/comfy` (no
+        slash) it would yield `""` and the panel would hammer `/api/...`,
+        which is ComfyFed's own federation API. Starlette's own
+        redirect-slashes cannot help here because the SPA mount at `/`
+        matches `/comfy` first.
+        """
+        return RedirectResponse("/comfy/", status_code=307)
+
+    if comfy_present:
+        app.mount("/comfy", StaticFiles(directory=comfy_root, html=True), name="comfy")
+    else:
+        logger.info(
+            "comfyfed_server: %s not populated; /comfy serves the fetch-comfy-ui notice.",
+            comfy_root,
+        )
+
+        @app.get("/comfy/", include_in_schema=False)
+        async def _comfy_notice() -> HTMLResponse:
+            return HTMLResponse(_COMFY_NOTICE_HTML)
+
     web_dist = _find_web_dist()
     if web_dist is None:
         logger.warning(
@@ -139,10 +239,13 @@ def create_app(data_dir: str) -> FastAPI:
 
         @app.exception_handler(404)
         async def _spa_fallback(request: Request, exc: HTTPException) -> JSONResponse | FileResponse:
-            # `/comfy/api/` is the ComfyUI-compatible surface: like `/api/`,
-            # its 404s must stay JSON, not be swallowed by the SPA's
-            # index.html fallback.
-            if request.url.path.startswith("/api/") or request.url.path.startswith("/comfy/api/"):
+            # `/api/` is ComfyFed's own API and `/comfy` is the embedded
+            # ComfyUI panel (its `/comfy/api/` compat surface included).
+            # Neither is part of the console SPA, so a 404 there must stay a
+            # 404 -- returning index.html would turn a missing panel asset
+            # into an HTML body the ComfyUI frontend then tries to parse.
+            path = request.url.path
+            if path.startswith("/api/") or path == _COMFY_PREFIX or path.startswith(_COMFY_PREFIX + "/"):
                 return await _http_exception_handler(request, exc)
             return FileResponse(index_path)
 

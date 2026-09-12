@@ -11,7 +11,7 @@ import sys
 
 import uvicorn
 
-from . import bootstrap, db, i18n, security
+from . import bootstrap, comfy_frontend, db, i18n, security
 from .app import create_app
 
 # Best-effort: force UTF-8 stdout/stderr so bilingual (zh-TW + en) install
@@ -171,6 +171,41 @@ def _cmd_publish_agent(args: argparse.Namespace) -> None:
     print(i18n.t("publish.offline_key_note", "en"))
 
 
+def _bilingual(key: str, **fields) -> None:
+    for lang in ("zh-TW", "en"):
+        print(i18n.t(key, lang).format(**fields))
+
+
+def _cmd_fetch_comfy_ui(args: argparse.Namespace) -> None:
+    """Download the official ComfyUI frontend bundle into the data directory.
+
+    Deliberately does NOT require the server to be installed: an operator can
+    stage the static files before (or independently of) `install`.
+    """
+    data_dir = args.data_dir
+    os.makedirs(data_dir, exist_ok=True)
+
+    if comfy_frontend.is_populated(data_dir):
+        _bilingual("fetch_ui.already_present")
+        print(f"  {comfy_frontend.frontend_dir(data_dir)}")
+        return
+
+    version = args.version or comfy_frontend.FRONTEND_VERSION
+    if args.version:
+        _bilingual("fetch_ui.unpinned_warning")
+
+    _bilingual("fetch_ui.start", version=version)
+
+    try:
+        result = comfy_frontend.fetch(data_dir, version=args.version)
+    except comfy_frontend.FetchError as exc:
+        _bilingual("fetch_ui.failed")
+        raise SystemExit(f"  {exc}")
+
+    _bilingual("fetch_ui.done", files=result["files"])
+    print(f"  {result['dir']}")
+
+
 def _cmd_run(args: argparse.Namespace) -> None:
     app = create_app(args.data_dir)
     uvicorn.run(app, host=args.host, port=args.port)
@@ -212,6 +247,21 @@ def cli() -> None:
     )
     publish.add_argument("--data-dir", default=DEFAULT_DATA_DIR, help="Data directory (default: ./data).")
     publish.set_defaults(func=_cmd_publish_agent)
+
+    fetch_ui = sub.add_parser(
+        "fetch-comfy-ui",
+        help="Download the official ComfyUI frontend for the embedded /comfy editor.",
+    )
+    fetch_ui.add_argument(
+        "--version",
+        default=None,
+        help=(
+            "Override the pinned comfyui-frontend-package version "
+            f"(default: {comfy_frontend.FRONTEND_VERSION}). Skips sha256 verification."
+        ),
+    )
+    fetch_ui.add_argument("--data-dir", default=DEFAULT_DATA_DIR, help="Data directory (default: ./data).")
+    fetch_ui.set_defaults(func=_cmd_fetch_comfy_ui)
 
     args = parser.parse_args()
     args.func(args)
