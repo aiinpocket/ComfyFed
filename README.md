@@ -121,6 +121,25 @@ comfyfed-agent run
 
 之所以要有這層設定，是因為 **workflow 本身就是可執行內容**——一個惡意或設計不良的自訂節點可以在 worker 機器上執行任意程式碼。此白名單是本機端的縱深防禦（agent 執行前擋一次），伺服器端也會另外比對節點需求做派工判斷，兩層互相獨立。
 
+### 產出物雜湊驗證
+
+worker 上傳每個產出檔時會附上該檔案的 sha256（`X-Artifact-SHA256`），伺服器收到後自己重算一次雜湊比對——不符就整個上傳被拒（`artifact.hash_mismatch`），worker 會自動重傳一次；還是不符就直接把工作標記失敗，不會讓損毀或被調包的檔案悄悄入庫。驗證通過的雜湊會存進工作紀錄的 `result_hashes`，`GET /api/jobs/{id}` 可以查到。
+
+### 磁碟清理
+
+worker 每跑完一個工作（不管成功或失敗）都會清掉這個工作在 agent 端暫存的資料；但真正會持續佔用磁碟空間的是**本機 ComfyUI 自己的 `input`／`output` 目錄**——每個工作的參考圖會被複製進 `input`，每次算圖的結果又會落在 `output`，長期跑下去容易把 worker 的硬碟塞滿。
+
+如果想讓 agent 幫忙清這兩個目錄，在 `agent.json` 設定：
+
+```json
+{
+  "comfy_output_dir": "D:/ComfyUI/output",
+  "comfy_input_dir": "D:/ComfyUI/input"
+}
+```
+
+設定後，agent 只會在**該工作成功完成、且產出物雜湊已通過平台驗證**的前提下，才刪除這個工作對應的檔案（依 ComfyUI history 回報的檔名／子目錄組路徑，只刪確認存在、且路徑安全的檔案）；沒設定就完全略過、不動任何 ComfyUI 檔案。失敗的工作一律不刪 ComfyUI 端的產出，方便你事後查原因。
+
 ### 工作自動評估
 
 伺服器收到工作後會自動解析 workflow 需要的節點類別、模型檔案與（若已知）VRAM 需求，對每台候選 worker 給出：
@@ -313,6 +332,25 @@ Each worker sets `node_policy` in `agent.json`:
 - `custom`: allow only a configured list (`whitelist_extra`, intersected with what's installed).
 
 This exists because **a workflow is executable content** — a malicious or poorly-written custom node can run arbitrary code on the worker's machine. This whitelist is local, defense-in-depth (checked before the agent executes anything); the server independently checks node requirements for dispatch decisions, as a second, separate layer.
+
+### Artifact hash verification
+
+Every artifact a worker uploads carries its sha256 (`X-Artifact-SHA256`); the server recomputes the hash itself over the bytes it received and compares. A mismatch rejects the whole upload (`artifact.hash_mismatch`), the agent retries once automatically, and if it still doesn't match the job is marked failed rather than letting a corrupted or swapped file quietly land in storage. A verified hash is stored in the job's `result_hashes` and is visible via `GET /api/jobs/{id}`.
+
+### Disk cleanup
+
+After every job — success or failure — the worker discards whatever it staged for that job in its own memory/temp state. What actually accumulates on disk over time is local ComfyUI's own `input`/`output` directories: every job's reference assets get copied into `input`, and every render lands in `output`. Left alone, that fills the worker's disk.
+
+To have the agent clean those up too, set in `agent.json`:
+
+```json
+{
+  "comfy_output_dir": "D:/ComfyUI/output",
+  "comfy_input_dir": "D:/ComfyUI/input"
+}
+```
+
+With these set, the agent deletes a job's files ONLY once that job succeeded AND its artifact hashes were confirmed by the platform (reconstructing each output's path from the filename/subfolder ComfyUI's history reported, and refusing to touch anything outside the configured directories). Leave them unset and the agent skips this step entirely — it never guesses where ComfyUI's folders are. A failed job's ComfyUI-side outputs are always left in place so you can inspect what happened.
 
 ### Job assessment
 

@@ -69,7 +69,7 @@ worker 斷線（>90s 無心跳）→ assigned/running 的任務自動回 queued 
     - `eligible_after_fetch`——**只缺模型**且聯邦內其他成員有、且磁碟裝得下 → 可派（先補模型再開工：Phase 2 平台中繼、Phase 3 P2P；Phase 1 此類顯示「僅缺模型，待模型分發功能開通」）
     - `ineligible(reasons)`——缺節點安裝／backend 不符／**權重連 VRAM＋系統 RAM 都放不下**等**硬缺口** → 不派，UI 明列原因（「worker-A 缺 IPAdapter 節點」「worker-B 估需 40GB，VRAM 8GB＋RAM 16GB 放不下」）。VRAM 單獨不足**不再**列為硬缺口，改走上述 `vram_offload` 警告；`min_vram_gb` 進階覆寫仍是硬條件。
   - 派工優先序：eligible ＞ eligible_after_fetch（省頻寬）；全部 ineligible 才留佇列＋標示原因。
-- Worker 端執行：收 job → 白名單檢查 → POST 本機 ComfyUI `/prompt` → 輪詢 history/進度 → 上傳產物（圖/影片）→ 回報完成 → 雙方簽收據。
+- Worker 端執行：收 job → 白名單檢查 → POST 本機 ComfyUI `/prompt` → 輪詢 history/進度 → 上傳產物（圖/影片，附 `X-Artifact-SHA256` 供平台驗雜湊，不符或被拒重試一次）→ 回報完成 → 雙方簽收據 → 清除本次 job 的檔案（成功且雜湊確認後，另刪已設定的 ComfyUI input/output 目錄中的本次任務檔，避免 worker 磁碟被塞滿）。
 
 ## 8. 模型分發（Phase 2+，方向已定案）
 

@@ -203,7 +203,7 @@ def test_full_job_lifecycle_over_the_wire(server, mock_comfy, tmp_path):
 
         # ...run the workflow against (mock) ComfyUI...
         results, exec_seconds = comfy.run_workflow("http://mockcomfy", workflow, client=mock_client)
-        assert results == [("out.png", b"FAKE-PNG-BYTES")]
+        assert results == [("out.png", b"FAKE-PNG-BYTES", "")]
         # The mock ComfyUI has no /queue endpoint, so the prompt was never
         # observed under queue_running -- exec_seconds falls back to the span
         # since the local /prompt POST, which still excludes federation
@@ -218,7 +218,7 @@ def test_full_job_lifecycle_over_the_wire(server, mock_comfy, tmp_path):
         # signing goes through the real agent-side `signing.signed_headers`,
         # the same code path a real agent uses, so a future wire-format
         # change there breaks this test instead of a hand-rolled duplicate.
-        filename, content = results[0]
+        filename, content, _subfolder = results[0]
         artifact_path = f"/api/agent/jobs/{job_id}/artifacts"
         prebuilt = httpx.Request(
             "POST",

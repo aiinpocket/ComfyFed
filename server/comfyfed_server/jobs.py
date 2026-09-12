@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 from typing import Optional
@@ -104,6 +105,7 @@ def _job_dict_full(job: db.Job) -> dict:
     d["required_models"] = json.loads(job.required_models or "[]")
     d["started_at"] = job.started_at.isoformat() if job.started_at else None
     d["finished_at"] = job.finished_at.isoformat() if job.finished_at else None
+    d["result_hashes"] = json.loads(job.result_hashes or "{}")
     return d
 
 
@@ -265,10 +267,45 @@ def create_router(data_dir: str) -> APIRouter:
         except ValueError:
             raise _error(400, "jobs.bad_asset_name", f"Invalid artifact filename: {file.filename!r}")
 
+        # Hash the bytes ourselves rather than trusting the agent's claim: this
+        # is what lets a corrupted-in-transit or swapped artifact be caught
+        # before it's persisted. `file.file` is a SpooledTemporaryFile already
+        # fully buffered by `request.form()` above, so reading it through once
+        # and seeking back to 0 costs no extra I/O round trip and leaves
+        # `store.put` free to stream it to disk exactly as before.
+        hasher = hashlib.sha256()
+        for chunk in iter(lambda: file.file.read(1024 * 1024), b""):
+            hasher.update(chunk)
+        computed_sha256 = hasher.hexdigest()
+        file.file.seek(0)
+
+        # The header is optional for backward compatibility with older agents
+        # that don't send it yet; when present, a mismatch means the bytes the
+        # platform received are not the bytes the worker produced (corruption
+        # or a swap in transit), so the upload is rejected outright.
+        claimed_sha256 = request.headers.get("X-Artifact-SHA256")
+        if claimed_sha256 and claimed_sha256.strip().lower() != computed_sha256:
+            raise _error(
+                400,
+                "artifact.hash_mismatch",
+                "Uploaded artifact does not match the declared X-Artifact-SHA256.",
+            )
+
         store = storage.get_store(data_dir)
         stored = store.put(job_id, artifact_name, file.file)
 
-        return {"stored": stored}
+        with db.get_session() as session:
+            job = session.get(db.Job, job_id)
+            if job is not None:
+                try:
+                    hashes = json.loads(job.result_hashes or "{}")
+                except (TypeError, ValueError):
+                    hashes = {}
+                hashes[stored] = computed_sha256
+                job.result_hashes = json.dumps(hashes)
+                session.commit()
+
+        return {"stored": stored, "sha256": computed_sha256}
 
     @r.get("/api/jobs/{job_id}/artifacts/{filename}")
     def get_job_artifact(job_id: str, filename: str, _payload: dict = Depends(auth.require_admin)):

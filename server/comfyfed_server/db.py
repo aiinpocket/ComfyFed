@@ -81,6 +81,7 @@ class Job(Base):
     required_models: Mapped[str] = mapped_column(String, default="[]", server_default="[]")
     est_vram_gb: Mapped[Optional[float]] = mapped_column(Float, nullable=True)
     input_assets: Mapped[str] = mapped_column(String, default="[]", server_default="[]")
+    result_hashes: Mapped[str] = mapped_column(String, default="{}", server_default="{}")
 
 
 class Receipt(Base):

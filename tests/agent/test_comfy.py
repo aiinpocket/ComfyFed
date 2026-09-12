@@ -94,7 +94,7 @@ def test_run_workflow_returns_output_files(client):
         on_progress=progress_calls.append,
         client=client,
     )
-    assert files == [("out.png", b"PNGDATA")]
+    assert files == [("out.png", b"PNGDATA", "")]
     assert progress_calls[-1] == 1.0
     # Never observed running in /queue (history was already there on the
     # first poll), so exec_seconds falls back to the span since the local
@@ -153,7 +153,7 @@ def test_run_workflow_reports_a_moving_estimate_while_queued(client, monkeypatch
         expected_seconds=60,
     )
 
-    assert files == [("out.png", b"PNGDATA")]
+    assert files == [("out.png", b"PNGDATA", "")]
     assert progress_calls[0] == 0.0
     assert progress_calls[-1] == 1.0
 
@@ -216,7 +216,7 @@ def test_run_workflow_exec_seconds_excludes_queue_wait(client, monkeypatch):
     )
     total_elapsed = comfy.time.monotonic() - submitted_at
 
-    assert files == [("out.png", b"PNGDATA")]
+    assert files == [("out.png", b"PNGDATA", "")]
     assert exec_seconds is not None
     # exec_seconds only starts counting once the prompt is first seen under
     # queue_running (after the 3 pending-only polls), so it is strictly less

@@ -4,8 +4,10 @@ from __future__ import annotations
 
 import asyncio
 import gzip
+import hashlib
 import json
 import logging
+import os
 import time
 from typing import Optional
 from urllib.parse import urlsplit, urlunsplit
@@ -140,6 +142,96 @@ class PlatformConnection:
         return self._sign(payload.encode())
 
 
+def _is_safe_relative_path(path: str) -> bool:
+    """True if `path` (a ComfyUI filename or subfolder) is safe to join onto a
+    configured base directory: not absolute and with no `..` component.
+
+    ComfyUI-reported names are not attacker-controlled in the usual sense
+    (they come back from our own local ComfyUI's history/`/view`), but a
+    malformed or unexpected value here must never turn into a delete outside
+    `comfy_output_dir`/`comfy_input_dir` -- so this is checked unconditionally
+    before any `os.remove`.
+    """
+    if not path:
+        return True
+    if os.path.isabs(path):
+        return False
+    return ".." not in path.replace("\\", "/").split("/")
+
+
+def _safe_remove_under(base_dir: str, *components: str) -> None:
+    """Best-effort delete of `base_dir/<components>`, refusing unsafe paths.
+
+    Never raises: a path that fails the safety check or a file that no
+    longer exists is logged and skipped, and any OS-level failure (permission
+    denied, file in use) is caught and logged too. Cleanup must never be able
+    to turn a successfully-reported job into a crashed one.
+    """
+    for component in components:
+        if not _is_safe_relative_path(component):
+            logger.warning(
+                "runner: refusing to clean up unsafe path component %r under %s", component, base_dir
+            )
+            return
+
+    path = os.path.join(base_dir, *(c for c in components if c))
+    try:
+        if os.path.isfile(path):
+            os.remove(path)
+    except OSError:
+        logger.exception("runner: failed to remove %s during job cleanup", path)
+
+
+def cleanup_job_files(
+    *,
+    success: bool,
+    comfy_output_dir: Optional[str],
+    comfy_input_dir: Optional[str],
+    output_files: list[dict],
+    input_filenames: list[str],
+) -> None:
+    """Best-effort disk cleanup for one finished job.
+
+    Called from `handle_job`'s `finally`, so it runs whether the job
+    succeeded or failed. This agent keeps a job's downloaded inputs and the
+    outputs pulled back from ComfyUI's `/view` in memory only -- nothing of
+    that kind is ever written to a local temp file, so there is no
+    agent-private temp file to remove here.
+
+    What DOES accumulate on disk without bound is ComfyUI's OWN `input` and
+    `output` directories: every job's assets get copied into
+    `comfy_input_dir` (by `comfy.upload_input`) and every render lands in
+    `comfy_output_dir`. Deleting this job's entries there is the cleanup that
+    actually keeps the worker's disk from filling up, and it only runs when:
+
+    - both directories are configured (an operator who hasn't set them gets
+      no deletions and a log line explaining why, never a guess at where
+      ComfyUI's folders live), and
+    - `success` is true -- i.e. the run finished AND every artifact's upload
+      was hash-verified by the platform. A failed job's (possibly partial)
+      outputs are left in place for the operator to inspect.
+
+    `output_files` is a list of `{"filename", "subfolder"}` dicts (from
+    `comfy.run_workflow`'s results) and `input_filenames` the job's own
+    `input_assets` list, both from `handle_job`.
+    """
+    if not success:
+        logger.debug("runner: job did not succeed, skipping ComfyUI-directory cleanup")
+        return
+
+    if comfy_output_dir:
+        for item in output_files:
+            _safe_remove_under(comfy_output_dir, item.get("subfolder") or "", item.get("filename") or "")
+    else:
+        logger.debug("runner: comfy_output_dir not configured, skipping worker output cleanup")
+
+    if comfy_input_dir:
+        for filename in input_filenames:
+            _safe_remove_under(comfy_input_dir, filename)
+    else:
+        logger.debug("runner: comfy_input_dir not configured, skipping worker input cleanup")
+
+
 class AgentLoop:
     """Owns one `PlatformConnection` per configured platform and one global job lock."""
 
@@ -202,6 +294,9 @@ class AgentLoop:
     async def handle_job(self, conn: PlatformConnection, job_msg: dict) -> None:
         """Run one job dispatched over `conn`, broadcasting busy state to every platform."""
         job_id = job_msg["job_id"]
+        input_filenames = list(job_msg.get("input_assets") or [])
+        output_files: list[dict] = []
+        success = False
         async with self.job_lock:
             try:
                 await self.broadcast_heartbeat("busy", progress=0.0, job_id=job_id)
@@ -218,7 +313,7 @@ class AgentLoop:
                 )
                 whitelist.check(workflow, allowed)
 
-                for filename in job_msg.get("input_assets") or []:
+                for filename in input_filenames:
                     content = await self._download_input(conn.entry, job_id, filename)
                     await asyncio.to_thread(comfy.upload_input, self.config.comfy_url, filename, content)
 
@@ -236,17 +331,31 @@ class AgentLoop:
                 files, exec_seconds = await asyncio.to_thread(
                     comfy.run_workflow, self.config.comfy_url, workflow, on_progress
                 )
+                output_files = [
+                    {"filename": filename, "subfolder": subfolder} for filename, _content, subfolder in files
+                ]
 
-                for filename, content in files:
+                for filename, content, _subfolder in files:
                     await self._upload_artifact(conn.entry, job_id, filename, content)
 
                 await conn.send_job_done(
-                    job_id, [filename for filename, _content in files], exec_seconds
+                    job_id, [filename for filename, _content, _subfolder in files], exec_seconds
                 )
+                success = True
             except Exception as exc:
                 logger.exception("runner: job %s failed", job_id)
                 await conn.send_job_failed(job_id, str(exc))
             finally:
+                try:
+                    cleanup_job_files(
+                        success=success,
+                        comfy_output_dir=self.config.comfy_output_dir,
+                        comfy_input_dir=self.config.comfy_input_dir,
+                        output_files=output_files,
+                        input_filenames=input_filenames,
+                    )
+                except Exception:
+                    logger.exception("runner: job %s cleanup raised unexpectedly", job_id)
                 await self.broadcast_heartbeat("idle", progress=0.0, job_id=None)
 
     async def _download_input(self, entry: PlatformEntry, job_id: str, filename: str) -> bytes:
@@ -258,14 +367,41 @@ class AgentLoop:
             return resp.content
 
     async def _upload_artifact(self, entry: PlatformEntry, job_id: str, filename: str, content: bytes) -> None:
+        """Upload one job artifact and verify the platform received it uncorrupted.
+
+        Sends the locally computed sha256 as `X-Artifact-SHA256`; the
+        platform recomputes its own hash over the bytes it received and
+        echoes it back in `{"sha256": ...}`. Only a response whose hash
+        matches ours counts as success -- a mismatch (corruption or a swap in
+        transit) or any non-2xx (including the platform's own 400
+        `artifact.hash_mismatch`) is retried once with a fresh upload. If
+        that also fails, raises so `handle_job` reports the job failed
+        instead of silently losing or corrupting the result.
+        """
         path = f"/api/agent/jobs/{job_id}/artifacts"
-        async with httpx.AsyncClient(base_url=entry.platform_url) as client:
-            request = client.build_request("POST", path, files={"file": (filename, content)})
-            body = request.read()
-            headers = signing.signed_headers(entry, "POST", path, body)
-            request.headers.update(headers)
-            resp = await client.send(request)
-            resp.raise_for_status()
+        local_sha256 = hashlib.sha256(content).hexdigest()
+
+        for attempt in range(2):
+            try:
+                async with httpx.AsyncClient(base_url=entry.platform_url) as client:
+                    request = client.build_request("POST", path, files={"file": (filename, content)})
+                    body = request.read()
+                    headers = signing.signed_headers(entry, "POST", path, body)
+                    headers["X-Artifact-SHA256"] = local_sha256
+                    request.headers.update(headers)
+                    resp = await client.send(request)
+
+                if resp.status_code == 200 and resp.json().get("sha256") == local_sha256:
+                    return
+
+                logger.warning(
+                    "runner: artifact upload for %r not confirmed (status=%s, attempt=%d)",
+                    filename, resp.status_code, attempt + 1,
+                )
+            except Exception:
+                logger.exception("runner: artifact upload for %r raised (attempt=%d)", filename, attempt + 1)
+
+        raise RuntimeError("artifact upload failed")
 
     async def _handle_message(self, conn: PlatformConnection, message: dict) -> None:
         msg_type = message.get("type")

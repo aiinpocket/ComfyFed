@@ -138,11 +138,15 @@ def run_workflow(
     on_progress: Optional[Callable[[float], None]] = None,
     client: Optional[httpx.Client] = None,
     expected_seconds: float = _DEFAULT_EXPECTED_SECONDS,
-) -> tuple[list[tuple[str, bytes]], Optional[float]]:
+) -> tuple[list[tuple[str, bytes, str]], Optional[float]]:
     """Submit `workflow` to ComfyUI, poll until done, and return its outputs.
 
-    Returns `(files, exec_seconds)`: `files` is a list of (filename, content)
-    tuples for every image/gif/video output produced by the run.
+    Returns `(files, exec_seconds)`: `files` is a list of
+    (filename, content, subfolder) tuples for every image/gif/video output
+    produced by the run. `subfolder` is ComfyUI's own subfolder for that
+    output (often "") and is carried through so a caller can reconstruct the
+    exact on-disk path ComfyUI itself used -- e.g. to clean up its output
+    directory after the artifact is safely uploaded elsewhere.
     `exec_seconds` is the measured wall-clock span between the first moment
     this prompt was observed under ComfyUI's `/queue` `queue_running` (i.e.
     GPU execution actually started, as opposed to merely being queued behind
@@ -229,19 +233,20 @@ def run_workflow(
         if on_progress is not None:
             on_progress(1.0)
 
-        results: list[tuple[str, bytes]] = []
+        results: list[tuple[str, bytes, str]] = []
         outputs = history_entry.get("outputs") or {}
         for node_output in outputs.values():
             for key in ("images", "gifs", "videos"):
                 for item in node_output.get(key, []) or []:
+                    subfolder = item.get("subfolder", "")
                     params = {
                         "filename": item["filename"],
-                        "subfolder": item.get("subfolder", ""),
+                        "subfolder": subfolder,
                         "type": item.get("type", "output"),
                     }
                     view_resp = c.get(f"{comfy_url.rstrip('/')}/view", params=params)
                     view_resp.raise_for_status()
-                    results.append((item["filename"], view_resp.content))
+                    results.append((item["filename"], view_resp.content, subfolder))
         return results, exec_seconds
     finally:
         if owns:

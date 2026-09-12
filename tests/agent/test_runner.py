@@ -1,10 +1,14 @@
+import hashlib
 import json
+import os
 
+import httpx
 import pytest
 
 from comfyfed_agent import comfy, hardware, whitelist
 from comfyfed_agent.config import AgentConfig, PlatformEntry
-from comfyfed_agent.runner import AgentLoop
+from comfyfed_agent.runner import AgentLoop, cleanup_job_files
+from comfyfed_agent import runner as runner_module
 
 _real_whitelist_check = whitelist.check
 
@@ -241,3 +245,261 @@ async def test_broadcast_heartbeat_carries_each_connections_object_info_hash(two
     await loop.broadcast_heartbeat("idle")
 
     assert conn_a.heartbeats[-1]["object_info_hash"] == "deadbeef"
+
+
+# --- Artifact hash verification -------------------------------------------
+
+
+class _FakeArtifactResponse:
+    def __init__(self, status_code, sha256=None):
+        self.status_code = status_code
+        self._sha256 = sha256
+
+    def json(self):
+        return {"sha256": self._sha256}
+
+
+def _fake_async_client_factory(responses):
+    """A `httpx.AsyncClient` stand-in that pops one canned response per `send`."""
+
+    class _FakeAsyncClient:
+        def __init__(self, *args, **kwargs):
+            pass
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *args):
+            return False
+
+        def build_request(self, method, path, files=None):
+            return httpx.Request(method, "http://testserver" + path, files=files)
+
+        async def send(self, request):
+            return responses.pop(0)
+
+    return _FakeAsyncClient
+
+
+async def test_upload_artifact_succeeds_when_response_hash_matches(two_platform_loop, monkeypatch):
+    loop = two_platform_loop
+    entry = loop.connections["worker-a"].entry
+    content = b"pixel-bytes"
+    correct_hash = hashlib.sha256(content).hexdigest()
+
+    monkeypatch.setattr(
+        runner_module.httpx, "AsyncClient", _fake_async_client_factory([_FakeArtifactResponse(200, correct_hash)])
+    )
+
+    await loop._upload_artifact(entry, "job-x", "out.png", content)  # must not raise
+
+
+async def test_upload_artifact_retries_once_then_succeeds(two_platform_loop, monkeypatch):
+    loop = two_platform_loop
+    entry = loop.connections["worker-a"].entry
+    content = b"pixel-bytes"
+    correct_hash = hashlib.sha256(content).hexdigest()
+
+    # First attempt: platform rejects with a hash mismatch (400, no sha256).
+    # Second attempt: succeeds with the matching hash.
+    monkeypatch.setattr(
+        runner_module.httpx,
+        "AsyncClient",
+        _fake_async_client_factory([_FakeArtifactResponse(400, None), _FakeArtifactResponse(200, correct_hash)]),
+    )
+
+    await loop._upload_artifact(entry, "job-x", "out.png", content)  # must not raise
+
+
+async def test_upload_artifact_raises_after_two_failed_attempts(two_platform_loop, monkeypatch):
+    loop = two_platform_loop
+    entry = loop.connections["worker-a"].entry
+    content = b"pixel-bytes"
+
+    monkeypatch.setattr(
+        runner_module.httpx,
+        "AsyncClient",
+        _fake_async_client_factory([_FakeArtifactResponse(400, None), _FakeArtifactResponse(400, None)]),
+    )
+
+    with pytest.raises(RuntimeError, match="artifact upload failed"):
+        await loop._upload_artifact(entry, "job-x", "out.png", content)
+
+
+async def test_handle_job_reports_job_failed_when_artifact_upload_never_verifies(two_platform_loop, monkeypatch):
+    loop = two_platform_loop
+    conn_a = loop.connections["worker-a"]
+
+    monkeypatch.setattr(comfy, "run_workflow", lambda *a, **k: ([("out.png", b"bytes", "")], 1.0))
+    monkeypatch.setattr(
+        runner_module.httpx,
+        "AsyncClient",
+        _fake_async_client_factory([_FakeArtifactResponse(400, None), _FakeArtifactResponse(400, None)]),
+    )
+
+    job_msg = {
+        "job_id": "job-hash-fail",
+        "workflow_json": json.dumps({"1": {"class_type": "KSampler", "inputs": {}}}),
+        "input_assets": [],
+    }
+
+    await loop.handle_job(conn_a, job_msg)
+
+    assert conn_a.job_failed == ("job-hash-fail", "artifact upload failed")
+
+
+# --- Worker-side job file cleanup -------------------------------------------
+
+
+def test_cleanup_job_files_removes_configured_output_and_input_files(tmp_path):
+    output_dir = tmp_path / "output"
+    input_dir = tmp_path / "input"
+    (output_dir / "sub").mkdir(parents=True)
+    input_dir.mkdir()
+    out_file = output_dir / "sub" / "result.png"
+    out_file.write_bytes(b"x")
+    in_file = input_dir / "ref.png"
+    in_file.write_bytes(b"y")
+
+    cleanup_job_files(
+        success=True,
+        comfy_output_dir=str(output_dir),
+        comfy_input_dir=str(input_dir),
+        output_files=[{"filename": "result.png", "subfolder": "sub"}],
+        input_filenames=["ref.png"],
+    )
+
+    assert not out_file.exists()
+    assert not in_file.exists()
+
+
+def test_cleanup_job_files_skips_everything_on_failure(tmp_path):
+    output_dir = tmp_path / "output"
+    input_dir = tmp_path / "input"
+    output_dir.mkdir()
+    input_dir.mkdir()
+    out_file = output_dir / "result.png"
+    out_file.write_bytes(b"x")
+    in_file = input_dir / "ref.png"
+    in_file.write_bytes(b"y")
+
+    cleanup_job_files(
+        success=False,
+        comfy_output_dir=str(output_dir),
+        comfy_input_dir=str(input_dir),
+        output_files=[{"filename": "result.png", "subfolder": ""}],
+        input_filenames=["ref.png"],
+    )
+
+    assert out_file.exists()
+    assert in_file.exists()
+
+
+def test_cleanup_job_files_no_op_when_dirs_not_configured(tmp_path):
+    # Must not raise even though there is nowhere configured to clean up.
+    cleanup_job_files(
+        success=True,
+        comfy_output_dir=None,
+        comfy_input_dir=None,
+        output_files=[{"filename": "result.png", "subfolder": ""}],
+        input_filenames=["ref.png"],
+    )
+
+
+def test_cleanup_job_files_refuses_path_traversal(tmp_path):
+    output_dir = tmp_path / "output"
+    output_dir.mkdir()
+    canary = tmp_path / "canary.txt"
+    canary.write_bytes(b"do-not-delete")
+
+    cleanup_job_files(
+        success=True,
+        comfy_output_dir=str(output_dir),
+        comfy_input_dir=None,
+        output_files=[{"filename": "canary.txt", "subfolder": ".."}],
+        input_filenames=[],
+    )
+
+    assert canary.exists()
+
+
+async def test_handle_job_cleans_up_comfy_output_dir_on_success(two_platform_loop, monkeypatch, tmp_path):
+    loop = two_platform_loop
+    conn_a = loop.connections["worker-a"]
+    output_dir = tmp_path / "output"
+    output_dir.mkdir()
+    out_file = output_dir / "result.png"
+    out_file.write_bytes(b"x")
+    loop.config.comfy_output_dir = str(output_dir)
+
+    monkeypatch.setattr(comfy, "run_workflow", lambda *a, **k: ([("result.png", b"bytes", "")], 1.0))
+    monkeypatch.setattr(AgentLoop, "_upload_artifact", lambda self, *a, **k: _noop_coro())
+
+    job_msg = {
+        "job_id": "job-cleanup-out",
+        "workflow_json": json.dumps({"1": {"class_type": "KSampler", "inputs": {}}}),
+        "input_assets": [],
+    }
+
+    await loop.handle_job(conn_a, job_msg)
+
+    assert conn_a.job_done == ("job-cleanup-out", ["result.png"], 1.0)
+    assert not out_file.exists()
+
+
+async def test_handle_job_leaves_comfy_output_dir_untouched_when_not_configured(
+    two_platform_loop, monkeypatch, tmp_path
+):
+    loop = two_platform_loop
+    conn_a = loop.connections["worker-a"]
+    output_dir = tmp_path / "output"
+    output_dir.mkdir()
+    out_file = output_dir / "result.png"
+    out_file.write_bytes(b"x")
+    assert loop.config.comfy_output_dir is None
+
+    monkeypatch.setattr(comfy, "run_workflow", lambda *a, **k: ([("result.png", b"bytes", "")], 1.0))
+    monkeypatch.setattr(AgentLoop, "_upload_artifact", lambda self, *a, **k: _noop_coro())
+
+    job_msg = {
+        "job_id": "job-cleanup-noop",
+        "workflow_json": json.dumps({"1": {"class_type": "KSampler", "inputs": {}}}),
+        "input_assets": [],
+    }
+
+    await loop.handle_job(conn_a, job_msg)
+
+    assert out_file.exists()  # untouched: comfy_output_dir was never configured
+
+
+async def test_handle_job_cleans_up_comfy_input_dir_on_success(two_platform_loop, monkeypatch, tmp_path):
+    loop = two_platform_loop
+    conn_a = loop.connections["worker-a"]
+    input_dir = tmp_path / "input"
+    input_dir.mkdir()
+    in_file = input_dir / "ref.png"
+    in_file.write_bytes(b"y")
+    loop.config.comfy_input_dir = str(input_dir)
+
+    monkeypatch.setattr(AgentLoop, "_download_input", lambda self, *a, **k: _bytes_coro(b"ref-bytes"))
+    monkeypatch.setattr(comfy, "upload_input", lambda *a, **k: None)
+    monkeypatch.setattr(comfy, "run_workflow", lambda *a, **k: ([], 1.0))
+
+    job_msg = {
+        "job_id": "job-cleanup-in",
+        "workflow_json": json.dumps({"1": {"class_type": "KSampler", "inputs": {}}}),
+        "input_assets": ["ref.png"],
+    }
+
+    await loop.handle_job(conn_a, job_msg)
+
+    assert conn_a.job_done == ("job-cleanup-in", [], 1.0)
+    assert not in_file.exists()
+
+
+async def _noop_coro():
+    return None
+
+
+async def _bytes_coro(value: bytes) -> bytes:
+    return value
