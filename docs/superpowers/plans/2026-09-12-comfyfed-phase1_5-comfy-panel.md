@@ -61,3 +61,12 @@
 - 素材隨範本：amyntas_ref.png 打包進 server package data；create_app 時 seed 進 data/comfy_staging；/comfy/api/object_info 回應後處理：把 staging 現有檔名注入 LoadImage 的 image 欄位 options（聯集、去重），使範本的 LoadImage 下拉即選即用；送單走既有 resolve_asset 管線。
 - 縮圖：用實際成品（panel_verify.png、電影 QC 幀）轉 webp。
 - 測試：範本路由 serve index/JSON/縮圖＋未登入擋；object_info 注入 staging 檔名；template workflow JSON 結構 sanity（nodes 含 Note、引用素材=打包素材名）；wheel package-data 打包驗證。README 兩語新增「範本」段。
+
+### Task 8: 缺模型指南＋R2 模型鏡像連結（使用者定案 2026-09-13）
+- 問題：全新安裝的用戶 clone 範本後沒有模型檔，範本等於廢的；模型太大不進 git。
+- 模型鏡像：Cloudflare R2 公開 bucket，base URL https://pub-6a50550b7f984673a3ab1a1b580e4fb9.r2.dev/models/<category>/<filename>（結構鏡射 ComfyUI models 目錄）。
+- 每支範本新增一則「⓪ 缺模型？」MarkdownNote（雙語、放最左上）：列出本範本所需全部模型——檔名、放置路徑（models/ 下子資料夾）、大小、R2 下載連結；說明「放好檔案後不用重啟 ComfyUI 或 worker：agent 每 10 分鐘自動重掃並回報平台，評估會自動轉綠（急的話重啟 agent 立即生效）」。
+- index.json：若官方 template schema 支援 models 欄位（name/url/directory），一併填入（前端可能顯示模型需求）；不支援則僅便條＋README。
+- README 兩語：「模型下載」章節——總表（9 檔、各大小、R2 連結、放置路徑）、磁碟需求總量、agent 自動偵測說明。
+- Console Jobs 頁評估明細的 missing_models reason 已有；無 UI 變更需求。
+- 測試：範本 JSON 含缺模型便條且列出的檔名/路徑與該範本 loader 引用完全一致（防漂移）；README 連結格式正確。
