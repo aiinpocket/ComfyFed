@@ -213,9 +213,9 @@ def test_i18n_both_languages():
 **Interfaces:**
 - Consumes: `db`, `require_admin`, `verify_agent`
 - Produces:
-  - `POST /api/jobs {workflow_json, requirements?}`（admin, csrf）→ `{job_id}`（status=queued）；requirements JSON 選填：`{min_vram_gb?: float, min_free_disk_gb?: float, gpu_name_contains?: str}` 存 `Job.requirements: str='{}'`（Task 2 的 Job 表加此欄）；`GET /api/jobs?status=`（admin）；`GET /api/jobs/{id}`
+  - `POST /api/jobs`（admin, csrf，**multipart**：`workflow_json` 欄位＋零或多個 `assets` 檔案）→ `{job_id}`（status=queued）；伺服端呼叫 `assess.extract` 偵測 workflow 引用的輸入素材（LoadImage/LoadImageMask 節點的 `image` 欄位字串值）——引用了但未附的檔 → 400 `jobs.missing_assets`（回缺檔清單）；附檔存 `data/job_inputs/<job_id>/<filename>`；新增 Alembic migration 加 `Job.input_assets: str='[]'`（JSON list of filenames）；`GET /api/agent/jobs/{id}/inputs/{filename}`（signed，僅 assigned worker）供 agent 下載；requirements JSON 選填：`{min_vram_gb?: float, min_free_disk_gb?: float, gpu_name_contains?: str}` 存 `Job.requirements: str='{}'`（Task 2 的 Job 表加此欄）；`GET /api/jobs?status=`（admin）；`GET /api/jobs/{id}`
   - 新模組 `server/comfyfed_server/assess.py`——**自動任務評估引擎**（使用者不需手填需求）：
-    - `assess.extract(workflow: dict) -> JobNeeds(nodes: set, models: set, est_vram_gb: float|None)`：nodes=各 node 的 class_type；models=掃描 inputs 中的模型欄位（欄位名 ∈ {ckpt_name, unet_name, clip_name, clip_name1, clip_name2, vae_name, lora_name, model_name, control_net_name, style_model_name, upscale_model_name}，值為 str 且以 .safetensors/.ckpt/.pt/.sft/.gguf 結尾）；est_vram_gb=Σ(引用模型大小，查各 worker 回報庫存取最大已知值)×1.15，查無任何大小→None（不做 VRAM 判定）
+    - `assess.extract(workflow: dict) -> JobNeeds(nodes: set, models: set, est_vram_gb: float|None, assets: set)`——assets=LoadImage/LoadImageMask 節點 inputs 的 `image` 字串值（**任務輸入素材，如角色形象參考圖**；與模型分開處理：模型走庫存判定，素材隨任務附檔）：nodes=各 node 的 class_type；models=掃描 inputs 中的模型欄位（欄位名 ∈ {ckpt_name, unet_name, clip_name, clip_name1, clip_name2, vae_name, lora_name, model_name, control_net_name, style_model_name, upscale_model_name}，值為 str 且以 .safetensors/.ckpt/.pt/.sft/.gguf 結尾）；est_vram_gb=Σ(引用模型大小，查各 worker 回報庫存取最大已知值)×1.15，查無任何大小→None（不做 VRAM 判定）
     - `assess.verdict(worker, needs, requirements_override: dict) -> Verdict(kind: "eligible"|"eligible_after_fetch"|"ineligible", reasons: list[str], missing_models: list[str])`：缺節點/backend 不符/est_vram>vram_gb/override 不符→ineligible（reasons 用穩定 code 如 `missing_nodes:IPAdapter`、`vram:18.2>12`）；僅缺模型且聯邦內其他 worker 庫存有＋free_disk 夠→eligible_after_fetch；全過→eligible
   - Job 表欄位改：`required_nodes: str='[]'`, `required_models: str='[]'`, `est_vram_gb: float|None`, `requirements: str='{}'`（=進階覆寫，預設空）
   - `dispatch.pick_job_for` 只派 verdict=eligible（Phase 1；eligible_after_fetch 標記於 job 供 UI 顯示「僅缺模型，待模型分發開通」）
@@ -240,7 +240,7 @@ def test_i18n_both_languages():
   - 握手成功後 agent 立即送 `{"type":"hello","hardware":{gpu_name,vram_gb,cpu,cpu_cores,ram_gb,agent_version},"backend":"cuda|rocm|mps|cpu","torch_version":str,"node_classes":[...]}`——node_classes 取自本機 ComfyUI `GET /object_info` 的鍵集合（=真實安裝節點含 custom nodes），依 agent 端 node_policy 過濾後上報；server 存 Worker.hardware/backend/torch_version/node_classes（硬體採集：`nvidia-smi --query-gpu=name,memory.total`、`psutil`、`shutil.disk_usage(comfy 模型目錄)`；backend 偵測：nvidia-smi 成功→cuda、否則試 rocm-smi、`platform.system()=="Darwin"`→mps、fallback cpu）
   - agent→server：`{"type":"heartbeat","state":"idle|busy","progress":float,"job_id":str|None,"dynamic":{free_vram_gb,free_ram_gb,free_disk_gb}}`（server 更新 last_seen/status/dynamic/job.progress）
   - agent→server：`{"type":"inventory","models":[{"name":"diffusion_models/x.safetensors","size":123}]}`——上線後與每 10 分鐘掃描 ComfyUI models 目錄（相對路徑＋bytes）；server 存 `Worker.model_inventory: str='[]'`（Task 2 Worker 表加此欄）——評估引擎與未來 P2P tracker 的資料源；`{"type":"job_done","job_id","result_files":[names]}`；`{"type":"job_failed","job_id","error"}`
-  - server→agent：`{"type":"job","job_id","workflow_json"}`（僅對 state=idle 者推）
+  - server→agent：`{"type":"job","job_id","workflow_json","input_assets":[filenames]}`（僅對 state=idle 者推）
   - server 背景迴圈每 5s：`requeue_stale()`＋為每個 idle 連線 `pick_job_for` 並推送
 - [ ] **Step 1: 失敗測試**（TestClient websocket：未簽名關閉 4401；簽名握手 ready；送 heartbeat 後 DB last_seen 更新且 status=online；enqueue job 後 idle 連線收到 job 訊息；回 job_done 後 job status=done）
 - [ ] **Step 2: FAIL → Step 3: 實作 → Step 4: PASS**
@@ -273,7 +273,8 @@ def test_i18n_both_languages():
   - `whitelist.allowed_classes(policy: str, comfy_url: str, custom: list) -> set`：policy=`installed`（預設）→ 本機 `/object_info` 鍵集合；`official_only` → 內建常數 `OFFICIAL_NODE_CLASSES`（官方 nodes 快照）∩ installed；`custom` → 自訂清單 ∩ installed
   - `whitelist.check(workflow: dict, allowed: set) -> None|raises NodeNotAllowed(node_class)`（雙保險：平台派工已比對過交集，agent 端仍再驗一次——不信任平台的防禦縱深）
   - `comfy.run_workflow(comfy_url, workflow, on_progress) -> list[Path]`：POST /prompt→輪詢 /history→下載 outputs 到暫存
-  - `runner.AgentLoop(config)`：對每個 platform 開 WS；收 job→全平台廣播 busy→白名單→run_workflow（進度回 WS）→上傳 artifacts→job_done→收 receipt→ack→廣播 idle；單一併發（一次一 job）
+  - `comfy.upload_input(comfy_url, filename, content: bytes) -> None`：POST ComfyUI `/upload/image`（multipart，overwrite=true）——把任務附帶的輸入素材（參考圖等）放進本機 ComfyUI input 目錄
+  - `runner.AgentLoop(config)`：對每個 platform 開 WS；收 job（訊息含 `input_assets` 清單）→全平台廣播 busy→白名單→**逐一下載 input assets（signed GET `/api/agent/jobs/{id}/inputs/{f}`）→ upload_input 到本機 ComfyUI**→run_workflow（進度回 WS）→上傳 artifacts→job_done→收 receipt→ack→廣播 idle；單一併發（一次一 job）
   - `cli()`：`comfyfed-agent register <bundle.json>`、`comfyfed-agent run`
 - [ ] **Step 1: 失敗測試**（白名單擋未知節點；mock comfy 跑通回檔案；AgentLoop 對兩個 mock 平台：A 派工時 B 收到 busy 心跳）
 - [ ] **Step 2: FAIL → Step 3: 實作 → Step 4: PASS**
@@ -290,7 +291,7 @@ def test_i18n_both_languages():
 - Produces: `npm run build` 產 `web/dist`；頁面功能：
   - Login（錯誤碼→i18n 訊息）；右上語言切換（localStorage）
   - Dashboard：worker 卡片（online/offline/busy、進度條、last_seen、**硬體摘要：GPU 型號＋VRAM、RAM、磁碟可用**）＋佇列摘要；5s 輪詢 `GET /api/workers`、`GET /api/jobs?status=queued,assigned,running`
-  - Jobs：貼上/上傳 workflow JSON 送出（需求**全自動評估**；「進階」摺疊區才有手動覆寫欄）；任務表（狀態、進度、結果檔下載連結）；queued 任務點開顯示**評估明細**：每個 worker 的三態判定＋白話原因（「只缺模型 X──等模型分發功能」「缺 IPAdapter 節點」「VRAM 不足：需約 18GB／僅 12GB」）
+  - Jobs：貼上/上傳 workflow JSON 送出（需求**全自動評估**；「進階」摺疊區才有手動覆寫欄）；貼上後前端即時解析 LoadImage 引用的輸入檔名並逐一顯示附檔欄位（**角色形象參考圖等隨任務上傳**，缺檔不能送出、雙語提示）；任務表（狀態、進度、結果檔下載連結）；queued 任務點開顯示**評估明細**：每個 worker 的三態判定＋白話原因（「只缺模型 X──等模型分發功能」「缺 IPAdapter 節點」「VRAM 不足：需約 18GB／僅 12GB」）
   - Workers：新增（輸入名稱→顯示 bundle JSON＋下載按鈕）、停用
   - Reports：日期區間選擇→貢獻表
   - Settings：改密碼、platform_url、預設語言
