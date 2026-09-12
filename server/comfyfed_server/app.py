@@ -7,7 +7,7 @@ import os
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import JSONResponse
 
-from . import auth, bootstrap, db
+from . import auth, bootstrap, db, workers
 
 
 def _error_body(code: str, message: str) -> dict:
@@ -45,5 +45,6 @@ def create_app(data_dir: str) -> FastAPI:
     app = FastAPI(title="ComfyFed")
     app.add_exception_handler(HTTPException, _http_exception_handler)
     app.include_router(auth.router)
+    app.include_router(workers.create_router(data_dir))
 
     return app
