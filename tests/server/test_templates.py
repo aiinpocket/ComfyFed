@@ -81,7 +81,11 @@ def _backup_url(name):
     return GCS_MODEL_BASE + MODEL_SOURCES[name]["dir"] + "/" + name
 
 
-_GCS_URL_RE = re.compile(re.escape(GCS_MODEL_BASE) + r"\S+")
+# A model link, i.e. the mirror base plus at least one path character. URL
+# characters only, so prose that quotes the bare base in backticks (the
+# README's "the mirror lives at `<base>/`" sentences) is not mistaken for a
+# link to a file called 「，目錄結構…」.
+_GCS_URL_RE = re.compile(re.escape(GCS_MODEL_BASE) + r"[A-Za-z0-9._/~%+-]+")
 
 
 def _gcs_urls_in(text):
@@ -93,10 +97,33 @@ def _repo_root():
     return os.path.normpath(os.path.join(os.path.dirname(__file__), "..", ".."))
 
 
+# Trees that hold no shipped prose: build artifacts, VCS metadata, review
+# notes (which legitimately quote the decommissioned domain when recording
+# that it WAS decommissioned), and anything not under version control.
+_UNSCANNED_DIRS = {
+    ".git",
+    ".venv",
+    "venv",
+    "node_modules",
+    "__pycache__",
+    ".pytest_cache",
+    ".mypy_cache",
+    "build",
+    "dist",
+    ".superpowers",
+    ".egg-info",
+}
+
+
 def _iter_repo_text_files(*subdirs):
-    for subdir in subdirs:
-        root = os.path.join(_repo_root(), subdir)
-        for dirpath, _dirnames, filenames in os.walk(root):
+    """Every readable text file in the repo, or only under `subdirs`."""
+    roots = [os.path.join(_repo_root(), s) for s in subdirs] or [_repo_root()]
+    for root in roots:
+        for dirpath, dirnames, filenames in os.walk(root):
+            dirnames[:] = [
+                d for d in dirnames
+                if d not in _UNSCANNED_DIRS and not d.endswith(".egg-info")
+            ]
             for filename in filenames:
                 path = os.path.join(dirpath, filename)
                 try:
@@ -106,13 +133,56 @@ def _iter_repo_text_files(*subdirs):
                     continue
 
 
-def test_decommissioned_mirror_domain_appears_nowhere_under_server_or_docs():
+def test_decommissioned_mirror_domain_appears_nowhere_in_the_repo():
+    """The old Cloudflare R2 mirror's domain is gone from every shipped tree.
+
+    Widened past `server/` + `docs/` after the branch's README kept pointing
+    at the dead bucket while the tables underneath already said GCS: the
+    README lives at the repo root and was never scanned.
+    """
+    tests_root = os.path.join(_repo_root(), "tests") + os.sep
     offenders = [
         path
-        for path, text in _iter_repo_text_files("server", "docs")
-        if DECOMMISSIONED_MIRROR_DOMAIN in text
+        for path, text in _iter_repo_text_files()
+        # The test suite itself has to spell the domain out in order to guard
+        # against it; everything else is shipped material.
+        if DECOMMISSIONED_MIRROR_DOMAIN in text and not path.startswith(tests_root)
     ]
     assert not offenders, offenders
+
+
+# "R2" alone is a false-positive magnet: the README's roadmap legitimately
+# names Cloudflare R2 as a possible future artifact store, which is not a
+# claim about today's model mirror. So the guard is scoped to the sections
+# that actually describe the mirror -- the two 模型下載 / "Model downloads"
+# headings -- where any mention of R2 is by definition the stale prose.
+_MODEL_SECTION_HEADINGS = ("### 模型下載", "### Model downloads")
+
+
+def _readme_text():
+    with open(os.path.join(_repo_root(), "README.md"), encoding="utf-8") as f:
+        return f.read()
+
+
+def _readme_sections(text, headings):
+    for heading in headings:
+        start = text.index(heading)
+        end = text.find("\n## ", start)
+        next_sub = text.find("\n### ", start + len(heading))
+        if next_sub != -1 and (end == -1 or next_sub < end):
+            end = next_sub
+        yield heading, text[start : end if end != -1 else len(text)]
+
+
+def test_readme_model_download_sections_do_not_name_the_dead_r2_mirror():
+    for heading, section in _readme_sections(_readme_text(), _MODEL_SECTION_HEADINGS):
+        assert "R2" not in section, heading
+        assert "Cloudflare" not in section, heading
+
+
+def test_readme_model_download_sections_describe_the_gcs_mirror():
+    for heading, section in _readme_sections(_readme_text(), _MODEL_SECTION_HEADINGS):
+        assert "storage.googleapis.com/comfyfed-models" in section, heading
 
 
 @pytest.fixture()
@@ -476,15 +546,60 @@ _FLUX_CATEGORY = {
     "templates": [{"name": "flux_dev", "mediaType": "image", "mediaSubtype": "webp"}],
 }
 
+# The shape the REAL official library uses: download metadata hangs off each
+# node's `properties.models`, never a top-level `models` key. Verified against
+# every one of the 550 workflow JSONs in `comfyui-workflow-templates-json`
+# 0.1.74 (287 model-bearing nodes, 0 top-level `models` lists) and against the
+# pinned frontend bundle, whose `getEmbeddedModels(node)` reads exactly
+# `node.properties?.models` before `hasDownloadMetadata` decides whether to
+# render a Download button.
 _FLUX_WORKFLOW = {
+    "id": "flux_dev",
+    "revision": 0,
+    "last_node_id": 2,
+    "nodes": [
+        {
+            "id": 1,
+            "type": "UNETLoader",
+            "pos": [0, 0],
+            "properties": {
+                "Node name for S&R": "UNETLoader",
+                "models": [
+                    {
+                        "name": "flux1-dev.safetensors",
+                        "url": "https://huggingface.co/black-forest-labs/FLUX.1-dev/resolve/main/flux1-dev.safetensors",
+                        "directory": "diffusion_models",
+                        "hash": "h",
+                        "hash_type": "SHA256",
+                    }
+                ],
+            },
+            "widgets_values": ["flux1-dev.safetensors", "default"],
+        },
+        {
+            "id": 2,
+            "type": "SaveImage",
+            "pos": [400, 0],
+            "properties": {"Node name for S&R": "SaveImage"},
+            "widgets_values": ["ComfyUI"],
+        },
+    ],
+    "links": [],
+    "version": 0.4,
+}
+
+# A workflow using the top-level `models` key instead. The official library
+# does not emit this shape, but stripping covers it as a superset, and a
+# hand-authored workflow could.
+_TOP_LEVEL_MODELS_WORKFLOW = {
     "version": 0.4,
     "nodes": [],
     "links": [],
     "models": [
         {
-            "name": "flux1-dev.safetensors",
+            "name": "ae.safetensors",
             "url": "https://x/y",
-            "directory": "diffusion_models",
+            "directory": "vae",
             "hash": "h",
             "hash_type": "SHA256",
         }
@@ -499,6 +614,8 @@ def _seed_official_dir(data_dir, *, index_extra=None, localized=None, logo=None)
         json.dump([_FLUX_CATEGORY], f)
     with open(os.path.join(official_dir, "flux_dev.json"), "w", encoding="utf-8") as f:
         json.dump(_FLUX_WORKFLOW, f)
+    with open(os.path.join(official_dir, "legacy_top_level.json"), "w", encoding="utf-8") as f:
+        json.dump(_TOP_LEVEL_MODELS_WORKFLOW, f)
     with open(os.path.join(official_dir, "flux_dev-1.webp"), "wb") as f:
         f.write(b"RIFF" + b"\x00" * 8 + b"WEBP")
     if localized is not None:
@@ -531,19 +648,40 @@ def test_index_json_is_comfyfed_alone_when_official_dir_absent(client):
     assert [t["name"] for t in categories[0]["templates"]] == list(templates.TEMPLATE_NAMES)
 
 
-def test_official_workflow_json_has_download_metadata_stripped(client):
+def test_official_workflow_json_has_per_node_download_metadata_stripped(client):
+    """The real library's shape: `nodes[].properties.models`."""
     _login(client)
     _seed_official_dir(client.data_dir)
 
     r = client.get("/comfy/templates/flux_dev.json")
     assert r.status_code == 200
     body = r.json()
-    models = body["models"]
+
+    loader = body["nodes"][0]
+    models = loader["properties"]["models"]
     assert len(models) == 1
+    # name + directory survive (the missing-model panel still names the file);
+    # everything hasDownloadMetadata() needs is gone.
     assert models[0] == {"name": "flux1-dev.safetensors", "directory": "diffusion_models"}
-    assert "url" not in models[0]
-    assert "hash" not in models[0]
-    assert "hash_type" not in models[0]
+    # Nothing else about the node or the graph was disturbed.
+    assert loader["properties"]["Node name for S&R"] == "UNETLoader"
+    assert loader["widgets_values"] == ["flux1-dev.safetensors", "default"]
+    assert body["nodes"][1] == _FLUX_WORKFLOW["nodes"][1]
+    assert body["id"] == "flux_dev"
+    # And no url survives anywhere in the served document.
+    assert "huggingface.co" not in json.dumps(body)
+
+
+def test_official_workflow_json_has_top_level_download_metadata_stripped(client):
+    """Stripping stays a superset: a top-level `models` list is covered too."""
+    _login(client)
+    _seed_official_dir(client.data_dir)
+
+    r = client.get("/comfy/templates/legacy_top_level.json")
+    assert r.status_code == 200
+    models = r.json()["models"]
+    assert len(models) == 1
+    assert models[0] == {"name": "ae.safetensors", "directory": "vae"}
 
 
 def test_own_template_workflow_still_served_byte_identical(client):
@@ -604,6 +742,28 @@ def test_traversal_filenames_still_404_with_official_dir_present(client):
     _login(client)
     _seed_official_dir(client.data_dir)
     assert client.get("/comfy/templates/..%2F..%2Fcomfyfed.db").status_code == 404
+    # Windows drive-relative: os.path.join(dir, "C:x.json") == "C:x.json".
+    assert client.get("/comfy/templates/C:x.json").status_code == 404
+
+
+def test_manifest_json_is_not_served_as_a_template(client):
+    _login(client)
+    official_dir = _seed_official_dir(client.data_dir)
+    with open(os.path.join(official_dir, "manifest.json"), "w", encoding="utf-8") as f:
+        json.dump({"meta_version": "1.0", "sub_packages": {"json": "0.1.74"}}, f)
+
+    assert client.get("/comfy/templates/manifest.json").status_code == 404
+
+
+def test_mp3_thumbnail_is_served_as_audio(client):
+    _login(client)
+    official_dir = _seed_official_dir(client.data_dir)
+    with open(os.path.join(official_dir, "audio_tpl-1.mp3"), "wb") as f:
+        f.write(b"ID3")
+
+    r = client.get("/comfy/templates/audio_tpl-1.mp3")
+    assert r.status_code == 200
+    assert r.headers["content-type"] == "audio/mpeg"
 
 
 def test_readme_model_downloads_section_covers_the_whole_inventory():

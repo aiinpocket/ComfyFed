@@ -46,7 +46,7 @@ META_PACKAGE = "comfyui-workflow-templates"
 META_JSON_URL = f"https://pypi.org/pypi/{META_PACKAGE}/json"
 
 _DIRNAME = "comfy_templates_official"
-_MANIFEST_NAME = "manifest.json"
+MANIFEST_NAME = "manifest.json"
 
 # A member is part of the payload we want iff its path has a "/templates/"
 # segment somewhere in it (every sub-package wheel nests its files under
@@ -68,7 +68,7 @@ def official_dir(data_dir: str) -> str:
 
 def load_manifest(data_dir: str) -> dict | None:
     """Return the manifest written by the last successful `fetch`, or None."""
-    path = os.path.join(official_dir(data_dir), _MANIFEST_NAME)
+    path = os.path.join(official_dir(data_dir), MANIFEST_NAME)
     try:
         with open(path, "r", encoding="utf-8") as f:
             return json.load(f)
@@ -224,7 +224,7 @@ def fetch(data_dir: str, version: str | None = None) -> dict:
             "files": total_files,
             "fetched_at": datetime.now(timezone.utc).isoformat(),
         }
-        with open(os.path.join(tmp_dir, _MANIFEST_NAME), "w", encoding="utf-8") as f:
+        with open(os.path.join(tmp_dir, MANIFEST_NAME), "w", encoding="utf-8") as f:
             json.dump(manifest, f, ensure_ascii=False, indent=2)
 
         # Atomic swap: drop the old dir (if any) and rename the fully-built

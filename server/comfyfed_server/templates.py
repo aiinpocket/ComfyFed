@@ -56,19 +56,23 @@ has run it) into `<data_dir>/comfy_templates_official`:
   though ComfyFed ships its own placeholder file under `templates_data/` for
   historical reasons.
 * Any other `*.json` -- resolved from the packaged dir first, then the
-  official dir. A JSON file that comes from the official dir and has a
-  top-level `models` list has `url`, `hash`, and `hash_type` stripped from
-  every entry (keeping `name` + `directory`) before being returned. The
-  frontend's `hasDownloadMetadata` check needs both `url` and `directory` to
-  render its browser-side "Download" button, which in web mode is a plain
-  `<a href>` that lands the file on the *viewer's* PC, not the worker
-  actually running the graph -- so that button would silently mislead a
-  ComfyFed user. Stripping only `url` (not the whole entry) keeps the model
-  `name` visible to the missing-model panel; Task 3's `/prompt` rejection is
-  where a worker-side download nudge actually belongs. ComfyFed's own
-  template JSONs never carry `models[].url` (their guidance lives in sticky
-  notes instead) so they pass through this step unchanged regardless of
-  source.
+  official dir. A JSON file that comes from the official dir has `url`,
+  `hash`, and `hash_type` stripped (keeping `name` + `directory`) from every
+  entry of **`nodes[].properties.models`** -- the shape the real official
+  library actually uses -- and, as a harmless superset, from a top-level
+  `models` list too. The frontend's `hasDownloadMetadata` check
+  (`settingStore-*.js`: `!!candidate.url && !!candidate.directory`) is
+  applied to the missing-model candidates built by `getEmbeddedModels`
+  (`node.properties?.models`), so the per-node location is the one that
+  decides whether its browser-side "Download" button renders. In web mode
+  that button is a plain `<a href>` that lands the file on the *viewer's*
+  PC, not the worker actually running the graph -- so it would silently
+  mislead a ComfyFed user. Stripping only the download keys (not the whole
+  entry) keeps the model `name` visible to the missing-model panel; Task 3's
+  `/prompt` rejection is where a worker-side download nudge actually
+  belongs. ComfyFed's own template JSONs never carry download metadata
+  (their guidance lives in sticky notes instead) so they pass through this
+  step unchanged regardless of source.
 * Non-JSON files (thumbnails/media) -- packaged dir first, then official
   dir, same `_MEDIA_TYPES` mapping. No subpaths are ever allowed in
   `filename`, from either source.
@@ -105,7 +109,16 @@ _MEDIA_TYPES = {
     ".jpg": "image/jpeg",
     ".jpeg": "image/jpeg",
     ".mp4": "video/mp4",
+    ".webm": "video/webm",
+    ".gif": "image/gif",
+    # The official index has a handful of `{"mediaType":"audio",
+    # "mediaSubtype":"mp3"}` templates whose preview will not play if the
+    # thumbnail route falls through to application/octet-stream.
+    ".mp3": "audio/mpeg",
 }
+
+# Files under the official dir that are library bookkeeping, not templates.
+_NON_TEMPLATE_NAMES = frozenset({official_templates.MANIFEST_NAME})
 
 TEMPLATE_NAMES = (
     "comfyfed-wuxia-t2i",
@@ -172,20 +185,51 @@ def _load_json(path: str) -> list | dict | None:
         return None
 
 
-def _strip_download_metadata(workflow: dict) -> dict:
-    """Drop `url`/`hash`/`hash_type` from every entry of a top-level `models`
-    list, keeping `name` + `directory`. See the module docstring for why."""
-    models = workflow.get("models")
+_DOWNLOAD_KEYS = ("url", "hash", "hash_type")
+
+
+def _stripped_models(models) -> list | None:
+    """`models` with the download keys removed from every dict entry, or None
+    when it is not a list (i.e. there is nothing to strip here)."""
     if not isinstance(models, list):
-        return workflow
-    workflow = dict(workflow)
-    workflow["models"] = [
-        {k: v for k, v in entry.items() if k not in ("url", "hash", "hash_type")}
+        return None
+    return [
+        {k: v for k, v in entry.items() if k not in _DOWNLOAD_KEYS}
         if isinstance(entry, dict)
         else entry
         for entry in models
     ]
-    return workflow
+
+
+def _strip_download_metadata(workflow: dict) -> dict:
+    """Drop `url`/`hash`/`hash_type` from every model entry the frontend could
+    turn into a Download button, keeping `name` + `directory`.
+
+    Both locations are handled: `nodes[].properties.models`, which is what the
+    real official library emits and what `getEmbeddedModels` reads, and a
+    top-level `models` list, which the library does not currently use but
+    which costs nothing to cover. See the module docstring for why.
+    """
+    result = dict(workflow)
+
+    top_level = _stripped_models(workflow.get("models"))
+    if top_level is not None:
+        result["models"] = top_level
+
+    nodes = workflow.get("nodes")
+    if isinstance(nodes, list):
+        stripped_nodes = []
+        for node in nodes:
+            properties = node.get("properties") if isinstance(node, dict) else None
+            if isinstance(properties, dict):
+                models = _stripped_models(properties.get("models"))
+                if models is not None:
+                    node = dict(node)
+                    node["properties"] = {**properties, "models": models}
+            stripped_nodes.append(node)
+        result["nodes"] = stripped_nodes
+
+    return result
 
 
 def _merged_index(data_dir: str, index_name: str) -> list | None:
@@ -220,8 +264,20 @@ def create_router(data_dir: str) -> APIRouter:
     def template_file(filename: str):
         # No subpaths: the frontend only ever asks for files directly under
         # `templates/`, so anything with a separator in it is a traversal
-        # attempt rather than a legitimate request.
-        if not filename or filename in (".", "..") or "/" in filename or "\\" in filename:
+        # attempt rather than a legitimate request. `:` is rejected too --
+        # on Windows `os.path.join(dir, "C:x.json")` yields the *drive-
+        # relative* `C:x.json`, which escapes both template roots.
+        if (
+            not filename
+            or filename in (".", "..")
+            or "/" in filename
+            or "\\" in filename
+            or ":" in filename
+        ):
+            raise HTTPException(status_code=404, detail="Not found")
+
+        # Library bookkeeping is not a template and is not served.
+        if filename in _NON_TEMPLATE_NAMES:
             raise HTTPException(status_code=404, detail="Not found")
 
         official_dir = official_templates.official_dir(data_dir)
