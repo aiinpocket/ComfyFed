@@ -24,6 +24,12 @@ class AgentConfig:
     node_policy: str = "installed"
     models_dir: str | None = None
     auto_update: bool = True
+    # Local ComfyUI directories, used only for post-job disk cleanup (see
+    # runner.cleanup_job_files). Left unset (None) by default: cleanup then
+    # skips the ComfyUI-directory step and only logs that it did so -- it
+    # never guesses where ComfyUI's own input/output folders live.
+    comfy_output_dir: str | None = None
+    comfy_input_dir: str | None = None
 
     @classmethod
     def load(cls, path: str) -> "AgentConfig":
@@ -42,6 +48,8 @@ class AgentConfig:
             node_policy=data.get("node_policy", cls.node_policy),
             models_dir=data.get("models_dir"),
             auto_update=data.get("auto_update", cls.auto_update),
+            comfy_output_dir=data.get("comfy_output_dir"),
+            comfy_input_dir=data.get("comfy_input_dir"),
         )
 
     def save(self, path: str) -> None:
@@ -57,6 +65,8 @@ class AgentConfig:
             "node_policy": self.node_policy,
             "models_dir": self.models_dir,
             "auto_update": self.auto_update,
+            "comfy_output_dir": self.comfy_output_dir,
+            "comfy_input_dir": self.comfy_input_dir,
         }
 
         tmp_path = f"{path}.tmp-{os.getpid()}"

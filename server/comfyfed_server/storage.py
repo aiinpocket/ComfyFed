@@ -18,6 +18,18 @@ _ARTIFACTS_DIRNAME = "artifacts"
 _ARTIFACT_STORE_SETTING_KEY = "artifact_store"
 
 
+# Reserved DOS device names. On Windows these resolve to devices rather than
+# files at ANY directory depth and with ANY extension -- opening `con.png` for
+# write succeeds and writes to the console, `nul.json` silently discards, and
+# `com1` can block on a serial port. A client-supplied artifact or upload name
+# must never reach `open()` as one of these.
+_WINDOWS_DEVICE_NAMES = frozenset(
+    ["con", "prn", "aux", "nul"]
+    + [f"com{n}" for n in range(1, 10)]
+    + [f"lpt{n}" for n in range(1, 10)]
+)
+
+
 def sanitize_path_component(value: str, *, what: str = "path component") -> str:
     """Reduce `value` to a single, safe path segment, or raise ValueError.
 
@@ -25,6 +37,19 @@ def sanitize_path_component(value: str, *, what: str = "path component") -> str:
     separator (including a disguised traversal like `../../etc/passwd`,
     whose basename would otherwise be accepted as `passwd`). Idempotent:
     sanitizing an already-sanitized value returns it unchanged.
+
+    Also rejects two Windows-specific hazards, unconditionally rather than
+    only on Windows, so the same name is valid or invalid on every host a
+    ComfyFed server may run on (an artifact name that a Linux platform
+    accepted must not become unservable when the deployment moves):
+
+    * Reserved DOS device names (`CON`, `NUL`, `COM1`, ... -- case
+      insensitive, with or without an extension). These are devices, not
+      files: `open("nul.json", "wb")` on Windows writes to the null device
+      and the artifact is silently lost.
+    * Names ending in a dot or a space. Windows strips those on resolution,
+      so `report.png.` and `report.png` are the same file -- a difference
+      that lets a name slip past an equality check and then collide.
 
     Public because every place that turns a client-supplied name into a path
     segment -- artifact storage here, and job-input uploads in jobs.py --
@@ -34,6 +59,12 @@ def sanitize_path_component(value: str, *, what: str = "path component") -> str:
         raise ValueError(f"Invalid {what}: {value!r}")
     base = os.path.basename(value)
     if base != value or base in ("", ".", ".."):
+        raise ValueError(f"Invalid {what}: {value!r}")
+    if base[-1] in (".", " "):
+        raise ValueError(f"Invalid {what}: {value!r}")
+    # "con.png" and plain "con" are both the console device; the stem before
+    # the FIRST dot is what Windows matches on.
+    if base.split(".", 1)[0].lower() in _WINDOWS_DEVICE_NAMES:
         raise ValueError(f"Invalid {what}: {value!r}")
     return base
 

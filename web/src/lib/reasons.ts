@@ -7,7 +7,13 @@ import type { TFunction } from 'i18next';
  *   missing_nodes:A,B
  *   missing_models:A,B                (fetchable from a peer — soft)
  *   missing_models_unavailable:A,B    (nowhere in the federation — hard)
- *   vram:18.4>12                      (needs > has)
+ *   vram:25.5>15.9+63.6               (needs > VRAM + system RAM — hard)
+ *
+ * ...and the shapes emitted as non-blocking `warnings` on an ELIGIBLE
+ * verdict, which parse through the same function but are rendered as a dim
+ * note rather than a refusal:
+ *
+ *   vram_offload:25.5>15.9            (over VRAM, fits in VRAM + RAM)
  *   backend:cuda!=rocm                (override wanted != worker reports)
  *   override:min_vram_gb | override:min_free_disk_gb | override:gpu_name_contains
  */
@@ -51,14 +57,32 @@ export function parseReason(raw: string): ParsedReason {
       };
 
     case 'vram': {
-      const [needed, available] = rest.split('>');
+      // `needed>vram+ram`. Older servers emitted `needed>vram` with no `+`
+      // part, so the second half is split defensively rather than assumed.
+      const [needed, budget] = rest.split('>');
+      const [vram, ram] = (budget ?? '').split('+');
       return {
         key: 'vram',
         values: {
           needed: formatGb(needed),
-          available: formatGb(available),
+          available: formatGb(vram),
+          ram: formatGb(ram ?? '0'),
         },
         tone: 'error',
+      };
+    }
+
+    case 'vram_offload': {
+      // Not a refusal: ComfyUI streams weights from system RAM when they do
+      // not fit in VRAM. The job runs, just more slowly.
+      const [needed, available] = rest.split('>');
+      return {
+        key: 'vram_offload',
+        values: {
+          needed: formatGb(needed),
+          available: formatGb(available),
+        },
+        tone: 'warning',
       };
     }
 

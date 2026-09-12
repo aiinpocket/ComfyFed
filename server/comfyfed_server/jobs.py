@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 from typing import Optional
@@ -17,6 +18,69 @@ _JOB_INPUTS_DIRNAME = "job_inputs"
 
 def _error(status_code: int, code: str, message: str = "") -> HTTPException:
     return HTTPException(status_code=status_code, detail={"code": code, "message": message or code})
+
+
+class MissingAssetsError(Exception):
+    """A workflow references input assets the caller did not make available.
+
+    Carries the sorted missing filenames so each caller can render it in its
+    own error dialect -- the console's `{"error": {"code", "message"}}`
+    envelope, or the ComfyUI-compatible `{"error": {...}, "node_errors": {}}`
+    shape in `comfyapi.py`.
+    """
+
+    def __init__(self, missing: list[str]):
+        super().__init__(", ".join(missing))
+        self.missing = missing
+
+
+def job_inputs_dir(data_dir: str, job_id: str) -> str:
+    """Directory holding a job's staged input assets."""
+    return os.path.join(data_dir, _JOB_INPUTS_DIRNAME, job_id)
+
+
+def create_job(
+    workflow_json_text: str,
+    workflow: dict,
+    *,
+    requirements: Optional[dict] = None,
+    available_assets: Optional[set[str]] = None,
+) -> str:
+    """Assess a workflow and persist a queued Job row. Returns the job id.
+
+    The single assess-and-persist path, shared by the console's
+    `POST /api/jobs` and the ComfyUI-compatible `POST /comfy/api/prompt`, so
+    the two entry points can never drift on what a job records (required
+    nodes/models, VRAM estimate, declared input assets).
+
+    `available_assets` is the set of input filenames the caller can actually
+    supply; anything the workflow references beyond it raises
+    `MissingAssetsError` before anything is written. Storing the asset bytes
+    is the caller's job (they arrive as uploads in one case and from staging
+    in the other).
+    """
+    needs = assess.extract(workflow)
+    available = set(available_assets or ())
+
+    missing = sorted(needs.assets - available)
+    if missing:
+        raise MissingAssetsError(missing)
+
+    with db.get_session() as session:
+        all_workers = session.query(db.Worker).all()
+        est_vram_gb = assess.estimate_vram(needs.models, all_workers)
+
+        job = db.Job(
+            workflow_json=workflow_json_text,
+            requirements=json.dumps(requirements or {}),
+            required_nodes=json.dumps(sorted(needs.nodes)),
+            required_models=json.dumps(sorted(needs.models)),
+            est_vram_gb=est_vram_gb,
+            input_assets=json.dumps(sorted(available)),
+        )
+        session.add(job)
+        session.commit()
+        return job.id
 
 
 def _job_dict(job: db.Job) -> dict:
@@ -41,6 +105,7 @@ def _job_dict_full(job: db.Job) -> dict:
     d["required_models"] = json.loads(job.required_models or "[]")
     d["started_at"] = job.started_at.isoformat() if job.started_at else None
     d["finished_at"] = job.finished_at.isoformat() if job.finished_at else None
+    d["result_hashes"] = json.loads(job.result_hashes or "{}")
     return d
 
 
@@ -66,8 +131,6 @@ def create_router(data_dir: str) -> APIRouter:
             except (TypeError, ValueError):
                 raise _error(400, "jobs.invalid_workflow", "requirements is not valid JSON.")
 
-        needs = assess.extract(workflow)
-
         uploaded_names = []
         for upload in assets:
             try:
@@ -78,31 +141,21 @@ def create_router(data_dir: str) -> APIRouter:
                 raise _error(400, "jobs.bad_asset_name", f"Invalid asset filename: {upload.filename!r}")
             uploaded_names.append(filename)
 
-        missing = sorted(needs.assets - set(uploaded_names))
-        if missing:
+        try:
+            job_id = create_job(
+                workflow_json,
+                workflow,
+                requirements=requirements_dict,
+                available_assets=set(uploaded_names),
+            )
+        except MissingAssetsError as exc:
             raise _error(
                 400,
                 "jobs.missing_assets",
-                f"Workflow references assets that were not uploaded: {', '.join(missing)}",
+                f"Workflow references assets that were not uploaded: {', '.join(exc.missing)}",
             )
 
-        with db.get_session() as session:
-            all_workers = session.query(db.Worker).all()
-            est_vram_gb = assess.estimate_vram(needs.models, all_workers)
-
-            job = db.Job(
-                workflow_json=workflow_json,
-                requirements=json.dumps(requirements_dict),
-                required_nodes=json.dumps(sorted(needs.nodes)),
-                required_models=json.dumps(sorted(needs.models)),
-                est_vram_gb=est_vram_gb,
-                input_assets=json.dumps(uploaded_names),
-            )
-            session.add(job)
-            session.commit()
-            job_id = job.id
-
-        job_dir = os.path.join(data_dir, _JOB_INPUTS_DIRNAME, job_id)
+        job_dir = job_inputs_dir(data_dir, job_id)
         os.makedirs(job_dir, exist_ok=True)
         for upload, filename in zip(assets, uploaded_names):
             dest = os.path.join(job_dir, filename)
@@ -156,6 +209,7 @@ def create_router(data_dir: str) -> APIRouter:
                         "name": worker.name,
                         "verdict": v.kind,
                         "reasons": v.reasons,
+                        "warnings": v.warnings,
                         "missing_models": v.missing_models,
                     }
                 )
@@ -213,10 +267,45 @@ def create_router(data_dir: str) -> APIRouter:
         except ValueError:
             raise _error(400, "jobs.bad_asset_name", f"Invalid artifact filename: {file.filename!r}")
 
+        # Hash the bytes ourselves rather than trusting the agent's claim: this
+        # is what lets a corrupted-in-transit or swapped artifact be caught
+        # before it's persisted. `file.file` is a SpooledTemporaryFile already
+        # fully buffered by `request.form()` above, so reading it through once
+        # and seeking back to 0 costs no extra I/O round trip and leaves
+        # `store.put` free to stream it to disk exactly as before.
+        hasher = hashlib.sha256()
+        for chunk in iter(lambda: file.file.read(1024 * 1024), b""):
+            hasher.update(chunk)
+        computed_sha256 = hasher.hexdigest()
+        file.file.seek(0)
+
+        # The header is optional for backward compatibility with older agents
+        # that don't send it yet; when present, a mismatch means the bytes the
+        # platform received are not the bytes the worker produced (corruption
+        # or a swap in transit), so the upload is rejected outright.
+        claimed_sha256 = request.headers.get("X-Artifact-SHA256")
+        if claimed_sha256 and claimed_sha256.strip().lower() != computed_sha256:
+            raise _error(
+                400,
+                "artifact.hash_mismatch",
+                "Uploaded artifact does not match the declared X-Artifact-SHA256.",
+            )
+
         store = storage.get_store(data_dir)
         stored = store.put(job_id, artifact_name, file.file)
 
-        return {"stored": stored}
+        with db.get_session() as session:
+            job = session.get(db.Job, job_id)
+            if job is not None:
+                try:
+                    hashes = json.loads(job.result_hashes or "{}")
+                except (TypeError, ValueError):
+                    hashes = {}
+                hashes[stored] = computed_sha256
+                job.result_hashes = json.dumps(hashes)
+                session.commit()
+
+        return {"stored": stored, "sha256": computed_sha256}
 
     @r.get("/api/jobs/{job_id}/artifacts/{filename}")
     def get_job_artifact(job_id: str, filename: str, _payload: dict = Depends(auth.require_admin)):

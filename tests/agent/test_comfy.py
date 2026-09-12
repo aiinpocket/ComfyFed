@@ -13,7 +13,10 @@ def _make_app():
     # `history_misses` makes /history return "not finished yet" that many
     # times, so a test can exercise the in-progress polling path;
     # `queue_running` is what /queue reports while that happens.
-    state = {"uploads": {}, "history_misses": 0, "queue_running": []}
+    # `pending_polls` makes /queue report the prompt as merely *pending*
+    # (simulating another workload ahead of it on a shared worker) for that
+    # many calls before it starts reporting `queue_running`.
+    state = {"uploads": {}, "history_misses": 0, "queue_running": [], "pending_polls": 0}
 
     @app.get("/object_info")
     def object_info():
@@ -32,6 +35,9 @@ def _make_app():
 
     @app.get("/queue")
     def queue():
+        if state["pending_polls"] > 0:
+            state["pending_polls"] -= 1
+            return {"queue_running": [], "queue_pending": [[0, "p1", {}]]}
         return {"queue_running": state["queue_running"], "queue_pending": []}
 
     @app.get("/history/{prompt_id}")
@@ -82,14 +88,24 @@ def test_upload_input_posts_multipart_with_overwrite(client):
 
 def test_run_workflow_returns_output_files(client):
     progress_calls = []
-    files = comfy.run_workflow(
+    files, exec_seconds = comfy.run_workflow(
         COMFY_URL,
         {"1": {"class_type": "KSampler", "inputs": {}}},
         on_progress=progress_calls.append,
         client=client,
     )
-    assert files == [("out.png", b"PNGDATA")]
+    assert files == [("out.png", b"PNGDATA", "")]
     assert progress_calls[-1] == 1.0
+    # Never observed running in /queue (history was already there on the
+    # first poll), so exec_seconds falls back to the span since the local
+    # /prompt POST -- a real, positive upper bound, NOT None. None would make
+    # the server bill its own assigned->done wall clock, re-admitting the
+    # federation queue wait this measurement exists to exclude.
+    # `>= 0`, not `> 0`: the mock finishes in microseconds and Windows'
+    # time.monotonic ticks at ~15ms, so a genuine measurement can legitimately
+    # round to 0.0. The invariant under test is that it is a NUMBER.
+    assert exec_seconds is not None
+    assert exec_seconds >= 0
 
 
 def test_run_workflow_raises_on_prompt_error(client):
@@ -129,7 +145,7 @@ def test_run_workflow_reports_a_moving_estimate_while_queued(client, monkeypatch
     client.app.state.mock["queue_running"] = [[0, "p1", {}]]
 
     progress_calls = []
-    files = comfy.run_workflow(
+    files, exec_seconds = comfy.run_workflow(
         COMFY_URL,
         {"1": {"class_type": "KSampler", "inputs": {}}},
         on_progress=progress_calls.append,
@@ -137,7 +153,7 @@ def test_run_workflow_reports_a_moving_estimate_while_queued(client, monkeypatch
         expected_seconds=60,
     )
 
-    assert files == [("out.png", b"PNGDATA")]
+    assert files == [("out.png", b"PNGDATA", "")]
     assert progress_calls[0] == 0.0
     assert progress_calls[-1] == 1.0
 
@@ -146,6 +162,9 @@ def test_run_workflow_reports_a_moving_estimate_while_queued(client, monkeypatch
     # No longer the old hardcoded 0.5; a bounded, non-decreasing estimate.
     assert all(0.1 <= p <= 0.9 for p in interim)
     assert interim == sorted(interim)
+    # Observed under queue_running the whole time it was queued, so the
+    # execution window was measured (not None).
+    assert exec_seconds is not None
 
 
 def test_run_workflow_sits_at_ceiling_once_off_the_queue(client, monkeypatch):
@@ -154,7 +173,7 @@ def test_run_workflow_sits_at_ceiling_once_off_the_queue(client, monkeypatch):
     client.app.state.mock["queue_running"] = []  # already left the queue
 
     progress_calls = []
-    comfy.run_workflow(
+    _files, exec_seconds = comfy.run_workflow(
         COMFY_URL,
         {"1": {"class_type": "KSampler", "inputs": {}}},
         on_progress=progress_calls.append,
@@ -163,3 +182,43 @@ def test_run_workflow_sits_at_ceiling_once_off_the_queue(client, monkeypatch):
 
     assert progress_calls[1:-1] == [0.9, 0.9]
     assert progress_calls[-1] == 1.0
+    # Already off the queue on the first poll (queue_running was empty the
+    # whole time), so it was never observed running -- exec_seconds falls
+    # back to the span since submission rather than going None.
+    # `>= 0`, not `> 0`: the mock finishes in microseconds and Windows'
+    # time.monotonic ticks at ~15ms, so a genuine measurement can legitimately
+    # round to 0.0. The invariant under test is that it is a NUMBER.
+    assert exec_seconds is not None
+    assert exec_seconds >= 0
+
+
+def test_run_workflow_exec_seconds_excludes_queue_wait(client, monkeypatch):
+    """A worker shared with other work (ours or another platform's) can sit
+    `queue_pending` for a while before it actually starts running -- billing
+    must only count the time from `queue_running` onward, not that wait.
+
+    Uses a tiny real poll interval rather than faking `time.monotonic`
+    globally: that function is shared process-wide (also used internally by
+    httpx/anyio for the in-process test client), so stubbing it out affects
+    far more than this one poll loop.
+    """
+    monkeypatch.setattr(comfy, "_POLL_INTERVAL_SECONDS", 0.01)
+
+    client.app.state.mock["history_misses"] = 5
+    client.app.state.mock["pending_polls"] = 3  # pending for 3 polls first
+    client.app.state.mock["queue_running"] = [[0, "p1", {}]]
+
+    submitted_at = comfy.time.monotonic()
+    files, exec_seconds = comfy.run_workflow(
+        COMFY_URL,
+        {"1": {"class_type": "KSampler", "inputs": {}}},
+        client=client,
+    )
+    total_elapsed = comfy.time.monotonic() - submitted_at
+
+    assert files == [("out.png", b"PNGDATA", "")]
+    assert exec_seconds is not None
+    # exec_seconds only starts counting once the prompt is first seen under
+    # queue_running (after the 3 pending-only polls), so it is strictly less
+    # than the elapsed time since submission.
+    assert 0 < exec_seconds < total_elapsed

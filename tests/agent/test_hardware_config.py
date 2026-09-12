@@ -28,6 +28,25 @@ def test_scan_models_returns_empty_for_missing_dir(tmp_path):
     assert hardware.scan_models(str(tmp_path / "nope")) == []
 
 
+def test_comfy_output_and_input_dir_round_trip_through_save_and_load(tmp_path):
+    path = tmp_path / "agent.json"
+    config = AgentConfig(comfy_output_dir=str(tmp_path / "output"), comfy_input_dir=str(tmp_path / "input"))
+    config.save(str(path))
+
+    loaded = AgentConfig.load(str(path))
+    assert loaded.comfy_output_dir == str(tmp_path / "output")
+    assert loaded.comfy_input_dir == str(tmp_path / "input")
+
+
+def test_comfy_output_and_input_dir_default_to_none(tmp_path):
+    path = tmp_path / "agent.json"
+    AgentConfig().save(str(path))
+
+    loaded = AgentConfig.load(str(path))
+    assert loaded.comfy_output_dir is None
+    assert loaded.comfy_input_dir is None
+
+
 def test_config_save_is_not_group_or_world_readable(tmp_path):
     path = tmp_path / "nested" / "agent.json"
     config = AgentConfig(

@@ -1,3 +1,4 @@
+import hashlib
 import io
 import json
 from datetime import datetime, timedelta, timezone
@@ -56,7 +57,7 @@ def _submit(client, csrf, workflow=None):
     return r.json()["job_id"]
 
 
-def _signed_post_multipart(client, path, worker_id, signing_key, filename, content):
+def _signed_post_multipart(client, path, worker_id, signing_key, filename, content, extra_headers=None):
     req = httpx.Request(
         "POST",
         "http://testserver" + path,
@@ -70,17 +71,16 @@ def _signed_post_multipart(client, path, worker_id, signing_key, filename, conte
     message = f"POST\n{path}\n{ts}\n{nonce}\n".encode() + body
     sig = signing_key.sign(message).signature.hex()
 
-    return client.post(
-        path,
-        content=body,
-        headers={
-            "Content-Type": content_type,
-            "X-Worker-Id": worker_id,
-            "X-Ts": ts,
-            "X-Nonce": nonce,
-            "X-Sig": sig,
-        },
-    )
+    headers = {
+        "Content-Type": content_type,
+        "X-Worker-Id": worker_id,
+        "X-Ts": ts,
+        "X-Nonce": nonce,
+        "X-Sig": sig,
+    }
+    headers.update(extra_headers or {})
+
+    return client.post(path, content=body, headers=headers)
 
 
 def test_artifact_upload_lands_on_disk(client):
@@ -99,7 +99,11 @@ def test_artifact_upload_lands_on_disk(client):
 
     ok = _signed_post_multipart(client, path, w1_id, w1_key, "out.png", b"pixel-bytes")
     assert ok.status_code == 200
-    assert ok.json() == {"stored": "out.png"}
+    expected_sha256 = hashlib.sha256(b"pixel-bytes").hexdigest()
+    assert ok.json() == {"stored": "out.png", "sha256": expected_sha256}
+
+    with db.get_session() as session:
+        assert json.loads(session.get(db.Job, job_id).result_hashes) == {"out.png": expected_sha256}
 
     store = storage.get_store(client.data_dir)
     with store.open(job_id, "out.png") as f:
@@ -108,6 +112,74 @@ def test_artifact_upload_lands_on_disk(client):
     forbidden = _signed_post_multipart(client, path, w2_id, w2_key, "out.png", b"pixel-bytes")
     assert forbidden.status_code == 403
     assert forbidden.json()["error"]["code"] == "jobs.not_assigned"
+
+
+def test_artifact_upload_with_matching_hash_header_succeeds(client):
+    csrf = _login(client)
+    w1_id, w1_key = _register_worker_with_key(client, csrf, "agent1")
+    job_id = _submit(client, csrf)
+    with db.get_session() as session:
+        job = session.get(db.Job, job_id)
+        job.status = "assigned"
+        job.worker_id = w1_id
+        session.commit()
+
+    path = f"/api/agent/jobs/{job_id}/artifacts"
+    expected_sha256 = hashlib.sha256(b"pixel-bytes").hexdigest()
+
+    ok = _signed_post_multipart(
+        client, path, w1_id, w1_key, "out.png", b"pixel-bytes",
+        extra_headers={"X-Artifact-SHA256": expected_sha256},
+    )
+    assert ok.status_code == 200
+    assert ok.json() == {"stored": "out.png", "sha256": expected_sha256}
+
+
+def test_artifact_upload_with_mismatched_hash_header_is_rejected(client):
+    csrf = _login(client)
+    w1_id, w1_key = _register_worker_with_key(client, csrf, "agent1")
+    job_id = _submit(client, csrf)
+    with db.get_session() as session:
+        job = session.get(db.Job, job_id)
+        job.status = "assigned"
+        job.worker_id = w1_id
+        session.commit()
+
+    path = f"/api/agent/jobs/{job_id}/artifacts"
+
+    bad = _signed_post_multipart(
+        client, path, w1_id, w1_key, "out.png", b"pixel-bytes",
+        extra_headers={"X-Artifact-SHA256": "0" * 64},
+    )
+    assert bad.status_code == 400
+    assert bad.json()["error"]["code"] == "artifact.hash_mismatch"
+
+    # Rejected upload must not be stored, and must not pollute result_hashes.
+    store = storage.get_store(client.data_dir)
+    with pytest.raises(FileNotFoundError):
+        store.open(job_id, "out.png")
+    with db.get_session() as session:
+        assert json.loads(session.get(db.Job, job_id).result_hashes) == {}
+
+
+def test_get_job_exposes_result_hashes(client):
+    csrf = _login(client)
+    w1_id, w1_key = _register_worker_with_key(client, csrf, "agent1")
+    job_id = _submit(client, csrf)
+    with db.get_session() as session:
+        job = session.get(db.Job, job_id)
+        job.status = "assigned"
+        job.worker_id = w1_id
+        session.commit()
+
+    path = f"/api/agent/jobs/{job_id}/artifacts"
+    expected_sha256 = hashlib.sha256(b"pixel-bytes").hexdigest()
+    ok = _signed_post_multipart(client, path, w1_id, w1_key, "out.png", b"pixel-bytes")
+    assert ok.status_code == 200
+
+    res = client.get(f"/api/jobs/{job_id}", headers={"X-CSRF": csrf})
+    assert res.status_code == 200
+    assert res.json()["result_hashes"] == {"out.png": expected_sha256}
 
 
 def test_artifact_download_requires_admin(client):

@@ -121,6 +121,25 @@ comfyfed-agent run
 
 之所以要有這層設定，是因為 **workflow 本身就是可執行內容**——一個惡意或設計不良的自訂節點可以在 worker 機器上執行任意程式碼。此白名單是本機端的縱深防禦（agent 執行前擋一次），伺服器端也會另外比對節點需求做派工判斷，兩層互相獨立。
 
+### 產出物雜湊驗證
+
+worker 上傳每個產出檔時會附上該檔案的 sha256（`X-Artifact-SHA256`），伺服器收到後自己重算一次雜湊比對——不符就整個上傳被拒（`artifact.hash_mismatch`），worker 會自動重傳一次；還是不符就直接把工作標記失敗，不會讓損毀或被調包的檔案悄悄入庫。驗證通過的雜湊會存進工作紀錄的 `result_hashes`，`GET /api/jobs/{id}` 可以查到。
+
+### 磁碟清理
+
+worker 每跑完一個工作（不管成功或失敗）都會清掉這個工作在 agent 端暫存的資料；但真正會持續佔用磁碟空間的是**本機 ComfyUI 自己的 `input`／`output` 目錄**——每個工作的參考圖會被複製進 `input`，每次算圖的結果又會落在 `output`，長期跑下去容易把 worker 的硬碟塞滿。
+
+如果想讓 agent 幫忙清這兩個目錄，在 `agent.json` 設定：
+
+```json
+{
+  "comfy_output_dir": "D:/ComfyUI/output",
+  "comfy_input_dir": "D:/ComfyUI/input"
+}
+```
+
+設定後，agent 只會在**該工作成功完成、且產出物雜湊已通過平台驗證**的前提下，才刪除這個工作對應的檔案（依 ComfyUI history 回報的檔名／子目錄組路徑，只刪確認存在、且路徑安全的檔案）；沒設定就完全略過、不動任何 ComfyUI 檔案。失敗的工作一律不刪 ComfyUI 端的產出，方便你事後查原因。
+
 ### 工作自動評估
 
 伺服器收到工作後會自動解析 workflow 需要的節點類別、模型檔案與（若已知）VRAM 需求，對每台候選 worker 給出：
@@ -128,6 +147,34 @@ comfyfed-agent run
 - `eligible`：worker 具備所有必要節點與模型，可直接派工。
 - `eligible_after_fetch`：worker 缺少的模型可以在聯邦內其他 worker 上取得（Phase 2 才會落地實際傳輸機制），且磁碟空間足夠容納。
 - `ineligible`：附上白話原因，例如缺少節點類別、VRAM 不足、缺的模型在聯邦裡也找不到等。
+
+### 內嵌工作流編輯器（`/comfy`）
+
+不想自備 ComfyUI 也能拉工作流：平台可以直接把**官方 ComfyUI 前端**掛在 `/comfy`，你在瀏覽器裡拉好圖、按 Queue，工作就直接進聯邦排隊，跑完的圖也在同一個介面看。
+
+前端靜態檔不隨套件安裝（那是 20 幾 MB 的 JS，API-only 的部署根本用不到），要先抓一次：
+
+```bash
+comfyfed-server fetch-comfy-ui --data-dir ./data
+```
+
+這個指令會去 PyPI 抓 `comfyui-frontend-package` 的 wheel（**版本與 sha256 都釘死在程式碼裡**，下載後先驗雜湊才解壓），把裡面的 `static/` 解到 `<data-dir>/comfy_frontend/`。已經抓過就直接跳過。抓完**要重啟伺服器**，`/comfy` 才會掛上去。
+
+- `--version X` 可以指定別的版本，但那樣就**不驗 sha256**，也不保證跟本平台的 `/comfy/api` 相容（指令會警告你）。
+- 還沒抓的時候，`/comfy` 會顯示一頁雙語說明，告訴你跑上面那行指令。
+- `/comfy` 跟它的靜態檔都要**管理員 session**，沒登入一律導回 `/`（Console 登入頁）。
+
+抓完之後，登入 Console →「工作」頁，按主要按鈕「**開啟工作流編輯器**」就會在新分頁打開。原本貼 API JSON 的表單還在，收進同一頁的「改用貼上 API JSON」摺疊區。
+
+⚠ **編輯器裡至少要有一台 worker 在線才會出現節點**：節點清單不是平台自己編的，而是所有**在線且未停用** worker 回報的 `/object_info` 聯集。全部離線的話節點面板會是空的——這是正常的，不是壞掉。
+
+⚠ **節點清單是「聯集」，不代表任何一台 worker 都跑得動**：`/object_info` 把全部在線 worker 的節點併成一份，所以編輯器裡看得到的節點，可能分散在不同機器上。一張混用了 A 機獨有節點與 B 機獨有節點的圖**送得出去**（會建立工作、進佇列），但派工時對每一台 worker 都不合格，於是**一直卡在佇列裡**，不會有錯誤訊息。工作頁的「不合格原因」會說明缺什麼。`/comfy/api/object_info` 的回應帶了 `X-ComfyFed-Worker-Count` 標頭，是這份聯集來自幾台 worker。
+
+⚠ **編輯器上方工具列有幾顆按鈕沒有後端**：**取消／中斷（Cancel、Interrupt）、清空佇列（Clear queue）、刪除歷史紀錄**這些動作在 ComfyFed 上都沒有對應的 API，按下去只會拿到 404。Phase 1.5 的相容層是唯讀的佇列與歷史：工作一旦送出就只能等它跑完或失敗。要停掉一個工作，目前得從 Console 或直接改資料庫處理。
+
+目前的相容層只做到「拉圖 → 送工作 → 看結果」這條主線。編輯器裡幾個依賴單機 ComfyUI 的功能不會動：**存工作流到伺服器、官方範本、Manager／自訂節點擴充、模型清單瀏覽**（模型在各個 worker 上，平台自己沒有）。工作流請用瀏覽器的匯出／匯入，或用 Console 的「貼上 API JSON」。編輯器的介面偏好（主題等）會存在 `<data-dir>/comfy_settings.json`。
+
+**跟自備 ComfyUI 的關係**：兩者不衝突，是兩個入口。內嵌編輯器是「我沒有 ComfyUI，或懶得開」的路；如果你本機已經有 ComfyUI，照樣可以在自己那邊拉好工作流、用「Save (API format)」匯出，再貼進 Console 送出。真正跑圖的一律是聯邦裡的 worker（也就是各成員自己的 ComfyUI），平台本身不裝 ComfyUI、也不跑推論——`/comfy` 只是一層把官方前端的動作翻譯成聯邦工作的相容 API。
 
 ### 發布 agent 新版本
 
@@ -147,6 +194,7 @@ comfyfed-server publish-agent dist/comfyfed_agent-0.2.0-py3-none-any.whl \
 ### 已知限制
 
 - **失敗的工作不會產生收據**：收據只在 `job_done` 時建立，所以工作跑到一半失敗（或 worker 中途離線被 requeue）所耗掉的 GPU 時間不會計入貢獻報表。這段算力目前是「沒被記帳」的。
+- **計費以實際執行秒數為準，不含排隊等待**：收據的 `gpu_seconds` 取 agent 量到的實際執行秒數（`exec_seconds`，從 ComfyUI `/queue` 第一次出現在 `queue_running` 算起）與牆鐘時間（`finished_at - started_at`）兩者較小值；agent 量不到（舊版 agent、跑太快沒觀察到、或 ComfyUI `/queue` 打不到）時退回牆鐘時間。這是刻意的：同一台 worker 可能同時服務本機使用與多個平台，若把排隊等待也算進 GPU 時間，會讓每個平台都重複計費同一段等待，破壞未來的分潤機制——因此其他平台（或本機）佔用 worker 的那段時間，不算進這份收據。
 
 ### 後續規劃（Roadmap）
 
@@ -285,6 +333,25 @@ Each worker sets `node_policy` in `agent.json`:
 
 This exists because **a workflow is executable content** — a malicious or poorly-written custom node can run arbitrary code on the worker's machine. This whitelist is local, defense-in-depth (checked before the agent executes anything); the server independently checks node requirements for dispatch decisions, as a second, separate layer.
 
+### Artifact hash verification
+
+Every artifact a worker uploads carries its sha256 (`X-Artifact-SHA256`); the server recomputes the hash itself over the bytes it received and compares. A mismatch rejects the whole upload (`artifact.hash_mismatch`), the agent retries once automatically, and if it still doesn't match the job is marked failed rather than letting a corrupted or swapped file quietly land in storage. A verified hash is stored in the job's `result_hashes` and is visible via `GET /api/jobs/{id}`.
+
+### Disk cleanup
+
+After every job — success or failure — the worker discards whatever it staged for that job in its own memory/temp state. What actually accumulates on disk over time is local ComfyUI's own `input`/`output` directories: every job's reference assets get copied into `input`, and every render lands in `output`. Left alone, that fills the worker's disk.
+
+To have the agent clean those up too, set in `agent.json`:
+
+```json
+{
+  "comfy_output_dir": "D:/ComfyUI/output",
+  "comfy_input_dir": "D:/ComfyUI/input"
+}
+```
+
+With these set, the agent deletes a job's files ONLY once that job succeeded AND its artifact hashes were confirmed by the platform (reconstructing each output's path from the filename/subfolder ComfyUI's history reported, and refusing to touch anything outside the configured directories). Leave them unset and the agent skips this step entirely — it never guesses where ComfyUI's folders are. A failed job's ComfyUI-side outputs are always left in place so you can inspect what happened.
+
 ### Job assessment
 
 When a job arrives, the server automatically extracts the node classes, model files, and (when known) VRAM needs from the workflow, and rules on each candidate worker:
@@ -292,6 +359,76 @@ When a job arrives, the server automatically extracts the node classes, model fi
 - `eligible`: the worker already has every required node and model — dispatch directly.
 - `eligible_after_fetch`: models missing on this worker are available from another worker in the federation (actual transfer lands in Phase 2), and there's enough free disk to hold them.
 - `ineligible`: with plain-language reasons, e.g. missing node classes, insufficient VRAM, or missing models that no one else in the federation has either.
+
+### Embedded workflow editor (`/comfy`)
+
+You don't need your own ComfyUI to build a workflow: the platform can serve
+the **official ComfyUI frontend** at `/comfy`. Wire up your graph in the
+browser, press Queue, and the job goes straight into the federation's queue —
+the results come back in the same interface.
+
+The static bundle is not installed with the package (it's ~24 MB of
+JavaScript that an API-only deployment never touches), so fetch it once:
+
+```bash
+comfyfed-server fetch-comfy-ui --data-dir ./data
+```
+
+That downloads the `comfyui-frontend-package` wheel from PyPI — **both the
+version and its sha256 are pinned in the source**, and the digest is verified
+before anything is extracted — and unpacks its `static/` tree into
+`<data-dir>/comfy_frontend/`. Already fetched: it's a no-op. **Restart the
+server** afterwards so `/comfy` gets mounted.
+
+- `--version X` fetches a different release, but then the sha256 check is
+  **skipped** and compatibility with this platform's `/comfy/api` is not
+  guaranteed (the command warns about both).
+- Until you fetch it, `/comfy` serves a bilingual notice page telling you to
+  run the command above.
+- `/comfy` and all of its assets require an **admin session**; without one you
+  are redirected to `/` (the console login).
+
+Once it's there, log into the console, go to **Jobs**, and hit the primary
+**Open workflow editor** button — it opens in a new tab. The old paste-the-API-JSON
+form is still on that page, tucked into the "Paste API JSON instead" section.
+
+⚠ **Nodes only appear when at least one worker is online.** The node catalogue
+is not something the platform invents: it is the union of the `/object_info`
+snapshots reported by every **online, enabled** worker. With the whole fleet
+offline the node panel is empty — that's expected, not a bug.
+
+⚠ **That catalogue is a union, so it does not describe any single worker.**
+Nodes visible in the editor may live on different machines. A graph mixing a
+node only worker A has with one only worker B has **submits fine** — the job
+is created and queued — but it is ineligible for every worker individually, so
+it simply **sits in the queue forever** with no error. The Jobs page's
+ineligibility reasons explain what is missing. `/comfy/api/object_info`
+returns an `X-ComfyFed-Worker-Count` header saying how many workers the union
+came from.
+
+⚠ **Several toolbar buttons in the editor have no backend.** **Cancel /
+Interrupt, Clear queue, and deleting history entries** have no ComfyFed API
+behind them and answer **404** when clicked. The Phase 1.5 compatibility layer
+exposes the queue and history read-only: once a job is submitted it runs to
+completion or failure. Stopping a job means going through the console or the
+database.
+
+The compatibility layer currently covers the main line only: build a graph,
+queue it, see the results. Editor features that assume a single local ComfyUI
+do not work — **saving workflows to the server, the official template
+gallery, Manager / custom-node extensions, and model browsing** (models live
+on the workers; the platform has none). Export/import workflows through the
+browser instead, or paste the API JSON into the console. Editor UI
+preferences (theme and so on) persist to `<data-dir>/comfy_settings.json`.
+
+**How this relates to bringing your own ComfyUI**: they are two doors into the
+same federation, not alternatives. The embedded editor is for "I don't have
+ComfyUI here, or don't feel like launching it". If you already run ComfyUI
+locally, keep building there, export with "Save (API format)", and paste it
+into the console. Either way the actual rendering happens on federation
+workers — each member's own ComfyUI. The platform itself never installs
+ComfyUI and never runs inference; `/comfy` is only a compatibility layer that
+translates the official frontend's actions into federation jobs.
 
 ### Publishing an agent release
 
@@ -327,6 +464,18 @@ identically either way.
   `job_done`, so GPU time burned by a job that failed part-way through (or by
   a worker that dropped off and had its job requeued) never reaches the
   contribution report. That compute is currently unaccounted for.
+- **Billing is actual execution seconds, not queue wait**: a receipt's
+  `gpu_seconds` is `min(exec_seconds, wall_clock)`, where `exec_seconds` is
+  the agent's own measurement (from the moment ComfyUI's `/queue` first
+  reports the prompt under `queue_running` to completion) and `wall_clock` is
+  `finished_at - started_at`. It falls back to the wall clock when
+  `exec_seconds` is missing (an older agent, a run that finished before it
+  was ever observed running, or an unreachable `/queue`). This is
+  deliberate: one worker can serve local use plus several platforms at once,
+  and billing queue-wait as GPU time would double-charge every platform for
+  the same idle stretch, breaking future revenue sharing. Time a worker
+  spends queued behind other platforms' (or local) work is excluded from
+  this platform's receipts.
 
 ### Roadmap
 

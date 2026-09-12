@@ -56,6 +56,10 @@ def pick_job_for(worker_id: str) -> Optional[db.Job]:
 
             needs = assess.needs_from_job(job)
             v = assess.verdict(worker, needs, requirements_override, all_workers)
+            # `warnings` (e.g. vram_offload) are explicitly NOT a bar to
+            # dispatch: an eligible-with-warning worker runs the job, just
+            # more slowly. Phase 1 does no preference ordering between a
+            # clean worker and a warned one.
             if v.kind != "eligible":
                 continue
 
@@ -79,8 +83,14 @@ def pick_job_for(worker_id: str) -> Optional[db.Job]:
         return None
 
 
-def requeue_stale(now: datetime) -> int:
+def requeue_stale(now: datetime) -> list[str]:
     """Requeue assigned/running jobs of workers that haven't checked in recently.
+
+    Returns the ids of the jobs actually requeued (so `len()` is the old
+    count). The ids, not just the count, because the panel has to be told:
+    a job the frontend believes is executing goes silently back to `queued`
+    here, and nothing else will ever send it a done/failed event for that
+    attempt -- see `agentws.dispatch_tick`.
 
     A worker is stale if it hasn't checked in for more than 90s. A worker that
     has never heartbeated at all (`last_seen is None`) falls back to its
@@ -92,7 +102,7 @@ def requeue_stale(now: datetime) -> int:
     cleared, progress reset), and the worker itself is marked offline.
     """
     cutoff = now - timedelta(seconds=_STALE_SECONDS)
-    count = 0
+    requeued: list[str] = []
     with db.get_session() as session:
         workers = session.query(db.Worker).all()
         for worker in workers:
@@ -109,14 +119,14 @@ def requeue_stale(now: datetime) -> int:
                 job.status = "queued"
                 job.worker_id = None
                 job.progress = 0
-                count += 1
+                requeued.append(job.id)
 
             worker.status = "offline"
             metrics.get_metrics().worker_up.labels(worker=worker.name).set(0)
 
         session.commit()
 
-    return count
+    return requeued
 
 
 def _owned_job(session, job_id: Optional[str], worker_id: str, statuses) -> Optional[db.Job]:

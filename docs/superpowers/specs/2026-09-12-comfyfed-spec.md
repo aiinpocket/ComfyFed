@@ -12,7 +12,7 @@
 | Worker | 有 GPU 的機器，跑一個輕量 Agent，包住本機 ComfyUI 的 API。 |
 | Identity Bundle（識別碼） | 平台簽發的 JSON：`{platform_url, platform_pubkey, register_token}`。register_token 一次性。 |
 | Job | 一份 ComfyUI workflow JSON ＋參數，整包在單一 worker 上執行。 |
-| Receipt（收據） | 任務完成後雙方簽章的憑證（誰、何時、幾 GPU 秒），分潤與問責的地基。 |
+| Receipt（收據） | 任務完成後雙方簽章的憑證（誰、何時、幾 GPU 秒），分潤與問責的地基。**GPU 秒＝實際執行秒數（2026-09-12 使用者定案）**：agent 量測自己的 prompt 在本機 ComfyUI `queue_running` 中的實際執行區間，`job_done` 回報 `exec_seconds`；平台取 `min(exec_seconds, 派工至完成牆鐘)` 入帳。**排隊等待、本地任務、其他平台的工作一律不計**——一台 worker 多平台共享時，busy 牆鐘計費會把等待時間重複算給每個平台，分潤必錯。 |
 
 ## 2. 信任模型（定案）
 
@@ -61,15 +61,15 @@ worker 斷線（>90s 無心跳）→ assigned/running 的任務自動回 queued 
 - 派工：平台推給「online 且 idle **且能力符合**」的 worker（WS push）；worker 接單後對**其他已註冊平台**廣播 busy。
 - **硬體與能力回報（定案，2026-09-12 架構審查後擴充）**：worker 上線握手時回報——硬體檔案（GPU 型號、VRAM 總量、CPU 型號/核心數、RAM 總量、模型目錄磁碟可用空間、agent 版本）＋**運算後端（cuda/rocm/mps/cpu）與 torch 版本**＋**已安裝節點類別清單**（取自本機 ComfyUI `/object_info`，即 custom nodes 的真實庫存）；心跳夾動態值（VRAM/RAM/磁碟可用量）。
 - **自動任務評估引擎（定案）**：需求**由平台從 workflow 自動推導**，不依賴使用者手填（可進階覆寫，但預設全自動——使用者多非 IT 背景）：
-  - 解析 workflow → ①node class 集合 ②**引用的模型檔清單**（掃描 loader 節點的 ckpt_name/unet_name/clip_name/vae_name/lora_name 等欄位——LoRA 與 checkpoint 同級對待，皆入庫存/判定/分發）③**VRAM 粗估**（最大單一引用模型×1.15──ComfyUI 順序載入/卸載，峰值由最大模型主導；聯邦庫存查大小）④**輸入素材清單**（LoadImage/LoadImageMask 等節點的 image/audio/video 欄位——如角色固定形象參考圖）
+  - 解析 workflow → ①node class 集合 ②**引用的模型檔清單**（掃描 loader 節點的 ckpt_name/unet_name/clip_name/vae_name/lora_name 等欄位——LoRA 與 checkpoint 同級對待，皆入庫存/判定/分發）③**VRAM 粗估**（最大單一引用模型×1.15──ComfyUI 順序載入/卸載，峰值由最大模型主導；聯邦庫存查大小）。**此估值不是硬門檻（定案，2026-09-12 實機驗證後修正）**：ComfyUI 放不進 VRAM 時會把權重卸載到系統 RAM 串流執行，慢但跑得動（實測 15.9GB 顯卡跑得動 22GB 的 flux 與 33B 影片模型），因此比較對象是 **VRAM＋系統 RAM**；估值超過 VRAM 但塞得進 VRAM＋RAM 時仍判 `eligible`，只附一則非阻斷警告 `vram_offload:<估值>><VRAM>`。④**輸入素材清單**（LoadImage/LoadImageMask 等節點的 image/audio/video 欄位——如角色固定形象參考圖）
   - **任務輸入素材隨任務走（定案，2026-09-12）**：模型靠庫存/分發，但參考圖等輸入素材是任務私有的——送任務時平台自動偵測 workflow 引用的輸入檔並要求附檔（multipart 上傳，存 `data/job_inputs/<job_id>/`）；agent 領工後以簽名請求下載附檔、POST 本機 ComfyUI `/upload/image` 放進 input 目錄，再送 `/prompt`。缺附檔的任務在送出前就被 UI 擋下，不會派出去才失敗。
   - worker 心跳夾**本地模型庫存**（檔名＋大小；雜湊 Phase 2 補），平台隨時知道誰有什麼
   - 每個 worker 對每個 job 得出三態判定：
     - `eligible`——節點✓ backend✓ VRAM✓ 模型全有 → 直接派
     - `eligible_after_fetch`——**只缺模型**且聯邦內其他成員有、且磁碟裝得下 → 可派（先補模型再開工：Phase 2 平台中繼、Phase 3 P2P；Phase 1 此類顯示「僅缺模型，待模型分發功能開通」）
-    - `ineligible(reasons)`——缺節點安裝／backend 不符／VRAM 不足等**硬缺口** → 不派，UI 明列原因（「worker-A 缺 IPAdapter 節點」「worker-B VRAM 估需 18GB 僅 12GB」）
+    - `ineligible(reasons)`——缺節點安裝／backend 不符／**權重連 VRAM＋系統 RAM 都放不下**等**硬缺口** → 不派，UI 明列原因（「worker-A 缺 IPAdapter 節點」「worker-B 估需 40GB，VRAM 8GB＋RAM 16GB 放不下」）。VRAM 單獨不足**不再**列為硬缺口，改走上述 `vram_offload` 警告；`min_vram_gb` 進階覆寫仍是硬條件。
   - 派工優先序：eligible ＞ eligible_after_fetch（省頻寬）；全部 ineligible 才留佇列＋標示原因。
-- Worker 端執行：收 job → 白名單檢查 → POST 本機 ComfyUI `/prompt` → 輪詢 history/進度 → 上傳產物（圖/影片）→ 回報完成 → 雙方簽收據。
+- Worker 端執行：收 job → 白名單檢查 → POST 本機 ComfyUI `/prompt` → 輪詢 history/進度 → 上傳產物（圖/影片，附 `X-Artifact-SHA256` 供平台驗雜湊，不符或被拒重試一次）→ 回報完成 → 雙方簽收據 → 清除本次 job 的檔案（成功且雜湊確認後，另刪已設定的 ComfyUI input/output 目錄中的本次任務檔，避免 worker 磁碟被塞滿）。
 
 ## 8. 模型分發（Phase 2+，方向已定案）
 
@@ -79,7 +79,8 @@ worker 斷線（>90s 無心跳）→ assigned/running 的任務自動回 queued 
 ## 9. 分階段
 
 - **Phase 1（本計畫）**：平台核心＋Agent 核心端到端可用——安裝→登入→發識別碼→worker 註冊上線→送 workflow→派工執行→結果回傳→收據入帳→儀表板可視。
-- **Phase 2**：模型 manifest＋平台中繼下載；ComfyUI 相容 API 面板（原生 Comfy 前端直連平台）；`/object_info` 能力交集。
+- **Phase 1.5（2026-09-12 使用者定案提前）：內嵌 ComfyUI 工作流編輯器**——「要使用者自己在別處做好 workflow 再貼 JSON」對非 IT 使用者不可用。平台內嵌**官方 ComfyUI 前端**（comfyui-frontend-package 靜態包，pinned 版本＋SHA256，`comfyfed-server fetch-comfy-ui` 下載）於 `/comfy`（admin session 保護），平台實作 ComfyUI 相容 API（`/comfy/api/*`）：`object_info`=**在線 worker 能力聯集**（agent 以簽名請求回傳完整 /object_info JSON，gzip＋hash 去重，存平台檔案系統）、`prompt`→聯邦 job、`queue`/`history`/`view`→佇列與 artifacts 映射、`upload/image`→任務附檔管線、WS 進度轉發。Console 任務頁保留貼 JSON 作為進階路徑，主按鈕改為開啟編輯器。
+- **Phase 2**：模型 manifest＋平台中繼下載；`/object_info` 能力交集模式（保守選項）。
 - **Phase 3**：成員間 P2P 分塊傳輸；貢獻報表進階（分潤試算）；多管理員。
 - **未來方向：ComfyFed Cloud（2026-09-12 提出）**——平台端移植 Cloudflare Workers＋D1＋R2 的免自架部署形態：D1=SQLite（schema 近乎原樣）、R2=ArtifactStore 的 S3 介面（presigned 直傳、零出口費）、agent 長連 WS 改由 Durable Objects（hibernation）承接、派工迴圈改 DO alarms、Ed25519 驗簽走 WebCrypto。價值：DDNS/固定IP/NAT/TLS 痛點全消失。定位：**自架 Python 版仍是本體**（內網/離線場景＋資料自主），Cloud 版是第二部署形態；現有架構決策（outbound-only WS、S3 介面、簽章收據）已刻意為此保留可移植性。
 

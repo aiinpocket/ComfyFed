@@ -149,8 +149,8 @@ def test_requeue_stale_returns_job_to_queue_and_it_can_be_repicked(client):
         session.commit()
 
     now = datetime.now(timezone.utc).replace(tzinfo=None)
-    count = dispatch.requeue_stale(now)
-    assert count == 1
+    requeued = dispatch.requeue_stale(now)
+    assert requeued == [job_id]
 
     with db.get_session() as session:
         job = session.get(db.Job, job_id)
@@ -262,8 +262,8 @@ def test_requeue_stale_requeues_a_worker_that_never_heartbeated(client):
         session.get(db.Worker, w2).last_seen = datetime.now(timezone.utc).replace(tzinfo=None)
         session.commit()
 
-    count = dispatch.requeue_stale(datetime.now(timezone.utc).replace(tzinfo=None))
-    assert count == 1
+    requeued = dispatch.requeue_stale(datetime.now(timezone.utc).replace(tzinfo=None))
+    assert requeued == [job_id]
 
     with db.get_session() as session:
         job = session.get(db.Job, job_id)
@@ -281,7 +281,7 @@ def test_requeue_stale_leaves_a_freshly_registered_worker_alone(client):
     job_id = r.json()["job_id"]
     assert dispatch.pick_job_for(w1) is not None
 
-    assert dispatch.requeue_stale(datetime.now(timezone.utc).replace(tzinfo=None)) == 0
+    assert dispatch.requeue_stale(datetime.now(timezone.utc).replace(tzinfo=None)) == []
     with db.get_session() as session:
         assert session.get(db.Job, job_id).status == "assigned"
 
@@ -489,15 +489,20 @@ def test_flux_job_fits_a_16gb_card_and_dispatches(client):
 
 
 def test_an_oversized_single_model_is_still_blocked_on_vram(client):
-    """The gate still catches absurd mismatches: a 24 GB model on an 8 GB card."""
+    """The gate still catches absurd mismatches, but the bar is VRAM PLUS RAM.
+
+    LIVE-3: ComfyUI offloads weights to system RAM when they do not fit in
+    VRAM, so `est > vram` alone is not a refusal. A 40 GB model on an 8 GB
+    card with 16 GB of RAM fits nowhere, and that IS.
+    """
     csrf = _login(client)
     _register_worker(
         client,
         csrf,
         "small-card",
         node_classes=["UNETLoader", "KSampler"],
-        model_inventory=[{"name": "diffusion_models/huge-model.safetensors", "size": 24.0}],
-        hardware={"vram_gb": 8.0},
+        model_inventory=[{"name": "diffusion_models/huge-model.safetensors", "size": 40.0}],
+        hardware={"vram_gb": 8.0, "ram_gb": 16.0},
         dynamic={"free_disk_gb": 500.0},
     )
 
@@ -505,11 +510,94 @@ def test_an_oversized_single_model_is_still_blocked_on_vram(client):
     job_id = _submit(client, csrf, workflow=workflow).json()["job_id"]
 
     detail = client.get(f"/api/jobs/{job_id}", headers={"X-CSRF": csrf}).json()
-    assert detail["est_vram_gb"] == pytest.approx(24.0 * 1.15)
+    assert detail["est_vram_gb"] == pytest.approx(40.0 * 1.15)
 
     entry = client.get(f"/api/jobs/{job_id}/assessment", headers={"X-CSRF": csrf}).json()["workers"][0]
     assert entry["verdict"] == "ineligible"
     assert any(r.startswith("vram:") for r in entry["reasons"])
+    assert entry["warnings"] == []
+
+    # And it stays in the queue.
+    assert dispatch.pick_job_for(entry["worker_id"]) is None
+
+
+def test_a_model_over_vram_but_under_vram_plus_ram_dispatches_with_a_warning(client):
+    """LIVE-3, the real machine that prompted this: flux1-dev is 22.17 GB and
+    est = 25.49, on a 15.9 GB card with 63.6 GB of RAM. That card demonstrably
+    runs flux (and a 33B video model) because ComfyUI streams weights from
+    system RAM. The old hard `est > vram` gate made every worker ineligible,
+    so a panel-submitted job sat queued forever with no error.
+    """
+    csrf = _login(client)
+    worker_id = _register_worker(
+        client,
+        csrf,
+        "real-card",
+        node_classes=["UNETLoader", "KSampler"],
+        model_inventory=[{"name": "diffusion_models/flux1-dev.safetensors", "size": 22.17}],
+        hardware={"vram_gb": 15.9, "ram_gb": 63.6},
+        dynamic={"free_disk_gb": 500.0},
+    )
+
+    workflow = {"1": {"class_type": "UNETLoader", "inputs": {"unet_name": "flux1-dev.safetensors"}}}
+    job_id = _submit(client, csrf, workflow=workflow).json()["job_id"]
+
+    detail = client.get(f"/api/jobs/{job_id}", headers={"X-CSRF": csrf}).json()
+    assert detail["est_vram_gb"] == pytest.approx(22.17 * 1.15)
+
+    entry = client.get(f"/api/jobs/{job_id}/assessment", headers={"X-CSRF": csrf}).json()["workers"][0]
+    assert entry["verdict"] == "eligible"
+    assert entry["reasons"] == []
+    assert len(entry["warnings"]) == 1
+    assert entry["warnings"][0].startswith("vram_offload:")
+    assert entry["warnings"][0].endswith(">15.9")
+
+    # The point of the whole fix: an eligible-with-warning worker DISPATCHES.
+    picked = dispatch.pick_job_for(worker_id)
+    assert picked is not None and picked.id == job_id
+
+
+def test_a_model_that_fits_in_vram_carries_no_warning(client):
+    csrf = _login(client)
+    _register_worker(
+        client,
+        csrf,
+        "big-card",
+        node_classes=["UNETLoader", "KSampler"],
+        model_inventory=[{"name": "diffusion_models/small.safetensors", "size": 4.0}],
+        hardware={"vram_gb": 24.0, "ram_gb": 64.0},
+        dynamic={"free_disk_gb": 500.0},
+    )
+
+    workflow = {"1": {"class_type": "UNETLoader", "inputs": {"unet_name": "small.safetensors"}}}
+    job_id = _submit(client, csrf, workflow=workflow).json()["job_id"]
+
+    entry = client.get(f"/api/jobs/{job_id}/assessment", headers={"X-CSRF": csrf}).json()["workers"][0]
+    assert entry["verdict"] == "eligible"
+    assert entry["warnings"] == []
+
+
+def test_min_vram_override_stays_a_hard_refusal(client):
+    """The automatic gate softened; the manual override did not."""
+    csrf = _login(client)
+    _register_worker(
+        client,
+        csrf,
+        "real-card",
+        node_classes=["UNETLoader", "KSampler"],
+        model_inventory=[{"name": "diffusion_models/flux1-dev.safetensors", "size": 22.17}],
+        hardware={"vram_gb": 15.9, "ram_gb": 63.6},
+        dynamic={"free_disk_gb": 500.0},
+    )
+
+    workflow = {"1": {"class_type": "UNETLoader", "inputs": {"unet_name": "flux1-dev.safetensors"}}}
+    job_id = _submit(
+        client, csrf, workflow=workflow, requirements={"min_vram_gb": 24.0}
+    ).json()["job_id"]
+
+    entry = client.get(f"/api/jobs/{job_id}/assessment", headers={"X-CSRF": csrf}).json()["workers"][0]
+    assert entry["verdict"] == "ineligible"
+    assert "override:min_vram_gb" in entry["reasons"]
 
 
 def test_flux_job_with_a_genuinely_absent_model_is_still_ineligible(client):

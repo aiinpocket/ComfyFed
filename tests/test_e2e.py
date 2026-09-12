@@ -202,8 +202,14 @@ def test_full_job_lifecycle_over_the_wire(server, mock_comfy, tmp_path):
         assert _mock_state["uploads"]["ref.png"] == b"input-image-bytes"
 
         # ...run the workflow against (mock) ComfyUI...
-        results = comfy.run_workflow("http://mockcomfy", workflow, client=mock_client)
-        assert results == [("out.png", b"FAKE-PNG-BYTES")]
+        results, exec_seconds = comfy.run_workflow("http://mockcomfy", workflow, client=mock_client)
+        assert results == [("out.png", b"FAKE-PNG-BYTES", "")]
+        # The mock ComfyUI has no /queue endpoint, so the prompt was never
+        # observed under queue_running -- exec_seconds falls back to the span
+        # since the local /prompt POST, which still excludes federation
+        # dispatch and input download. (The server's own wall-clock fallback,
+        # for a genuinely absent exec_seconds, is covered by test_agent_ws.py.)
+        assert exec_seconds is not None and exec_seconds >= 0
 
         # ...upload the resulting artifact back to the platform via a signed
         # multipart POST. The multipart body must be frozen to concrete bytes
@@ -212,7 +218,7 @@ def test_full_job_lifecycle_over_the_wire(server, mock_comfy, tmp_path):
         # signing goes through the real agent-side `signing.signed_headers`,
         # the same code path a real agent uses, so a future wire-format
         # change there breaks this test instead of a hand-rolled duplicate.
-        filename, content = results[0]
+        filename, content, _subfolder = results[0]
         artifact_path = f"/api/agent/jobs/{job_id}/artifacts"
         prebuilt = httpx.Request(
             "POST",
@@ -230,7 +236,14 @@ def test_full_job_lifecycle_over_the_wire(server, mock_comfy, tmp_path):
         assert artifact_resp.json()["stored"] == filename
 
         # ...and finally reports job_done over the WebSocket.
-        ws.send_json({"type": "job_done", "job_id": job_id, "result_files": [filename]})
+        ws.send_json(
+            {
+                "type": "job_done",
+                "job_id": job_id,
+                "result_files": [filename],
+                "exec_seconds": exec_seconds,
+            }
+        )
 
         # The server immediately pushes back a platform-signed receipt.
         receipt_msg = ws.receive_json()
