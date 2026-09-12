@@ -33,7 +33,7 @@ MODEL_INVENTORY = {
     "minimax_h3_audio_vae_fp32.safetensors",
     "minimax_h3_ref2v_turbo_8step_v1.0_768p_comfyui_resized_avg_rank_64_bf16.safetensors",
 }
-MISSING_MODELS_NOTE_TITLE = "⑩ 缺模型？/ Missing models?"
+MISSING_MODELS_NOTE_TITLE = "⓪ 缺模型？/ Missing models?"
 
 _R2_URL_RE = re.compile(r"https://pub-6a50550b7f984673a3ab1a1b580e4fb9\.r2\.dev/models/\S+")
 
