@@ -1,9 +1,11 @@
+import os
+
 import pytest
 from fastapi.testclient import TestClient
 from nacl.signing import VerifyKey
 
 from comfyfed_server import app as app_module
-from comfyfed_server import bootstrap, security
+from comfyfed_server import bootstrap, db, security
 
 
 @pytest.fixture()
@@ -149,3 +151,56 @@ def test_disable_unknown_worker_404(client):
     r = client.post("/api/workers/does-not-exist/disable", headers={"X-CSRF": csrf})
     assert r.status_code == 404
     assert r.json()["error"]["code"] == "workers.not_found"
+
+
+def test_agent_version_defaults_when_no_settings(client):
+    r = client.get("/api/agent/version")
+    assert r.status_code == 200
+    body = r.json()
+    assert body == {
+        "latest": "0.1.0",
+        "min_supported": "0.1.0",
+        "wheel_url": None,
+        "sha256": None,
+        "platform_sig": None,
+    }
+
+
+def test_agent_version_reads_settings(client):
+    with db.get_session() as session:
+        session.add(db.Setting(key="agent_latest", value="0.2.0"))
+        session.add(db.Setting(key="agent_min_supported", value="0.2.0"))
+        session.add(db.Setting(key="agent_wheel_url", value="http://h/api/agent/releases/agent-0.2.0.whl"))
+        session.add(db.Setting(key="agent_wheel_sha256", value="deadbeef"))
+        session.add(db.Setting(key="agent_wheel_sig", value="abcd"))
+        session.commit()
+
+    r = client.get("/api/agent/version")
+    assert r.status_code == 200
+    body = r.json()
+    assert body["latest"] == "0.2.0"
+    assert body["min_supported"] == "0.2.0"
+    assert body["wheel_url"] == "http://h/api/agent/releases/agent-0.2.0.whl"
+    assert body["sha256"] == "deadbeef"
+    assert body["platform_sig"] == "abcd"
+
+
+def test_agent_release_serves_file(client):
+    releases_dir = os.path.join(client.data_dir, "releases")
+    os.makedirs(releases_dir, exist_ok=True)
+    with open(os.path.join(releases_dir, "agent-0.2.0.whl"), "wb") as f:
+        f.write(b"fake wheel bytes")
+
+    r = client.get("/api/agent/releases/agent-0.2.0.whl")
+    assert r.status_code == 200
+    assert r.content == b"fake wheel bytes"
+
+
+def test_agent_release_missing_404(client):
+    r = client.get("/api/agent/releases/does-not-exist.whl")
+    assert r.status_code == 404
+
+
+def test_agent_release_sanitizes_path_traversal(client):
+    r = client.get("/api/agent/releases/..%2F..%2Fsecrets.txt")
+    assert r.status_code in (404, 400)

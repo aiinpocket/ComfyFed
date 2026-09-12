@@ -23,6 +23,7 @@ class AgentConfig:
     whitelist_extra: list[str] = field(default_factory=list)
     node_policy: str = "installed"
     models_dir: str | None = None
+    auto_update: bool = True
 
     @classmethod
     def load(cls, path: str) -> "AgentConfig":
@@ -40,6 +41,7 @@ class AgentConfig:
             whitelist_extra=list(data.get("whitelist_extra", [])),
             node_policy=data.get("node_policy", cls.node_policy),
             models_dir=data.get("models_dir"),
+            auto_update=data.get("auto_update", cls.auto_update),
         )
 
     def save(self, path: str) -> None:
@@ -54,6 +56,7 @@ class AgentConfig:
             "whitelist_extra": list(self.whitelist_extra),
             "node_policy": self.node_policy,
             "models_dir": self.models_dir,
+            "auto_update": self.auto_update,
         }
 
         tmp_path = f"{path}.tmp-{os.getpid()}"

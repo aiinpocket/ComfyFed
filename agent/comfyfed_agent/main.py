@@ -7,10 +7,11 @@ import asyncio
 import json
 import os
 import socket
+import sys
 
 import httpx
 
-from . import identity
+from . import __version__, identity, update
 from .config import AgentConfig
 from .runner import AgentLoop
 
@@ -35,6 +36,25 @@ def _cmd_run(args: argparse.Namespace) -> None:
     if not cfg.platforms:
         print(f"No platforms registered in {args.config}. Run 'comfyfed-agent register <bundle.json>' first.")
         return
+
+    # One agent install may be pinned to multiple platforms; checking the
+    # first is enough since any pinned platform can vouch for whether this
+    # agent build is still supported.
+    with httpx.Client() as client:
+        decision = update.check(cfg.platforms[0], __version__, client)
+
+        if decision.action == "blocked":
+            print(
+                f"This agent version ({__version__}) is no longer supported by "
+                f"{cfg.platforms[0].platform_url} (minimum: {decision.min_supported}). "
+                "請更新 comfyfed-agent 後再啟動 / Please update comfyfed-agent before starting."
+            )
+            sys.exit(3)
+
+        if decision.action == "update" and cfg.auto_update:
+            print(f"Updating comfyfed-agent {__version__} -> {decision.latest}...")
+            if not update.apply_update(cfg.platforms[0], decision, client):
+                print("Update failed verification; continuing with the current version.")
 
     print(f"Starting agent loop for {len(cfg.platforms)} platform(s)...")
     asyncio.run(AgentLoop(cfg, args.config).run())

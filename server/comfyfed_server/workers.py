@@ -3,11 +3,13 @@
 from __future__ import annotations
 
 import json
+import os
 import secrets
 import time
 from typing import Optional
 
 from fastapi import APIRouter, Depends, Header, HTTPException, Request
+from fastapi.responses import FileResponse
 from nacl.exceptions import BadSignatureError
 from nacl.signing import VerifyKey
 from pydantic import BaseModel
@@ -16,6 +18,14 @@ from sqlalchemy import update
 from . import auth, db, security
 
 _PLATFORM_URL_KEY = "platform_url"
+
+_RELEASES_DIRNAME = "releases"
+_AGENT_VERSION_DEFAULT = "0.1.0"
+_AGENT_LATEST_KEY = "agent_latest"
+_AGENT_MIN_SUPPORTED_KEY = "agent_min_supported"
+_AGENT_WHEEL_URL_KEY = "agent_wheel_url"
+_AGENT_WHEEL_SHA256_KEY = "agent_wheel_sha256"
+_AGENT_WHEEL_SIG_KEY = "agent_wheel_sig"
 
 _NONCE_TTL_SECONDS = 300
 _MAX_TS_SKEW_SECONDS = 120
@@ -195,6 +205,30 @@ def create_router(data_dir: str) -> APIRouter:
                 }
                 for w in workers
             ]
+
+    @r.get("/api/agent/version")
+    def agent_version():
+        with db.get_session() as session:
+
+            def _setting(key: str, default: Optional[str]) -> Optional[str]:
+                row = session.get(db.Setting, key)
+                return row.value if row is not None else default
+
+            return {
+                "latest": _setting(_AGENT_LATEST_KEY, _AGENT_VERSION_DEFAULT),
+                "min_supported": _setting(_AGENT_MIN_SUPPORTED_KEY, _AGENT_VERSION_DEFAULT),
+                "wheel_url": _setting(_AGENT_WHEEL_URL_KEY, None),
+                "sha256": _setting(_AGENT_WHEEL_SHA256_KEY, None),
+                "platform_sig": _setting(_AGENT_WHEEL_SIG_KEY, None),
+            }
+
+    @r.get("/api/agent/releases/{filename}")
+    def agent_release(filename: str):
+        safe_name = os.path.basename(filename)
+        path = os.path.join(data_dir, _RELEASES_DIRNAME, safe_name)
+        if not os.path.isfile(path):
+            raise _error(404, "agent.release_not_found", "Release file not found.")
+        return FileResponse(path)
 
     @r.post("/api/workers/{worker_id}/disable")
     def disable_worker(
