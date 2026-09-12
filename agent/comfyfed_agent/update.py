@@ -98,6 +98,10 @@ def apply_update(
     installed. Any failure returns False and leaves the current install
     untouched -- the caller should keep running the old version.
     """
+    if decision.action != "update":
+        logger.warning("apply_update called with action=%r; refusing to update.", decision.action)
+        return False
+
     if not decision.wheel_url or not decision.sha256 or not decision.platform_sig:
         logger.warning("Update decision missing wheel_url/sha256/platform_sig; refusing to update.")
         return False
@@ -126,12 +130,22 @@ def apply_update(
     try:
         with os.fdopen(fd, "wb") as f:
             f.write(wheel_bytes)
-        pip_install(tmp_path)
+        try:
+            pip_install(tmp_path)
+        except Exception:
+            logger.warning("pip install of downloaded wheel failed; continuing with the current version.")
+            return False
     finally:
         try:
             os.remove(tmp_path)
         except OSError:
             pass
 
-    restart()
+    # pip install has already succeeded at this point, so a failure to
+    # restart is logged but still reported as a successful update -- the
+    # new version is installed and will take effect on the next start.
+    try:
+        restart()
+    except Exception:
+        logger.warning("Update installed but restart failed; it will take effect on next start.")
     return True

@@ -164,6 +164,43 @@ def test_apply_update_good_signature_installs_and_restarts():
     assert restart_calls == [True]
 
 
+def test_apply_update_pip_install_raises_returns_false_and_no_restart():
+    import subprocess
+
+    signing_key = SigningKey.generate()
+    entry = _entry(platform_pubkey=bytes(signing_key.verify_key).hex())
+
+    wheel_bytes = b"fake wheel contents"
+    sha256 = hashlib.sha256(wheel_bytes).hexdigest()
+    good_sig = signing_key.sign(sha256.encode()).signature.hex()
+
+    decision = UpdateDecision(
+        action="update",
+        latest="0.2.0",
+        min_supported="0.1.0",
+        wheel_url="http://testplatform/api/agent/releases/agent-0.2.0.whl",
+        sha256=sha256,
+        platform_sig=good_sig,
+    )
+    client = _FakeClient(wheel_bytes=wheel_bytes)
+
+    restart_calls = []
+
+    def _failing_pip_install(path):
+        raise subprocess.CalledProcessError(1, ["pip", "install", path])
+
+    ok = apply_update(
+        entry,
+        decision,
+        client,
+        pip_install=_failing_pip_install,
+        restart=lambda: restart_calls.append(True),
+    )
+
+    assert ok is False
+    assert restart_calls == []
+
+
 def test_apply_update_missing_wheel_info_rejected():
     entry = _entry()
     decision = UpdateDecision(action="ok", latest="0.1.0", min_supported="0.1.0")

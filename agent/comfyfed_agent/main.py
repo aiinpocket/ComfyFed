@@ -51,10 +51,13 @@ def _cmd_run(args: argparse.Namespace) -> None:
             )
             sys.exit(3)
 
-        if decision.action == "update" and cfg.auto_update:
-            print(f"Updating comfyfed-agent {__version__} -> {decision.latest}...")
-            if not update.apply_update(cfg.platforms[0], decision, client):
-                print("Update failed verification; continuing with the current version.")
+        if decision.action == "update":
+            if cfg.auto_update:
+                print(f"Updating comfyfed-agent {__version__} -> {decision.latest}...")
+                if not update.apply_update(cfg.platforms[0], decision, client):
+                    print("Update failed verification; continuing with the current version.")
+            else:
+                print(f"新版本可用 / A new version is available: {decision.latest} (auto_update is off).")
 
     print(f"Starting agent loop for {len(cfg.platforms)} platform(s)...")
     asyncio.run(AgentLoop(cfg, args.config).run())
