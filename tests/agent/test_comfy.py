@@ -97,8 +97,15 @@ def test_run_workflow_returns_output_files(client):
     assert files == [("out.png", b"PNGDATA")]
     assert progress_calls[-1] == 1.0
     # Never observed running in /queue (history was already there on the
-    # first poll), so there's no measured execution window.
-    assert exec_seconds is None
+    # first poll), so exec_seconds falls back to the span since the local
+    # /prompt POST -- a real, positive upper bound, NOT None. None would make
+    # the server bill its own assigned->done wall clock, re-admitting the
+    # federation queue wait this measurement exists to exclude.
+    # `>= 0`, not `> 0`: the mock finishes in microseconds and Windows'
+    # time.monotonic ticks at ~15ms, so a genuine measurement can legitimately
+    # round to 0.0. The invariant under test is that it is a NUMBER.
+    assert exec_seconds is not None
+    assert exec_seconds >= 0
 
 
 def test_run_workflow_raises_on_prompt_error(client):
@@ -176,8 +183,13 @@ def test_run_workflow_sits_at_ceiling_once_off_the_queue(client, monkeypatch):
     assert progress_calls[1:-1] == [0.9, 0.9]
     assert progress_calls[-1] == 1.0
     # Already off the queue on the first poll (queue_running was empty the
-    # whole time), so it was never observed running -- no measured window.
-    assert exec_seconds is None
+    # whole time), so it was never observed running -- exec_seconds falls
+    # back to the span since submission rather than going None.
+    # `>= 0`, not `> 0`: the mock finishes in microseconds and Windows'
+    # time.monotonic ticks at ~15ms, so a genuine measurement can legitimately
+    # round to 0.0. The invariant under test is that it is a NUMBER.
+    assert exec_seconds is not None
+    assert exec_seconds >= 0
 
 
 def test_run_workflow_exec_seconds_excludes_queue_wait(client, monkeypatch):

@@ -205,9 +205,11 @@ def test_full_job_lifecycle_over_the_wire(server, mock_comfy, tmp_path):
         results, exec_seconds = comfy.run_workflow("http://mockcomfy", workflow, client=mock_client)
         assert results == [("out.png", b"FAKE-PNG-BYTES")]
         # The mock ComfyUI has no /queue endpoint, so the prompt was never
-        # observed under queue_running -- the server must fall back to the
-        # wall clock for billing (covered by test_agent_ws.py).
-        assert exec_seconds is None
+        # observed under queue_running -- exec_seconds falls back to the span
+        # since the local /prompt POST, which still excludes federation
+        # dispatch and input download. (The server's own wall-clock fallback,
+        # for a genuinely absent exec_seconds, is covered by test_agent_ws.py.)
+        assert exec_seconds is not None and exec_seconds >= 0
 
         # ...upload the resulting artifact back to the platform via a signed
         # multipart POST. The multipart body must be frozen to concrete bytes

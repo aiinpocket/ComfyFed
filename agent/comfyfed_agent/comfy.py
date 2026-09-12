@@ -148,9 +148,14 @@ def run_workflow(
     GPU execution actually started, as opposed to merely being queued behind
     other work -- ours or another platform's, on a worker shared across
     platforms) and completion. When that moment was never observed -- the run
-    finished between polls, or `/queue` was unreachable -- `exec_seconds` is
-    `None` and the caller must fall back to a different measure of billed
-    time (see `runner.py` / the server's receipt creation).
+    finished between polls, or `/queue` was unreachable -- it falls back to
+    the span since the local `/prompt` POST: a strict upper bound on GPU time
+    that is still measured wholly on this worker, so it excludes federation
+    dispatch and input download. It is deliberately NOT `None` there: `None`
+    makes the server bill its own `assigned -> done` wall clock, which puts
+    the federation's queue wait back into the bill -- the exact thing this
+    measurement exists to keep out. `None` is reserved for a run that is
+    genuinely unmeasurable (an exception before submission).
 
     Raises `ComfyError` on a /prompt submission error (node_errors, a
     top-level error, or a non-2xx response) or when the finished history
@@ -164,6 +169,10 @@ def run_workflow(
     c, owns = _client_or_new(client)
     try:
         client_id = str(uuid.uuid4())
+        # Clock for the exec_seconds fallback: everything after this point is
+        # local to this worker, so a span measured from here never includes
+        # federation dispatch or input download.
+        submitted_at = time.monotonic()
         resp = c.post(
             f"{comfy_url.rstrip('/')}/prompt",
             json={"prompt": workflow, "client_id": client_id},
@@ -203,7 +212,15 @@ def run_workflow(
                     on_progress(_PROGRESS_CEILING)
             time.sleep(_POLL_INTERVAL_SECONDS)
 
-        exec_seconds = (time.monotonic() - exec_start) if exec_start is not None else None
+        # Fall back to the span since the local /prompt POST when the running
+        # window was never observed (a run that finished between polls, or a
+        # /queue we could not reach). That is a strict upper bound on GPU
+        # time, but it is measured entirely on this worker AFTER submission,
+        # so it still excludes federation dispatch and input download -- which
+        # is exactly what the server's own wall-clock fallback (assigned ->
+        # done) would wrongly re-admit into the bill. `None` is reserved for
+        # genuinely unmeasurable runs.
+        exec_seconds = time.monotonic() - (exec_start if exec_start is not None else submitted_at)
 
         status = history_entry.get("status") or {}
         if status.get("status_str") == "error":
