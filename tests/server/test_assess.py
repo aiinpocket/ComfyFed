@@ -59,11 +59,17 @@ def test_estimate_vram_none_when_no_known_size():
     assert assess.estimate_vram({"sd_xl_base.safetensors"}, []) is None
 
 
-def test_estimate_vram_sums_max_known_size_with_fudge_factor():
+def test_estimate_vram_uses_the_largest_single_model_with_fudge_factor():
+    """Peak VRAM is driven by the biggest model, not the sum of all of them.
+
+    ComfyUI loads and offloads models around the diffusion pass, so they are
+    not all resident at once. Each model's size is still the largest value
+    known for it anywhere in the federation (6.0 here, not w1's stale 4.0).
+    """
     w1 = _worker("w1", model_inventory=[{"name": "a.safetensors", "size": 4.0}])
     w2 = _worker("w2", model_inventory=[{"name": "a.safetensors", "size": 6.0}, {"name": "b.safetensors", "size": 2.0}])
     result = assess.estimate_vram({"a.safetensors", "b.safetensors"}, [w1, w2])
-    assert result == (6.0 + 2.0) * 1.15
+    assert result == 6.0 * 1.15
 
 
 def test_verdict_eligible_when_everything_present():
@@ -295,8 +301,9 @@ def test_estimate_vram_finds_category_relative_models():
 
     estimate = assess.estimate_vram({"flux1-dev.safetensors", "ae.safetensors"}, [worker])
     assert estimate is not None
-    # (11.9 + 0.3) * the 1.15 fudge factor -- the sizes were actually found.
-    assert estimate == pytest.approx((11.9 + 0.3) * 1.15)
+    # The sizes were actually found, and the largest (11.9, not 0.3) drives
+    # the estimate -- x the 1.15 fudge factor.
+    assert estimate == pytest.approx(11.9 * 1.15)
 
 
 def test_estimate_vram_returns_none_when_nothing_matches():
@@ -341,3 +348,33 @@ def test_find_model_reports_presence_and_the_largest_known_size():
     assert assess.find_model(inventory, "absent.safetensors") == (False, None)
     assert assess.find_model([], "anything") == (False, None)
     assert assess.find_model([{"no_name": 1}, "junk"], "anything") == (False, None)
+
+
+def test_fetch_disk_headroom_is_still_a_sum_not_a_max():
+    """Disk and VRAM measure different resources.
+
+    Every fetched model lands on disk and stays there simultaneously, so the
+    eligible_after_fetch headroom check sums them -- even though the VRAM
+    estimate deliberately takes the largest single model.
+    """
+    peer = _worker(
+        "peer",
+        model_inventory=[
+            {"name": "diffusion_models/big.safetensors", "size": 11.0},
+            {"name": "text_encoders/also_big.safetensors", "size": 9.0},
+        ],
+    )
+    needs = assess.JobNeeds(
+        nodes=set(),
+        models={"big.safetensors", "also_big.safetensors"},
+        est_vram_gb=None,
+        assets=set(),
+    )
+
+    # 15 GB free clears the largest model (11) but not the total (20).
+    cramped = _worker("w1", dynamic={"free_disk_gb": 15.0})
+    assert assess.verdict(cramped, needs, {}, [cramped, peer]).kind == "ineligible"
+
+    # 25 GB clears the sum.
+    roomy = _worker("w2", dynamic={"free_disk_gb": 25.0})
+    assert assess.verdict(roomy, needs, {}, [roomy, peer]).kind == "eligible_after_fetch"

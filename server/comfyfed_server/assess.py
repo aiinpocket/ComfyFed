@@ -234,27 +234,35 @@ def _worker_node_classes(worker) -> list[str]:
 
 
 def estimate_vram(models: set[str], workers: list) -> float | None:
-    """Sum the max known size (GB) of each model across all workers' inventories.
+    """Estimate a job's peak VRAM: the LARGEST single referenced model x 1.15.
 
-    Inventory entries are matched with `matches_model_name`, not by string
-    equality -- see that helper for why the two names differ in shape.
+    Deliberately the largest model, not the sum of all of them. ComfyUI does
+    not hold every referenced model in VRAM simultaneously -- it loads and
+    offloads them around the diffusion pass, so text encoders and the VAE are
+    generally not resident at the same time as the diffusion model. Peak usage
+    is therefore dominated by the single biggest model.
+
+    Summing instead (the original spec's rule) overstated a flux workflow at
+    ~25.6 GB when it in fact runs on a 16 GB card, which made real jobs
+    undispatchable. This gate exists to catch absurd mismatches -- a 24 GB
+    model on an 8 GB card -- not to predict peak usage precisely.
+
+    Each model's size is the largest value known for it anywhere in the
+    federation. Inventory entries are matched with `matches_model_name`, not
+    by string equality -- see that helper for why the two names differ in
+    shape.
 
     Returns None if no referenced model has a known size anywhere.
     """
-    total = 0.0
-    found_any = False
+    largest: float | None = None
     for model_name in models:
-        best_size = None
         for worker in workers:
             _found, size = find_model(_model_inventory(worker), model_name)
-            if size is not None and (best_size is None or size > best_size):
-                best_size = size
-        if best_size is not None:
-            found_any = True
-            total += best_size
-    if not found_any:
+            if size is not None and (largest is None or size > largest):
+                largest = size
+    if largest is None:
         return None
-    return total * _VRAM_FUDGE_FACTOR
+    return largest * _VRAM_FUDGE_FACTOR
 
 
 def verdict(worker, needs: JobNeeds, requirements_override: dict, all_workers: list) -> Verdict:
@@ -328,6 +336,10 @@ def verdict(worker, needs: JobNeeds, requirements_override: dict, all_workers: l
 
     # Can every missing model be fetched from some other worker, and does
     # this worker have enough free disk for the total size of what's missing?
+    #
+    # This one really is a SUM, unlike the VRAM estimate above: every fetched
+    # model lands on disk and stays there at the same time. Don't "correct"
+    # it to a max to match estimate_vram -- they measure different resources.
     other_workers = [w for w in all_workers if w is not worker]
     total_missing_size = 0.0
     all_available_elsewhere = True

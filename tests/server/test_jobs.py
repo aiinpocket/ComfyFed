@@ -449,61 +449,22 @@ FLUX_ROOT_RELATIVE_INVENTORY = [
 ]
 
 
-def test_real_world_flux_job_is_assessed_eligible_and_dispatches(client):
-    """End-to-end guard for the live-reproduced integration bug.
+def test_flux_job_fits_a_16gb_card_and_dispatches(client):
+    """End-to-end guard for the live-reproduced failure on rtx5080-main.
 
-    A worker whose inventory is models-root-relative must be judged eligible
-    for a workflow whose loader values are category-relative -- and the job
-    must actually get picked up. Before the matching fix every model read as
-    missing, so the verdict was ineligible and nothing was ever dispatched.
+    Two separate defects had to be fixed for this to pass, and this test
+    covers both:
+
+    1. The worker's inventory is models-root-relative
+       ("diffusion_models/flux1-dev.safetensors") while the workflow's loader
+       values are category-relative ("flux1-dev.safetensors"). Exact-string
+       comparison judged every model missing.
+    2. Peak VRAM is the LARGEST single model (11.9 * 1.15 = 13.7), not the sum
+       of all four (25.6, which would still have blocked a 16 GB card).
+       ComfyUI loads and offloads models around the diffusion pass.
     """
     csrf = _login(client)
     worker_id = _register_worker(
-        client,
-        csrf,
-        "rtx5080-main",
-        node_classes=["UNETLoader", "DualCLIPLoader", "VAELoader", "KSampler"],
-        model_inventory=FLUX_ROOT_RELATIVE_INVENTORY,
-        # 32 GB so the VRAM heuristic doesn't confound the seam under test;
-        # the 16 GB case is pinned separately below.
-        hardware={"vram_gb": 32.0, "gpu_name": "NVIDIA GeForce RTX 5080"},
-        dynamic={"free_disk_gb": 500.0},
-    )
-
-    submitted = _submit(client, csrf, workflow=FLUX_WORKFLOW)
-    assert submitted.status_code == 200
-    job_id = submitted.json()["job_id"]
-
-    # The sizes were found, so the estimate is real rather than None.
-    detail = client.get(f"/api/jobs/{job_id}", headers={"X-CSRF": csrf}).json()
-    assert detail["est_vram_gb"] is not None
-    assert 20 < detail["est_vram_gb"] < 30  # (11.9+9.8+0.25+0.3) * 1.15
-
-    assessment = client.get(f"/api/jobs/{job_id}/assessment", headers={"X-CSRF": csrf}).json()
-    entry = assessment["workers"][0]
-    assert entry["verdict"] == "eligible", entry
-    assert entry["missing_models"] == []
-
-    picked = dispatch.pick_job_for(worker_id)
-    assert picked is not None and picked.id == job_id
-
-
-def test_flux_job_on_a_16gb_card_is_now_blocked_by_the_vram_heuristic(client):
-    """Characterisation test: pins TODAY's behaviour, which is questionable.
-
-    With model matching fixed, the estimator finally finds the flux model
-    sizes -- and sums ALL of them (11.9 + 9.8 + 0.25 + 0.3) * 1.15 = 25.6 GB,
-    so a 16 GB card is judged VRAM-ineligible. Real ComfyUI runs this workflow
-    on 16 GB because it does not hold every model in VRAM at once.
-
-    So the live symptom ("nothing dispatches" on rtx5080-main) is only half
-    fixed by the name matching: the reason changes from
-    missing_models_unavailable to vram. Reworking `estimate_vram` is outside
-    this fix's scope, so this test documents the current outcome rather than
-    asserting the desired one. If the heuristic is changed, update this test.
-    """
-    csrf = _login(client)
-    _register_worker(
         client,
         csrf,
         "rtx5080-main",
@@ -514,11 +475,39 @@ def test_flux_job_on_a_16gb_card_is_now_blocked_by_the_vram_heuristic(client):
     )
 
     job_id = _submit(client, csrf, workflow=FLUX_WORKFLOW).json()["job_id"]
-    entry = client.get(f"/api/jobs/{job_id}/assessment", headers={"X-CSRF": csrf}).json()["workers"][0]
 
-    # The models ARE found now -- that part of the bug is fixed.
+    detail = client.get(f"/api/jobs/{job_id}", headers={"X-CSRF": csrf}).json()
+    assert detail["est_vram_gb"] == pytest.approx(11.9 * 1.15)  # 13.685
+
+    entry = client.get(f"/api/jobs/{job_id}/assessment", headers={"X-CSRF": csrf}).json()["workers"][0]
     assert entry["missing_models"] == []
-    # But the summed-size heuristic blocks it on VRAM.
+    assert entry["verdict"] == "eligible", entry
+
+    # And it actually dispatches, which is the whole point.
+    picked = dispatch.pick_job_for(worker_id)
+    assert picked is not None and picked.id == job_id
+
+
+def test_an_oversized_single_model_is_still_blocked_on_vram(client):
+    """The gate still catches absurd mismatches: a 24 GB model on an 8 GB card."""
+    csrf = _login(client)
+    _register_worker(
+        client,
+        csrf,
+        "small-card",
+        node_classes=["UNETLoader", "KSampler"],
+        model_inventory=[{"name": "diffusion_models/huge-model.safetensors", "size": 24.0}],
+        hardware={"vram_gb": 8.0},
+        dynamic={"free_disk_gb": 500.0},
+    )
+
+    workflow = {"1": {"class_type": "UNETLoader", "inputs": {"unet_name": "huge-model.safetensors"}}}
+    job_id = _submit(client, csrf, workflow=workflow).json()["job_id"]
+
+    detail = client.get(f"/api/jobs/{job_id}", headers={"X-CSRF": csrf}).json()
+    assert detail["est_vram_gb"] == pytest.approx(24.0 * 1.15)
+
+    entry = client.get(f"/api/jobs/{job_id}/assessment", headers={"X-CSRF": csrf}).json()["workers"][0]
     assert entry["verdict"] == "ineligible"
     assert any(r.startswith("vram:") for r in entry["reasons"])
 
