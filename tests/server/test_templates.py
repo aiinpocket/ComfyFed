@@ -76,6 +76,29 @@ MODEL_INVENTORY = set(MODEL_SOURCES)
 FLUX_GATED_CAVEAT = "（需登入 HuggingFace 並同意 FLUX.1-dev 授權）"
 MISSING_MODELS_NOTE_TITLE = "⓪ 缺模型？/ Missing models?"
 
+# Phase 1.8 Task 1 added two zero-model templates: no loaders, no "缺模型？"
+# note, and a 3-group layout (①選素材 ②合併 ③輸出) instead of the 4-group
+# layout the model-bearing templates use. Every assertion that only makes
+# sense for a template with loaders/models is scoped to the other three via
+# MODEL_BEARING_TEMPLATE_NAMES, so it keeps checking those three exactly as
+# strictly as before instead of silently covering fewer templates.
+ZERO_MODEL_TEMPLATE_NAMES = ("comfyfed-video-concat", "comfyfed-image-intro-video")
+MODEL_BEARING_TEMPLATE_NAMES = tuple(
+    n for n in ("comfyfed-wuxia-t2i", "comfyfed-character-portrait", "comfyfed-ref2v-video")
+)
+ZERO_MODEL_ALLOWED_NODE_TYPES = {
+    "MarkdownNote",
+    "LoadImage",
+    "LoadVideo",
+    "GetVideoComponents",
+    "ImageBatch",
+    "AudioConcat",
+    "CreateVideo",
+    "SaveVideo",
+    "ImageScale",
+    "RepeatImageBatch",
+}
+
 
 def _backup_url(name):
     return GCS_MODEL_BASE + MODEL_SOURCES[name]["dir"] + "/" + name
@@ -239,7 +262,11 @@ def test_index_json_has_the_fields_the_frontend_reads():
         assert entry["mediaType"] == "image"
         assert entry["mediaSubtype"] == "webp"
         assert isinstance(entry["tags"], list) and entry["tags"]
-        assert isinstance(entry["models"], list) and entry["models"]
+        assert isinstance(entry["models"], list)
+        if entry["name"] in ZERO_MODEL_TEMPLATE_NAMES:
+            assert entry["models"] == [], entry["name"]
+        else:
+            assert entry["models"], entry["name"]
 
 
 @pytest.mark.parametrize("name", templates.TEMPLATE_NAMES)
@@ -262,9 +289,12 @@ def test_template_workflow_is_annotated_ui_format(name):
         assert any("一" <= ch <= "鿿" for ch in text), note["id"]
         assert sum(ch.isascii() and ch.isalpha() for ch in text) > 100, note["id"]
 
-    # Every stage of the graph is boxed and titled.
+    # Every stage of the graph is boxed and titled. The model-bearing
+    # templates lay out 4 groups (load / subject / sample / output); the
+    # zero-model templates collapse that to 3 (①選素材 ②合併 ③輸出).
     titles = [g["title"] for g in workflow["groups"]]
-    assert len(titles) == 4
+    expected_groups = 3 if name in ZERO_MODEL_TEMPLATE_NAMES else 4
+    assert len(titles) == expected_groups, name
     assert all(t.strip() for t in titles)
 
     # Link endpoints resolve.
@@ -317,7 +347,7 @@ def test_templates_only_reference_packaged_assets(name):
 
     packaged = set(templates.asset_names())
     for node in workflow["nodes"]:
-        if node["type"] != "LoadImage":
+        if node["type"] not in ("LoadImage", "LoadVideo"):
             continue
         assert node["widgets_values"][0] in packaged
 
@@ -527,7 +557,7 @@ def _missing_models_note_text(name):
     return notes[MISSING_MODELS_NOTE_TITLE]
 
 
-@pytest.mark.parametrize("name", templates.TEMPLATE_NAMES)
+@pytest.mark.parametrize("name", MODEL_BEARING_TEMPLATE_NAMES)
 def test_missing_models_note_exists_and_is_placed_first(name):
     with open(os.path.join(templates.templates_dir(), f"{name}.json"), encoding="utf-8") as f:
         workflow = json.load(f)
@@ -542,7 +572,7 @@ def test_missing_models_note_exists_and_is_placed_first(name):
     assert workflow["nodes"][0]["pos"][1] < other_top_left["pos"][1]
 
 
-@pytest.mark.parametrize("name", templates.TEMPLATE_NAMES)
+@pytest.mark.parametrize("name", MODEL_BEARING_TEMPLATE_NAMES)
 def test_missing_models_note_mentions_every_model_the_graph_actually_uses(name):
     """Anti-drift: if a template's loaders change, its note must be updated too."""
     with open(os.path.join(templates.templates_dir(), f"{name}.json"), encoding="utf-8") as f:
@@ -556,7 +586,7 @@ def test_missing_models_note_mentions_every_model_the_graph_actually_uses(name):
         assert filename in note_text, f"{name}'s missing-models note omits {filename}"
 
 
-@pytest.mark.parametrize("name", templates.TEMPLATE_NAMES)
+@pytest.mark.parametrize("name", MODEL_BEARING_TEMPLATE_NAMES)
 def test_missing_models_note_links_are_dual_official_and_gcs_backup(name):
     note_text = _missing_models_note_text(name)
 
@@ -783,15 +813,16 @@ def test_official_workflow_json_has_subgraph_download_metadata_stripped(client):
     assert "huggingface.co" not in json.dumps(body)
 
 
-def test_own_template_workflow_still_served_byte_identical(client):
+@pytest.mark.parametrize("name", templates.TEMPLATE_NAMES)
+def test_own_template_workflow_still_served_byte_identical(client, name):
     _login(client)
     _seed_official_dir(client.data_dir)
 
-    packaged_path = os.path.join(templates.templates_dir(), "comfyfed-wuxia-t2i.json")
+    packaged_path = os.path.join(templates.templates_dir(), f"{name}.json")
     with open(packaged_path, "rb") as f:
         expected = f.read()
 
-    r = client.get("/comfy/templates/comfyfed-wuxia-t2i.json")
+    r = client.get(f"/comfy/templates/{name}.json")
     assert r.status_code == 200
     assert r.content == expected
 
@@ -884,3 +915,85 @@ def test_readme_model_downloads_section_covers_the_whole_inventory():
     # And every model's official source link is present too.
     for filename, source in MODEL_SOURCES.items():
         assert source["official"] in readme, filename
+
+
+# --- Phase 1.8 Task 1: zero-model video templates -----------------------
+
+
+@pytest.mark.parametrize("name", ZERO_MODEL_TEMPLATE_NAMES)
+def test_zero_model_template_json_parses(name):
+    with open(os.path.join(templates.templates_dir(), f"{name}.json"), encoding="utf-8") as f:
+        workflow = json.load(f)
+    assert workflow["version"] == 0.4
+
+
+@pytest.mark.parametrize("name", ZERO_MODEL_TEMPLATE_NAMES)
+def test_zero_model_template_only_uses_the_documented_node_classes(name):
+    """The zero-model selling point only holds if no loader node sneaks in."""
+    with open(os.path.join(templates.templates_dir(), f"{name}.json"), encoding="utf-8") as f:
+        workflow = json.load(f)
+
+    for node in workflow["nodes"]:
+        assert node["type"] in ZERO_MODEL_ALLOWED_NODE_TYPES, (name, node["id"], node["type"])
+
+
+@pytest.mark.parametrize("name", ZERO_MODEL_TEMPLATE_NAMES)
+def test_zero_model_template_has_no_loader_model_filenames(name):
+    with open(os.path.join(templates.templates_dir(), f"{name}.json"), encoding="utf-8") as f:
+        workflow = json.load(f)
+    assert not _loader_model_filenames(workflow), name
+
+
+@pytest.mark.parametrize("name", ZERO_MODEL_TEMPLATE_NAMES)
+def test_zero_model_template_has_no_missing_models_note(name):
+    notes = _notes_by_title(name)
+    assert MISSING_MODELS_NOTE_TITLE not in notes, name
+
+
+@pytest.mark.parametrize("name", ZERO_MODEL_TEMPLATE_NAMES)
+def test_zero_model_template_links_have_slot_consistent_endpoints(name):
+    """Every link's from/to slot index must land inside that node's actual
+    outputs/inputs array -- catches an off-by-one before it ever reaches a
+    worker."""
+    with open(os.path.join(templates.templates_dir(), f"{name}.json"), encoding="utf-8") as f:
+        workflow = json.load(f)
+
+    nodes = {n["id"]: n for n in workflow["nodes"]}
+    for link_id, src, src_slot, dst, dst_slot, wire in workflow["links"]:
+        src_outputs = nodes[src]["outputs"]
+        dst_inputs = nodes[dst]["inputs"]
+        assert 0 <= src_slot < len(src_outputs), (name, link_id)
+        assert 0 <= dst_slot < len(dst_inputs), (name, link_id)
+        assert src_outputs[src_slot]["type"] == wire, (name, link_id)
+        assert dst_inputs[dst_slot]["type"] == wire, (name, link_id)
+        assert link_id in src_outputs[src_slot]["links"], (name, link_id)
+        assert dst_inputs[dst_slot]["link"] == link_id, (name, link_id)
+
+
+def test_zero_model_templates_say_no_model_is_needed():
+    for name in ZERO_MODEL_TEMPLATE_NAMES:
+        notes = _notes_by_title(name)
+        combined = "\n".join(notes.values())
+        assert "不需要任何模型" in combined, name
+
+
+def test_zero_model_templates_flag_the_red_framed_nodes_to_edit():
+    for name in ZERO_MODEL_TEMPLATE_NAMES:
+        notes = _notes_by_title(name)
+        combined = "\n".join(notes.values())
+        assert "紅框" in combined, name
+        assert "改" in combined, name
+
+
+def test_video_concat_note_covers_matching_resolution_and_fps():
+    notes = _notes_by_title("comfyfed-video-concat")
+    combined = "\n".join(notes.values())
+    assert "解析度" in combined
+    assert "fps" in combined
+
+
+def test_image_intro_video_note_covers_the_amount_formula():
+    notes = _notes_by_title("comfyfed-image-intro-video")
+    combined = "\n".join(notes.values())
+    assert "amount" in combined
+    assert "fps" in combined

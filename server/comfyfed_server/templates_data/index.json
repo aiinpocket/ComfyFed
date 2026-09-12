@@ -32,6 +32,24 @@
         "description": "MiniMax H3 reference-to-video with audio, 1152x640, 141 frames at 8 steps via the turbo LoRA. Ships with a reference image.",
         "tags": ["minimax", "video", "reference", "audio", "comfyfed"],
         "models": ["minimax_h3_ref2va_pruned_int8_convrot.safetensors"]
+      },
+      {
+        "name": "comfyfed-video-concat",
+        "title": "多影片串接 / Video concat",
+        "mediaType": "image",
+        "mediaSubtype": "webp",
+        "description": "Join two video clips end-to-end, picture and audio both concatenated. Needs zero models -- runs on a brand-new worker.",
+        "tags": ["video", "concat", "no-model", "無需模型", "comfyfed"],
+        "models": []
+      },
+      {
+        "name": "comfyfed-image-intro-video",
+        "title": "圖片開場＋影片 / Image intro + video",
+        "mediaType": "image",
+        "mediaSubtype": "webp",
+        "description": "Hold one still image for a few seconds as a title card, then play a video clip. Needs zero models -- runs on a brand-new worker.",
+        "tags": ["video", "image", "intro", "no-model", "無需模型", "comfyfed"],
+        "models": []
       }
     ]
   }

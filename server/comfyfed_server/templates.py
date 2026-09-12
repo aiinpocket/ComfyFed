@@ -23,7 +23,7 @@ frontend checks before it resolves a template's workflow and thumbnail through
 `fileURL('/templates/<name>...')` rather than through the custom-node API. A
 category is only reachable in the browser's sidebar when it is either
 `isEssential` (rendered as its own entry) or carries a `category` group name --
-ours sets both, so the three templates always have a home.
+ours sets both, so the templates always have a home.
 
 Per template the frontend reads `name` (the file stem), `title`,
 `description`, `mediaType`/`mediaSubtype` (which build the thumbnail URL
@@ -96,7 +96,10 @@ logger = logging.getLogger(__name__)
 _DATA_DIRNAME = "templates_data"
 _ASSETS_SUBDIR = "assets"
 
-# The three templates the library ships, in the order `index.json` lists them.
+# The templates the library ships, in the order `index.json` lists them. The
+# first three carry models (loader nodes + a "缺模型？" note); the last two
+# are zero-model templates (LoadVideo/LoadImage + video-compositing nodes
+# only) that a brand-new worker can run with nothing downloaded.
 # Content types stated outright rather than via `mimetypes`, whose Windows
 # backend answers from the registry: there, `.webp` is frequently unknown and
 # `.json` can come back as `text/plain`. The frontend *checks* that
@@ -124,6 +127,8 @@ TEMPLATE_NAMES = (
     "comfyfed-wuxia-t2i",
     "comfyfed-character-portrait",
     "comfyfed-ref2v-video",
+    "comfyfed-video-concat",
+    "comfyfed-image-intro-video",
 )
 
 
