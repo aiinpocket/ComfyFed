@@ -19,6 +19,17 @@ from comfyfed_server import app as app_module
 from comfyfed_server import bootstrap, comfyapi, db, dispatch, storage, workers
 
 
+def _pick_job_for(worker_id):
+    """Test-only stand-in for the old single-worker `dispatch.pick_job_for`:
+    dispatch now ranks a whole idle batch at once via `assign_jobs`. Returns
+    the job assigned to `worker_id`, or None if nothing eligible was found
+    for it."""
+    for assigned_worker_id, job in dispatch.assign_jobs([worker_id]):
+        if assigned_worker_id == worker_id:
+            return job
+    return None
+
+
 @pytest.fixture()
 def client(tmp_path):
     comfyapi.clear_object_info_cache()
@@ -85,7 +96,7 @@ def _post_prompt(client, prompt=None, client_id="frontend-1"):
 def _finish_job(client, csrf, job_id, *, result_files, artifact_bytes=b"png-bytes"):
     """Drive a queued job to `done` with stored artifacts, via the real dispatch path."""
     worker_id = _register_worker(client, csrf, f"runner-{job_id[:6]}")
-    picked = dispatch.pick_job_for(worker_id)
+    picked = _pick_job_for(worker_id)
     assert picked is not None and picked.id == job_id
     assert dispatch.mark_running(job_id, worker_id)
 
@@ -416,7 +427,7 @@ def test_queue_shape_splits_running_and_pending(client):
     running_id = _post_prompt(client).json()["prompt_id"]
 
     worker_id = _register_worker(client, csrf, "runner")
-    picked = dispatch.pick_job_for(worker_id)
+    picked = _pick_job_for(worker_id)
     assert picked is not None and picked.id == queued_id
     dispatch.mark_running(queued_id, worker_id)
     running_id, queued_id = queued_id, running_id
@@ -453,7 +464,7 @@ def test_interrupt_cancels_the_oldest_running_job(client):
     newer_id = _post_prompt(client).json()["prompt_id"]
 
     worker_id = _register_worker(client, csrf, "runner")
-    picked = dispatch.pick_job_for(worker_id)
+    picked = _pick_job_for(worker_id)
     assert picked is not None and picked.id == older_id
     dispatch.mark_running(older_id, worker_id)
 
@@ -515,7 +526,7 @@ def test_queue_clear_cancels_every_non_terminal_job(client):
     done_id = _post_prompt(client).json()["prompt_id"]
 
     worker_id = _register_worker(client, csrf, "runner")
-    dispatch.pick_job_for(worker_id)
+    _pick_job_for(worker_id)
     with db.get_session() as session:
         job = session.get(db.Job, running_id)
         job.status = "running"
@@ -594,7 +605,7 @@ def test_history_includes_failed_job_with_error_status(client):
     csrf = _login(client)
     prompt_id = _post_prompt(client).json()["prompt_id"]
     worker_id = _register_worker(client, csrf, "runner")
-    dispatch.pick_job_for(worker_id)
+    _pick_job_for(worker_id)
     dispatch.mark_failed(prompt_id, worker_id, "boom")
 
     entry = client.get("/comfy/api/history").json()[prompt_id]

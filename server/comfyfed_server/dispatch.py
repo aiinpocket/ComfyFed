@@ -31,16 +31,51 @@ def _utcnow() -> datetime:
     return datetime.now(timezone.utc).replace(tzinfo=None)
 
 
-def pick_job_for(worker_id: str) -> Optional[db.Job]:
-    """Atomically assign the oldest eligible queued job to `worker_id`.
-
-    Jobs that are not eligible for this worker are skipped without blocking
-    later (newer) jobs from being considered.
+def _free_vram_gb(worker: db.Worker) -> float:
+    """Free VRAM for ranking purposes, from the same heartbeat snapshot
+    `assess.verdict` reads (`worker.dynamic["free_vram_gb"]`). Missing or
+    non-numeric is treated as 0 rather than raising or crashing ranking --
+    an unranked worker should lose ties, not break the tick.
     """
+    free_vram = assess._worker_dynamic(worker).get("free_vram_gb")
+    if not isinstance(free_vram, (int, float)) or isinstance(free_vram, bool):
+        return 0.0
+    return float(free_vram)
+
+
+def assign_jobs(idle_worker_ids: list[str]) -> list[tuple[str, db.Job]]:
+    """Rank idle workers per queued job and atomically claim the best pair.
+
+    For each queued job, oldest first, every still-unassigned idle worker's
+    `assess.verdict` is evaluated and the best eligible one picked:
+
+    1. eligible with no warnings beats eligible-with-warnings (e.g. the
+       `vram_offload` note) -- a clean run beats one that will offload.
+    2. tie-break by largest free VRAM, from the worker's `dynamic` heartbeat
+       snapshot (see `_free_vram_gb`).
+    3. stable tie-break by worker name, so results are deterministic when
+       ranking is otherwise a wash.
+
+    Each worker is claimed for at most one job per call: once a worker wins a
+    job it drops out of the candidate pool for every later job this tick.
+    The claim itself is atomic: the `WHERE status == "queued"` re-check in
+    the same UPDATE statement means
+    a job someone else claimed a moment ago (rowcount 0) is skipped rather
+    than double-assigned.
+
+    Returns the (worker_id, job) pairs actually claimed, for the caller
+    (`agentws.dispatch_tick`) to push over each worker's connection.
+    """
+    if not idle_worker_ids:
+        return []
+
     with db.get_session() as session:
-        worker = session.get(db.Worker, worker_id)
-        if worker is None:
-            return None
+        workers = {
+            w.id: w
+            for w in session.query(db.Worker).filter(db.Worker.id.in_(idle_worker_ids)).all()
+        }
+        if not workers:
+            return []
 
         all_workers = session.query(db.Worker).all()
 
@@ -51,7 +86,13 @@ def pick_job_for(worker_id: str) -> Optional[db.Job]:
             .all()
         )
 
+        available_worker_ids = set(workers.keys())
+        assignments: list[tuple[str, db.Job]] = []
+
         for job in queued_jobs:
+            if not available_worker_ids:
+                break
+
             requirements_override = {}
             try:
                 requirements_override = json.loads(job.requirements or "{}")
@@ -59,22 +100,33 @@ def pick_job_for(worker_id: str) -> Optional[db.Job]:
                 requirements_override = {}
 
             needs = assess.needs_from_job(job)
-            v = assess.verdict(worker, needs, requirements_override, all_workers)
-            # `warnings` (e.g. vram_offload) are explicitly NOT a bar to
-            # dispatch: an eligible-with-warning worker runs the job, just
-            # more slowly. Phase 1 does no preference ordering between a
-            # clean worker and a warned one.
-            if v.kind != "eligible":
+
+            # (has_warnings, -free_vram, name, worker_id): sorts clean before
+            # warned, then largest free VRAM first, then name for determinism.
+            candidates = []
+            for candidate_id in available_worker_ids:
+                worker = workers[candidate_id]
+                v = assess.verdict(worker, needs, requirements_override, all_workers)
+                if v.kind != "eligible":
+                    continue
+                candidates.append(
+                    (bool(v.warnings), -_free_vram_gb(worker), worker.name, candidate_id)
+                )
+
+            if not candidates:
                 continue
+
+            candidates.sort()
+            best_worker_id = candidates[0][3]
 
             # Atomic claim: only succeeds if the job is still queued. If
             # another process/thread beat us to it, rowcount is 0 and we
-            # move on to the next candidate rather than returning a job
-            # that's no longer actually ours.
+            # move on to the next job rather than assigning one that's no
+            # longer actually up for grabs.
             result = session.execute(
                 update(db.Job)
                 .where(db.Job.id == job.id, db.Job.status == "queued")
-                .values(status="assigned", worker_id=worker_id)
+                .values(status="assigned", worker_id=best_worker_id)
             )
             if result.rowcount != 1:
                 session.rollback()
@@ -82,9 +134,10 @@ def pick_job_for(worker_id: str) -> Optional[db.Job]:
 
             session.commit()
             session.refresh(job)
-            return job
+            assignments.append((best_worker_id, job))
+            available_worker_ids.discard(best_worker_id)
 
-        return None
+        return assignments
 
 
 def requeue_stale(now: datetime) -> list[str]:
@@ -192,7 +245,7 @@ def try_readopt(job_id: str, worker_id: str) -> bool:
     `job_done` handling) then proceeds exactly as it would for a normal owned
     completion.
 
-    The atomic claim mirrors `pick_job_for`'s: the `WHERE` clause re-checks
+    The atomic claim mirrors `assign_jobs`'s: the `WHERE` clause re-checks
     `status == "queued"` in the same statement that flips it, so a concurrent
     dispatch_tick claiming the job first (rowcount 0) is detected rather than
     the two writers silently clobbering each other.

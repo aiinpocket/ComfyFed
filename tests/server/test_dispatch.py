@@ -6,11 +6,13 @@ the blip window) lives in test_agent_ws.py / test_receipts.py instead, where
 the fixtures for a live connection already exist.
 """
 
+import json
 from datetime import datetime, timedelta, timezone
 
 import pytest
 from alembic import command
 from alembic.config import Config
+from sqlalchemy import update
 
 from comfyfed_server import db, dispatch, metrics
 
@@ -25,14 +27,22 @@ def _utcnow():
     return datetime.now(timezone.utc).replace(tzinfo=None)
 
 
-def _make_worker(worker_id="w1"):
+def _make_worker(worker_id="w1", hardware=None, dynamic=None):
     with db.get_session() as session:
-        session.add(db.Worker(id=worker_id, name=worker_id, pubkey="pk"))
+        session.add(
+            db.Worker(
+                id=worker_id,
+                name=worker_id,
+                pubkey="pk",
+                hardware=json.dumps(hardware or {}),
+                dynamic=json.dumps(dynamic or {}),
+            )
+        )
         session.commit()
     return worker_id
 
 
-def _make_job(job_id="j1", status="queued", worker_id=None, last_worker_id=None):
+def _make_job(job_id="j1", status="queued", worker_id=None, last_worker_id=None, est_vram_gb=None):
     with db.get_session() as session:
         session.add(
             db.Job(
@@ -41,6 +51,7 @@ def _make_job(job_id="j1", status="queued", worker_id=None, last_worker_id=None)
                 status=status,
                 worker_id=worker_id,
                 last_worker_id=last_worker_id,
+                est_vram_gb=est_vram_gb,
             )
         )
         session.commit()
@@ -201,3 +212,105 @@ def test_try_readopt_false_on_terminal_job(_db):
     job_id = _make_job(status="done", worker_id=None, last_worker_id=worker_id)
 
     assert dispatch.try_readopt(job_id, worker_id) is False
+
+
+# --- Task 4: assign_jobs -- rank eligible workers per job -------------------
+
+
+def test_assign_jobs_prefers_clean_worker_over_warned_worker(_db):
+    # w_warn has just enough VRAM+RAM headroom to be eligible-with-warning
+    # (vram_offload); w_clean fits the job in VRAM outright.
+    warned_id = _make_worker("w_warn", hardware={"vram_gb": 8, "ram_gb": 64})
+    clean_id = _make_worker("w_clean", hardware={"vram_gb": 24, "ram_gb": 64})
+    job_id = _make_job(est_vram_gb=20)
+
+    assignments = dispatch.assign_jobs([warned_id, clean_id])
+
+    assert len(assignments) == 1
+    worker_id, job = assignments[0]
+    assert worker_id == clean_id
+    assert job.id == job_id
+    with db.get_session() as session:
+        assert session.get(db.Job, job_id).status == "assigned"
+        assert session.get(db.Job, job_id).worker_id == clean_id
+
+
+def test_assign_jobs_ties_broken_by_largest_free_vram(_db):
+    small_id = _make_worker("w_small", dynamic={"free_vram_gb": 4})
+    big_id = _make_worker("w_big", dynamic={"free_vram_gb": 12})
+    job_id = _make_job()
+
+    assignments = dispatch.assign_jobs([small_id, big_id])
+
+    assert len(assignments) == 1
+    worker_id, job = assignments[0]
+    assert worker_id == big_id
+    assert job.id == job_id
+
+
+def test_assign_jobs_assigns_both_jobs_oldest_first_in_one_tick(_db):
+    worker_a = _make_worker("w_a")
+    worker_b = _make_worker("w_b")
+    now = _utcnow()
+    with db.get_session() as session:
+        session.add(
+            db.Job(id="j_old", workflow_json="{}", status="queued", created_at=now - timedelta(seconds=10))
+        )
+        session.add(db.Job(id="j_new", workflow_json="{}", status="queued", created_at=now))
+        session.commit()
+
+    assignments = dispatch.assign_jobs([worker_a, worker_b])
+
+    assert len(assignments) == 2
+    assigned_job_ids = {job.id for _worker_id, job in assignments}
+    assert assigned_job_ids == {"j_old", "j_new"}
+    assigned_worker_ids = {worker_id for worker_id, _job in assignments}
+    assert assigned_worker_ids == {worker_a, worker_b}
+    with db.get_session() as session:
+        assert session.get(db.Job, "j_old").status == "assigned"
+        assert session.get(db.Job, "j_new").status == "assigned"
+
+
+def test_assign_jobs_skips_gracefully_when_job_already_claimed(_db):
+    worker_id = _make_worker()
+    job_id = _make_job()
+
+    # Simulate a concurrent claim landing between candidate evaluation and
+    # this call's own atomic UPDATE: the job is no longer queued by the time
+    # assign_jobs gets to it.
+    with db.get_session() as session:
+        session.execute(
+            update(db.Job).where(db.Job.id == job_id).values(status="assigned", worker_id="someone-else")
+        )
+        session.commit()
+
+    assignments = dispatch.assign_jobs([worker_id])
+
+    assert assignments == []
+    with db.get_session() as session:
+        job = session.get(db.Job, job_id)
+        assert job.worker_id == "someone-else"
+
+
+def test_assign_jobs_ignores_unknown_worker_ids(_db):
+    assert dispatch.assign_jobs(["no-such-worker"]) == []
+
+
+def test_assign_jobs_empty_idle_list_returns_empty(_db):
+    _make_job()
+    assert dispatch.assign_jobs([]) == []
+
+
+def test_assign_jobs_each_worker_gets_at_most_one_job_per_tick(_db):
+    worker_id = _make_worker()
+    job1 = _make_job("j1")
+    job2 = _make_job("j2")
+
+    assignments = dispatch.assign_jobs([worker_id])
+
+    assert len(assignments) == 1
+    assert assignments[0][1].id in (job1, job2)
+    with db.get_session() as session:
+        statuses = {j.id: j.status for j in session.query(db.Job).all()}
+    # Exactly one of the two jobs got claimed; the other stays queued.
+    assert sorted(statuses.values()) == ["assigned", "queued"]

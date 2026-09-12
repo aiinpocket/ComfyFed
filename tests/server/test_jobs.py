@@ -10,6 +10,17 @@ from comfyfed_server import app as app_module
 from comfyfed_server import bootstrap, db, dispatch
 
 
+def _pick_job_for(worker_id):
+    """Test-only stand-in for the old single-worker `dispatch.pick_job_for`:
+    dispatch now ranks a whole idle batch at once via `assign_jobs`. Returns
+    the job assigned to `worker_id`, or None if nothing eligible was found
+    for it."""
+    for assigned_worker_id, job in dispatch.assign_jobs([worker_id]):
+        if assigned_worker_id == worker_id:
+            return job
+    return None
+
+
 @pytest.fixture()
 def client(tmp_path):
     data_dir = str(tmp_path)
@@ -104,13 +115,13 @@ def test_dispatch_pick_is_atomic_across_two_workers(client):
     r2 = _submit(client, csrf)
     assert r1.status_code == 200 and r2.status_code == 200
 
-    job_a = dispatch.pick_job_for(w1)
-    job_b = dispatch.pick_job_for(w2)
+    job_a = _pick_job_for(w1)
+    job_b = _pick_job_for(w2)
 
     assert job_a is not None
     assert job_a.id != (job_b.id if job_b else None)
     # Only two jobs existed; a third pick should find nothing left.
-    job_c = dispatch.pick_job_for(w1)
+    job_c = _pick_job_for(w1)
     assert job_c is None
 
 
@@ -125,7 +136,7 @@ def test_dispatch_pick_skips_ineligible_without_blocking_later_jobs(client):
     r2 = _submit(client, csrf)  # simple workflow the worker CAN run
     job2_id = r2.json()["job_id"]
 
-    picked = dispatch.pick_job_for(worker)
+    picked = _pick_job_for(worker)
     assert picked is not None
     assert picked.id == job2_id
 
@@ -138,7 +149,7 @@ def test_requeue_stale_returns_job_to_queue_and_it_can_be_repicked(client):
     r = _submit(client, csrf)
     job_id = r.json()["job_id"]
 
-    picked = dispatch.pick_job_for(w1)
+    picked = _pick_job_for(w1)
     assert picked is not None and picked.id == job_id
     dispatch.mark_running(job_id, w1)
 
@@ -160,7 +171,7 @@ def test_requeue_stale_returns_job_to_queue_and_it_can_be_repicked(client):
         worker = session.get(db.Worker, w1)
         assert worker.status == "offline"
 
-    repicked = dispatch.pick_job_for(w2)
+    repicked = _pick_job_for(w2)
     assert repicked is not None
     assert repicked.id == job_id
 
@@ -250,7 +261,7 @@ def test_requeue_stale_requeues_a_worker_that_never_heartbeated(client):
     r = _submit(client, csrf)
     job_id = r.json()["job_id"]
 
-    picked = dispatch.pick_job_for(w1)
+    picked = _pick_job_for(w1)
     assert picked is not None and picked.id == job_id
 
     old = datetime.now(timezone.utc).replace(tzinfo=None) - timedelta(seconds=200)
@@ -279,7 +290,7 @@ def test_requeue_stale_leaves_a_freshly_registered_worker_alone(client):
 
     r = _submit(client, csrf)
     job_id = r.json()["job_id"]
-    assert dispatch.pick_job_for(w1) is not None
+    assert _pick_job_for(w1) is not None
 
     assert dispatch.requeue_stale(datetime.now(timezone.utc).replace(tzinfo=None)) == []
     with db.get_session() as session:
@@ -337,7 +348,7 @@ def test_retry_requeues_a_failed_job_and_clears_the_last_attempt(client):
         assert job.finished_at is None
 
     # And it is dispatchable again.
-    assert dispatch.pick_job_for(w1) is not None
+    assert _pick_job_for(w1) is not None
 
 
 def test_retry_on_a_non_failed_job_is_409(client):
@@ -375,7 +386,7 @@ def test_cancel_assigned_job_moves_to_cancelled(client):
     csrf = _login(client)
     w1 = _register_worker(client, csrf, "w1")
     job_id = _submit(client, csrf).json()["job_id"]
-    assert dispatch.pick_job_for(w1) is not None
+    assert _pick_job_for(w1) is not None
 
     r = client.post(f"/api/jobs/{job_id}/cancel", headers={"X-CSRF": csrf})
     assert r.status_code == 200
@@ -395,7 +406,7 @@ def test_cancel_already_done_job_is_409_with_terminal_status(client):
     csrf = _login(client)
     w1 = _register_worker(client, csrf, "w1")
     job_id = _submit(client, csrf).json()["job_id"]
-    assert dispatch.pick_job_for(w1) is not None
+    assert _pick_job_for(w1) is not None
     assert dispatch.mark_done(job_id, w1, ["out.png"])
 
     r = client.post(f"/api/jobs/{job_id}/cancel", headers={"X-CSRF": csrf})
@@ -555,7 +566,7 @@ def test_flux_job_fits_a_16gb_card_and_dispatches(client):
     assert entry["verdict"] == "eligible", entry
 
     # And it actually dispatches, which is the whole point.
-    picked = dispatch.pick_job_for(worker_id)
+    picked = _pick_job_for(worker_id)
     assert picked is not None and picked.id == job_id
 
 
@@ -589,7 +600,7 @@ def test_an_oversized_single_model_is_still_blocked_on_vram(client):
     assert entry["warnings"] == []
 
     # And it stays in the queue.
-    assert dispatch.pick_job_for(entry["worker_id"]) is None
+    assert _pick_job_for(entry["worker_id"]) is None
 
 
 def test_a_model_over_vram_but_under_vram_plus_ram_dispatches_with_a_warning(client):
@@ -624,7 +635,7 @@ def test_a_model_over_vram_but_under_vram_plus_ram_dispatches_with_a_warning(cli
     assert entry["warnings"][0].endswith(">15.9")
 
     # The point of the whole fix: an eligible-with-warning worker DISPATCHES.
-    picked = dispatch.pick_job_for(worker_id)
+    picked = _pick_job_for(worker_id)
     assert picked is not None and picked.id == job_id
 
 

@@ -618,10 +618,13 @@ def _handle_receipt_ack(worker_id: str, message: dict) -> None:
 
 
 async def dispatch_tick() -> None:
-    """One iteration of the background loop: requeue stale jobs, then push a
-    queued job to every idle connection that has one available. Swallows and
-    logs all exceptions so the caller (the background task, or a test) never
-    sees a crash from a single bad connection or DB hiccup."""
+    """One iteration of the background loop: requeue stale jobs, then collect
+    every idle connection's worker id and hand the whole batch to
+    `dispatch.assign_jobs` in one call, so it can rank workers against each
+    other rather than assigning greedily connection-by-connection. Each
+    (worker, job) pair it returns is then pushed on that worker's connection.
+    Swallows and logs all exceptions so the caller (the background task, or a
+    test) never sees a crash from a single bad connection or DB hiccup."""
     requeued: list[str] = []
     try:
         requeued = dispatch.requeue_stale(_utcnow())
@@ -640,15 +643,16 @@ async def dispatch_tick() -> None:
         except Exception:
             logger.exception("agentws: failed to relay requeued jobs to the panel")
 
-    for worker_id, conn in list(_connections.items()):
-        if conn.state != "idle":
-            continue
-        try:
-            job = dispatch.pick_job_for(worker_id)
-        except Exception:
-            logger.exception("agentws: pick_job_for failed for worker %s", worker_id)
-            continue
-        if job is None:
+    idle_worker_ids = [worker_id for worker_id, conn in _connections.items() if conn.state == "idle"]
+    try:
+        assignments = dispatch.assign_jobs(idle_worker_ids)
+    except Exception:
+        logger.exception("agentws: assign_jobs failed")
+        assignments = []
+
+    for worker_id, job in assignments:
+        conn = _connections.get(worker_id)
+        if conn is None:
             continue
         try:
             await conn.ws.send_json(
