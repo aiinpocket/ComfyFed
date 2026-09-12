@@ -8,7 +8,7 @@ from typing import Optional
 
 from sqlalchemy import update
 
-from . import assess, db
+from . import assess, db, metrics
 
 _STALE_SECONDS = 90
 
@@ -108,6 +108,7 @@ def requeue_stale(now: datetime) -> int:
                 count += 1
 
             worker.status = "offline"
+            metrics.get_metrics().worker_up.labels(worker=worker.name).set(0)
 
         session.commit()
 
@@ -121,7 +122,9 @@ def mark_running(job_id: str) -> None:
             return
         job.status = "running"
         job.started_at = _utcnow()
+        wait_seconds = (job.started_at - job.created_at).total_seconds()
         session.commit()
+    metrics.get_metrics().job_wait_seconds.observe(max(wait_seconds, 0.0))
 
 
 def mark_done(job_id: str, result_files: list) -> None:
@@ -132,7 +135,10 @@ def mark_done(job_id: str, result_files: list) -> None:
         job.status = "done"
         job.result_files = json.dumps(result_files)
         job.finished_at = _utcnow()
+        run_seconds = (job.finished_at - job.started_at).total_seconds() if job.started_at else None
         session.commit()
+    if run_seconds is not None:
+        metrics.get_metrics().job_run_seconds.observe(max(run_seconds, 0.0))
 
 
 def mark_failed(job_id: str, error: str) -> None:
@@ -143,4 +149,7 @@ def mark_failed(job_id: str, error: str) -> None:
         job.status = "failed"
         job.error = error
         job.finished_at = _utcnow()
+        run_seconds = (job.finished_at - job.started_at).total_seconds() if job.started_at else None
         session.commit()
+    if run_seconds is not None:
+        metrics.get_metrics().job_run_seconds.observe(max(run_seconds, 0.0))

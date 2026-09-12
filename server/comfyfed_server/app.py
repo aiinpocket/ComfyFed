@@ -9,10 +9,11 @@ import os
 from contextlib import asynccontextmanager
 
 from fastapi import FastAPI, HTTPException, Request
-from fastapi.responses import FileResponse, JSONResponse
+from fastapi.responses import FileResponse, JSONResponse, Response
 from fastapi.staticfiles import StaticFiles
+from prometheus_client import CONTENT_TYPE_LATEST, generate_latest
 
-from . import agentws, auth, bootstrap, db, jobs, receipts, workers
+from . import agentws, auth, bootstrap, db, jobs, metrics, receipts, workers
 
 logger = logging.getLogger(__name__)
 
@@ -71,6 +72,7 @@ def create_app(data_dir: str) -> FastAPI:
         )
 
     bootstrap.ensure_installed(data_dir, lang=None, url=None, interactive=False)
+    metrics.init()
 
     @asynccontextmanager
     async def lifespan(_app: FastAPI):
@@ -89,6 +91,21 @@ def create_app(data_dir: str) -> FastAPI:
     app.include_router(jobs.create_router(data_dir))
     app.include_router(receipts.create_router())
     app.include_router(agentws.create_router(data_dir))
+
+    @app.get("/metrics")
+    async def metrics_endpoint(request: Request) -> Response:
+        with db.get_session() as session:
+            public = metrics.is_public(session)
+        if not public:
+            # Conditional auth: whether admin is required depends on a DB
+            # setting, so this can't be a static `Depends(auth.require_admin)`
+            # on the route. Reuse the same session-payload check it uses.
+            payload = auth._read_session_payload(request.cookies.get("cf_session"))
+            if not payload or not payload.get("authenticated"):
+                raise auth._error(401, "auth.required", "Login required.")
+
+        data = generate_latest(metrics.get_metrics().registry)
+        return Response(content=data, media_type=CONTENT_TYPE_LATEST)
 
     web_dist = _find_web_dist()
     if web_dist is None:

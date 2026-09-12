@@ -20,7 +20,7 @@ from fastapi import APIRouter, WebSocket, WebSocketDisconnect
 from nacl.exceptions import BadSignatureError
 from nacl.signing import SigningKey, VerifyKey
 
-from . import db, dispatch, security
+from . import db, dispatch, metrics, security
 
 logger = logging.getLogger(__name__)
 
@@ -64,6 +64,11 @@ def create_router(data_dir: str) -> APIRouter:
 
         conn = _Connection(ws=websocket, worker_id=worker_id, loop=asyncio.get_running_loop())
         _connections[worker_id] = conn
+
+        with db.get_session() as session:
+            worker = session.get(db.Worker, worker_id)
+            worker_name = worker.name if worker is not None else worker_id
+        metrics.get_metrics().ws_reconnects_total.labels(worker=worker_name).inc()
 
         try:
             await websocket.send_json({"type": "ready"})
@@ -164,6 +169,7 @@ def _handle_heartbeat(worker_id: str, conn: _Connection, message: dict) -> None:
     if state in ("idle", "busy"):
         conn.state = state
 
+    dynamic = message.get("dynamic") or {}
     with db.get_session() as session:
         worker = session.get(db.Worker, worker_id)
         if worker is None:
@@ -173,7 +179,8 @@ def _handle_heartbeat(worker_id: str, conn: _Connection, message: dict) -> None:
             worker.status = "online"
         elif state == "busy":
             worker.status = "busy"
-        worker.dynamic = json.dumps(message.get("dynamic") or {})
+        worker.dynamic = json.dumps(dynamic)
+        worker_name = worker.name
         session.commit()
 
         job_id = message.get("job_id")
@@ -184,6 +191,10 @@ def _handle_heartbeat(worker_id: str, conn: _Connection, message: dict) -> None:
                 if isinstance(progress, (int, float)):
                     job.progress = float(progress)
                     session.commit()
+
+    m = metrics.get_metrics()
+    m.worker_up.labels(worker=worker_name).set(1)
+    m.set_worker_dynamic(worker_name, dynamic)
 
 
 def _handle_inventory(worker_id: str, message: dict) -> None:
