@@ -129,6 +129,25 @@ comfyfed-agent run
 - `eligible_after_fetch`：worker 缺少的模型可以在聯邦內其他 worker 上取得（Phase 2 才會落地實際傳輸機制），且磁碟空間足夠容納。
 - `ineligible`：附上白話原因，例如缺少節點類別、VRAM 不足、缺的模型在聯邦裡也找不到等。
 
+### 發布 agent 新版本
+
+伺服器端有一個發布指令，會把 wheel 複製到 `<data-dir>/releases/`、算好 sha256、用平台金鑰簽章，並把 `agent_*` 設定一次寫好：
+
+```bash
+comfyfed-server publish-agent dist/comfyfed_agent-0.2.0-py3-none-any.whl \
+  --min-supported 0.1.0
+```
+
+（版本號預設從 wheel 檔名解析，可用 `--latest` 覆寫；`--min-supported` 不給就等於 `--latest`，代表舊版 agent 一律擋掉。）
+
+發布完成後，agent 啟動時會去問 `/api/agent/version`，比對版本、下載 wheel、驗 sha256 與簽章，全部通過才安裝並重啟。**簽章內容是 `{版本}|{sha256}`**──把版本綁進簽章裡，就沒辦法拿舊版本的簽章去冒充新版本，避免被降版攻擊。
+
+⚠ **平台簽章金鑰可以離線保管**（規格建議做法）：如果不想把 `data/keys/platform.key` 放在線上主機，可以不跑 `publish-agent`，改成在離線機器上自己對 `"{版本}|{sha256}"` 簽名，再手動把 `agent_latest`／`agent_min_supported`／`agent_wheel_url`／`agent_wheel_sha256`／`agent_wheel_sig` 五個設定寫進資料庫。agent 端的驗證方式完全一樣。
+
+### 已知限制
+
+- **失敗的工作不會產生收據**：收據只在 `job_done` 時建立，所以工作跑到一半失敗（或 worker 中途離線被 requeue）所耗掉的 GPU 時間不會計入貢獻報表。這段算力目前是「沒被記帳」的。
+
 ### 後續規劃（Roadmap）
 
 **Phase 2**
@@ -273,6 +292,41 @@ When a job arrives, the server automatically extracts the node classes, model fi
 - `eligible`: the worker already has every required node and model — dispatch directly.
 - `eligible_after_fetch`: models missing on this worker are available from another worker in the federation (actual transfer lands in Phase 2), and there's enough free disk to hold them.
 - `ineligible`: with plain-language reasons, e.g. missing node classes, insufficient VRAM, or missing models that no one else in the federation has either.
+
+### Publishing an agent release
+
+The server ships a publish command that copies the wheel into
+`<data-dir>/releases/`, computes its sha256, signs it with the platform key,
+and writes all five `agent_*` settings in one go:
+
+```bash
+comfyfed-server publish-agent dist/comfyfed_agent-0.2.0-py3-none-any.whl \
+  --min-supported 0.1.0
+```
+
+(The version is parsed from the wheel filename unless you pass `--latest`.
+`--min-supported` defaults to `--latest`, which locks out every older agent.)
+
+Once published, an agent asks `/api/agent/version` at startup, compares
+versions, downloads the wheel, and installs it only if both the sha256 and
+the platform signature verify. **The signed payload is `{version}|{sha256}`** —
+binding the version into the signature means an old release's signature
+cannot be replayed to advertise a newer version, so a downgrade attack does
+not work.
+
+⚠ **The platform signing key may be kept offline** (as the spec recommends).
+If you would rather not keep `data/keys/platform.key` on the live host, skip
+`publish-agent`: sign `"{version}|{sha256}"` yourself on an offline machine
+and set `agent_latest`, `agent_min_supported`, `agent_wheel_url`,
+`agent_wheel_sha256` and `agent_wheel_sig` by hand. The agent verifies them
+identically either way.
+
+### Known limitations
+
+- **Failed jobs produce no receipt**: receipts are written only on
+  `job_done`, so GPU time burned by a job that failed part-way through (or by
+  a worker that dropped off and had its job requeued) never reaches the
+  contribution report. That compute is currently unaccounted for.
 
 ### Roadmap
 
