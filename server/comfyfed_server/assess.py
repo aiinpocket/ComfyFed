@@ -125,7 +125,7 @@ def needs_from_job(job) -> JobNeeds:
     return JobNeeds(nodes=nodes, models=models, est_vram_gb=job.est_vram_gb, assets=set())
 
 
-def _model_inventory(worker) -> list[dict]:
+def model_inventory(worker) -> list[dict]:
     import json
 
     try:
@@ -229,7 +229,7 @@ def _worker_hardware(worker) -> dict:
         return {}
 
 
-def _worker_node_classes(worker) -> list[str]:
+def worker_node_classes(worker) -> list[str]:
     import json
 
     try:
@@ -262,7 +262,7 @@ def estimate_vram(models: set[str], workers: list) -> float | None:
     largest: float | None = None
     for model_name in models:
         for worker in workers:
-            _found, size = find_model(_model_inventory(worker), model_name)
+            _found, size = find_model(model_inventory(worker), model_name)
             if size is not None and (largest is None or size > largest):
                 largest = size
     if largest is None:
@@ -294,7 +294,7 @@ def verdict(worker, needs: JobNeeds, requirements_override: dict, all_workers: l
     # Phase 1 workers that have never connected report node_classes == '[]'.
     # An empty list is "unknown", not "supports nothing" — skip the node
     # check entirely in that case, rather than flagging every job ineligible.
-    worker_nodes = _worker_node_classes(worker)
+    worker_nodes = worker_node_classes(worker)
     if worker_nodes:
         missing_nodes = needs.nodes - set(worker_nodes)
         if missing_nodes:
@@ -355,7 +355,7 @@ def verdict(worker, needs: JobNeeds, requirements_override: dict, all_workers: l
         if gpu_name_contains not in gpu_name:
             reasons.append("override:gpu_name_contains")
 
-    worker_inventory = _model_inventory(worker)
+    worker_inventory = model_inventory(worker)
     missing_models = sorted(
         name for name in needs.models if not find_model(worker_inventory, name)[0]
     )
@@ -381,7 +381,7 @@ def verdict(worker, needs: JobNeeds, requirements_override: dict, all_workers: l
     for model_name in missing_models:
         found_size = None
         for other in other_workers:
-            found, size = find_model(_model_inventory(other), model_name)
+            found, size = find_model(model_inventory(other), model_name)
             if not found:
                 continue
             # Present but with an unknown size still counts as fetchable; it

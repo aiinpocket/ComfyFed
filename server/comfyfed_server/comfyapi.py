@@ -267,40 +267,58 @@ def _online_worker_hashes(session) -> list[tuple[str, str]]:
     return [(w.id, w.object_info_hash or "") for w in rows]
 
 
-def _blocking_missing_models(needs: assess.JobNeeds) -> set[str]:
-    """Models NO online worker has, when that is the ONLY reason none of them
-    can run this job right now.
+def _fleet_wide_gaps(needs: assess.JobNeeds) -> tuple[set[str], set[str]]:
+    """`(models, node classes)` that NOT ONE registered worker can supply.
 
-    Returns an empty set (today's behavior: queue and wait) unless:
+    Deliberately fleet-wide rather than "every worker that happens to be
+    online right now": the classic home federation is one big GPU box holding
+    every model plus a small always-on box holding none, and refusing a prompt
+    during the GPU box's ten-minute reboot -- for models the user already owns
+    -- is strictly worse than queueing it. Every registered worker row counts,
+    whatever its `status` and whether or not it is disabled, so a sleeping or
+    temporarily-disabled machine still vouches for its inventory. Only a model
+    that exists nowhere in the federation is a real dead end, and that is what
+    the admin can actually act on.
 
-    * at least one worker is online, AND
-    * every online worker's verdict is `ineligible` with a non-empty
-      `missing_models` (a worker ineligible for a non-model reason with no
-      models missing -- e.g. `missing_nodes` alone -- fails this and the set
-      comes back empty), AND
-    * the intersection of those `missing_models` sets -- models no online
-      worker has, not just the ones any single worker lacks -- is non-empty.
+    Matching is `assess.find_model`, i.e. `assess.matches_model_name`
+    semantics, so a worker's `diffusion_models/flux1-dev.safetensors`
+    satisfies a workflow's `flux1-dev.safetensors`.
 
-    A single eligible or `eligible_after_fetch` worker, or no workers online
-    at all, always yields an empty set: this is a pre-flight refusal, not a
-    replacement for the existing queue-and-wait behavior.
+    Node classes are computed the same way and returned alongside, because a
+    fleet missing both would otherwise send the admin off to download 22 GB
+    for a job that still cannot run (see `post_prompt`, which appends a
+    節點 line to the guidance). A worker reporting an EMPTY `node_classes`
+    list means "unknown", not "supports nothing" -- same rule as
+    `assess.verdict` -- so such workers are skipped for the node check, and
+    if that leaves no informative worker the node set comes back empty.
+
+    With zero workers registered both sets are empty: an install that has
+    never had an agent connect keeps today's queue-and-wait behavior.
     """
     with db.get_session() as session:
-        online_workers = (
-            session.query(db.Worker)
-            .filter(db.Worker.disabled == False)  # noqa: E712
-            .filter(db.Worker.status != "offline")
-            .all()
-        )
-        if not online_workers:
-            return set()
         all_workers = session.query(db.Worker).all()
+        if not all_workers:
+            return set(), set()
+        inventories = [assess.model_inventory(w) for w in all_workers]
+        node_class_sets = [
+            classes for classes in (set(assess.worker_node_classes(w)) for w in all_workers)
+            if classes
+        ]
 
-    verdicts = [assess.verdict(w, needs, {}, all_workers) for w in online_workers]
-    if not all(v.kind == "ineligible" and v.missing_models for v in verdicts):
-        return set()
+    missing_models = {
+        name
+        for name in needs.models
+        if not any(assess.find_model(inventory, name)[0] for inventory in inventories)
+    }
 
-    return set.intersection(*(set(v.missing_models) for v in verdicts))
+    missing_nodes: set[str] = set()
+    if node_class_sets:
+        missing_nodes = {
+            node for node in needs.nodes
+            if not any(node in classes for classes in node_class_sets)
+        }
+
+    return missing_models, missing_nodes
 
 
 def staged_image_names(data_dir: str) -> list[str]:
@@ -468,10 +486,21 @@ def create_router(
 
         needs = assess.extract(prompt)
 
-        blocking = _blocking_missing_models(needs)
+        blocking, missing_nodes = _fleet_wide_gaps(needs)
         if blocking:
+            names = sorted(blocking)
+            guidance = model_guide.guidance_message(names, data_dir)
+            if missing_nodes:
+                guidance += "\n\n" + model_guide.missing_nodes_note(sorted(missing_nodes))
+            # message = one-line summary, details = the full guidance. The
+            # official frontend uses `message` as the Errors-panel card title
+            # and as the leading half of the dialog's `message + ": " +
+            # details`, so a multi-line blob in `message` renders either as a
+            # collapsed one-line headline or twice over.
             return _comfy_error(
-                "prompt.missing_models", model_guide.guidance_message(sorted(blocking), data_dir)
+                "prompt.missing_models",
+                model_guide.guidance_summary(names),
+                guidance,
             )
 
         resolved: dict[str, str] = {}

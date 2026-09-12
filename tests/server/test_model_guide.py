@@ -52,13 +52,37 @@ def test_lookup_unknown_model_returns_none(tmp_path):
 
 
 def _write_official_template(data_dir, name, models):
+    """Seed one official-library workflow JSON in the shape the REAL library
+    uses: download metadata on each node's `properties.models`, no top-level
+    `models` key (0 of the 550 workflows in `comfyui-workflow-templates-json`
+    have one)."""
+    official_dir = os.path.join(data_dir, "comfy_templates_official")
+    os.makedirs(official_dir, exist_ok=True)
+    workflow = {
+        "id": name,
+        "nodes": [
+            {"id": 1, "type": "Note", "properties": {}},
+            {
+                "id": 2,
+                "type": "UNETLoader",
+                "properties": {"Node name for S&R": "UNETLoader", "models": models},
+            },
+        ],
+        "links": [],
+    }
+    with open(os.path.join(official_dir, f"{name}.json"), "w", encoding="utf-8") as f:
+        json.dump(workflow, f)
+
+
+def _write_top_level_models_template(data_dir, name, models):
+    """The other accepted shape: a top-level `models` list."""
     official_dir = os.path.join(data_dir, "comfy_templates_official")
     os.makedirs(official_dir, exist_ok=True)
     with open(os.path.join(official_dir, f"{name}.json"), "w", encoding="utf-8") as f:
-        json.dump({"models": models}, f)
+        json.dump({"nodes": [], "models": models}, f)
 
 
-def test_harvest_reads_official_template_models(tmp_path):
+def test_harvest_reads_per_node_properties_models(tmp_path):
     data_dir = str(tmp_path)
     _write_official_template(
         data_dir,
@@ -77,6 +101,57 @@ def test_harvest_reads_official_template_models(tmp_path):
         "url": "https://example.com/harvested_model.safetensors",
         "directory": "checkpoints",
     }
+
+
+def test_harvest_also_reads_a_top_level_models_list(tmp_path):
+    data_dir = str(tmp_path)
+    _write_top_level_models_template(
+        data_dir,
+        "legacy_template",
+        [
+            {
+                "name": "legacy_model.safetensors",
+                "url": "https://example.com/legacy_model.safetensors",
+                "directory": "loras",
+            }
+        ],
+    )
+
+    assert model_guide.harvest(data_dir)["legacy_model.safetensors"] == {
+        "url": "https://example.com/legacy_model.safetensors",
+        "directory": "loras",
+    }
+
+
+def test_harvest_gathers_models_from_several_nodes(tmp_path):
+    data_dir = str(tmp_path)
+    official_dir = os.path.join(data_dir, "comfy_templates_official")
+    os.makedirs(official_dir, exist_ok=True)
+    workflow = {
+        "nodes": [
+            {
+                "id": 1,
+                "properties": {
+                    "models": [{"name": "a.safetensors", "url": "https://e/a", "directory": "vae"}]
+                },
+            },
+            {"id": 2, "properties": {"models": "not-a-list"}},
+            {"id": 3, "properties": None},
+            {
+                "id": 4,
+                "properties": {
+                    "models": [
+                        {"name": "b.safetensors", "url": "https://e/b", "directory": "loras"}
+                    ]
+                },
+            },
+        ]
+    }
+    with open(os.path.join(official_dir, "multi.json"), "w", encoding="utf-8") as f:
+        json.dump(workflow, f)
+
+    harvested = model_guide.harvest(data_dir)
+    assert sorted(harvested) == ["a.safetensors", "b.safetensors"]
 
 
 def test_harvest_ignores_index_and_manifest_files(tmp_path):
@@ -161,7 +236,7 @@ def test_guidance_message_curated_gated_harvested_and_unknown(tmp_path):
     )
 
     expected = (
-        "無法執行：目前在線的 worker 都缺少以下模型。"
+        "無法執行：聯邦裡所有已註冊的 worker 都缺少以下模型（含目前離線的）。"
         "請在 worker 主機下載後放到指定資料夾，worker 會在 10 分鐘內自動掃描並回報，不需重啟。"
         "\n\n"
         "【flux1-dev.safetensors】(22.17 GB)\n"
@@ -186,6 +261,27 @@ def test_guidance_message_never_mentions_old_mirror_domain(tmp_path):
         ["flux1-dev.safetensors", "clip_l.safetensors", "unknown.safetensors"], str(tmp_path)
     )
     assert "models.aiinpocket.com" not in message
+
+
+def test_guidance_summary_is_one_short_line(tmp_path):
+    one = model_guide.guidance_summary(["flux1-dev.safetensors"])
+    assert one == "缺少模型：flux1-dev.safetensors，無法執行——詳見下方下載指引"
+
+    several = model_guide.guidance_summary(
+        ["ae.safetensors", "flux1-dev.safetensors", "clip_l.safetensors"]
+    )
+    assert several == "缺少模型：ae.safetensors 等 3 項，無法執行——詳見下方下載指引"
+
+    for line in (one, several):
+        assert "\n" not in line
+
+
+def test_missing_nodes_note_names_every_node(tmp_path):
+    note = model_guide.missing_nodes_note(["FooLoader", "BarSampler"])
+    assert note == (
+        "另外，所有 worker 也都缺少節點：FooLoader、BarSampler"
+        "——需在 worker 端安裝對應 custom node。"
+    )
 
 
 def test_no_reference_to_aiinpocket_models_domain_anywhere_in_module():

@@ -2,12 +2,14 @@
 
 ComfyFed is a federation with no models of its own -- every model lives on a
 worker's disk, and the frontend's stock "Download" buttons (a plain
-`<a href>`) are useless here (see `templates.py`, which strips `models[].url`
-from every SERVED template so those buttons never render). Instead, when a
-submitted prompt cannot run on the current fleet because every online worker
-is missing the same model(s), `comfyapi.post_prompt` rejects it with a
-ComfyUI-shaped error whose message tells the admin exactly where to get each
-missing model and where to put it -- see `guidance_message`.
+`<a href>`) are useless here (see `templates.py`, which strips the download
+metadata from every SERVED template so those buttons never render). Instead,
+when a submitted prompt names a model that NOT ONE registered worker has --
+offline and disabled ones included, so a sleeping GPU box still counts --
+`comfyapi.post_prompt` rejects it with a ComfyUI-shaped error whose
+`details` tell the admin exactly where to get each missing model and where to
+put it (`guidance_message`) under a one-line `message` summary
+(`guidance_summary`).
 
 Two sources feed the model->download-info lookup, checked in this order:
 
@@ -17,8 +19,9 @@ Two sources feed the model->download-info lookup, checked in this order:
    GCS mirror as a backup, and whether the official source is access-gated.
 2. `harvest()` -- every OTHER model referenced by the official template
    library's workflow JSONs (`official_templates.official_dir`), read
-   straight off disk. `templates.py` strips `url`/`hash` from what it SERVES
-   to the browser, but the original files on disk still carry them (Task 2),
+   straight off disk from `nodes[].properties.models` (the shape the real
+   library uses). `templates.py` strips `url`/`hash` from what it SERVES to
+   the browser, but the original files on disk still carry them (Task 2),
    which is exactly what this module needs and the browser must not see.
 
 A model in neither source still gets a guidance block -- see
@@ -38,14 +41,14 @@ _GCS_BACKUP_BASE = "https://storage.googleapis.com/comfyfed-models/models"
 _FLUX_GATED_NOTE = "（需登入 HuggingFace 並同意 FLUX.1-dev 授權）"
 
 _HEADER = (
-    "無法執行：目前在線的 worker 都缺少以下模型。"
+    "無法執行：聯邦裡所有已註冊的 worker 都缺少以下模型（含目前離線的）。"
     "請在 worker 主機下載後放到指定資料夾，worker 會在 10 分鐘內自動掃描並回報，不需重啟。"
 )
 
 # Files in `official_dir` that are never a template workflow (and so never
-# carry a `models[]` array worth harvesting).
+# carry model metadata worth harvesting).
 _NON_TEMPLATE_PREFIXES = ("index",)
-_NON_TEMPLATE_NAMES = {"manifest.json"}
+_NON_TEMPLATE_NAMES = {official_templates.MANIFEST_NAME}
 
 
 @dataclass(frozen=True)
@@ -184,14 +187,50 @@ def _is_template_file(filename: str) -> bool:
     return True
 
 
+def _model_entries(data: dict):
+    """Every model-metadata dict in one workflow JSON, from both places the
+    format puts them.
+
+    The official library carries its download metadata per node, at
+    `nodes[].properties.models` -- that is what the frontend's
+    `getEmbeddedModels` reads and what all 550 workflow JSONs in
+    `comfyui-workflow-templates-json` actually use. A top-level `models`
+    list is also accepted so a hand-authored workflow that uses it is not
+    silently ignored; the two are simply chained.
+    """
+    top_level = data.get("models")
+    if isinstance(top_level, list):
+        for entry in top_level:
+            if isinstance(entry, dict):
+                yield entry
+
+    nodes = data.get("nodes")
+    if not isinstance(nodes, list):
+        return
+    for node in nodes:
+        if not isinstance(node, dict):
+            continue
+        properties = node.get("properties")
+        if not isinstance(properties, dict):
+            continue
+        models = properties.get("models")
+        if not isinstance(models, list):
+            continue
+        for entry in models:
+            if isinstance(entry, dict):
+                yield entry
+
+
 def harvest(data_dir: str) -> dict[str, dict]:
-    """Scan the official template library's workflow JSONs for `models[]`.
+    """Scan the official template library's workflow JSONs for model metadata.
 
     Returns `{name: {"url": ..., "directory": ...}}` for every model entry
-    found, first-write-wins on a name collision across templates. Reads the
-    ORIGINAL files on disk -- `templates.py` only strips `url`/`hash` from
-    what it serves over HTTP, never from these files -- so this is the one
-    place download links for non-curated models can still be found.
+    found in `nodes[].properties.models` (and in a top-level `models` list,
+    if a workflow happens to use one), first-write-wins on a name collision
+    across templates. Reads the ORIGINAL files on disk -- `templates.py` only
+    strips `url`/`hash` from what it serves over HTTP, never from these files
+    -- so this is the one place download links for non-curated models can
+    still be found.
     """
     dir_path = official_templates.official_dir(data_dir)
     try:
@@ -220,12 +259,7 @@ def harvest(data_dir: str) -> dict[str, dict]:
             continue
         if not isinstance(data, dict):
             continue
-        models = data.get("models")
-        if not isinstance(models, list):
-            continue
-        for entry in models:
-            if not isinstance(entry, dict):
-                continue
+        for entry in _model_entries(data):
             name = entry.get("name")
             if not isinstance(name, str) or not name:
                 continue
@@ -296,3 +330,34 @@ def guidance_message(missing: list[str], data_dir: str) -> str:
     """
     blocks = [_HEADER] + [_render_block(name, lookup(name, data_dir)) for name in missing]
     return "\n\n".join(blocks)
+
+
+def guidance_summary(missing: list[str]) -> str:
+    """One-line zh-TW summary of a missing-model rejection.
+
+    This is the `error.message` of the `/prompt` refusal, deliberately short:
+    the official frontend renders that field as the error card's *title* in
+    the right-side Errors panel and as the leading half of the error
+    dialog's `message + ": " + details`. The full `guidance_message` blocks
+    go in `details`. See `comfyapi.post_prompt`.
+    """
+    if not missing:
+        return "缺少模型，無法執行——詳見下方下載指引"
+    head = missing[0]
+    if len(missing) == 1:
+        return f"缺少模型：{head}，無法執行——詳見下方下載指引"
+    return f"缺少模型：{head} 等 {len(missing)} 項，無法執行——詳見下方下載指引"
+
+
+def missing_nodes_note(missing_nodes: list[str]) -> str:
+    """Trailing guidance line for node classes no registered worker has.
+
+    Appended to `guidance_message` when the fleet is missing BOTH models and
+    node classes, so an admin who downloads every listed model does not then
+    discover the job still cannot run for a reason nothing mentioned.
+    """
+    return (
+        "另外，所有 worker 也都缺少節點："
+        + "、".join(missing_nodes)
+        + "——需在 worker 端安裝對應 custom node。"
+    )

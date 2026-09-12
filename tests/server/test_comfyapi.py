@@ -250,7 +250,14 @@ def _set_model_inventory(client, worker_id, inventory):
         session.commit()
 
 
-def test_prompt_rejects_when_every_online_worker_lacks_the_model(client):
+def _set_node_classes(client, worker_id, classes):
+    with db.get_session() as session:
+        worker = session.get(db.Worker, worker_id)
+        worker.node_classes = json.dumps(classes)
+        session.commit()
+
+
+def test_prompt_rejects_when_no_registered_worker_has_the_model(client):
     csrf = _login(client)
     worker_id = _register_worker(client, csrf, "runner-1")
     _set_model_inventory(client, worker_id, [{"name": "diffusion_models/other.safetensors", "size": 1.0}])
@@ -259,21 +266,30 @@ def test_prompt_rejects_when_every_online_worker_lacks_the_model(client):
     assert r.status_code == 400
     body = r.json()
     assert body["error"]["type"] == "prompt.missing_models"
+
+    # message is a SHORT one-line summary: the frontend uses it as the errors
+    # panel's card title and as the first half of the dialog's
+    # `message + ": " + details`.
     message = body["error"]["message"]
+    assert message == "缺少模型：flux1-dev.safetensors，無法執行——詳見下方下載指引"
+    assert "\n" not in message
+
+    # details carries the full multi-block guidance.
+    details = body["error"]["details"]
     assert (
         "官方載點：https://huggingface.co/black-forest-labs/FLUX.1-dev/resolve/main/flux1-dev.safetensors"
-        in message
+        in details
     )
     assert (
         "備份載點：https://storage.googleapis.com/comfyfed-models/models/diffusion_models/flux1-dev.safetensors"
-        in message
+        in details
     )
     assert body["node_errors"] == {}
     with db.get_session() as session:
         assert session.query(db.Job).count() == 0
 
 
-def test_prompt_still_queues_when_no_workers_online(client):
+def test_prompt_still_queues_when_no_workers_registered(client):
     _login(client)
     r = _post_prompt(client, prompt=FLUX_PROMPT)
     assert r.status_code == 200
@@ -290,6 +306,103 @@ def test_prompt_still_queues_when_a_worker_is_eligible(client):
     assert r.status_code == 200
     with db.get_session() as session:
         assert session.query(db.Job).count() == 1
+
+
+def test_prompt_queues_when_the_only_worker_with_the_model_is_offline(client):
+    """The classic home federation: one GPU box holding everything, rebooting,
+    plus a small always-on box holding nothing. The job must wait, not be
+    refused with instructions to re-download models the user already owns."""
+    csrf = _login(client)
+    gpu = _register_worker(client, csrf, "gpu-box", status="offline")
+    _set_model_inventory(client, gpu, [{"name": "diffusion_models/flux1-dev.safetensors", "size": 22.17}])
+    small = _register_worker(client, csrf, "always-on")
+    _set_model_inventory(client, small, [])
+
+    r = _post_prompt(client, prompt=FLUX_PROMPT)
+    assert r.status_code == 200
+    with db.get_session() as session:
+        assert session.query(db.Job).count() == 1
+
+
+def test_prompt_queues_when_a_disabled_worker_has_the_model(client):
+    csrf = _login(client)
+    holder = _register_worker(client, csrf, "paused-box", disabled=True)
+    _set_model_inventory(client, holder, [{"name": "diffusion_models/flux1-dev.safetensors", "size": 22.17}])
+    _register_worker(client, csrf, "empty-box")
+
+    r = _post_prompt(client, prompt=FLUX_PROMPT)
+    assert r.status_code == 200
+
+
+def test_prompt_rejection_fires_past_an_unrelated_online_bystander(client):
+    """A model absent fleet-wide is still a dead end even when some other
+    worker happens to be online and busy with something else."""
+    csrf = _login(client)
+    a = _register_worker(client, csrf, "bystander")
+    _set_model_inventory(client, a, [{"name": "vae/ae.safetensors", "size": 0.31}])
+    b = _register_worker(client, csrf, "other", status="offline")
+    _set_model_inventory(client, b, [{"name": "loras/unrelated.safetensors", "size": 0.1}])
+
+    r = _post_prompt(client, prompt=FLUX_PROMPT)
+    assert r.status_code == 400
+    assert r.json()["error"]["type"] == "prompt.missing_models"
+
+
+def test_prompt_with_only_missing_nodes_never_triggers_model_guidance(client):
+    """Missing node classes are not a missing-model problem: the job queues
+    (unchanged behavior) rather than being refused with download links."""
+    csrf = _login(client)
+    worker_id = _register_worker(client, csrf, "runner-1")
+    _set_model_inventory(client, worker_id, [{"name": "diffusion_models/flux1-dev.safetensors", "size": 22.17}])
+    _set_node_classes(client, worker_id, ["SaveImage"])  # no UNETLoader
+
+    r = _post_prompt(client, prompt=FLUX_PROMPT)
+    assert r.status_code == 200
+    with db.get_session() as session:
+        assert session.query(db.Job).count() == 1
+
+
+def test_prompt_rejection_also_names_fleet_wide_missing_nodes(client):
+    """Both missing: the guidance must not send the admin off to download
+    22 GB for a job that still cannot run for want of a custom node."""
+    csrf = _login(client)
+    worker_id = _register_worker(client, csrf, "runner-1")
+    _set_model_inventory(client, worker_id, [])
+    _set_node_classes(client, worker_id, ["SaveImage"])  # no UNETLoader
+
+    r = _post_prompt(client, prompt=FLUX_PROMPT)
+    assert r.status_code == 400
+    details = r.json()["error"]["details"]
+    assert "另外，所有 worker 也都缺少節點：UNETLoader" in details
+    assert "需在 worker 端安裝對應 custom node" in details
+
+
+def test_prompt_rejection_omits_the_node_line_when_nodes_are_fine(client):
+    csrf = _login(client)
+    worker_id = _register_worker(client, csrf, "runner-1")
+    _set_model_inventory(client, worker_id, [])
+    _set_node_classes(client, worker_id, ["UNETLoader", "SaveImage"])
+
+    r = _post_prompt(client, prompt=FLUX_PROMPT)
+    assert r.status_code == 400
+    assert "缺少節點" not in r.json()["error"]["details"]
+
+
+def test_prompt_summary_counts_models_when_several_are_missing(client):
+    csrf = _login(client)
+    worker_id = _register_worker(client, csrf, "runner-1")
+    _set_model_inventory(client, worker_id, [])
+
+    prompt = {
+        "1": {"class_type": "UNETLoader", "inputs": {"unet_name": "flux1-dev.safetensors"}},
+        "2": {"class_type": "VAELoader", "inputs": {"vae_name": "ae.safetensors"}},
+        "3": {"class_type": "SaveImage", "inputs": {"images": ["1", 0]}},
+    }
+    r = _post_prompt(client, prompt=prompt)
+    assert r.status_code == 400
+    assert r.json()["error"]["message"] == (
+        "缺少模型：ae.safetensors 等 2 項，無法執行——詳見下方下載指引"
+    )
 
 
 # --- queue -----------------------------------------------------------------
