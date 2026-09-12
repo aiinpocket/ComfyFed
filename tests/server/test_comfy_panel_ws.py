@@ -18,6 +18,17 @@ from comfyfed_server import app as app_module
 from comfyfed_server import bootstrap, comfyapi, db, dispatch, panelws
 
 
+def _pick_job_for(worker_id):
+    """Test-only stand-in for the old single-worker `dispatch.pick_job_for`:
+    dispatch now ranks a whole idle batch at once via `assign_jobs`. Returns
+    the job assigned to `worker_id`, or None if nothing eligible was found
+    for it."""
+    for assigned_worker_id, job in dispatch.assign_jobs([worker_id]):
+        if assigned_worker_id == worker_id:
+            return job
+    return None
+
+
 def relay(coro):
     """Drive one panelws coroutine from a synchronous test.
 
@@ -146,7 +157,7 @@ def test_client_feature_flags_message_is_consumed_without_disrupting_the_socket(
     csrf = _login(client)
     job_id = _post_prompt(client)
     worker_id = _register_worker(client, csrf, "runner")
-    dispatch.pick_job_for(worker_id)
+    _pick_job_for(worker_id)
 
     with client.websocket_connect("/comfy/api/ws") as ws:
         ws.receive_json()  # initial status
@@ -183,7 +194,7 @@ def test_initial_status_queue_remaining_includes_running_jobs(client):
     csrf = _login(client)
     job_id = _post_prompt(client)
     worker_id = _register_worker(client, csrf, "runner")
-    dispatch.pick_job_for(worker_id)
+    _pick_job_for(worker_id)
     dispatch.mark_running(job_id, worker_id)
 
     with client.websocket_connect("/comfy/api/ws") as ws:
@@ -198,7 +209,7 @@ def test_progress_event_relayed_to_panel_client(client):
     csrf = _login(client)
     job_id = _post_prompt(client)
     worker_id = _register_worker(client, csrf, "runner")
-    dispatch.pick_job_for(worker_id)
+    _pick_job_for(worker_id)
     dispatch.mark_running(job_id, worker_id)
 
     with client.websocket_connect("/comfy/api/ws") as ws:
@@ -218,7 +229,7 @@ def test_executing_event_on_job_running(client):
     csrf = _login(client)
     job_id = _post_prompt(client)
     worker_id = _register_worker(client, csrf, "runner")
-    dispatch.pick_job_for(worker_id)
+    _pick_job_for(worker_id)
 
     with client.websocket_connect("/comfy/api/ws") as ws:
         ws.receive_json()  # initial status
@@ -241,7 +252,7 @@ def test_job_done_sends_executed_then_executing_none_then_status(client):
     csrf = _login(client)
     job_id = _post_prompt(client)
     worker_id = _register_worker(client, csrf, "runner")
-    dispatch.pick_job_for(worker_id)
+    _pick_job_for(worker_id)
     dispatch.mark_running(job_id, worker_id)
     dispatch.mark_done(job_id, worker_id, ["out_00001_.png"])
 
@@ -285,7 +296,7 @@ def test_job_failed_sends_execution_error(client):
     csrf = _login(client)
     job_id = _post_prompt(client)
     worker_id = _register_worker(client, csrf, "runner")
-    dispatch.pick_job_for(worker_id)
+    _pick_job_for(worker_id)
 
     with client.websocket_connect("/comfy/api/ws") as ws:
         ws.receive_json()  # initial status
@@ -308,11 +319,67 @@ def test_job_failed_sends_execution_error(client):
         assert status["data"]["status"] == {"exec_info": {"queue_remaining": 1}}
 
 
+def test_job_cancelled_relay_clears_executing_and_refreshes_status(client):
+    _login(client)
+    job_id = "some-job"
+    with client.websocket_connect("/comfy/api/ws") as ws:
+        ws.receive_json()  # initial status
+        ws.receive_json()  # feature_flags
+
+        relay(panelws.job_cancelled(job_id))
+
+        cleared = ws.receive_json()
+        assert cleared == {"type": "executing", "data": {"node": None, "prompt_id": job_id}}
+
+        status = ws.receive_json()
+        assert status["type"] == "status"
+
+
+def test_admin_cancel_api_relays_to_the_panel(client):
+    """The admin cancel API (jobs.py) must reach a connected panel client via
+    the same `executing:null` + `status` combination `job_requeued` uses."""
+    csrf = _login(client)
+    job_id = _post_prompt(client)
+    worker_id = _register_worker(client, csrf, "runner")
+    _pick_job_for(worker_id)
+    dispatch.mark_running(job_id, worker_id)
+
+    with client.websocket_connect("/comfy/api/ws") as ws:
+        ws.receive_json()  # initial status
+        ws.receive_json()  # feature_flags
+
+        r = client.post(f"/api/jobs/{job_id}/cancel", headers={"X-CSRF": csrf})
+        assert r.status_code == 200
+
+        cleared = ws.receive_json()
+        assert cleared == {"type": "executing", "data": {"node": None, "prompt_id": job_id}}
+        status = ws.receive_json()
+        assert status["type"] == "status"
+
+
+def test_comfy_interrupt_relays_to_the_panel(client):
+    csrf = _login(client)
+    job_id = _post_prompt(client)
+    worker_id = _register_worker(client, csrf, "runner")
+    _pick_job_for(worker_id)
+    dispatch.mark_running(job_id, worker_id)
+
+    with client.websocket_connect("/comfy/api/ws") as ws:
+        ws.receive_json()  # initial status
+        ws.receive_json()  # feature_flags
+
+        r = client.post("/comfy/api/interrupt")
+        assert r.status_code == 200
+
+        cleared = ws.receive_json()
+        assert cleared == {"type": "executing", "data": {"node": None, "prompt_id": job_id}}
+
+
 def test_broadcast_reaches_multiple_connected_clients(client):
     csrf = _login(client)
     job_id = _post_prompt(client)
     worker_id = _register_worker(client, csrf, "runner")
-    dispatch.pick_job_for(worker_id)
+    _pick_job_for(worker_id)
 
     with client.websocket_connect("/comfy/api/ws") as ws1, client.websocket_connect(
         "/comfy/api/ws"
@@ -366,7 +433,7 @@ def test_agent_heartbeat_progress_relayed_through_real_agentws_handler(client):
         "/api/agent/register", json={"token": token, "name": "w1", "pubkey": pubkey_hex}
     )
     worker_id = reg.json()["worker_id"]
-    dispatch.pick_job_for(worker_id)
+    _pick_job_for(worker_id)
 
     with client.websocket_connect("/comfy/api/ws") as panel_ws:
         panel_ws.receive_json()  # initial status
@@ -473,7 +540,7 @@ async def test_same_loop_job_done_delivers_three_events_in_order(client):
     csrf = _login(client)
     job_id = _post_prompt(client)
     worker_id = _register_worker(client, csrf, "runner")
-    dispatch.pick_job_for(worker_id)
+    _pick_job_for(worker_id)
     dispatch.mark_running(job_id, worker_id)
     dispatch.mark_done(job_id, worker_id, ["out_00001_.png"])
 
@@ -502,7 +569,7 @@ async def test_same_loop_agentws_handler_relays_job_done(client):
     csrf = _login(client)
     job_id = _post_prompt(client)
     worker_id = _register_worker(client, csrf, "runner")
-    dispatch.pick_job_for(worker_id)
+    _pick_job_for(worker_id)
     dispatch.mark_running(job_id, worker_id)
     dispatch.mark_done(job_id, worker_id, ["out_00001_.png"])
 
@@ -530,7 +597,7 @@ async def test_dispatch_tick_relays_requeued_jobs_to_the_panel(client):
     csrf = _login(client)
     job_id = _post_prompt(client)
     worker_id = _register_worker(client, csrf, "runner")
-    dispatch.pick_job_for(worker_id)
+    _pick_job_for(worker_id)
     dispatch.mark_running(job_id, worker_id)
 
     stale = datetime.now(timezone.utc).replace(tzinfo=None) - timedelta(seconds=200)

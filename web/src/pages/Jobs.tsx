@@ -11,6 +11,7 @@ import {
   FileInput,
   Group,
   Loader,
+  Modal,
   NumberInput,
   Select,
   SimpleGrid,
@@ -493,6 +494,10 @@ function SubmitPanel({ onSubmitted }: { onSubmitted: () => void }) {
 
 /* -------------------------------------------------------------- jobs table */
 
+/** Statuses a row's cancel action applies to -- anything already terminal
+ * (done/failed/cancelled) has nothing left to cancel. */
+const CANCELLABLE_STATUSES = new Set(['queued', 'assigned', 'running']);
+
 /** Requeue a failed job. Sits in the results cell of a failed row. */
 function RetryButton({ jobId, onRetried }: { jobId: string; onRetried: () => void }) {
   const { t } = useTranslation();
@@ -539,6 +544,23 @@ function RetryButton({ jobId, onRetried }: { jobId: string; onRetried: () => voi
   );
 }
 
+/** Row action for a queued/assigned/running job: opens the confirm dialog. */
+function CancelButton({ onClick }: { onClick: (event: React.MouseEvent) => void }) {
+  const { t } = useTranslation();
+
+  return (
+    <Button
+      size="compact-xs"
+      variant="light"
+      color="red"
+      leftSection={<IconX size={13} />}
+      onClick={onClick}
+    >
+      {t('jobs.cancel')}
+    </Button>
+  );
+}
+
 function JobsTable({
   jobs,
   workers,
@@ -551,11 +573,42 @@ function JobsTable({
   const { t } = useTranslation();
   const theme = useMantineTheme();
   const [expanded, setExpanded] = useState<string | null>(null);
+  const [cancelTarget, setCancelTarget] = useState<Job | null>(null);
+  const [cancelling, setCancelling] = useState(false);
 
   const workerName = new Map(workers.map((w) => [w.id, w.name] as const));
   const ordered = [...jobs].reverse();
 
+  const confirmCancel = async () => {
+    if (!cancelTarget) return;
+    setCancelling(true);
+    try {
+      await api.cancelJob(cancelTarget.id);
+      notifications.show({
+        color: 'teal',
+        icon: <IconCheck size={16} />,
+        title: t('jobs.cancel_success'),
+        message: cancelTarget.id,
+      });
+      setCancelTarget(null);
+      onChanged();
+    } catch (caught) {
+      notifications.show({
+        color: 'red',
+        icon: <IconX size={16} />,
+        title: t('jobs.cancel_failed'),
+        message:
+          caught instanceof ApiError
+            ? t(`errors.${caught.code}`, { defaultValue: caught.message })
+            : t('errors.network'),
+      });
+    } finally {
+      setCancelling(false);
+    }
+  };
+
   return (
+    <>
     <Table.ScrollContainer minWidth={860}>
       <Table verticalSpacing="sm" horizontalSpacing="md">
         <Table.Thead style={{ background: theme.other.surfaces.raised }}>
@@ -621,6 +674,13 @@ function JobsTable({
                   <Table.Td>
                     {job.status === 'failed' ? (
                       <RetryButton jobId={job.id} onRetried={onChanged} />
+                    ) : CANCELLABLE_STATUSES.has(job.status) ? (
+                      <CancelButton
+                        onClick={(event) => {
+                          event.stopPropagation();
+                          setCancelTarget(job);
+                        }}
+                      />
                     ) : job.result_files.length === 0 ? (
                       <Text size="sm" c="dimmed">
                         —
@@ -660,6 +720,27 @@ function JobsTable({
         </Table.Tbody>
       </Table>
     </Table.ScrollContainer>
+
+    <Modal
+      opened={cancelTarget !== null}
+      onClose={() => setCancelTarget(null)}
+      title={t('jobs.cancel_confirm_title')}
+    >
+      <Stack gap="md">
+        <Text size="sm">
+          {t('jobs.cancel_confirm_body', { id: cancelTarget ? shortId(cancelTarget.id) : '' })}
+        </Text>
+        <Group justify="flex-end" gap="sm">
+          <Button variant="default" onClick={() => setCancelTarget(null)}>
+            {t('common.cancel')}
+          </Button>
+          <Button color="red" onClick={confirmCancel} loading={cancelling}>
+            {t('jobs.cancel_confirm_action')}
+          </Button>
+        </Group>
+      </Stack>
+    </Modal>
+    </>
   );
 }
 

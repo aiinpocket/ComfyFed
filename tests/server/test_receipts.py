@@ -243,6 +243,52 @@ def test_artifact_download_404s_for_nonexistent_job(client):
     assert res.json()["error"]["code"] == "jobs.not_found"
 
 
+# --- Phase 1.7: artifact upload during the blip re-adoption window ----------
+
+
+def test_artifact_upload_accepted_in_blip_readopt_window(client):
+    """(d) A job requeued while its worker blipped (status=queued,
+    last_worker_id=worker) still accepts that worker's artifact upload. The
+    upload path is deliberately read-only -- it must not itself flip
+    ownership; only a subsequent job_done's dispatch.try_readopt does that."""
+    csrf = _login(client)
+    w1_id, w1_key = _register_worker_with_key(client, csrf, "agent1")
+    job_id = _submit(client, csrf)
+    with db.get_session() as session:
+        job = session.get(db.Job, job_id)
+        job.status = "queued"
+        job.worker_id = None
+        job.last_worker_id = w1_id
+        session.commit()
+
+    path = f"/api/agent/jobs/{job_id}/artifacts"
+    ok = _signed_post_multipart(client, path, w1_id, w1_key, "out.png", b"pixel-bytes")
+    assert ok.status_code == 200
+
+    with db.get_session() as session:
+        job = session.get(db.Job, job_id)
+        assert job.status == "queued"
+        assert job.worker_id is None
+
+
+def test_artifact_upload_rejected_when_blip_last_worker_mismatches(client):
+    csrf = _login(client)
+    w1_id, w1_key = _register_worker_with_key(client, csrf, "agent1")
+    w2_id, _w2_key = _register_worker_with_key(client, csrf, "agent2")
+    job_id = _submit(client, csrf)
+    with db.get_session() as session:
+        job = session.get(db.Job, job_id)
+        job.status = "queued"
+        job.worker_id = None
+        job.last_worker_id = w2_id
+        session.commit()
+
+    path = f"/api/agent/jobs/{job_id}/artifacts"
+    forbidden = _signed_post_multipart(client, path, w1_id, w1_key, "out.png", b"pixel-bytes")
+    assert forbidden.status_code == 403
+    assert forbidden.json()["error"]["code"] == "jobs.not_assigned"
+
+
 def test_job_done_creates_dual_signed_receipt_over_ws(client):
     csrf = _login(client)
     worker_id, sk = _register_worker_with_key(client, csrf, "w1")

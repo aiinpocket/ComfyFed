@@ -51,7 +51,8 @@
     "assigned": "已指派",
     "running": "執行中",
     "done": "已完成",
-    "failed": "失敗"
+    "failed": "失敗",
+    "cancelled": "已取消"
   },
   "verdict": {
     "eligible": "可以跑",
@@ -149,7 +150,13 @@
     "est_vram": "預估 VRAM：{{value}}",
     "retry": "重試",
     "retry_success": "任務已重新排隊",
-    "retry_failed": "無法重試這個任務"
+    "retry_failed": "無法重試這個任務",
+    "cancel": "取消",
+    "cancel_confirm_title": "要取消這個任務嗎？",
+    "cancel_confirm_body": "任務 {{id}} 會立即停止，取消的任務不會產生費用紀錄。",
+    "cancel_confirm_action": "確定取消任務",
+    "cancel_success": "任務已取消",
+    "cancel_failed": "無法取消這個任務"
   },
   "workers": {
     "title": "Worker",
@@ -237,6 +244,7 @@
     "jobs.not_found": "這個任務已經不存在了。",
     "jobs.artifact_not_found": "這個結果檔已經取不到了。",
     "jobs.not_retryable": "只有失敗的任務可以重試。",
+    "jobs.already_terminal": "這個任務已經結束，無法再取消。",
     "settings.bad_platform_url": "平台網址必須以 http:// 或 https:// 開頭。",
     "settings.bad_lang": "不支援這個語言。",
     "reports.bad_date": "無法讀取這個日期。",

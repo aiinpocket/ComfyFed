@@ -20,23 +20,62 @@ _OWNED_STATUSES = ("assigned", "running")
 
 # Statuses a job never leaves again. Re-transitioning one is always wrong,
 # so it stays a WARNING even when the worker does own the job.
-_TERMINAL_STATUSES = ("done", "failed")
+_TERMINAL_STATUSES = ("done", "failed", "cancelled")
+
+# Statuses cancel_job is willing to act on -- anything already terminal is a
+# no-op (returns None), matching _TERMINAL_STATUSES' definition of "done".
+_CANCELLABLE_STATUSES = ("queued", "assigned", "running")
 
 
 def _utcnow() -> datetime:
     return datetime.now(timezone.utc).replace(tzinfo=None)
 
 
-def pick_job_for(worker_id: str) -> Optional[db.Job]:
-    """Atomically assign the oldest eligible queued job to `worker_id`.
-
-    Jobs that are not eligible for this worker are skipped without blocking
-    later (newer) jobs from being considered.
+def _free_vram_gb(worker: db.Worker) -> float:
+    """Free VRAM for ranking purposes, from the same heartbeat snapshot
+    `assess.verdict` reads (`worker.dynamic["free_vram_gb"]`). Missing or
+    non-numeric is treated as 0 rather than raising or crashing ranking --
+    an unranked worker should lose ties, not break the tick.
     """
+    free_vram = assess._worker_dynamic(worker).get("free_vram_gb")
+    if not isinstance(free_vram, (int, float)) or isinstance(free_vram, bool):
+        return 0.0
+    return float(free_vram)
+
+
+def assign_jobs(idle_worker_ids: list[str]) -> list[tuple[str, db.Job]]:
+    """Rank idle workers per queued job and atomically claim the best pair.
+
+    For each queued job, oldest first, every still-unassigned idle worker's
+    `assess.verdict` is evaluated and the best eligible one picked:
+
+    1. eligible with no warnings beats eligible-with-warnings (e.g. the
+       `vram_offload` note) -- a clean run beats one that will offload.
+    2. tie-break by largest free VRAM, from the worker's `dynamic` heartbeat
+       snapshot (see `_free_vram_gb`).
+    3. stable tie-break by worker name, so results are deterministic when
+       ranking is otherwise a wash.
+
+    Each worker is claimed for at most one job per call: once a worker wins a
+    job it drops out of the candidate pool for every later job this tick.
+    The claim itself is atomic: the `WHERE status == "queued"` re-check in
+    the same UPDATE statement means
+    a job someone else claimed a moment ago (rowcount 0) is skipped rather
+    than double-assigned.
+
+    Returns the (worker_id, job) pairs actually claimed, for the caller
+    (`agentws.dispatch_tick`) to push over each worker's connection.
+    """
+    if not idle_worker_ids:
+        return []
+
     with db.get_session() as session:
-        worker = session.get(db.Worker, worker_id)
-        if worker is None:
-            return None
+        workers = {
+            w.id: w
+            for w in session.query(db.Worker).filter(db.Worker.id.in_(idle_worker_ids)).all()
+        }
+        if not workers:
+            return []
 
         all_workers = session.query(db.Worker).all()
 
@@ -47,7 +86,13 @@ def pick_job_for(worker_id: str) -> Optional[db.Job]:
             .all()
         )
 
+        available_worker_ids = set(workers.keys())
+        assignments: list[tuple[str, db.Job]] = []
+
         for job in queued_jobs:
+            if not available_worker_ids:
+                break
+
             requirements_override = {}
             try:
                 requirements_override = json.loads(job.requirements or "{}")
@@ -55,22 +100,33 @@ def pick_job_for(worker_id: str) -> Optional[db.Job]:
                 requirements_override = {}
 
             needs = assess.needs_from_job(job)
-            v = assess.verdict(worker, needs, requirements_override, all_workers)
-            # `warnings` (e.g. vram_offload) are explicitly NOT a bar to
-            # dispatch: an eligible-with-warning worker runs the job, just
-            # more slowly. Phase 1 does no preference ordering between a
-            # clean worker and a warned one.
-            if v.kind != "eligible":
+
+            # (has_warnings, -free_vram, name, worker_id): sorts clean before
+            # warned, then largest free VRAM first, then name for determinism.
+            candidates = []
+            for candidate_id in available_worker_ids:
+                worker = workers[candidate_id]
+                v = assess.verdict(worker, needs, requirements_override, all_workers)
+                if v.kind != "eligible":
+                    continue
+                candidates.append(
+                    (bool(v.warnings), -_free_vram_gb(worker), worker.name, candidate_id)
+                )
+
+            if not candidates:
                 continue
+
+            candidates.sort()
+            best_worker_id = candidates[0][3]
 
             # Atomic claim: only succeeds if the job is still queued. If
             # another process/thread beat us to it, rowcount is 0 and we
-            # move on to the next candidate rather than returning a job
-            # that's no longer actually ours.
+            # move on to the next job rather than assigning one that's no
+            # longer actually up for grabs.
             result = session.execute(
                 update(db.Job)
                 .where(db.Job.id == job.id, db.Job.status == "queued")
-                .values(status="assigned", worker_id=worker_id)
+                .values(status="assigned", worker_id=best_worker_id)
             )
             if result.rowcount != 1:
                 session.rollback()
@@ -78,9 +134,10 @@ def pick_job_for(worker_id: str) -> Optional[db.Job]:
 
             session.commit()
             session.refresh(job)
-            return job
+            assignments.append((best_worker_id, job))
+            available_worker_ids.discard(best_worker_id)
 
-        return None
+        return assignments
 
 
 def requeue_stale(now: datetime) -> list[str]:
@@ -117,6 +174,11 @@ def requeue_stale(now: datetime) -> list[str]:
             )
             for job in jobs:
                 job.status = "queued"
+                # Recorded *before* worker_id is cleared, so a job_done that
+                # eventually arrives from this same worker (it merely blipped
+                # offline, not truly gone) can be re-adopted -- see
+                # try_readopt below.
+                job.last_worker_id = worker.id
                 job.worker_id = None
                 job.progress = 0
                 requeued.append(job.id)
@@ -127,6 +189,101 @@ def requeue_stale(now: datetime) -> list[str]:
         session.commit()
 
     return requeued
+
+
+def cancel_job(job_id: str, *, reason: str) -> Optional[str]:
+    """Move a queued/assigned/running job to `cancelled`.
+
+    Sets `error=reason` and `finished_at`, and returns the worker_id that
+    owned the job at the moment of cancellation (None if it was still
+    unowned/queued) so a caller (an admin API, the ComfyUI-compat /interrupt
+    or /queue-delete handlers) knows whether it needs to push `job_cancelled`
+    to a live agent connection.
+
+    Ownership is then *released* exactly the way `requeue_stale` releases it
+    -- `last_worker_id = worker_id`, `worker_id = None` -- and that is load
+    bearing, not tidiness. The immediate push is one-shot: it is a silent
+    no-op when the owner has no live connection at that instant (a routine
+    reconnect, a brief drop). With ownership cleared, every *later* thing the
+    old owner says about this job -- heartbeat, progress, job_done, artifact
+    upload -- lands on the not-owned path, which pushes `job_cancelled`
+    again; the per-connection dedup bounds it to one push per socket and a
+    reconnect starts a fresh set, so a missed notification self-heals within
+    one heartbeat instead of the worker rendering to completion for nothing.
+    `last_worker_id` keeps that worker identifiable as the *former* owner, so
+    `_owned_job` can log its now-pointless messages at DEBUG rather than
+    spending the forgery-signal WARNING on them. It does not make the job
+    re-adoptable: `try_readopt` requires status `queued`, and `cancelled` is
+    terminal.
+
+    A no-op returning None for a job that's already terminal (done, failed,
+    or already cancelled) or doesn't exist -- cancelling twice, or cancelling
+    something that finished moments before the request landed, must not
+    stomp on a real result. `_TERMINAL_STATUSES` and `_CANCELLABLE_STATUSES`
+    partition the status space between them, so nothing else falls through.
+
+    A cancelled job never gets a receipt: this function only ever flips
+    `status`/`error`/`finished_at`, the same fields `mark_done`/`mark_failed`
+    touch -- receipt creation lives entirely in agentws's `job_done` handling
+    and is never invoked from here.
+    """
+    with db.get_session() as session:
+        job = session.get(db.Job, job_id)
+        if job is None or job.status not in _CANCELLABLE_STATUSES:
+            return None
+        owning_worker_id = job.worker_id
+        job.status = "cancelled"
+        job.error = reason
+        job.finished_at = _utcnow()
+        if owning_worker_id is not None:
+            job.last_worker_id = owning_worker_id
+            job.worker_id = None
+        session.commit()
+    return owning_worker_id
+
+
+def is_terminal(status: str) -> bool:
+    """Whether `status` is one a job's lifecycle never leaves.
+
+    Public wrapper around `_TERMINAL_STATUSES` for callers outside this
+    module (the admin cancel API needs it to tell a 404 apart from a 409)
+    that should not reach into a private module constant.
+    """
+    return status in _TERMINAL_STATUSES
+
+
+def try_readopt(job_id: str, worker_id: str) -> bool:
+    """Restore ownership of a job to `worker_id` if it's the worker's own job
+    blipping back, not someone else's.
+
+    A job only qualifies when it is still `queued` (nobody has picked it up
+    since) AND `last_worker_id == worker_id` (this is the same worker
+    `requeue_stale` took it from, not merely a worker that happens to be
+    guessing job ids). On a match, ownership is restored (`status=assigned,
+    worker_id=worker_id`) and True is returned; the caller (agentws's
+    `job_done` handling) then proceeds exactly as it would for a normal owned
+    completion.
+
+    The atomic claim mirrors `assign_jobs`'s: the `WHERE` clause re-checks
+    `status == "queued"` in the same statement that flips it, so a concurrent
+    dispatch_tick claiming the job first (rowcount 0) is detected rather than
+    the two writers silently clobbering each other.
+    """
+    with db.get_session() as session:
+        result = session.execute(
+            update(db.Job)
+            .where(
+                db.Job.id == job_id,
+                db.Job.status == "queued",
+                db.Job.last_worker_id == worker_id,
+            )
+            .values(status="assigned", worker_id=worker_id)
+        )
+        if result.rowcount != 1:
+            session.rollback()
+            return False
+        session.commit()
+        return True
 
 
 def _owned_job(session, job_id: Optional[str], worker_id: str, statuses) -> Optional[db.Job]:
@@ -144,6 +301,13 @@ def _owned_job(session, job_id: Optional[str], worker_id: str, statuses) -> Opti
 
     * WARNING -- a job owned by someone else, an unknown job id, or an attempt
       to re-transition a job that has already finished. All genuinely wrong.
+    * DEBUG -- a job this worker used to own that has since ended without it
+      (`last_worker_id` matches and the status is terminal -- in practice a
+      cancellation, which releases `worker_id`; see `cancel_job`). The worker
+      is not forging anything, it is simply a message or two behind: it keeps
+      heartbeating for the job until the `job_cancelled` push it triggers
+      reaches it. Charging the forgery WARNING for that would put one line
+      per heartbeat in the log for the rest of the run.
     * DEBUG -- this worker's own job simply isn't in the state this call wanted
       (e.g. a repeated busy heartbeat for a job already marked running). That
       is the normal steady state: the agent heartbeats every 30s for the whole
@@ -158,7 +322,9 @@ def _owned_job(session, job_id: Optional[str], worker_id: str, statuses) -> Opti
         return None
 
     if job.worker_id != worker_id:
-        logger.warning(
+        was_ours_and_is_over = job.last_worker_id == worker_id and job.status in _TERMINAL_STATUSES
+        log = logger.debug if was_ours_and_is_over else logger.warning
+        log(
             "dispatch: worker %s may not transition job %s owned by %s (status=%s)",
             worker_id,
             job_id,

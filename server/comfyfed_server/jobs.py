@@ -8,9 +8,9 @@ import os
 from typing import Optional
 
 from fastapi import APIRouter, Depends, File, Form, HTTPException, Request, UploadFile
-from fastapi.responses import FileResponse
+from fastapi.responses import FileResponse, JSONResponse
 
-from . import assess, auth, db, storage
+from . import agentws, assess, auth, db, dispatch, storage
 from .workers import verify_agent
 
 _JOB_INPUTS_DIRNAME = "job_inputs"
@@ -252,7 +252,16 @@ def create_router(data_dir: str) -> APIRouter:
             job = session.get(db.Job, job_id)
             if job is None:
                 raise _error(404, "jobs.not_found", "Job not found.")
-            if job.worker_id != worker.id or job.status not in ("assigned", "running"):
+            # Ownership OR the blip re-adoption window: a worker that went
+            # offline mid-run and got requeued (dispatch.requeue_stale sets
+            # status back to "queued" and records last_worker_id) may still
+            # be uploading the result it produced before it dropped. This
+            # check is deliberately read-only -- it does not flip ownership
+            # itself; only a subsequent job_done's dispatch.try_readopt does
+            # that (see agentws._handle_job_done).
+            owns_it = job.worker_id == worker.id and job.status in ("assigned", "running")
+            in_blip_window = job.status == "queued" and job.last_worker_id == worker.id
+            if not (owns_it or in_blip_window):
                 raise _error(403, "jobs.not_assigned", "Job is not assigned to this worker.")
 
         form = await request.form()
@@ -325,6 +334,45 @@ def create_router(data_dir: str) -> APIRouter:
         return FileResponse(
             path, media_type="application/octet-stream", filename=os.path.basename(path)
         )
+
+    @r.post("/api/jobs/{job_id}/cancel")
+    async def cancel_job(job_id: str, _payload: dict = Depends(auth.require_csrf)):
+        """Cancel a queued/assigned/running job from the console.
+
+        404 for an unknown job, 409 (with the terminal status in the body)
+        for one that already finished, was already cancelled, or failed --
+        cancelling twice, or cancelling something that finished moments
+        before the request landed, must not stomp on a real result.
+
+        The terminal case is decided by `cancel_and_notify`'s own return
+        rather than by a separate status read beforehand: that read and the
+        cancel were two decisions about the same job taken at two different
+        moments, so a job finishing in between answered `{"status":
+        "cancelled"}` for a job it had not cancelled. The status is only read
+        back afterwards, to say *which* terminal state the caller lost to.
+        """
+        with db.get_session() as session:
+            if session.get(db.Job, job_id) is None:
+                raise _error(404, "jobs.not_found", "Job not found.")
+
+        if not await agentws.cancel_and_notify(job_id, reason="cancelled by admin"):
+            with db.get_session() as session:
+                job = session.get(db.Job, job_id)
+                if job is None:
+                    raise _error(404, "jobs.not_found", "Job not found.")
+                status = job.status
+            return JSONResponse(
+                status_code=409,
+                content={
+                    "error": {
+                        "code": "jobs.already_terminal",
+                        "message": f"Job is already {status}.",
+                    },
+                    "status": status,
+                },
+            )
+
+        return {"status": "cancelled"}
 
     @r.post("/api/jobs/{job_id}/retry")
     def retry_job(job_id: str, _payload: dict = Depends(auth.require_csrf)):
