@@ -3,9 +3,12 @@
 from __future__ import annotations
 
 import secrets
+import time
 from typing import Optional
 
-from fastapi import APIRouter, Depends, HTTPException
+from fastapi import APIRouter, Depends, Header, HTTPException, Request
+from nacl.exceptions import BadSignatureError
+from nacl.signing import VerifyKey
 from pydantic import BaseModel
 from sqlalchemy import update
 
@@ -13,9 +16,74 @@ from . import auth, db, security
 
 _PLATFORM_URL_KEY = "platform_url"
 
+_NONCE_TTL_SECONDS = 300
+_MAX_TS_SKEW_SECONDS = 120
+
+# In-memory replay-protection store, keyed by (worker_id, nonce) -> monotonic
+# expiry. Pruned opportunistically on each check. Not shared across processes;
+# fine for a single-process server.
+_seen_nonces: dict[tuple[str, str], float] = {}
+
 
 def _error(status_code: int, code: str, message: str = "") -> HTTPException:
     return HTTPException(status_code=status_code, detail={"code": code, "message": message or code})
+
+
+def _prune_nonces(now_monotonic: float) -> None:
+    expired = [key for key, expiry in _seen_nonces.items() if expiry <= now_monotonic]
+    for key in expired:
+        del _seen_nonces[key]
+
+
+async def verify_agent(
+    request: Request,
+    x_worker_id: Optional[str] = Header(default=None, alias="X-Worker-Id"),
+    x_ts: Optional[str] = Header(default=None, alias="X-Ts"),
+    x_nonce: Optional[str] = Header(default=None, alias="X-Nonce"),
+    x_sig: Optional[str] = Header(default=None, alias="X-Sig"),
+) -> db.Worker:
+    """Verify an Ed25519-signed agent request, enforcing replay protection.
+
+    On success returns the `db.Worker` row. Raises 401 `agent.bad_signature`
+    for missing/malformed headers, an unknown worker, a bad signature, or a
+    stale timestamp (without distinguishing which, to avoid leaking worker
+    existence); 403 `agent.worker_disabled` for a disabled worker; 409
+    `agent.replay` for a reused nonce.
+    """
+    if not x_worker_id or not x_ts or not x_nonce or not x_sig:
+        raise _error(401, "agent.bad_signature", "Missing signature headers.")
+
+    with db.get_session() as session:
+        worker = session.get(db.Worker, x_worker_id)
+        if worker is None:
+            raise _error(401, "agent.bad_signature", "Invalid signature.")
+        if worker.disabled:
+            raise _error(403, "agent.worker_disabled", "Worker is disabled.")
+
+        try:
+            ts = int(x_ts)
+        except ValueError:
+            raise _error(401, "agent.bad_signature", "Invalid signature.")
+
+        if abs(time.time() - ts) > _MAX_TS_SKEW_SECONDS:
+            raise _error(401, "agent.bad_signature", "Invalid signature.")
+
+        body = await request.body()
+        message = f"{request.method.upper()}\n{request.url.path}\n{x_ts}\n{x_nonce}\n".encode() + body
+
+        try:
+            VerifyKey(bytes.fromhex(worker.pubkey)).verify(message, bytes.fromhex(x_sig))
+        except (BadSignatureError, ValueError):
+            raise _error(401, "agent.bad_signature", "Invalid signature.")
+
+        now_monotonic = time.monotonic()
+        _prune_nonces(now_monotonic)
+        nonce_key = (x_worker_id, x_nonce)
+        if nonce_key in _seen_nonces:
+            raise _error(409, "agent.replay", "Nonce already used.")
+        _seen_nonces[nonce_key] = now_monotonic + _NONCE_TTL_SECONDS
+
+        return worker
 
 
 class IssueTokenBody(BaseModel):
@@ -83,6 +151,10 @@ def create_router(data_dir: str) -> APIRouter:
         signature = signing_key.sign(msg).signature
 
         return {"worker_id": worker_id, "certificate": signature.hex()}
+
+    @r.post("/api/agent/ping")
+    def ping(_worker: db.Worker = Depends(verify_agent)):
+        return {"ok": True}
 
     @r.get("/api/workers")
     def list_workers(_payload: dict = Depends(auth.require_admin)):
