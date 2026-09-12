@@ -50,7 +50,7 @@ from typing import Callable, Optional
 from fastapi import APIRouter, Depends, File, Form, Request, UploadFile, WebSocket, WebSocketDisconnect
 from fastapi.responses import FileResponse, JSONResponse, Response
 
-from . import assess, auth, db, jobs, model_guide, panelws, storage, workers
+from . import agentws, assess, auth, db, jobs, model_guide, panelws, storage, workers
 
 # Node classes whose id keys a history entry's `outputs`. The ComfyUI frontend
 # looks up the images it should display under the id of the node that saved
@@ -579,6 +579,65 @@ def create_router(
                 _queue_entry(numbers.get(j.id, 0), j) for j in rows if j.status in _PENDING_STATUSES
             ]
         return JSONResponse(content={"queue_running": running, "queue_pending": pending})
+
+    @r.post("/interrupt")
+    async def post_interrupt() -> Response:
+        """Cancel whatever the panel currently sees as executing.
+
+        Upstream's `/interrupt` targets the single job ComfyUI itself is
+        running; ComfyFed's federation equivalent is the oldest job in
+        `_RUNNING_STATUSES` (the same ordering `GET /queue` reports as
+        `queue_running`) -- the one the panel's own UI would be showing as
+        the active prompt. A no-op (still 200) when nothing is running,
+        matching upstream's fire-and-forget contract: the real ComfyUI
+        answers `/interrupt` with an empty 200 unconditionally too.
+        """
+        with db.get_session() as session:
+            job = (
+                session.query(db.Job)
+                .filter(db.Job.status.in_(_RUNNING_STATUSES))
+                .order_by(db.Job.created_at.asc())
+                .first()
+            )
+            job_id = job.id if job is not None else None
+
+        if job_id:
+            await agentws.cancel_and_notify(job_id, reason="interrupted from panel")
+
+        return JSONResponse(content={})
+
+    @r.post("/queue")
+    async def post_queue(request: Request) -> Response:
+        """ComfyUI-compat queue mutation: `{"delete": [prompt_ids]}` cancels
+        those specific jobs; `{"clear": true}` cancels every non-terminal
+        job currently in the federation's queue (upstream empties the whole
+        pending queue -- ComfyFed has no separate "local queue" to distinguish
+        it from jobs already dispatched to a worker, so `assigned`/`running`
+        jobs are cancelled too).
+        """
+        try:
+            body = await request.json()
+        except (ValueError, TypeError):
+            body = None
+        if not isinstance(body, dict):
+            body = {}
+
+        if body.get("clear"):
+            with db.get_session() as session:
+                job_ids = [
+                    j.id
+                    for j in session.query(db.Job)
+                    .filter(db.Job.status.in_(_PENDING_STATUSES + _RUNNING_STATUSES))
+                    .all()
+                ]
+        else:
+            requested = body.get("delete")
+            job_ids = [pid for pid in requested if isinstance(pid, str)] if isinstance(requested, list) else []
+
+        for job_id in job_ids:
+            await agentws.cancel_and_notify(job_id, reason="removed from panel queue")
+
+        return JSONResponse(content={})
 
     @r.get("/history")
     def get_history(max_items: Optional[int] = None) -> Response:

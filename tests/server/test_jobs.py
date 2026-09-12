@@ -356,6 +356,77 @@ def test_retry_unknown_job_is_404(client):
     assert r.json()["error"]["code"] == "jobs.not_found"
 
 
+def test_cancel_queued_job_moves_to_cancelled(client):
+    csrf = _login(client)
+    job_id = _submit(client, csrf).json()["job_id"]
+
+    r = client.post(f"/api/jobs/{job_id}/cancel", headers={"X-CSRF": csrf})
+    assert r.status_code == 200
+    assert r.json() == {"status": "cancelled"}
+
+    with db.get_session() as session:
+        job = session.get(db.Job, job_id)
+        assert job.status == "cancelled"
+        assert job.error == "cancelled by admin"
+        assert job.finished_at is not None
+
+
+def test_cancel_assigned_job_moves_to_cancelled(client):
+    csrf = _login(client)
+    w1 = _register_worker(client, csrf, "w1")
+    job_id = _submit(client, csrf).json()["job_id"]
+    assert dispatch.pick_job_for(w1) is not None
+
+    r = client.post(f"/api/jobs/{job_id}/cancel", headers={"X-CSRF": csrf})
+    assert r.status_code == 200
+
+    with db.get_session() as session:
+        assert session.get(db.Job, job_id).status == "cancelled"
+
+
+def test_cancel_unknown_job_is_404(client):
+    csrf = _login(client)
+    r = client.post("/api/jobs/does-not-exist/cancel", headers={"X-CSRF": csrf})
+    assert r.status_code == 404
+    assert r.json()["error"]["code"] == "jobs.not_found"
+
+
+def test_cancel_already_done_job_is_409_with_terminal_status(client):
+    csrf = _login(client)
+    w1 = _register_worker(client, csrf, "w1")
+    job_id = _submit(client, csrf).json()["job_id"]
+    assert dispatch.pick_job_for(w1) is not None
+    assert dispatch.mark_done(job_id, w1, ["out.png"])
+
+    r = client.post(f"/api/jobs/{job_id}/cancel", headers={"X-CSRF": csrf})
+    assert r.status_code == 409
+    assert r.json()["error"]["code"] == "jobs.already_terminal"
+    assert r.json()["status"] == "done"
+
+    with db.get_session() as session:
+        assert session.get(db.Job, job_id).status == "done"
+
+
+def test_cancel_already_cancelled_job_is_409(client):
+    csrf = _login(client)
+    job_id = _submit(client, csrf).json()["job_id"]
+
+    first = client.post(f"/api/jobs/{job_id}/cancel", headers={"X-CSRF": csrf})
+    assert first.status_code == 200
+
+    second = client.post(f"/api/jobs/{job_id}/cancel", headers={"X-CSRF": csrf})
+    assert second.status_code == 409
+    assert second.json()["status"] == "cancelled"
+
+
+def test_cancel_requires_csrf(client):
+    csrf = _login(client)
+    job_id = _submit(client, csrf).json()["job_id"]
+    r = client.post(f"/api/jobs/{job_id}/cancel")
+    assert r.status_code == 403
+    assert r.json()["error"]["code"] == "auth.csrf"
+
+
 def test_retry_requires_csrf(client):
     csrf = _login(client)
     job_id = _submit(client, csrf).json()["job_id"]

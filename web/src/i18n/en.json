@@ -51,7 +51,8 @@
     "assigned": "Assigned",
     "running": "Running",
     "done": "Done",
-    "failed": "Failed"
+    "failed": "Failed",
+    "cancelled": "Cancelled"
   },
   "verdict": {
     "eligible": "Can run it",
@@ -149,7 +150,13 @@
     "est_vram": "Estimated VRAM: {{value}}",
     "retry": "Retry",
     "retry_success": "Job requeued",
-    "retry_failed": "Could not retry this job"
+    "retry_failed": "Could not retry this job",
+    "cancel": "Cancel",
+    "cancel_confirm_title": "Cancel this job?",
+    "cancel_confirm_body": "Job {{id}} will stop immediately. No charge is recorded for a cancelled job.",
+    "cancel_confirm_action": "Cancel job",
+    "cancel_success": "Job cancelled",
+    "cancel_failed": "Could not cancel this job"
   },
   "workers": {
     "title": "Workers",
@@ -237,6 +244,7 @@
     "jobs.not_found": "That job no longer exists.",
     "jobs.artifact_not_found": "That result file is no longer available.",
     "jobs.not_retryable": "Only failed jobs can be retried.",
+    "jobs.already_terminal": "This job already finished and can no longer be cancelled.",
     "settings.bad_platform_url": "The platform URL must start with http:// or https://.",
     "settings.bad_lang": "That language is not supported.",
     "reports.bad_date": "That date could not be read.",

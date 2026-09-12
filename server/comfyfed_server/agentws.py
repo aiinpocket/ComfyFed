@@ -256,6 +256,66 @@ async def _send_job_cancelled(conn: "_Connection", job_id: Optional[str]) -> Non
         )
 
 
+async def push_job_cancelled(worker_id: Optional[str], job_id: str) -> None:
+    """Push `job_cancelled` to `worker_id`'s live connection, if any.
+
+    Public entry point for callers outside the agent socket itself -- the
+    admin cancel API and the ComfyUI-compat `/interrupt` and `/queue`
+    (delete/clear) handlers -- that need to tell an owning agent its job was
+    just cancelled out from under it. A no-op when `worker_id` is falsy (the
+    job was never picked up) or that worker isn't currently connected.
+
+    Mirrors `panelws.post_event`'s cross-event-loop handling: a caller
+    running on a different loop than the one the connection was accepted on
+    (as happens under `TestClient`, and would for any future worker-thread
+    caller) is scheduled via `run_coroutine_threadsafe` rather than awaited
+    directly, which would silently never run if the loops differed, or
+    deadlock if `.result()` were called unconditionally on the same loop.
+    """
+    if not worker_id:
+        return
+    conn = _connections.get(worker_id)
+    if conn is None:
+        return
+    current = asyncio.get_running_loop()
+    if conn.loop is current:
+        await _send_job_cancelled(conn, job_id)
+    else:
+        asyncio.run_coroutine_threadsafe(_send_job_cancelled(conn, job_id), conn.loop).result(
+            timeout=5
+        )
+
+
+async def cancel_and_notify(job_id: str, *, reason: str) -> bool:
+    """Cancel `job_id` if it is still cancellable, notifying whoever cares.
+
+    Shared by the admin cancel API and the ComfyUI-compat `/interrupt` and
+    `/queue` (delete/clear) handlers, so all three entry points can never
+    drift on what "cancel this job" actually does to a live agent connection
+    or the panel: the owning agent (if any) gets `job_cancelled` pushed over
+    its live connection, and every connected panel client gets the
+    `executing:null` + refreshed `status` combination `panelws.job_cancelled`
+    sends.
+
+    Returns whether anything actually happened. `dispatch.cancel_job`'s own
+    return (the owning worker_id, or None) is ambiguous between "cancelled
+    but nobody owned it yet" and "no-op: already terminal or unknown" -- a
+    caller that only wants to notify on a REAL cancellation needs the two
+    told apart, so eligibility is checked up front instead.
+    """
+    with db.get_session() as session:
+        job = session.get(db.Job, job_id)
+        cancellable = job is not None and not dispatch.is_terminal(job.status)
+    if not cancellable:
+        return False
+
+    owner = dispatch.cancel_job(job_id, reason=reason)
+    if owner:
+        await push_job_cancelled(owner, job_id)
+    await panelws.job_cancelled(job_id)
+    return True
+
+
 async def _handle_job_done(worker_id: str, conn: "_Connection", message: dict) -> None:
     """Handle a `job_done` message, including blip re-adoption.
 

@@ -155,7 +155,7 @@ export interface Worker {
   model_count: number;
 }
 
-export type JobStatus = 'queued' | 'assigned' | 'running' | 'done' | 'failed';
+export type JobStatus = 'queued' | 'assigned' | 'running' | 'done' | 'failed' | 'cancelled';
 
 export interface Job {
   id: string;
@@ -298,6 +298,11 @@ export const api = {
   /** Requeue a failed job. Rejects with `jobs.not_retryable` (409) otherwise. */
   retryJob(jobId: string): Promise<{ ok: boolean; job_id: string }> {
     return postJson(`/api/jobs/${encodeURIComponent(jobId)}/retry`, {});
+  },
+
+  /** Cancel a queued/assigned/running job. Rejects with `jobs.already_terminal` (409) otherwise. */
+  cancelJob(jobId: string): Promise<{ status: string }> {
+    return postJson(`/api/jobs/${encodeURIComponent(jobId)}/cancel`, {});
   },
 
   updateSettings(update: SettingsUpdate): Promise<{ platform_url: string; lang: string }> {

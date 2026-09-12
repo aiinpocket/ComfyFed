@@ -170,6 +170,16 @@ def cancel_job(job_id: str, *, reason: str) -> Optional[str]:
     return owning_worker_id
 
 
+def is_terminal(status: str) -> bool:
+    """Whether `status` is one a job's lifecycle never leaves.
+
+    Public wrapper around `_TERMINAL_STATUSES` for callers outside this
+    module (the admin cancel API needs it to tell a 404 apart from a 409)
+    that should not reach into a private module constant.
+    """
+    return status in _TERMINAL_STATUSES
+
+
 def try_readopt(job_id: str, worker_id: str) -> bool:
     """Restore ownership of a job to `worker_id` if it's the worker's own job
     blipping back, not someone else's.

@@ -192,6 +192,20 @@ async def job_requeued(job_id: str) -> None:
     await post_event({"type": "executing", "data": {"node": None, "prompt_id": job_id}})
 
 
+async def job_cancelled(job_id: str) -> None:
+    """Tell the panel a job was cancelled -- admin API, native /interrupt, or
+    a /queue delete/clear.
+
+    ComfyUI's own protocol has no "cancelled" concept for the frontend to
+    render, so this relays the same combination `job_requeued` uses: clear
+    the executing marker for this job (a no-op if it wasn't the one showing
+    as executing) and refresh the queue badge, which together are what stop
+    the panel from believing a cancelled job is still queued or running.
+    """
+    await post_event({"type": "executing", "data": {"node": None, "prompt_id": job_id}})
+    await job_status_refresh()
+
+
 async def job_done(job: "db.Job") -> None:
     """Emit `executed` + the completion `executing` signal + a refreshed `status`.
 

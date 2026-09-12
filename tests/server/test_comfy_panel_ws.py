@@ -308,6 +308,62 @@ def test_job_failed_sends_execution_error(client):
         assert status["data"]["status"] == {"exec_info": {"queue_remaining": 1}}
 
 
+def test_job_cancelled_relay_clears_executing_and_refreshes_status(client):
+    _login(client)
+    job_id = "some-job"
+    with client.websocket_connect("/comfy/api/ws") as ws:
+        ws.receive_json()  # initial status
+        ws.receive_json()  # feature_flags
+
+        relay(panelws.job_cancelled(job_id))
+
+        cleared = ws.receive_json()
+        assert cleared == {"type": "executing", "data": {"node": None, "prompt_id": job_id}}
+
+        status = ws.receive_json()
+        assert status["type"] == "status"
+
+
+def test_admin_cancel_api_relays_to_the_panel(client):
+    """The admin cancel API (jobs.py) must reach a connected panel client via
+    the same `executing:null` + `status` combination `job_requeued` uses."""
+    csrf = _login(client)
+    job_id = _post_prompt(client)
+    worker_id = _register_worker(client, csrf, "runner")
+    dispatch.pick_job_for(worker_id)
+    dispatch.mark_running(job_id, worker_id)
+
+    with client.websocket_connect("/comfy/api/ws") as ws:
+        ws.receive_json()  # initial status
+        ws.receive_json()  # feature_flags
+
+        r = client.post(f"/api/jobs/{job_id}/cancel", headers={"X-CSRF": csrf})
+        assert r.status_code == 200
+
+        cleared = ws.receive_json()
+        assert cleared == {"type": "executing", "data": {"node": None, "prompt_id": job_id}}
+        status = ws.receive_json()
+        assert status["type"] == "status"
+
+
+def test_comfy_interrupt_relays_to_the_panel(client):
+    csrf = _login(client)
+    job_id = _post_prompt(client)
+    worker_id = _register_worker(client, csrf, "runner")
+    dispatch.pick_job_for(worker_id)
+    dispatch.mark_running(job_id, worker_id)
+
+    with client.websocket_connect("/comfy/api/ws") as ws:
+        ws.receive_json()  # initial status
+        ws.receive_json()  # feature_flags
+
+        r = client.post("/comfy/api/interrupt")
+        assert r.status_code == 200
+
+        cleared = ws.receive_json()
+        assert cleared == {"type": "executing", "data": {"node": None, "prompt_id": job_id}}
+
+
 def test_broadcast_reaches_multiple_connected_clients(client):
     csrf = _login(client)
     job_id = _post_prompt(client)

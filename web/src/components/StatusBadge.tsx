@@ -13,6 +13,7 @@ const JOB_COLORS: Record<string, MantineColor> = {
   running: 'federation',
   done: 'teal',
   failed: 'red',
+  cancelled: 'orange',
 };
 
 interface DotProps {

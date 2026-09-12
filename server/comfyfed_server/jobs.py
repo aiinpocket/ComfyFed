@@ -8,9 +8,9 @@ import os
 from typing import Optional
 
 from fastapi import APIRouter, Depends, File, Form, HTTPException, Request, UploadFile
-from fastapi.responses import FileResponse
+from fastapi.responses import FileResponse, JSONResponse
 
-from . import assess, auth, db, storage
+from . import agentws, assess, auth, db, dispatch, storage
 from .workers import verify_agent
 
 _JOB_INPUTS_DIRNAME = "job_inputs"
@@ -334,6 +334,36 @@ def create_router(data_dir: str) -> APIRouter:
         return FileResponse(
             path, media_type="application/octet-stream", filename=os.path.basename(path)
         )
+
+    @r.post("/api/jobs/{job_id}/cancel")
+    async def cancel_job(job_id: str, _payload: dict = Depends(auth.require_csrf)):
+        """Cancel a queued/assigned/running job from the console.
+
+        404 for an unknown job, 409 (with the terminal status in the body)
+        for one that already finished, was already cancelled, or failed --
+        cancelling twice, or cancelling something that finished moments
+        before the request landed, must not stomp on a real result.
+        """
+        with db.get_session() as session:
+            job = session.get(db.Job, job_id)
+            if job is None:
+                raise _error(404, "jobs.not_found", "Job not found.")
+            status = job.status
+
+        if dispatch.is_terminal(status):
+            return JSONResponse(
+                status_code=409,
+                content={
+                    "error": {
+                        "code": "jobs.already_terminal",
+                        "message": f"Job is already {status}.",
+                    },
+                    "status": status,
+                },
+            )
+
+        await agentws.cancel_and_notify(job_id, reason="cancelled by admin")
+        return {"status": "cancelled"}
 
     @r.post("/api/jobs/{job_id}/retry")
     def retry_job(job_id: str, _payload: dict = Depends(auth.require_csrf)):

@@ -794,6 +794,99 @@ def test_job_done_for_job_now_owned_by_another_worker_is_rejected_and_cancelled(
         ws_a.close()
 
 
+# --- Task 2: cancel entry points push job_cancelled to the owning agent -----
+
+
+def test_admin_cancel_pushes_job_cancelled_to_the_owning_agent(client):
+    csrf = _login(client)
+    worker_id, sk = _register_worker(client, csrf, "w1")
+    job_id = _submit(client, csrf)
+
+    ws = _connect(client, worker_id, sk)
+    try:
+        ws.send_json({"type": "heartbeat", "state": "idle", "progress": 0.0, "job_id": None, "dynamic": {}})
+        agentws.dispatch_once(worker_id)
+        assert ws.receive_json()["type"] == "job"  # worker now owns job_id, status=assigned
+
+        r = client.post(f"/api/jobs/{job_id}/cancel", headers={"X-CSRF": csrf})
+        assert r.status_code == 200
+
+        cancelled_msg = ws.receive_json()
+        assert cancelled_msg == {"type": "job_cancelled", "job_id": job_id}
+
+        with db.get_session() as session:
+            assert session.get(db.Job, job_id).status == "cancelled"
+    finally:
+        ws.close()
+
+
+def test_admin_cancel_of_an_unowned_queued_job_sends_nothing_to_any_agent(client):
+    """A queued job has no owner yet -- there is no connection to push to."""
+    csrf = _login(client)
+    worker_id, sk = _register_worker(client, csrf, "w1")
+    job_id = _submit(client, csrf)
+
+    ws = _connect(client, worker_id, sk)
+    try:
+        r = client.post(f"/api/jobs/{job_id}/cancel", headers={"X-CSRF": csrf})
+        assert r.status_code == 200
+
+        with db.get_session() as session:
+            assert session.get(db.Job, job_id).status == "cancelled"
+
+        # Nothing was ever queued to push to this connection -- no job to
+        # dispatch, and no job_cancelled for a job it never owned.
+        assert agentws._connections[worker_id].cancelled_jobs_sent == set()
+    finally:
+        ws.close()
+
+
+def test_comfy_interrupt_pushes_job_cancelled_to_the_running_worker(client):
+    csrf = _login(client)
+    worker_id, sk = _register_worker(client, csrf, "w1")
+    job_id = _submit(client, csrf)
+
+    ws = _connect(client, worker_id, sk)
+    try:
+        ws.send_json({"type": "heartbeat", "state": "idle", "progress": 0.0, "job_id": None, "dynamic": {}})
+        agentws.dispatch_once(worker_id)
+        assert ws.receive_json()["type"] == "job"
+
+        ws.send_json({"type": "heartbeat", "state": "busy", "progress": 0.0, "job_id": job_id, "dynamic": {}})
+        agentws.dispatch_once(worker_id)  # -> running
+
+        r = client.post("/comfy/api/interrupt")
+        assert r.status_code == 200
+
+        cancelled_msg = ws.receive_json()
+        assert cancelled_msg == {"type": "job_cancelled", "job_id": job_id}
+
+        with db.get_session() as session:
+            assert session.get(db.Job, job_id).status == "cancelled"
+    finally:
+        ws.close()
+
+
+def test_comfy_queue_delete_pushes_job_cancelled_to_the_assigned_worker(client):
+    csrf = _login(client)
+    worker_id, sk = _register_worker(client, csrf, "w1")
+    job_id = _submit(client, csrf)
+
+    ws = _connect(client, worker_id, sk)
+    try:
+        ws.send_json({"type": "heartbeat", "state": "idle", "progress": 0.0, "job_id": None, "dynamic": {}})
+        agentws.dispatch_once(worker_id)
+        assert ws.receive_json()["type"] == "job"  # assigned to worker_id
+
+        r = client.post("/comfy/api/queue", json={"delete": [job_id]})
+        assert r.status_code == 200
+
+        cancelled_msg = ws.receive_json()
+        assert cancelled_msg == {"type": "job_cancelled", "job_id": job_id}
+    finally:
+        ws.close()
+
+
 def test_job_done_resent_for_own_terminal_job_does_not_send_job_cancelled(client):
     """A duplicate job_done for a job this worker already legitimately
     finished must not be mistaken for "not owned" -- it still owns the job,

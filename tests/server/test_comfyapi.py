@@ -109,6 +109,8 @@ def _finish_job(client, csrf, job_id, *, result_files, artifact_bytes=b"png-byte
         ("get", "/comfy/api/history/abc"),
         ("get", "/comfy/api/view?filename=x.png"),
         ("post", "/comfy/api/prompt"),
+        ("post", "/comfy/api/interrupt"),
+        ("post", "/comfy/api/queue"),
     ],
 )
 def test_all_routes_require_admin_session(client, method, path):
@@ -433,6 +435,113 @@ def test_queue_shape_splits_running_and_pending(client):
     assert entry[2] == SIMPLE_PROMPT
     assert isinstance(entry[3], dict)
     assert entry[4] == ["2"]
+
+
+# --- cancellation: /interrupt and /queue ------------------------------------
+
+
+def test_interrupt_with_nothing_running_is_still_200(client):
+    _login(client)
+    r = client.post("/comfy/api/interrupt")
+    assert r.status_code == 200
+    assert r.json() == {}
+
+
+def test_interrupt_cancels_the_oldest_running_job(client):
+    csrf = _login(client)
+    older_id = _post_prompt(client).json()["prompt_id"]
+    newer_id = _post_prompt(client).json()["prompt_id"]
+
+    worker_id = _register_worker(client, csrf, "runner")
+    picked = dispatch.pick_job_for(worker_id)
+    assert picked is not None and picked.id == older_id
+    dispatch.mark_running(older_id, worker_id)
+
+    r = client.post("/comfy/api/interrupt")
+    assert r.status_code == 200
+    assert r.json() == {}
+
+    with db.get_session() as session:
+        assert session.get(db.Job, older_id).status == "cancelled"
+        # The still-queued job is untouched.
+        assert session.get(db.Job, newer_id).status == "queued"
+
+
+def test_interrupt_does_not_touch_only_queued_jobs(client):
+    """Nothing is `assigned`/`running` yet -- /interrupt has nothing to cancel."""
+    _login(client)
+    job_id = _post_prompt(client).json()["prompt_id"]
+
+    r = client.post("/comfy/api/interrupt")
+    assert r.status_code == 200
+
+    with db.get_session() as session:
+        assert session.get(db.Job, job_id).status == "queued"
+
+
+def test_queue_delete_cancels_listed_jobs_only(client):
+    csrf = _login(client)
+    job_a = _post_prompt(client).json()["prompt_id"]
+    job_b = _post_prompt(client).json()["prompt_id"]
+    job_c = _post_prompt(client).json()["prompt_id"]
+
+    r = client.post("/comfy/api/queue", json={"delete": [job_a, job_c]})
+    assert r.status_code == 200
+    assert r.json() == {}
+
+    with db.get_session() as session:
+        assert session.get(db.Job, job_a).status == "cancelled"
+        assert session.get(db.Job, job_b).status == "queued"
+        assert session.get(db.Job, job_c).status == "cancelled"
+
+
+def test_queue_delete_ignores_unknown_and_terminal_ids(client):
+    csrf = _login(client)
+    job_id = _post_prompt(client).json()["prompt_id"]
+    _finish_job(client, csrf, job_id, result_files=["out.png"])
+
+    r = client.post("/comfy/api/queue", json={"delete": [job_id, "no-such-job"]})
+    assert r.status_code == 200
+
+    with db.get_session() as session:
+        # Still done -- a terminal job must never be clobbered back to cancelled.
+        assert session.get(db.Job, job_id).status == "done"
+
+
+def test_queue_clear_cancels_every_non_terminal_job(client):
+    csrf = _login(client)
+    queued_id = _post_prompt(client).json()["prompt_id"]
+    running_id = _post_prompt(client).json()["prompt_id"]
+    done_id = _post_prompt(client).json()["prompt_id"]
+
+    worker_id = _register_worker(client, csrf, "runner")
+    dispatch.pick_job_for(worker_id)
+    with db.get_session() as session:
+        job = session.get(db.Job, running_id)
+        job.status = "running"
+        job.worker_id = worker_id
+        session.commit()
+    _finish_job(client, csrf, done_id, result_files=["out.png"])
+
+    r = client.post("/comfy/api/queue", json={"clear": True})
+    assert r.status_code == 200
+
+    with db.get_session() as session:
+        assert session.get(db.Job, queued_id).status == "cancelled"
+        assert session.get(db.Job, running_id).status == "cancelled"
+        # A job that already finished is left alone.
+        assert session.get(db.Job, done_id).status == "done"
+
+
+def test_queue_delete_with_empty_body_is_a_noop(client):
+    _login(client)
+    job_id = _post_prompt(client).json()["prompt_id"]
+
+    r = client.post("/comfy/api/queue", json={})
+    assert r.status_code == 200
+
+    with db.get_session() as session:
+        assert session.get(db.Job, job_id).status == "queued"
 
 
 # --- history ---------------------------------------------------------------
