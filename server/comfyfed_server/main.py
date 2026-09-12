@@ -8,7 +8,7 @@ import sys
 
 import uvicorn
 
-from . import bootstrap, db, i18n
+from . import bootstrap, i18n
 from .app import create_app
 
 # Best-effort: force UTF-8 stdout/stderr so bilingual (zh-TW + en) install
@@ -69,11 +69,8 @@ def _cmd_install(args: argparse.Namespace) -> None:
 
     # In interactive mode the wizard prompts for lang/url itself, so they may
     # not be present on `args`; read back what was actually persisted.
-    with db.get_session() as session:
-        lang_row = session.get(db.Setting, bootstrap._LANG_KEY)
-        url_row = session.get(db.Setting, bootstrap._PLATFORM_URL_KEY)
-        lang = (lang_row.value if lang_row else None) or args.lang or "en"
-        url = (url_row.value if url_row else None) or args.url or ""
+    lang = bootstrap.get_lang() or args.lang or "en"
+    url = bootstrap.get_platform_url() or args.url or ""
 
     _print_password_box(result.admin_password, lang, url)
 

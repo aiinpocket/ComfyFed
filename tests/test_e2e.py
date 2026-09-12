@@ -18,8 +18,6 @@ from __future__ import annotations
 
 import json
 import os
-import secrets
-import time
 import uuid
 from io import BytesIO
 
@@ -208,8 +206,12 @@ def test_full_job_lifecycle_over_the_wire(server, mock_comfy, tmp_path):
         assert results == [("out.png", b"FAKE-PNG-BYTES")]
 
         # ...upload the resulting artifact back to the platform via a signed
-        # multipart POST (built manually so we can sign the exact body bytes
-        # the server will receive)...
+        # multipart POST. The multipart body must be frozen to concrete bytes
+        # *before* signing (httpx.Request(...).read()), since the signature
+        # covers exactly what the server will read from request.body() — and
+        # signing goes through the real agent-side `signing.signed_headers`,
+        # the same code path a real agent uses, so a future wire-format
+        # change there breaks this test instead of a hand-rolled duplicate.
         filename, content = results[0]
         artifact_path = f"/api/agent/jobs/{job_id}/artifacts"
         prebuilt = httpx.Request(
@@ -218,20 +220,11 @@ def test_full_job_lifecycle_over_the_wire(server, mock_comfy, tmp_path):
             files={"file": (filename, content, "application/octet-stream")},
         )
         body = prebuilt.read()
-        ts = str(int(time.time()))
-        nonce = secrets.token_hex(16)
-        message = f"POST\n{artifact_path}\n{ts}\n{nonce}\n".encode() + body
-        artifact_sig = sk.sign(message).signature.hex()
+        sig_headers = signing.signed_headers(entry, "POST", artifact_path, body)
         artifact_resp = server.post(
             artifact_path,
             content=body,
-            headers={
-                "X-Worker-Id": entry.worker_id,
-                "X-Ts": ts,
-                "X-Nonce": nonce,
-                "X-Sig": artifact_sig,
-                "Content-Type": prebuilt.headers["content-type"],
-            },
+            headers={**sig_headers, "Content-Type": prebuilt.headers["content-type"]},
         )
         assert artifact_resp.status_code == 200
         assert artifact_resp.json()["stored"] == filename

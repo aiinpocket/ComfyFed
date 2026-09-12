@@ -25,6 +25,28 @@ def _is_installed(session) -> bool:
     return session.get(db.Setting, _ADMIN_PASSWORD_HASH_KEY) is not None
 
 
+def get_lang() -> str:
+    """Return the installed server's interface language (default "en").
+
+    Assumes `db.init_db` has already run (e.g. via `ensure_installed` or
+    `create_app`) in this process.
+    """
+    with db.get_session() as session:
+        row = session.get(db.Setting, _LANG_KEY)
+        return row.value if row is not None else "en"
+
+
+def get_platform_url() -> str:
+    """Return the installed server's public platform URL (default "").
+
+    Assumes `db.init_db` has already run (e.g. via `ensure_installed` or
+    `create_app`) in this process.
+    """
+    with db.get_session() as session:
+        row = session.get(db.Setting, _PLATFORM_URL_KEY)
+        return row.value if row is not None else ""
+
+
 def ensure_installed(
     data_dir: str,
     lang: str | None,
