@@ -12,7 +12,7 @@
 | Worker | 有 GPU 的機器，跑一個輕量 Agent，包住本機 ComfyUI 的 API。 |
 | Identity Bundle（識別碼） | 平台簽發的 JSON：`{platform_url, platform_pubkey, register_token}`。register_token 一次性。 |
 | Job | 一份 ComfyUI workflow JSON ＋參數，整包在單一 worker 上執行。 |
-| Receipt（收據） | 任務完成後雙方簽章的憑證（誰、何時、幾 GPU 秒），分潤與問責的地基。 |
+| Receipt（收據） | 任務完成後雙方簽章的憑證（誰、何時、幾 GPU 秒），分潤與問責的地基。**GPU 秒＝實際執行秒數（2026-09-12 使用者定案）**：agent 量測自己的 prompt 在本機 ComfyUI `queue_running` 中的實際執行區間，`job_done` 回報 `exec_seconds`；平台取 `min(exec_seconds, 派工至完成牆鐘)` 入帳。**排隊等待、本地任務、其他平台的工作一律不計**——一台 worker 多平台共享時，busy 牆鐘計費會把等待時間重複算給每個平台，分潤必錯。 |
 
 ## 2. 信任模型（定案）
 

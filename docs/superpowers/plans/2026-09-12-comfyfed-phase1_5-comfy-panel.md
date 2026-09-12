@@ -43,3 +43,8 @@
 ## Self-Review
 - 覆蓋 spec §Phase 1.5 全點：官方前端 pinned 下載（T4）、admin 保護（T4）、object_info 聯集與 agent 全量回報（T1/T2）、prompt→job（T2）、upload→附檔管線（T3）、WS 進度（T3）、Console 整合（T4）。
 - 風險：前端相容細節（訊息形狀）——已指定以本機真 ComfyUI server.py 為權威對齊來源；e2e 兜底。
+
+### Task 5: 收據計費修正——實際執行秒數（使用者定案 2026-09-12）
+- agent comfy.run_workflow：偵測 prompt 進入 /queue queue_running 的時刻（首次出現）與完成時刻，回傳 exec_seconds；runner job_done 訊息夾 `exec_seconds`。
+- server agentws job_done 處理：receipt gpu_seconds = min(exec_seconds, (finished_at-started_at) 牆鐘)（exec 缺失→牆鐘 fallback＋log）；收據 payload 格式不變。
+- 測試：mock comfy 佇列先 pending 再 running（模擬前面有別的工作）→ exec_seconds 顯著小於牆鐘且 receipt 用 exec；缺 exec_seconds fallback。README 已知限制段更新（兩語）。
