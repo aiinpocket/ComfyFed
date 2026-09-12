@@ -1,0 +1,295 @@
+/**
+ * Typed fetch wrapper for the ComfyFed REST API.
+ *
+ * The server authenticates with an httpOnly signed session cookie and requires
+ * an `X-CSRF` header (value handed back by POST /api/auth/login) on every
+ * state-changing request. The token is kept in memory and mirrored into
+ * sessionStorage so a page reload inside a live session keeps working.
+ */
+
+const CSRF_STORAGE_KEY = 'cf_csrf';
+
+let csrfToken: string | null = null;
+
+function readStoredCsrf(): string | null {
+  try {
+    return sessionStorage.getItem(CSRF_STORAGE_KEY);
+  } catch {
+    return null;
+  }
+}
+
+export function getCsrf(): string | null {
+  if (csrfToken === null) csrfToken = readStoredCsrf();
+  return csrfToken;
+}
+
+export function setCsrf(token: string | null): void {
+  csrfToken = token;
+  try {
+    if (token === null) sessionStorage.removeItem(CSRF_STORAGE_KEY);
+    else sessionStorage.setItem(CSRF_STORAGE_KEY, token);
+  } catch {
+    /* private-mode browsers: in-memory token still works for this tab */
+  }
+}
+
+/** Error envelope the server returns: {"error": {"code", "message"}}. */
+export class ApiError extends Error {
+  readonly code: string;
+  readonly status: number;
+
+  constructor(code: string, message: string, status: number) {
+    super(message || code);
+    this.name = 'ApiError';
+    this.code = code;
+    this.status = status;
+  }
+}
+
+/** Set by the app so a 401 anywhere can bounce the user back to /login. */
+let unauthorizedHandler: (() => void) | null = null;
+
+export function onUnauthorized(handler: (() => void) | null): void {
+  unauthorizedHandler = handler;
+}
+
+async function parseError(response: Response): Promise<ApiError> {
+  let code = 'http_error';
+  let message = response.statusText;
+  try {
+    const body = await response.json();
+    if (body?.error?.code) {
+      code = String(body.error.code);
+      message = String(body.error.message ?? code);
+    }
+  } catch {
+    /* non-JSON error body (proxy/gateway); keep the status text */
+  }
+  return new ApiError(code, message, response.status);
+}
+
+type Method = 'GET' | 'POST';
+
+async function request<T>(
+  method: Method,
+  path: string,
+  body?: BodyInit | null,
+  headers: Record<string, string> = {},
+): Promise<T> {
+  const finalHeaders: Record<string, string> = { ...headers };
+  const csrf = getCsrf();
+  if (method !== 'GET' && csrf) finalHeaders['X-CSRF'] = csrf;
+
+  const response = await fetch(path, {
+    method,
+    credentials: 'include',
+    headers: finalHeaders,
+    body: body ?? null,
+  });
+
+  if (response.status === 401) {
+    setCsrf(null);
+    // /api/auth/login itself must surface its own 401 (wrong password) rather
+    // than trigger a redirect loop.
+    if (!path.endsWith('/api/auth/login')) unauthorizedHandler?.();
+    throw await parseError(response);
+  }
+  if (!response.ok) throw await parseError(response);
+
+  if (response.status === 204) return undefined as T;
+  const text = await response.text();
+  return (text ? JSON.parse(text) : undefined) as T;
+}
+
+function getJson<T>(path: string): Promise<T> {
+  return request<T>('GET', path);
+}
+
+function postJson<T>(path: string, payload: unknown): Promise<T> {
+  return request<T>('POST', path, JSON.stringify(payload ?? {}), {
+    'Content-Type': 'application/json',
+  });
+}
+
+function postForm<T>(path: string, form: FormData): Promise<T> {
+  // No Content-Type header: the browser must set the multipart boundary.
+  return request<T>('POST', path, form);
+}
+
+/* ------------------------------------------------------------------ types */
+
+export interface MeResponse {
+  authenticated: boolean;
+  lang: string;
+  platform_url?: string;
+}
+
+export interface WorkerHardware {
+  gpu_name?: string | null;
+  vram_gb?: number | null;
+  cpu?: string | null;
+  cpu_cores?: number | null;
+  ram_gb?: number | null;
+  agent_version?: string | null;
+}
+
+export interface WorkerDynamic {
+  free_vram_gb?: number | null;
+  free_ram_gb?: number | null;
+  free_disk_gb?: number | null;
+}
+
+export type WorkerStatus = 'online' | 'busy' | 'offline';
+
+export interface Worker {
+  id: string;
+  name: string;
+  status: WorkerStatus | string;
+  last_seen: string | null;
+  disabled: boolean;
+  hardware: WorkerHardware;
+  dynamic: WorkerDynamic;
+  backend: string;
+  torch_version: string;
+  model_count: number;
+}
+
+export type JobStatus = 'queued' | 'assigned' | 'running' | 'done' | 'failed' | 'canceled';
+
+export interface Job {
+  id: string;
+  status: JobStatus | string;
+  progress: number;
+  worker_id: string | null;
+  created_at: string | null;
+  error: string | null;
+  result_files: string[];
+  input_assets: string[];
+  est_vram_gb: number | null;
+}
+
+export interface JobDetail extends Job {
+  workflow_json: Record<string, unknown>;
+  requirements: Record<string, unknown>;
+  required_nodes: string[];
+  required_models: string[];
+  started_at: string | null;
+  finished_at: string | null;
+}
+
+export type VerdictKind = 'eligible' | 'eligible_after_fetch' | 'ineligible';
+
+export interface WorkerVerdict {
+  worker_id: string;
+  name: string;
+  verdict: VerdictKind | string;
+  reasons: string[];
+  missing_models: string[];
+}
+
+export interface Assessment {
+  workers: WorkerVerdict[];
+}
+
+export interface TokenBundle {
+  platform_url: string;
+  platform_pubkey: string;
+  register_token: string;
+}
+
+export interface Contribution {
+  worker_id: string;
+  name: string;
+  jobs: number;
+  gpu_seconds: number;
+}
+
+export interface RequirementsOverride {
+  min_vram_gb?: number;
+  min_free_disk_gb?: number;
+  gpu_name_contains?: string;
+}
+
+/* -------------------------------------------------------------- endpoints */
+
+export const api = {
+  async login(password: string): Promise<void> {
+    const result = await request<{ csrf: string }>(
+      'POST',
+      '/api/auth/login',
+      JSON.stringify({ password }),
+      { 'Content-Type': 'application/json' },
+    );
+    setCsrf(result.csrf);
+  },
+
+  async logout(): Promise<void> {
+    try {
+      await postJson('/api/auth/logout', {});
+    } finally {
+      setCsrf(null);
+    }
+  },
+
+  me(): Promise<MeResponse> {
+    return getJson<MeResponse>('/api/auth/me');
+  },
+
+  changePassword(oldPassword: string, newPassword: string): Promise<{ ok: boolean }> {
+    return postJson('/api/auth/change-password', { old: oldPassword, new: newPassword });
+  },
+
+  listWorkers(): Promise<Worker[]> {
+    return getJson<Worker[]>('/api/workers');
+  },
+
+  async issueWorkerToken(name: string): Promise<TokenBundle> {
+    const result = await postJson<{ bundle: TokenBundle }>('/api/workers/tokens', { name });
+    return result.bundle;
+  },
+
+  disableWorker(workerId: string): Promise<{ ok: boolean }> {
+    return postJson(`/api/workers/${encodeURIComponent(workerId)}/disable`, {});
+  },
+
+  listJobs(statuses?: string[]): Promise<Job[]> {
+    const query = statuses?.length ? `?status=${encodeURIComponent(statuses.join(','))}` : '';
+    return getJson<Job[]>(`/api/jobs${query}`);
+  },
+
+  getJob(jobId: string): Promise<JobDetail> {
+    return getJson<JobDetail>(`/api/jobs/${encodeURIComponent(jobId)}`);
+  },
+
+  getAssessment(jobId: string): Promise<Assessment> {
+    return getJson<Assessment>(`/api/jobs/${encodeURIComponent(jobId)}/assessment`);
+  },
+
+  submitJob(
+    workflowJson: string,
+    requirements: RequirementsOverride | null,
+    assets: File[],
+  ): Promise<{ job_id: string }> {
+    const form = new FormData();
+    form.append('workflow_json', workflowJson);
+    if (requirements && Object.keys(requirements).length > 0) {
+      form.append('requirements', JSON.stringify(requirements));
+    }
+    for (const file of assets) form.append('assets', file, file.name);
+    return postForm<{ job_id: string }>('/api/jobs', form);
+  },
+
+  contributions(from?: string, to?: string): Promise<Contribution[]> {
+    const params = new URLSearchParams();
+    if (from) params.set('from', from);
+    if (to) params.set('to', to);
+    const query = params.toString();
+    return getJson<Contribution[]>(`/api/reports/contributions${query ? `?${query}` : ''}`);
+  },
+};
+
+/** Download URL for a finished job's result file. */
+export function artifactUrl(jobId: string, filename: string): string {
+  return `/api/jobs/${encodeURIComponent(jobId)}/artifacts/${encodeURIComponent(filename)}`;
+}
