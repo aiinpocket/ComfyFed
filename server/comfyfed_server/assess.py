@@ -3,6 +3,13 @@
 Extracts a job's requirements (custom nodes, models, estimated VRAM, and
 input assets) from a ComfyUI API-format workflow, and judges whether a given
 worker can run it.
+
+Model-name contract: the two sides of every inventory comparison are relative
+to different roots. A worker's inventory is relative to the ComfyUI models
+ROOT (`diffusion_models/flux1-dev.safetensors`), while a workflow's loader
+value is relative to that node's CATEGORY folder (`flux1-dev.safetensors`).
+Never compare them with `==` -- every lookup here goes through
+`matches_model_name` / `find_model`.
 """
 
 from __future__ import annotations
@@ -122,6 +129,83 @@ def _model_inventory(worker) -> list[dict]:
         return []
 
 
+def _normalize_model_path(name: str) -> str:
+    """Lower-friction form of a model path: forward slashes, no leading slash."""
+    return str(name).replace("\\", "/").lstrip("/")
+
+
+def matches_model_name(inventory_name: str, needed_name: str) -> bool:
+    """Whether an inventory entry satisfies a model a workflow asks for.
+
+    These two names are relative to DIFFERENT roots, which is the whole reason
+    this helper exists:
+
+    * The agent's inventory (`hardware.scan_models`) walks the ComfyUI models
+      directory and reports paths relative to that ROOT, so entries look like
+      `diffusion_models/flux1-dev.safetensors` or `loras/wuxia/x.safetensors`.
+    * A workflow's loader value is relative to that node's own CATEGORY folder,
+      so the same two models appear as `flux1-dev.safetensors` and
+      `wuxia/x.safetensors`.
+
+    Comparing them as exact strings judged every model on every real machine
+    missing, so nothing was ever dispatched. A needed name `N` matches an
+    inventory entry `I` when, after normalising separators:
+
+    1. `I == N` -- already category-relative, or an agent that reports it that way.
+    2. `I` minus its first path component == `N` -- strip the category dir.
+       This is the normal case, and it keeps any deeper subfolder intact.
+    3. `I` ends with `/N` -- lenient fallback for layouts that nest deeper than
+       one category level (e.g. an extra_model_paths root).
+
+    Deliberately one-directional: an inventory path may carry extra leading
+    components, never the needed name.
+    """
+    inventory = _normalize_model_path(inventory_name)
+    needed = _normalize_model_path(needed_name)
+    if not inventory or not needed:
+        return False
+
+    if inventory == needed:
+        return True
+
+    _category, separator, remainder = inventory.partition("/")
+    if separator and remainder == needed:
+        return True
+
+    return inventory.endswith("/" + needed)
+
+
+def find_model(inventory: list, needed_name: str) -> tuple[bool, float | None]:
+    """Look `needed_name` up in one worker's inventory.
+
+    Returns `(found, best_known_size_gb)`. `(True, None)` means the model is
+    present but its size is unknown/malformed; when several entries match (a
+    model duplicated across categories) the largest known size wins, so a size
+    estimate errs high rather than low.
+
+    Single lookup primitive for every caller -- presence, VRAM estimation and
+    fetch-from-a-peer sizing -- so the matching rule can never drift between
+    "does this worker have it" and "how big is it".
+    """
+    found = False
+    best_size: float | None = None
+
+    for entry in inventory or []:
+        if not isinstance(entry, dict):
+            continue
+        name = entry.get("name")
+        if not isinstance(name, str) or not matches_model_name(name, needed_name):
+            continue
+
+        found = True
+        size = entry.get("size")
+        if isinstance(size, (int, float)) and not isinstance(size, bool):
+            if best_size is None or size > best_size:
+                best_size = size
+
+    return found, best_size
+
+
 def _worker_dynamic(worker) -> dict:
     import json
 
@@ -152,6 +236,9 @@ def _worker_node_classes(worker) -> list[str]:
 def estimate_vram(models: set[str], workers: list) -> float | None:
     """Sum the max known size (GB) of each model across all workers' inventories.
 
+    Inventory entries are matched with `matches_model_name`, not by string
+    equality -- see that helper for why the two names differ in shape.
+
     Returns None if no referenced model has a known size anywhere.
     """
     total = 0.0
@@ -159,12 +246,9 @@ def estimate_vram(models: set[str], workers: list) -> float | None:
     for model_name in models:
         best_size = None
         for worker in workers:
-            for entry in _model_inventory(worker):
-                if entry.get("name") == model_name:
-                    size = entry.get("size")
-                    if isinstance(size, (int, float)):
-                        if best_size is None or size > best_size:
-                            best_size = size
+            _found, size = find_model(_model_inventory(worker), model_name)
+            if size is not None and (best_size is None or size > best_size):
+                best_size = size
         if best_size is not None:
             found_any = True
             total += best_size
@@ -230,8 +314,10 @@ def verdict(worker, needs: JobNeeds, requirements_override: dict, all_workers: l
         if gpu_name_contains not in gpu_name:
             reasons.append("override:gpu_name_contains")
 
-    worker_model_names = {e.get("name") for e in _model_inventory(worker)}
-    missing_models = sorted(needs.models - worker_model_names)
+    worker_inventory = _model_inventory(worker)
+    missing_models = sorted(
+        name for name in needs.models if not find_model(worker_inventory, name)[0]
+    )
 
     if reasons:
         # Hard reasons (nodes/vram/override) always win over model status.
@@ -248,14 +334,14 @@ def verdict(worker, needs: JobNeeds, requirements_override: dict, all_workers: l
     for model_name in missing_models:
         found_size = None
         for other in other_workers:
-            for entry in _model_inventory(other):
-                if entry.get("name") == model_name:
-                    size = entry.get("size")
-                    if isinstance(size, (int, float)):
-                        if found_size is None or size > found_size:
-                            found_size = size
-                    else:
-                        found_size = found_size if found_size is not None else 0.0
+            found, size = find_model(_model_inventory(other), model_name)
+            if not found:
+                continue
+            # Present but with an unknown size still counts as fetchable; it
+            # just contributes nothing to the disk-headroom total.
+            candidate = size if size is not None else 0.0
+            if found_size is None or candidate > found_size:
+                found_size = candidate
         if found_size is None:
             all_available_elsewhere = False
             break

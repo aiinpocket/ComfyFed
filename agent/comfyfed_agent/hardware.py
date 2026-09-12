@@ -114,7 +114,17 @@ def collect_dynamic(model_dir_or_none: str | None) -> dict:
 def scan_models(models_dir: str) -> list[dict]:
     """Walk `models_dir` and return the local model inventory.
 
-    Returns `[{"name": "relative/posix/path", "size": <GB>}, ...]` where
+    Returns `[{"name": "relative/posix/path", "size": <GB>}, ...]`.
+
+    `name` is relative to the models ROOT and therefore keeps its category
+    directory: `diffusion_models/flux1-dev.safetensors`, not
+    `flux1-dev.safetensors`. A workflow's loader value, by contrast, is
+    relative to that node's CATEGORY folder, so the server must not compare
+    the two as plain strings -- it matches them with
+    `comfyfed_server.assess.matches_model_name`, which strips the leading
+    category component. Keep this shape: reporting bare filenames instead
+    would make models in different categories collide.
+
     `size` is the file size in **gigabytes**, rounded to 3 decimal places
     (~1 MB resolution) -- NOT bytes.
 

@@ -427,3 +427,118 @@ def test_artifact_store_base_path_is_not_implemented_by_default():
 
     with _pytest.raises(NotImplementedError):
         _Remote().path("j", "f.png")
+
+
+# A realistic flux workflow: loader values are CATEGORY-relative bare names.
+FLUX_WORKFLOW = {
+    "1": {"class_type": "UNETLoader", "inputs": {"unet_name": "flux1-dev.safetensors"}},
+    "2": {
+        "class_type": "DualCLIPLoader",
+        "inputs": {"clip_name1": "t5xxl_fp16.safetensors", "clip_name2": "clip_l.safetensors"},
+    },
+    "3": {"class_type": "VAELoader", "inputs": {"vae_name": "ae.safetensors"}},
+    "4": {"class_type": "KSampler", "inputs": {"seed": 1, "model": ["1", 0]}},
+}
+
+# The same models as the agent reports them: relative to the models ROOT.
+FLUX_ROOT_RELATIVE_INVENTORY = [
+    {"name": "diffusion_models/flux1-dev.safetensors", "size": 11.9},
+    {"name": "text_encoders/t5xxl_fp16.safetensors", "size": 9.8},
+    {"name": "text_encoders/clip_l.safetensors", "size": 0.25},
+    {"name": "vae/ae.safetensors", "size": 0.3},
+]
+
+
+def test_real_world_flux_job_is_assessed_eligible_and_dispatches(client):
+    """End-to-end guard for the live-reproduced integration bug.
+
+    A worker whose inventory is models-root-relative must be judged eligible
+    for a workflow whose loader values are category-relative -- and the job
+    must actually get picked up. Before the matching fix every model read as
+    missing, so the verdict was ineligible and nothing was ever dispatched.
+    """
+    csrf = _login(client)
+    worker_id = _register_worker(
+        client,
+        csrf,
+        "rtx5080-main",
+        node_classes=["UNETLoader", "DualCLIPLoader", "VAELoader", "KSampler"],
+        model_inventory=FLUX_ROOT_RELATIVE_INVENTORY,
+        # 32 GB so the VRAM heuristic doesn't confound the seam under test;
+        # the 16 GB case is pinned separately below.
+        hardware={"vram_gb": 32.0, "gpu_name": "NVIDIA GeForce RTX 5080"},
+        dynamic={"free_disk_gb": 500.0},
+    )
+
+    submitted = _submit(client, csrf, workflow=FLUX_WORKFLOW)
+    assert submitted.status_code == 200
+    job_id = submitted.json()["job_id"]
+
+    # The sizes were found, so the estimate is real rather than None.
+    detail = client.get(f"/api/jobs/{job_id}", headers={"X-CSRF": csrf}).json()
+    assert detail["est_vram_gb"] is not None
+    assert 20 < detail["est_vram_gb"] < 30  # (11.9+9.8+0.25+0.3) * 1.15
+
+    assessment = client.get(f"/api/jobs/{job_id}/assessment", headers={"X-CSRF": csrf}).json()
+    entry = assessment["workers"][0]
+    assert entry["verdict"] == "eligible", entry
+    assert entry["missing_models"] == []
+
+    picked = dispatch.pick_job_for(worker_id)
+    assert picked is not None and picked.id == job_id
+
+
+def test_flux_job_on_a_16gb_card_is_now_blocked_by_the_vram_heuristic(client):
+    """Characterisation test: pins TODAY's behaviour, which is questionable.
+
+    With model matching fixed, the estimator finally finds the flux model
+    sizes -- and sums ALL of them (11.9 + 9.8 + 0.25 + 0.3) * 1.15 = 25.6 GB,
+    so a 16 GB card is judged VRAM-ineligible. Real ComfyUI runs this workflow
+    on 16 GB because it does not hold every model in VRAM at once.
+
+    So the live symptom ("nothing dispatches" on rtx5080-main) is only half
+    fixed by the name matching: the reason changes from
+    missing_models_unavailable to vram. Reworking `estimate_vram` is outside
+    this fix's scope, so this test documents the current outcome rather than
+    asserting the desired one. If the heuristic is changed, update this test.
+    """
+    csrf = _login(client)
+    _register_worker(
+        client,
+        csrf,
+        "rtx5080-main",
+        node_classes=["UNETLoader", "DualCLIPLoader", "VAELoader", "KSampler"],
+        model_inventory=FLUX_ROOT_RELATIVE_INVENTORY,
+        hardware={"vram_gb": 16.0},
+        dynamic={"free_disk_gb": 500.0},
+    )
+
+    job_id = _submit(client, csrf, workflow=FLUX_WORKFLOW).json()["job_id"]
+    entry = client.get(f"/api/jobs/{job_id}/assessment", headers={"X-CSRF": csrf}).json()["workers"][0]
+
+    # The models ARE found now -- that part of the bug is fixed.
+    assert entry["missing_models"] == []
+    # But the summed-size heuristic blocks it on VRAM.
+    assert entry["verdict"] == "ineligible"
+    assert any(r.startswith("vram:") for r in entry["reasons"])
+
+
+def test_flux_job_with_a_genuinely_absent_model_is_still_ineligible(client):
+    """The looser matching must not turn real misses into false eligibility."""
+    csrf = _login(client)
+    _register_worker(
+        client,
+        csrf,
+        "w1",
+        node_classes=["UNETLoader", "KSampler"],
+        model_inventory=[{"name": "diffusion_models/some-other-model.safetensors", "size": 4.0}],
+        hardware={"vram_gb": 16.0},
+    )
+
+    workflow = {"1": {"class_type": "UNETLoader", "inputs": {"unet_name": "flux1-dev.safetensors"}}}
+    job_id = _submit(client, csrf, workflow=workflow).json()["job_id"]
+
+    assessment = client.get(f"/api/jobs/{job_id}/assessment", headers={"X-CSRF": csrf}).json()
+    entry = assessment["workers"][0]
+    assert entry["verdict"] == "ineligible"
+    assert entry["missing_models"] == ["flux1-dev.safetensors"]

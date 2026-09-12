@@ -1,5 +1,7 @@
 import json
 
+import pytest
+
 from comfyfed_server import assess, db
 
 
@@ -208,3 +210,134 @@ def test_needs_from_job_survives_corrupt_json_columns():
     needs = assess.needs_from_job(job)
     assert needs.nodes == set()
     assert needs.models == set()
+
+
+# --------------------------------------------------------------------------
+# Model-name matching across the inventory/loader root mismatch.
+#
+# Live-reproduced bug: a worker's inventory is relative to the models ROOT
+# ("diffusion_models/flux1-dev.safetensors") while a workflow's loader value
+# is relative to its CATEGORY folder ("flux1-dev.safetensors"). Exact string
+# comparison judged every model on every real machine missing, so nothing was
+# ever dispatched.
+# --------------------------------------------------------------------------
+
+
+def test_matches_model_name_strips_the_category_directory():
+    assert assess.matches_model_name("diffusion_models/flux1-dev.safetensors", "flux1-dev.safetensors")
+    assert assess.matches_model_name("vae/ae.safetensors", "ae.safetensors")
+    assert assess.matches_model_name("text_encoders/t5xxl_fp16.safetensors", "t5xxl_fp16.safetensors")
+
+
+def test_matches_model_name_keeps_deeper_subfolders():
+    # A loras loader value carries its subfolder; only the category is stripped.
+    assert assess.matches_model_name("loras/wuxia/x.safetensors", "wuxia/x.safetensors")
+    assert assess.matches_model_name("loras/wuxia/x.safetensors", "x.safetensors")  # lenient fallback
+
+
+def test_matches_model_name_handles_windows_separators():
+    assert assess.matches_model_name(r"diffusion_models\flux1-dev.safetensors", "flux1-dev.safetensors")
+    assert assess.matches_model_name(r"loras\wuxia\x.safetensors", "wuxia/x.safetensors")
+
+
+def test_matches_model_name_still_matches_identical_names():
+    assert assess.matches_model_name("flux1-dev.safetensors", "flux1-dev.safetensors")
+
+
+def test_matches_model_name_rejects_unrelated_and_partial_names():
+    assert not assess.matches_model_name("diffusion_models/flux1-dev.safetensors", "sd_xl_base.safetensors")
+    # Must not match on a bare suffix that isn't a whole path component.
+    assert not assess.matches_model_name("diffusion_models/xflux1-dev.safetensors", "flux1-dev.safetensors")
+    # One-directional: the needed name never carries the extra components.
+    assert not assess.matches_model_name("flux1-dev.safetensors", "diffusion_models/flux1-dev.safetensors")
+    assert not assess.matches_model_name("", "flux1-dev.safetensors")
+
+
+FLUX_INVENTORY = [
+    {"name": "diffusion_models/flux1-dev.safetensors", "size": 11.9},
+    {"name": "vae/ae.safetensors", "size": 0.3},
+    {"name": "text_encoders/t5xxl_fp16.safetensors", "size": 9.8},
+    {"name": "text_encoders/clip_l.safetensors", "size": 0.25},
+]
+
+# Loader values as ComfyUI actually writes them: category-relative.
+FLUX_NEEDED = {
+    "flux1-dev.safetensors",
+    "ae.safetensors",
+    "t5xxl_fp16.safetensors",
+    "clip_l.safetensors",
+}
+
+
+def test_real_world_flux_inventory_is_eligible():
+    """The live repro: rtx5080-main + a flux workflow must be eligible."""
+    worker = _worker(
+        "rtx5080-main",
+        node_classes=["UNETLoader", "DualCLIPLoader", "VAELoader", "KSampler"],
+        model_inventory=FLUX_INVENTORY,
+        hardware={"vram_gb": 16},
+    )
+    needs = assess.JobNeeds(
+        nodes={"UNETLoader", "DualCLIPLoader", "VAELoader", "KSampler"},
+        models=set(FLUX_NEEDED),
+        est_vram_gb=None,
+        assets=set(),
+    )
+
+    v = assess.verdict(worker, needs, {}, [worker])
+    assert v.kind == "eligible"
+    assert v.missing_models == []
+    assert v.reasons == []
+
+
+def test_estimate_vram_finds_category_relative_models():
+    worker = _worker("w1", model_inventory=FLUX_INVENTORY)
+
+    estimate = assess.estimate_vram({"flux1-dev.safetensors", "ae.safetensors"}, [worker])
+    assert estimate is not None
+    # (11.9 + 0.3) * the 1.15 fudge factor -- the sizes were actually found.
+    assert estimate == pytest.approx((11.9 + 0.3) * 1.15)
+
+
+def test_estimate_vram_returns_none_when_nothing_matches():
+    worker = _worker("w1", model_inventory=FLUX_INVENTORY)
+    assert assess.estimate_vram({"not_here.safetensors"}, [worker]) is None
+
+
+def test_eligible_after_fetch_matches_a_peer_by_category_relative_name():
+    """A peer's models-root-relative inventory must satisfy a missing model."""
+    have_nothing = _worker("w1", node_classes=["KSampler"], dynamic={"free_disk_gb": 500})
+    peer = _worker("w2", model_inventory=FLUX_INVENTORY)
+    needs = assess.JobNeeds(
+        nodes={"KSampler"}, models={"flux1-dev.safetensors"}, est_vram_gb=None, assets=set()
+    )
+
+    v = assess.verdict(have_nothing, needs, {}, [have_nothing, peer])
+    assert v.kind == "eligible_after_fetch"
+    assert v.missing_models == ["flux1-dev.safetensors"]
+
+
+def test_eligible_after_fetch_uses_the_matched_size_for_the_disk_check():
+    """The 11.9 GB size must be found, so 5 GB of free disk is not enough."""
+    cramped = _worker("w1", node_classes=["KSampler"], dynamic={"free_disk_gb": 5})
+    peer = _worker("w2", model_inventory=FLUX_INVENTORY)
+    needs = assess.JobNeeds(
+        nodes={"KSampler"}, models={"flux1-dev.safetensors"}, est_vram_gb=None, assets=set()
+    )
+
+    v = assess.verdict(cramped, needs, {}, [cramped, peer])
+    assert v.kind == "ineligible"
+    assert any(r.startswith("missing_models_unavailable") for r in v.reasons)
+
+
+def test_find_model_reports_presence_and_the_largest_known_size():
+    inventory = [
+        {"name": "loras/style.safetensors", "size": 0.1},
+        {"name": "checkpoints/style.safetensors", "size": 2.0},  # same basename, bigger
+        {"name": "vae/broken.safetensors", "size": "not a number"},
+    ]
+    assert assess.find_model(inventory, "style.safetensors") == (True, 2.0)
+    assert assess.find_model(inventory, "broken.safetensors") == (True, None)
+    assert assess.find_model(inventory, "absent.safetensors") == (False, None)
+    assert assess.find_model([], "anything") == (False, None)
+    assert assess.find_model([{"no_name": 1}, "junk"], "anything") == (False, None)
