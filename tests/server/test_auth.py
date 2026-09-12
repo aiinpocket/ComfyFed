@@ -43,7 +43,10 @@ def test_me_reports_authenticated(client):
 def test_me_unauthenticated_without_session(client):
     r = client.get("/api/auth/me")
     assert r.status_code == 200
-    assert r.json() == {"authenticated": False, "lang": "en"}
+    body = r.json()
+    assert body["authenticated"] is False
+    assert body["lang"] == "en"
+    assert "platform_url" in body
 
 
 def test_change_password_requires_csrf(client):

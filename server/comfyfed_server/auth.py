@@ -15,6 +15,7 @@ from . import db, security
 _SESSION_SECRET_KEY = "session_secret"
 _ADMIN_PASSWORD_HASH_KEY = "admin_password_hash"
 _LANG_KEY = "lang"
+_PLATFORM_URL_KEY = "platform_url"
 
 _COOKIE_NAME = "cf_session"
 _COOKIE_MAX_AGE = 7 * 24 * 3600  # 7 days
@@ -184,7 +185,8 @@ def me(cf_session: Optional[str] = Cookie(default=None)):
     authenticated = bool(payload and payload.get("authenticated"))
     with db.get_session() as db_session:
         lang = _get_setting(db_session, _LANG_KEY) or "en"
-    return {"authenticated": authenticated, "lang": lang}
+        platform_url = _get_setting(db_session, _PLATFORM_URL_KEY) or ""
+    return {"authenticated": authenticated, "lang": lang, "platform_url": platform_url}
 
 
 @router.post("/change-password")

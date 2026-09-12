@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import secrets
 import time
 from typing import Optional
@@ -27,6 +28,17 @@ _seen_nonces: dict[tuple[str, str], float] = {}
 
 def _error(status_code: int, code: str, message: str = "") -> HTTPException:
     return HTTPException(status_code=status_code, detail={"code": code, "message": message or code})
+
+
+def _json_or(raw: Optional[str], default):
+    """Decode a JSON text column, falling back to `default` on bad/empty data."""
+    try:
+        value = json.loads(raw or "")
+    except (TypeError, ValueError):
+        return default
+    if type(value) is not type(default):
+        return default
+    return value
 
 
 def _prune_nonces(now_monotonic: float) -> None:
@@ -172,6 +184,14 @@ def create_router(data_dir: str) -> APIRouter:
                     "status": w.status,
                     "last_seen": w.last_seen.isoformat() if w.last_seen else None,
                     "disabled": w.disabled,
+                    # Hardware summary for the console's worker cards. Stored
+                    # as JSON text columns; decoded defensively so one bad row
+                    # cannot break the whole listing.
+                    "hardware": _json_or(w.hardware, {}),
+                    "dynamic": _json_or(w.dynamic, {}),
+                    "backend": w.backend,
+                    "torch_version": w.torch_version,
+                    "model_count": len(_json_or(w.model_inventory, [])),
                 }
                 for w in workers
             ]
