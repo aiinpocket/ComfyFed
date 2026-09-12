@@ -918,3 +918,90 @@ def test_job_done_resent_for_own_terminal_job_does_not_send_job_cancelled(client
             assert json.loads(job.result_files) == ["out.png"]
     finally:
         ws.close()
+
+
+# --- Final review Major 1: a cancel the owner missed must be re-pushed ------
+
+
+def test_cancel_then_owner_heartbeat_pushes_job_cancelled_once_without_warning_spam(client, caplog):
+    """The cancel push landing nowhere (agent mid-reconnect) must not be the
+    end of it: the owner's very next busy heartbeat has to learn about it.
+
+    `cancel_job` clears `worker_id` (recording `last_worker_id`), so every
+    later reference by the old owner takes the not-owned path -- which pushes
+    `job_cancelled`, deduped per connection. And because that worker IS the
+    job's former owner and the job is terminal, the repeat heartbeats log at
+    DEBUG: WARNING stays reserved for forged job ids.
+    """
+    csrf = _login(client)
+    worker_a, key_a = _register_worker(client, csrf, "w-a")
+    job_id = _submit(client, csrf)
+
+    ws_a = _connect(client, worker_a, key_a)
+    try:
+        ws_a.send_json({"type": "heartbeat", "state": "idle", "progress": 0.0, "job_id": None, "dynamic": {}})
+        agentws.dispatch_once(worker_a)
+        assert ws_a.receive_json()["type"] == "job"
+
+        # Cancelled straight through dispatch, i.e. the push found no live
+        # connection -- exactly the window the review reproduced.
+        assert dispatch.cancel_job(job_id, reason="operator cancelled") == worker_a
+        with db.get_session() as session:
+            job = session.get(db.Job, job_id)
+            assert job.status == "cancelled"
+            assert job.worker_id is None
+            assert job.last_worker_id == worker_a
+
+        with caplog.at_level(logging.DEBUG, logger="comfyfed_server.dispatch"):
+            for progress in (0.1, 0.4, 0.7):
+                ws_a.send_json(
+                    {
+                        "type": "heartbeat",
+                        "state": "busy",
+                        "progress": progress,
+                        "job_id": job_id,
+                        "dynamic": {},
+                    }
+                )
+                agentws.dispatch_once(worker_a)
+
+        assert ws_a.receive_json() == {"type": "job_cancelled", "job_id": job_id}
+        # Exactly one push for the whole burst.
+        assert agentws._connections[worker_a].cancelled_jobs_sent == {job_id}
+
+        warnings = [r for r in caplog.records if r.levelno >= logging.WARNING]
+        assert warnings == [], "a former owner's heartbeat for its cancelled job is not a forgery signal"
+        assert any(r.levelno == logging.DEBUG for r in caplog.records)
+    finally:
+        ws_a.close()
+
+
+def test_forged_job_id_from_a_stranger_still_warns(client, caplog):
+    """The DEBUG downgrade above must not blind the forgery signal: a worker
+    referencing a job it never owned still logs WARNING."""
+    csrf = _login(client)
+    worker_a, key_a = _register_worker(client, csrf, "w-a")
+    worker_b, key_b = _register_worker(client, csrf, "w-b")
+    job_id = _submit(client, csrf)
+
+    ws_a = _connect(client, worker_a, key_a)
+    try:
+        ws_a.send_json({"type": "heartbeat", "state": "idle", "progress": 0.0, "job_id": None, "dynamic": {}})
+        agentws.dispatch_once(worker_a)
+        assert ws_a.receive_json()["type"] == "job"
+
+        ws_b = _connect(client, worker_b, key_b)
+        try:
+            dispatch.cancel_job(job_id, reason="operator cancelled")
+            with caplog.at_level(logging.DEBUG, logger="comfyfed_server.dispatch"):
+                ws_b.send_json(
+                    {"type": "heartbeat", "state": "busy", "progress": 0.5, "job_id": job_id, "dynamic": {}}
+                )
+                agentws.dispatch_once(worker_b)
+
+            warnings = [r for r in caplog.records if r.levelno >= logging.WARNING]
+            assert len(warnings) == 1
+        finally:
+            ws_b.close()
+    finally:
+        ws_a.close()

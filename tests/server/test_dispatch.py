@@ -314,3 +314,31 @@ def test_assign_jobs_each_worker_gets_at_most_one_job_per_tick(_db):
         statuses = {j.id: j.status for j in session.query(db.Job).all()}
     # Exactly one of the two jobs got claimed; the other stays queued.
     assert sorted(statuses.values()) == ["assigned", "queued"]
+
+
+def test_cancel_job_clears_worker_id_and_records_last_worker_id(_db):
+    """So every later reference by the old owner hits the not-owned path and
+    gets re-told (final review Major 1). Mirrors `requeue_stale`."""
+    worker_id = _make_worker()
+    job_id = _make_job(status="running", worker_id=worker_id)
+
+    assert dispatch.cancel_job(job_id, reason="user requested") == worker_id
+
+    with db.get_session() as session:
+        job = session.get(db.Job, job_id)
+        assert job.worker_id is None
+        assert job.last_worker_id == worker_id
+
+
+def test_try_readopt_refuses_a_cancelled_job(_db):
+    """Clearing worker_id must not make a cancelled job look re-adoptable:
+    `try_readopt` requires status `queued`, and cancelled is terminal."""
+    worker_id = _make_worker()
+    job_id = _make_job(status="running", worker_id=worker_id)
+    dispatch.cancel_job(job_id, reason="user requested")
+
+    assert dispatch.try_readopt(job_id, worker_id) is False
+    with db.get_session() as session:
+        job = session.get(db.Job, job_id)
+        assert job.status == "cancelled"
+        assert job.worker_id is None

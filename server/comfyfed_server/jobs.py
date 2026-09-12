@@ -343,14 +343,24 @@ def create_router(data_dir: str) -> APIRouter:
         for one that already finished, was already cancelled, or failed --
         cancelling twice, or cancelling something that finished moments
         before the request landed, must not stomp on a real result.
+
+        The terminal case is decided by `cancel_and_notify`'s own return
+        rather than by a separate status read beforehand: that read and the
+        cancel were two decisions about the same job taken at two different
+        moments, so a job finishing in between answered `{"status":
+        "cancelled"}` for a job it had not cancelled. The status is only read
+        back afterwards, to say *which* terminal state the caller lost to.
         """
         with db.get_session() as session:
-            job = session.get(db.Job, job_id)
-            if job is None:
+            if session.get(db.Job, job_id) is None:
                 raise _error(404, "jobs.not_found", "Job not found.")
-            status = job.status
 
-        if dispatch.is_terminal(status):
+        if not await agentws.cancel_and_notify(job_id, reason="cancelled by admin"):
+            with db.get_session() as session:
+                job = session.get(db.Job, job_id)
+                if job is None:
+                    raise _error(404, "jobs.not_found", "Job not found.")
+                status = job.status
             return JSONResponse(
                 status_code=409,
                 content={
@@ -362,7 +372,6 @@ def create_router(data_dir: str) -> APIRouter:
                 },
             )
 
-        await agentws.cancel_and_notify(job_id, reason="cancelled by admin")
         return {"status": "cancelled"}
 
     @r.post("/api/jobs/{job_id}/retry")

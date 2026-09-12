@@ -122,7 +122,14 @@ def create_router(data_dir: str) -> APIRouter:
         except WebSocketDisconnect:
             pass
         finally:
-            _connections.pop(worker_id, None)
+            # Only evict OUR OWN registration. A socket that dropped silently
+            # can reach this line after the agent has already reconnected and
+            # registered a new connection; popping by worker_id alone would
+            # unregister the live one, leaving a worker that heartbeats fine
+            # but is invisible to dispatch_tick and to push_job_cancelled --
+            # which this branch makes load-bearing for cancellation delivery.
+            if _connections.get(worker_id) is conn:
+                del _connections[worker_id]
 
     return r
 

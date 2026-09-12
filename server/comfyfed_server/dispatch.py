@@ -200,6 +200,22 @@ def cancel_job(job_id: str, *, reason: str) -> Optional[str]:
     or /queue-delete handlers) knows whether it needs to push `job_cancelled`
     to a live agent connection.
 
+    Ownership is then *released* exactly the way `requeue_stale` releases it
+    -- `last_worker_id = worker_id`, `worker_id = None` -- and that is load
+    bearing, not tidiness. The immediate push is one-shot: it is a silent
+    no-op when the owner has no live connection at that instant (a routine
+    reconnect, a brief drop). With ownership cleared, every *later* thing the
+    old owner says about this job -- heartbeat, progress, job_done, artifact
+    upload -- lands on the not-owned path, which pushes `job_cancelled`
+    again; the per-connection dedup bounds it to one push per socket and a
+    reconnect starts a fresh set, so a missed notification self-heals within
+    one heartbeat instead of the worker rendering to completion for nothing.
+    `last_worker_id` keeps that worker identifiable as the *former* owner, so
+    `_owned_job` can log its now-pointless messages at DEBUG rather than
+    spending the forgery-signal WARNING on them. It does not make the job
+    re-adoptable: `try_readopt` requires status `queued`, and `cancelled` is
+    terminal.
+
     A no-op returning None for a job that's already terminal (done, failed,
     or already cancelled) or doesn't exist -- cancelling twice, or cancelling
     something that finished moments before the request landed, must not
@@ -219,6 +235,9 @@ def cancel_job(job_id: str, *, reason: str) -> Optional[str]:
         job.status = "cancelled"
         job.error = reason
         job.finished_at = _utcnow()
+        if owning_worker_id is not None:
+            job.last_worker_id = owning_worker_id
+            job.worker_id = None
         session.commit()
     return owning_worker_id
 
@@ -282,6 +301,13 @@ def _owned_job(session, job_id: Optional[str], worker_id: str, statuses) -> Opti
 
     * WARNING -- a job owned by someone else, an unknown job id, or an attempt
       to re-transition a job that has already finished. All genuinely wrong.
+    * DEBUG -- a job this worker used to own that has since ended without it
+      (`last_worker_id` matches and the status is terminal -- in practice a
+      cancellation, which releases `worker_id`; see `cancel_job`). The worker
+      is not forging anything, it is simply a message or two behind: it keeps
+      heartbeating for the job until the `job_cancelled` push it triggers
+      reaches it. Charging the forgery WARNING for that would put one line
+      per heartbeat in the log for the rest of the run.
     * DEBUG -- this worker's own job simply isn't in the state this call wanted
       (e.g. a repeated busy heartbeat for a job already marked running). That
       is the normal steady state: the agent heartbeats every 30s for the whole
@@ -296,7 +322,9 @@ def _owned_job(session, job_id: Optional[str], worker_id: str, statuses) -> Opti
         return None
 
     if job.worker_id != worker_id:
-        logger.warning(
+        was_ours_and_is_over = job.last_worker_id == worker_id and job.status in _TERMINAL_STATUSES
+        log = logger.debug if was_ours_and_is_over else logger.warning
+        log(
             "dispatch: worker %s may not transition job %s owned by %s (status=%s)",
             worker_id,
             job_id,
