@@ -19,6 +19,69 @@ def _error(status_code: int, code: str, message: str = "") -> HTTPException:
     return HTTPException(status_code=status_code, detail={"code": code, "message": message or code})
 
 
+class MissingAssetsError(Exception):
+    """A workflow references input assets the caller did not make available.
+
+    Carries the sorted missing filenames so each caller can render it in its
+    own error dialect -- the console's `{"error": {"code", "message"}}`
+    envelope, or the ComfyUI-compatible `{"error": {...}, "node_errors": {}}`
+    shape in `comfyapi.py`.
+    """
+
+    def __init__(self, missing: list[str]):
+        super().__init__(", ".join(missing))
+        self.missing = missing
+
+
+def job_inputs_dir(data_dir: str, job_id: str) -> str:
+    """Directory holding a job's staged input assets."""
+    return os.path.join(data_dir, _JOB_INPUTS_DIRNAME, job_id)
+
+
+def create_job(
+    workflow_json_text: str,
+    workflow: dict,
+    *,
+    requirements: Optional[dict] = None,
+    available_assets: Optional[set[str]] = None,
+) -> str:
+    """Assess a workflow and persist a queued Job row. Returns the job id.
+
+    The single assess-and-persist path, shared by the console's
+    `POST /api/jobs` and the ComfyUI-compatible `POST /comfy/api/prompt`, so
+    the two entry points can never drift on what a job records (required
+    nodes/models, VRAM estimate, declared input assets).
+
+    `available_assets` is the set of input filenames the caller can actually
+    supply; anything the workflow references beyond it raises
+    `MissingAssetsError` before anything is written. Storing the asset bytes
+    is the caller's job (they arrive as uploads in one case and from staging
+    in the other).
+    """
+    needs = assess.extract(workflow)
+    available = set(available_assets or ())
+
+    missing = sorted(needs.assets - available)
+    if missing:
+        raise MissingAssetsError(missing)
+
+    with db.get_session() as session:
+        all_workers = session.query(db.Worker).all()
+        est_vram_gb = assess.estimate_vram(needs.models, all_workers)
+
+        job = db.Job(
+            workflow_json=workflow_json_text,
+            requirements=json.dumps(requirements or {}),
+            required_nodes=json.dumps(sorted(needs.nodes)),
+            required_models=json.dumps(sorted(needs.models)),
+            est_vram_gb=est_vram_gb,
+            input_assets=json.dumps(sorted(available)),
+        )
+        session.add(job)
+        session.commit()
+        return job.id
+
+
 def _job_dict(job: db.Job) -> dict:
     return {
         "id": job.id,
@@ -66,8 +129,6 @@ def create_router(data_dir: str) -> APIRouter:
             except (TypeError, ValueError):
                 raise _error(400, "jobs.invalid_workflow", "requirements is not valid JSON.")
 
-        needs = assess.extract(workflow)
-
         uploaded_names = []
         for upload in assets:
             try:
@@ -78,31 +139,21 @@ def create_router(data_dir: str) -> APIRouter:
                 raise _error(400, "jobs.bad_asset_name", f"Invalid asset filename: {upload.filename!r}")
             uploaded_names.append(filename)
 
-        missing = sorted(needs.assets - set(uploaded_names))
-        if missing:
+        try:
+            job_id = create_job(
+                workflow_json,
+                workflow,
+                requirements=requirements_dict,
+                available_assets=set(uploaded_names),
+            )
+        except MissingAssetsError as exc:
             raise _error(
                 400,
                 "jobs.missing_assets",
-                f"Workflow references assets that were not uploaded: {', '.join(missing)}",
+                f"Workflow references assets that were not uploaded: {', '.join(exc.missing)}",
             )
 
-        with db.get_session() as session:
-            all_workers = session.query(db.Worker).all()
-            est_vram_gb = assess.estimate_vram(needs.models, all_workers)
-
-            job = db.Job(
-                workflow_json=workflow_json,
-                requirements=json.dumps(requirements_dict),
-                required_nodes=json.dumps(sorted(needs.nodes)),
-                required_models=json.dumps(sorted(needs.models)),
-                est_vram_gb=est_vram_gb,
-                input_assets=json.dumps(uploaded_names),
-            )
-            session.add(job)
-            session.commit()
-            job_id = job.id
-
-        job_dir = os.path.join(data_dir, _JOB_INPUTS_DIRNAME, job_id)
+        job_dir = job_inputs_dir(data_dir, job_id)
         os.makedirs(job_dir, exist_ok=True)
         for upload, filename in zip(assets, uploaded_names):
             dest = os.path.join(job_dir, filename)

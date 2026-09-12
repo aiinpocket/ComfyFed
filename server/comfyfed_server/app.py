@@ -14,7 +14,7 @@ from fastapi.responses import FileResponse, JSONResponse, Response
 from fastapi.staticfiles import StaticFiles
 from prometheus_client import CONTENT_TYPE_LATEST, generate_latest
 
-from . import agentws, auth, bootstrap, db, jobs, metrics, receipts, workers
+from . import agentws, auth, bootstrap, comfyapi, db, jobs, metrics, receipts, workers
 
 logger = logging.getLogger(__name__)
 
@@ -110,6 +110,7 @@ def create_app(data_dir: str) -> FastAPI:
     app.include_router(jobs.create_router(data_dir))
     app.include_router(receipts.create_router())
     app.include_router(agentws.create_router(data_dir))
+    app.include_router(comfyapi.create_router(data_dir))
 
     @app.get("/metrics")
     async def metrics_endpoint(request: Request) -> Response:
@@ -137,7 +138,10 @@ def create_app(data_dir: str) -> FastAPI:
 
         @app.exception_handler(404)
         async def _spa_fallback(request: Request, exc: HTTPException) -> JSONResponse | FileResponse:
-            if request.url.path.startswith("/api/"):
+            # `/comfy/api/` is the ComfyUI-compatible surface: like `/api/`,
+            # its 404s must stay JSON, not be swallowed by the SPA's
+            # index.html fallback.
+            if request.url.path.startswith("/api/") or request.url.path.startswith("/comfy/api/"):
                 return await _http_exception_handler(request, exc)
             return FileResponse(index_path)
 
