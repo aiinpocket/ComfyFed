@@ -59,10 +59,25 @@ def clear() -> None:
     _connections.clear()
 
 
+_QUEUE_REMAINING_STATUSES = ("queued", "assigned", "running")
+
+
 def queue_status() -> dict:
-    """Build the `status.exec_info` payload for the initial/refreshed `status` message."""
+    """Build the `status.exec_info` payload for the initial/refreshed `status` message.
+
+    `queue_remaining` matches upstream's `get_tasks_remaining()`
+    (`len(queue) + len(currently_running)`, execution.py): queued jobs PLUS
+    ones already picked up but not finished, i.e. exactly the statuses
+    `GET /comfy/api/queue` splits into `queue_pending` (comfyapi's
+    `_PENDING_STATUSES`) and `queue_running` (`_RUNNING_STATUSES`). Not
+    queued-only -- a job mid-execution is still "remaining" work upstream.
+    """
     with db.get_session() as session:
-        remaining = session.query(db.Job).filter(db.Job.status == "queued").count()
+        remaining = (
+            session.query(db.Job)
+            .filter(db.Job.status.in_(_QUEUE_REMAINING_STATUSES))
+            .count()
+        )
     return {"exec_info": {"queue_remaining": remaining}}
 
 
@@ -123,7 +138,19 @@ def job_done(job: "db.Job") -> None:
     node = next(iter(outputs), comfyapi.FALLBACK_OUTPUT_KEY)
 
     post_event(
-        {"type": "executed", "data": {"prompt_id": job.id, "output": outputs, "node": node}}
+        {
+            "type": "executed",
+            "data": {
+                "prompt_id": job.id,
+                "output": outputs,
+                "node": node,
+                # Same value as "node" -- ComfyFed jobs have no distinct
+                # real/display node id, but upstream's shape always carries
+                # both (execution.py), and the pinned frontend may read
+                # display_node for gallery routing.
+                "display_node": node,
+            },
+        }
     )
     post_event({"type": "executing", "data": {"node": None, "prompt_id": job.id}})
     post_event({"type": "status", "data": {"status": queue_status()}})
@@ -142,6 +169,7 @@ def job_failed(job_id: str, error: str) -> None:
                 "traceback": [],
                 "current_inputs": {},
                 "current_outputs": {},
+                "executed": [],
             },
         }
     )

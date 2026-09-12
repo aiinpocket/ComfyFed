@@ -88,6 +88,20 @@ def test_initial_status_reports_queue_remaining(client):
         assert msg["data"]["status"]["exec_info"]["queue_remaining"] == 2
 
 
+def test_initial_status_queue_remaining_includes_running_jobs(client):
+    # Matches upstream get_tasks_remaining() = len(queue) + len(currently_running):
+    # a job already picked up (assigned/running) still counts as "remaining".
+    csrf = _login(client)
+    job_id = _post_prompt(client)
+    worker_id = _register_worker(client, csrf, "runner")
+    dispatch.pick_job_for(worker_id)
+    dispatch.mark_running(job_id, worker_id)
+
+    with client.websocket_connect("/comfy/api/ws") as ws:
+        msg = ws.receive_json()
+        assert msg["data"]["status"]["exec_info"]["queue_remaining"] == 1
+
+
 # --- job lifecycle relay ------------------------------------------------------
 
 
@@ -144,6 +158,7 @@ def test_job_done_sends_executed_then_executing_none_then_status(client):
             assert executed["type"] == "executed"
             assert executed["data"]["prompt_id"] == job_id
             assert executed["data"]["node"] == "2"
+            assert executed["data"]["display_node"] == "2"
             assert executed["data"]["output"] == {
                 "2": {"images": [{"filename": "out_00001_.png", "subfolder": "", "type": "output"}]}
             }
@@ -174,6 +189,7 @@ def test_job_failed_sends_execution_error(client):
         assert msg["type"] == "execution_error"
         assert msg["data"]["prompt_id"] == job_id
         assert msg["data"]["exception_message"] == "boom"
+        assert msg["data"]["executed"] == []
 
 
 def test_broadcast_reaches_multiple_connected_clients(client):
