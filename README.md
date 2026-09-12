@@ -149,6 +149,10 @@ comfyfed-server fetch-comfy-ui --data-dir ./data
 
 ⚠ **編輯器裡至少要有一台 worker 在線才會出現節點**：節點清單不是平台自己編的，而是所有**在線且未停用** worker 回報的 `/object_info` 聯集。全部離線的話節點面板會是空的——這是正常的，不是壞掉。
 
+⚠ **節點清單是「聯集」，不代表任何一台 worker 都跑得動**：`/object_info` 把全部在線 worker 的節點併成一份，所以編輯器裡看得到的節點，可能分散在不同機器上。一張混用了 A 機獨有節點與 B 機獨有節點的圖**送得出去**（會建立工作、進佇列），但派工時對每一台 worker 都不合格，於是**一直卡在佇列裡**，不會有錯誤訊息。工作頁的「不合格原因」會說明缺什麼。`/comfy/api/object_info` 的回應帶了 `X-ComfyFed-Worker-Count` 標頭，是這份聯集來自幾台 worker。
+
+⚠ **編輯器上方工具列有幾顆按鈕沒有後端**：**取消／中斷（Cancel、Interrupt）、清空佇列（Clear queue）、刪除歷史紀錄**這些動作在 ComfyFed 上都沒有對應的 API，按下去只會拿到 404。Phase 1.5 的相容層是唯讀的佇列與歷史：工作一旦送出就只能等它跑完或失敗。要停掉一個工作，目前得從 Console 或直接改資料庫處理。
+
 目前的相容層只做到「拉圖 → 送工作 → 看結果」這條主線。編輯器裡幾個依賴單機 ComfyUI 的功能不會動：**存工作流到伺服器、官方範本、Manager／自訂節點擴充、模型清單瀏覽**（模型在各個 worker 上，平台自己沒有）。工作流請用瀏覽器的匯出／匯入，或用 Console 的「貼上 API JSON」。編輯器的介面偏好（主題等）會存在 `<data-dir>/comfy_settings.json`。
 
 **跟自備 ComfyUI 的關係**：兩者不衝突，是兩個入口。內嵌編輯器是「我沒有 ComfyUI，或懶得開」的路；如果你本機已經有 ComfyUI，照樣可以在自己那邊拉好工作流、用「Save (API format)」匯出，再貼進 Console 送出。真正跑圖的一律是聯邦裡的 worker（也就是各成員自己的 ComfyUI），平台本身不裝 ComfyUI、也不跑推論——`/comfy` 只是一層把官方前端的動作翻譯成聯邦工作的相容 API。
@@ -354,6 +358,22 @@ form is still on that page, tucked into the "Paste API JSON instead" section.
 is not something the platform invents: it is the union of the `/object_info`
 snapshots reported by every **online, enabled** worker. With the whole fleet
 offline the node panel is empty — that's expected, not a bug.
+
+⚠ **That catalogue is a union, so it does not describe any single worker.**
+Nodes visible in the editor may live on different machines. A graph mixing a
+node only worker A has with one only worker B has **submits fine** — the job
+is created and queued — but it is ineligible for every worker individually, so
+it simply **sits in the queue forever** with no error. The Jobs page's
+ineligibility reasons explain what is missing. `/comfy/api/object_info`
+returns an `X-ComfyFed-Worker-Count` header saying how many workers the union
+came from.
+
+⚠ **Several toolbar buttons in the editor have no backend.** **Cancel /
+Interrupt, Clear queue, and deleting history entries** have no ComfyFed API
+behind them and answer **404** when clicked. The Phase 1.5 compatibility layer
+exposes the queue and history read-only: once a job is submitted it runs to
+completion or failure. Stopping a job means going through the console or the
+database.
 
 The compatibility layer currently covers the main line only: build a graph,
 queue it, see the results. Editor features that assume a single local ComfyUI
