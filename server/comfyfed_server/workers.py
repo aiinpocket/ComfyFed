@@ -8,6 +8,7 @@ import json
 import os
 import secrets
 import time
+import zlib
 from typing import Optional
 
 from fastapi import APIRouter, Depends, Header, HTTPException, Request
@@ -24,6 +25,19 @@ _PLATFORM_URL_KEY = "platform_url"
 _RELEASES_DIRNAME = "releases"
 _OBJECT_INFO_DIRNAME = "object_info"
 _MAX_OBJECT_INFO_BYTES = 32 * 1024 * 1024
+
+# Hard cap on the COMPRESSED upload, checked against Content-Length before a
+# single byte is read. A real ComfyUI `/object_info` gzips to a couple of MB
+# at most, so 8MB is generous; the point is that without it the decompressed
+# cap alone is no protection -- a body has to be fully buffered and fully
+# inflated before it can be measured.
+_MAX_OBJECT_INFO_COMPRESSED_BYTES = 8 * 1024 * 1024
+
+# zlib window size selecting a gzip (rather than zlib or raw deflate) stream.
+_GZIP_WBITS = 31
+
+# Chunk requested per `decompressobj.decompress` call while inflating.
+_DECOMPRESS_CHUNK_BYTES = 1024 * 1024
 _AGENT_VERSION_DEFAULT = "0.1.0"
 _AGENT_LATEST_KEY = "agent_latest"
 _AGENT_MIN_SUPPORTED_KEY = "agent_min_supported"
@@ -136,6 +150,75 @@ async def verify_agent(
         _seen_nonces[nonce_key] = now_monotonic + _NONCE_TTL_SECONDS
 
         return worker
+
+
+async def limit_object_info_upload(request: Request) -> None:
+    """Reject an oversized `/api/agent/object_info` body from its Content-Length.
+
+    Declared as the FIRST dependency on that route, ahead of `verify_agent`,
+    on purpose: FastAPI resolves dependencies in signature order and
+    `verify_agent` has to buffer the whole body to check the signature over
+    it. Checking the declared length here is the only point at which the
+    upload can still be refused without reading it.
+    """
+    raw_length = request.headers.get("content-length")
+    if raw_length is None:
+        return
+    try:
+        length = int(raw_length)
+    except ValueError:
+        raise _error(400, "agent.bad_object_info", "Invalid Content-Length.")
+    if length > _MAX_OBJECT_INFO_COMPRESSED_BYTES:
+        raise _error(
+            413,
+            "agent.object_info_too_large",
+            "Compressed object_info exceeds the upload size limit.",
+        )
+
+
+class ObjectInfoTooLarge(Exception):
+    """Raised by `bounded_gunzip` when the inflated stream passes its cap."""
+
+
+def bounded_gunzip(gzip_bytes: bytes, max_bytes: Optional[int] = None) -> bytes:
+    """Gunzip `gzip_bytes`, aborting as soon as the output passes `max_bytes`.
+
+    `gzip.decompress` inflates the whole stream before anything can be
+    measured, which makes the decompressed size limit unenforceable: a few
+    hundred KB of gzipped zeros expands to gigabytes and the process is
+    already out of memory by the time `len()` is consulted. Inflating
+    incrementally with a `max_length` bound means a bomb costs at most one
+    chunk past the cap.
+
+    Raises `ObjectInfoTooLarge` past the cap, and `zlib.error` (which the
+    caller maps to a 400) for anything that is not a valid gzip stream.
+    """
+    # Resolved at call time, not as a default argument, so the cap stays a
+    # single mutable module-level knob (tests shrink it).
+    if max_bytes is None:
+        max_bytes = _MAX_OBJECT_INFO_BYTES
+
+    decompressor = zlib.decompressobj(wbits=_GZIP_WBITS)
+    chunks: list[bytes] = []
+    total = 0
+    data = gzip_bytes
+    while True:
+        chunk = decompressor.decompress(data, _DECOMPRESS_CHUNK_BYTES)
+        # After the first call the remaining input lives in unconsumed_tail;
+        # feeding it back in is how a max_length-bounded loop makes progress.
+        data = decompressor.unconsumed_tail
+        if chunk:
+            total += len(chunk)
+            if total > max_bytes:
+                raise ObjectInfoTooLarge()
+            chunks.append(chunk)
+        elif not data:
+            break
+        if decompressor.eof and not data:
+            break
+    if not decompressor.eof:
+        raise zlib.error("truncated gzip stream")
+    return b"".join(chunks)
 
 
 def object_info_path(data_dir: str, worker_id: str) -> str:
@@ -254,6 +337,7 @@ def create_router(data_dir: str) -> APIRouter:
     @r.post("/api/agent/object_info")
     async def upload_object_info(
         request: Request,
+        _limit: None = Depends(limit_object_info_upload),
         x_oi_hash: Optional[str] = Header(default=None, alias="X-OI-Hash"),
         worker: db.Worker = Depends(verify_agent),
     ):
@@ -261,15 +345,23 @@ def create_router(data_dir: str) -> APIRouter:
             raise _error(400, "agent.bad_object_info", "Missing X-OI-Hash header.")
 
         body = await request.body()
-        try:
-            decompressed = gzip.decompress(body)
-        except (gzip.BadGzipFile, OSError, EOFError):
-            raise _error(400, "agent.bad_object_info", "Invalid gzip payload.")
+        if len(body) > _MAX_OBJECT_INFO_COMPRESSED_BYTES:
+            # A chunked upload has no Content-Length for the dependency above
+            # to check, so the actual size is re-checked here.
+            raise _error(
+                413,
+                "agent.object_info_too_large",
+                "Compressed object_info exceeds the upload size limit.",
+            )
 
-        if len(decompressed) > _MAX_OBJECT_INFO_BYTES:
+        try:
+            decompressed = bounded_gunzip(body)
+        except ObjectInfoTooLarge:
             raise _error(
                 413, "agent.object_info_too_large", "Decompressed object_info exceeds the size limit."
             )
+        except (zlib.error, OSError, EOFError):
+            raise _error(400, "agent.bad_object_info", "Invalid gzip payload.")
 
         try:
             json.loads(decompressed)

@@ -280,3 +280,85 @@ def test_heartbeat_hash_matches_but_file_missing_still_triggers_resend(client):
         assert msg["type"] == "want_object_info"
     finally:
         ws.close()
+
+
+# --- upload size bounding (I1) -------------------------------------------------
+
+
+def test_oversized_content_length_is_413_before_the_body_is_read(client, monkeypatch):
+    """A declared Content-Length past the compressed cap is refused up front.
+
+    The point is the ORDER: the decompressed cap alone is unenforceable
+    because `verify_agent` must buffer the whole body to check the signature
+    over it. `limit_object_info_upload` is declared as the first dependency on
+    the route precisely so an oversized upload dies before that read.
+    """
+    entry = _register_worker(client)
+    monkeypatch.setattr(workers, "_MAX_OBJECT_INFO_COMPRESSED_BYTES", 64)
+
+    # Incompressible content, so the GZIPPED body is genuinely over the cap
+    # (a run of repeated characters would gzip to a few dozen bytes).
+    payload = json.dumps({"Node": {"x": os.urandom(4096).hex()}}).encode()
+    r = _upload(client, entry, payload)
+    assert r.status_code == 413
+    assert r.json()["error"]["code"] == "agent.object_info_too_large"
+
+
+def test_content_length_within_the_compressed_cap_still_succeeds(client, monkeypatch):
+    entry = _register_worker(client)
+    monkeypatch.setattr(workers, "_MAX_OBJECT_INFO_COMPRESSED_BYTES", 4096)
+
+    r = _upload(client, entry, _object_info_payload())
+    assert r.status_code == 200
+
+
+def test_gzip_bomb_is_413_without_being_materialized(client, monkeypatch):
+    """A small gzip that inflates past the decompressed cap must be refused.
+
+    64MB of zeros gzips to well under 100KB, so it sails past every
+    compressed-size check; the old `gzip.decompress()` would have inflated the
+    whole thing into memory before `len()` could object. `bounded_gunzip`
+    aborts one chunk past the cap. The assertion is just the 413 -- if the
+    bomb HAD been materialized, this test would be measured in gigabytes of
+    RSS rather than by its return code.
+    """
+    entry = _register_worker(client)
+    monkeypatch.setattr(workers, "_MAX_OBJECT_INFO_BYTES", 1024 * 1024)
+
+    bomb = b"\0" * (64 * 1024 * 1024)
+    gz = gzip.compress(bomb)
+    assert len(gz) < 1024 * 1024  # small enough to pass every compressed check
+
+    oi_hash = hashlib.sha256(bomb).hexdigest()
+    headers = signing.signed_headers(entry, "POST", "/api/agent/object_info", gz)
+    headers["X-OI-Hash"] = oi_hash
+    headers["Content-Encoding"] = "gzip"
+
+    r = client.post("/api/agent/object_info", headers=headers, content=gz)
+    assert r.status_code == 413
+    assert r.json()["error"]["code"] == "agent.object_info_too_large"
+
+
+def test_bounded_gunzip_round_trips_a_normal_payload():
+    payload = _object_info_payload()
+    assert workers.bounded_gunzip(gzip.compress(payload)) == payload
+
+
+def test_bounded_gunzip_rejects_a_non_gzip_stream():
+    import zlib
+
+    with pytest.raises(zlib.error):
+        workers.bounded_gunzip(b"definitely not gzip")
+
+
+def test_bounded_gunzip_rejects_a_truncated_stream():
+    import zlib
+
+    gz = gzip.compress(b"x" * 100_000)
+    with pytest.raises(zlib.error):
+        workers.bounded_gunzip(gz[: len(gz) // 2])
+
+
+def test_bounded_gunzip_raises_at_the_cap():
+    with pytest.raises(workers.ObjectInfoTooLarge):
+        workers.bounded_gunzip(gzip.compress(b"a" * 5000), max_bytes=1000)
