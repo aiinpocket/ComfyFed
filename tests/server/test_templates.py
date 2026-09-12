@@ -15,7 +15,7 @@ import pytest
 from fastapi.testclient import TestClient
 
 from comfyfed_server import app as app_module
-from comfyfed_server import bootstrap, comfyapi, db, templates
+from comfyfed_server import bootstrap, comfyapi, db, official_templates, templates
 
 # Task 8: the R2 model mirror. This is the single ground truth the anti-drift
 # tests below check everything against -- every model filename the packaged
@@ -380,6 +380,145 @@ def test_missing_models_note_links_are_valid_r2_urls(name):
     for url in urls:
         assert url.startswith(R2_MODEL_BASE), url
         assert url.rsplit("/", 1)[-1] in MODEL_INVENTORY, url
+
+
+# --- Task 2: merged official template library --------------------------
+
+
+_FLUX_CATEGORY = {
+    "moduleName": "default",
+    "title": "Flux",
+    "templates": [{"name": "flux_dev", "mediaType": "image", "mediaSubtype": "webp"}],
+}
+
+_FLUX_WORKFLOW = {
+    "version": 0.4,
+    "nodes": [],
+    "links": [],
+    "models": [
+        {
+            "name": "flux1-dev.safetensors",
+            "url": "https://x/y",
+            "directory": "diffusion_models",
+            "hash": "h",
+            "hash_type": "SHA256",
+        }
+    ],
+}
+
+
+def _seed_official_dir(data_dir, *, index_extra=None, localized=None, logo=None):
+    official_dir = official_templates.official_dir(data_dir)
+    os.makedirs(official_dir, exist_ok=True)
+    with open(os.path.join(official_dir, "index.json"), "w", encoding="utf-8") as f:
+        json.dump([_FLUX_CATEGORY], f)
+    with open(os.path.join(official_dir, "flux_dev.json"), "w", encoding="utf-8") as f:
+        json.dump(_FLUX_WORKFLOW, f)
+    with open(os.path.join(official_dir, "flux_dev-1.webp"), "wb") as f:
+        f.write(b"RIFF" + b"\x00" * 8 + b"WEBP")
+    if localized is not None:
+        with open(os.path.join(official_dir, "index.zh.json"), "w", encoding="utf-8") as f:
+            json.dump(localized, f)
+    if logo is not None:
+        with open(os.path.join(official_dir, "index_logo.json"), "w", encoding="utf-8") as f:
+            json.dump(logo, f)
+    return official_dir
+
+
+def test_index_json_merges_official_categories_after_comfyfed(client):
+    _login(client)
+    _seed_official_dir(client.data_dir)
+
+    r = client.get("/comfy/templates/index.json")
+    assert r.status_code == 200
+    categories = r.json()
+    assert len(categories) == 2
+    assert [t["name"] for t in categories[0]["templates"]] == list(templates.TEMPLATE_NAMES)
+    assert categories[1] == _FLUX_CATEGORY
+
+
+def test_index_json_is_comfyfed_alone_when_official_dir_absent(client):
+    _login(client)
+    r = client.get("/comfy/templates/index.json")
+    assert r.status_code == 200
+    categories = r.json()
+    assert len(categories) == 1
+    assert [t["name"] for t in categories[0]["templates"]] == list(templates.TEMPLATE_NAMES)
+
+
+def test_official_workflow_json_has_download_metadata_stripped(client):
+    _login(client)
+    _seed_official_dir(client.data_dir)
+
+    r = client.get("/comfy/templates/flux_dev.json")
+    assert r.status_code == 200
+    body = r.json()
+    models = body["models"]
+    assert len(models) == 1
+    assert models[0] == {"name": "flux1-dev.safetensors", "directory": "diffusion_models"}
+    assert "url" not in models[0]
+    assert "hash" not in models[0]
+    assert "hash_type" not in models[0]
+
+
+def test_own_template_workflow_still_served_byte_identical(client):
+    _login(client)
+    _seed_official_dir(client.data_dir)
+
+    packaged_path = os.path.join(templates.templates_dir(), "comfyfed-wuxia-t2i.json")
+    with open(packaged_path, "rb") as f:
+        expected = f.read()
+
+    r = client.get("/comfy/templates/comfyfed-wuxia-t2i.json")
+    assert r.status_code == 200
+    assert r.content == expected
+
+
+def test_official_media_file_is_served(client):
+    _login(client)
+    _seed_official_dir(client.data_dir)
+
+    r = client.get("/comfy/templates/flux_dev-1.webp")
+    assert r.status_code == 200
+    assert r.headers["content-type"] == "image/webp"
+
+
+def test_localized_index_merges_when_official_localized_file_present(client):
+    _login(client)
+    localized_flux = {**_FLUX_CATEGORY, "title": "Flux (中文)"}
+    _seed_official_dir(client.data_dir, localized=[localized_flux])
+
+    r = client.get("/comfy/templates/index.zh.json")
+    assert r.status_code == 200
+    categories = r.json()
+    assert len(categories) == 2
+    assert [t["name"] for t in categories[0]["templates"]] == list(templates.TEMPLATE_NAMES)
+    assert categories[1] == localized_flux
+
+
+def test_localized_index_404s_without_official_localized_file(client):
+    _login(client)
+    assert client.get("/comfy/templates/index.zh.json").status_code == 404
+
+    _seed_official_dir(client.data_dir)  # official dir present, but no index.zh.json
+    assert client.get("/comfy/templates/index.zh.json").status_code == 404
+
+
+def test_index_logo_json_served_from_official_dir_or_404s(client):
+    _login(client)
+    assert client.get("/comfy/templates/index_logo.json").status_code == 404
+
+    logo = {"logo": "flux"}
+    _seed_official_dir(client.data_dir, logo=logo)
+    r = client.get("/comfy/templates/index_logo.json")
+    assert r.status_code == 200
+    assert r.json() == logo
+
+
+def test_traversal_filenames_still_404_with_official_dir_present(client):
+    _login(client)
+    _seed_official_dir(client.data_dir)
+    assert client.get("/comfy/templates/..%2F..%2Fcomfyfed.db").status_code == 404
 
 
 def test_readme_model_downloads_section_covers_the_whole_inventory():

@@ -38,17 +38,54 @@ and is served under `/comfy/`, which the app's session gate already covers.
 `templates_data/assets/` holds the input images the templates reference; they
 are copied into the panel's staging directory at startup (`seed_staging`) so a
 template's `LoadImage` resolves on the very first run.
+
+Since Phase 1.6 Task 2, `/comfy/templates/...` also merges in the official
+ComfyUI template library fetched by `official_templates.fetch` (when an admin
+has run it) into `<data_dir>/comfy_templates_official`:
+
+* `index.json` -- ComfyFed's own categories (always our packaged copy, kept
+  first so the 平台專用分類 stays visually distinct in the sidebar) followed by
+  the official library's categories, if `official_dir/index.json` exists and
+  parses. Otherwise ComfyFed's categories are served alone, same as before
+  this feature existed.
+* `index.<locale>.json` -- merged the same way, but only if the official
+  dir has that exact localized index; if not, this route 404s and the
+  frontend's own fallback logic re-requests `index.json`.
+* `index_logo.json` -- served **only** from the official dir; with no
+  official copy present this always 404s (soft-fails client-side), even
+  though ComfyFed ships its own placeholder file under `templates_data/` for
+  historical reasons.
+* Any other `*.json` -- resolved from the packaged dir first, then the
+  official dir. A JSON file that comes from the official dir and has a
+  top-level `models` list has `url`, `hash`, and `hash_type` stripped from
+  every entry (keeping `name` + `directory`) before being returned. The
+  frontend's `hasDownloadMetadata` check needs both `url` and `directory` to
+  render its browser-side "Download" button, which in web mode is a plain
+  `<a href>` that lands the file on the *viewer's* PC, not the worker
+  actually running the graph -- so that button would silently mislead a
+  ComfyFed user. Stripping only `url` (not the whole entry) keeps the model
+  `name` visible to the missing-model panel; Task 3's `/prompt` rejection is
+  where a worker-side download nudge actually belongs. ComfyFed's own
+  template JSONs never carry `models[].url` (their guidance lives in sticky
+  notes instead) so they pass through this step unchanged regardless of
+  source.
+* Non-JSON files (thumbnails/media) -- packaged dir first, then official
+  dir, same `_MEDIA_TYPES` mapping. No subpaths are ever allowed in
+  `filename`, from either source.
 """
 
 from __future__ import annotations
 
+import json
 import logging
 import os
 import shutil
 from importlib import resources
 
 from fastapi import APIRouter, HTTPException
-from fastapi.responses import FileResponse
+from fastapi.responses import FileResponse, JSONResponse
+
+from . import official_templates
 
 logger = logging.getLogger(__name__)
 
@@ -126,8 +163,51 @@ def seed_staging(staging_dir: str) -> list[str]:
     return copied
 
 
-def create_router() -> APIRouter:
-    """Serve `templates_data/` at `/comfy/templates/...`.
+def _load_json(path: str) -> list | dict | None:
+    """Best-effort JSON read; None on any missing/unreadable/malformed file."""
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            return json.load(f)
+    except (OSError, json.JSONDecodeError):
+        return None
+
+
+def _strip_download_metadata(workflow: dict) -> dict:
+    """Drop `url`/`hash`/`hash_type` from every entry of a top-level `models`
+    list, keeping `name` + `directory`. See the module docstring for why."""
+    models = workflow.get("models")
+    if not isinstance(models, list):
+        return workflow
+    workflow = dict(workflow)
+    workflow["models"] = [
+        {k: v for k, v in entry.items() if k not in ("url", "hash", "hash_type")}
+        if isinstance(entry, dict)
+        else entry
+        for entry in models
+    ]
+    return workflow
+
+
+def _merged_index(data_dir: str, index_name: str) -> list | None:
+    """ComfyFed's categories from `index_name` (packaged) followed by the
+    official library's categories from the same-named file in `official_dir`,
+    if it exists and parses. None if neither side has anything to serve."""
+    ours = _load_json(os.path.join(templates_dir(), index_name))
+    official = _load_json(os.path.join(official_templates.official_dir(data_dir), index_name))
+
+    if not isinstance(official, list):
+        if official is not None:
+            logger.debug("comfyfed_server: official %s is not a list of categories, ignoring", index_name)
+        return ours
+
+    ours_list = ours if isinstance(ours, list) else []
+    return ours_list + official
+
+
+def create_router(data_dir: str) -> APIRouter:
+    """Serve `templates_data/`, merged with the official template library
+    fetched into `official_templates.official_dir(data_dir)`, at
+    `/comfy/templates/...`. See the module docstring for the merge rules.
 
     A plain route rather than a `StaticFiles` mount, because the panel's own
     static mount already owns `/comfy` and is registered later; routes are
@@ -137,16 +217,55 @@ def create_router() -> APIRouter:
     r = APIRouter()
 
     @r.get("/comfy/templates/{filename}", include_in_schema=False)
-    def template_file(filename: str) -> FileResponse:
+    def template_file(filename: str):
         # No subpaths: the frontend only ever asks for files directly under
         # `templates/`, so anything with a separator in it is a traversal
         # attempt rather than a legitimate request.
         if not filename or filename in (".", "..") or "/" in filename or "\\" in filename:
             raise HTTPException(status_code=404, detail="Not found")
-        path = os.path.join(templates_dir(), filename)
-        if not os.path.isfile(path):
-            raise HTTPException(status_code=404, detail="Not found")
+
+        official_dir = official_templates.official_dir(data_dir)
+
+        if filename == "index_logo.json":
+            logo = _load_json(os.path.join(official_dir, filename))
+            if logo is None:
+                raise HTTPException(status_code=404, detail="Not found")
+            return JSONResponse(logo)
+
+        if filename == "index.json":
+            merged = _merged_index(data_dir, filename)
+            if merged is None:
+                raise HTTPException(status_code=404, detail="Not found")
+            return JSONResponse(merged)
+
+        if filename.startswith("index.") and filename.endswith(".json") and filename != "index.json":
+            official = _load_json(os.path.join(official_dir, filename))
+            if not isinstance(official, list):
+                raise HTTPException(status_code=404, detail="Not found")
+            ours = _load_json(os.path.join(templates_dir(), "index.json"))
+            ours_list = ours if isinstance(ours, list) else []
+            return JSONResponse(ours_list + official)
+
         extension = os.path.splitext(filename)[1].lower()
-        return FileResponse(path, media_type=_MEDIA_TYPES.get(extension, "application/octet-stream"))
+
+        path = os.path.join(templates_dir(), filename)
+        source = "packaged" if os.path.isfile(path) else None
+        if source is None:
+            official_path = os.path.join(official_dir, filename)
+            if os.path.isfile(official_path):
+                path = official_path
+                source = "official"
+
+        if source is None:
+            raise HTTPException(status_code=404, detail="Not found")
+
+        media_type = _MEDIA_TYPES.get(extension, "application/octet-stream")
+
+        if source == "official" and extension == ".json":
+            workflow = _load_json(path)
+            if isinstance(workflow, dict):
+                return JSONResponse(_strip_download_metadata(workflow))
+
+        return FileResponse(path, media_type=media_type)
 
     return r
