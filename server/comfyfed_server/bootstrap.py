@@ -1,0 +1,72 @@
+"""First-run install wizard: bilingual prompts, random admin password, settings persistence."""
+
+from __future__ import annotations
+
+import os
+import secrets
+from dataclasses import dataclass
+
+from . import db, i18n, security
+
+_DB_FILENAME = "comfyfed.db"
+
+_ADMIN_PASSWORD_HASH_KEY = "admin_password_hash"
+_PLATFORM_URL_KEY = "platform_url"
+_LANG_KEY = "lang"
+
+
+@dataclass
+class InstallResult:
+    admin_password: str | None
+    first_run: bool
+
+
+def _is_installed(session) -> bool:
+    return session.get(db.Setting, _ADMIN_PASSWORD_HASH_KEY) is not None
+
+
+def ensure_installed(
+    data_dir: str,
+    lang: str | None,
+    url: str | None,
+    interactive: bool,
+) -> InstallResult:
+    """Ensure the server is installed: on first run, generate credentials and platform keys.
+
+    Non-first runs are a no-op and return first_run=False with admin_password=None.
+    """
+    db.init_db(os.path.join(data_dir, _DB_FILENAME))
+
+    with db.get_session() as session:
+        if _is_installed(session):
+            return InstallResult(admin_password=None, first_run=False)
+
+        if interactive:
+            print(i18n.t("install.choose_lang", "zh-TW") + " / " + i18n.t("install.choose_lang", "en"))
+            chosen_lang = input().strip() or "en"
+            lang = chosen_lang or lang
+
+            print(i18n.t("install.enter_url", lang))
+            entered_url = input().strip()
+            url = entered_url or url
+
+        lang = lang or "en"
+        url = url or ""
+
+        # Platform Ed25519 keys, generated and persisted on first install.
+        security.load_platform_keys(data_dir)
+
+        admin_password = secrets.token_urlsafe(12)
+        admin_password_hash = security.hash_password(admin_password)
+
+        session.add(db.Setting(key=_ADMIN_PASSWORD_HASH_KEY, value=admin_password_hash))
+        session.add(db.Setting(key=_PLATFORM_URL_KEY, value=url))
+        session.add(db.Setting(key=_LANG_KEY, value=lang))
+        session.commit()
+
+        if interactive:
+            print(i18n.t("install.admin_password_notice", lang))
+            print(admin_password)
+            print(i18n.t("install.done", lang))
+
+        return InstallResult(admin_password=admin_password, first_run=True)
