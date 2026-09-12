@@ -202,7 +202,15 @@ def test_job_done_sends_executed_then_executing_none_then_status(client):
             assert executed["data"]["node"] == "2"
             assert executed["data"]["display_node"] == "2"
             assert executed["data"]["output"] == {
-                "2": {"images": [{"filename": "out_00001_.png", "subfolder": "", "type": "output"}]}
+                "2": {
+                    "images": [
+                        {
+                            "filename": "out_00001_.png",
+                            "subfolder": job_id,
+                            "type": "output",
+                        }
+                    ]
+                }
             }
 
             completion = ws.receive_json()

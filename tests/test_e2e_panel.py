@@ -223,11 +223,19 @@ def test_panel_drives_a_job_end_to_end(server, tmp_path):
     assert entry_body["status"]["completed"] is True
     # Keyed by the SaveImage node's id, which is what the frontend looks up.
     assert entry_body["outputs"]["9"]["images"] == [
-        {"filename": ARTIFACT_NAME, "subfolder": "", "type": "output"}
+        {"filename": ARTIFACT_NAME, "subfolder": prompt_id, "type": "output"}
     ]
 
+    # The frontend round-trips `subfolder` straight out of history, which is
+    # what scopes the lookup to this job.
+    image = entry_body["outputs"]["9"]["images"][0]
     view = server.get(
-        "/comfy/api/view", params={"filename": ARTIFACT_NAME, "type": "output", "subfolder": ""}
+        "/comfy/api/view",
+        params={
+            "filename": image["filename"],
+            "type": image["type"],
+            "subfolder": image["subfolder"],
+        },
     )
     assert view.status_code == 200
     assert view.content == ARTIFACT_BYTES

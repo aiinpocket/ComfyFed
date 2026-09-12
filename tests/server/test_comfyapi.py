@@ -144,6 +144,34 @@ def test_object_info_no_online_workers_returns_empty_with_header(client):
     assert r.headers.get("X-ComfyFed-No-Workers") == "1"
 
 
+def test_object_info_reports_source_worker_count_in_a_header(client):
+    """M5: how many workers the union came from, without polluting the body.
+
+    The body has to stay a plausible ComfyUI `/object_info` -- the stock
+    frontend turns every top-level key into a node -- so the count rides in a
+    response header instead. It is what lets a caller warn that a graph mixing
+    nodes from different workers may submit but never be dispatchable.
+    """
+    csrf = _login(client)
+    _register_worker(client, csrf, "w1", object_info={"KSampler": {}})
+    _register_worker(client, csrf, "w2", object_info={"LoadImage": {}})
+    # Neither of these contributes, so neither is counted.
+    _register_worker(client, csrf, "w3", status="offline", object_info={"OfflineOnly": {}})
+    _register_worker(client, csrf, "w4", disabled=True, object_info={"DisabledOnly": {}})
+
+    r = client.get("/comfy/api/object_info")
+    assert r.status_code == 200
+    assert r.headers["X-ComfyFed-Worker-Count"] == "2"
+    assert set(r.json()) == {"KSampler", "LoadImage"}
+
+
+def test_object_info_worker_count_is_zero_with_no_workers(client):
+    _login(client)
+    r = client.get("/comfy/api/object_info")
+    assert r.headers["X-ComfyFed-Worker-Count"] == "0"
+    assert r.headers["X-ComfyFed-No-Workers"] == "1"
+
+
 def test_object_info_cache_invalidates_when_worker_hash_changes(client):
     csrf = _login(client)
     worker_id = _register_worker(client, csrf, "w1", object_info={"NodeA": {}})
@@ -257,9 +285,15 @@ def test_history_shape_for_done_job(client):
     assert len(entry["prompt"]) == 5
     assert entry["prompt"][1] == prompt_id
     assert entry["prompt"][2] == SIMPLE_PROMPT
-    # Outputs keyed by the workflow's SaveImage node id.
+    # Outputs keyed by the workflow's SaveImage node id; `subfolder` carries
+    # the owning job id so a recycled ComfyUI filename still resolves to THIS
+    # job's bytes when the frontend round-trips it into /view.
     assert entry["outputs"] == {
-        "2": {"images": [{"filename": "out_00001_.png", "subfolder": "", "type": "output"}]}
+        "2": {
+            "images": [
+                {"filename": "out_00001_.png", "subfolder": prompt_id, "type": "output"}
+            ]
+        }
     }
     assert entry["status"]["status_str"] == "success"
     assert entry["status"]["completed"] is True
@@ -313,6 +347,94 @@ def test_view_streams_a_done_jobs_artifact(client):
     r = client.get("/comfy/api/view?filename=out.png")
     assert r.status_code == 200
     assert r.content == b"IMGDATA"
+
+
+def test_view_scopes_a_colliding_filename_to_its_own_job(client):
+    """C2: ComfyUI's default output names recur across jobs constantly.
+
+    Every worker numbers `ComfyUI_00001_.png` from its own counter, so two
+    unrelated jobs routinely produce the identical filename. The global
+    newest-first scan served the most recent job's bytes for EVERY history
+    entry with that name; the fix is `subfolder` = the owning job id, which
+    the frontend round-trips out of history into its /view call.
+    """
+    csrf = _login(client)
+    name = "ComfyUI_00001_.png"
+
+    job1 = _post_prompt(client).json()["prompt_id"]
+    _finish_job(client, csrf, job1, result_files=[name], artifact_bytes=b"FIRST-JOB-BYTES")
+    job2 = _post_prompt(client).json()["prompt_id"]
+    _finish_job(client, csrf, job2, result_files=[name], artifact_bytes=b"SECOND-JOB-BYTES")
+
+    # The old job's history entry hands the frontend everything it needs.
+    entry = client.get(f"/comfy/api/history/{job1}").json()[job1]
+    image = next(iter(entry["outputs"].values()))["images"][0]
+    assert image["subfolder"] == job1
+
+    r = client.get(
+        "/comfy/api/view",
+        params={
+            "filename": image["filename"],
+            "type": image["type"],
+            "subfolder": image["subfolder"],
+        },
+    )
+    assert r.status_code == 200
+    assert r.content == b"FIRST-JOB-BYTES"
+
+    # ...and the newer job still resolves to its own bytes.
+    r2 = client.get(
+        "/comfy/api/view", params={"filename": name, "type": "output", "subfolder": job2}
+    )
+    assert r2.status_code == 200
+    assert r2.content == b"SECOND-JOB-BYTES"
+
+
+def test_view_with_unknown_subfolder_job_is_404(client):
+    csrf = _login(client)
+    prompt_id = _post_prompt(client).json()["prompt_id"]
+    _finish_job(client, csrf, prompt_id, result_files=["out.png"])
+
+    r = client.get(
+        "/comfy/api/view",
+        params={"filename": "out.png", "type": "output", "subfolder": "no-such-job"},
+    )
+    assert r.status_code == 404
+
+
+def test_view_with_subfolder_not_owning_the_file_is_404(client):
+    """A job id that exists but never produced this filename must not serve it."""
+    csrf = _login(client)
+    job1 = _post_prompt(client).json()["prompt_id"]
+    _finish_job(client, csrf, job1, result_files=["mine.png"], artifact_bytes=b"MINE")
+    job2 = _post_prompt(client).json()["prompt_id"]
+    _finish_job(client, csrf, job2, result_files=["other.png"], artifact_bytes=b"OTHER")
+
+    r = client.get(
+        "/comfy/api/view",
+        params={"filename": "mine.png", "type": "output", "subfolder": job2},
+    )
+    assert r.status_code == 404
+
+
+def test_view_subfolder_traversal_is_rejected(client):
+    _login(client)
+    r = client.get(
+        "/comfy/api/view",
+        params={"filename": "out.png", "type": "output", "subfolder": "../../etc"},
+    )
+    assert r.status_code == 400
+
+
+def test_view_without_subfolder_still_resolves_legacy_links(client):
+    """The empty-subfolder global scan stays as a fallback for older links."""
+    csrf = _login(client)
+    prompt_id = _post_prompt(client).json()["prompt_id"]
+    _finish_job(client, csrf, prompt_id, result_files=["legacy.png"], artifact_bytes=b"LEGACY")
+
+    r = client.get("/comfy/api/view", params={"filename": "legacy.png"})
+    assert r.status_code == 200
+    assert r.content == b"LEGACY"
 
 
 def test_view_unknown_filename_404(client):

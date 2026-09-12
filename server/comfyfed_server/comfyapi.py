@@ -76,6 +76,16 @@ _SETTINGS_FILENAME = "comfy_settings.json"
 # agentws's convention for its own agent socket.
 _CLOSE_UNAUTHORIZED = 4401
 
+# How many workers contributed to the `/object_info` union, reported as a
+# response header rather than mixed into the body. The body has to stay a
+# byte-for-byte plausible ComfyUI `/object_info` -- the stock frontend
+# iterates it and builds a node for every key, so any ComfyFed-specific entry
+# would materialise as a bogus node in the palette, and any extra field on a
+# node def risks tripping its schema handling. A header is invisible to the
+# frontend and readable by anything of ours that wants to explain "these
+# nodes come from N workers, and a graph mixing them may be undispatchable".
+_WORKER_COUNT_HEADER = "X-ComfyFed-Worker-Count"
+
 
 def staging_dir(data_dir: str) -> str:
     return os.path.join(data_dir, _STAGING_DIRNAME)
@@ -191,6 +201,17 @@ def job_outputs(job: db.Job) -> dict:
     Shared by `_history_entry` (`GET /history`) and `panelws.job_done` (the
     WS `executed` event), so a done job's outputs can never drift between the
     two surfaces. Empty until the job has result files.
+
+    `subfolder` carries the JOB ID, which is what makes an old history entry
+    still resolvable. ComfyUI names outputs from a node-side prefix
+    (`ComfyUI_00001_.png`), and every worker in a federation numbers from its
+    own counter -- so the same filename recurs across jobs constantly. The
+    frontend round-trips `subfolder` verbatim from history into its `/view`
+    call, and `/view` reads it back as the owning job (see the route), so a
+    filename collision resolves to the right bytes instead of whichever job
+    finished most recently. Upstream uses the same field for the same
+    purpose (its outputs live under `output/<subfolder>/`), so this is a
+    shape the stock frontend already handles -- no client change needed.
     """
     files = _result_files(job)
     if not files:
@@ -200,7 +221,7 @@ def job_outputs(job: db.Job) -> dict:
     return {
         key: {
             "images": [
-                {"filename": name, "subfolder": "", "type": "output"} for name in files
+                {"filename": name, "subfolder": job.id, "type": "output"} for name in files
             ]
         }
     }
@@ -270,7 +291,10 @@ def create_router(
             fleet = _online_worker_hashes(session)
 
         if not fleet:
-            return JSONResponse(content={}, headers={"X-ComfyFed-No-Workers": "1"})
+            return JSONResponse(
+                content={},
+                headers={"X-ComfyFed-No-Workers": "1", _WORKER_COUNT_HEADER: "0"},
+            )
 
         key = frozenset(fleet)
         cached = _object_info_cache.get(key)
@@ -288,7 +312,9 @@ def create_router(
             _object_info_cache[key] = merged
             cached = merged
 
-        return JSONResponse(content=cached)
+        return JSONResponse(
+            content=cached, headers={_WORKER_COUNT_HEADER: str(len(fleet))}
+        )
 
     @r.post("/prompt")
     async def post_prompt(request: Request) -> Response:
@@ -417,12 +443,11 @@ def create_router(
         except ValueError:
             return Response(status_code=400)
 
-        if subfolder:
-            # ComfyFed artifacts are flat under their job; a subfolder can only
-            # ever be a traversal attempt or a request we cannot satisfy.
-            return Response(status_code=404)
-
         if type == "input":
+            # The staging area is genuinely flat, so a subfolder there can
+            # only be a traversal attempt or a request we cannot satisfy.
+            if subfolder:
+                return Response(status_code=404)
             path = os.path.join(staging_dir(data_dir), safe_name)
             if not os.path.isfile(path):
                 return Response(status_code=404)
@@ -432,19 +457,37 @@ def create_router(
         if type != "output":
             return Response(status_code=404)
 
-        with db.get_session() as session:
-            candidates = (
-                session.query(db.Job)
-                .filter(db.Job.status == "done")
-                .order_by(db.Job.finished_at.desc(), db.Job.created_at.desc())
-                .all()
-            )
-            job_id = next(
-                (job.id for job in candidates if safe_name in _result_files(job)), None
-            )
+        if subfolder:
+            # The modern path: `subfolder` is the owning job id, as emitted by
+            # `job_outputs` and round-tripped by the frontend out of history.
+            # It is what disambiguates ComfyUI's recycled default output names
+            # (`ComfyUI_00001_.png`) across jobs -- without it an old history
+            # entry would be served whichever job most recently produced a
+            # file of that name.
+            try:
+                job_id = storage.sanitize_path_component(subfolder, what="subfolder")
+            except ValueError:
+                return Response(status_code=400)
+            with db.get_session() as session:
+                job = session.get(db.Job, job_id)
+                if job is None or safe_name not in _result_files(job):
+                    return Response(status_code=404)
+        else:
+            # Legacy fallback for links minted before outputs carried a
+            # subfolder: scan done jobs newest-first for the filename.
+            with db.get_session() as session:
+                candidates = (
+                    session.query(db.Job)
+                    .filter(db.Job.status == "done")
+                    .order_by(db.Job.finished_at.desc(), db.Job.created_at.desc())
+                    .all()
+                )
+                job_id = next(
+                    (job.id for job in candidates if safe_name in _result_files(job)), None
+                )
 
-        if job_id is None:
-            return Response(status_code=404)
+            if job_id is None:
+                return Response(status_code=404)
 
         store = storage.get_store(data_dir)
         try:
