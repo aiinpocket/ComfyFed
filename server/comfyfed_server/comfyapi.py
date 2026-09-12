@@ -686,6 +686,14 @@ def create_router(
     def global_subgraphs() -> Response:
         return JSONResponse(content={})
 
+    @r.get("/folder_paths")
+    def folder_paths() -> Response:
+        # The missing-model locate-flow calls this to suggest which folder a
+        # model might belong in; there are no model folders on the platform
+        # (models live on the workers), so an empty dict -- no suggestions --
+        # is the truthful answer, same rationale as `/models` above.
+        return JSONResponse(content={})
+
     @r.get("/system_stats")
     def system_stats() -> Response:
         """Upstream's shape, filled in for a platform that owns no GPU.
@@ -797,10 +805,18 @@ def create_ws_router() -> APIRouter:
             await websocket.send_json(
                 {"type": "status", "data": {"status": panelws.queue_status(), "sid": sid}}
             )
+            # Right after the initial status: the pinned frontend gates a
+            # handful of UI affordances on these, and answering unprompted
+            # (rather than waiting for a request) matches upstream's own
+            # connect behavior. See `panelws.FEATURE_FLAGS` for what each
+            # one means and why every one of them is false here.
+            await websocket.send_json({"type": "feature_flags", "data": panelws.FEATURE_FLAGS})
             while True:
-                # The panel client only ever listens; any inbound message (or
-                # the disconnect it eventually raises) just keeps this
-                # coroutine alive until the connection ends.
+                # The panel client only ever listens; any inbound message --
+                # including the `feature_flags` frame the frontend announces
+                # its own capabilities with on open -- is simply discarded
+                # here, same as everything else. The disconnect this
+                # eventually raises just ends the loop.
                 await websocket.receive_text()
         except WebSocketDisconnect:
             pass

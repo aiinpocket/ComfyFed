@@ -615,6 +615,7 @@ def test_prompt_copies_staged_asset_into_job_inputs(client):
         ("/comfy/api/models", []),
         ("/comfy/api/i18n", {}),
         ("/comfy/api/global_subgraphs", {}),
+        ("/comfy/api/folder_paths", {}),
     ],
 )
 def test_bootstrap_routes_return_the_empty_upstream_shape(client, path, expected):
