@@ -18,11 +18,28 @@ _ARTIFACTS_DIRNAME = "artifacts"
 _ARTIFACT_STORE_SETTING_KEY = "artifact_store"
 
 
+def _sanitize_path_component(value: str, *, what: str) -> str:
+    """Reduce `value` to a single, safe path segment.
+
+    Rejects empty strings, `.`/`..`, and anything containing a path
+    separator (including a disguised traversal like `../../etc/passwd`,
+    whose basename would otherwise be accepted as `passwd`). Idempotent:
+    sanitizing an already-sanitized value returns it unchanged.
+    """
+    if not value:
+        raise ValueError(f"Invalid {what}: {value!r}")
+    base = os.path.basename(value)
+    if base != value or base in ("", ".", ".."):
+        raise ValueError(f"Invalid {what}: {value!r}")
+    return base
+
+
 def _sanitize_filename(filename: str) -> str:
-    name = os.path.basename(filename or "")
-    if not name or name in (".", ".."):
-        raise ValueError(f"Invalid artifact filename: {filename!r}")
-    return name
+    return _sanitize_path_component(filename or "", what="artifact filename")
+
+
+def _sanitize_job_id(job_id: str) -> str:
+    return _sanitize_path_component(job_id or "", what="job id")
 
 
 class ArtifactStore(ABC):
@@ -48,8 +65,9 @@ class LocalStore(ArtifactStore):
         self._base_dir = base_dir
 
     def _path(self, job_id: str, filename: str) -> str:
+        job = _sanitize_job_id(job_id)
         name = _sanitize_filename(filename)
-        return os.path.join(self._base_dir, _ARTIFACTS_DIRNAME, job_id, name)
+        return os.path.join(self._base_dir, _ARTIFACTS_DIRNAME, job, name)
 
     def put(self, job_id: str, filename: str, stream: BinaryIO) -> str:
         name = _sanitize_filename(filename)
@@ -65,8 +83,9 @@ class LocalStore(ArtifactStore):
         return open(path, "rb")
 
     def url(self, job_id: str, filename: str) -> str:
+        job = _sanitize_job_id(job_id)
         name = _sanitize_filename(filename)
-        return f"/api/jobs/{job_id}/artifacts/{name}"
+        return f"/api/jobs/{job}/artifacts/{name}"
 
 
 def get_store(data_dir: str) -> ArtifactStore:

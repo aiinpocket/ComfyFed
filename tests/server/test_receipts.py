@@ -132,6 +132,44 @@ def test_artifact_download_requires_admin(client):
     assert missing.json()["error"]["code"] == "jobs.artifact_not_found"
 
 
+def test_store_rejects_path_traversal_job_id(client):
+    store = storage.get_store(client.data_dir)
+
+    # Directly exercising the store: job_id=".." must never be accepted, even
+    # though a bare os.path.basename(".") pass-through would collapse it to
+    # "<data_dir>/<filename>" and expose files like keys/platform.key.
+    with pytest.raises(ValueError):
+        store.open("..", "platform.key")
+    with pytest.raises(ValueError):
+        store.put("..", "platform.key", io.BytesIO(b"pwned"))
+    with pytest.raises(ValueError):
+        store.url("..", "platform.key")
+
+    # keys/platform.key must genuinely exist (proves this isn't a vacuous check).
+    _, _ = security.load_platform_keys(client.data_dir)
+
+
+def test_artifact_download_rejects_path_traversal_job_id_over_http(client):
+    csrf = _login(client)
+    # Force the real platform key to exist so a traversal attempt has a real
+    # target to read if the sanitization regresses.
+    security.load_platform_keys(client.data_dir)
+
+    # Percent-encode the ".." segment so httpx doesn't normalize it away
+    # client-side before the request is even sent.
+    res = client.get("/api/jobs/%2e%2e/artifacts/platform.key", headers={"X-CSRF": csrf})
+    assert res.status_code == 404
+    assert res.json()["error"]["code"] == "jobs.not_found"
+    assert res.headers["content-type"].startswith("application/json")  # never leaked raw key bytes
+
+
+def test_artifact_download_404s_for_nonexistent_job(client):
+    csrf = _login(client)
+    res = client.get("/api/jobs/no-such-job/artifacts/out.png", headers={"X-CSRF": csrf})
+    assert res.status_code == 404
+    assert res.json()["error"]["code"] == "jobs.not_found"
+
+
 def test_job_done_creates_dual_signed_receipt_over_ws(client):
     csrf = _login(client)
     worker_id, sk = _register_worker_with_key(client, csrf, "w1")

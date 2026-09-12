@@ -222,6 +222,11 @@ def create_router(data_dir: str) -> APIRouter:
 
     @r.get("/api/jobs/{job_id}/artifacts/{filename}")
     def get_job_artifact(job_id: str, filename: str, _payload: dict = Depends(auth.require_admin)):
+        with db.get_session() as session:
+            job = session.get(db.Job, job_id)
+            if job is None:
+                raise _error(404, "jobs.not_found", "Job not found.")
+
         store = storage.get_store(data_dir)
         try:
             f = store.open(job_id, filename)
