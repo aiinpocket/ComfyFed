@@ -267,6 +267,92 @@ def _online_worker_hashes(session) -> list[tuple[str, str]]:
     return [(w.id, w.object_info_hash or "") for w in rows]
 
 
+def staged_image_names(data_dir: str) -> list[str]:
+    """Sorted filenames currently sitting in the panel's staging directory."""
+    try:
+        staging = staging_dir(data_dir)
+        return sorted(
+            name for name in os.listdir(staging)
+            if os.path.isfile(os.path.join(staging, name))
+        )
+    except OSError:
+        return []
+
+
+def _merge_options(spec: list, names: list[str]) -> Optional[list]:
+    """Return a copy of a combo input spec with `names` merged into its options.
+
+    `/object_info` writes a combo two different ways and both turn up in the
+    same fleet: the historical `[[option, ...], config]` and the newer
+    `["COMBO", {"options": [...], ...}]`. Returns None when `spec` is neither,
+    so the caller can leave an input it does not understand untouched.
+    """
+    if not isinstance(spec, list) or not spec:
+        return None
+
+    if isinstance(spec[0], list):
+        existing = spec[0]
+        merged = existing + [n for n in names if n not in existing]
+        return [merged, *spec[1:]]
+
+    if spec[0] == "COMBO" and len(spec) > 1 and isinstance(spec[1], dict):
+        config = spec[1]
+        existing = config.get("options")
+        if not isinstance(existing, list):
+            return None
+        merged = existing + [n for n in names if n not in existing]
+        return [spec[0], {**config, "options": merged}, *spec[2:]]
+
+    return None
+
+
+def _with_staged_images(object_info: dict, names: list[str]) -> dict:
+    """Offer every staged filename in the `image` dropdown of upload nodes.
+
+    A worker's `/object_info` lists the images sitting in ITS OWN ComfyUI
+    `input/` folder, which is not where a panel upload lands -- ComfyFed
+    stages uploads centrally and copies them into a job at submit time. So
+    without this the dropdown of a `LoadImage` in one of our templates would
+    be empty (or, worse, list some worker's unrelated leftovers) and the
+    packaged `amyntas_ref.png` would be unselectable even though `/prompt`
+    resolves it perfectly well.
+
+    "Upload node" is detected the way ComfyUI itself marks one: a required
+    `image` input whose config carries `image_upload`. That catches
+    `LoadImage`, `LoadImageMask` and any custom node following the same
+    convention, without hard-coding a class list.
+
+    Node defs are copied on write, because the caller's dict is the shared
+    `/object_info` union cache.
+    """
+    if not names or not isinstance(object_info, dict):
+        return object_info
+
+    result = object_info
+    for node_name, node_def in object_info.items():
+        if not isinstance(node_def, dict):
+            continue
+        required = node_def.get("input", {}).get("required") if isinstance(node_def.get("input"), dict) else None
+        if not isinstance(required, dict):
+            continue
+        spec = required.get("image")
+        if not isinstance(spec, list) or len(spec) < 2 or not isinstance(spec[1], dict):
+            continue
+        if not spec[1].get("image_upload"):
+            continue
+        merged = _merge_options(spec, names)
+        if merged is None or merged == spec:
+            continue
+        if result is object_info:
+            result = dict(object_info)
+        patched_def = dict(node_def)
+        patched_input = dict(patched_def["input"])
+        patched_input["required"] = {**required, "image": merged}
+        patched_def["input"] = patched_input
+        result[node_name] = patched_def
+    return result
+
+
 def create_router(
     data_dir: str,
     resolve_asset: Optional[Callable[[str], Optional[str]]] = None,
@@ -313,8 +399,20 @@ def create_router(
             cached = merged
 
         return JSONResponse(
-            content=cached, headers={_WORKER_COUNT_HEADER: str(len(fleet))}
+            content=_with_staged_images(cached, staged_image_names(data_dir)),
+            headers={_WORKER_COUNT_HEADER: str(len(fleet))},
         )
+
+    @r.get("/workflow_templates")
+    def workflow_templates() -> Response:
+        """Custom-node template map -- always empty for ComfyFed.
+
+        The frontend's template browser calls this FIRST and only fetches the
+        core `templates/index.json` (which is where our library lives, see
+        `templates.py`) once it resolves. A 404 here would leave the browser
+        empty, so the route exists purely to say "no custom-node packs".
+        """
+        return JSONResponse(content={})
 
     @r.post("/prompt")
     async def post_prompt(request: Request) -> Response:

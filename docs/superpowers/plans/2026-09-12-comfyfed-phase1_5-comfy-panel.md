@@ -54,3 +54,10 @@
 - agent 清除：job 結束（成功或失敗）後一律刪除本次 job 的 agent 端暫存（下載的 input assets 副本、/view 拉回的輸出副本）；AgentConfig 新增選填 `comfy_output_dir: str|None`、`comfy_input_dir: str|None`（load/save），有設定時：成功且雜湊確認後，刪 ComfyUI output 目錄中本次 job 的輸出檔（依 history 的 filename/subfolder 組路徑，只刪確認存在且屬於本次的檔）與 input 目錄中本次上傳的 asset 檔；未設定→略過並 log。清除動作 defensive try/except，絕不因清除失敗影響 job_done 回報。
 - 測試：上傳附錯 hash→400 且 agent 重試；正確流程 result_hashes 落庫＋回應 hash；agent 暫存清除（mock 檔案存在→job 後不存在）；comfy_output_dir 設定時對應檔被刪、未設定時不動。README 兩語：磁碟清理段。
 - Spec §7 worker 端執行 bullet 同步補述。
+
+### Task 7: 範本庫＋成功案例打包＋畫布註解（使用者定案 2026-09-12）
+- 平台成為前端範本瀏覽器的供應端：先確認 bundle 取範本的機制（frontend assets 內對 workflow_templates 與 templates/index.json 的抓取路徑），平台在對應路徑 serve 我方範本包（index.json＋各範本 UI 格式 workflow JSON＋webp 縮圖），admin session 保護同 /comfy。
+- 範本三支（皆為實戰驗證過的圖）：①wuxia-t2i（flux 文生圖）②character-portrait（flux 角色立繪）③ref2v-video（MiniMax H3 參考圖生影片，源自 make_film.py 的 turbo 8-step ref 圖——controller 定案：novice 範本以 turbo 縮短生成時間）。每支含 Note/MarkdownNote 便條與群組框，逐步雙語說明「這個節點在做什麼、novice 該改哪裡」。
+- 素材隨範本：amyntas_ref.png 打包進 server package data；create_app 時 seed 進 data/comfy_staging；/comfy/api/object_info 回應後處理：把 staging 現有檔名注入 LoadImage 的 image 欄位 options（聯集、去重），使範本的 LoadImage 下拉即選即用；送單走既有 resolve_asset 管線。
+- 縮圖：用實際成品（panel_verify.png、電影 QC 幀）轉 webp。
+- 測試：範本路由 serve index/JSON/縮圖＋未登入擋；object_info 注入 staging 檔名；template workflow JSON 結構 sanity（nodes 含 Note、引用素材=打包素材名）；wheel package-data 打包驗證。README 兩語新增「範本」段。
