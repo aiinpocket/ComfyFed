@@ -7,6 +7,7 @@ import gzip
 import hashlib
 import json
 import logging
+import ntpath
 import os
 import time
 from typing import Optional
@@ -143,43 +144,81 @@ class PlatformConnection:
 
 
 def _is_safe_relative_path(path: str) -> bool:
-    """True if `path` (a ComfyUI filename or subfolder) is safe to join onto a
-    configured base directory: not absolute and with no `..` component.
+    """True if `path` is a non-empty relative path segment safe to join onto
+    a configured base directory: no absolute form (in ANY sense) and no `..`
+    traversal component.
 
-    ComfyUI-reported names are not attacker-controlled in the usual sense
-    (they come back from our own local ComfyUI's history/`/view`), but a
-    malformed or unexpected value here must never turn into a delete outside
-    `comfy_output_dir`/`comfy_input_dir` -- so this is checked unconditionally
-    before any `os.remove`.
+    `filename`/`subfolder` ultimately derive from workflow content (a
+    SaveImage node's `filename_prefix`, echoed back by ComfyUI's history) --
+    i.e. this is workflow-influenced input feeding a DELETE, not merely our
+    own local ComfyUI's say-so. A naive `os.path.isabs` check is not enough
+    on Windows: `os.path.isabs("C:foo")` is False (it's drive-*relative*, not
+    absolute) yet `os.path.join(base, "C:foo")` silently discards `base`
+    entirely and resolves against drive C's current directory; `"/etc/passwd"`
+    is also not `os.path.isabs` on Windows (no drive letter) but still joins
+    to the root of whichever drive `base` lives on. So every one of these is
+    rejected explicitly, not just POSIX-style `..` traversal -- and this is
+    only the first of two independent checks; `_safe_remove_under` also
+    verifies the final resolved path is still under `base_dir` before
+    deleting anything.
     """
     if not path:
-        return True
+        return False
     if os.path.isabs(path):
         return False
-    return ".." not in path.replace("\\", "/").split("/")
+    if ntpath.splitdrive(path)[0]:
+        return False
+    if path.startswith("/") or path.startswith("\\"):
+        return False
+    normalized = path.replace("\\", "/")
+    if ".." in normalized.split("/"):
+        return False
+    return True
 
 
-def _safe_remove_under(base_dir: str, *components: str) -> None:
-    """Best-effort delete of `base_dir/<components>`, refusing unsafe paths.
+def _safe_remove_under(base_dir: str, filename: str, subfolder: str = "") -> None:
+    """Best-effort delete of `base_dir/<subfolder>/<filename>`, refusing unsafe paths.
 
-    Never raises: a path that fails the safety check or a file that no
-    longer exists is logged and skipped, and any OS-level failure (permission
+    Two independent layers, mirroring `storage.sanitize_path_component`'s
+    sanitize-then-verify approach for artifact paths: (1) `filename` and any
+    non-empty `subfolder` must each pass `_is_safe_relative_path`; (2) even
+    so, the joined path is resolved with `os.path.realpath` and confirmed to
+    still fall strictly under `os.path.realpath(base_dir)` (via
+    `os.path.commonpath`) before anything is removed -- belt and suspenders
+    against a component that slips past (1) in some case not yet enumerated,
+    or a symlink planted inside `base_dir`.
+
+    Never raises: a path that fails either check, or a file that no longer
+    exists, is logged and skipped, and any OS-level failure (permission
     denied, file in use) is caught and logged too. Cleanup must never be able
     to turn a successfully-reported job into a crashed one.
     """
-    for component in components:
-        if not _is_safe_relative_path(component):
-            logger.warning(
-                "runner: refusing to clean up unsafe path component %r under %s", component, base_dir
-            )
-            return
+    if not _is_safe_relative_path(filename):
+        logger.warning("runner: refusing to clean up unsafe filename %r under %s", filename, base_dir)
+        return
+    if subfolder and not _is_safe_relative_path(subfolder):
+        logger.warning("runner: refusing to clean up unsafe subfolder %r under %s", subfolder, base_dir)
+        return
 
-    path = os.path.join(base_dir, *(c for c in components if c))
+    candidate = os.path.join(base_dir, subfolder, filename) if subfolder else os.path.join(base_dir, filename)
+
+    base_real = os.path.realpath(base_dir)
+    candidate_real = os.path.realpath(candidate)
     try:
-        if os.path.isfile(path):
-            os.remove(path)
+        inside_base = os.path.commonpath([base_real, candidate_real]) == base_real
+    except ValueError:
+        # commonpath raises when the paths don't share a root (e.g. different
+        # drives on Windows) -- definitely not "under" the base dir either.
+        inside_base = False
+    if not inside_base:
+        logger.warning("runner: refusing to clean up path outside %s: %s", base_dir, candidate_real)
+        return
+
+    try:
+        if os.path.isfile(candidate_real):
+            os.remove(candidate_real)
     except OSError:
-        logger.exception("runner: failed to remove %s during job cleanup", path)
+        logger.exception("runner: failed to remove %s during job cleanup", candidate_real)
 
 
 def cleanup_job_files(
@@ -221,7 +260,7 @@ def cleanup_job_files(
 
     if comfy_output_dir:
         for item in output_files:
-            _safe_remove_under(comfy_output_dir, item.get("subfolder") or "", item.get("filename") or "")
+            _safe_remove_under(comfy_output_dir, item.get("filename") or "", item.get("subfolder") or "")
     else:
         logger.debug("runner: comfy_output_dir not configured, skipping worker output cleanup")
 

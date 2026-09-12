@@ -7,7 +7,7 @@ import pytest
 
 from comfyfed_agent import comfy, hardware, whitelist
 from comfyfed_agent.config import AgentConfig, PlatformEntry
-from comfyfed_agent.runner import AgentLoop, cleanup_job_files
+from comfyfed_agent.runner import AgentLoop, _is_safe_relative_path, cleanup_job_files
 from comfyfed_agent import runner as runner_module
 
 _real_whitelist_check = whitelist.check
@@ -421,6 +421,56 @@ def test_cleanup_job_files_refuses_path_traversal(tmp_path):
     )
 
     assert canary.exists()
+
+
+@pytest.mark.parametrize(
+    "unsafe",
+    ["C:evil", "/etc/passwd", "..\\x", "sub/../..", "..", "C:\\evil", "\\evil"],
+)
+def test_is_safe_relative_path_rejects_windows_and_traversal_escapes(unsafe):
+    assert _is_safe_relative_path(unsafe) is False
+
+
+def test_is_safe_relative_path_accepts_normal_nested_relative_path():
+    assert _is_safe_relative_path("subfolder/file.png") is True
+
+
+@pytest.mark.parametrize(
+    "unsafe_filename",
+    ["C:evil", "/etc/passwd", "..\\x", "sub/../.."],
+)
+def test_cleanup_job_files_refuses_hardened_traversal_and_drive_escapes(tmp_path, unsafe_filename):
+    output_dir = tmp_path / "output"
+    output_dir.mkdir()
+    canary = tmp_path / "canary.txt"
+    canary.write_bytes(b"do-not-delete")
+
+    cleanup_job_files(
+        success=True,
+        comfy_output_dir=str(output_dir),
+        comfy_input_dir=None,
+        output_files=[{"filename": unsafe_filename, "subfolder": ""}],
+        input_filenames=[],
+    )
+
+    assert canary.exists()
+
+
+def test_cleanup_job_files_still_deletes_normal_nested_output_path(tmp_path):
+    output_dir = tmp_path / "output"
+    (output_dir / "subfolder").mkdir(parents=True)
+    out_file = output_dir / "subfolder" / "file.png"
+    out_file.write_bytes(b"x")
+
+    cleanup_job_files(
+        success=True,
+        comfy_output_dir=str(output_dir),
+        comfy_input_dir=None,
+        output_files=[{"filename": "file.png", "subfolder": "subfolder"}],
+        input_filenames=[],
+    )
+
+    assert not out_file.exists()
 
 
 async def test_handle_job_cleans_up_comfy_output_dir_on_success(two_platform_loop, monkeypatch, tmp_path):
