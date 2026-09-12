@@ -8,6 +8,7 @@ import type { TFunction } from 'i18next';
  *   missing_models:A,B                (fetchable from a peer — soft)
  *   missing_models_unavailable:A,B    (nowhere in the federation — hard)
  *   vram:18.4>12                      (needs > has)
+ *   backend:cuda!=rocm                (override wanted != worker reports)
  *   override:min_vram_gb | override:min_free_disk_gb | override:gpu_name_contains
  */
 
@@ -57,6 +58,15 @@ export function parseReason(raw: string): ParsedReason {
           needed: formatGb(needed),
           available: formatGb(available),
         },
+        tone: 'error',
+      };
+    }
+
+    case 'backend': {
+      const [wanted, actual] = rest.split('!=');
+      return {
+        key: 'backend',
+        values: { wanted: wanted || '?', actual: actual || '?' },
         tone: 'error',
       };
     }

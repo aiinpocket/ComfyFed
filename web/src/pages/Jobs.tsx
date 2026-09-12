@@ -12,6 +12,7 @@ import {
   Group,
   Loader,
   NumberInput,
+  Select,
   SimpleGrid,
   Stack,
   Table,
@@ -36,6 +37,7 @@ import {
   IconDownload,
   IconFileUpload,
   IconInbox,
+  IconRefresh,
   IconSend,
   IconX,
 } from '@tabler/icons-react';
@@ -47,6 +49,7 @@ import {
   api,
   artifactUrl,
   type Assessment,
+  type Backend,
   type Job,
   type RequirementsOverride,
   type Worker,
@@ -108,7 +111,7 @@ export function Jobs() {
               description={t('jobs.empty_hint')}
             />
           ) : (
-            <JobsTable jobs={jobs} workers={workers} />
+            <JobsTable jobs={jobs} workers={workers} onChanged={refresh} />
           )}
         </Card>
       </Stack>
@@ -130,6 +133,7 @@ function SubmitPanel({ onSubmitted }: { onSubmitted: () => void }) {
   const [minVram, setMinVram] = useState<number | ''>('');
   const [minDisk, setMinDisk] = useState<number | ''>('');
   const [gpuContains, setGpuContains] = useState('');
+  const [backend, setBackend] = useState<string | null>(null);
   const [submitting, setSubmitting] = useState(false);
 
   // Re-parse whenever the pasted JSON changes; asset slots follow the parse.
@@ -176,6 +180,7 @@ function SubmitPanel({ onSubmitted }: { onSubmitted: () => void }) {
     if (minVram !== '') overrides.min_vram_gb = Number(minVram);
     if (minDisk !== '') overrides.min_free_disk_gb = Number(minDisk);
     if (gpuContains.trim()) overrides.gpu_name_contains = gpuContains.trim();
+    if (backend) overrides.backend = backend as Backend;
 
     const files = summary.assets
       .map((name) => assetFiles[name])
@@ -193,6 +198,7 @@ function SubmitPanel({ onSubmitted }: { onSubmitted: () => void }) {
       setMinVram('');
       setMinDisk('');
       setGpuContains('');
+      setBackend(null);
       setAdvancedOpen(false);
       onSubmitted();
     } catch (caught) {
@@ -371,6 +377,20 @@ function SubmitPanel({ onSubmitted }: { onSubmitted: () => void }) {
                 value={gpuContains}
                 onChange={(event) => setGpuContains(event.currentTarget.value)}
               />
+              <Select
+                label={t('jobs.backend')}
+                placeholder={t('jobs.auto')}
+                description={t('jobs.backend_hint')}
+                value={backend}
+                onChange={setBackend}
+                clearable
+                data={[
+                  { value: 'cuda', label: 'CUDA (NVIDIA)' },
+                  { value: 'rocm', label: 'ROCm (AMD)' },
+                  { value: 'mps', label: 'MPS (Apple)' },
+                  { value: 'cpu', label: 'CPU' },
+                ]}
+              />
             </SimpleGrid>
           </Collapse>
         </Box>
@@ -397,7 +417,61 @@ function SubmitPanel({ onSubmitted }: { onSubmitted: () => void }) {
 
 /* -------------------------------------------------------------- jobs table */
 
-function JobsTable({ jobs, workers }: { jobs: Job[]; workers: Worker[] }) {
+/** Requeue a failed job. Sits in the results cell of a failed row. */
+function RetryButton({ jobId, onRetried }: { jobId: string; onRetried: () => void }) {
+  const { t } = useTranslation();
+  const [busy, setBusy] = useState(false);
+
+  const retry = async (event: React.MouseEvent) => {
+    event.stopPropagation();
+    setBusy(true);
+    try {
+      await api.retryJob(jobId);
+      notifications.show({
+        color: 'teal',
+        icon: <IconCheck size={16} />,
+        title: t('jobs.retry_success'),
+        message: jobId,
+      });
+      onRetried();
+    } catch (caught) {
+      notifications.show({
+        color: 'red',
+        icon: <IconX size={16} />,
+        title: t('jobs.retry_failed'),
+        message:
+          caught instanceof ApiError
+            ? t(`errors.${caught.code}`, { defaultValue: caught.message })
+            : t('errors.network'),
+      });
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  return (
+    <Button
+      size="compact-xs"
+      variant="light"
+      color="federation"
+      loading={busy}
+      leftSection={<IconRefresh size={13} />}
+      onClick={retry}
+    >
+      {t('jobs.retry')}
+    </Button>
+  );
+}
+
+function JobsTable({
+  jobs,
+  workers,
+  onChanged,
+}: {
+  jobs: Job[];
+  workers: Worker[];
+  onChanged: () => void;
+}) {
   const { t } = useTranslation();
   const theme = useMantineTheme();
   const [expanded, setExpanded] = useState<string | null>(null);
@@ -469,7 +543,9 @@ function JobsTable({ jobs, workers }: { jobs: Job[]; workers: Worker[] }) {
                     </Tooltip>
                   </Table.Td>
                   <Table.Td>
-                    {job.result_files.length === 0 ? (
+                    {job.status === 'failed' ? (
+                      <RetryButton jobId={job.id} onRetried={onChanged} />
+                    ) : job.result_files.length === 0 ? (
                       <Text size="sm" c="dimmed">
                         —
                       </Text>

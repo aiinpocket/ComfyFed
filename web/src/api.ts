@@ -155,7 +155,7 @@ export interface Worker {
   model_count: number;
 }
 
-export type JobStatus = 'queued' | 'assigned' | 'running' | 'done' | 'failed' | 'canceled';
+export type JobStatus = 'queued' | 'assigned' | 'running' | 'done' | 'failed';
 
 export interface Job {
   id: string;
@@ -205,10 +205,19 @@ export interface Contribution {
   gpu_seconds: number;
 }
 
+/** Compute backends a job can be pinned to via the advanced override. */
+export type Backend = 'cuda' | 'rocm' | 'mps' | 'cpu';
+
 export interface RequirementsOverride {
   min_vram_gb?: number;
   min_free_disk_gb?: number;
   gpu_name_contains?: string;
+  backend?: Backend;
+}
+
+export interface SettingsUpdate {
+  platform_url?: string;
+  lang?: string;
 }
 
 /* -------------------------------------------------------------- endpoints */
@@ -278,6 +287,15 @@ export const api = {
     }
     for (const file of assets) form.append('assets', file, file.name);
     return postForm<{ job_id: string }>('/api/jobs', form);
+  },
+
+  /** Requeue a failed job. Rejects with `jobs.not_retryable` (409) otherwise. */
+  retryJob(jobId: string): Promise<{ ok: boolean; job_id: string }> {
+    return postJson(`/api/jobs/${encodeURIComponent(jobId)}/retry`, {});
+  },
+
+  updateSettings(update: SettingsUpdate): Promise<{ platform_url: string; lang: string }> {
+    return postJson('/api/settings', update);
   },
 
   contributions(from?: string, to?: string): Promise<Contribution[]> {

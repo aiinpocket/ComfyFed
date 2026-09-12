@@ -21,6 +21,7 @@
     "done": "Done",
     "copy": "Copy",
     "copied": "Copied",
+    "save": "Save",
     "never": "Never",
     "unknown": "Unknown"
   },
@@ -50,8 +51,7 @@
     "assigned": "Assigned",
     "running": "Running",
     "done": "Done",
-    "failed": "Failed",
-    "canceled": "Canceled"
+    "failed": "Failed"
   },
   "verdict": {
     "eligible": "Can run it",
@@ -64,6 +64,7 @@
     "missing_models": "Only missing model(s) {{items}} — waiting on model distribution.",
     "missing_models_unavailable": "Model(s) {{items}} are not available anywhere in the federation yet.",
     "vram": "Not enough VRAM: needs about {{needed}}, has {{available}}.",
+    "backend": "Wrong compute backend: the job asks for {{wanted}}, this worker runs {{actual}}.",
     "override_min_vram": "Does not meet the manual minimum-VRAM override.",
     "override_min_free_disk": "Does not meet the manual minimum-free-disk override.",
     "override_gpu_name": "GPU name does not match the manual override.",
@@ -117,6 +118,8 @@
     "min_vram": "Minimum VRAM",
     "min_disk": "Minimum free disk",
     "gpu_contains": "GPU name contains",
+    "backend": "Compute backend",
+    "backend_hint": "Pin the job to one backend.",
     "auto": "Automatic",
     "submit": "Submit job",
     "submit_success": "Job submitted",
@@ -136,7 +139,10 @@
     "assessment_error": "Could not load the assessment for this job.",
     "assessment_no_workers": "No workers to assess",
     "assessment_no_workers_hint": "Register at least one worker before this job can be dispatched.",
-    "est_vram": "Estimated VRAM: {{value}}"
+    "est_vram": "Estimated VRAM: {{value}}",
+    "retry": "Retry",
+    "retry_success": "Job requeued",
+    "retry_failed": "Could not retry this job"
   },
   "workers": {
     "title": "Workers",
@@ -189,7 +195,7 @@
     "title": "Settings",
     "subtitle": "Console and platform configuration.",
     "password_heading": "Admin password",
-    "password_hint": "Changing the password does not sign out existing sessions.",
+    "password_hint": "Changing the password signs out every session, including this one — you will need to sign in again.",
     "old_password": "Current password",
     "new_password": "New password",
     "confirm_password": "Confirm new password",
@@ -203,9 +209,15 @@
     "platform_heading": "Platform URL",
     "platform_hint": "The address workers connect back to. It is baked into every registration bundle.",
     "platform_unset": "Not configured",
-    "platform_change_hint": "Set during installation; re-run the server installer to change it.",
+    "platform_edit_label": "Change platform URL",
+    "platform_invalid": "Must start with http:// or https://.",
+    "platform_saved": "Platform URL updated",
+    "platform_saved_hint": "Registration bundles issued from now on will use the new address.",
+    "platform_save_failed": "Could not update the platform URL",
+    "platform_change_hint": "Workers already registered keep using the address they were given; re-issue a bundle to move them.",
     "language_heading": "Console language",
-    "language_hint": "Applies to this browser and is remembered for next time."
+    "language_hint": "Applies to this browser and becomes the server’s default language.",
+    "language_save_failed": "Could not save the default language"
   },
   "errors": {
     "auth.required": "Wrong password.",
@@ -217,6 +229,11 @@
     "jobs.bad_asset_name": "One of the attached files has an unusable name.",
     "jobs.not_found": "That job no longer exists.",
     "jobs.artifact_not_found": "That result file is no longer available.",
+    "jobs.not_retryable": "Only failed jobs can be retried.",
+    "settings.bad_platform_url": "The platform URL must start with http:// or https://.",
+    "settings.bad_lang": "That language is not supported.",
+    "reports.bad_date": "That date could not be read.",
+    "validation_error": "The server could not read that request.",
     "workers.not_found": "That worker no longer exists.",
     "http_error": "The server rejected the request.",
     "network": "Could not reach the server.",

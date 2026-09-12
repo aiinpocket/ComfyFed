@@ -8,12 +8,20 @@ import {
   SimpleGrid,
   Stack,
   Text,
+  TextInput,
   Tooltip,
   useMantineTheme,
 } from '@mantine/core';
 import { notifications } from '@mantine/notifications';
-import { IconCheck, IconCopy, IconKey, IconWorldBolt, IconX } from '@tabler/icons-react';
-import { useState } from 'react';
+import {
+  IconCheck,
+  IconCopy,
+  IconDeviceFloppy,
+  IconKey,
+  IconWorldBolt,
+  IconX,
+} from '@tabler/icons-react';
+import { useEffect, useState } from 'react';
 import { useTranslation } from 'react-i18next';
 
 import { ApiError, api } from '../api';
@@ -32,6 +40,67 @@ export function Settings({ platformUrl }: SettingsProps) {
   const [newPassword, setNewPassword] = useState('');
   const [confirmPassword, setConfirmPassword] = useState('');
   const [busy, setBusy] = useState(false);
+
+  // Server-side settings, seeded from what the app already loaded.
+  const [savedUrl, setSavedUrl] = useState(platformUrl);
+  const [urlDraft, setUrlDraft] = useState(platformUrl);
+  const [savingUrl, setSavingUrl] = useState(false);
+  const [savingLang, setSavingLang] = useState(false);
+
+  useEffect(() => {
+    setSavedUrl(platformUrl);
+    setUrlDraft(platformUrl);
+  }, [platformUrl]);
+
+  const urlValid = urlDraft.startsWith('http://') || urlDraft.startsWith('https://');
+  const urlDirty = urlDraft !== savedUrl;
+
+  const notifyFailure = (title: string, caught: unknown) =>
+    notifications.show({
+      color: 'red',
+      icon: <IconX size={16} />,
+      title,
+      message:
+        caught instanceof ApiError
+          ? t(`errors.${caught.code}`, { defaultValue: caught.message })
+          : t('errors.network'),
+    });
+
+  const savePlatformUrl = async (event: React.FormEvent) => {
+    event.preventDefault();
+    if (!urlDirty || !urlValid || savingUrl) return;
+    setSavingUrl(true);
+    try {
+      const result = await api.updateSettings({ platform_url: urlDraft.trim() });
+      setSavedUrl(result.platform_url);
+      setUrlDraft(result.platform_url);
+      notifications.show({
+        color: 'teal',
+        icon: <IconCheck size={16} />,
+        title: t('settings.platform_saved'),
+        message: t('settings.platform_saved_hint'),
+      });
+    } catch (caught) {
+      notifyFailure(t('settings.platform_save_failed'), caught);
+    } finally {
+      setSavingUrl(false);
+    }
+  };
+
+  // The picker sets this browser's language AND the server-side default that
+  // new sessions and the installer's bilingual output fall back to.
+  const changeLanguage = async (value: string) => {
+    const lang = value as Lang;
+    persistLang(lang);
+    setSavingLang(true);
+    try {
+      await api.updateSettings({ lang });
+    } catch (caught) {
+      notifyFailure(t('settings.language_save_failed'), caught);
+    } finally {
+      setSavingLang(false);
+    }
+  };
 
   const mismatch = confirmPassword.length > 0 && confirmPassword !== newPassword;
   const tooShort = newPassword.length > 0 && newPassword.length < 8;
@@ -142,10 +211,10 @@ export function Settings({ platformUrl }: SettingsProps) {
                 }}
               >
                 <Mono c="" size="sm">
-                  {platformUrl || t('settings.platform_unset')}
+                  {savedUrl || t('settings.platform_unset')}
                 </Mono>
-                {platformUrl && (
-                  <CopyButton value={platformUrl} timeout={1500}>
+                {savedUrl && (
+                  <CopyButton value={savedUrl} timeout={1500}>
                     {({ copied, copy }) => (
                       <Tooltip label={copied ? t('common.copied') : t('common.copy')}>
                         <Button
@@ -162,9 +231,32 @@ export function Settings({ platformUrl }: SettingsProps) {
                   </CopyButton>
                 )}
               </Group>
-              <Text size="xs" c="dimmed">
-                {t('settings.platform_change_hint')}
-              </Text>
+
+              <form onSubmit={savePlatformUrl}>
+                <Stack gap="xs">
+                  <TextInput
+                    label={t('settings.platform_edit_label')}
+                    placeholder="https://your-domain.example"
+                    value={urlDraft}
+                    onChange={(event) => setUrlDraft(event.currentTarget.value)}
+                    error={urlDraft && !urlValid ? t('settings.platform_invalid') : undefined}
+                  />
+                  <Group justify="space-between" align="center" wrap="wrap" gap="xs">
+                    <Text size="xs" c="dimmed" style={{ flex: 1, minWidth: 180 }}>
+                      {t('settings.platform_change_hint')}
+                    </Text>
+                    <Button
+                      type="submit"
+                      size="compact-sm"
+                      leftSection={<IconDeviceFloppy size={15} />}
+                      disabled={!urlDirty || !urlValid}
+                      loading={savingUrl}
+                    >
+                      {t('common.save')}
+                    </Button>
+                  </Group>
+                </Stack>
+              </form>
             </Stack>
           </Card>
 
@@ -176,7 +268,8 @@ export function Settings({ platformUrl }: SettingsProps) {
               </Text>
               <SegmentedControl
                 value={i18n.language === 'zh-TW' ? 'zh-TW' : 'en'}
-                onChange={(value) => persistLang(value as Lang)}
+                disabled={savingLang}
+                onChange={(value) => void changeLanguage(value)}
                 data={[
                   { value: 'zh-TW', label: '繁體中文' },
                   { value: 'en', label: 'English' },

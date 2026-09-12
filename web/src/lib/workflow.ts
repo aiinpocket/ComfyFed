@@ -21,7 +21,10 @@ const MODEL_FIELD_NAMES = new Set([
 
 const MODEL_EXTENSIONS = ['.safetensors', '.ckpt', '.pt', '.sft', '.gguf'];
 
-const ASSET_NODE_CLASSES = new Set(['LoadImage', 'LoadImageMask']);
+const ASSET_NODE_CLASSES = new Set(['LoadImage', 'LoadImageMask', 'LoadAudio']);
+
+/** Input fields on those classes that name an uploaded file. */
+const ASSET_FIELD_NAMES = ['image', 'audio', 'video'];
 
 export interface WorkflowSummary {
   nodeCount: number;
@@ -72,8 +75,10 @@ export function parseWorkflow(text: string): WorkflowSummary {
     }
 
     if (typeof classType === 'string' && ASSET_NODE_CLASSES.has(classType)) {
-      const image = inputRecord.image;
-      if (typeof image === 'string') assets.add(image);
+      for (const field of ASSET_FIELD_NAMES) {
+        const value = inputRecord[field];
+        if (typeof value === 'string') assets.add(value);
+      }
     }
   }
 

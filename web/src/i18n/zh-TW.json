@@ -21,6 +21,7 @@
     "done": "完成",
     "copy": "複製",
     "copied": "已複製",
+    "save": "儲存",
     "never": "從未",
     "unknown": "未知"
   },
@@ -50,8 +51,7 @@
     "assigned": "已指派",
     "running": "執行中",
     "done": "已完成",
-    "failed": "失敗",
-    "canceled": "已取消"
+    "failed": "失敗"
   },
   "verdict": {
     "eligible": "可以跑",
@@ -64,6 +64,7 @@
     "missing_models": "只缺模型 {{items}}──等模型分發功能。",
     "missing_models_unavailable": "模型 {{items}} 目前整個聯邦裡都還沒有。",
     "vram": "VRAM 不足：需要約 {{needed}}，只有 {{available}}。",
+    "backend": "運算後端不符：任務指定 {{wanted}}，這台 worker 跑的是 {{actual}}。",
     "override_min_vram": "不符合手動指定的最低 VRAM 條件。",
     "override_min_free_disk": "不符合手動指定的最低可用磁碟條件。",
     "override_gpu_name": "GPU 型號不符合手動指定的關鍵字。",
@@ -117,6 +118,8 @@
     "min_vram": "最低 VRAM",
     "min_disk": "最低可用磁碟",
     "gpu_contains": "GPU 型號包含",
+    "backend": "運算後端",
+    "backend_hint": "指定只能跑在某一種後端。",
     "auto": "自動",
     "submit": "送出任務",
     "submit_success": "任務已送出",
@@ -136,7 +139,10 @@
     "assessment_error": "無法載入這個任務的評估結果。",
     "assessment_no_workers": "沒有可評估的 Worker",
     "assessment_no_workers_hint": "至少要註冊一台 Worker，這個任務才派得出去。",
-    "est_vram": "預估 VRAM：{{value}}"
+    "est_vram": "預估 VRAM：{{value}}",
+    "retry": "重試",
+    "retry_success": "任務已重新排隊",
+    "retry_failed": "無法重試這個任務"
   },
   "workers": {
     "title": "Worker",
@@ -189,7 +195,7 @@
     "title": "設定",
     "subtitle": "控制台與平台設定。",
     "password_heading": "管理員密碼",
-    "password_hint": "改密碼不會把已登入的工作階段踢掉。",
+    "password_hint": "改密碼會把所有已登入的工作階段（包含目前這一個）全部踢掉，需要重新登入。",
     "old_password": "目前密碼",
     "new_password": "新密碼",
     "confirm_password": "再次輸入新密碼",
@@ -203,9 +209,15 @@
     "platform_heading": "平台網址",
     "platform_hint": "Worker 回連的位址，會寫進每一份註冊包裡。",
     "platform_unset": "尚未設定",
-    "platform_change_hint": "安裝時設定；要修改請重跑伺服器安裝程式。",
+    "platform_edit_label": "修改平台網址",
+    "platform_invalid": "必須以 http:// 或 https:// 開頭。",
+    "platform_saved": "平台網址已更新",
+    "platform_saved_hint": "之後產生的註冊包都會用新網址。",
+    "platform_save_failed": "無法更新平台網址",
+    "platform_change_hint": "已註冊的 Worker 還是用當初拿到的網址，要携過來請重新發一份註冊包。",
     "language_heading": "控制台語言",
-    "language_hint": "只影響這個瀏覽器，下次會記得你的選擇。"
+    "language_hint": "套用到這個瀏覽器，同時成為伺服器的預設語言。",
+    "language_save_failed": "無法儲存預設語言"
   },
   "errors": {
     "auth.required": "密碼錯誤。",
@@ -217,6 +229,11 @@
     "jobs.bad_asset_name": "其中一個附檔的檔名不能使用。",
     "jobs.not_found": "這個任務已經不存在了。",
     "jobs.artifact_not_found": "這個結果檔已經取不到了。",
+    "jobs.not_retryable": "只有失敗的任務可以重試。",
+    "settings.bad_platform_url": "平台網址必須以 http:// 或 https:// 開頭。",
+    "settings.bad_lang": "不支援這個語言。",
+    "reports.bad_date": "無法讀取這個日期。",
+    "validation_error": "伺服器無法讀取這個請求。",
     "workers.not_found": "這台 Worker 已經不存在了。",
     "http_error": "伺服器拒絕了這個請求。",
     "network": "連不上伺服器。",

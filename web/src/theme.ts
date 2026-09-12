@@ -59,7 +59,6 @@ export const statusColor = {
   running: 'federation',
   done: 'teal',
   failed: 'red',
-  canceled: 'gray',
 } as const;
 
 export const theme = createTheme({
