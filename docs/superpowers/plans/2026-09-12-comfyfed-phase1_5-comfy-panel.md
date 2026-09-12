@@ -64,7 +64,7 @@
 
 ### Task 8: 缺模型指南＋R2 模型鏡像連結（使用者定案 2026-09-13）
 - 問題：全新安裝的用戶 clone 範本後沒有模型檔，範本等於廢的；模型太大不進 git。
-- 模型鏡像：Cloudflare R2 公開 bucket，base URL https://models.aiinpocket.com/models/<category>/<filename>（結構鏡射 ComfyUI models 目錄）。
+- 模型鏡像：Cloudflare R2 公開 bucket（結構鏡射 ComfyUI models 目錄）；⚠ 2026-09-13 該 R2 已停用並改為官方載點＋GCS 備份雙連結（見 2026-09-13-phase1_6-official-templates.md Task 5），本節保留原始決策紀錄僅供追溯。
 - 每支範本新增一則「⓪ 缺模型？」MarkdownNote（雙語、放最左上）：列出本範本所需全部模型——檔名、放置路徑（models/ 下子資料夾）、大小、R2 下載連結；說明「放好檔案後不用重啟 ComfyUI 或 worker：agent 每 10 分鐘自動重掃並回報平台，評估會自動轉綠（急的話重啟 agent 立即生效）」。
 - index.json：若官方 template schema 支援 models 欄位（name/url/directory），一併填入（前端可能顯示模型需求）；不支援則僅便條＋README。
 - README 兩語：「模型下載」章節——總表（9 檔、各大小、R2 連結、放置路徑）、磁碟需求總量、agent 自動偵測說明。

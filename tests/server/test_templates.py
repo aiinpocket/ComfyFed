@@ -17,30 +17,102 @@ from fastapi.testclient import TestClient
 from comfyfed_server import app as app_module
 from comfyfed_server import bootstrap, comfyapi, db, official_templates, templates
 
-# Task 8: the R2 model mirror. This is the single ground truth the anti-drift
-# tests below check everything against -- every model filename the packaged
-# workflow JSONs reference, and every download link in the "Missing models?"
-# notes and the README, must trace back to one of these entries.
-R2_MODEL_BASE = "https://models.aiinpocket.com/models/"
-MODEL_INVENTORY = {
-    "flux1-dev.safetensors",
-    "clip_l.safetensors",
-    "t5xxl_fp16.safetensors",
-    "ae.safetensors",
-    "minimax_h3_ref2va_pruned_int8_convrot.safetensors",
-    "qwen3vl_32b_heretic_minimax_h3_nvfp4.safetensors",
-    "minimax_h3_video_vae_fp16.safetensors",
-    "minimax_h3_audio_vae_fp32.safetensors",
-    "minimax_h3_ref2v_turbo_8step_v1.0_768p_comfyui_resized_avg_rank_64_bf16.safetensors",
+# Task 5: dual official/GCS-backup links. This is the single ground truth the
+# anti-drift tests below check everything against -- every model filename the
+# packaged workflow JSONs reference, and every download link in the "Missing
+# models?" notes and the README, must trace back to one of these entries.
+# The old Cloudflare R2 mirror (models.aiinpocket.com) is decommissioned;
+# every mention of it anywhere under server/ or docs/ must be gone.
+GCS_MODEL_BASE = "https://storage.googleapis.com/comfyfed-models/models/"
+DECOMMISSIONED_MIRROR_DOMAIN = "models.aiinpocket.com"
+MODEL_SOURCES = {
+    "flux1-dev.safetensors": {
+        "dir": "diffusion_models",
+        "official": "https://huggingface.co/black-forest-labs/FLUX.1-dev/resolve/main/flux1-dev.safetensors",
+        "gated": True,
+    },
+    "clip_l.safetensors": {
+        "dir": "text_encoders",
+        "official": "https://huggingface.co/comfyanonymous/flux_text_encoders/resolve/main/clip_l.safetensors",
+        "gated": False,
+    },
+    "t5xxl_fp16.safetensors": {
+        "dir": "text_encoders",
+        "official": "https://huggingface.co/comfyanonymous/flux_text_encoders/resolve/main/t5xxl_fp16.safetensors",
+        "gated": False,
+    },
+    "ae.safetensors": {
+        "dir": "vae",
+        "official": "https://huggingface.co/black-forest-labs/FLUX.1-dev/resolve/main/ae.safetensors",
+        "gated": True,
+    },
+    "minimax_h3_ref2va_pruned_int8_convrot.safetensors": {
+        "dir": "diffusion_models",
+        "official": "https://huggingface.co/Comfy-Org/MiniMax-H3/resolve/main/diffusion_models/minimax_h3_ref2va_pruned_int8_convrot.safetensors",
+        "gated": False,
+    },
+    "qwen3vl_32b_heretic_minimax_h3_nvfp4.safetensors": {
+        "dir": "text_encoders",
+        "official": "https://huggingface.co/sakamakismile/Qwen3-VL-32B-Heretic-MiniMax-H3-NVFP4/resolve/main/qwen3vl_32b_heretic_minimax_h3_nvfp4.safetensors",
+        "gated": False,
+    },
+    "minimax_h3_video_vae_fp16.safetensors": {
+        "dir": "vae",
+        "official": "https://huggingface.co/Comfy-Org/MiniMax-H3/resolve/main/vae/minimax_h3_video_vae_fp16.safetensors",
+        "gated": False,
+    },
+    "minimax_h3_audio_vae_fp32.safetensors": {
+        "dir": "vae",
+        "official": "https://huggingface.co/Comfy-Org/MiniMax-H3/resolve/main/vae/minimax_h3_audio_vae_fp32.safetensors",
+        "gated": False,
+    },
+    "minimax_h3_ref2v_turbo_8step_v1.0_768p_comfyui_resized_avg_rank_64_bf16.safetensors": {
+        "dir": "loras",
+        "official": "https://huggingface.co/drbaph/MiniMax-H3-Turbo-Lora-ComfyUI/resolve/main/minimax_h3_ref2v_turbo_8step_v1.0_768p_comfyui_resized_avg_rank_64_bf16.safetensors",
+        "gated": False,
+    },
 }
+MODEL_INVENTORY = set(MODEL_SOURCES)
+FLUX_GATED_CAVEAT = "（需登入 HuggingFace 並同意 FLUX.1-dev 授權）"
 MISSING_MODELS_NOTE_TITLE = "⓪ 缺模型？/ Missing models?"
 
-_R2_URL_RE = re.compile(re.escape(R2_MODEL_BASE) + r"\S+")
+
+def _backup_url(name):
+    return GCS_MODEL_BASE + MODEL_SOURCES[name]["dir"] + "/" + name
 
 
-def _r2_urls_in(text):
+_GCS_URL_RE = re.compile(re.escape(GCS_MODEL_BASE) + r"\S+")
+
+
+def _gcs_urls_in(text):
     # Trailing markdown/punctuation (`)`, `.`, etc.) never belongs to the URL.
-    return [u.rstrip(").,;。）") for u in _R2_URL_RE.findall(text)]
+    return [u.rstrip(").,;。）") for u in _GCS_URL_RE.findall(text)]
+
+
+def _repo_root():
+    return os.path.normpath(os.path.join(os.path.dirname(__file__), "..", ".."))
+
+
+def _iter_repo_text_files(*subdirs):
+    for subdir in subdirs:
+        root = os.path.join(_repo_root(), subdir)
+        for dirpath, _dirnames, filenames in os.walk(root):
+            for filename in filenames:
+                path = os.path.join(dirpath, filename)
+                try:
+                    with open(path, encoding="utf-8") as f:
+                        yield path, f.read()
+                except (UnicodeDecodeError, OSError):
+                    continue
+
+
+def test_decommissioned_mirror_domain_appears_nowhere_under_server_or_docs():
+    offenders = [
+        path
+        for path, text in _iter_repo_text_files("server", "docs")
+        if DECOMMISSIONED_MIRROR_DOMAIN in text
+    ]
+    assert not offenders, offenders
 
 
 @pytest.fixture()
@@ -373,13 +445,26 @@ def test_missing_models_note_mentions_every_model_the_graph_actually_uses(name):
 
 
 @pytest.mark.parametrize("name", templates.TEMPLATE_NAMES)
-def test_missing_models_note_links_are_valid_r2_urls(name):
+def test_missing_models_note_links_are_dual_official_and_gcs_backup(name):
     note_text = _missing_models_note_text(name)
-    urls = _r2_urls_in(note_text)
-    assert urls, f"{name}'s missing-models note has no R2 links"
+
+    urls = _gcs_urls_in(note_text)
+    assert urls, f"{name}'s missing-models note has no GCS backup links"
     for url in urls:
-        assert url.startswith(R2_MODEL_BASE), url
+        assert url.startswith(GCS_MODEL_BASE), url
         assert url.rsplit("/", 1)[-1] in MODEL_INVENTORY, url
+
+    referenced = {
+        filename for filename in MODEL_INVENTORY if filename in note_text
+    }
+    assert referenced, f"{name}'s missing-models note references no curated model"
+
+    for filename in referenced:
+        source = MODEL_SOURCES[filename]
+        assert f"官方載點：{source['official']}" in note_text, (name, filename)
+        assert f"備份載點：{_backup_url(filename)}" in note_text, (name, filename)
+        if source["gated"]:
+            assert f"官方載點：{source['official']}{FLUX_GATED_CAVEAT}" in note_text, (name, filename)
 
 
 # --- Task 2: merged official template library --------------------------
@@ -526,13 +611,17 @@ def test_readme_model_downloads_section_covers_the_whole_inventory():
     with open(readme_path, encoding="utf-8") as f:
         readme = f.read()
 
-    urls = _r2_urls_in(readme)
-    assert urls, "README has no R2 model links"
+    urls = _gcs_urls_in(readme)
+    assert urls, "README has no GCS backup model links"
     for url in urls:
-        assert url.startswith(R2_MODEL_BASE), url
+        assert url.startswith(GCS_MODEL_BASE), url
         assert url.rsplit("/", 1)[-1] in MODEL_INVENTORY, url
 
     # Every model in the shared inventory shows up at least once in the README
     # (bilingual tables both reference the same nine files).
     seen = {url.rsplit("/", 1)[-1] for url in urls}
     assert seen == MODEL_INVENTORY
+
+    # And every model's official source link is present too.
+    for filename, source in MODEL_SOURCES.items():
+        assert source["official"] in readme, filename

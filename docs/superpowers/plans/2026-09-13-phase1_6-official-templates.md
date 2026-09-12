@@ -15,7 +15,7 @@
 - All user-facing strings zh-TW first, matching existing tone (繁體中文、台灣用語).
 - Never modify files under `data/comfy_frontend/` — the official bundle is served verbatim.
 - All existing tests stay green (`python -m pytest server/tests agent/tests` — 389 passing at branch point).
-- No reference to `models.aiinpocket.com` may remain anywhere in the repo after Task 5.
+- No reference to the decommissioned R2 mirror's custom domain may remain anywhere in the repo after Task 5.
 - GCS backup base URL: `https://storage.googleapis.com/comfyfed-models/models/` (bucket `comfyfed-models`, project local-hardware, public objectViewer).
 - Path handling: any filename derived from an archive or request must be rejected if it contains `/`, `\`, `..`, or is empty (existing convention in `templates.py` / `storage.sanitize_path_component`).
 - Frontend contract facts (from research, do not re-derive): core index at `{base}/templates/index.json`, localized `index.<locale>.json` (e.g. `index.zh.json`) with automatic fallback to `index.json` on 404/non-JSON; per-template workflow `/templates/<name>.json`; thumbnails `/templates/<name>-1.<mediaSubtype>` (`-2` for compare variants); `index_logo.json` soft-fails; `/api/workflow_templates` must return `{}`; missing-model Download button renders only when a template JSON's top-level `models[]` entry has BOTH `url` and `directory`; feature flags travel over WS as `{"type":"feature_flags","data":{...}}` in both directions.
@@ -115,7 +115,7 @@ post_prompt change: after `assess.extract(prompt)` and BEFORE `jobs.create_job`,
 - Gated entries (flux1-dev, ae) append to the 官方載點 line: `（需登入 HuggingFace 並同意 FLUX.1-dev 授權）`.
 - `(<size_gb> GB)` omitted when unknown (harvested entries). 備份載點 line omitted when no GCS backup (non-curated). For a harvested-only entry use its `url` as 官方載點 and its `directory`. For a model in neither source, the block is just 【name】＋`放置路徑：models/<資料夾依節點類型>/`＋`官方載點：請向工作流提供者取得下載來源`.
 
-- [ ] **Step 1: Failing tests** for `model_guide`: (a) all 9 curated names resolve with correct URLs; category-relative lookup (`text_encoders/clip_l.safetensors`) resolves too; (b) harvest() reads a tmp official dir's template models arrays; (c) guidance_message renders the exact block format above for one curated gated model + one harvested + one unknown (assert exact strings — they are the product copy); (d) no `models.aiinpocket.com` anywhere in module output.
+- [ ] **Step 1: Failing tests** for `model_guide`: (a) all 9 curated names resolve with correct URLs; category-relative lookup (`text_encoders/clip_l.safetensors`) resolves too; (b) harvest() reads a tmp official dir's template models arrays; (c) guidance_message renders the exact block format above for one curated gated model + one harvested + one unknown (assert exact strings — they are the product copy); (d) no reference to the decommissioned R2 mirror's custom domain anywhere in module output.
 - [ ] **Step 2: Failing test in test_comfyapi.py**: with one online worker whose inventory lacks `flux1-dev.safetensors`, POST /prompt with a flux workflow → 400, body `error.type == "prompt.missing_models"`, message contains `官方載點：https://huggingface.co/black-forest-labs/FLUX.1-dev/resolve/main/flux1-dev.safetensors` and `備份載點：https://storage.googleapis.com/comfyfed-models/models/diffusion_models/flux1-dev.safetensors`; with zero workers online → job still created (today's behavior); with an eligible worker → job created.
 - [ ] **Step 3: Run, verify failure. Step 4: Implement. Step 5: Full suite; commit** `feat(server): reject unrunnable prompts with per-model download guidance (official + GCS backup links)`.
 
@@ -137,17 +137,17 @@ Incoming text messages of type `feature_flags` from the client are expected chat
 ### Task 5: Dual-link swap — 官方載點＋GCS 備份 everywhere
 
 **Files:**
-- Modify: `server/comfyfed_server/templates_data/index.json` (each template's `models` string list stays name-only — verify, no URLs there), the three workflow JSONs `comfyfed-wuxia-t2i.json` / `comfyfed-character-portrait.json` / `comfyfed-ref2v-video.json` (the ⓪ 缺模型 MarkdownNote), `docs/` model guide page(s) that carry `models.aiinpocket.com` links, spec addendum if it references them
+- Modify: `server/comfyfed_server/templates_data/index.json` (each template's `models` string list stays name-only — verify, no URLs there), the three workflow JSONs `comfyfed-wuxia-t2i.json` / `comfyfed-character-portrait.json` / `comfyfed-ref2v-video.json` (the ⓪ 缺模型 MarkdownNote), `docs/` model guide page(s) that carry the decommissioned R2 mirror's links, spec addendum if it references them
 - Test: extend the existing template-note test (the one that asserted mirror links) to assert the new format
 
-In every ⓪ 缺模型 sticky note, replace each model's single `https://models.aiinpocket.com/models/...` link with two lines using the registry table (keep the existing note structure — model name, size, 放置路徑 — only the link lines change):
+In every ⓪ 缺模型 sticky note, replace each model's single decommissioned-R2-mirror link with two lines using the registry table (keep the existing note structure — model name, size, 放置路徑 — only the link lines change):
 ```
 官方載點：<official_url>
 備份載點：<backup_url>
 ```
 flux1-dev 與 ae 的官方載點行尾加註 `（需登入 HuggingFace 並同意 FLUX.1-dev 授權）`. Keep the existing 「放好後不用重啟，worker 每 10 分鐘自動掃描」 copy unchanged.
 
-- [ ] **Step 1: Update the test** asserting: zero occurrences of `models.aiinpocket.com` across the repo's server/ + docs/ trees; each of the three notes contains both `官方載點：` and `備份載點：` and the correct GCS URL for its models; flux note carries the 授權 caveat.
+- [ ] **Step 1: Update the test** asserting: zero occurrences of the decommissioned R2 mirror's custom domain across the repo's server/ + docs/ trees; each of the three notes contains both `官方載點：` and `備份載點：` and the correct GCS URL for its models; flux note carries the 授權 caveat.
 - [ ] **Step 2–3: Verify fail, apply the swaps (JSON string editing — mind escaping), full suite; commit** `docs+templates: swap model mirror to dual official/GCS links`.
 
 ### Task 6 (controller-executed, not a subagent dispatch): Live verification

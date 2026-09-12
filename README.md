@@ -200,17 +200,17 @@ comfyfed-server fetch-comfy-ui --data-dir ./data
 
 全新安裝的 worker 沒有任何模型檔，範本等於是廢的。模型太大不會進 git，改放 Cloudflare R2 公開鏡像，目錄結構鏡射 ComfyUI 的 `models/` 資料夾——下載後照「放置路徑」欄放進 worker 的 `ComfyUI/models/` 底下對應子資料夾即可。
 
-| 檔案 | 大小 | 放置路徑 | 下載 |
-| --- | --- | --- | --- |
-| `flux1-dev.safetensors` | 22.17 GB | `models/diffusion_models/` | [R2](https://models.aiinpocket.com/models/diffusion_models/flux1-dev.safetensors) |
-| `clip_l.safetensors` | 0.23 GB | `models/text_encoders/` | [R2](https://models.aiinpocket.com/models/text_encoders/clip_l.safetensors) |
-| `t5xxl_fp16.safetensors` | 9.12 GB | `models/text_encoders/` | [R2](https://models.aiinpocket.com/models/text_encoders/t5xxl_fp16.safetensors) |
-| `ae.safetensors` | 0.31 GB | `models/vae/` | [R2](https://models.aiinpocket.com/models/vae/ae.safetensors) |
-| `minimax_h3_ref2va_pruned_int8_convrot.safetensors` | 19.53 GB | `models/diffusion_models/` | [R2](https://models.aiinpocket.com/models/diffusion_models/minimax_h3_ref2va_pruned_int8_convrot.safetensors) |
-| `qwen3vl_32b_heretic_minimax_h3_nvfp4.safetensors` | 14.61 GB | `models/text_encoders/` | [R2](https://models.aiinpocket.com/models/text_encoders/qwen3vl_32b_heretic_minimax_h3_nvfp4.safetensors) |
-| `minimax_h3_video_vae_fp16.safetensors` | 4.85 GB | `models/vae/` | [R2](https://models.aiinpocket.com/models/vae/minimax_h3_video_vae_fp16.safetensors) |
-| `minimax_h3_audio_vae_fp32.safetensors` | 0.56 GB | `models/vae/` | [R2](https://models.aiinpocket.com/models/vae/minimax_h3_audio_vae_fp32.safetensors) |
-| `minimax_h3_ref2v_turbo_8step_v1.0_768p_comfyui_resized_avg_rank_64_bf16.safetensors` | 0.91 GB | `models/loras/` | [R2](https://models.aiinpocket.com/models/loras/minimax_h3_ref2v_turbo_8step_v1.0_768p_comfyui_resized_avg_rank_64_bf16.safetensors) |
+| 檔案 | 大小 | 放置路徑 | 官方載點 | 備份載點 |
+| --- | --- | --- | --- | --- |
+| `flux1-dev.safetensors` | 22.17 GB | `models/diffusion_models/` | [官方](https://huggingface.co/black-forest-labs/FLUX.1-dev/resolve/main/flux1-dev.safetensors)（需登入 HuggingFace 並同意 FLUX.1-dev 授權） | [備份](https://storage.googleapis.com/comfyfed-models/models/diffusion_models/flux1-dev.safetensors) |
+| `clip_l.safetensors` | 0.23 GB | `models/text_encoders/` | [官方](https://huggingface.co/comfyanonymous/flux_text_encoders/resolve/main/clip_l.safetensors) | [備份](https://storage.googleapis.com/comfyfed-models/models/text_encoders/clip_l.safetensors) |
+| `t5xxl_fp16.safetensors` | 9.12 GB | `models/text_encoders/` | [官方](https://huggingface.co/comfyanonymous/flux_text_encoders/resolve/main/t5xxl_fp16.safetensors) | [備份](https://storage.googleapis.com/comfyfed-models/models/text_encoders/t5xxl_fp16.safetensors) |
+| `ae.safetensors` | 0.31 GB | `models/vae/` | [官方](https://huggingface.co/black-forest-labs/FLUX.1-dev/resolve/main/ae.safetensors)（需登入 HuggingFace 並同意 FLUX.1-dev 授權） | [備份](https://storage.googleapis.com/comfyfed-models/models/vae/ae.safetensors) |
+| `minimax_h3_ref2va_pruned_int8_convrot.safetensors` | 19.53 GB | `models/diffusion_models/` | [官方](https://huggingface.co/Comfy-Org/MiniMax-H3/resolve/main/diffusion_models/minimax_h3_ref2va_pruned_int8_convrot.safetensors) | [備份](https://storage.googleapis.com/comfyfed-models/models/diffusion_models/minimax_h3_ref2va_pruned_int8_convrot.safetensors) |
+| `qwen3vl_32b_heretic_minimax_h3_nvfp4.safetensors` | 14.61 GB | `models/text_encoders/` | [官方](https://huggingface.co/sakamakismile/Qwen3-VL-32B-Heretic-MiniMax-H3-NVFP4/resolve/main/qwen3vl_32b_heretic_minimax_h3_nvfp4.safetensors) | [備份](https://storage.googleapis.com/comfyfed-models/models/text_encoders/qwen3vl_32b_heretic_minimax_h3_nvfp4.safetensors) |
+| `minimax_h3_video_vae_fp16.safetensors` | 4.85 GB | `models/vae/` | [官方](https://huggingface.co/Comfy-Org/MiniMax-H3/resolve/main/vae/minimax_h3_video_vae_fp16.safetensors) | [備份](https://storage.googleapis.com/comfyfed-models/models/vae/minimax_h3_video_vae_fp16.safetensors) |
+| `minimax_h3_audio_vae_fp32.safetensors` | 0.56 GB | `models/vae/` | [官方](https://huggingface.co/Comfy-Org/MiniMax-H3/resolve/main/vae/minimax_h3_audio_vae_fp32.safetensors) | [備份](https://storage.googleapis.com/comfyfed-models/models/vae/minimax_h3_audio_vae_fp32.safetensors) |
+| `minimax_h3_ref2v_turbo_8step_v1.0_768p_comfyui_resized_avg_rank_64_bf16.safetensors` | 0.91 GB | `models/loras/` | [官方](https://huggingface.co/drbaph/MiniMax-H3-Turbo-Lora-ComfyUI/resolve/main/minimax_h3_ref2v_turbo_8step_v1.0_768p_comfyui_resized_avg_rank_64_bf16.safetensors) | [備份](https://storage.googleapis.com/comfyfed-models/models/loras/minimax_h3_ref2v_turbo_8step_v1.0_768p_comfyui_resized_avg_rank_64_bf16.safetensors) |
 
 全部裝齊約 **72 GB**；只跑武俠文生圖／角色立繪兩支 Flux 範本約 **31.8 GB**，只跑參考圖生影片約 **40.5 GB**。每支範本的畫布上也有一則「⓪ 缺模型？」便條紙，列出該範本自己需要哪幾個檔案。
 
@@ -519,17 +519,17 @@ Cloudflare R2 bucket whose layout mirrors ComfyUI's `models/` directory —
 download a file and drop it under the matching subfolder of the worker's
 `ComfyUI/models/`.
 
-| File | Size | Target path | Download |
-| --- | --- | --- | --- |
-| `flux1-dev.safetensors` | 22.17 GB | `models/diffusion_models/` | [R2](https://models.aiinpocket.com/models/diffusion_models/flux1-dev.safetensors) |
-| `clip_l.safetensors` | 0.23 GB | `models/text_encoders/` | [R2](https://models.aiinpocket.com/models/text_encoders/clip_l.safetensors) |
-| `t5xxl_fp16.safetensors` | 9.12 GB | `models/text_encoders/` | [R2](https://models.aiinpocket.com/models/text_encoders/t5xxl_fp16.safetensors) |
-| `ae.safetensors` | 0.31 GB | `models/vae/` | [R2](https://models.aiinpocket.com/models/vae/ae.safetensors) |
-| `minimax_h3_ref2va_pruned_int8_convrot.safetensors` | 19.53 GB | `models/diffusion_models/` | [R2](https://models.aiinpocket.com/models/diffusion_models/minimax_h3_ref2va_pruned_int8_convrot.safetensors) |
-| `qwen3vl_32b_heretic_minimax_h3_nvfp4.safetensors` | 14.61 GB | `models/text_encoders/` | [R2](https://models.aiinpocket.com/models/text_encoders/qwen3vl_32b_heretic_minimax_h3_nvfp4.safetensors) |
-| `minimax_h3_video_vae_fp16.safetensors` | 4.85 GB | `models/vae/` | [R2](https://models.aiinpocket.com/models/vae/minimax_h3_video_vae_fp16.safetensors) |
-| `minimax_h3_audio_vae_fp32.safetensors` | 0.56 GB | `models/vae/` | [R2](https://models.aiinpocket.com/models/vae/minimax_h3_audio_vae_fp32.safetensors) |
-| `minimax_h3_ref2v_turbo_8step_v1.0_768p_comfyui_resized_avg_rank_64_bf16.safetensors` | 0.91 GB | `models/loras/` | [R2](https://models.aiinpocket.com/models/loras/minimax_h3_ref2v_turbo_8step_v1.0_768p_comfyui_resized_avg_rank_64_bf16.safetensors) |
+| File | Size | Target path | Official | Backup |
+| --- | --- | --- | --- | --- |
+| `flux1-dev.safetensors` | 22.17 GB | `models/diffusion_models/` | [Official](https://huggingface.co/black-forest-labs/FLUX.1-dev/resolve/main/flux1-dev.safetensors) (requires HuggingFace login + accepting the FLUX.1-dev license) | [Backup](https://storage.googleapis.com/comfyfed-models/models/diffusion_models/flux1-dev.safetensors) |
+| `clip_l.safetensors` | 0.23 GB | `models/text_encoders/` | [Official](https://huggingface.co/comfyanonymous/flux_text_encoders/resolve/main/clip_l.safetensors) | [Backup](https://storage.googleapis.com/comfyfed-models/models/text_encoders/clip_l.safetensors) |
+| `t5xxl_fp16.safetensors` | 9.12 GB | `models/text_encoders/` | [Official](https://huggingface.co/comfyanonymous/flux_text_encoders/resolve/main/t5xxl_fp16.safetensors) | [Backup](https://storage.googleapis.com/comfyfed-models/models/text_encoders/t5xxl_fp16.safetensors) |
+| `ae.safetensors` | 0.31 GB | `models/vae/` | [Official](https://huggingface.co/black-forest-labs/FLUX.1-dev/resolve/main/ae.safetensors) (requires HuggingFace login + accepting the FLUX.1-dev license) | [Backup](https://storage.googleapis.com/comfyfed-models/models/vae/ae.safetensors) |
+| `minimax_h3_ref2va_pruned_int8_convrot.safetensors` | 19.53 GB | `models/diffusion_models/` | [Official](https://huggingface.co/Comfy-Org/MiniMax-H3/resolve/main/diffusion_models/minimax_h3_ref2va_pruned_int8_convrot.safetensors) | [Backup](https://storage.googleapis.com/comfyfed-models/models/diffusion_models/minimax_h3_ref2va_pruned_int8_convrot.safetensors) |
+| `qwen3vl_32b_heretic_minimax_h3_nvfp4.safetensors` | 14.61 GB | `models/text_encoders/` | [Official](https://huggingface.co/sakamakismile/Qwen3-VL-32B-Heretic-MiniMax-H3-NVFP4/resolve/main/qwen3vl_32b_heretic_minimax_h3_nvfp4.safetensors) | [Backup](https://storage.googleapis.com/comfyfed-models/models/text_encoders/qwen3vl_32b_heretic_minimax_h3_nvfp4.safetensors) |
+| `minimax_h3_video_vae_fp16.safetensors` | 4.85 GB | `models/vae/` | [Official](https://huggingface.co/Comfy-Org/MiniMax-H3/resolve/main/vae/minimax_h3_video_vae_fp16.safetensors) | [Backup](https://storage.googleapis.com/comfyfed-models/models/vae/minimax_h3_video_vae_fp16.safetensors) |
+| `minimax_h3_audio_vae_fp32.safetensors` | 0.56 GB | `models/vae/` | [Official](https://huggingface.co/Comfy-Org/MiniMax-H3/resolve/main/vae/minimax_h3_audio_vae_fp32.safetensors) | [Backup](https://storage.googleapis.com/comfyfed-models/models/vae/minimax_h3_audio_vae_fp32.safetensors) |
+| `minimax_h3_ref2v_turbo_8step_v1.0_768p_comfyui_resized_avg_rank_64_bf16.safetensors` | 0.91 GB | `models/loras/` | [Official](https://huggingface.co/drbaph/MiniMax-H3-Turbo-Lora-ComfyUI/resolve/main/minimax_h3_ref2v_turbo_8step_v1.0_768p_comfyui_resized_avg_rank_64_bf16.safetensors) | [Backup](https://storage.googleapis.com/comfyfed-models/models/loras/minimax_h3_ref2v_turbo_8step_v1.0_768p_comfyui_resized_avg_rank_64_bf16.safetensors) |
 
 Everything together is about **72 GB**; the two Flux templates (wuxia,
 character portrait) need about **31.8 GB**; the reference-to-video template
