@@ -387,6 +387,33 @@ def test_cleanup_job_files_removes_configured_output_and_input_files(tmp_path):
 
     assert not out_file.exists()
     assert not in_file.exists()
+    # The per-job subfolder is this job's litter too: gone once emptied.
+    assert not (output_dir / "sub").exists()
+    assert output_dir.exists()
+
+
+def test_cleanup_job_files_removes_empty_namespace_chain_but_not_shared_dirs(tmp_path):
+    """`namespace_outputs` nests outputs at e.g. `<job>/sub`; cleanup peels the
+    emptied chain deepest-first and stops at a directory another job still
+    uses."""
+    output_dir = tmp_path / "output"
+    (output_dir / "job-a" / "clips").mkdir(parents=True)
+    (output_dir / "job-a" / "clips" / "v.mp4").write_bytes(b"x")
+    # A sibling job's file keeps the shared parent alive.
+    (output_dir / "job-b").mkdir()
+    (output_dir / "job-b" / "other.png").write_bytes(b"y")
+
+    cleanup_job_files(
+        mode=CleanupMode.SUCCESS,
+        comfy_output_dir=str(output_dir),
+        comfy_input_dir=None,
+        output_files=[{"filename": "v.mp4", "subfolder": "job-a/clips"}],
+        input_filenames=[],
+    )
+
+    assert not (output_dir / "job-a").exists()
+    assert (output_dir / "job-b" / "other.png").exists()
+    assert output_dir.exists()
 
 
 def test_cleanup_job_files_skips_everything_on_failure(tmp_path):

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import re
 import time
 import uuid
 from typing import Callable, Optional
@@ -221,6 +222,43 @@ def interrupt_or_dequeue(comfy_url: str, prompt_id: str, client: Optional[httpx.
     finally:
         if owns:
             c.close()
+
+
+def namespace_outputs(workflow: dict, namespace: str) -> dict:
+    """Prefix every save node's `filename_prefix` with `<namespace>/`.
+
+    Two problems, one knob (caught live, not in review):
+
+    1. ComfyUI caches node results by their inputs. Submit the *identical*
+       prompt twice -- a novice cloning a template and pressing 執行 twice
+       is exactly that -- and the second run's save node is a cache hit: its
+       history entry points at the FIRST run's output file, which this agent
+       already deleted when the first job's artifacts were safely uploaded.
+       The second job then 404s pulling its "output". A per-job prefix
+       changes the save node's inputs, so it always re-executes and writes a
+       fresh file (its upstream stays cached -- same image, near-zero
+       exec_seconds, which is the correct bill for a cache hit).
+    2. `filename_prefix` may carry directories, so the namespace doubles as
+       a per-job subfolder under ComfyUI's output dir -- cleanup then removes
+       exactly this job's files, never a neighbour's.
+
+    The namespace is sanitized to a conservative character set (the job id
+    is a UUID in practice, but it arrives over the wire) and the workflow is
+    mutated in place and returned. Non-dict nodes/inputs and non-string
+    prefixes are left untouched: validation is `whitelist.check`'s job.
+    """
+    safe = re.sub(r"[^A-Za-z0-9._-]", "_", namespace)
+    if not safe.strip("._-"):
+        # All punctuation (e.g. a namespace of ".." or "."), which as a lone
+        # path component would mean traversal or no directory at all.
+        safe = "job"
+    for node in workflow.values():
+        if not isinstance(node, dict):
+            continue
+        inputs = node.get("inputs")
+        if isinstance(inputs, dict) and isinstance(inputs.get("filename_prefix"), str):
+            inputs["filename_prefix"] = f"{safe}/{inputs['filename_prefix']}"
+    return workflow
 
 
 def run_workflow(

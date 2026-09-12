@@ -197,6 +197,17 @@ def _is_safe_relative_path(path: str) -> bool:
     return True
 
 
+def _subfolder_chain(base_dir: str, subfolder: str) -> list[str]:
+    """`base_dir/subfolder` and each parent up to (excluding) `base_dir`.
+
+    Deepest first, so `cleanup_job_files` can rmdir the leaf and then peel
+    the now-empty parents -- e.g. `comfyfed/<job>` removes `<job>` and then
+    `comfyfed`, but stops at the first directory that still has content.
+    """
+    parts = [p for p in subfolder.replace("\\", "/").split("/") if p]
+    return [os.path.join(base_dir, *parts[: i + 1]) for i in range(len(parts) - 1, -1, -1)]
+
+
 def _safe_remove_under(base_dir: str, filename: str, subfolder: str = "") -> None:
     """Best-effort delete of `base_dir/<subfolder>/<filename>`, refusing unsafe paths.
 
@@ -305,6 +316,30 @@ def cleanup_job_files(
     if comfy_output_dir:
         for item in output_files:
             _safe_remove_under(comfy_output_dir, item.get("filename") or "", item.get("subfolder") or "")
+        # `namespace_outputs` routes every save into a per-job subfolder, so
+        # once its files are gone the directory chain is this job's litter
+        # too. Deepest-first, rmdir only (refuses non-empty), same safety
+        # gates as the file removals.
+        subfolders = sorted(
+            {item.get("subfolder") or "" for item in output_files if item.get("subfolder")},
+            key=lambda s: s.count("/") + s.count("\\"),
+            reverse=True,
+        )
+        base_real = os.path.realpath(comfy_output_dir)
+        for subfolder in subfolders:
+            if not _is_safe_relative_path(subfolder):
+                continue
+            for path in _subfolder_chain(comfy_output_dir, subfolder):
+                path_real = os.path.realpath(path)
+                try:
+                    if os.path.commonpath([base_real, path_real]) != base_real or path_real == base_real:
+                        break
+                except ValueError:
+                    break
+                try:
+                    os.rmdir(path_real)
+                except OSError:
+                    break  # not empty (another job's files) or in use -- stop here
     else:
         logger.debug("runner: comfy_output_dir not configured, skipping worker output cleanup")
 
@@ -460,7 +495,7 @@ class AgentLoop:
                 raise_if_cancelled()
                 await self.broadcast_heartbeat("busy", progress=0.0, job_id=job_id)
 
-                workflow = json.loads(job_msg["workflow_json"])
+                workflow = comfy.namespace_outputs(json.loads(job_msg["workflow_json"]), job_id)
                 # allowed_classes does a blocking HTTP call to ComfyUI's
                 # /object_info; running it inline would stall this connection's
                 # heartbeats (and every other platform's, they share the loop).

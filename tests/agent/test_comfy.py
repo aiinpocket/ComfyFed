@@ -335,3 +335,44 @@ def test_run_workflow_exec_seconds_excludes_queue_wait(client, monkeypatch):
     # queue_running (after the 3 pending-only polls), so it is strictly less
     # than the elapsed time since submission.
     assert 0 < exec_seconds < total_elapsed
+
+
+# --- namespace_outputs ----------------------------------------------------
+
+
+def test_namespace_outputs_prefixes_every_save_node():
+    workflow = {
+        "1": {"class_type": "SaveImage", "inputs": {"filename_prefix": "wuxia", "images": ["2", 0]}},
+        "2": {"class_type": "KSampler", "inputs": {"seed": 1}},
+        "3": {"class_type": "SaveVideo", "inputs": {"filename_prefix": "clips/take"}},
+    }
+    out = comfy.namespace_outputs(workflow, "0d5e8c1a-1111-2222-3333-444455556666")
+    assert out["1"]["inputs"]["filename_prefix"] == "0d5e8c1a-1111-2222-3333-444455556666/wuxia"
+    assert out["3"]["inputs"]["filename_prefix"] == "0d5e8c1a-1111-2222-3333-444455556666/clips/take"
+    # Nodes without a filename_prefix are untouched.
+    assert out["2"]["inputs"] == {"seed": 1}
+
+
+def test_namespace_outputs_sanitizes_hostile_namespace_and_tolerates_junk_nodes():
+    workflow = {
+        "1": {"class_type": "SaveImage", "inputs": {"filename_prefix": "x"}},
+        "2": "not-a-node",
+        "3": {"class_type": "Weird", "inputs": "not-a-dict"},
+        "4": {"class_type": "Weirder", "inputs": {"filename_prefix": 42}},
+    }
+    out = comfy.namespace_outputs(workflow, "../..\evil id")
+    prefix = out["1"]["inputs"]["filename_prefix"]
+    component, sep, rest = prefix.partition("/")
+    # One sanitized directory component, no separators smuggled through, and
+    # the component itself can never mean "parent" or "here".
+    assert (sep, rest) == ("/", "x")
+    assert "\\" not in component and " " not in component
+    assert component not in (".", "..")
+    assert out["3"]["inputs"] == "not-a-dict"
+    assert out["4"]["inputs"]["filename_prefix"] == 42
+
+
+def test_namespace_outputs_all_punctuation_namespace_falls_back():
+    workflow = {"1": {"class_type": "SaveImage", "inputs": {"filename_prefix": "x"}}}
+    out = comfy.namespace_outputs(workflow, "..")
+    assert out["1"]["inputs"]["filename_prefix"] == "job/x"
