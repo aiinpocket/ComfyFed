@@ -105,6 +105,43 @@ def test_template_workflow_is_annotated_ui_format(name):
         assert src in node_ids and dst in node_ids, link_id
 
 
+def _notes_by_title(name):
+    with open(os.path.join(templates.templates_dir(), f"{name}.json"), encoding="utf-8") as f:
+        workflow = json.load(f)
+    return {
+        node["title"]: node["widgets_values"][0]
+        for node in workflow["nodes"]
+        if node["type"] in ("Note", "MarkdownNote")
+    }
+
+
+def test_subject_specific_notes_are_not_shared_between_templates():
+    """Guards against the obvious authoring slip: copy a template, forget a note.
+
+    Only the model-loader note may legitimately be identical across the two
+    Flux templates -- it describes the same three loaders and says nothing
+    about the subject. Every other note walks the reader through what THIS
+    template makes, so sharing one verbatim means it is describing the wrong
+    thing.
+    """
+    shareable = "① 模型載入器 / Model loaders"
+    seen: dict[str, str] = {}
+    for name in templates.TEMPLATE_NAMES:
+        for title, text in _notes_by_title(name).items():
+            if title == shareable:
+                continue
+            owner = seen.setdefault(text, name)
+            assert owner == name, f"{name} reuses {owner}'s note verbatim: {title}"
+
+
+def test_portrait_prompt_note_is_about_portraits():
+    note = _notes_by_title("comfyfed-character-portrait")["② 提示詞 / Prompt"]
+    assert "wuxia" not in note.lower()
+    # It has to say what this template is for and where its output goes next.
+    assert "定裝照" in note
+    assert "reference" in note.lower()
+
+
 @pytest.mark.parametrize("name", templates.TEMPLATE_NAMES)
 def test_templates_only_reference_packaged_assets(name):
     with open(os.path.join(templates.templates_dir(), f"{name}.json"), encoding="utf-8") as f:

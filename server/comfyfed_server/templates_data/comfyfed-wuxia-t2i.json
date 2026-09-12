@@ -591,7 +591,7 @@
       "title": "③ 取樣參數 / Sampler",
       "properties": {},
       "widgets_values": [
-        "**繁體中文 — 取樣參數什麼時候要動**\n\n- `EmptySD3LatentImage` 的 `width`/`height` = 出圖尺寸。改成 16 的倍數；\n  尺寸越大越慢也越吃 VRAM。\n- `BasicScheduler` 的 `steps` = 疊代次數。步數越多越細緻、也越慢。\n  **想快速試提示詞就調小（8 步約幾秒），滿意了再調回 20～28 出正式圖。**\n- `RandomNoise` 的 `noise_seed` = 亂數種子。**同一組提示詞＋同一個種子 = 同一張圖**；\n  想換一張就改種子（或把後面的控制設成 randomize）。\n- `KSamplerSelect` 的 `euler` 和 `BasicScheduler` 的 `simple` 是 Flux 的標準組合，\n  沒有特別理由不用改。\n\n---\n\n**English — when to touch the sampler**\n\nWidth/height set the output size (multiples of 16). `steps` trades speed for\ndetail — 8 for quick prompt tests, 20–28 for finals. Same prompt + same\n`noise_seed` = the same picture; change the seed for a different one. Leave\n`euler` + `simple` alone; that is the standard Flux pairing."
+        "**繁體中文 — 取樣參數什麼時候要動**\n\n- `EmptySD3LatentImage` 的 `width`/`height` = 出圖尺寸。改成 16 的倍數；\n  尺寸越大越慢也越吃 VRAM。\n- `BasicScheduler` 的 `steps` = 疊代次數，這支範本預設 **8**。\n  步數越多越細緻、也越慢。**8 步幾秒就跑完，很適合一直改提示詞試水溫；挑到滿意的種子之後，再把步數調到 20～28 出一張正式的。**\n- `RandomNoise` 的 `noise_seed` = 亂數種子。**同一組提示詞＋同一個種子 = 同一張圖**；\n  想換一張就改種子（或把後面的控制設成 randomize）。\n- `KSamplerSelect` 的 `euler` 和 `BasicScheduler` 的 `simple` 是 Flux 的標準組合，\n  沒有特別理由不用改。\n\n---\n\n**English — when to touch the sampler**\n\nWidth/height set the output size (multiples of 16). `steps` defaults to\n8 here and trades speed for detail. 8 steps finishes in seconds, which is ideal for iterating on the prompt; once a seed looks right, re-run it at 20–28 for the final. Same prompt +\nsame `noise_seed` = the same picture; change the seed for a different one.\nLeave `euler` + `simple` alone; that is the standard Flux pairing."
       ],
       "color": "#432",
       "bgcolor": "#653"
@@ -615,7 +615,7 @@
       "title": "④ 輸出 / Output",
       "properties": {},
       "widgets_values": [
-        "**繁體中文 — 輸出在哪裡看**\n\n`SaveImage` 是輸出節點。按下右上角的 **Run / Queue** 之後：\n\n1. 這張工作流會變成一個聯邦 job，派給線上的 worker 執行。\n2. 進度會在畫面上跑；完成後圖片直接顯示在這個節點裡。\n3. 同一張圖也會出現在 Console 的「工作」頁面，可以下載或查收據。\n\n`filename_prefix` 只是檔名前綴，想分類的話可以寫成 `wuxia/shot`。\n\n---\n\n**English — where the result shows up**\n\n`SaveImage` is the output node. Hit Run/Queue: the graph becomes a federation\njob, a worker runs it, and the image appears in this node when it finishes.\nThe same file is listed on the console's Jobs page with its receipt."
+        "**繁體中文 — 輸出在哪裡看**\n\n`SaveImage` 是輸出節點。按下右上角的 **Run / Queue** 之後：\n\n1. 這張工作流會變成一個聯邦 job，派給線上的 worker 執行。\n2. 進度會在畫面上跑；完成後圖片直接顯示在這個節點裡。\n3. 同一張圖也會出現在 Console 的「工作」頁面，可以下載或查收據。\n\n`filename_prefix` 只是檔名前綴，想分類的話可以寫成 `wuxia/ridge`。\n\n---\n\n**English — where the result shows up**\n\n`SaveImage` is the output node. Hit Run/Queue: the graph becomes a federation\njob, a worker runs it, and the image appears in this node when it finishes.\nThe same file is listed on the console's Jobs page with its receipt.\n`filename_prefix` is just a name prefix — `wuxia/ridge` also files it into a folder."
       ],
       "color": "#432",
       "bgcolor": "#653"
