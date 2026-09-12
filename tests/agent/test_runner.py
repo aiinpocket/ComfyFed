@@ -52,6 +52,12 @@ class FakeConnection:
         self.object_info_hash = ""
         self.object_info_uploads: list[tuple[bytes, str]] = []
         self.receipt_acks: list[tuple[str, str]] = []
+        # A live socket, as far as the reporting retry is concerned; a test
+        # simulates a blip by setting it to None (what `close()` does).
+        self.ws = object()
+
+    async def recv(self):
+        await asyncio.sleep(3600)  # nothing ever arrives; the poll times out
 
     async def send_heartbeat(self, state, progress=0.0, job_id=None, dynamic=None, object_info_hash=None):
         self.state = state
@@ -938,3 +944,217 @@ async def test_current_job_pointers_are_cleared_when_the_job_ends(two_platform_l
     assert loop._current_job_id is None
     assert loop._current_job_task is None
     assert loop._jobs == {}
+
+
+# --- Final review Major 2: completion must survive a connection blip -------
+
+
+async def test_job_done_is_retried_until_the_connection_comes_back(
+    two_platform_loop, monkeypatch, tmp_path
+):
+    """The run finishes DURING the outage -- the likeliest blip case, since
+    the 90s requeue exists precisely for runs that outlive one. The
+    completion must be held and re-sent on the new socket, never turned into
+    a job_failed and never cleaned up as a FAILURE."""
+    loop = two_platform_loop
+    conn_a = loop.connections["worker-a"]
+
+    output_dir = tmp_path / "output"
+    output_dir.mkdir()
+    out_file = output_dir / "result.png"
+    out_file.write_bytes(b"x")
+    loop.config.comfy_output_dir = str(output_dir)
+
+    monkeypatch.setattr(runner_module, "_REPORT_RETRY_START_SECONDS", 0.01)
+    monkeypatch.setattr(comfy, "run_workflow", lambda *a, **k: ([("result.png", b"bytes", "")], 1.0))
+    monkeypatch.setattr(AgentLoop, "_upload_artifact", lambda self, *a, **k: _noop_coro())
+
+    conn_a.ws = None  # the socket is down: PlatformConnection._send would raise
+    attempts = {"n": 0}
+    real_send_job_done = conn_a.send_job_done
+
+    async def _send_job_done(job_id, result_files, exec_seconds=None):
+        attempts["n"] += 1
+        if conn_a.ws is None:
+            raise AttributeError("'NoneType' object has no attribute 'send'")
+        await real_send_job_done(job_id, result_files, exec_seconds)
+
+    conn_a.send_job_done = _send_job_done
+
+    await loop._handle_message(conn_a, _job_message("job-blip"))
+    task = loop._current_job_task
+
+    # Reconnect: `_run_platform` reuses the same connection object and
+    # replaces `.ws` in place, which is the signal the retry waits on.
+    await asyncio.sleep(0.05)
+    assert not task.done(), "the completion must be held, not dropped"
+    conn_a.ws = object()
+
+    await asyncio.wait_for(task, timeout=10)
+
+    assert attempts["n"] >= 2
+    assert conn_a.job_done == ("job-blip", ["result.png"], 1.0)
+    assert conn_a.job_failed is None, "a transport error is not a job failure"
+    assert not out_file.exists(), "a reported completion still cleans up on success"
+
+
+async def test_unreported_completion_at_shutdown_keeps_the_files(
+    two_platform_loop, monkeypatch, tmp_path
+):
+    """Still unsent when the agent stops: leave everything on disk so a
+    restart (or the server's requeue) can redo or re-adopt the work."""
+    loop = two_platform_loop
+    conn_a = loop.connections["worker-a"]
+
+    output_dir = tmp_path / "output"
+    output_dir.mkdir()
+    out_file = output_dir / "result.png"
+    out_file.write_bytes(b"x")
+    loop.config.comfy_output_dir = str(output_dir)
+
+    monkeypatch.setattr(runner_module, "_REPORT_RETRY_START_SECONDS", 0.01)
+    monkeypatch.setattr(comfy, "run_workflow", lambda *a, **k: ([("result.png", b"bytes", "")], 1.0))
+    monkeypatch.setattr(AgentLoop, "_upload_artifact", lambda self, *a, **k: _noop_coro())
+
+    conn_a.ws = None
+    reporting = asyncio.Event()
+
+    async def _always_fails(job_id, result_files, exec_seconds=None):
+        reporting.set()
+        raise AttributeError("'NoneType' object has no attribute 'send'")
+
+    conn_a.send_job_done = _always_fails
+
+    await loop._handle_message(conn_a, _job_message("job-unreported"))
+    await asyncio.wait_for(reporting.wait(), timeout=10)
+
+    await asyncio.wait_for(loop.shutdown(timeout=0.2), timeout=10)
+
+    assert conn_a.job_done is None
+    assert conn_a.job_failed is None
+    assert out_file.exists(), "an unreported completion must not be cleaned up"
+
+
+async def test_a_genuine_upload_rejection_still_fails_the_job(two_platform_loop, monkeypatch):
+    """The retry loop must not swallow real errors: a platform that answers
+    and rejects is still a failed job."""
+    loop = two_platform_loop
+    conn_a = loop.connections["worker-a"]
+
+    monkeypatch.setattr(comfy, "run_workflow", lambda *a, **k: ([("result.png", b"bytes", "")], 1.0))
+
+    async def _rejected(self, entry, job_id, filename, content):
+        raise RuntimeError("artifact upload failed")
+
+    monkeypatch.setattr(AgentLoop, "_upload_artifact", _rejected)
+
+    await loop._handle_message(conn_a, _job_message("job-rejected"))
+    task = loop._current_job_task
+    await asyncio.wait_for(task, timeout=10)
+
+    assert conn_a.job_failed == ("job-rejected", "artifact upload failed")
+
+
+# --- Final review Major 3: the cancel handler must not block the loop ------
+
+
+async def test_job_cancelled_does_not_block_the_receive_loop(cancellable_loop, monkeypatch):
+    """A hung ComfyUI must not stall the socket: `interrupt_or_dequeue` runs
+    as its own task, so `_handle_message` returns immediately."""
+    loop = cancellable_loop
+    conn_a = loop.connections["worker-a"]
+
+    interrupt_running = threading.Event()
+    release = threading.Event()
+
+    def _hanging_interrupt(comfy_url, prompt_id, **kwargs):
+        interrupt_running.set()
+        release.wait(10)
+        return "interrupted"
+
+    monkeypatch.setattr(comfy, "interrupt_or_dequeue", _hanging_interrupt)
+
+    await loop._handle_message(conn_a, _job_message("job-hang"))
+    await _await_flag(loop.test_started)
+
+    started = time.monotonic()
+    await loop._handle_message(conn_a, {"type": "job_cancelled", "job_id": "job-hang"})
+    elapsed = time.monotonic() - started
+
+    assert elapsed < 1.0, "the receive loop waited for ComfyUI"
+    await _await_flag(interrupt_running)
+    release.set()
+    await asyncio.wait_for(loop._current_job_task, timeout=10)
+
+
+def test_interrupt_or_dequeue_uses_a_short_timeout():
+    """Cancel-time HTTP gets its own short timeout -- the default 30s client
+    would let a hung ComfyUI eat most of the server's 90s stale margin."""
+    assert comfy._CANCEL_HTTP_TIMEOUT_SECONDS <= 10.0
+
+
+# --- Final review Major 4: the periodic heartbeat carries the job id -------
+
+
+async def test_periodic_heartbeat_carries_the_running_job_id(cancellable_loop, monkeypatch):
+    """"A zombied worker learns within one heartbeat" is only true if the
+    30s heartbeat actually names the job. The job task's own broadcasts only
+    fire on ComfyUI progress events, which whole phases (model load, video
+    encode, artifact upload) produce none of."""
+    loop = cancellable_loop
+    conn_a = loop.connections["worker-a"]
+
+    monkeypatch.setattr(runner_module, "_HEARTBEAT_INTERVAL_SECONDS", 0)
+    monkeypatch.setattr(runner_module, "_RECV_POLL_TIMEOUT_SECONDS", 0.01)
+
+    await loop._handle_message(conn_a, _job_message("job-heartbeat"))
+    task = loop._current_job_task
+    await _await_flag(loop.test_started)
+
+    conn_a.heartbeats.clear()
+    loop_task = asyncio.create_task(loop._connection_loop(conn_a))
+    await asyncio.sleep(0.1)
+    loop_task.cancel()
+    try:
+        await loop_task
+    except asyncio.CancelledError:
+        pass
+
+    assert conn_a.heartbeats, "the periodic heartbeat never fired"
+    assert all(hb["job_id"] == "job-heartbeat" for hb in conn_a.heartbeats)
+
+    await loop._handle_message(conn_a, {"type": "job_cancelled", "job_id": "job-heartbeat"})
+    await asyncio.wait_for(task, timeout=10)
+
+
+async def test_periodic_heartbeat_only_names_the_job_on_its_own_platform(
+    cancellable_loop, monkeypatch
+):
+    """A job dispatched by platform A must never be named on platform B's
+    heartbeat: B doesn't know the id, would treat it as not-owned, and would
+    push a job_cancelled that kills a perfectly healthy run."""
+    loop = cancellable_loop
+    conn_a = loop.connections["worker-a"]
+    conn_b = loop.connections["worker-b"]
+
+    monkeypatch.setattr(runner_module, "_HEARTBEAT_INTERVAL_SECONDS", 0)
+    monkeypatch.setattr(runner_module, "_RECV_POLL_TIMEOUT_SECONDS", 0.01)
+
+    await loop._handle_message(conn_a, _job_message("job-scoped"))
+    task = loop._current_job_task
+    await _await_flag(loop.test_started)
+
+    conn_b.heartbeats.clear()
+    loop_task = asyncio.create_task(loop._connection_loop(conn_b))
+    await asyncio.sleep(0.1)
+    loop_task.cancel()
+    try:
+        await loop_task
+    except asyncio.CancelledError:
+        pass
+
+    assert conn_b.heartbeats
+    assert all(hb["job_id"] is None for hb in conn_b.heartbeats)
+
+    await loop._handle_message(conn_a, {"type": "job_cancelled", "job_id": "job-scoped"})
+    await asyncio.wait_for(task, timeout=10)

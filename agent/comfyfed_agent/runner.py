@@ -30,6 +30,25 @@ _RECV_POLL_TIMEOUT_SECONDS = 1.0
 _BACKOFF_START_SECONDS = 5
 _BACKOFF_MAX_SECONDS = 60
 
+# Backoff for re-reporting a finished job across a connection blip (see
+# `_report_completion`). Unbounded in total: the work is already done and
+# paid for in GPU time, so the only sane thing to do with it is keep trying
+# to hand it over until the agent stops.
+_REPORT_RETRY_START_SECONDS = 1.0
+_REPORT_RETRY_MAX_SECONDS = 30.0
+
+
+class PlatformUnavailable(Exception):
+    """The platform could not be reached -- as opposed to answering and
+    saying no.
+
+    The distinction decides a job's fate. A platform that ANSWERS and
+    rejects (a 4xx, a hash mismatch) is a real failure: report it and move
+    on. A platform we simply could not talk to says nothing about the run,
+    which finished perfectly well, so the completion is held and retried
+    across the reconnect instead of being thrown away as a failure.
+    """
+
 
 class PlatformConnection:
     """One agent<->platform WebSocket connection, with small testable methods."""
@@ -309,9 +328,19 @@ class _JobHandle:
     """
 
     job_id: str
+    # The connection that dispatched this job. Everything about the job is
+    # scoped to it: only that platform may cancel it, and only that
+    # platform's heartbeats may name it (any other platform would read the
+    # id as one it never issued -- i.e. not owned -- and push a
+    # `job_cancelled` that would kill a perfectly healthy run).
+    conn: Optional["PlatformConnection"] = None
     cancel_event: asyncio.Event = field(default_factory=asyncio.Event)
     prompt_id: Optional[str] = None
     task: Optional[asyncio.Task] = None
+    # True while the run is over and only the hand-off (artifact uploads +
+    # job_done) is left. Such a job must not be cancel-evented by shutdown:
+    # there is nothing left to abort, only a result to deliver or preserve.
+    reporting: bool = False
     # The prompt id ComfyUI has already been told to stop, so the wind-down
     # re-check never fires a second `/interrupt` for a prompt the receive
     # loop already handled -- on a shared worker that second call could land
@@ -342,6 +371,8 @@ class AgentLoop:
         # Every spawned handle_job task, so shutdown can reap them instead of
         # letting the event loop close over pending work.
         self._job_tasks: set[asyncio.Task] = set()
+        # Same, for the fire-and-forget "tell ComfyUI to stop" tasks.
+        self._stop_tasks: set[asyncio.Task] = set()
         # Most recently spawned job (diagnostics, and what tests await).
         self._current_job_task: Optional[asyncio.Task] = None
         self._current_job_id: Optional[str] = None
@@ -409,7 +440,7 @@ class AgentLoop:
         cancelled = False
         handle = self._jobs.get(job_id)
         if handle is None:
-            handle = _JobHandle(job_id=job_id)
+            handle = _JobHandle(job_id=job_id, conn=conn)
             self._jobs[job_id] = handle
 
         def raise_if_cancelled() -> None:
@@ -464,21 +495,21 @@ class AgentLoop:
                     {"filename": filename, "subfolder": subfolder} for filename, _content, subfolder in files
                 ]
 
-                # The upload loop is the longest NETWORK phase of a job
-                # (minutes, for video), so the cancel event is re-read before
-                # every file and once more before reporting completion:
-                # uploading artifacts for a cancelled job pushes bytes the
-                # server rejects (its artifact gate wants assigned/running,
-                # and the job is `cancelled` by then).
-                for filename, content, _subfolder in files:
-                    raise_if_cancelled()
-                    await self._upload_artifact(conn.entry, job_id, filename, content)
-
-                raise_if_cancelled()
-                await conn.send_job_done(
-                    job_id, [filename for filename, _content, _subfolder in files], exec_seconds
-                )
+                await self._report_completion(conn, handle, files, exec_seconds)
                 success = True
+            except asyncio.CancelledError:
+                # Almost always shutdown reaching a job whose result was
+                # never handed over. Say so loudly and leave every file
+                # alone (the `finally` picks FAILURE, which cleans nothing):
+                # a restart can redo the run, or the server's requeue plus
+                # blip re-adoption can still collect it. Deleting the inputs
+                # here would only guarantee the redo starts from scratch.
+                logger.warning(
+                    "runner: job %s wound down before its completion reached the platform; "
+                    "leaving its files on disk for a retry or requeue",
+                    job_id,
+                )
+                raise
             except comfy.JobCancelled:
                 # Deliberately silent toward the platform: it cancelled this
                 # job, so neither job_done nor job_failed is sent -- either
@@ -531,6 +562,78 @@ class AgentLoop:
                         self._current_job_task = None
                 await self.broadcast_heartbeat("idle", progress=0.0, job_id=None)
 
+    async def _report_completion(
+        self, conn: PlatformConnection, handle: _JobHandle, files: list, exec_seconds
+    ) -> None:
+        """Hand a finished job's artifacts and `job_done` to the platform,
+        surviving a connection blip.
+
+        This is the phase the whole re-adoption design hinges on, and the
+        one most likely to straddle an outage: the server's stale requeue
+        fires at 90s precisely because runs outlive short disconnects, so
+        "the run ended while the socket was down" is the NORMAL blip, not an
+        exotic one. Dropping the completion there would send the job back to
+        the queue and have a second worker redo GPU-minutes that are already
+        spent -- the double-spend this phase exists to remove.
+
+        So a transport failure (`PlatformUnavailable` from an upload, or any
+        error from `send_job_done` -- during a blip `conn.ws` is None and
+        `_send` raises) is not a failure of the job: it backs off, waits for
+        `_run_platform` to put a live socket back on the same connection
+        object, and starts the hand-off again from the first artifact. The
+        server accepts the retry through `try_readopt`, and re-uploading an
+        artifact it already has is idempotent (same job, same filename,
+        hash-verified).
+
+        A platform that ANSWERS and rejects is a different thing entirely
+        and propagates untouched to the failure path. So does a cancel
+        (`JobCancelled`) and a task cancellation.
+        """
+        job_id = handle.job_id
+        handle.reporting = True
+        backoff = _REPORT_RETRY_START_SECONDS
+        while True:
+            try:
+                # The cancel event is re-read before every file: the upload
+                # loop is the longest NETWORK phase of a job (minutes, for
+                # video), and a cancelled job's uploads are rejected anyway
+                # (the artifact gate wants assigned/running).
+                for filename, content, _subfolder in files:
+                    if handle.cancel_event.is_set():
+                        raise comfy.JobCancelled()
+                    await self._upload_artifact(conn.entry, job_id, filename, content)
+
+                if handle.cancel_event.is_set():
+                    raise comfy.JobCancelled()
+                try:
+                    await conn.send_job_done(
+                        job_id, [filename for filename, _content, _subfolder in files], exec_seconds
+                    )
+                except Exception as exc:  # the socket, not the job
+                    raise PlatformUnavailable(str(exc)) from exc
+                return
+            except PlatformUnavailable as exc:
+                logger.warning(
+                    "runner: job %s finished but the platform is unreachable (%s); "
+                    "holding the completion, retrying in %.0fs",
+                    job_id, exc, backoff,
+                )
+                await self._wait_for_live_connection(conn, backoff)
+                backoff = min(backoff * 2, _REPORT_RETRY_MAX_SECONDS)
+
+    async def _wait_for_live_connection(self, conn: PlatformConnection, timeout: float) -> None:
+        """Sleep until `conn` has a socket again, or `timeout` elapses.
+
+        `_run_platform` reconnects on the SAME `PlatformConnection` object,
+        replacing `.ws` in place, so that attribute is the signal a held
+        completion waits on. The timeout keeps this a backoff rather than a
+        promise: a retry against a socket that is merely about to die simply
+        fails again and backs off further.
+        """
+        deadline = time.monotonic() + timeout
+        while getattr(conn, "ws", None) is None and time.monotonic() < deadline:
+            await asyncio.sleep(min(0.25, timeout))
+
     async def _download_input(self, entry: PlatformEntry, job_id: str, filename: str) -> bytes:
         path = f"/api/agent/jobs/{job_id}/inputs/{filename}"
         headers = signing.signed_headers(entry, "GET", path, b"")
@@ -550,9 +653,16 @@ class AgentLoop:
         `artifact.hash_mismatch`) is retried once with a fresh upload. If
         that also fails, raises so `handle_job` reports the job failed
         instead of silently losing or corrupting the result.
+
+        Which exception it raises matters: `RuntimeError` when the platform
+        ANSWERED and the upload still did not verify (a real rejection --
+        the job failed), `PlatformUnavailable` when no attempt got an
+        answer at all (a transport problem -- the job is fine, the socket
+        isn't). `_report_completion` holds and retries only the latter.
         """
         path = f"/api/agent/jobs/{job_id}/artifacts"
         local_sha256 = hashlib.sha256(content).hexdigest()
+        answered = False
 
         for attempt in range(2):
             try:
@@ -564,6 +674,7 @@ class AgentLoop:
                     request.headers.update(headers)
                     resp = await client.send(request)
 
+                answered = True
                 if resp.status_code == 200 and resp.json().get("sha256") == local_sha256:
                     return
 
@@ -574,6 +685,8 @@ class AgentLoop:
             except Exception:
                 logger.exception("runner: artifact upload for %r raised (attempt=%d)", filename, attempt + 1)
 
+        if not answered:
+            raise PlatformUnavailable(f"artifact upload for {filename!r} could not reach the platform")
         raise RuntimeError("artifact upload failed")
 
     def _spawn_job(self, conn: PlatformConnection, message: dict) -> asyncio.Task:
@@ -589,7 +702,7 @@ class AgentLoop:
         job_id = message["job_id"]
         # Registered BEFORE the task starts, so a `job_cancelled` arriving in
         # the same batch of messages can already find (and trip) the handle.
-        handle = _JobHandle(job_id=job_id)
+        handle = _JobHandle(job_id=job_id, conn=conn)
         self._jobs[job_id] = handle
 
         task = asyncio.create_task(self.handle_job(conn, message), name=f"comfyfed-job-{job_id}")
@@ -614,7 +727,29 @@ class AgentLoop:
         if exc is not None:
             logger.error("runner: job task %s raised", task.get_name(), exc_info=exc)
 
-    async def _handle_job_cancelled(self, message: dict) -> None:
+    def _job_id_for(self, conn: PlatformConnection) -> Optional[str]:
+        """The id of the job `conn`'s own platform dispatched, if one is
+        running -- and never another platform's.
+
+        This is what the periodic heartbeat carries, and it is the entire
+        basis of the spec's "a zombied worker learns within one heartbeat":
+        a heartbeat with no job_id tells the server nothing to check
+        ownership against, so a worker re-assigned away mid-run would only
+        find out when its `job_done` is finally rejected -- after the render
+        it was told to abandon. Naming a job on the WRONG platform's
+        heartbeat is worse than naming none: that platform never issued the
+        id, would read it as not-owned, and would push a `job_cancelled`
+        that aborts a healthy run.
+        """
+        job_id = self._current_job_id
+        if job_id is None:
+            return None
+        handle = self._jobs.get(job_id)
+        if handle is None or handle.conn is not conn:
+            return None
+        return job_id
+
+    async def _handle_job_cancelled(self, conn: PlatformConnection, message: dict) -> None:
         """Platform says this job is no longer ours: stop ComfyUI and wind down.
 
         Two independent halves, both needed. The cancel event unblocks *us*
@@ -625,16 +760,41 @@ class AgentLoop:
         """
         job_id = message.get("job_id")
         handle = self._jobs.get(job_id) if job_id else None
-        if handle is None:
+        if handle is None or (handle.conn is not None and handle.conn is not conn):
             # Routine, not alarming: the server pushes job_cancelled whenever
             # this agent references a job it no longer owns, which includes
-            # jobs this process already finished or never ran.
+            # jobs this process already finished or never ran. A job id that
+            # belongs to a DIFFERENT platform's run is ignored for the same
+            # reason it is never advertised there -- only the platform that
+            # dispatched a job may cancel it.
             logger.debug("runner: job_cancelled for job %r we are not running, ignoring", job_id)
             return
 
         logger.info("runner: platform cancelled job %s", job_id)
         handle.cancel_event.set()
-        await self._stop_comfy_prompt(handle)
+        # Stopping ComfyUI is fired as its own task, never awaited here:
+        # this runs inside the receive loop, and `interrupt_or_dequeue`
+        # makes two HTTP calls that a hung ComfyUI can stall for their full
+        # timeout -- during which this connection would read no message and
+        # send no heartbeat, and could trip the server's 90s stale requeue
+        # from inside the handler whose purpose is preventing exactly that.
+        self._spawn_stop_comfy_prompt(handle)
+
+    def _spawn_stop_comfy_prompt(self, handle: _JobHandle) -> asyncio.Task:
+        """Run `_stop_comfy_prompt` off the caller's own coroutine, tracked
+        so `shutdown` can reap it and a failure inside it is never silent."""
+        task = asyncio.create_task(
+            self._stop_comfy_prompt(handle), name=f"comfyfed-stop-{handle.job_id}"
+        )
+        self._stop_tasks.add(task)
+
+        def _done(t: asyncio.Task) -> None:
+            self._stop_tasks.discard(t)
+            if not t.cancelled() and t.exception() is not None:
+                logger.error("runner: %s raised", t.get_name(), exc_info=t.exception())
+
+        task.add_done_callback(_done)
+        return task
 
     async def _stop_comfy_prompt(self, handle: _JobHandle) -> None:
         """Tell ComfyUI to stop this job's prompt, at most once per prompt.
@@ -687,14 +847,24 @@ class AgentLoop:
         """
         handles = list(self._jobs.values())
         for handle in handles:
+            if handle.reporting:
+                # The run is over; only the hand-off is left. Tripping its
+                # cancel event would make a delivered-or-preserved result
+                # look like a platform cancellation and delete its files.
+                logger.warning(
+                    "runner: job %s finished but its completion never reached the platform",
+                    handle.job_id,
+                )
+                continue
             handle.cancel_event.set()
         # Stopping ourselves is not enough: an agent that exits while ComfyUI
         # renders on would come back, advertise idle, and get dispatched work
         # that then queues behind the ghost prompt of the job it abandoned.
         for handle in handles:
-            await self._stop_comfy_prompt(handle)
+            if not handle.reporting:
+                await self._stop_comfy_prompt(handle)
 
-        tasks = list(self._job_tasks)
+        tasks = list(self._job_tasks) + list(self._stop_tasks)
         if tasks:
             _done, pending = await asyncio.wait(tasks, timeout=timeout)
             for task in pending:
@@ -702,6 +872,7 @@ class AgentLoop:
             if pending:
                 await asyncio.gather(*pending, return_exceptions=True)
         self._job_tasks.clear()
+        self._stop_tasks.clear()
         self._jobs.clear()
 
     async def _handle_message(self, conn: PlatformConnection, message: dict) -> None:
@@ -709,7 +880,7 @@ class AgentLoop:
         if msg_type == "job":
             self._spawn_job(conn, message)
         elif msg_type == "job_cancelled":
-            await self._handle_job_cancelled(message)
+            await self._handle_job_cancelled(conn, message)
         elif msg_type == "receipt":
             worker_sig = conn.sign_receipt_payload(message["payload"])
             await conn.send_receipt_ack(message["receipt_id"], worker_sig)
@@ -734,7 +905,13 @@ class AgentLoop:
             if now - last_heartbeat >= _HEARTBEAT_INTERVAL_SECONDS:
                 dynamic = hardware.collect_dynamic(self.config.models_dir)
                 await conn.send_heartbeat(
-                    conn.state, dynamic=dynamic, object_info_hash=conn.object_info_hash or None
+                    conn.state,
+                    # Carrying the job id is what lets the server notice a
+                    # worker still grinding on a job it no longer owns; see
+                    # `_job_id_for` for why it is scoped to this connection.
+                    job_id=self._job_id_for(conn),
+                    dynamic=dynamic,
+                    object_info_hash=conn.object_info_hash or None,
                 )
                 last_heartbeat = now
 
@@ -778,11 +955,12 @@ class AgentLoop:
                 # deliver. Finished tasks have already reaped themselves via
                 # `_on_job_task_done`; a survivor is logged, not orphaned --
                 # `shutdown` still accounts for it at process exit.
-                for task in self._job_tasks:
-                    logger.warning(
-                        "runner: %s still running across the %s reconnect",
-                        task.get_name(), conn.entry.platform_url,
-                    )
+                for handle in self._jobs.values():
+                    if handle.conn is conn and handle.task is not None and not handle.task.done():
+                        logger.warning(
+                            "runner: job %s still running across the %s reconnect",
+                            handle.job_id, conn.entry.platform_url,
+                        )
 
             await asyncio.sleep(backoff)
             backoff = min(backoff * 2, _BACKOFF_MAX_SECONDS)

@@ -12,6 +12,13 @@ import httpx
 
 _POLL_INTERVAL_SECONDS = 1.0
 
+# Cancel-time HTTP gets a much shorter timeout than the default 30s client.
+# `interrupt_or_dequeue` runs on behalf of the agent's receive loop, and two
+# sequential 30s timeouts against a hung ComfyUI would be 60s of a socket
+# that sends no heartbeat -- most of the server's 90s stale-requeue margin,
+# on the one path whose whole job is to stay responsive.
+_CANCEL_HTTP_TIMEOUT_SECONDS = 10.0
+
 # Progress ramp bounds (see `_estimate_progress`).
 _PROGRESS_FLOOR = 0.1
 _PROGRESS_CEILING = 0.9
@@ -197,7 +204,8 @@ def interrupt_or_dequeue(comfy_url: str, prompt_id: str, client: Optional[httpx.
     `job_cancelled` branch) logs it -- the cancel event alone is already
     enough to wind the run down.
     """
-    c, owns = _client_or_new(client)
+    owns = client is None
+    c = client if client is not None else httpx.Client(timeout=_CANCEL_HTTP_TIMEOUT_SECONDS)
     try:
         base = comfy_url.rstrip("/")
         placement = _queue_placement(comfy_url, prompt_id, c)
