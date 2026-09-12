@@ -18,6 +18,13 @@ comfyfed-server = "comfyfed_server.main:cli"
 comfyfed-agent = "comfyfed_agent.main:cli"
 [tool.setuptools.packages.find]
 where = ["server", "agent"]
+[tool.setuptools]
+include-package-data = true
+[tool.setuptools.package-data]
+# The workflow-template library (index, UI-format workflows, thumbnails and
+# the input images templates reference) has to travel inside the wheel --
+# `templates.py` locates it with importlib.resources, not a repo path.
+comfyfed_server = ["templates_data/*.json", "templates_data/*.webp", "templates_data/assets/*"]
 [tool.pytest.ini_options]
 asyncio_mode = "auto"
 testpaths = ["tests"]

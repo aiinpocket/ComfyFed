@@ -24,6 +24,7 @@ from . import (
     jobs,
     metrics,
     receipts,
+    templates,
     workers,
 )
 
@@ -136,6 +137,12 @@ def create_app(data_dir: str) -> FastAPI:
     bootstrap.ensure_installed(data_dir, lang=None, url=None, interactive=False)
     metrics.init()
 
+    # Put the template library's input images where the panel looks for
+    # uploads, so a freshly opened template's `LoadImage` already resolves.
+    seeded = templates.seed_staging(comfyapi.staging_dir(data_dir))
+    if seeded:
+        logger.info("comfyfed_server: seeded template assets into staging: %s", ", ".join(seeded))
+
     @asynccontextmanager
     async def lifespan(_app: FastAPI):
         task = agentws.start_background_task()
@@ -157,6 +164,7 @@ def create_app(data_dir: str) -> FastAPI:
     app.include_router(agentws.create_router(data_dir))
     app.include_router(comfyapi.create_router(data_dir))
     app.include_router(comfyapi.create_ws_router())
+    app.include_router(templates.create_router())
 
     @app.get("/metrics")
     async def metrics_endpoint(request: Request) -> Response:

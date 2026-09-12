@@ -172,9 +172,29 @@ comfyfed-server fetch-comfy-ui --data-dir ./data
 
 ⚠ **編輯器上方工具列有幾顆按鈕沒有後端**：**取消／中斷（Cancel、Interrupt）、清空佇列（Clear queue）、刪除歷史紀錄**這些動作在 ComfyFed 上都沒有對應的 API，按下去只會拿到 404。Phase 1.5 的相容層是唯讀的佇列與歷史：工作一旦送出就只能等它跑完或失敗。要停掉一個工作，目前得從 Console 或直接改資料庫處理。
 
-目前的相容層只做到「拉圖 → 送工作 → 看結果」這條主線。編輯器裡幾個依賴單機 ComfyUI 的功能不會動：**存工作流到伺服器、官方範本、Manager／自訂節點擴充、模型清單瀏覽**（模型在各個 worker 上，平台自己沒有）。工作流請用瀏覽器的匯出／匯入，或用 Console 的「貼上 API JSON」。編輯器的介面偏好（主題等）會存在 `<data-dir>/comfy_settings.json`。
+目前的相容層只做到「拉圖 → 送工作 → 看結果」這條主線。編輯器裡幾個依賴單機 ComfyUI 的功能不會動：**存工作流到伺服器、Manager／自訂節點擴充、模型清單瀏覽**（模型在各個 worker 上，平台自己沒有）。工作流請用瀏覽器的匯出／匯入，或用 Console 的「貼上 API JSON」。編輯器的介面偏好（主題等）會存在 `<data-dir>/comfy_settings.json`。範本瀏覽器則是通的，只是裡面裝的是 ComfyFed 自己的範本（見下一節），不是 ComfyUI 官方那一整包。
 
 **跟自備 ComfyUI 的關係**：兩者不衝突，是兩個入口。內嵌編輯器是「我沒有 ComfyUI，或懶得開」的路；如果你本機已經有 ComfyUI，照樣可以在自己那邊拉好工作流、用「Save (API format)」匯出，再貼進 Console 送出。真正跑圖的一律是聯邦裡的 worker（也就是各成員自己的 ComfyUI），平台本身不裝 ComfyUI、也不跑推論——`/comfy` 只是一層把官方前端的動作翻譯成聯邦工作的相容 API。
+
+### 範本
+
+第一次打開編輯器不知道從哪開始，就用範本。ComfyFed 內建三支**實戰跑過**的工作流，每一支都在畫布上用便條紙逐段標了「這個節點在幹嘛、你該改哪裡」，中英雙語。
+
+**怎麼打開**：編輯器左側工具列的**範本／Browse Templates**（或功能表 Workflow → Browse Templates；空白畫布上也會有入口）→ 側邊分類選 **ComfyFed** → 點縮圖，它就會**複製一份**到畫布上變成新的未命名工作流。**改的是副本，範本本身動不到**，改壞了關掉重開一份就好。
+
+三支範本：
+
+| 名稱 | 是什麼 | 尺寸／步數 |
+| --- | --- | --- |
+| **武俠文生圖** | Flux 文生圖。就是 ComfyFed 第一次跑通聯邦派工用的那張圖，提示詞原封不動 | 768×768，8 步（很快，適合先熟悉流程） |
+| **角色立繪** | 同一條 Flux 流程的直式版，專門生單一角色的定裝照 | 896×1152，20 步 |
+| **參考圖生影片** | MiniMax H3 Ref2V：一張定裝照 →「同一個人」在動的影片，**自帶聲音** | 1152×640，141 格（約 6 秒），8 步（turbo LoRA） |
+
+**改一個地方就能跑**：每支範本都有一個紫色群組框標著「只改這一區」，裡面就是提示詞節點（第三支還多一個參考圖節點）。其他三個群組框（載入模型／取樣／輸出）照著便條紙看就好，不用動。改完按右上角 **Run**，工作流就變成一個聯邦 job 排進佇列，跑完結果直接顯示在最右邊的輸出節點裡，Console 的「工作」頁也拿得到檔案與收據。
+
+**附帶素材**：第三支範本要一張參考圖。平台會在啟動時把 `amyntas_ref.png` 放進 `<data-dir>/comfy_staging/`，所以 `LoadImage` 的下拉一開就選得到。要換成自己的圖，直接在 `LoadImage` 節點上傳（或把檔案拖進畫布）即可——上傳的檔案一樣進 staging，送單時才複製成那個 job 的輸入。
+
+⚠ 範本用到的模型（`flux1-dev`、MiniMax H3 那幾顆、turbo LoRA）**必須有 worker 真的裝了**，下拉才選得到、工作才派得出去。沒有的話工作會建立成功但一直卡在佇列——原因看「工作」頁的不合格說明。
 
 ### 發布 agent 新版本
 
@@ -415,11 +435,13 @@ database.
 
 The compatibility layer currently covers the main line only: build a graph,
 queue it, see the results. Editor features that assume a single local ComfyUI
-do not work — **saving workflows to the server, the official template
-gallery, Manager / custom-node extensions, and model browsing** (models live
-on the workers; the platform has none). Export/import workflows through the
-browser instead, or paste the API JSON into the console. Editor UI
-preferences (theme and so on) persist to `<data-dir>/comfy_settings.json`.
+do not work — **saving workflows to the server, Manager / custom-node
+extensions, and model browsing** (models live on the workers; the platform has
+none). Export/import workflows through the browser instead, or paste the API
+JSON into the console. Editor UI preferences (theme and so on) persist to
+`<data-dir>/comfy_settings.json`. The template browser *does* work, but it is
+stocked with ComfyFed's own templates (next section) rather than ComfyUI's
+upstream gallery.
 
 **How this relates to bringing your own ComfyUI**: they are two doors into the
 same federation, not alternatives. The embedded editor is for "I don't have
@@ -429,6 +451,45 @@ into the console. Either way the actual rendering happens on federation
 workers — each member's own ComfyUI. The platform itself never installs
 ComfyUI and never runs inference; `/comfy` is only a compatibility layer that
 translates the official frontend's actions into federation jobs.
+
+### Templates
+
+If you open the editor and have no idea where to start, start from a template.
+ComfyFed ships three **production-proven** workflows, each annotated on the
+canvas with sticky notes — in Traditional Chinese and English — explaining what
+every stage does and which node you are supposed to edit.
+
+**Opening the browser**: the **Browse Templates** entry in the editor's left
+toolbar (also under Workflow → Browse Templates, and on the empty-canvas
+screen) → pick the **ComfyFed** category in the sidebar → click a thumbnail.
+That **clones** the template into a new untitled workflow; you edit the copy,
+the template itself is never touched, so if you break it, close it and take a
+fresh one.
+
+| Template | What it is | Size / steps |
+| --- | --- | --- |
+| **Wuxia text-to-image** | Flux text-to-image — the exact graph (and prompt) of ComfyFed's first end-to-end federation run | 768×768, 8 steps (fast; good for learning the flow) |
+| **Character portrait** | The same Flux pipeline in portrait orientation, for single-character reference sheets | 896×1152, 20 steps |
+| **Reference to video** | MiniMax H3 Ref2V: one reference photo → a clip of the same person moving, **with generated audio** | 1152×640, 141 frames (~6s), 8 steps via the turbo LoRA |
+
+**Change one thing and run.** Each template has a purple group box labelled
+"only edit here" containing the prompt node (the video one also has the
+reference-image node). The other three groups — load models, sampling, output —
+are explained by the notes and need no edits. Press **Run**: the graph becomes
+a federation job, and when a worker finishes, the result renders inside the
+output node on the right and is also downloadable, with its receipt, from the
+console's Jobs page.
+
+**Bundled asset**: the reference-to-video template needs a reference image. The
+server seeds `amyntas_ref.png` into `<data-dir>/comfy_staging/` at startup, so
+the `LoadImage` dropdown resolves out of the box. To use your own, upload it on
+the `LoadImage` node (or drop the file onto the canvas) — uploads land in the
+same staging area and are copied into the job's inputs at submit time.
+
+⚠ The models these templates name (`flux1-dev`, the MiniMax H3 set, the turbo
+LoRA) must actually be installed **on a worker** for the dropdowns to offer
+them and for the job to be dispatchable. Otherwise the job is created but sits
+in the queue; the Jobs page's ineligibility reasons say what is missing.
 
 ### Publishing an agent release
 

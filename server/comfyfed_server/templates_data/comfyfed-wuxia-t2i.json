@@ -1,0 +1,795 @@
+{
+  "last_node_id": 104,
+  "last_link_id": 13,
+  "nodes": [
+    {
+      "id": 1,
+      "type": "UNETLoader",
+      "pos": [
+        0,
+        120
+      ],
+      "size": [
+        300,
+        82
+      ],
+      "flags": {},
+      "order": 0,
+      "mode": 0,
+      "inputs": [],
+      "outputs": [
+        {
+          "name": "MODEL",
+          "type": "MODEL",
+          "slot_index": 0,
+          "links": [
+            3,
+            5
+          ]
+        }
+      ],
+      "properties": {
+        "Node name for S&R": "UNETLoader"
+      },
+      "widgets_values": [
+        "flux1-dev.safetensors",
+        "default"
+      ],
+      "bgcolor": "#323",
+      "color": "#535"
+    },
+    {
+      "id": 2,
+      "type": "DualCLIPLoader",
+      "pos": [
+        0,
+        250
+      ],
+      "size": [
+        300,
+        130
+      ],
+      "flags": {},
+      "order": 1,
+      "mode": 0,
+      "inputs": [],
+      "outputs": [
+        {
+          "name": "CLIP",
+          "type": "CLIP",
+          "slot_index": 0,
+          "links": [
+            1
+          ]
+        }
+      ],
+      "properties": {
+        "Node name for S&R": "DualCLIPLoader"
+      },
+      "widgets_values": [
+        "clip_l.safetensors",
+        "t5xxl_fp16.safetensors",
+        "flux",
+        "default"
+      ],
+      "bgcolor": "#323",
+      "color": "#535"
+    },
+    {
+      "id": 3,
+      "type": "VAELoader",
+      "pos": [
+        0,
+        430
+      ],
+      "size": [
+        300,
+        58
+      ],
+      "flags": {},
+      "order": 2,
+      "mode": 0,
+      "inputs": [],
+      "outputs": [
+        {
+          "name": "VAE",
+          "type": "VAE",
+          "slot_index": 0,
+          "links": [
+            12
+          ]
+        }
+      ],
+      "properties": {
+        "Node name for S&R": "VAELoader"
+      },
+      "widgets_values": [
+        "ae.safetensors"
+      ],
+      "bgcolor": "#323",
+      "color": "#535"
+    },
+    {
+      "id": 4,
+      "type": "CLIPTextEncode",
+      "pos": [
+        400,
+        120
+      ],
+      "size": [
+        440,
+        240
+      ],
+      "flags": {},
+      "order": 3,
+      "mode": 0,
+      "inputs": [
+        {
+          "name": "clip",
+          "type": "CLIP",
+          "link": 1
+        }
+      ],
+      "outputs": [
+        {
+          "name": "CONDITIONING",
+          "type": "CONDITIONING",
+          "slot_index": 0,
+          "links": [
+            2
+          ]
+        }
+      ],
+      "properties": {
+        "Node name for S&R": "CLIPTextEncode"
+      },
+      "widgets_values": [
+        "Cinematic film still, a wuxia swordsman standing on a misty bamboo mountain ridge at dawn, flowing white robes, long black hair tied up, hand resting on sword hilt, warm golden rim light, photorealistic, 35mm film grain"
+      ],
+      "title": "提示詞 Prompt ← 改這裡 / edit here",
+      "bgcolor": "#533",
+      "color": "#a33"
+    },
+    {
+      "id": 5,
+      "type": "FluxGuidance",
+      "pos": [
+        400,
+        410
+      ],
+      "size": [
+        300,
+        58
+      ],
+      "flags": {},
+      "order": 4,
+      "mode": 0,
+      "inputs": [
+        {
+          "name": "conditioning",
+          "type": "CONDITIONING",
+          "link": 2
+        }
+      ],
+      "outputs": [
+        {
+          "name": "CONDITIONING",
+          "type": "CONDITIONING",
+          "slot_index": 0,
+          "links": [
+            4
+          ]
+        }
+      ],
+      "properties": {
+        "Node name for S&R": "FluxGuidance"
+      },
+      "widgets_values": [
+        3.5
+      ]
+    },
+    {
+      "id": 10,
+      "type": "EmptySD3LatentImage",
+      "pos": [
+        900,
+        120
+      ],
+      "size": [
+        280,
+        106
+      ],
+      "flags": {},
+      "order": 5,
+      "mode": 0,
+      "inputs": [],
+      "outputs": [
+        {
+          "name": "LATENT",
+          "type": "LATENT",
+          "slot_index": 0,
+          "links": [
+            10
+          ]
+        }
+      ],
+      "properties": {
+        "Node name for S&R": "EmptySD3LatentImage"
+      },
+      "widgets_values": [
+        768,
+        768,
+        1
+      ]
+    },
+    {
+      "id": 7,
+      "type": "KSamplerSelect",
+      "pos": [
+        900,
+        270
+      ],
+      "size": [
+        280,
+        58
+      ],
+      "flags": {},
+      "order": 6,
+      "mode": 0,
+      "inputs": [],
+      "outputs": [
+        {
+          "name": "SAMPLER",
+          "type": "SAMPLER",
+          "slot_index": 0,
+          "links": [
+            8
+          ]
+        }
+      ],
+      "properties": {
+        "Node name for S&R": "KSamplerSelect"
+      },
+      "widgets_values": [
+        "euler"
+      ]
+    },
+    {
+      "id": 8,
+      "type": "BasicScheduler",
+      "pos": [
+        900,
+        370
+      ],
+      "size": [
+        280,
+        106
+      ],
+      "flags": {},
+      "order": 7,
+      "mode": 0,
+      "inputs": [
+        {
+          "name": "model",
+          "type": "MODEL",
+          "link": 5
+        }
+      ],
+      "outputs": [
+        {
+          "name": "SIGMAS",
+          "type": "SIGMAS",
+          "slot_index": 0,
+          "links": [
+            9
+          ]
+        }
+      ],
+      "properties": {
+        "Node name for S&R": "BasicScheduler"
+      },
+      "widgets_values": [
+        "simple",
+        8,
+        1.0
+      ]
+    },
+    {
+      "id": 9,
+      "type": "RandomNoise",
+      "pos": [
+        900,
+        520
+      ],
+      "size": [
+        280,
+        82
+      ],
+      "flags": {},
+      "order": 8,
+      "mode": 0,
+      "inputs": [],
+      "outputs": [
+        {
+          "name": "NOISE",
+          "type": "NOISE",
+          "slot_index": 0,
+          "links": [
+            6
+          ]
+        }
+      ],
+      "properties": {
+        "Node name for S&R": "RandomNoise"
+      },
+      "widgets_values": [
+        359338,
+        "randomize"
+      ]
+    },
+    {
+      "id": 6,
+      "type": "BasicGuider",
+      "pos": [
+        1240,
+        120
+      ],
+      "size": [
+        270,
+        46
+      ],
+      "flags": {},
+      "order": 9,
+      "mode": 0,
+      "inputs": [
+        {
+          "name": "model",
+          "type": "MODEL",
+          "link": 3
+        },
+        {
+          "name": "conditioning",
+          "type": "CONDITIONING",
+          "link": 4
+        }
+      ],
+      "outputs": [
+        {
+          "name": "GUIDER",
+          "type": "GUIDER",
+          "slot_index": 0,
+          "links": [
+            7
+          ]
+        }
+      ],
+      "properties": {
+        "Node name for S&R": "BasicGuider"
+      },
+      "widgets_values": []
+    },
+    {
+      "id": 11,
+      "type": "SamplerCustomAdvanced",
+      "pos": [
+        1240,
+        210
+      ],
+      "size": [
+        280,
+        150
+      ],
+      "flags": {},
+      "order": 10,
+      "mode": 0,
+      "inputs": [
+        {
+          "name": "noise",
+          "type": "NOISE",
+          "link": 6
+        },
+        {
+          "name": "guider",
+          "type": "GUIDER",
+          "link": 7
+        },
+        {
+          "name": "sampler",
+          "type": "SAMPLER",
+          "link": 8
+        },
+        {
+          "name": "sigmas",
+          "type": "SIGMAS",
+          "link": 9
+        },
+        {
+          "name": "latent_image",
+          "type": "LATENT",
+          "link": 10
+        }
+      ],
+      "outputs": [
+        {
+          "name": "output",
+          "type": "LATENT",
+          "slot_index": 0,
+          "links": [
+            11
+          ]
+        },
+        {
+          "name": "denoised_output",
+          "type": "LATENT",
+          "slot_index": 1,
+          "links": []
+        }
+      ],
+      "properties": {
+        "Node name for S&R": "SamplerCustomAdvanced"
+      },
+      "widgets_values": []
+    },
+    {
+      "id": 12,
+      "type": "VAEDecode",
+      "pos": [
+        1580,
+        120
+      ],
+      "size": [
+        250,
+        46
+      ],
+      "flags": {},
+      "order": 11,
+      "mode": 0,
+      "inputs": [
+        {
+          "name": "samples",
+          "type": "LATENT",
+          "link": 11
+        },
+        {
+          "name": "vae",
+          "type": "VAE",
+          "link": 12
+        }
+      ],
+      "outputs": [
+        {
+          "name": "IMAGE",
+          "type": "IMAGE",
+          "slot_index": 0,
+          "links": [
+            13
+          ]
+        }
+      ],
+      "properties": {
+        "Node name for S&R": "VAEDecode"
+      },
+      "widgets_values": []
+    },
+    {
+      "id": 13,
+      "type": "SaveImage",
+      "pos": [
+        1580,
+        220
+      ],
+      "size": [
+        460,
+        460
+      ],
+      "flags": {},
+      "order": 12,
+      "mode": 0,
+      "inputs": [
+        {
+          "name": "images",
+          "type": "IMAGE",
+          "link": 13
+        }
+      ],
+      "outputs": [],
+      "properties": {
+        "Node name for S&R": "SaveImage"
+      },
+      "widgets_values": [
+        "comfyfed_wuxia"
+      ]
+    },
+    {
+      "id": 100,
+      "type": "MarkdownNote",
+      "pos": [
+        0,
+        -900
+      ],
+      "size": [
+        1000,
+        440
+      ],
+      "flags": {},
+      "order": 13,
+      "mode": 0,
+      "inputs": [],
+      "outputs": [],
+      "title": "這是什麼範本 / What this template is",
+      "properties": {},
+      "widgets_values": [
+        "# 武俠文生圖（Flux）\n\n打一段英文描述就生一張電影感的圖。這張工作流就是 ComfyFed 第一次跑通聯邦派工時用的那一張，提示詞原封不動留在裡面，步數 8、尺寸 768×768，跑起來很快，很適合拿來熟悉整條流程。\n\n**怎麼用：** 只改中間紫框裡的提示詞 → 按右上角 Run → 等 worker 跑完 → 圖出現在最右邊的\n`SaveImage` 節點。其他節點看註解就好，不用動。\n\n**注意：** 節點下拉選單裡的模型檔名，來自聯邦裡「目前在線」的 worker。\n沒有 worker 在線時下拉會是空的，送出也會失敗。\n\n---\n\n# Wuxia text-to-image (Flux)\n\nType an English description, get a cinematic still. This is the exact graph ComfyFed's first end-to-end federation run used — same prompt, 8 steps, 768x768. Fast, and a good way to learn the pipeline.\n\n**How to use:** edit the prompt in the purple group, press Run, wait for a\nworker, and the picture appears in the `SaveImage` node on the right. Model\ndropdowns are populated from the workers that are online right now."
+      ],
+      "color": "#432",
+      "bgcolor": "#653"
+    },
+    {
+      "id": 101,
+      "type": "MarkdownNote",
+      "pos": [
+        0,
+        -420
+      ],
+      "size": [
+        340,
+        420
+      ],
+      "flags": {},
+      "order": 14,
+      "mode": 0,
+      "inputs": [],
+      "outputs": [],
+      "title": "① 模型載入器 / Model loaders",
+      "properties": {},
+      "widgets_values": [
+        "**繁體中文**\n\n這一區是「模型載入器」，把三個檔案讀進來：\n\n- `UNETLoader` — 主模型（畫圖的腦袋），這裡用 `flux1-dev.safetensors`。\n- `DualCLIPLoader` — 兩個文字編碼器，負責把你的文字翻譯成模型看得懂的東西。\n- `VAELoader` — 把模型算出來的潛在影像還原成看得到的圖片。\n\n**新手不用動這一區。** 檔名下拉選單列出的是聯邦裡目前線上 worker 有的檔案；\n如果下拉是空的，代表現在沒有在線的 worker。\n\n---\n\n**English**\n\nModel loaders: the diffusion model, the two text encoders, and the VAE.\nNovices should leave this group alone. The dropdown lists the files that the\nonline federation workers actually have; an empty dropdown means no worker is\nonline right now."
+      ],
+      "color": "#432",
+      "bgcolor": "#653"
+    },
+    {
+      "id": 102,
+      "type": "MarkdownNote",
+      "pos": [
+        400,
+        -420
+      ],
+      "size": [
+        480,
+        420
+      ],
+      "flags": {},
+      "order": 15,
+      "mode": 0,
+      "inputs": [],
+      "outputs": [],
+      "title": "② 提示詞 / Prompt",
+      "properties": {},
+      "widgets_values": [
+        "**繁體中文 — 你只需要改這裡**\n\n紅框裡的 `CLIPTextEncode` 就是提示詞。把裡面的英文換成你想要的畫面描述即可，\n其餘節點都不用碰。\n\n寫法建議：**主體 → 動作/姿勢 → 場景 → 光線 → 風格/鏡頭**，用逗號分隔，全部用英文。\n例如 `a wuxia swordsman, hand on sword hilt, misty bamboo ridge at dawn,\ngolden rim light, photorealistic, 35mm film grain`。\n\n`FluxGuidance` 的 `guidance` 預設 3.5：數字越大越貼近提示詞、但越容易僵硬；\n2.5～4.0 之間都算安全範圍。\n\n---\n\n**English — this is the only group you need to edit**\n\nReplace the text inside `CLIPTextEncode` with your own scene description\n(subject → action → setting → light → style, comma separated, in English).\n`FluxGuidance` defaults to 3.5; 2.5–4.0 is the safe range."
+      ],
+      "color": "#432",
+      "bgcolor": "#653"
+    },
+    {
+      "id": 103,
+      "type": "MarkdownNote",
+      "pos": [
+        900,
+        -420
+      ],
+      "size": [
+        640,
+        420
+      ],
+      "flags": {},
+      "order": 16,
+      "mode": 0,
+      "inputs": [],
+      "outputs": [],
+      "title": "③ 取樣參數 / Sampler",
+      "properties": {},
+      "widgets_values": [
+        "**繁體中文 — 取樣參數什麼時候要動**\n\n- `EmptySD3LatentImage` 的 `width`/`height` = 出圖尺寸。改成 16 的倍數；\n  尺寸越大越慢也越吃 VRAM。\n- `BasicScheduler` 的 `steps` = 疊代次數。步數越多越細緻、也越慢。\n  **想快速試提示詞就調小（8 步約幾秒），滿意了再調回 20～28 出正式圖。**\n- `RandomNoise` 的 `noise_seed` = 亂數種子。**同一組提示詞＋同一個種子 = 同一張圖**；\n  想換一張就改種子（或把後面的控制設成 randomize）。\n- `KSamplerSelect` 的 `euler` 和 `BasicScheduler` 的 `simple` 是 Flux 的標準組合，\n  沒有特別理由不用改。\n\n---\n\n**English — when to touch the sampler**\n\nWidth/height set the output size (multiples of 16). `steps` trades speed for\ndetail — 8 for quick prompt tests, 20–28 for finals. Same prompt + same\n`noise_seed` = the same picture; change the seed for a different one. Leave\n`euler` + `simple` alone; that is the standard Flux pairing."
+      ],
+      "color": "#432",
+      "bgcolor": "#653"
+    },
+    {
+      "id": 104,
+      "type": "MarkdownNote",
+      "pos": [
+        1580,
+        -420
+      ],
+      "size": [
+        500,
+        420
+      ],
+      "flags": {},
+      "order": 17,
+      "mode": 0,
+      "inputs": [],
+      "outputs": [],
+      "title": "④ 輸出 / Output",
+      "properties": {},
+      "widgets_values": [
+        "**繁體中文 — 輸出在哪裡看**\n\n`SaveImage` 是輸出節點。按下右上角的 **Run / Queue** 之後：\n\n1. 這張工作流會變成一個聯邦 job，派給線上的 worker 執行。\n2. 進度會在畫面上跑；完成後圖片直接顯示在這個節點裡。\n3. 同一張圖也會出現在 Console 的「工作」頁面，可以下載或查收據。\n\n`filename_prefix` 只是檔名前綴，想分類的話可以寫成 `wuxia/shot`。\n\n---\n\n**English — where the result shows up**\n\n`SaveImage` is the output node. Hit Run/Queue: the graph becomes a federation\njob, a worker runs it, and the image appears in this node when it finishes.\nThe same file is listed on the console's Jobs page with its receipt."
+      ],
+      "color": "#432",
+      "bgcolor": "#653"
+    }
+  ],
+  "links": [
+    [
+      1,
+      2,
+      0,
+      4,
+      0,
+      "CLIP"
+    ],
+    [
+      2,
+      4,
+      0,
+      5,
+      0,
+      "CONDITIONING"
+    ],
+    [
+      3,
+      1,
+      0,
+      6,
+      0,
+      "MODEL"
+    ],
+    [
+      4,
+      5,
+      0,
+      6,
+      1,
+      "CONDITIONING"
+    ],
+    [
+      5,
+      1,
+      0,
+      8,
+      0,
+      "MODEL"
+    ],
+    [
+      6,
+      9,
+      0,
+      11,
+      0,
+      "NOISE"
+    ],
+    [
+      7,
+      6,
+      0,
+      11,
+      1,
+      "GUIDER"
+    ],
+    [
+      8,
+      7,
+      0,
+      11,
+      2,
+      "SAMPLER"
+    ],
+    [
+      9,
+      8,
+      0,
+      11,
+      3,
+      "SIGMAS"
+    ],
+    [
+      10,
+      10,
+      0,
+      11,
+      4,
+      "LATENT"
+    ],
+    [
+      11,
+      11,
+      0,
+      12,
+      0,
+      "LATENT"
+    ],
+    [
+      12,
+      3,
+      0,
+      12,
+      1,
+      "VAE"
+    ],
+    [
+      13,
+      12,
+      0,
+      13,
+      0,
+      "IMAGE"
+    ]
+  ],
+  "groups": [
+    {
+      "id": 1,
+      "title": "① 載入模型 / Load models",
+      "bounding": [
+        -20,
+        40,
+        340,
+        480
+      ],
+      "color": "#3f789e",
+      "font_size": 24,
+      "flags": {}
+    },
+    {
+      "id": 2,
+      "title": "② 提示詞 / Prompt — 只改這一區 / only edit here",
+      "bounding": [
+        380,
+        40,
+        480,
+        450
+      ],
+      "color": "#a1309b",
+      "font_size": 24,
+      "flags": {}
+    },
+    {
+      "id": 3,
+      "title": "③ 取樣 / Sampling",
+      "bounding": [
+        880,
+        40,
+        660,
+        580
+      ],
+      "color": "#3f789e",
+      "font_size": 24,
+      "flags": {}
+    },
+    {
+      "id": 4,
+      "title": "④ 輸出 / Output",
+      "bounding": [
+        1560,
+        40,
+        500,
+        660
+      ],
+      "color": "#3f9e5a",
+      "font_size": 24,
+      "flags": {}
+    }
+  ],
+  "config": {},
+  "extra": {
+    "ds": {
+      "scale": 0.55,
+      "offset": [
+        420,
+        880
+      ]
+    }
+  },
+  "version": 0.4
+}

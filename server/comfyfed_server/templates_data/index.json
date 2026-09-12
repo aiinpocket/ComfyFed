@@ -1,0 +1,38 @@
+[
+  {
+    "moduleName": "default",
+    "title": "ComfyFed",
+    "type": "image",
+    "isEssential": true,
+    "category": "ComfyFed",
+    "templates": [
+      {
+        "name": "comfyfed-wuxia-t2i",
+        "title": "武俠文生圖 / Wuxia text-to-image",
+        "mediaType": "image",
+        "mediaSubtype": "webp",
+        "description": "Flux text-to-image, 768x768 at 8 steps. The graph ComfyFed's first end-to-end federation run used; edit the prompt and press Run.",
+        "tags": ["flux", "text-to-image", "wuxia", "comfyfed"],
+        "models": ["flux1-dev.safetensors"]
+      },
+      {
+        "name": "comfyfed-character-portrait",
+        "title": "角色立繪 / Character portrait",
+        "mediaType": "image",
+        "mediaSubtype": "webp",
+        "description": "Flux character reference sheet, 896x1152 at 20 steps. Feed its output into the reference-to-video template.",
+        "tags": ["flux", "portrait", "character", "comfyfed"],
+        "models": ["flux1-dev.safetensors"]
+      },
+      {
+        "name": "comfyfed-ref2v-video",
+        "title": "參考圖生影片 / Reference to video",
+        "mediaType": "image",
+        "mediaSubtype": "webp",
+        "description": "MiniMax H3 reference-to-video with audio, 1152x640, 141 frames at 8 steps via the turbo LoRA. Ships with a reference image.",
+        "tags": ["minimax", "video", "reference", "audio", "comfyfed"],
+        "models": ["minimax_h3_ref2va_pruned_int8_convrot.safetensors"]
+      }
+    ]
+  }
+]
