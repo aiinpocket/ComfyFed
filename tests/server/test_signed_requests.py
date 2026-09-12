@@ -122,3 +122,21 @@ def test_disabled_worker_403(client):
     r = _ping(client, entry)
     assert r.status_code == 403
     assert r.json()["error"]["code"] == "agent.worker_disabled"
+
+
+def test_disabled_worker_with_invalid_signature_401_not_403(client):
+    """A disabled worker with a bad signature must not leak disabled status.
+
+    Signature validity is checked before the disabled check, so an
+    unauthenticated caller who guesses a worker_id can't use the 401-vs-403
+    distinction to learn whether that worker exists or is disabled.
+    """
+    entry = _register_worker(client)
+    csrf = _login(client)
+    disable = client.post(f"/api/workers/{entry.worker_id}/disable", headers={"X-CSRF": csrf})
+    assert disable.status_code == 200
+
+    headers = signing.signed_headers(entry, "POST", "/api/agent/ping", b"")
+    r = client.post("/api/agent/ping", headers=headers, content=b"tampered")
+    assert r.status_code == 401
+    assert r.json()["error"]["code"] == "agent.bad_signature"

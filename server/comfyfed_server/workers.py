@@ -57,8 +57,6 @@ async def verify_agent(
         worker = session.get(db.Worker, x_worker_id)
         if worker is None:
             raise _error(401, "agent.bad_signature", "Invalid signature.")
-        if worker.disabled:
-            raise _error(403, "agent.worker_disabled", "Worker is disabled.")
 
         try:
             ts = int(x_ts)
@@ -71,10 +69,17 @@ async def verify_agent(
         body = await request.body()
         message = f"{request.method.upper()}\n{request.url.path}\n{x_ts}\n{x_nonce}\n".encode() + body
 
+        # Signature must be validated BEFORE any disabled-worker check: if we
+        # returned 403 for a disabled worker without checking the signature
+        # first, an attacker who merely guesses a worker_id could use the
+        # 401-vs-403 distinction as an oracle for worker existence/status.
         try:
             VerifyKey(bytes.fromhex(worker.pubkey)).verify(message, bytes.fromhex(x_sig))
         except (BadSignatureError, ValueError):
             raise _error(401, "agent.bad_signature", "Invalid signature.")
+
+        if worker.disabled:
+            raise _error(403, "agent.worker_disabled", "Worker is disabled.")
 
         now_monotonic = time.monotonic()
         _prune_nonces(now_monotonic)
