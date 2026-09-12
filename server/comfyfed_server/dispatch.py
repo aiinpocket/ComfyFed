@@ -20,7 +20,11 @@ _OWNED_STATUSES = ("assigned", "running")
 
 # Statuses a job never leaves again. Re-transitioning one is always wrong,
 # so it stays a WARNING even when the worker does own the job.
-_TERMINAL_STATUSES = ("done", "failed")
+_TERMINAL_STATUSES = ("done", "failed", "cancelled")
+
+# Statuses cancel_job is willing to act on -- anything already terminal is a
+# no-op (returns None), matching _TERMINAL_STATUSES' definition of "done".
+_CANCELLABLE_STATUSES = ("queued", "assigned", "running")
 
 
 def _utcnow() -> datetime:
@@ -117,6 +121,11 @@ def requeue_stale(now: datetime) -> list[str]:
             )
             for job in jobs:
                 job.status = "queued"
+                # Recorded *before* worker_id is cleared, so a job_done that
+                # eventually arrives from this same worker (it merely blipped
+                # offline, not truly gone) can be re-adopted -- see
+                # try_readopt below.
+                job.last_worker_id = worker.id
                 job.worker_id = None
                 job.progress = 0
                 requeued.append(job.id)
@@ -127,6 +136,72 @@ def requeue_stale(now: datetime) -> list[str]:
         session.commit()
 
     return requeued
+
+
+def cancel_job(job_id: str, *, reason: str) -> Optional[str]:
+    """Move a queued/assigned/running job to `cancelled`.
+
+    Sets `error=reason` and `finished_at`, and returns the worker_id that
+    owned the job at the moment of cancellation (None if it was still
+    unowned/queued) so a caller (an admin API, the ComfyUI-compat /interrupt
+    or /queue-delete handlers) knows whether it needs to push `job_cancelled`
+    to a live agent connection.
+
+    A no-op returning None for a job that's already terminal (done, failed,
+    or already cancelled) or doesn't exist -- cancelling twice, or cancelling
+    something that finished moments before the request landed, must not
+    stomp on a real result. `_TERMINAL_STATUSES` and `_CANCELLABLE_STATUSES`
+    partition the status space between them, so nothing else falls through.
+
+    A cancelled job never gets a receipt: this function only ever flips
+    `status`/`error`/`finished_at`, the same fields `mark_done`/`mark_failed`
+    touch -- receipt creation lives entirely in agentws's `job_done` handling
+    and is never invoked from here.
+    """
+    with db.get_session() as session:
+        job = session.get(db.Job, job_id)
+        if job is None or job.status not in _CANCELLABLE_STATUSES:
+            return None
+        owning_worker_id = job.worker_id
+        job.status = "cancelled"
+        job.error = reason
+        job.finished_at = _utcnow()
+        session.commit()
+    return owning_worker_id
+
+
+def try_readopt(job_id: str, worker_id: str) -> bool:
+    """Restore ownership of a job to `worker_id` if it's the worker's own job
+    blipping back, not someone else's.
+
+    A job only qualifies when it is still `queued` (nobody has picked it up
+    since) AND `last_worker_id == worker_id` (this is the same worker
+    `requeue_stale` took it from, not merely a worker that happens to be
+    guessing job ids). On a match, ownership is restored (`status=assigned,
+    worker_id=worker_id`) and True is returned; the caller (agentws's
+    `job_done` handling) then proceeds exactly as it would for a normal owned
+    completion.
+
+    The atomic claim mirrors `pick_job_for`'s: the `WHERE` clause re-checks
+    `status == "queued"` in the same statement that flips it, so a concurrent
+    dispatch_tick claiming the job first (rowcount 0) is detected rather than
+    the two writers silently clobbering each other.
+    """
+    with db.get_session() as session:
+        result = session.execute(
+            update(db.Job)
+            .where(
+                db.Job.id == job_id,
+                db.Job.status == "queued",
+                db.Job.last_worker_id == worker_id,
+            )
+            .values(status="assigned", worker_id=worker_id)
+        )
+        if result.rowcount != 1:
+            session.rollback()
+            return False
+        session.commit()
+        return True
 
 
 def _owned_job(session, job_id: Optional[str], worker_id: str, statuses) -> Optional[db.Job]:

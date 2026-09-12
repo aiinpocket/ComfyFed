@@ -70,6 +70,12 @@ class Job(Base):
     workflow_json: Mapped[str] = mapped_column(String)
     status: Mapped[str] = mapped_column(String, default="queued", server_default="queued")
     worker_id: Mapped[Optional[str]] = mapped_column(String, nullable=True)
+    # The worker that most recently held this job before it went back to
+    # `queued` (a stale-worker requeue -- see dispatch.requeue_stale). Lets
+    # dispatch.try_readopt tell "you blipped offline and are back" (this
+    # worker) apart from "someone else owns it now" (a different worker, or
+    # nobody yet) when a late job_done/job_failed/heartbeat arrives.
+    last_worker_id: Mapped[Optional[str]] = mapped_column(String, nullable=True)
     progress: Mapped[float] = mapped_column(Float, default=0, server_default="0")
     created_at: Mapped[datetime] = mapped_column(DateTime, default=_utcnow)
     started_at: Mapped[Optional[datetime]] = mapped_column(DateTime, nullable=True)

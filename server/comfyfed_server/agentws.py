@@ -32,7 +32,12 @@ Agent -> server message contract (all JSON):
 
 Server -> agent also includes `{"type": "want_object_info"}` (see above); the
 full object_info payload itself travels out-of-band over a signed HTTP POST
-(`/api/agent/object_info` in workers.py), not this socket.
+(`/api/agent/object_info` in workers.py), not this socket. It also includes
+`{"type": "job_cancelled", "job_id": str}`, pushed whenever this connection
+references a job it no longer owns -- a job someone else now owns, or one
+requeued out from under it that a blip re-adoption (see dispatch.try_readopt)
+didn't restore -- so the agent can abort a run it has no business finishing.
+Sent at most once per job per connection (see `_send_job_cancelled`).
 
 A `job_id` in any of these is only acted on when the authenticated worker
 actually owns that job (see dispatch._owned_job).
@@ -46,7 +51,7 @@ import logging
 import math
 import os
 import secrets
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from typing import Optional
 
@@ -80,6 +85,10 @@ class _Connection:
     worker_id: str
     loop: asyncio.AbstractEventLoop
     state: str = "idle"  # idle | busy | dispatched
+    # job_ids this connection has already been sent `job_cancelled` for --
+    # see `_send_job_cancelled`. Scoped to the connection instance itself, so
+    # a reconnect naturally starts with a clean set.
+    cancelled_jobs_sent: set = field(default_factory=set)
 
 
 # Module-level connection registry: worker_id -> live connection state.
@@ -192,31 +201,99 @@ async def _handle_message(worker_id: str, conn: _Connection, message: dict) -> N
         elif msg_type == "inventory":
             _handle_inventory(worker_id, message)
         elif msg_type == "job_done":
-            job_id = message.get("job_id")
-            # A receipt is only ever written for a transition we actually
-            # applied, so a worker cannot mint contribution records for jobs
-            # it does not own by sending someone else's job_id.
-            if dispatch.mark_done(job_id, worker_id, message.get("result_files") or []):
-                await _notify_panel_job_done(job_id)
-                exec_seconds = message.get("exec_seconds")
-                if (
-                    not isinstance(exec_seconds, (int, float))
-                    or isinstance(exec_seconds, bool)
-                    or not math.isfinite(exec_seconds)
-                ):
-                    exec_seconds = None
-                await _create_and_push_receipt(worker_id, conn, job_id, exec_seconds)
+            await _handle_job_done(worker_id, conn, message)
         elif msg_type == "job_failed":
             job_id = message.get("job_id")
             error = message.get("error") or ""
             if dispatch.mark_failed(job_id, worker_id, error):
                 await panelws.job_failed(job_id, error)
+            elif job_id and _job_not_owned_by(job_id, worker_id):
+                await _send_job_cancelled(conn, job_id)
         elif msg_type == "receipt_ack":
             _handle_receipt_ack(worker_id, message)
         else:
             logger.warning("agentws: unknown message type %r from worker %s", msg_type, worker_id)
     except Exception:
         logger.exception("agentws: error handling %r message from worker %s", msg_type, worker_id)
+
+
+def _job_not_owned_by(job_id: Optional[str], worker_id: str) -> bool:
+    """Read-only ownership check: is `job_id` currently *not* held by
+    `worker_id` (someone else's, or unowned/unknown)?
+
+    Used only to decide whether a failed transition deserves a
+    `job_cancelled` push -- unlike `dispatch._owned_job`, this doesn't care
+    about the job's status, only who (if anyone) currently holds it. A
+    worker re-sending a message for its own already-terminal job (e.g. a
+    duplicate `job_done`) must NOT get `job_cancelled`: it still owns that
+    job, it's just too late -- so this returns False for it.
+    """
+    if not job_id:
+        return False
+    with db.get_session() as session:
+        job = session.get(db.Job, job_id)
+        return job is None or job.worker_id != worker_id
+
+
+async def _send_job_cancelled(conn: "_Connection", job_id: Optional[str]) -> None:
+    """Push `{"type": "job_cancelled", "job_id": job_id}` to `conn`, at most
+    once per job for the lifetime of this connection.
+
+    Without the dedup, a worker that keeps referencing a job it no longer
+    owns -- it heartbeats every ~30s for the length of a run -- would get
+    this pushed on every single message for as long as it kept doing so. The
+    set lives on the `_Connection` itself, so a fresh connection (reconnect)
+    naturally starts clean without any explicit clearing.
+    """
+    if not job_id or job_id in conn.cancelled_jobs_sent:
+        return
+    conn.cancelled_jobs_sent.add(job_id)
+    try:
+        await conn.ws.send_json({"type": "job_cancelled", "job_id": job_id})
+    except Exception:
+        logger.exception(
+            "agentws: failed to send job_cancelled to worker %s for job %s", conn.worker_id, job_id
+        )
+
+
+async def _handle_job_done(worker_id: str, conn: "_Connection", message: dict) -> None:
+    """Handle a `job_done` message, including blip re-adoption.
+
+    A receipt is only ever written for a transition we actually applied, so
+    a worker cannot mint contribution records for jobs it does not own by
+    sending someone else's job_id.
+
+    When the straightforward `mark_done` fails because this worker doesn't
+    currently own the job, that's not necessarily forgery -- it's exactly
+    what a worker that blipped offline mid-run looks like: `requeue_stale`
+    put the job back to `queued` and recorded `last_worker_id`, and this
+    `job_done` is that same worker coming back with the (possibly genuine)
+    result. `try_readopt` tells the two cases apart: on success, ownership is
+    restored and completion proceeds exactly as if it had never blipped. On
+    failure -- someone else's job now, or plain unknown -- the message is
+    rejected and the worker is told via `job_cancelled` so it stops chasing a
+    job that isn't its to finish.
+    """
+    job_id = message.get("job_id")
+    result_files = message.get("result_files") or []
+
+    done = dispatch.mark_done(job_id, worker_id, result_files)
+    if not done and job_id and _job_not_owned_by(job_id, worker_id):
+        if dispatch.try_readopt(job_id, worker_id):
+            done = dispatch.mark_done(job_id, worker_id, result_files)
+        else:
+            await _send_job_cancelled(conn, job_id)
+
+    if done:
+        await _notify_panel_job_done(job_id)
+        exec_seconds = message.get("exec_seconds")
+        if (
+            not isinstance(exec_seconds, (int, float))
+            or isinstance(exec_seconds, bool)
+            or not math.isfinite(exec_seconds)
+        ):
+            exec_seconds = None
+        await _create_and_push_receipt(worker_id, conn, job_id, exec_seconds)
 
 
 async def _notify_panel_job_done(job_id: Optional[str]) -> None:
@@ -263,6 +340,8 @@ async def _handle_heartbeat(worker_id: str, conn: _Connection, message: dict) ->
         conn.state = state
 
     dynamic = message.get("dynamic") or {}
+    job_id = message.get("job_id")
+    job_not_owned = False
     with db.get_session() as session:
         worker = session.get(db.Worker, worker_id)
         if worker is None:
@@ -277,7 +356,6 @@ async def _handle_heartbeat(worker_id: str, conn: _Connection, message: dict) ->
         stored_hash = worker.object_info_hash or ""
         session.commit()
 
-        job_id = message.get("job_id")
         if job_id:
             job = session.get(db.Job, job_id)
             if job is not None and job.worker_id == worker_id:
@@ -286,16 +364,29 @@ async def _handle_heartbeat(worker_id: str, conn: _Connection, message: dict) ->
                     job.progress = float(progress)
                     session.commit()
                     await panelws.job_progress(job_id, job.progress)
+            else:
+                job_not_owned = True
+
+    # A heartbeat carrying a job_id this worker doesn't (or no longer) own --
+    # most commonly a stale agent still reporting a job that was requeued and
+    # picked up by someone else. Told once per connection (dedup lives in
+    # _send_job_cancelled) so the agent can abort instead of grinding away on
+    # a run that will never be accepted.
+    if job_not_owned:
+        await _send_job_cancelled(conn, job_id)
 
     # The agent broadcasts a busy heartbeat carrying the job_id the moment it
     # picks the job up (see agent runner.handle_job), and that is the only
     # signal the server gets that execution actually started -- so this is
     # where "assigned" becomes "running" (and started_at gets set, which the
     # job_done receipt's gpu_seconds is computed from). Ownership and status
-    # are gated inside dispatch.mark_running.
-    if state == "busy" and message.get("job_id"):
-        if dispatch.mark_running(message["job_id"], worker_id):
-            await panelws.job_running(message["job_id"])
+    # are gated inside dispatch.mark_running -- called unconditionally here
+    # (even when job_not_owned already told us it'll fail) so the WARNING it
+    # logs for a foreign job_id keeps firing on every such heartbeat, not
+    # just the first.
+    if state == "busy" and job_id:
+        if dispatch.mark_running(job_id, worker_id):
+            await panelws.job_running(job_id)
 
     try:
         m = metrics.get_metrics()

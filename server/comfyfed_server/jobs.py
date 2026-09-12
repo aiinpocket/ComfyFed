@@ -252,7 +252,16 @@ def create_router(data_dir: str) -> APIRouter:
             job = session.get(db.Job, job_id)
             if job is None:
                 raise _error(404, "jobs.not_found", "Job not found.")
-            if job.worker_id != worker.id or job.status not in ("assigned", "running"):
+            # Ownership OR the blip re-adoption window: a worker that went
+            # offline mid-run and got requeued (dispatch.requeue_stale sets
+            # status back to "queued" and records last_worker_id) may still
+            # be uploading the result it produced before it dropped. This
+            # check is deliberately read-only -- it does not flip ownership
+            # itself; only a subsequent job_done's dispatch.try_readopt does
+            # that (see agentws._handle_job_done).
+            owns_it = job.worker_id == worker.id and job.status in ("assigned", "running")
+            in_blip_window = job.status == "queued" and job.last_worker_id == worker.id
+            if not (owns_it or in_blip_window):
                 raise _error(403, "jobs.not_assigned", "Job is not assigned to this worker.")
 
         form = await request.form()

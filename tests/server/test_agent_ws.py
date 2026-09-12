@@ -658,3 +658,170 @@ def test_foreign_and_terminal_transitions_still_warn(client, caplog):
     terminal_warnings = [r for r in caplog.records if r.levelno >= logging.WARNING]
     assert len(terminal_warnings) == 1
     assert "done" in terminal_warnings[0].getMessage()
+
+
+# --- Phase 1.7: job_cancelled push + blip re-adoption -----------------------
+
+
+def test_busy_heartbeat_for_foreign_job_sends_job_cancelled_once_with_dedup(client, caplog):
+    """(a) A worker repeatedly heartbeating a job it doesn't own gets
+    `job_cancelled` exactly once (dedup), while the ownership WARNING from
+    dispatch.mark_running keeps firing on every single heartbeat."""
+    csrf = _login(client)
+    worker_a, key_a = _register_worker(client, csrf, "w-a")
+    worker_b, key_b = _register_worker(client, csrf, "w-b")
+    job_id = _submit(client, csrf)
+
+    ws_a = _connect(client, worker_a, key_a)
+    try:
+        ws_a.send_json({"type": "heartbeat", "state": "idle", "progress": 0.0, "job_id": None, "dynamic": {}})
+        agentws.dispatch_once(worker_a)
+        assert ws_a.receive_json()["type"] == "job"  # worker_a now owns job_id
+
+        ws_b = _connect(client, worker_b, key_b)
+        try:
+            with caplog.at_level(logging.WARNING, logger="comfyfed_server.dispatch"):
+                for progress in (0.1, 0.4, 0.7):
+                    ws_b.send_json(
+                        {
+                            "type": "heartbeat",
+                            "state": "busy",
+                            "progress": progress,
+                            "job_id": job_id,
+                            "dynamic": {},
+                        }
+                    )
+                    agentws.dispatch_once(worker_b)
+
+            cancelled_msg = ws_b.receive_json()
+            assert cancelled_msg == {"type": "job_cancelled", "job_id": job_id}
+
+            warnings = [r for r in caplog.records if r.levelno >= logging.WARNING]
+            assert len(warnings) == 3  # one per heartbeat, still not deduped
+
+            with db.get_session() as session:
+                job = session.get(db.Job, job_id)
+                assert job.status == "assigned"
+                assert job.worker_id == worker_a
+                assert job.started_at is None
+        finally:
+            ws_b.close()
+    finally:
+        ws_a.close()
+
+
+def test_job_done_after_blip_readopts_and_completes(client):
+    """(b) A job_done from the same worker last_worker_id names, for a job
+    that's back to `queued` (a blip requeue), is re-adopted and finishes
+    exactly like a normal completion -- no job_cancelled."""
+    csrf = _login(client)
+    worker_id, sk = _register_worker(client, csrf, "w1")
+    job_id = _submit(client, csrf)
+
+    ws = _connect(client, worker_id, sk)
+    try:
+        ws.send_json({"type": "heartbeat", "state": "idle", "progress": 0.0, "job_id": None, "dynamic": {}})
+        agentws.dispatch_once(worker_id)
+        assert ws.receive_json()["type"] == "job"
+
+        ws.send_json({"type": "heartbeat", "state": "busy", "progress": 0.0, "job_id": job_id, "dynamic": {}})
+        agentws.dispatch_once(worker_id)
+
+        # Simulate the requeue dispatch.requeue_stale performs when this
+        # worker blips offline mid-run: back to queued, ownership cleared,
+        # last_worker_id recorded.
+        with db.get_session() as session:
+            job = session.get(db.Job, job_id)
+            job.status = "queued"
+            job.worker_id = None
+            job.last_worker_id = worker_id
+            session.commit()
+
+        ws.send_json({"type": "job_done", "job_id": job_id, "result_files": ["out.png"]})
+        agentws.dispatch_once(worker_id)
+
+        # The very next message is the receipt -- not a job_cancelled.
+        receipt_msg = ws.receive_json()
+        assert receipt_msg["type"] == "receipt"
+
+        with db.get_session() as session:
+            job = session.get(db.Job, job_id)
+            assert job.status == "done"
+            assert json.loads(job.result_files) == ["out.png"]
+            assert session.query(db.Receipt).count() == 1
+    finally:
+        ws.close()
+
+
+def test_job_done_for_job_now_owned_by_another_worker_is_rejected_and_cancelled(client):
+    """(c) A stale job_done from worker A for a job worker B now actually
+    owns is rejected outright, A is told via job_cancelled, and B's job is
+    untouched."""
+    csrf = _login(client)
+    worker_a, key_a = _register_worker(client, csrf, "w-a")
+    worker_b, _key_b = _register_worker(client, csrf, "w-b")
+    job_id = _submit(client, csrf)
+
+    ws_a = _connect(client, worker_a, key_a)
+    try:
+        ws_a.send_json({"type": "heartbeat", "state": "idle", "progress": 0.0, "job_id": None, "dynamic": {}})
+        agentws.dispatch_once(worker_a)
+        assert ws_a.receive_json()["type"] == "job"
+
+        # Simulate: A blipped, the job was requeued (last_worker_id=A), and
+        # worker B has since actually picked it up and is running it.
+        with db.get_session() as session:
+            job = session.get(db.Job, job_id)
+            job.status = "running"
+            job.worker_id = worker_b
+            job.last_worker_id = worker_a
+            job.started_at = datetime.now(timezone.utc).replace(tzinfo=None)
+            session.commit()
+
+        ws_a.send_json({"type": "job_done", "job_id": job_id, "result_files": ["stale.png"]})
+        agentws.dispatch_once(worker_a)
+
+        cancelled_msg = ws_a.receive_json()
+        assert cancelled_msg == {"type": "job_cancelled", "job_id": job_id}
+
+        with db.get_session() as session:
+            job = session.get(db.Job, job_id)
+            assert job.status == "running"
+            assert job.worker_id == worker_b
+            assert json.loads(job.result_files) == []
+            assert session.query(db.Receipt).count() == 0
+    finally:
+        ws_a.close()
+
+
+def test_job_done_resent_for_own_terminal_job_does_not_send_job_cancelled(client):
+    """A duplicate job_done for a job this worker already legitimately
+    finished must not be mistaken for "not owned" -- it still owns the job,
+    it's just too late. No job_cancelled belongs on that socket."""
+    csrf = _login(client)
+    worker_id, sk = _register_worker(client, csrf, "w1")
+    job_id = _submit(client, csrf)
+
+    ws = _connect(client, worker_id, sk)
+    try:
+        ws.send_json({"type": "heartbeat", "state": "idle", "progress": 0.0, "job_id": None, "dynamic": {}})
+        agentws.dispatch_once(worker_id)
+        assert ws.receive_json()["type"] == "job"
+
+        ws.send_json({"type": "job_done", "job_id": job_id, "result_files": ["out.png"]})
+        agentws.dispatch_once(worker_id)
+        assert ws.receive_json()["type"] == "receipt"
+
+        ws.send_json({"type": "job_done", "job_id": job_id, "result_files": ["again.png"]})
+        agentws.dispatch_once(worker_id)
+
+        # No job_cancelled was queued for the resend -- it still owns the
+        # job, it's just too late to matter.
+        assert job_id not in agentws._connections[worker_id].cancelled_jobs_sent
+
+        with db.get_session() as session:
+            job = session.get(db.Job, job_id)
+            assert job.status == "done"
+            assert json.loads(job.result_files) == ["out.png"]
+    finally:
+        ws.close()
