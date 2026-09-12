@@ -1,4 +1,5 @@
 import json
+import logging
 
 import pytest
 from fastapi.testclient import TestClient
@@ -6,7 +7,7 @@ from nacl.signing import SigningKey
 from starlette.websockets import WebSocketDisconnect
 
 from comfyfed_server import agentws, app as app_module
-from comfyfed_server import bootstrap, db
+from comfyfed_server import bootstrap, db, dispatch
 
 
 @pytest.fixture()
@@ -356,3 +357,94 @@ def test_byte_scale_inventory_is_converted_to_gigabytes(client):
     job_id = _submit(client, csrf, workflow=workflow)
     detail = client.get(f"/api/jobs/{job_id}", headers={"X-CSRF": csrf}).json()
     assert 6.0 <= detail["est_vram_gb"] <= 8.0
+
+
+def test_repeated_busy_heartbeat_is_a_silent_no_op(client, caplog):
+    """A job's later busy heartbeats must not warn.
+
+    The agent heartbeats every 30s for the whole length of a job, but only the
+    first one has a transition to make. If the rest logged at WARNING they
+    would bury the cross-worker forgery signal that shares this code path.
+    """
+    csrf = _login(client)
+    worker_id, sk = _register_worker(client, csrf, "w1")
+    job_id = _submit(client, csrf)
+
+    with client.websocket_connect("/api/agent/ws") as ws:
+        challenge = ws.receive_json()
+        sig = sk.sign(challenge["nonce"].encode()).signature.hex()
+        ws.send_json({"type": "auth", "worker_id": worker_id, "sig": sig})
+        assert ws.receive_json()["type"] == "ready"
+
+        ws.send_json({"type": "heartbeat", "state": "idle", "progress": 0.0, "job_id": None, "dynamic": {}})
+        agentws.dispatch_once(worker_id)
+        assert ws.receive_json()["type"] == "job"
+
+        ws.send_json({"type": "heartbeat", "state": "busy", "progress": 0.0, "job_id": job_id, "dynamic": {}})
+        agentws.dispatch_once(worker_id)
+
+        with db.get_session() as session:
+            first = session.get(db.Job, job_id)
+            assert first.status == "running"
+            started_at = first.started_at
+
+        # Everything from here on must be silent at WARNING and change nothing.
+        with caplog.at_level(logging.DEBUG, logger="comfyfed_server.dispatch"):
+            for progress in (0.3, 0.6, 0.9):
+                ws.send_json(
+                    {
+                        "type": "heartbeat",
+                        "state": "busy",
+                        "progress": progress,
+                        "job_id": job_id,
+                        "dynamic": {},
+                    }
+                )
+                agentws.dispatch_once(worker_id)
+
+        warnings = [r for r in caplog.records if r.levelno >= logging.WARNING]
+        assert warnings == [], [r.getMessage() for r in warnings]
+        # It is still logged, just at DEBUG.
+        assert any(r.levelno == logging.DEBUG for r in caplog.records)
+
+        with db.get_session() as session:
+            job = session.get(db.Job, job_id)
+            assert job.status == "running"
+            assert job.started_at == started_at  # not restarted
+            assert job.progress == 0.9  # progress still tracked
+
+
+def test_foreign_and_terminal_transitions_still_warn(client, caplog):
+    """The forgery signal stays loud: wrong owner, and re-finishing a done job."""
+    csrf = _login(client)
+    worker_a, key_a = _register_worker(client, csrf, "w-a")
+    worker_b, _key_b = _register_worker(client, csrf, "w-b")
+    job_id = _submit(client, csrf)
+
+    with db.get_session() as session:
+        job = session.get(db.Job, job_id)
+        job.status = "assigned"
+        job.worker_id = worker_a
+        session.commit()
+
+    with caplog.at_level(logging.DEBUG, logger="comfyfed_server.dispatch"):
+        # Wrong owner.
+        assert dispatch.mark_done(job_id, worker_b, []) is False
+        # Unknown job id.
+        assert dispatch.mark_done("no-such-job", worker_a, []) is False
+
+    warnings = [r.getMessage() for r in caplog.records if r.levelno >= logging.WARNING]
+    assert len(warnings) == 2
+    assert any(worker_b in m for m in warnings)
+    assert any("no-such-job" in m for m in warnings)
+
+    # Finish it legitimately, then try to finish it again.
+    assert dispatch.mark_done(job_id, worker_a, ["out.png"]) is True
+
+    caplog.clear()
+    with caplog.at_level(logging.DEBUG, logger="comfyfed_server.dispatch"):
+        assert dispatch.mark_done(job_id, worker_a, ["again.png"]) is False
+
+    terminal_warnings = [r for r in caplog.records if r.levelno >= logging.WARNING]
+    assert len(terminal_warnings) == 1
+    assert "done" in terminal_warnings[0].getMessage()

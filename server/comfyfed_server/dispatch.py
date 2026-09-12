@@ -18,6 +18,10 @@ _STALE_SECONDS = 90
 # Statuses a worker is allowed to transition out of by reporting on a job.
 _OWNED_STATUSES = ("assigned", "running")
 
+# Statuses a job never leaves again. Re-transitioning one is always wrong,
+# so it stays a WARNING even when the worker does own the job.
+_TERMINAL_STATUSES = ("done", "failed")
+
 
 def _utcnow() -> datetime:
     return datetime.now(timezone.utc).replace(tzinfo=None)
@@ -124,6 +128,17 @@ def _owned_job(session, job_id: Optional[str], worker_id: str, statuses) -> Opti
     job it doesn't own (or one already finished). Mismatches are logged and
     dropped rather than raising -- a compromised or buggy agent shouldn't be
     able to tear down the message loop.
+
+    Log levels are deliberately split, because WARNING here is the signal that
+    someone is forging job ids and it has to stay findable:
+
+    * WARNING -- a job owned by someone else, an unknown job id, or an attempt
+      to re-transition a job that has already finished. All genuinely wrong.
+    * DEBUG -- this worker's own job simply isn't in the state this call wanted
+      (e.g. a repeated busy heartbeat for a job already marked running). That
+      is the normal steady state: the agent heartbeats every 30s for the whole
+      length of a job, and only the first one has anything to do. Logging those
+      at WARNING would bury the forgery signal under hundreds of lines per job.
     """
     if not job_id:
         return None
@@ -131,15 +146,28 @@ def _owned_job(session, job_id: Optional[str], worker_id: str, statuses) -> Opti
     if job is None:
         logger.warning("dispatch: worker %s referenced unknown job %s", worker_id, job_id)
         return None
-    if job.worker_id != worker_id or job.status not in statuses:
+
+    if job.worker_id != worker_id:
         logger.warning(
-            "dispatch: worker %s may not transition job %s (owner=%s, status=%s)",
+            "dispatch: worker %s may not transition job %s owned by %s (status=%s)",
             worker_id,
             job_id,
             job.worker_id,
             job.status,
         )
         return None
+
+    if job.status not in statuses:
+        log = logger.warning if job.status in _TERMINAL_STATUSES else logger.debug
+        log(
+            "dispatch: worker %s's job %s is %s, not %s; ignoring.",
+            worker_id,
+            job_id,
+            job.status,
+            "/".join(statuses),
+        )
+        return None
+
     return job
 
 
