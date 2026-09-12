@@ -21,7 +21,7 @@ from comfyfed_server import bootstrap, comfyapi, db, templates
 # tests below check everything against -- every model filename the packaged
 # workflow JSONs reference, and every download link in the "Missing models?"
 # notes and the README, must trace back to one of these entries.
-R2_MODEL_BASE = "https://pub-6a50550b7f984673a3ab1a1b580e4fb9.r2.dev/models/"
+R2_MODEL_BASE = "https://models.aiinpocket.com/models/"
 MODEL_INVENTORY = {
     "flux1-dev.safetensors",
     "clip_l.safetensors",
@@ -35,7 +35,7 @@ MODEL_INVENTORY = {
 }
 MISSING_MODELS_NOTE_TITLE = "⓪ 缺模型？/ Missing models?"
 
-_R2_URL_RE = re.compile(r"https://pub-6a50550b7f984673a3ab1a1b580e4fb9\.r2\.dev/models/\S+")
+_R2_URL_RE = re.compile(re.escape(R2_MODEL_BASE) + r"\S+")
 
 
 def _r2_urls_in(text):

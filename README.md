@@ -202,15 +202,15 @@ comfyfed-server fetch-comfy-ui --data-dir ./data
 
 | 檔案 | 大小 | 放置路徑 | 下載 |
 | --- | --- | --- | --- |
-| `flux1-dev.safetensors` | 22.17 GB | `models/diffusion_models/` | [R2](https://pub-6a50550b7f984673a3ab1a1b580e4fb9.r2.dev/models/diffusion_models/flux1-dev.safetensors) |
-| `clip_l.safetensors` | 0.23 GB | `models/text_encoders/` | [R2](https://pub-6a50550b7f984673a3ab1a1b580e4fb9.r2.dev/models/text_encoders/clip_l.safetensors) |
-| `t5xxl_fp16.safetensors` | 9.12 GB | `models/text_encoders/` | [R2](https://pub-6a50550b7f984673a3ab1a1b580e4fb9.r2.dev/models/text_encoders/t5xxl_fp16.safetensors) |
-| `ae.safetensors` | 0.31 GB | `models/vae/` | [R2](https://pub-6a50550b7f984673a3ab1a1b580e4fb9.r2.dev/models/vae/ae.safetensors) |
-| `minimax_h3_ref2va_pruned_int8_convrot.safetensors` | 19.53 GB | `models/diffusion_models/` | [R2](https://pub-6a50550b7f984673a3ab1a1b580e4fb9.r2.dev/models/diffusion_models/minimax_h3_ref2va_pruned_int8_convrot.safetensors) |
-| `qwen3vl_32b_heretic_minimax_h3_nvfp4.safetensors` | 14.61 GB | `models/text_encoders/` | [R2](https://pub-6a50550b7f984673a3ab1a1b580e4fb9.r2.dev/models/text_encoders/qwen3vl_32b_heretic_minimax_h3_nvfp4.safetensors) |
-| `minimax_h3_video_vae_fp16.safetensors` | 4.85 GB | `models/vae/` | [R2](https://pub-6a50550b7f984673a3ab1a1b580e4fb9.r2.dev/models/vae/minimax_h3_video_vae_fp16.safetensors) |
-| `minimax_h3_audio_vae_fp32.safetensors` | 0.56 GB | `models/vae/` | [R2](https://pub-6a50550b7f984673a3ab1a1b580e4fb9.r2.dev/models/vae/minimax_h3_audio_vae_fp32.safetensors) |
-| `minimax_h3_ref2v_turbo_8step_v1.0_768p_comfyui_resized_avg_rank_64_bf16.safetensors` | 0.91 GB | `models/loras/` | [R2](https://pub-6a50550b7f984673a3ab1a1b580e4fb9.r2.dev/models/loras/minimax_h3_ref2v_turbo_8step_v1.0_768p_comfyui_resized_avg_rank_64_bf16.safetensors) |
+| `flux1-dev.safetensors` | 22.17 GB | `models/diffusion_models/` | [R2](https://models.aiinpocket.com/models/diffusion_models/flux1-dev.safetensors) |
+| `clip_l.safetensors` | 0.23 GB | `models/text_encoders/` | [R2](https://models.aiinpocket.com/models/text_encoders/clip_l.safetensors) |
+| `t5xxl_fp16.safetensors` | 9.12 GB | `models/text_encoders/` | [R2](https://models.aiinpocket.com/models/text_encoders/t5xxl_fp16.safetensors) |
+| `ae.safetensors` | 0.31 GB | `models/vae/` | [R2](https://models.aiinpocket.com/models/vae/ae.safetensors) |
+| `minimax_h3_ref2va_pruned_int8_convrot.safetensors` | 19.53 GB | `models/diffusion_models/` | [R2](https://models.aiinpocket.com/models/diffusion_models/minimax_h3_ref2va_pruned_int8_convrot.safetensors) |
+| `qwen3vl_32b_heretic_minimax_h3_nvfp4.safetensors` | 14.61 GB | `models/text_encoders/` | [R2](https://models.aiinpocket.com/models/text_encoders/qwen3vl_32b_heretic_minimax_h3_nvfp4.safetensors) |
+| `minimax_h3_video_vae_fp16.safetensors` | 4.85 GB | `models/vae/` | [R2](https://models.aiinpocket.com/models/vae/minimax_h3_video_vae_fp16.safetensors) |
+| `minimax_h3_audio_vae_fp32.safetensors` | 0.56 GB | `models/vae/` | [R2](https://models.aiinpocket.com/models/vae/minimax_h3_audio_vae_fp32.safetensors) |
+| `minimax_h3_ref2v_turbo_8step_v1.0_768p_comfyui_resized_avg_rank_64_bf16.safetensors` | 0.91 GB | `models/loras/` | [R2](https://models.aiinpocket.com/models/loras/minimax_h3_ref2v_turbo_8step_v1.0_768p_comfyui_resized_avg_rank_64_bf16.safetensors) |
 
 全部裝齊約 **72 GB**；只跑武俠文生圖／角色立繪兩支 Flux 範本約 **31.8 GB**，只跑參考圖生影片約 **40.5 GB**。每支範本的畫布上也有一則「⓪ 缺模型？」便條紙，列出該範本自己需要哪幾個檔案。
 
@@ -521,15 +521,15 @@ download a file and drop it under the matching subfolder of the worker's
 
 | File | Size | Target path | Download |
 | --- | --- | --- | --- |
-| `flux1-dev.safetensors` | 22.17 GB | `models/diffusion_models/` | [R2](https://pub-6a50550b7f984673a3ab1a1b580e4fb9.r2.dev/models/diffusion_models/flux1-dev.safetensors) |
-| `clip_l.safetensors` | 0.23 GB | `models/text_encoders/` | [R2](https://pub-6a50550b7f984673a3ab1a1b580e4fb9.r2.dev/models/text_encoders/clip_l.safetensors) |
-| `t5xxl_fp16.safetensors` | 9.12 GB | `models/text_encoders/` | [R2](https://pub-6a50550b7f984673a3ab1a1b580e4fb9.r2.dev/models/text_encoders/t5xxl_fp16.safetensors) |
-| `ae.safetensors` | 0.31 GB | `models/vae/` | [R2](https://pub-6a50550b7f984673a3ab1a1b580e4fb9.r2.dev/models/vae/ae.safetensors) |
-| `minimax_h3_ref2va_pruned_int8_convrot.safetensors` | 19.53 GB | `models/diffusion_models/` | [R2](https://pub-6a50550b7f984673a3ab1a1b580e4fb9.r2.dev/models/diffusion_models/minimax_h3_ref2va_pruned_int8_convrot.safetensors) |
-| `qwen3vl_32b_heretic_minimax_h3_nvfp4.safetensors` | 14.61 GB | `models/text_encoders/` | [R2](https://pub-6a50550b7f984673a3ab1a1b580e4fb9.r2.dev/models/text_encoders/qwen3vl_32b_heretic_minimax_h3_nvfp4.safetensors) |
-| `minimax_h3_video_vae_fp16.safetensors` | 4.85 GB | `models/vae/` | [R2](https://pub-6a50550b7f984673a3ab1a1b580e4fb9.r2.dev/models/vae/minimax_h3_video_vae_fp16.safetensors) |
-| `minimax_h3_audio_vae_fp32.safetensors` | 0.56 GB | `models/vae/` | [R2](https://pub-6a50550b7f984673a3ab1a1b580e4fb9.r2.dev/models/vae/minimax_h3_audio_vae_fp32.safetensors) |
-| `minimax_h3_ref2v_turbo_8step_v1.0_768p_comfyui_resized_avg_rank_64_bf16.safetensors` | 0.91 GB | `models/loras/` | [R2](https://pub-6a50550b7f984673a3ab1a1b580e4fb9.r2.dev/models/loras/minimax_h3_ref2v_turbo_8step_v1.0_768p_comfyui_resized_avg_rank_64_bf16.safetensors) |
+| `flux1-dev.safetensors` | 22.17 GB | `models/diffusion_models/` | [R2](https://models.aiinpocket.com/models/diffusion_models/flux1-dev.safetensors) |
+| `clip_l.safetensors` | 0.23 GB | `models/text_encoders/` | [R2](https://models.aiinpocket.com/models/text_encoders/clip_l.safetensors) |
+| `t5xxl_fp16.safetensors` | 9.12 GB | `models/text_encoders/` | [R2](https://models.aiinpocket.com/models/text_encoders/t5xxl_fp16.safetensors) |
+| `ae.safetensors` | 0.31 GB | `models/vae/` | [R2](https://models.aiinpocket.com/models/vae/ae.safetensors) |
+| `minimax_h3_ref2va_pruned_int8_convrot.safetensors` | 19.53 GB | `models/diffusion_models/` | [R2](https://models.aiinpocket.com/models/diffusion_models/minimax_h3_ref2va_pruned_int8_convrot.safetensors) |
+| `qwen3vl_32b_heretic_minimax_h3_nvfp4.safetensors` | 14.61 GB | `models/text_encoders/` | [R2](https://models.aiinpocket.com/models/text_encoders/qwen3vl_32b_heretic_minimax_h3_nvfp4.safetensors) |
+| `minimax_h3_video_vae_fp16.safetensors` | 4.85 GB | `models/vae/` | [R2](https://models.aiinpocket.com/models/vae/minimax_h3_video_vae_fp16.safetensors) |
+| `minimax_h3_audio_vae_fp32.safetensors` | 0.56 GB | `models/vae/` | [R2](https://models.aiinpocket.com/models/vae/minimax_h3_audio_vae_fp32.safetensors) |
+| `minimax_h3_ref2v_turbo_8step_v1.0_768p_comfyui_resized_avg_rank_64_bf16.safetensors` | 0.91 GB | `models/loras/` | [R2](https://models.aiinpocket.com/models/loras/minimax_h3_ref2v_turbo_8step_v1.0_768p_comfyui_resized_avg_rank_64_bf16.safetensors) |
 
 Everything together is about **72 GB**; the two Flux templates (wuxia,
 character portrait) need about **31.8 GB**; the reference-to-video template
