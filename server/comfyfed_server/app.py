@@ -2,12 +2,15 @@
 
 from __future__ import annotations
 
+import asyncio
+import contextlib
 import os
+from contextlib import asynccontextmanager
 
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import JSONResponse
 
-from . import auth, bootstrap, db, jobs, workers
+from . import agentws, auth, bootstrap, db, jobs, workers
 
 
 def _error_body(code: str, message: str) -> dict:
@@ -42,10 +45,21 @@ def create_app(data_dir: str) -> FastAPI:
 
     bootstrap.ensure_installed(data_dir, lang=None, url=None, interactive=False)
 
-    app = FastAPI(title="ComfyFed")
+    @asynccontextmanager
+    async def lifespan(_app: FastAPI):
+        task = agentws.start_background_task()
+        try:
+            yield
+        finally:
+            task.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await task
+
+    app = FastAPI(title="ComfyFed", lifespan=lifespan)
     app.add_exception_handler(HTTPException, _http_exception_handler)
     app.include_router(auth.router)
     app.include_router(workers.create_router(data_dir))
     app.include_router(jobs.create_router(data_dir))
+    app.include_router(agentws.create_router())
 
     return app
