@@ -65,12 +65,8 @@ def create_router(data_dir: str) -> APIRouter:
         conn = _Connection(ws=websocket, worker_id=worker_id, loop=asyncio.get_running_loop())
         _connections[worker_id] = conn
 
-        with db.get_session() as session:
-            worker = session.get(db.Worker, worker_id)
-            worker_name = worker.name if worker is not None else worker_id
-        metrics.get_metrics().ws_reconnects_total.labels(worker=worker_name).inc()
-
         try:
+            _record_reconnect(worker_id)
             await websocket.send_json({"type": "ready"})
             while True:
                 message = await websocket.receive_json()
@@ -81,6 +77,19 @@ def create_router(data_dir: str) -> APIRouter:
             _connections.pop(worker_id, None)
 
     return r
+
+
+def _record_reconnect(worker_id: str) -> None:
+    """Increment ws_reconnects_total for this worker. Best-effort: metrics
+    must never break the WS dispatch path, so any failure (DB hiccup, metrics
+    not initialized, etc.) is logged and swallowed rather than propagated."""
+    try:
+        with db.get_session() as session:
+            worker = session.get(db.Worker, worker_id)
+            worker_name = worker.name if worker is not None else worker_id
+        metrics.get_metrics().ws_reconnects_total.labels(worker=worker_name).inc()
+    except Exception:
+        logger.exception("agentws: failed to record ws_reconnects_total for worker %s", worker_id)
 
 
 async def _handshake(websocket: WebSocket) -> Optional[str]:
@@ -192,9 +201,12 @@ def _handle_heartbeat(worker_id: str, conn: _Connection, message: dict) -> None:
                     job.progress = float(progress)
                     session.commit()
 
-    m = metrics.get_metrics()
-    m.worker_up.labels(worker=worker_name).set(1)
-    m.set_worker_dynamic(worker_name, dynamic)
+    try:
+        m = metrics.get_metrics()
+        m.worker_up.labels(worker=worker_name).set(1)
+        m.set_worker_dynamic(worker_name, dynamic)
+    except Exception:
+        logger.exception("agentws: failed to update heartbeat metrics for worker %s", worker_id)
 
 
 def _handle_inventory(worker_id: str, message: dict) -> None:

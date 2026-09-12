@@ -14,6 +14,8 @@ a module-level singleton set by `init()` (called once per `create_app`).
 
 from __future__ import annotations
 
+import logging
+import math
 from typing import Optional
 
 from prometheus_client import CollectorRegistry, Counter, Gauge, Histogram
@@ -21,7 +23,15 @@ from prometheus_client.core import GaugeMetricFamily
 
 from . import db
 
+logger = logging.getLogger(__name__)
+
 _METRICS_PUBLIC_KEY = "metrics_public"
+
+# Wide, minute/hour-scale buckets: render jobs commonly queue and run for
+# minutes, so the prometheus_client default buckets (all <= 10s) would put
+# every observation in the last bucket and be useless for dashboards/alerts.
+_JOB_WAIT_BUCKETS = (1, 5, 15, 60, 300, 900, 3600)
+_JOB_RUN_BUCKETS = (5, 30, 60, 180, 600, 1800, 3600, 7200)
 
 
 class _QueuedJobsCollector:
@@ -78,11 +88,13 @@ class Metrics:
         self.job_wait_seconds = Histogram(
             "comfyfed_job_wait_seconds",
             "Seconds a job waited in queue before it started running.",
+            buckets=_JOB_WAIT_BUCKETS,
             registry=self.registry,
         )
         self.job_run_seconds = Histogram(
             "comfyfed_job_run_seconds",
             "Seconds a job spent running, from start to done/failed.",
+            buckets=_JOB_RUN_BUCKETS,
             registry=self.registry,
         )
         self.ws_reconnects_total = Counter(
@@ -96,13 +108,29 @@ class Metrics:
     def set_worker_dynamic(self, worker_name: str, dynamic: dict) -> None:
         """Update the free-{vram,ram,disk} gauges from a heartbeat's
         `dynamic` payload, leaving a gauge unset (not zeroed) when the
-        worker's heartbeat doesn't report that field."""
-        if "free_vram_gb" in dynamic:
-            self.worker_free_vram_gb.labels(worker=worker_name).set(dynamic["free_vram_gb"])
-        if "free_ram_gb" in dynamic:
-            self.worker_free_ram_gb.labels(worker=worker_name).set(dynamic["free_ram_gb"])
-        if "free_disk_gb" in dynamic:
-            self.worker_free_disk_gb.labels(worker=worker_name).set(dynamic["free_disk_gb"])
+        worker's heartbeat doesn't report that field.
+
+        `dynamic` is worker-supplied and untrusted: a garbage/non-numeric
+        value must not raise and disconnect the worker's WS, so each value is
+        coerced to a finite float and silently skipped (logged) otherwise.
+        """
+        self._set_one(self.worker_free_vram_gb, worker_name, dynamic.get("free_vram_gb"))
+        self._set_one(self.worker_free_ram_gb, worker_name, dynamic.get("free_ram_gb"))
+        self._set_one(self.worker_free_disk_gb, worker_name, dynamic.get("free_disk_gb"))
+
+    @staticmethod
+    def _set_one(gauge: Gauge, worker_name: str, raw_value: object) -> None:
+        if raw_value is None:
+            return
+        try:
+            value = float(raw_value)  # type: ignore[arg-type]
+        except (TypeError, ValueError):
+            logger.warning("metrics: ignoring non-numeric dynamic value %r for worker %s", raw_value, worker_name)
+            return
+        if not math.isfinite(value):
+            logger.warning("metrics: ignoring non-finite dynamic value %r for worker %s", raw_value, worker_name)
+            return
+        gauge.labels(worker=worker_name).set(value)
 
 
 _current: Optional[Metrics] = None

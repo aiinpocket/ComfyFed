@@ -80,6 +80,48 @@ def test_heartbeat_sets_worker_gauges(client):
     assert 'comfyfed_worker_free_disk_gb{worker="w1"} 100.0' in text
 
 
+def test_heartbeat_with_garbage_dynamic_value_does_not_disconnect_worker(client):
+    csrf = _login(client)
+    worker_id, sk = _register_worker(client, csrf, "w1")
+
+    with client.websocket_connect("/api/agent/ws") as ws:
+        challenge = ws.receive_json()
+        sig = sk.sign(challenge["nonce"].encode()).signature.hex()
+        ws.send_json({"type": "auth", "worker_id": worker_id, "sig": sig})
+        assert ws.receive_json()["type"] == "ready"
+
+        ws.send_json(
+            {
+                "type": "heartbeat",
+                "state": "idle",
+                "progress": 0.0,
+                "job_id": None,
+                "dynamic": {"free_vram_gb": "garbage"},
+            }
+        )
+
+        # The connection must still be alive and processing messages after a
+        # malformed heartbeat value: a second heartbeat should go through
+        # normally rather than the socket having been torn down.
+        ws.send_json(
+            {
+                "type": "heartbeat",
+                "state": "idle",
+                "progress": 0.0,
+                "job_id": None,
+                "dynamic": {"free_vram_gb": 8.0},
+            }
+        )
+        agentws.dispatch_once(worker_id)
+
+    with db.get_session() as session:
+        worker = session.get(db.Worker, worker_id)
+        assert worker.status == "online"
+
+    text = client.get("/metrics").text
+    assert 'comfyfed_worker_free_vram_gb{worker="w1"} 8.0' in text
+
+
 def test_ws_reconnects_counter_increments(client):
     csrf = _login(client)
     worker_id, sk = _register_worker(client, csrf, "w1")
