@@ -48,3 +48,9 @@
 - agent comfy.run_workflow：偵測 prompt 進入 /queue queue_running 的時刻（首次出現）與完成時刻，回傳 exec_seconds；runner job_done 訊息夾 `exec_seconds`。
 - server agentws job_done 處理：receipt gpu_seconds = min(exec_seconds, (finished_at-started_at) 牆鐘)（exec 缺失→牆鐘 fallback＋log）；收據 payload 格式不變。
 - 測試：mock comfy 佇列先 pending 再 running（模擬前面有別的工作）→ exec_seconds 顯著小於牆鐘且 receipt 用 exec；缺 exec_seconds fallback。README 已知限制段更新（兩語）。
+
+### Task 6: 結果檔雜湊驗證＋worker 端任務檔案清除（使用者定案 2026-09-12）
+- agent 上傳 artifact 時附 X-Artifact-SHA256（檔案 sha256 hex）；平台重算比對，不符→400 artifact.hash_mismatch；回應 {"stored","sha256"}；平台以新 migration `Job.result_hashes: str='{}'`（JSON {filename: sha256}）存雜湊並在 GET /api/jobs/{id} 露出。agent 比對回應雜湊==本地雜湊才視為上傳成功；不符或 400 重試一次，仍失敗→job_failed("artifact upload failed")。
+- agent 清除：job 結束（成功或失敗）後一律刪除本次 job 的 agent 端暫存（下載的 input assets 副本、/view 拉回的輸出副本）；AgentConfig 新增選填 `comfy_output_dir: str|None`、`comfy_input_dir: str|None`（load/save），有設定時：成功且雜湊確認後，刪 ComfyUI output 目錄中本次 job 的輸出檔（依 history 的 filename/subfolder 組路徑，只刪確認存在且屬於本次的檔）與 input 目錄中本次上傳的 asset 檔；未設定→略過並 log。清除動作 defensive try/except，絕不因清除失敗影響 job_done 回報。
+- 測試：上傳附錯 hash→400 且 agent 重試；正確流程 result_hashes 落庫＋回應 hash；agent 暫存清除（mock 檔案存在→job 後不存在）；comfy_output_dir 設定時對應檔被刪、未設定時不動。README 兩語：磁碟清理段。
+- Spec §7 worker 端執行 bullet 同步補述。
