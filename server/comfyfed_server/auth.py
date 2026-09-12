@@ -6,7 +6,7 @@ import secrets
 from datetime import datetime, timedelta, timezone
 from typing import Optional
 
-from fastapi import APIRouter, Cookie, Header, HTTPException, Response
+from fastapi import APIRouter, Cookie, Depends, Header, HTTPException, Response
 from itsdangerous import BadSignature, SignatureExpired, URLSafeTimedSerializer
 from pydantic import BaseModel
 
@@ -119,6 +119,20 @@ def _require_csrf(payload: dict, x_csrf: Optional[str]) -> None:
         raise _error(403, "auth.csrf", "CSRF token missing or invalid.")
 
 
+async def require_csrf(
+    payload: dict = Depends(require_admin),
+    x_csrf: Optional[str] = Header(default=None, alias="X-CSRF"),
+) -> dict:
+    """Admin-session dependency that additionally enforces the X-CSRF header.
+
+    Reusable across routers: depend on this for any admin-authenticated,
+    state-changing route (POST/PUT/DELETE), and on `require_admin` alone for
+    read-only admin routes.
+    """
+    _require_csrf(payload, x_csrf)
+    return payload
+
+
 router = APIRouter(prefix="/api/auth")
 
 
@@ -176,14 +190,8 @@ def me(cf_session: Optional[str] = Cookie(default=None)):
 @router.post("/change-password")
 def change_password(
     body: ChangePasswordBody,
-    cf_session: Optional[str] = Cookie(default=None),
-    x_csrf: Optional[str] = Header(default=None, alias="X-CSRF"),
+    payload: dict = Depends(require_csrf),
 ):
-    payload = _read_session_payload(cf_session)
-    if not payload or not payload.get("authenticated"):
-        raise _error(401, "auth.required", "Login required.")
-    _require_csrf(payload, x_csrf)
-
     if len(body.new) < 8:
         raise _error(400, "auth.password_too_short", "New password must be at least 8 characters.")
 

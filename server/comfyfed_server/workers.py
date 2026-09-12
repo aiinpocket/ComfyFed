@@ -5,8 +5,9 @@ from __future__ import annotations
 import secrets
 from typing import Optional
 
-from fastapi import APIRouter, Cookie, Header, HTTPException
+from fastapi import APIRouter, Depends, HTTPException
 from pydantic import BaseModel
+from sqlalchemy import update
 
 from . import auth, db, security
 
@@ -15,18 +16,6 @@ _PLATFORM_URL_KEY = "platform_url"
 
 def _error(status_code: int, code: str, message: str = "") -> HTTPException:
     return HTTPException(status_code=status_code, detail={"code": code, "message": message or code})
-
-
-def _require_admin_with_csrf(
-    cf_session: Optional[str],
-    x_csrf: Optional[str],
-) -> dict:
-    payload = auth._read_session_payload(cf_session)
-    if not payload or not payload.get("authenticated"):
-        raise _error(401, "auth.required", "Login required.")
-    if not x_csrf or x_csrf != payload.get("csrf"):
-        raise _error(403, "auth.csrf", "CSRF token missing or invalid.")
-    return payload
 
 
 class IssueTokenBody(BaseModel):
@@ -45,11 +34,8 @@ def create_router(data_dir: str) -> APIRouter:
     @r.post("/api/workers/tokens")
     def issue_token(
         body: IssueTokenBody,
-        cf_session: Optional[str] = Cookie(default=None),
-        x_csrf: Optional[str] = Header(default=None, alias="X-CSRF"),
+        _payload: dict = Depends(auth.require_csrf),
     ):
-        _require_admin_with_csrf(cf_session, x_csrf)
-
         token = secrets.token_urlsafe(24)
         with db.get_session() as session:
             session.add(db.RegisterToken(token=token, worker_name=body.name))
@@ -72,13 +58,23 @@ def create_router(data_dir: str) -> APIRouter:
             token_row = session.get(db.RegisterToken, body.token)
             if token_row is None:
                 raise _error(401, "register.token_invalid", "Unknown register token.")
-            if token_row.used:
-                raise _error(409, "register.token_used", "Register token already used.")
 
             worker_name = body.name or token_row.worker_name
+
+            # Atomically claim the token: only one concurrent request can flip
+            # used=0 -> used=1. The loser sees rowcount == 0 and gets a 409,
+            # even if it read the row before the winner's commit.
+            result = session.execute(
+                update(db.RegisterToken)
+                .where(db.RegisterToken.token == body.token, db.RegisterToken.used == False)  # noqa: E712
+                .values(used=True)
+            )
+            if result.rowcount != 1:
+                session.rollback()
+                raise _error(409, "register.token_used", "Register token already used.")
+
             worker = db.Worker(name=worker_name, pubkey=body.pubkey)
             session.add(worker)
-            token_row.used = True
             session.commit()
             worker_id = worker.id
 
@@ -89,11 +85,7 @@ def create_router(data_dir: str) -> APIRouter:
         return {"worker_id": worker_id, "certificate": signature.hex()}
 
     @r.get("/api/workers")
-    def list_workers(cf_session: Optional[str] = Cookie(default=None)):
-        payload = auth._read_session_payload(cf_session)
-        if not payload or not payload.get("authenticated"):
-            raise _error(401, "auth.required", "Login required.")
-
+    def list_workers(_payload: dict = Depends(auth.require_admin)):
         with db.get_session() as session:
             workers = session.query(db.Worker).all()
             return [
@@ -110,11 +102,8 @@ def create_router(data_dir: str) -> APIRouter:
     @r.post("/api/workers/{worker_id}/disable")
     def disable_worker(
         worker_id: str,
-        cf_session: Optional[str] = Cookie(default=None),
-        x_csrf: Optional[str] = Header(default=None, alias="X-CSRF"),
+        _payload: dict = Depends(auth.require_csrf),
     ):
-        _require_admin_with_csrf(cf_session, x_csrf)
-
         with db.get_session() as session:
             worker = session.get(db.Worker, worker_id)
             if worker is None:
