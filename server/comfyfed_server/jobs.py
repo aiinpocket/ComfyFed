@@ -6,10 +6,10 @@ import json
 import os
 from typing import Optional
 
-from fastapi import APIRouter, Depends, File, Form, HTTPException, UploadFile
-from fastapi.responses import FileResponse
+from fastapi import APIRouter, Depends, File, Form, HTTPException, Request, UploadFile
+from fastapi.responses import FileResponse, Response
 
-from . import assess, auth, db
+from . import assess, auth, db, storage
 from .workers import verify_agent
 
 _JOB_INPUTS_DIRNAME = "job_inputs"
@@ -186,5 +186,49 @@ def create_router(data_dir: str) -> APIRouter:
         if not os.path.isfile(path):
             raise _error(404, "jobs.asset_not_found", "Asset not found for this job.")
         return FileResponse(path)
+
+    @r.post("/api/agent/jobs/{job_id}/artifacts")
+    async def upload_job_artifact(
+        job_id: str,
+        request: Request,
+        worker: db.Worker = Depends(verify_agent),
+    ):
+        # Deliberately NOT declared as `file: UploadFile = File(...)`: FastAPI
+        # parses declared File/Form params via `request.form()` *before* any
+        # dependency runs, which would consume the body stream ahead of
+        # `verify_agent`'s `request.body()` signature check (needed to
+        # authenticate this multipart request) and blow up with "Stream
+        # consumed". Parsing the form here, after verify_agent has already
+        # cached the body, works because Starlette replays the cached body.
+        with db.get_session() as session:
+            job = session.get(db.Job, job_id)
+            if job is None:
+                raise _error(404, "jobs.not_found", "Job not found.")
+            if job.worker_id != worker.id or job.status not in ("assigned", "running"):
+                raise _error(403, "jobs.not_assigned", "Job is not assigned to this worker.")
+
+        form = await request.form()
+        file = form.get("file")
+        if file is None or not hasattr(file, "file"):
+            raise _error(400, "jobs.bad_asset_name", "Missing 'file' field.")
+
+        store = storage.get_store(data_dir)
+        try:
+            stored = store.put(job_id, file.filename or "", file.file)
+        except ValueError:
+            raise _error(400, "jobs.bad_asset_name", f"Invalid artifact filename: {file.filename!r}")
+
+        return {"stored": stored}
+
+    @r.get("/api/jobs/{job_id}/artifacts/{filename}")
+    def get_job_artifact(job_id: str, filename: str, _payload: dict = Depends(auth.require_admin)):
+        store = storage.get_store(data_dir)
+        try:
+            f = store.open(job_id, filename)
+        except (FileNotFoundError, ValueError):
+            raise _error(404, "jobs.artifact_not_found", "Artifact not found.")
+        with f:
+            content = f.read()
+        return Response(content=content, media_type="application/octet-stream")
 
     return r

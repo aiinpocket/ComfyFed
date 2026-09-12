@@ -10,7 +10,7 @@ from contextlib import asynccontextmanager
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import JSONResponse
 
-from . import agentws, auth, bootstrap, db, jobs, workers
+from . import agentws, auth, bootstrap, db, jobs, receipts, workers
 
 
 def _error_body(code: str, message: str) -> dict:
@@ -60,6 +60,7 @@ def create_app(data_dir: str) -> FastAPI:
     app.include_router(auth.router)
     app.include_router(workers.create_router(data_dir))
     app.include_router(jobs.create_router(data_dir))
-    app.include_router(agentws.create_router())
+    app.include_router(receipts.create_router())
+    app.include_router(agentws.create_router(data_dir))
 
     return app

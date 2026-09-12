@@ -1,0 +1,88 @@
+"""Artifact storage abstraction for job result files.
+
+Phase 1 ships a single `LocalStore` implementation that writes artifacts to
+disk under the server's data directory. `get_store` selects the backend via
+the `artifact_store` setting so a future Phase 2 can add an S3-backed store
+(presigned direct upload) without changing callers.
+"""
+
+from __future__ import annotations
+
+import os
+from abc import ABC, abstractmethod
+from typing import BinaryIO, IO
+
+from . import db
+
+_ARTIFACTS_DIRNAME = "artifacts"
+_ARTIFACT_STORE_SETTING_KEY = "artifact_store"
+
+
+def _sanitize_filename(filename: str) -> str:
+    name = os.path.basename(filename or "")
+    if not name or name in (".", ".."):
+        raise ValueError(f"Invalid artifact filename: {filename!r}")
+    return name
+
+
+class ArtifactStore(ABC):
+    """Backend-agnostic storage for job result artifacts."""
+
+    @abstractmethod
+    def put(self, job_id: str, filename: str, stream: BinaryIO) -> str:
+        """Store `stream`'s bytes under `job_id`/`filename`. Returns the stored filename."""
+
+    @abstractmethod
+    def open(self, job_id: str, filename: str) -> IO[bytes]:
+        """Open a stored artifact for reading. Raises FileNotFoundError if absent."""
+
+    @abstractmethod
+    def url(self, job_id: str, filename: str) -> str:
+        """Return the (Phase 1: API) URL clients should use to fetch this artifact."""
+
+
+class LocalStore(ArtifactStore):
+    """Stores artifacts on the local filesystem at `<base_dir>/artifacts/<job_id>/<filename>`."""
+
+    def __init__(self, base_dir: str):
+        self._base_dir = base_dir
+
+    def _path(self, job_id: str, filename: str) -> str:
+        name = _sanitize_filename(filename)
+        return os.path.join(self._base_dir, _ARTIFACTS_DIRNAME, job_id, name)
+
+    def put(self, job_id: str, filename: str, stream: BinaryIO) -> str:
+        name = _sanitize_filename(filename)
+        path = self._path(job_id, name)
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        with open(path, "wb") as f:
+            for chunk in iter(lambda: stream.read(1024 * 1024), b""):
+                f.write(chunk)
+        return name
+
+    def open(self, job_id: str, filename: str) -> IO[bytes]:
+        path = self._path(job_id, filename)
+        return open(path, "rb")
+
+    def url(self, job_id: str, filename: str) -> str:
+        name = _sanitize_filename(filename)
+        return f"/api/jobs/{job_id}/artifacts/{name}"
+
+
+def get_store(data_dir: str) -> ArtifactStore:
+    """Build the configured `ArtifactStore` for this server instance.
+
+    Reads the `artifact_store` setting (default "local"). "s3" is reserved
+    for Phase 2 (presigned direct upload) and is not implemented yet.
+    """
+    with db.get_session() as session:
+        row = session.get(db.Setting, _ARTIFACT_STORE_SETTING_KEY)
+        kind = row.value if row is not None else "local"
+
+    if kind == "local":
+        return LocalStore(data_dir)
+    if kind == "s3":
+        raise ValueError(
+            "artifact_store 's3' is reserved for Phase 2 (presigned direct upload); not implemented in Phase 1."
+        )
+    raise ValueError(f"Unknown artifact_store setting: {kind!r}")

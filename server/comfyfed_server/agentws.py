@@ -18,15 +18,18 @@ from typing import Optional
 
 from fastapi import APIRouter, WebSocket, WebSocketDisconnect
 from nacl.exceptions import BadSignatureError
-from nacl.signing import VerifyKey
+from nacl.signing import SigningKey, VerifyKey
 
-from . import db, dispatch
+from . import db, dispatch, security
 
 logger = logging.getLogger(__name__)
 
 _AUTH_TIMEOUT_SECONDS = 10
 _TICK_INTERVAL_SECONDS = 5
 _CLOSE_UNAUTHORIZED = 4401
+
+# Set by create_router(data_dir); used to sign job_done receipts.
+_signing_key: Optional[SigningKey] = None
 
 
 def _utcnow() -> datetime:
@@ -45,7 +48,10 @@ class _Connection:
 _connections: dict[str, _Connection] = {}
 
 
-def create_router() -> APIRouter:
+def create_router(data_dir: str) -> APIRouter:
+    global _signing_key
+    _signing_key, _ = security.load_platform_keys(data_dir)
+
     r = APIRouter()
 
     @r.websocket("/api/agent/ws")
@@ -126,9 +132,13 @@ async def _handle_message(worker_id: str, conn: _Connection, message: dict) -> N
         elif msg_type == "inventory":
             _handle_inventory(worker_id, message)
         elif msg_type == "job_done":
-            dispatch.mark_done(message.get("job_id"), message.get("result_files") or [])
+            job_id = message.get("job_id")
+            dispatch.mark_done(job_id, message.get("result_files") or [])
+            await _create_and_push_receipt(worker_id, conn, job_id)
         elif msg_type == "job_failed":
             dispatch.mark_failed(message.get("job_id"), message.get("error") or "")
+        elif msg_type == "receipt_ack":
+            _handle_receipt_ack(worker_id, message)
         else:
             logger.warning("agentws: unknown message type %r from worker %s", msg_type, worker_id)
     except Exception:
@@ -182,6 +192,74 @@ def _handle_inventory(worker_id: str, message: dict) -> None:
         if worker is None:
             return
         worker.model_inventory = json.dumps(message.get("models") or [])
+        session.commit()
+
+
+async def _create_and_push_receipt(worker_id: str, conn: "_Connection", job_id: Optional[str]) -> None:
+    """Create a platform-signed Receipt for a just-completed job and push it
+    to the worker over its live connection, for the worker to counter-sign
+    via a `receipt_ack` message."""
+    if not job_id or _signing_key is None:
+        return
+
+    with db.get_session() as session:
+        job = session.get(db.Job, job_id)
+        if job is None:
+            return
+        gpu_seconds = 0.0
+        if job.started_at is not None and job.finished_at is not None:
+            gpu_seconds = (job.finished_at - job.started_at).total_seconds()
+
+        payload = f"{job_id}|{worker_id}|{gpu_seconds:.1f}"
+        platform_sig = _signing_key.sign(payload.encode()).signature.hex()
+
+        receipt = db.Receipt(
+            job_id=job_id,
+            worker_id=worker_id,
+            gpu_seconds=gpu_seconds,
+            platform_sig=platform_sig,
+        )
+        session.add(receipt)
+        session.commit()
+        receipt_id = receipt.id
+
+    try:
+        await conn.ws.send_json(
+            {
+                "type": "receipt",
+                "receipt_id": receipt_id,
+                "payload": payload,
+                "platform_sig": platform_sig,
+            }
+        )
+    except Exception:
+        logger.exception("agentws: failed to push receipt %s to worker %s", receipt_id, worker_id)
+
+
+def _handle_receipt_ack(worker_id: str, message: dict) -> None:
+    receipt_id = message.get("receipt_id")
+    worker_sig = message.get("worker_sig")
+    if not isinstance(receipt_id, str) or not isinstance(worker_sig, str):
+        return
+
+    with db.get_session() as session:
+        receipt = session.get(db.Receipt, receipt_id)
+        if receipt is None or receipt.worker_id != worker_id:
+            logger.warning("agentws: receipt_ack for unknown/foreign receipt %s from worker %s", receipt_id, worker_id)
+            return
+
+        worker = session.get(db.Worker, worker_id)
+        if worker is None:
+            return
+
+        payload = f"{receipt.job_id}|{receipt.worker_id}|{receipt.gpu_seconds:.1f}"
+        try:
+            VerifyKey(bytes.fromhex(worker.pubkey)).verify(payload.encode(), bytes.fromhex(worker_sig))
+        except (BadSignatureError, ValueError):
+            logger.warning("agentws: invalid receipt_ack signature for receipt %s from worker %s", receipt_id, worker_id)
+            return
+
+        receipt.worker_sig = worker_sig
         session.commit()
 
 
