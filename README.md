@@ -196,6 +196,26 @@ comfyfed-server fetch-comfy-ui --data-dir ./data
 
 ⚠ 範本用到的模型（`flux1-dev`、MiniMax H3 那幾顆、turbo LoRA）**必須有 worker 真的裝了**，下拉才選得到、工作才派得出去。沒有的話工作會建立成功但一直卡在佇列——原因看「工作」頁的不合格說明。
 
+### 模型下載
+
+全新安裝的 worker 沒有任何模型檔，範本等於是廢的。模型太大不會進 git，改放 Cloudflare R2 公開鏡像，目錄結構鏡射 ComfyUI 的 `models/` 資料夾——下載後照「放置路徑」欄放進 worker 的 `ComfyUI/models/` 底下對應子資料夾即可。
+
+| 檔案 | 大小 | 放置路徑 | 下載 |
+| --- | --- | --- | --- |
+| `flux1-dev.safetensors` | 22.17 GB | `models/diffusion_models/` | [R2](https://pub-6a50550b7f984673a3ab1a1b580e4fb9.r2.dev/models/diffusion_models/flux1-dev.safetensors) |
+| `clip_l.safetensors` | 0.23 GB | `models/text_encoders/` | [R2](https://pub-6a50550b7f984673a3ab1a1b580e4fb9.r2.dev/models/text_encoders/clip_l.safetensors) |
+| `t5xxl_fp16.safetensors` | 9.12 GB | `models/text_encoders/` | [R2](https://pub-6a50550b7f984673a3ab1a1b580e4fb9.r2.dev/models/text_encoders/t5xxl_fp16.safetensors) |
+| `ae.safetensors` | 0.31 GB | `models/vae/` | [R2](https://pub-6a50550b7f984673a3ab1a1b580e4fb9.r2.dev/models/vae/ae.safetensors) |
+| `minimax_h3_ref2va_pruned_int8_convrot.safetensors` | 19.53 GB | `models/diffusion_models/` | [R2](https://pub-6a50550b7f984673a3ab1a1b580e4fb9.r2.dev/models/diffusion_models/minimax_h3_ref2va_pruned_int8_convrot.safetensors) |
+| `qwen3vl_32b_heretic_minimax_h3_nvfp4.safetensors` | 14.61 GB | `models/text_encoders/` | [R2](https://pub-6a50550b7f984673a3ab1a1b580e4fb9.r2.dev/models/text_encoders/qwen3vl_32b_heretic_minimax_h3_nvfp4.safetensors) |
+| `minimax_h3_video_vae_fp16.safetensors` | 4.85 GB | `models/vae/` | [R2](https://pub-6a50550b7f984673a3ab1a1b580e4fb9.r2.dev/models/vae/minimax_h3_video_vae_fp16.safetensors) |
+| `minimax_h3_audio_vae_fp32.safetensors` | 0.56 GB | `models/vae/` | [R2](https://pub-6a50550b7f984673a3ab1a1b580e4fb9.r2.dev/models/vae/minimax_h3_audio_vae_fp32.safetensors) |
+| `minimax_h3_ref2v_turbo_8step_v1.0_768p_comfyui_resized_avg_rank_64_bf16.safetensors` | 0.91 GB | `models/loras/` | [R2](https://pub-6a50550b7f984673a3ab1a1b580e4fb9.r2.dev/models/loras/minimax_h3_ref2v_turbo_8step_v1.0_768p_comfyui_resized_avg_rank_64_bf16.safetensors) |
+
+全部裝齊約 **72 GB**；只跑武俠文生圖／角色立繪兩支 Flux 範本約 **31.8 GB**，只跑參考圖生影片約 **40.5 GB**。每支範本的畫布上也有一則「⓪ 缺模型？」便條紙，列出該範本自己需要哪幾個檔案。
+
+**不用重啟**：放好檔案後不必重啟 ComfyUI 或 agent——agent 每 10 分鐘會自動重掃本機模型庫存並回報平台，工作評估之後就會自動轉綠。真的等不及的話，手動重啟 agent 可以讓它立刻生效。
+
 ### 發布 agent 新版本
 
 伺服器端有一個發布指令，會把 wheel 複製到 `<data-dir>/releases/`、算好 sha256、用平台金鑰簽章，並把 `agent_*` 設定一次寫好：
@@ -490,6 +510,36 @@ same staging area and are copied into the job's inputs at submit time.
 LoRA) must actually be installed **on a worker** for the dropdowns to offer
 them and for the job to be dispatchable. Otherwise the job is created but sits
 in the queue; the Jobs page's ineligibility reasons say what is missing.
+
+### Model downloads
+
+A fresh worker has none of these files, which makes the templates dead on
+arrival. They are too large for git, so they are mirrored on a public
+Cloudflare R2 bucket whose layout mirrors ComfyUI's `models/` directory —
+download a file and drop it under the matching subfolder of the worker's
+`ComfyUI/models/`.
+
+| File | Size | Target path | Download |
+| --- | --- | --- | --- |
+| `flux1-dev.safetensors` | 22.17 GB | `models/diffusion_models/` | [R2](https://pub-6a50550b7f984673a3ab1a1b580e4fb9.r2.dev/models/diffusion_models/flux1-dev.safetensors) |
+| `clip_l.safetensors` | 0.23 GB | `models/text_encoders/` | [R2](https://pub-6a50550b7f984673a3ab1a1b580e4fb9.r2.dev/models/text_encoders/clip_l.safetensors) |
+| `t5xxl_fp16.safetensors` | 9.12 GB | `models/text_encoders/` | [R2](https://pub-6a50550b7f984673a3ab1a1b580e4fb9.r2.dev/models/text_encoders/t5xxl_fp16.safetensors) |
+| `ae.safetensors` | 0.31 GB | `models/vae/` | [R2](https://pub-6a50550b7f984673a3ab1a1b580e4fb9.r2.dev/models/vae/ae.safetensors) |
+| `minimax_h3_ref2va_pruned_int8_convrot.safetensors` | 19.53 GB | `models/diffusion_models/` | [R2](https://pub-6a50550b7f984673a3ab1a1b580e4fb9.r2.dev/models/diffusion_models/minimax_h3_ref2va_pruned_int8_convrot.safetensors) |
+| `qwen3vl_32b_heretic_minimax_h3_nvfp4.safetensors` | 14.61 GB | `models/text_encoders/` | [R2](https://pub-6a50550b7f984673a3ab1a1b580e4fb9.r2.dev/models/text_encoders/qwen3vl_32b_heretic_minimax_h3_nvfp4.safetensors) |
+| `minimax_h3_video_vae_fp16.safetensors` | 4.85 GB | `models/vae/` | [R2](https://pub-6a50550b7f984673a3ab1a1b580e4fb9.r2.dev/models/vae/minimax_h3_video_vae_fp16.safetensors) |
+| `minimax_h3_audio_vae_fp32.safetensors` | 0.56 GB | `models/vae/` | [R2](https://pub-6a50550b7f984673a3ab1a1b580e4fb9.r2.dev/models/vae/minimax_h3_audio_vae_fp32.safetensors) |
+| `minimax_h3_ref2v_turbo_8step_v1.0_768p_comfyui_resized_avg_rank_64_bf16.safetensors` | 0.91 GB | `models/loras/` | [R2](https://pub-6a50550b7f984673a3ab1a1b580e4fb9.r2.dev/models/loras/minimax_h3_ref2v_turbo_8step_v1.0_768p_comfyui_resized_avg_rank_64_bf16.safetensors) |
+
+Everything together is about **72 GB**; the two Flux templates (wuxia,
+character portrait) need about **31.8 GB**; the reference-to-video template
+alone needs about **40.5 GB**. Each template's canvas also carries a "⓪
+Missing models?" note listing exactly what that template needs.
+
+**No restart required**: once the files are in place you do not need to
+restart ComfyUI or the agent — it rescans its local model inventory every 10
+minutes and reports back, and the job assessment turns green on its own.
+Restart the agent if you want that to happen immediately instead of waiting.
 
 ### Publishing an agent release
 

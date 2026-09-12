@@ -9,12 +9,38 @@ shapes and the schema, not just "a file comes back".
 import gzip
 import json
 import os
+import re
 
 import pytest
 from fastapi.testclient import TestClient
 
 from comfyfed_server import app as app_module
 from comfyfed_server import bootstrap, comfyapi, db, templates
+
+# Task 8: the R2 model mirror. This is the single ground truth the anti-drift
+# tests below check everything against -- every model filename the packaged
+# workflow JSONs reference, and every download link in the "Missing models?"
+# notes and the README, must trace back to one of these entries.
+R2_MODEL_BASE = "https://pub-6a50550b7f984673a3ab1a1b580e4fb9.r2.dev/models/"
+MODEL_INVENTORY = {
+    "flux1-dev.safetensors",
+    "clip_l.safetensors",
+    "t5xxl_fp16.safetensors",
+    "ae.safetensors",
+    "minimax_h3_ref2va_pruned_int8_convrot.safetensors",
+    "qwen3vl_32b_heretic_minimax_h3_nvfp4.safetensors",
+    "minimax_h3_video_vae_fp16.safetensors",
+    "minimax_h3_audio_vae_fp32.safetensors",
+    "minimax_h3_ref2v_turbo_8step_v1.0_768p_comfyui_resized_avg_rank_64_bf16.safetensors",
+}
+MISSING_MODELS_NOTE_TITLE = "⑩ 缺模型？/ Missing models?"
+
+_R2_URL_RE = re.compile(r"https://pub-6a50550b7f984673a3ab1a1b580e4fb9\.r2\.dev/models/\S+")
+
+
+def _r2_urls_in(text):
+    # Trailing markdown/punctuation (`)`, `.`, etc.) never belongs to the URL.
+    return [u.rstrip(").,;。）") for u in _R2_URL_RE.findall(text)]
 
 
 @pytest.fixture()
@@ -294,3 +320,80 @@ def test_object_info_injection_does_not_duplicate_or_poison_the_cache(client):
     # the second (cache-hit) request must not have grown the list again.
     assert first["LoadImage"]["input"]["required"]["image"][0] == ["amyntas_ref.png"]
     assert second == first
+
+
+# --- Task 8: missing-model guide ---------------------------------------
+
+
+def _loader_model_filenames(workflow):
+    """Every `.safetensors` widget value in the graph -- i.e. the checkpoint,
+    text-encoder, VAE and LoRA files a loader node names, regardless of which
+    loader type carries it."""
+    names = set()
+    for node in workflow["nodes"]:
+        for value in node.get("widgets_values", []):
+            if isinstance(value, str) and value.endswith(".safetensors"):
+                names.add(value)
+    return names
+
+
+def _missing_models_note_text(name):
+    notes = _notes_by_title(name)
+    assert MISSING_MODELS_NOTE_TITLE in notes, f"{name} has no missing-models note"
+    return notes[MISSING_MODELS_NOTE_TITLE]
+
+
+@pytest.mark.parametrize("name", templates.TEMPLATE_NAMES)
+def test_missing_models_note_exists_and_is_placed_first(name):
+    with open(os.path.join(templates.templates_dir(), f"{name}.json"), encoding="utf-8") as f:
+        workflow = json.load(f)
+
+    assert workflow["nodes"][0]["type"] == "MarkdownNote"
+    assert workflow["nodes"][0]["title"] == MISSING_MODELS_NOTE_TITLE
+    # It has to actually sit top-left of the "what this template is" note, not
+    # just be first in the array.
+    other_top_left = next(
+        n for n in workflow["nodes"] if n.get("title") == "這是什麼範本 / What this template is"
+    )
+    assert workflow["nodes"][0]["pos"][1] < other_top_left["pos"][1]
+
+
+@pytest.mark.parametrize("name", templates.TEMPLATE_NAMES)
+def test_missing_models_note_mentions_every_model_the_graph_actually_uses(name):
+    """Anti-drift: if a template's loaders change, its note must be updated too."""
+    with open(os.path.join(templates.templates_dir(), f"{name}.json"), encoding="utf-8") as f:
+        workflow = json.load(f)
+
+    referenced = _loader_model_filenames(workflow)
+    assert referenced, f"{name} has no .safetensors loader values to check against"
+
+    note_text = _missing_models_note_text(name)
+    for filename in referenced:
+        assert filename in note_text, f"{name}'s missing-models note omits {filename}"
+
+
+@pytest.mark.parametrize("name", templates.TEMPLATE_NAMES)
+def test_missing_models_note_links_are_valid_r2_urls(name):
+    note_text = _missing_models_note_text(name)
+    urls = _r2_urls_in(note_text)
+    assert urls, f"{name}'s missing-models note has no R2 links"
+    for url in urls:
+        assert url.startswith(R2_MODEL_BASE), url
+        assert url.rsplit("/", 1)[-1] in MODEL_INVENTORY, url
+
+
+def test_readme_model_downloads_section_covers_the_whole_inventory():
+    readme_path = os.path.join(os.path.dirname(__file__), "..", "..", "README.md")
+    with open(readme_path, encoding="utf-8") as f:
+        readme = f.read()
+
+    urls = _r2_urls_in(readme)
+    assert urls, "README has no R2 model links"
+    for url in urls:
+        assert url.startswith(R2_MODEL_BASE), url
+        assert url.rsplit("/", 1)[-1] in MODEL_INVENTORY, url
+
+    # Every model in the shared inventory shows up at least once in the README
+    # (bilingual tables both reference the same nine files).
+    seen = {url.rsplit("/", 1)[-1] for url in urls}
+    assert seen == MODEL_INVENTORY
