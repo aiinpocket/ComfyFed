@@ -7,6 +7,7 @@ round-trips what was written; and a heartbeat reporting a stale/missing hash
 makes the platform ask for a resend over the agent WebSocket.
 """
 
+import asyncio
 import gzip
 import hashlib
 import json
@@ -210,10 +211,18 @@ def test_heartbeat_with_no_hash_drift_does_not_trigger_resend(client):
     class _FakeConn:
         state = "idle"
 
-    result = agentws._handle_heartbeat(
-        entry.worker_id,
-        _FakeConn(),
-        {"state": "idle", "progress": 0.0, "job_id": None, "dynamic": {}, "object_info_hash": oi_hash},
+    result = asyncio.run(
+        agentws._handle_heartbeat(
+            entry.worker_id,
+            _FakeConn(),
+            {
+                "state": "idle",
+                "progress": 0.0,
+                "job_id": None,
+                "dynamic": {},
+                "object_info_hash": oi_hash,
+            },
+        )
     )
     assert result is False
 

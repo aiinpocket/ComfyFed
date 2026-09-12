@@ -7,12 +7,28 @@ Shapes here are dictated by the real ComfyUI frontend, same rationale as
 envelopes per `server.py` / `execution.py`.
 """
 
+import asyncio
+import time
+
 import pytest
 from fastapi.testclient import TestClient
 from starlette.websockets import WebSocketDisconnect
 
 from comfyfed_server import app as app_module
 from comfyfed_server import bootstrap, comfyapi, db, dispatch, panelws
+
+
+def relay(coro):
+    """Drive one panelws coroutine from a synchronous test.
+
+    The relay functions are coroutines (see `panelws.post_event`), and these
+    tests hold their panel socket through `TestClient`, whose event loop runs
+    on its own thread. `asyncio.run` here therefore exercises panelws's
+    genuinely-cross-loop branch, which is the correct one for this situation.
+    The same-loop branch -- the one production actually takes -- is covered by
+    the async tests at the bottom of this file.
+    """
+    return asyncio.run(coro)
 
 
 @pytest.fixture(autouse=True)
@@ -134,7 +150,7 @@ def test_progress_event_relayed_to_panel_client(client):
     with client.websocket_connect("/comfy/api/ws") as ws:
         ws.receive_json()  # initial status
 
-        panelws.job_progress(job_id, 0.42)
+        relay(panelws.job_progress(job_id, 0.42))
 
         msg = ws.receive_json()
         assert msg == {
@@ -152,10 +168,17 @@ def test_executing_event_on_job_running(client):
     with client.websocket_connect("/comfy/api/ws") as ws:
         ws.receive_json()  # initial status
 
-        panelws.job_running(job_id)
+        relay(panelws.job_running(job_id))
 
         msg = ws.receive_json()
-        assert msg == {"type": "executing", "data": {"node": "comfyfed", "prompt_id": job_id}}
+        assert msg == {
+            "type": "executing",
+            "data": {
+                "node": "comfyfed",
+                "prompt_id": job_id,
+                "display_node": "comfyfed",
+            },
+        }
 
 
 def test_job_done_sends_executed_then_executing_none_then_status(client):
@@ -171,7 +194,7 @@ def test_job_done_sends_executed_then_executing_none_then_status(client):
         with client.websocket_connect("/comfy/api/ws") as ws:
             ws.receive_json()  # initial status
 
-            panelws.job_done(job)
+            relay(panelws.job_done(job))
 
             executed = ws.receive_json()
             assert executed["type"] == "executed"
@@ -202,13 +225,21 @@ def test_job_failed_sends_execution_error(client):
     with client.websocket_connect("/comfy/api/ws") as ws:
         ws.receive_json()  # initial status
 
-        panelws.job_failed(job_id, "boom")
+        relay(panelws.job_failed(job_id, "boom"))
 
         msg = ws.receive_json()
         assert msg["type"] == "execution_error"
         assert msg["data"]["prompt_id"] == job_id
         assert msg["data"]["exception_message"] == "boom"
         assert msg["data"]["executed"] == []
+
+        # A refreshed status follows, so the panel's queue badge cannot stay
+        # stuck counting a job that has left the queue. (This test calls the
+        # relay directly without applying the DB transition, so the count is
+        # still 1 -- what matters is that the message is sent, and sent last.)
+        status = ws.receive_json()
+        assert status["type"] == "status"
+        assert status["data"]["status"] == {"exec_info": {"queue_remaining": 1}}
 
 
 def test_broadcast_reaches_multiple_connected_clients(client):
@@ -223,18 +254,25 @@ def test_broadcast_reaches_multiple_connected_clients(client):
         ws1.receive_json()
         ws2.receive_json()
 
-        panelws.job_running(job_id)
+        relay(panelws.job_running(job_id))
 
         for ws in (ws1, ws2):
             msg = ws.receive_json()
-            assert msg == {"type": "executing", "data": {"node": "comfyfed", "prompt_id": job_id}}
+            assert msg == {
+                "type": "executing",
+                "data": {
+                    "node": "comfyfed",
+                    "prompt_id": job_id,
+                    "display_node": "comfyfed",
+                },
+            }
 
 
 def test_broadcast_with_no_connected_clients_is_a_noop(client):
     # No panel client connected at all -- must not raise.
-    panelws.job_progress("nonexistent-job", 0.5)
-    panelws.job_running("nonexistent-job")
-    panelws.job_failed("nonexistent-job", "boom")
+    relay(panelws.job_progress("nonexistent-job", 0.5))
+    relay(panelws.job_running("nonexistent-job"))
+    relay(panelws.job_failed("nonexistent-job", "boom"))
 
 
 # --- end-to-end through the real agent socket ---------------------------------
@@ -293,5 +331,153 @@ def test_agent_heartbeat_progress_relayed_through_real_agentws_handler(client):
             executing = panel_ws.receive_json()
             assert executing == {
                 "type": "executing",
-                "data": {"node": "comfyfed", "prompt_id": job_id},
+                "data": {
+                    "node": "comfyfed",
+                    "prompt_id": job_id,
+                    "display_node": "comfyfed",
+                },
             }
+
+
+# --- same-loop delivery (the production topology) ------------------------------
+#
+# Everything above holds its panel socket through `TestClient`, which runs the
+# app on its OWN event loop in a separate thread. That is NOT how production
+# looks: uvicorn runs the panel sockets and the agent socket handlers on one
+# loop, and the relay is invoked from a coroutine already executing on it.
+#
+# An earlier panelws scheduled every broadcast with
+# `run_coroutine_threadsafe(...).result(timeout=5)` against that same loop --
+# an unconditional self-deadlock in production (the loop blocks waiting for
+# work only it could run), which the TestClient tests could not see precisely
+# because their two loops made the cross-thread call legitimate. The tests
+# below register a fake connection on the CURRENT running loop and assert
+# delivery: completes promptly, in order, with no timeout burned.
+
+
+class _FakePanelSocket:
+    """Records what the relay sends, standing in for a live panel WebSocket."""
+
+    def __init__(self):
+        self.sent = []
+
+    async def send_json(self, evt):
+        self.sent.append(evt)
+
+
+def _register_on_current_loop() -> tuple[str, _FakePanelSocket]:
+    ws = _FakePanelSocket()
+    sid = panelws.register(ws)  # captures asyncio.get_running_loop()
+    return sid, ws
+
+
+async def test_same_loop_relay_delivers_without_blocking(client):
+    """A relay call from the loop the panel connection lives on must deliver.
+
+    The old implementation deadlocked here until its 5s timeout and delivered
+    nothing at all, so both halves of the assertion matter: something arrived,
+    and it arrived fast.
+    """
+    _login(client)
+    job_id = _post_prompt(client)
+
+    _sid, ws = _register_on_current_loop()
+
+    started = time.monotonic()
+    await panelws.job_progress(job_id, 0.5)
+    elapsed = time.monotonic() - started
+
+    assert ws.sent == [
+        {"type": "progress", "data": {"value": 50, "max": 100, "prompt_id": job_id}}
+    ]
+    assert elapsed < 1.0
+
+
+async def test_same_loop_job_done_delivers_three_events_in_order(client):
+    """`job_done` is the worst case: three events, 15s of deadlock before.
+
+    Order is part of the contract -- the frontend needs `executed` (the
+    outputs) before the `executing: null` that closes the prompt out, and the
+    refreshed `status` last -- so this must stay sequential awaits, never a
+    fire-and-forget task per event.
+    """
+    csrf = _login(client)
+    job_id = _post_prompt(client)
+    worker_id = _register_worker(client, csrf, "runner")
+    dispatch.pick_job_for(worker_id)
+    dispatch.mark_running(job_id, worker_id)
+    dispatch.mark_done(job_id, worker_id, ["out_00001_.png"])
+
+    _sid, ws = _register_on_current_loop()
+
+    with db.get_session() as session:
+        job = session.get(db.Job, job_id)
+        started = time.monotonic()
+        await panelws.job_done(job)
+        elapsed = time.monotonic() - started
+
+    assert [e["type"] for e in ws.sent] == ["executed", "executing", "status"]
+    assert ws.sent[1]["data"] == {"node": None, "prompt_id": job_id}
+    assert elapsed < 1.0
+
+
+async def test_same_loop_agentws_handler_relays_job_done(client):
+    """The real agentws handler path, driven on the loop the panel is on.
+
+    `_notify_panel_job_done` is what production actually calls; running it
+    here (rather than `panelws.job_done`) proves the await was threaded all
+    the way through the agent-socket handler, not just into panelws.
+    """
+    from comfyfed_server import agentws
+
+    csrf = _login(client)
+    job_id = _post_prompt(client)
+    worker_id = _register_worker(client, csrf, "runner")
+    dispatch.pick_job_for(worker_id)
+    dispatch.mark_running(job_id, worker_id)
+    dispatch.mark_done(job_id, worker_id, ["out_00001_.png"])
+
+    _sid, ws = _register_on_current_loop()
+
+    started = time.monotonic()
+    await agentws._notify_panel_job_done(job_id)
+    elapsed = time.monotonic() - started
+
+    assert [e["type"] for e in ws.sent] == ["executed", "executing", "status"]
+    assert elapsed < 1.0
+
+
+async def test_dispatch_tick_relays_requeued_jobs_to_the_panel(client):
+    """I2: a stale worker's running job goes back to `queued` silently.
+
+    Nothing else will ever send a done/failed event for that attempt, so
+    without an explicit `executing: null` the panel shows it executing
+    forever.
+    """
+    from datetime import datetime, timedelta, timezone
+
+    from comfyfed_server import agentws
+
+    csrf = _login(client)
+    job_id = _post_prompt(client)
+    worker_id = _register_worker(client, csrf, "runner")
+    dispatch.pick_job_for(worker_id)
+    dispatch.mark_running(job_id, worker_id)
+
+    stale = datetime.now(timezone.utc).replace(tzinfo=None) - timedelta(seconds=200)
+    with db.get_session() as session:
+        session.get(db.Worker, worker_id).last_seen = stale
+        session.commit()
+
+    _sid, ws = _register_on_current_loop()
+
+    await agentws.dispatch_tick()
+
+    assert ws.sent[0] == {
+        "type": "executing",
+        "data": {"node": None, "prompt_id": job_id},
+    }
+    assert ws.sent[-1]["type"] == "status"
+
+    with db.get_session() as session:
+        assert session.get(db.Job, job_id).status == "queued"

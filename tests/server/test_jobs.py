@@ -149,8 +149,8 @@ def test_requeue_stale_returns_job_to_queue_and_it_can_be_repicked(client):
         session.commit()
 
     now = datetime.now(timezone.utc).replace(tzinfo=None)
-    count = dispatch.requeue_stale(now)
-    assert count == 1
+    requeued = dispatch.requeue_stale(now)
+    assert requeued == [job_id]
 
     with db.get_session() as session:
         job = session.get(db.Job, job_id)
@@ -262,8 +262,8 @@ def test_requeue_stale_requeues_a_worker_that_never_heartbeated(client):
         session.get(db.Worker, w2).last_seen = datetime.now(timezone.utc).replace(tzinfo=None)
         session.commit()
 
-    count = dispatch.requeue_stale(datetime.now(timezone.utc).replace(tzinfo=None))
-    assert count == 1
+    requeued = dispatch.requeue_stale(datetime.now(timezone.utc).replace(tzinfo=None))
+    assert requeued == [job_id]
 
     with db.get_session() as session:
         job = session.get(db.Job, job_id)
@@ -281,7 +281,7 @@ def test_requeue_stale_leaves_a_freshly_registered_worker_alone(client):
     job_id = r.json()["job_id"]
     assert dispatch.pick_job_for(w1) is not None
 
-    assert dispatch.requeue_stale(datetime.now(timezone.utc).replace(tzinfo=None)) == 0
+    assert dispatch.requeue_stale(datetime.now(timezone.utc).replace(tzinfo=None)) == []
     with db.get_session() as session:
         assert session.get(db.Job, job_id).status == "assigned"
 

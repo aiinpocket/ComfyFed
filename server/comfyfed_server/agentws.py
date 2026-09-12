@@ -181,7 +181,7 @@ async def _handle_message(worker_id: str, conn: _Connection, message: dict) -> N
         if msg_type == "hello":
             _handle_hello(worker_id, message)
         elif msg_type == "heartbeat":
-            want_object_info = _handle_heartbeat(worker_id, conn, message)
+            want_object_info = await _handle_heartbeat(worker_id, conn, message)
             if want_object_info:
                 try:
                     await conn.ws.send_json({"type": "want_object_info"})
@@ -197,7 +197,7 @@ async def _handle_message(worker_id: str, conn: _Connection, message: dict) -> N
             # applied, so a worker cannot mint contribution records for jobs
             # it does not own by sending someone else's job_id.
             if dispatch.mark_done(job_id, worker_id, message.get("result_files") or []):
-                _notify_panel_job_done(job_id)
+                await _notify_panel_job_done(job_id)
                 exec_seconds = message.get("exec_seconds")
                 if (
                     not isinstance(exec_seconds, (int, float))
@@ -210,7 +210,7 @@ async def _handle_message(worker_id: str, conn: _Connection, message: dict) -> N
             job_id = message.get("job_id")
             error = message.get("error") or ""
             if dispatch.mark_failed(job_id, worker_id, error):
-                panelws.job_failed(job_id, error)
+                await panelws.job_failed(job_id, error)
         elif msg_type == "receipt_ack":
             _handle_receipt_ack(worker_id, message)
         else:
@@ -219,7 +219,7 @@ async def _handle_message(worker_id: str, conn: _Connection, message: dict) -> N
         logger.exception("agentws: error handling %r message from worker %s", msg_type, worker_id)
 
 
-def _notify_panel_job_done(job_id: Optional[str]) -> None:
+async def _notify_panel_job_done(job_id: Optional[str]) -> None:
     """Fetch the just-finished job and hand it to `panelws.job_done`.
 
     A separate lookup rather than reusing the row `dispatch.mark_done`
@@ -234,7 +234,7 @@ def _notify_panel_job_done(job_id: Optional[str]) -> None:
         job = session.get(db.Job, job_id)
         if job is None:
             return
-        panelws.job_done(job)
+        await panelws.job_done(job)
 
 
 def _handle_hello(worker_id: str, message: dict) -> None:
@@ -251,7 +251,7 @@ def _handle_hello(worker_id: str, message: dict) -> None:
         session.commit()
 
 
-def _handle_heartbeat(worker_id: str, conn: _Connection, message: dict) -> bool:
+async def _handle_heartbeat(worker_id: str, conn: _Connection, message: dict) -> bool:
     """Apply a heartbeat's state to the worker row.
 
     Returns True when the platform should ask the agent to resend its full
@@ -285,7 +285,7 @@ def _handle_heartbeat(worker_id: str, conn: _Connection, message: dict) -> bool:
                 if isinstance(progress, (int, float)):
                     job.progress = float(progress)
                     session.commit()
-                    panelws.job_progress(job_id, job.progress)
+                    await panelws.job_progress(job_id, job.progress)
 
     # The agent broadcasts a busy heartbeat carrying the job_id the moment it
     # picks the job up (see agent runner.handle_job), and that is the only
@@ -295,7 +295,7 @@ def _handle_heartbeat(worker_id: str, conn: _Connection, message: dict) -> bool:
     # are gated inside dispatch.mark_running.
     if state == "busy" and message.get("job_id"):
         if dispatch.mark_running(message["job_id"], worker_id):
-            panelws.job_running(message["job_id"])
+            await panelws.job_running(message["job_id"])
 
     try:
         m = metrics.get_metrics()
@@ -471,10 +471,23 @@ async def dispatch_tick() -> None:
     queued job to every idle connection that has one available. Swallows and
     logs all exceptions so the caller (the background task, or a test) never
     sees a crash from a single bad connection or DB hiccup."""
+    requeued: list[str] = []
     try:
-        dispatch.requeue_stale(_utcnow())
+        requeued = dispatch.requeue_stale(_utcnow())
     except Exception:
         logger.exception("agentws: requeue_stale failed")
+
+    # A requeue is invisible from the panel's side otherwise: the frontend
+    # still believes the job is executing, and the done/failed event that
+    # would have cleared it is never coming for that attempt. Clear the
+    # executing marker per job, then refresh the queue badge once.
+    if requeued:
+        try:
+            for job_id in requeued:
+                await panelws.job_requeued(job_id)
+            await panelws.job_status_refresh()
+        except Exception:
+            logger.exception("agentws: failed to relay requeued jobs to the panel")
 
     for worker_id, conn in list(_connections.items()):
         if conn.state != "idle":
