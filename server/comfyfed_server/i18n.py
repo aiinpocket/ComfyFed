@@ -19,6 +19,18 @@ _DICT: dict[str, dict[str, str]] = {
         "zh-TW": "安裝完成。",
         "en": "Installation complete.",
     },
+    "install.already_installed": {
+        "zh-TW": "伺服器已安裝完成，無需重複安裝。",
+        "en": "Server is already installed; nothing to do.",
+    },
+    "install.next_steps": {
+        "zh-TW": "接下來：執行 `comfyfed-server run` 啟動伺服器，然後用上面的密碼登入。",
+        "en": "Next: run `comfyfed-server run` to start the server, then log in with the password above.",
+    },
+    "install.password_box_title": {
+        "zh-TW": "管理員密碼（僅顯示一次，請立即保存）",
+        "en": "Admin password (shown once, save it now)",
+    },
 }
 
 

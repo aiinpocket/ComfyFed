@@ -4,13 +4,19 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import logging
 import os
 from contextlib import asynccontextmanager
 
 from fastapi import FastAPI, HTTPException, Request
-from fastapi.responses import JSONResponse
+from fastapi.responses import FileResponse, JSONResponse
+from fastapi.staticfiles import StaticFiles
 
 from . import agentws, auth, bootstrap, db, jobs, receipts, workers
+
+logger = logging.getLogger(__name__)
+
+_WEB_DIST_ENV_VAR = "COMFYFED_WEB_DIST"
 
 
 def _error_body(code: str, message: str) -> dict:
@@ -24,6 +30,27 @@ async def _http_exception_handler(request: Request, exc: HTTPException) -> JSONR
     else:
         body = _error_body("http_error", str(detail))
     return JSONResponse(status_code=exc.status_code, content=body)
+
+
+def _find_web_dist() -> str | None:
+    """Locate the built SPA's `web/dist` directory.
+
+    Checked in order: the `COMFYFED_WEB_DIST` env var override, then the path
+    relative to this package's location in the repo layout
+    (`server/comfyfed_server/app.py` -> `../../web/dist`). Returns None (and
+    the caller logs a warning) if neither exists, so tests and API-only
+    deployments never require the SPA to be built.
+    """
+    override = os.environ.get(_WEB_DIST_ENV_VAR)
+    if override and os.path.isdir(override):
+        return override
+
+    here = os.path.dirname(os.path.abspath(__file__))
+    candidate = os.path.normpath(os.path.join(here, "..", "..", "web", "dist"))
+    if os.path.isdir(candidate):
+        return candidate
+
+    return None
 
 
 def create_app(data_dir: str) -> FastAPI:
@@ -62,5 +89,23 @@ def create_app(data_dir: str) -> FastAPI:
     app.include_router(jobs.create_router(data_dir))
     app.include_router(receipts.create_router())
     app.include_router(agentws.create_router(data_dir))
+
+    web_dist = _find_web_dist()
+    if web_dist is None:
+        logger.warning(
+            "comfyfed_server: web/dist not found (set %s or build the SPA); running API-only.",
+            _WEB_DIST_ENV_VAR,
+        )
+    else:
+        index_path = os.path.join(web_dist, "index.html")
+
+        @app.exception_handler(404)
+        async def _spa_fallback(request: Request, exc: HTTPException) -> JSONResponse | FileResponse:
+            if request.url.path.startswith("/api/"):
+                return await _http_exception_handler(request, exc)
+            return FileResponse(index_path)
+
+        # Mounted last so it never shadows the API routers registered above.
+        app.mount("/", StaticFiles(directory=web_dist, html=True), name="web")
 
     return app
