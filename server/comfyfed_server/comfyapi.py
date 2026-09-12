@@ -50,7 +50,7 @@ from typing import Callable, Optional
 from fastapi import APIRouter, Depends, File, Form, Request, UploadFile, WebSocket, WebSocketDisconnect
 from fastapi.responses import FileResponse, JSONResponse, Response
 
-from . import assess, auth, db, jobs, panelws, storage, workers
+from . import assess, auth, db, jobs, model_guide, panelws, storage, workers
 
 # Node classes whose id keys a history entry's `outputs`. The ComfyUI frontend
 # looks up the images it should display under the id of the node that saved
@@ -267,6 +267,42 @@ def _online_worker_hashes(session) -> list[tuple[str, str]]:
     return [(w.id, w.object_info_hash or "") for w in rows]
 
 
+def _blocking_missing_models(needs: assess.JobNeeds) -> set[str]:
+    """Models NO online worker has, when that is the ONLY reason none of them
+    can run this job right now.
+
+    Returns an empty set (today's behavior: queue and wait) unless:
+
+    * at least one worker is online, AND
+    * every online worker's verdict is `ineligible` with a non-empty
+      `missing_models` (a worker ineligible for a non-model reason with no
+      models missing -- e.g. `missing_nodes` alone -- fails this and the set
+      comes back empty), AND
+    * the intersection of those `missing_models` sets -- models no online
+      worker has, not just the ones any single worker lacks -- is non-empty.
+
+    A single eligible or `eligible_after_fetch` worker, or no workers online
+    at all, always yields an empty set: this is a pre-flight refusal, not a
+    replacement for the existing queue-and-wait behavior.
+    """
+    with db.get_session() as session:
+        online_workers = (
+            session.query(db.Worker)
+            .filter(db.Worker.disabled == False)  # noqa: E712
+            .filter(db.Worker.status != "offline")
+            .all()
+        )
+        if not online_workers:
+            return set()
+        all_workers = session.query(db.Worker).all()
+
+    verdicts = [assess.verdict(w, needs, {}, all_workers) for w in online_workers]
+    if not all(v.kind == "ineligible" and v.missing_models for v in verdicts):
+        return set()
+
+    return set.intersection(*(set(v.missing_models) for v in verdicts))
+
+
 def staged_image_names(data_dir: str) -> list[str]:
     """Sorted filenames currently sitting in the panel's staging directory."""
     try:
@@ -431,6 +467,13 @@ def create_router(
             return _comfy_error("invalid_prompt", "Prompt must be a non-empty API-format object")
 
         needs = assess.extract(prompt)
+
+        blocking = _blocking_missing_models(needs)
+        if blocking:
+            return _comfy_error(
+                "prompt.missing_models", model_guide.guidance_message(sorted(blocking), data_dir)
+            )
+
         resolved: dict[str, str] = {}
         for name in sorted(needs.assets):
             path = resolver(name)

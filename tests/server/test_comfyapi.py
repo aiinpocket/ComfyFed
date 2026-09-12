@@ -237,6 +237,61 @@ def test_prompt_with_unstaged_asset_returns_comfy_style_error(client):
         assert session.query(db.Job).count() == 0
 
 
+FLUX_PROMPT = {
+    "1": {"class_type": "UNETLoader", "inputs": {"unet_name": "flux1-dev.safetensors"}},
+    "2": {"class_type": "SaveImage", "inputs": {"images": ["1", 0]}},
+}
+
+
+def _set_model_inventory(client, worker_id, inventory):
+    with db.get_session() as session:
+        worker = session.get(db.Worker, worker_id)
+        worker.model_inventory = json.dumps(inventory)
+        session.commit()
+
+
+def test_prompt_rejects_when_every_online_worker_lacks_the_model(client):
+    csrf = _login(client)
+    worker_id = _register_worker(client, csrf, "runner-1")
+    _set_model_inventory(client, worker_id, [{"name": "diffusion_models/other.safetensors", "size": 1.0}])
+
+    r = _post_prompt(client, prompt=FLUX_PROMPT)
+    assert r.status_code == 400
+    body = r.json()
+    assert body["error"]["type"] == "prompt.missing_models"
+    message = body["error"]["message"]
+    assert (
+        "官方載點：https://huggingface.co/black-forest-labs/FLUX.1-dev/resolve/main/flux1-dev.safetensors"
+        in message
+    )
+    assert (
+        "備份載點：https://storage.googleapis.com/comfyfed-models/models/diffusion_models/flux1-dev.safetensors"
+        in message
+    )
+    assert body["node_errors"] == {}
+    with db.get_session() as session:
+        assert session.query(db.Job).count() == 0
+
+
+def test_prompt_still_queues_when_no_workers_online(client):
+    _login(client)
+    r = _post_prompt(client, prompt=FLUX_PROMPT)
+    assert r.status_code == 200
+    with db.get_session() as session:
+        assert session.query(db.Job).count() == 1
+
+
+def test_prompt_still_queues_when_a_worker_is_eligible(client):
+    csrf = _login(client)
+    worker_id = _register_worker(client, csrf, "runner-1")
+    _set_model_inventory(client, worker_id, [{"name": "diffusion_models/flux1-dev.safetensors", "size": 22.17}])
+
+    r = _post_prompt(client, prompt=FLUX_PROMPT)
+    assert r.status_code == 200
+    with db.get_session() as session:
+        assert session.query(db.Job).count() == 1
+
+
 # --- queue -----------------------------------------------------------------
 
 
