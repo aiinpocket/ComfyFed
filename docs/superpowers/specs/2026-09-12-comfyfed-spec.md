@@ -18,7 +18,7 @@
 
 - **熟人圈邀請制**：worker 只認手動發放識別碼的平台；無公開註冊。
 - 技術手段保證「任務未被篡改、來源可追責」；社會手段（熟人圈）保證「任務善意」。
-- Workflow ＝可執行內容 ⇒ Agent 端強制 **node class 白名單**（預設僅 ComfyUI 官方內建節點），拒絕含未知節點的 workflow。
+- Workflow ＝可執行內容 ⇒ Agent 端強制 **node policy**：`installed`（預設，允許本機 ComfyUI 實際安裝的所有節點——來源為本機 `/object_info`，主人裝了什麼就信什麼）／`official_only`（保守模式）／自訂清單。拒絕含 policy 外節點的 workflow。
 - Worker 主權：可一鍵停用某平台、設資源上限、審閱歷史任務（本地保留 workflow＋prompt＋平台簽名）。
 
 ## 3. 網路與部署（定案）
@@ -59,7 +59,8 @@ queued → assigned → running → done
 worker 斷線（>90s 無心跳）→ assigned/running 的任務自動回 queued 重派其他活 worker
 ```
 - 派工：平台推給「online 且 idle **且能力符合**」的 worker（WS push）；worker 接單後對**其他已註冊平台**廣播 busy。
-- **硬體能力回報（定案）**：worker 上線握手時回報硬體檔案（GPU 型號、VRAM 總量、CPU 型號/核心數、RAM 總量、模型目錄所在磁碟可用空間、agent 版本）；心跳夾動態值（VRAM/RAM/磁碟可用量）。任務可宣告需求（`min_vram_gb`、`min_free_disk_gb`、`gpu_name_contains` 等），派工器只派給符合者；無符合者任務留佇列並在 UI 標示「無可用 worker 符合需求」。UI worker 卡片顯示硬體摘要。
+- **硬體與能力回報（定案，2026-09-12 架構審查後擴充）**：worker 上線握手時回報——硬體檔案（GPU 型號、VRAM 總量、CPU 型號/核心數、RAM 總量、模型目錄磁碟可用空間、agent 版本）＋**運算後端（cuda/rocm/mps/cpu）與 torch 版本**＋**已安裝節點類別清單**（取自本機 ComfyUI `/object_info`，即 custom nodes 的真實庫存）；心跳夾動態值（VRAM/RAM/磁碟可用量）。
+- **派工雙重比對**：①硬體需求（`min_vram_gb`、`min_free_disk_gb`、`gpu_name_contains`、`backend`）②**節點交集**——平台解析 workflow 的 node class 集合，必須 ⊆ worker 回報的節點清單才派發（CUDA 限定的 custom node 自然不會落到 MPS 機器，因為那台根本沒裝或 backend 不符）。無符合者留佇列，UI 標示「無可用 worker 符合需求」＋缺哪些節點/條件。
 - Worker 端執行：收 job → 白名單檢查 → POST 本機 ComfyUI `/prompt` → 輪詢 history/進度 → 上傳產物（圖/影片）→ 回報完成 → 雙方簽收據。
 
 ## 8. 模型分發（Phase 2+，方向已定案）
@@ -72,6 +73,13 @@ worker 斷線（>90s 無心跳）→ assigned/running 的任務自動回 queued 
 - **Phase 1（本計畫）**：平台核心＋Agent 核心端到端可用——安裝→登入→發識別碼→worker 註冊上線→送 workflow→派工執行→結果回傳→收據入帳→儀表板可視。
 - **Phase 2**：模型 manifest＋平台中繼下載；ComfyUI 相容 API 面板（原生 Comfy 前端直連平台）；`/object_info` 能力交集。
 - **Phase 3**：成員間 P2P 分塊傳輸；貢獻報表進階（分潤試算）；多管理員。
+
+## 9.5 架構審查補強（2026-09-12 定案，全部納入 Phase 1）
+
+1. **維運監控**：平台暴露 `/metrics`（Prometheus 格式，prometheus-client）：worker up/狀態 gauge、動態 VRAM/RAM/磁碟 gauge、佇列深度、任務等待與執行時間 histogram、WS 重連計數——可直接接 Prometheus/Grafana 做長期效能追蹤。
+2. **資料庫遷移**：Phase 1 即導入 **Alembic**；`init_db` 一律跑 `alembic upgrade head`（不是 create_all），schema 變更全走遷移腳本＋預設值——開源使用者自架升級不炸庫。
+3. **產物儲存抽象**：`ArtifactStore` 介面（`put/get/url`），Phase 1 內建 `LocalStore`（存平台磁碟）；介面預留 `S3Store`（presigned URL 直傳，worker 大檔不過平台）——設定檔切換，Phase 2 實作 S3。
+4. **Agent 自動更新**：平台提供 `GET /api/agent/version` → `{latest, min_supported, wheel_url, sha256, platform_sig}`；agent 啟動時比對版本——低於 min_supported 拒跑並提示、有新版依設定 `auto_update: true|false`（預設 true）下載 wheel→驗 SHA256＋平台簽章→pip 安裝→自我重啟。更新包必簽名，杜絕「平台被打穿後推毒更新」的單點（簽章私鑰離線保存選項寫入文件）。
 
 ## 10. 技術棧（定案）
 

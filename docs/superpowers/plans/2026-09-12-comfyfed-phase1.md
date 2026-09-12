@@ -38,9 +38,9 @@ name = "comfyfed"
 version = "0.1.0"
 requires-python = ">=3.12"
 dependencies = [
-  "fastapi>=0.115", "uvicorn[standard]>=0.30", "sqlalchemy>=2.0",
+  "fastapi>=0.115", "uvicorn[standard]>=0.30", "sqlalchemy>=2.0", "alembic>=1.13",
   "pynacl>=1.5", "argon2-cffi>=23.1", "httpx>=0.27", "websockets>=13",
-  "python-multipart>=0.0.9", "itsdangerous>=2.2",
+  "python-multipart>=0.0.9", "itsdangerous>=2.2", "psutil>=6.0", "prometheus-client>=0.20",
 ]
 [project.optional-dependencies]
 dev = ["pytest>=8", "pytest-asyncio>=0.24", "httpx>=0.27"]
@@ -91,7 +91,7 @@ def test_worker_defaults(tmp_path):
 ```
 
 - [ ] **Step 2: `pytest tests/server/test_db.py -v` → FAIL (no module)**
-- [ ] **Step 3: 實作 db.py**：SQLAlchemy 2 DeclarativeBase；module-level `_engine`；`init_db` 建引擎（`sqlite+pysqlite`、`PRAGMA journal_mode=WAL`）＋`Base.metadata.create_all`；`get_session` 用 `sessionmaker`＋contextmanager
+- [ ] **Step 3: 實作 db.py＋Alembic**：SQLAlchemy 2 DeclarativeBase；module-level `_engine`；`init_db` 建引擎（`sqlite+pysqlite`、`PRAGMA journal_mode=WAL`）後**程式化執行 `alembic upgrade head`**（`alembic.config.Config` 指到 repo 內 `server/alembic/`；不用 create_all）；`alembic init` 產生環境＋手寫 initial migration（含所有表與預設值）；`get_session` 用 `sessionmaker`＋contextmanager。Worker 表另含 `backend: str=''`（cuda/rocm/mps/cpu）、`torch_version: str=''`、`node_classes: str='[]'`（JSON list）；Job 表含 `requirements: str='{}'`、`required_nodes: str='[]'`
 - [ ] **Step 4: pytest → PASS**
 - [ ] **Step 5: Commit** `feat(server): sqlite schema and session management`
 
@@ -214,7 +214,8 @@ def test_i18n_both_languages():
 - Consumes: `db`, `require_admin`, `verify_agent`
 - Produces:
   - `POST /api/jobs {workflow_json, requirements?}`（admin, csrf）→ `{job_id}`（status=queued）；requirements JSON 選填：`{min_vram_gb?: float, min_free_disk_gb?: float, gpu_name_contains?: str}` 存 `Job.requirements: str='{}'`（Task 2 的 Job 表加此欄）；`GET /api/jobs?status=`（admin）；`GET /api/jobs/{id}`
-  - `dispatch.worker_meets(worker, requirements) -> bool`：對照 worker.hardware＋worker.dynamic（VRAM 用靜態 vram_gb、磁碟用動態 free_disk_gb、gpu_name_contains 大小寫不敏感子字串）
+  - job 建立時平台解析 workflow：`required_nodes = sorted({node["class_type"] for node in workflow.values()})` 存入 Job.required_nodes
+  - `dispatch.worker_meets(worker, job) -> bool`：①requirements 對照 worker.hardware＋worker.dynamic（VRAM 用靜態 vram_gb、磁碟用動態 free_disk_gb、gpu_name_contains／backend 大小寫不敏感）②`set(job.required_nodes) ⊆ set(worker.node_classes)`——**節點交集比對**（CUDA 限定 custom node 不會派到 MPS 機器）
   - `dispatch.pick_job_for(worker_id) -> Job|None`：原子性把「最舊且 worker_meets 通過」的 queued job 改 assigned＋綁 worker（跳過不符合的，不阻塞後面的 job）
   - `dispatch.requeue_stale(now) -> int`：worker last_seen 距今 >90s 的 assigned/running job → queued、worker_id=None、progress=0；worker.status='offline'
   - `dispatch.mark_running/mark_done(job_id, result_files)/mark_failed(job_id, error)`
@@ -232,7 +233,7 @@ def test_i18n_both_languages():
 **Interfaces:**
 - Produces（WS `/api/agent/ws`，JSON 訊息，`type` 欄位）：
   - 握手：server 送 `{"type":"challenge","nonce"}` → agent 回 `{"type":"auth","worker_id","sig"}`（sign(nonce)）→ server 回 `{"type":"ready"}`；失敗即關閉 code 4401
-  - 握手成功後 agent 立即送 `{"type":"hello","hardware":{gpu_name,vram_gb,cpu,cpu_cores,ram_gb,agent_version}}` → server 存 Worker.hardware（硬體採集：agent 用 `nvidia-smi --query-gpu=name,memory.total`、`psutil`（加入依賴）、`shutil.disk_usage(comfy 模型目錄)`）
+  - 握手成功後 agent 立即送 `{"type":"hello","hardware":{gpu_name,vram_gb,cpu,cpu_cores,ram_gb,agent_version},"backend":"cuda|rocm|mps|cpu","torch_version":str,"node_classes":[...]}`——node_classes 取自本機 ComfyUI `GET /object_info` 的鍵集合（=真實安裝節點含 custom nodes），依 agent 端 node_policy 過濾後上報；server 存 Worker.hardware/backend/torch_version/node_classes（硬體採集：`nvidia-smi --query-gpu=name,memory.total`、`psutil`、`shutil.disk_usage(comfy 模型目錄)`；backend 偵測：nvidia-smi 成功→cuda、否則試 rocm-smi、`platform.system()=="Darwin"`→mps、fallback cpu）
   - agent→server：`{"type":"heartbeat","state":"idle|busy","progress":float,"job_id":str|None,"dynamic":{free_vram_gb,free_ram_gb,free_disk_gb}}`（server 更新 last_seen/status/dynamic/job.progress）；`{"type":"job_done","job_id","result_files":[names]}`；`{"type":"job_failed","job_id","error"}`
   - server→agent：`{"type":"job","job_id","workflow_json"}`（僅對 state=idle 者推）
   - server 背景迴圈每 5s：`requeue_stale()`＋為每個 idle 連線 `pick_job_for` 並推送
@@ -248,7 +249,8 @@ def test_i18n_both_languages():
 
 **Interfaces:**
 - Produces:
-  - `POST /api/agent/jobs/{id}/artifacts`（signed, multipart）→ 存 `data/artifacts/{job_id}/{filename}`；限已 assigned 給該 worker 的 job
+  - `storage.ArtifactStore` 抽象（`put(job_id, filename, stream) -> str`、`open(job_id, filename) -> IO`、`url(job_id, filename) -> str`）；Phase 1 實作 `LocalStore(data/artifacts/)`；建構由 settings `artifact_store=local` 決定（預留 s3，Phase 2 實作 presigned 直傳）
+  - `POST /api/agent/jobs/{id}/artifacts`（signed, multipart）→ `ArtifactStore.put`；限已 assigned 給該 worker 的 job
   - job_done 處理時：計 `gpu_seconds = finished-started`，建 Receipt＋`platform_sig = sign(f"{job_id}|{worker_id}|{gpu_seconds:.1f}")`；WS 推 `{"type":"receipt","receipt_id","payload","platform_sig"}` 給 agent；agent 回 `{"type":"receipt_ack","receipt_id","worker_sig"}` → 存入 Receipt.worker_sig
   - `GET /api/reports/contributions?from=&to=`（admin）→ 按 worker 彙總 `{worker_id, name, jobs, gpu_seconds}`（時間區間篩選——使用者要求）
 - [ ] **Step 1: 失敗測試**（artifact 上傳落地；receipt 兩簽俱全且平台簽可驗；report 區間過濾正確）
@@ -263,7 +265,8 @@ def test_i18n_both_languages():
 
 **Interfaces:**
 - Produces:
-  - `whitelist.check(workflow: dict, extra: set) -> None|raises NodeNotAllowed(node_class)`；內建白名單=常數 `BUILTIN_NODE_CLASSES`（收錄官方 nodes：KSampler、CLIPLoader、UNETLoader、VAELoader、VAEDecode、SaveImage、SaveVideo、LoadImage、CLIPTextEncode、LoraLoaderModelOnly、EmptyLatentImage、SamplerCustomAdvanced、BasicScheduler、BasicGuider、KSamplerSelect、RandomNoise、MiniMaxH3* 等；維護於單一常數）
+  - `whitelist.allowed_classes(policy: str, comfy_url: str, custom: list) -> set`：policy=`installed`（預設）→ 本機 `/object_info` 鍵集合；`official_only` → 內建常數 `OFFICIAL_NODE_CLASSES`（官方 nodes 快照）∩ installed；`custom` → 自訂清單 ∩ installed
+  - `whitelist.check(workflow: dict, allowed: set) -> None|raises NodeNotAllowed(node_class)`（雙保險：平台派工已比對過交集，agent 端仍再驗一次——不信任平台的防禦縱深）
   - `comfy.run_workflow(comfy_url, workflow, on_progress) -> list[Path]`：POST /prompt→輪詢 /history→下載 outputs 到暫存
   - `runner.AgentLoop(config)`：對每個 platform 開 WS；收 job→全平台廣播 busy→白名單→run_workflow（進度回 WS）→上傳 artifacts→job_done→收 receipt→ack→廣播 idle；單一併發（一次一 job）
   - `cli()`：`comfyfed-agent register <bundle.json>`、`comfyfed-agent run`
@@ -305,7 +308,37 @@ def test_i18n_both_languages():
 - [ ] **Step 2: FAIL → Step 3: 實作 cli 與 mount → Step 4: PASS＋手動 `comfyfed-server install` 走一遍雙語導引截圖留檔**
 - [ ] **Step 5: Commit** `feat: cli entrypoints, spa serving, end-to-end smoke test`
 
-### Task 14: 文件
+### Task 14: Prometheus /metrics 端點
+
+**Files:**
+- Create: `server/comfyfed_server/metrics.py`, Modify: `app.py`, `agentws.py`, `dispatch.py`
+- Test: `tests/server/test_metrics.py`
+
+**Interfaces:**
+- Consumes: `db`、dispatch/agentws 的事件點
+- Produces: `GET /metrics`（Prometheus 文字格式，無需登入但可用 settings `metrics_public=false` 關閉改需 admin）：
+  - `comfyfed_worker_up{worker}`、`comfyfed_worker_free_vram_gb{worker}`、`comfyfed_worker_free_ram_gb{worker}`、`comfyfed_worker_free_disk_gb{worker}`（心跳時 set）
+  - `comfyfed_jobs_queued`（gauge，抓取時查 DB）、`comfyfed_job_wait_seconds`／`comfyfed_job_run_seconds`（histogram，job 開跑/完成時 observe）、`comfyfed_ws_reconnects_total{worker}`（counter）
+
+- [ ] **Step 1: 失敗測試**（TestClient GET /metrics 含 `comfyfed_jobs_queued`；心跳後 worker gauge 出現；job 完成後 histogram count ≥1）
+- [ ] **Step 2: FAIL → Step 3: 實作（prometheus-client registry；custom collector 查 queued 數）→ Step 4: PASS**
+- [ ] **Step 5: Commit** `feat(server): prometheus metrics endpoint`
+
+### Task 15: Agent 版本檢查與簽章自動更新
+
+**Files:**
+- Create: `agent/comfyfed_agent/update.py`, Modify: `agent/comfyfed_agent/main.py`, `server/comfyfed_server/workers.py`
+- Test: `tests/agent/test_update.py`
+
+**Interfaces:**
+- Produces:
+  - server：`GET /api/agent/version` → `{latest: "0.1.0", min_supported: "0.1.0", wheel_url: str|None, sha256: str|None, platform_sig: str|None}`（值來自 settings，admin 可在 Settings 頁維護；wheel 檔放 `data/releases/` 由平台 serve）
+  - agent：`update.check(entry, current: str) -> UpdateDecision(action: "ok"|"update"|"blocked")`；current < min_supported → blocked（雙語訊息退出）；有新版且 config `auto_update: true`（預設）→ 下載 wheel → 驗 SHA256 → 驗 `platform_sig`（平台公鑰對 sha256 簽名）→ `pip install --no-deps <wheel>` → `os.execv` 自我重啟；驗證失敗→不安裝、警告、照舊版續跑
+- [ ] **Step 1: 失敗測試**（版本比對三態；壞簽章拒裝；mock wheel 流程走到 pip 呼叫（monkeypatch subprocess））
+- [ ] **Step 2: FAIL → Step 3: 實作 → Step 4: PASS**
+- [ ] **Step 5: Commit** `feat(agent): signed self-update with min-supported version gate`
+
+### Task 16: 文件
 
 **Files:**
 - Modify: `README.md`（雙語：安裝平台、開 DDNS/固定 IP 注意事項＋反向代理 TLS 範例（Caddyfile 兩行）、新增 worker 流程、安全模型摘要、白名單說明）
@@ -313,6 +346,6 @@ def test_i18n_both_languages():
 
 ## Self-Review 紀錄
 
-- 規格覆蓋：安裝隨機密碼（T3/T13）、雙語 CLI＋UI（T3/T12/T13）、SQLite（T2）、DDNS/固定 IP=platform_url 設定＋文件（T3/T12/T14）、簽名協議＋防重放（T5-T7,T9）、斷線重派（T8/T9）、busy 廣播（T11）、收據與區間報表（T10/T12）、白名單（T11）。Phase 2 項目（模型 manifest、Comfy 面板、P2P）依規格明確排除。
+- 規格覆蓋：安裝隨機密碼（T3/T13）、雙語 CLI＋UI（T3/T12/T13）、SQLite＋Alembic 遷移（T2）、DDNS/固定 IP=platform_url 設定＋文件（T3/T12/T16）、簽名協議＋防重放（T5-T7,T9）、斷線重派（T8/T9）、busy 廣播（T11）、收據與區間報表（T10/T12）、node policy＋節點交集派工＋backend 比對（T2/T8/T9/T11）、/metrics（T14）、ArtifactStore 抽象（T10）、agent 簽章自動更新（T15）。Phase 2 項目（模型 manifest、Comfy 面板、P2P、S3 presigned 實作）依規格明確排除。
 - 型別一致性：`verify_agent`、`pick_job_for`、`requeue_stale`、bundle/certificate 欄位在 T5/T6/T7/T9 均沿用同名。
 - 無占位符：各任務含測試碼或明確斷言清單與實作要點。
