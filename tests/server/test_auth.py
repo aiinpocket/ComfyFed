@@ -18,7 +18,7 @@ def client(tmp_path):
 def test_wrong_password_401(client):
     r = client.post("/api/auth/login", json={"password": "wrong"})
     assert r.status_code == 401
-    assert r.json()["error"]["code"] == "auth.required" or "error" in r.json()
+    assert r.json()["error"]["code"] == "auth.required"
 
 
 def test_login_success_sets_cookie_and_csrf(client):
@@ -40,8 +40,10 @@ def test_me_reports_authenticated(client):
     assert body["lang"] == "en"
 
 
-def test_me_unauthenticated_without_session():
-    pass
+def test_me_unauthenticated_without_session(client):
+    r = client.get("/api/auth/me")
+    assert r.status_code == 200
+    assert r.json() == {"authenticated": False, "lang": "en"}
 
 
 def test_change_password_requires_csrf(client):
