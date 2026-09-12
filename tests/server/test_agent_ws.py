@@ -1,5 +1,6 @@
 import json
 import logging
+from datetime import datetime, timedelta, timezone
 
 import pytest
 from fastapi.testclient import TestClient
@@ -225,6 +226,130 @@ def test_busy_heartbeat_marks_the_assigned_job_running(client):
         with db.get_session() as session:
             receipt = session.get(db.Receipt, receipt_msg["receipt_id"])
             assert receipt.gpu_seconds > 0
+
+
+def _backdate_started_at(job_id, hours):
+    """Push a job's `started_at` into the past, so `finished_at - started_at`
+    (the wall clock) is large by the time `job_done` is sent -- used to prove
+    billing prefers `exec_seconds` over the wall clock rather than merely
+    happening to agree with it on a normal, fast test run."""
+    with db.get_session() as session:
+        job = session.get(db.Job, job_id)
+        job.started_at = datetime.now(timezone.utc).replace(tzinfo=None) - timedelta(hours=hours)
+        session.commit()
+
+
+def test_job_done_bills_exec_seconds_when_present_even_if_wall_clock_is_large(client):
+    """Deliverable 3: `gpu_seconds = min(exec_seconds, wall)`. A worker that
+    sat queued for an hour (large wall clock) before actually running for 2
+    real seconds must only be billed those 2 seconds."""
+    csrf = _login(client)
+    worker_id, sk = _register_worker(client, csrf, "w1")
+    job_id = _submit(client, csrf)
+
+    with client.websocket_connect("/api/agent/ws") as ws:
+        challenge = ws.receive_json()
+        sig = sk.sign(challenge["nonce"].encode()).signature.hex()
+        ws.send_json({"type": "auth", "worker_id": worker_id, "sig": sig})
+        assert ws.receive_json()["type"] == "ready"
+
+        ws.send_json({"type": "heartbeat", "state": "idle", "progress": 0.0, "job_id": None, "dynamic": {}})
+        agentws.dispatch_once(worker_id)
+        assert ws.receive_json()["type"] == "job"
+
+        ws.send_json({"type": "heartbeat", "state": "busy", "progress": 0.0, "job_id": job_id, "dynamic": {}})
+        agentws.dispatch_once(worker_id)
+
+        _backdate_started_at(job_id, hours=1)
+
+        ws.send_json(
+            {"type": "job_done", "job_id": job_id, "result_files": ["out.png"], "exec_seconds": 2.0}
+        )
+        agentws.dispatch_once(worker_id)
+
+        receipt_msg = ws.receive_json()
+        assert receipt_msg["type"] == "receipt"
+
+        with db.get_session() as session:
+            receipt = session.get(db.Receipt, receipt_msg["receipt_id"])
+            assert receipt.gpu_seconds == 2.0
+        assert receipt_msg["payload"] == f"{job_id}|{worker_id}|2.0"
+
+
+def test_job_done_without_exec_seconds_falls_back_to_wall_clock(client, caplog):
+    """Deliverable 3: a missing/invalid `exec_seconds` (older agent, or a
+    ComfyUI whose /queue was unreachable) must fall back to the wall clock,
+    with an info-level log noting the fallback."""
+    csrf = _login(client)
+    worker_id, sk = _register_worker(client, csrf, "w1")
+    job_id = _submit(client, csrf)
+
+    with client.websocket_connect("/api/agent/ws") as ws:
+        challenge = ws.receive_json()
+        sig = sk.sign(challenge["nonce"].encode()).signature.hex()
+        ws.send_json({"type": "auth", "worker_id": worker_id, "sig": sig})
+        assert ws.receive_json()["type"] == "ready"
+
+        ws.send_json({"type": "heartbeat", "state": "idle", "progress": 0.0, "job_id": None, "dynamic": {}})
+        agentws.dispatch_once(worker_id)
+        assert ws.receive_json()["type"] == "job"
+
+        ws.send_json({"type": "heartbeat", "state": "busy", "progress": 0.0, "job_id": job_id, "dynamic": {}})
+        agentws.dispatch_once(worker_id)
+
+        _backdate_started_at(job_id, hours=1)
+
+        with caplog.at_level(logging.INFO, logger="comfyfed_server.agentws"):
+            ws.send_json({"type": "job_done", "job_id": job_id, "result_files": ["out.png"]})
+            agentws.dispatch_once(worker_id)
+
+        receipt_msg = ws.receive_json()
+        assert receipt_msg["type"] == "receipt"
+
+        with db.get_session() as session:
+            receipt = session.get(db.Receipt, receipt_msg["receipt_id"])
+            # ~1 hour (3600s), allowing a little slack for real elapsed time.
+            assert 3595 <= receipt.gpu_seconds <= 3605
+        assert any("wall-clock" in rec.getMessage() for rec in caplog.records)
+
+
+def test_job_done_caps_absurd_exec_seconds_at_the_wall_clock(client):
+    """Deliverable 3: `exec_seconds` far exceeding the wall clock (a buggy or
+    hostile agent) must be capped at the wall clock, never inflate billing
+    past what actually elapsed."""
+    csrf = _login(client)
+    worker_id, sk = _register_worker(client, csrf, "w1")
+    job_id = _submit(client, csrf)
+
+    with client.websocket_connect("/api/agent/ws") as ws:
+        challenge = ws.receive_json()
+        sig = sk.sign(challenge["nonce"].encode()).signature.hex()
+        ws.send_json({"type": "auth", "worker_id": worker_id, "sig": sig})
+        assert ws.receive_json()["type"] == "ready"
+
+        ws.send_json({"type": "heartbeat", "state": "idle", "progress": 0.0, "job_id": None, "dynamic": {}})
+        agentws.dispatch_once(worker_id)
+        assert ws.receive_json()["type"] == "job"
+
+        ws.send_json({"type": "heartbeat", "state": "busy", "progress": 0.0, "job_id": job_id, "dynamic": {}})
+        agentws.dispatch_once(worker_id)
+
+        # Wall clock stays small (no backdating) -- just the real time
+        # elapsed by the test itself, well under a second.
+        ws.send_json(
+            {"type": "job_done", "job_id": job_id, "result_files": ["out.png"], "exec_seconds": 999999.0}
+        )
+        agentws.dispatch_once(worker_id)
+
+        receipt_msg = ws.receive_json()
+        assert receipt_msg["type"] == "receipt"
+
+        with db.get_session() as session:
+            job = session.get(db.Job, job_id)
+            wall = (job.finished_at - job.started_at).total_seconds()
+            receipt = session.get(db.Receipt, receipt_msg["receipt_id"])
+            assert receipt.gpu_seconds == wall
+            assert receipt.gpu_seconds < 999999.0
 
 
 def test_job_done_from_a_foreign_worker_changes_nothing(client):

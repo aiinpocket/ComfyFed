@@ -110,19 +110,51 @@ def _is_prompt_active(comfy_url: str, prompt_id: str, client: httpx.Client) -> b
     return False
 
 
+def _is_prompt_running(comfy_url: str, prompt_id: str, client: httpx.Client) -> bool:
+    """Whether ComfyUI's /queue specifically lists `prompt_id` under
+    `queue_running` right now -- i.e. GPU execution has actually started.
+
+    Used only to timestamp billing's `exec_seconds`, so this is the opposite
+    best-effort direction from `_is_prompt_active`: a /queue that errors or
+    returns an unexpected shape reports NOT running, because billing must
+    never guess a start time it did not actually observe.
+    """
+    try:
+        resp = client.get(f"{comfy_url.rstrip('/')}/queue")
+        resp.raise_for_status()
+        body = resp.json()
+    except Exception:
+        return False
+
+    for item in body.get("queue_running") or []:
+        if isinstance(item, (list, tuple)) and prompt_id in item:
+            return True
+    return False
+
+
 def run_workflow(
     comfy_url: str,
     workflow: dict,
     on_progress: Optional[Callable[[float], None]] = None,
     client: Optional[httpx.Client] = None,
     expected_seconds: float = _DEFAULT_EXPECTED_SECONDS,
-) -> list[tuple[str, bytes]]:
-    """Submit `workflow` to ComfyUI, poll until done, and return its output files.
+) -> tuple[list[tuple[str, bytes]], Optional[float]]:
+    """Submit `workflow` to ComfyUI, poll until done, and return its outputs.
 
-    Returns a list of (filename, content) tuples for every image/gif/video
-    output produced by the run. Raises `ComfyError` on a /prompt submission
-    error (node_errors, a top-level error, or a non-2xx response) or when the
-    finished history entry reports `status.status_str == "error"`.
+    Returns `(files, exec_seconds)`: `files` is a list of (filename, content)
+    tuples for every image/gif/video output produced by the run.
+    `exec_seconds` is the measured wall-clock span between the first moment
+    this prompt was observed under ComfyUI's `/queue` `queue_running` (i.e.
+    GPU execution actually started, as opposed to merely being queued behind
+    other work -- ours or another platform's, on a worker shared across
+    platforms) and completion. When that moment was never observed -- the run
+    finished between polls, or `/queue` was unreachable -- `exec_seconds` is
+    `None` and the caller must fall back to a different measure of billed
+    time (see `runner.py` / the server's receipt creation).
+
+    Raises `ComfyError` on a /prompt submission error (node_errors, a
+    top-level error, or a non-2xx response) or when the finished history
+    entry reports `status.status_str == "error"`.
 
     `on_progress` receives an ESTIMATE while the prompt is in ComfyUI's queue
     (see `_estimate_progress`) -- an elapsed-time ramp toward 0.9, sized by
@@ -150,6 +182,7 @@ def run_workflow(
             on_progress(0.0)
 
         started_at = time.monotonic()
+        exec_start: Optional[float] = None
         history_entry = None
         while history_entry is None:
             hist_resp = c.get(f"{comfy_url.rstrip('/')}/history/{prompt_id}")
@@ -158,6 +191,8 @@ def run_workflow(
             if prompt_id in history:
                 history_entry = history[prompt_id]
                 break
+            if exec_start is None and _is_prompt_running(comfy_url, prompt_id, c):
+                exec_start = time.monotonic()
             if on_progress is not None:
                 elapsed = time.monotonic() - started_at
                 if _is_prompt_active(comfy_url, prompt_id, c):
@@ -167,6 +202,8 @@ def run_workflow(
                     # (writing outputs), so sit at the ceiling.
                     on_progress(_PROGRESS_CEILING)
             time.sleep(_POLL_INTERVAL_SECONDS)
+
+        exec_seconds = (time.monotonic() - exec_start) if exec_start is not None else None
 
         status = history_entry.get("status") or {}
         if status.get("status_str") == "error":
@@ -188,7 +225,7 @@ def run_workflow(
                     view_resp = c.get(f"{comfy_url.rstrip('/')}/view", params=params)
                     view_resp.raise_for_status()
                     results.append((item["filename"], view_resp.content))
-        return results
+        return results, exec_seconds
     finally:
         if owns:
             c.close()

@@ -51,8 +51,8 @@ class FakeConnection:
             {"state": state, "progress": progress, "job_id": job_id, "object_info_hash": object_info_hash}
         )
 
-    async def send_job_done(self, job_id, result_files):
-        self.job_done = (job_id, result_files)
+    async def send_job_done(self, job_id, result_files, exec_seconds=None):
+        self.job_done = (job_id, result_files, exec_seconds)
 
     async def send_job_failed(self, job_id, error):
         self.job_failed = (job_id, error)
@@ -75,7 +75,7 @@ def _entry(worker_id: str) -> PlatformEntry:
 def two_platform_loop(monkeypatch):
     monkeypatch.setattr(whitelist, "allowed_classes", lambda *a, **k: {"KSampler"})
     monkeypatch.setattr(whitelist, "check", lambda *a, **k: None)
-    monkeypatch.setattr(comfy, "run_workflow", lambda *a, **k: [])
+    monkeypatch.setattr(comfy, "run_workflow", lambda *a, **k: ([], None))
     monkeypatch.setattr(hardware, "collect_dynamic", lambda *a, **k: {})
 
     config = AgentConfig(platforms=[_entry("worker-a"), _entry("worker-b")])
@@ -95,7 +95,7 @@ async def test_job_on_one_platform_broadcasts_busy_to_all_platforms(two_platform
 
     await loop.handle_job(conn_a, job_msg)
 
-    assert conn_a.job_done == ("job-1", [])
+    assert conn_a.job_done == ("job-1", [], None)
 
     busy_on_b = [hb for hb in conn_b.heartbeats if hb["state"] == "busy"]
     assert busy_on_b, "platform B should see a busy heartbeat while platform A dispatched the job"
@@ -104,6 +104,23 @@ async def test_job_on_one_platform_broadcasts_busy_to_all_platforms(two_platform
     # Both platforms should end up idle again once the job completes.
     assert conn_a.heartbeats[-1]["state"] == "idle"
     assert conn_b.heartbeats[-1]["state"] == "idle"
+
+
+async def test_job_done_carries_exec_seconds_from_run_workflow(two_platform_loop, monkeypatch):
+    loop = two_platform_loop
+    conn_a = loop.connections["worker-a"]
+
+    monkeypatch.setattr(comfy, "run_workflow", lambda *a, **k: ([], 2.5))
+
+    job_msg = {
+        "job_id": "job-1b",
+        "workflow_json": json.dumps({"1": {"class_type": "KSampler", "inputs": {}}}),
+        "input_assets": [],
+    }
+
+    await loop.handle_job(conn_a, job_msg)
+
+    assert conn_a.job_done == ("job-1b", [], 2.5)
 
 
 async def test_job_failure_sends_job_failed_and_returns_to_idle(two_platform_loop, monkeypatch):
@@ -136,7 +153,7 @@ async def test_job_with_disallowed_node_is_rejected_before_running(two_platform_
 
     def spy_run_workflow(*args, **kwargs):
         ran["called"] = True
-        return []
+        return [], None
 
     monkeypatch.setattr(comfy, "run_workflow", spy_run_workflow)
 

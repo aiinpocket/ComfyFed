@@ -171,6 +171,7 @@ comfyfed-server publish-agent dist/comfyfed_agent-0.2.0-py3-none-any.whl \
 ### 已知限制
 
 - **失敗的工作不會產生收據**：收據只在 `job_done` 時建立，所以工作跑到一半失敗（或 worker 中途離線被 requeue）所耗掉的 GPU 時間不會計入貢獻報表。這段算力目前是「沒被記帳」的。
+- **計費以實際執行秒數為準，不含排隊等待**：收據的 `gpu_seconds` 取 agent 量到的實際執行秒數（`exec_seconds`，從 ComfyUI `/queue` 第一次出現在 `queue_running` 算起）與牆鐘時間（`finished_at - started_at`）兩者較小值；agent 量不到（舊版 agent、跑太快沒觀察到、或 ComfyUI `/queue` 打不到）時退回牆鐘時間。這是刻意的：同一台 worker 可能同時服務本機使用與多個平台，若把排隊等待也算進 GPU 時間，會讓每個平台都重複計費同一段等待，破壞未來的分潤機制——因此其他平台（或本機）佔用 worker 的那段時間，不算進這份收據。
 
 ### 後續規劃（Roadmap）
 
@@ -405,6 +406,18 @@ identically either way.
   `job_done`, so GPU time burned by a job that failed part-way through (or by
   a worker that dropped off and had its job requeued) never reaches the
   contribution report. That compute is currently unaccounted for.
+- **Billing is actual execution seconds, not queue wait**: a receipt's
+  `gpu_seconds` is `min(exec_seconds, wall_clock)`, where `exec_seconds` is
+  the agent's own measurement (from the moment ComfyUI's `/queue` first
+  reports the prompt under `queue_running` to completion) and `wall_clock` is
+  `finished_at - started_at`. It falls back to the wall clock when
+  `exec_seconds` is missing (an older agent, a run that finished before it
+  was ever observed running, or an unreachable `/queue`). This is
+  deliberate: one worker can serve local use plus several platforms at once,
+  and billing queue-wait as GPU time would double-charge every platform for
+  the same idle stretch, breaking future revenue sharing. Time a worker
+  spends queued behind other platforms' (or local) work is excluded from
+  this platform's receipts.
 
 ### Roadmap
 

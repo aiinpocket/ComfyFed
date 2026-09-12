@@ -202,8 +202,12 @@ def test_full_job_lifecycle_over_the_wire(server, mock_comfy, tmp_path):
         assert _mock_state["uploads"]["ref.png"] == b"input-image-bytes"
 
         # ...run the workflow against (mock) ComfyUI...
-        results = comfy.run_workflow("http://mockcomfy", workflow, client=mock_client)
+        results, exec_seconds = comfy.run_workflow("http://mockcomfy", workflow, client=mock_client)
         assert results == [("out.png", b"FAKE-PNG-BYTES")]
+        # The mock ComfyUI has no /queue endpoint, so the prompt was never
+        # observed under queue_running -- the server must fall back to the
+        # wall clock for billing (covered by test_agent_ws.py).
+        assert exec_seconds is None
 
         # ...upload the resulting artifact back to the platform via a signed
         # multipart POST. The multipart body must be frozen to concrete bytes
@@ -230,7 +234,14 @@ def test_full_job_lifecycle_over_the_wire(server, mock_comfy, tmp_path):
         assert artifact_resp.json()["stored"] == filename
 
         # ...and finally reports job_done over the WebSocket.
-        ws.send_json({"type": "job_done", "job_id": job_id, "result_files": [filename]})
+        ws.send_json(
+            {
+                "type": "job_done",
+                "job_id": job_id,
+                "result_files": [filename],
+                "exec_seconds": exec_seconds,
+            }
+        )
 
         # The server immediately pushes back a platform-signed receipt.
         receipt_msg = ws.receive_json()

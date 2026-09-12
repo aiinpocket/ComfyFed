@@ -118,8 +118,17 @@ class PlatformConnection:
             resp = await client.post(path, content=gzip_payload, headers=headers)
             resp.raise_for_status()
 
-    async def send_job_done(self, job_id: str, result_files: list[str]) -> None:
-        await self._send({"type": "job_done", "job_id": job_id, "result_files": result_files})
+    async def send_job_done(
+        self, job_id: str, result_files: list[str], exec_seconds: Optional[float] = None
+    ) -> None:
+        await self._send(
+            {
+                "type": "job_done",
+                "job_id": job_id,
+                "result_files": result_files,
+                "exec_seconds": exec_seconds,
+            }
+        )
 
     async def send_job_failed(self, job_id: str, error: str) -> None:
         await self._send({"type": "job_failed", "job_id": job_id, "error": error})
@@ -224,14 +233,16 @@ class AgentLoop:
                     except Exception:
                         logger.exception("runner: failed to report job progress")
 
-                files = await asyncio.to_thread(
+                files, exec_seconds = await asyncio.to_thread(
                     comfy.run_workflow, self.config.comfy_url, workflow, on_progress
                 )
 
                 for filename, content in files:
                     await self._upload_artifact(conn.entry, job_id, filename, content)
 
-                await conn.send_job_done(job_id, [filename for filename, _content in files])
+                await conn.send_job_done(
+                    job_id, [filename for filename, _content in files], exec_seconds
+                )
             except Exception as exc:
                 logger.exception("runner: job %s failed", job_id)
                 await conn.send_job_failed(job_id, str(exc))

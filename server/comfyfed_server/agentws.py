@@ -19,7 +19,14 @@ Agent -> server message contract (all JSON):
   {"type": "inventory", "models": [{"name": str, "size": float}]}
       -- `size` is the model file size in GIGABYTES (not bytes); the server
          compares it against VRAM and free-disk figures that are also in GB.
-  {"type": "job_done", "job_id": str, "result_files": [str]}
+  {"type": "job_done", "job_id": str, "result_files": [str],
+   "exec_seconds": float|null}
+      -- `exec_seconds` is the agent's measurement of actual GPU execution
+         time (from `comfyfed_agent.comfy.run_workflow`), excluding time the
+         prompt spent merely queued on the worker. The receipt's billed
+         `gpu_seconds` is `min(exec_seconds, wall_clock)`, falling back to
+         the wall clock (`finished_at - started_at`) when this is missing or
+         invalid -- see `_create_and_push_receipt`.
   {"type": "job_failed", "job_id": str, "error": str}
   {"type": "receipt_ack", "receipt_id": str, "worker_sig": hex}
 
@@ -190,7 +197,10 @@ async def _handle_message(worker_id: str, conn: _Connection, message: dict) -> N
             # it does not own by sending someone else's job_id.
             if dispatch.mark_done(job_id, worker_id, message.get("result_files") or []):
                 _notify_panel_job_done(job_id)
-                await _create_and_push_receipt(worker_id, conn, job_id)
+                exec_seconds = message.get("exec_seconds")
+                if not isinstance(exec_seconds, (int, float)) or isinstance(exec_seconds, bool):
+                    exec_seconds = None
+                await _create_and_push_receipt(worker_id, conn, job_id, exec_seconds)
         elif msg_type == "job_failed":
             job_id = message.get("job_id")
             error = message.get("error") or ""
@@ -346,10 +356,23 @@ def _handle_inventory(worker_id: str, message: dict) -> None:
         session.commit()
 
 
-async def _create_and_push_receipt(worker_id: str, conn: "_Connection", job_id: Optional[str]) -> None:
+async def _create_and_push_receipt(
+    worker_id: str, conn: "_Connection", job_id: Optional[str], exec_seconds: Optional[float] = None
+) -> None:
     """Create a platform-signed Receipt for a just-completed job and push it
     to the worker over its live connection, for the worker to counter-sign
-    via a `receipt_ack` message."""
+    via a `receipt_ack` message.
+
+    Billing uses `exec_seconds` -- the agent's own measurement of actual GPU
+    execution time (see `comfyfed_agent.comfy.run_workflow`), not the wall
+    clock between "assigned" and "done" -- because a worker can sit queued
+    behind other work (ours or another platform's, on a worker shared across
+    platforms) without burning any of *this* platform's GPU time. Billing
+    queue-wait as GPU time would double-charge it to every platform a shared
+    worker serves. `exec_seconds` is capped at the wall-clock span (a worker
+    cannot bill more than it was observably busy for this job) and falls back
+    to the wall clock entirely when missing or invalid.
+    """
     if not job_id or _signing_key is None:
         return
 
@@ -357,9 +380,20 @@ async def _create_and_push_receipt(worker_id: str, conn: "_Connection", job_id: 
         job = session.get(db.Job, job_id)
         if job is None:
             return
-        gpu_seconds = 0.0
+        wall_seconds = 0.0
         if job.started_at is not None and job.finished_at is not None:
-            gpu_seconds = (job.finished_at - job.started_at).total_seconds()
+            wall_seconds = (job.finished_at - job.started_at).total_seconds()
+
+        if exec_seconds is None or exec_seconds < 0:
+            gpu_seconds = wall_seconds
+            logger.info(
+                "agentws: job %s has no valid exec_seconds from worker %s, "
+                "billing the wall-clock span instead",
+                job_id,
+                worker_id,
+            )
+        else:
+            gpu_seconds = min(exec_seconds, wall_seconds)
 
         payload = f"{job_id}|{worker_id}|{gpu_seconds:.1f}"
         platform_sig = _signing_key.sign(payload.encode()).signature.hex()
