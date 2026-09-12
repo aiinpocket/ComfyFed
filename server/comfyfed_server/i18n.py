@@ -65,6 +65,18 @@ _DICT: dict[str, dict[str, str]] = {
         "zh-TW": "管理員密碼（僅顯示一次，請立即保存）",
         "en": "Admin password (shown once, save it now)",
     },
+    "fetch_templates.start": {
+        "zh-TW": "正在從 PyPI 下載官方範本庫…",
+        "en": "Downloading the official template library from PyPI…",
+    },
+    "fetch_templates.done": {
+        "zh-TW": "範本庫安裝完成（{files} 個檔案，meta 版本 {meta_version}）。",
+        "en": "Template library installed ({files} files, meta version {meta_version}).",
+    },
+    "fetch_templates.failed": {
+        "zh-TW": "下載失敗：",
+        "en": "Fetch failed:",
+    },
 }
 
 

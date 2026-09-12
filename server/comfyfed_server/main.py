@@ -11,7 +11,7 @@ import sys
 
 import uvicorn
 
-from . import bootstrap, comfy_frontend, db, i18n, security
+from . import bootstrap, comfy_frontend, db, i18n, official_templates, security
 from .app import create_app
 
 # Best-effort: force UTF-8 stdout/stderr so bilingual (zh-TW + en) install
@@ -206,6 +206,29 @@ def _cmd_fetch_comfy_ui(args: argparse.Namespace) -> None:
     print(f"  {result['dir']}")
 
 
+def _cmd_fetch_comfy_templates(args: argparse.Namespace) -> None:
+    """Download the official ComfyUI workflow-template library into the data directory.
+
+    Unlike `fetch-comfy-ui`, this always re-downloads and replaces whatever
+    is already there: there is no pinned version to short-circuit against,
+    and PyPI's own per-file sha256 is verified on every run instead of a
+    constant baked into this codebase (see `official_templates.py`).
+    """
+    data_dir = args.data_dir
+    os.makedirs(data_dir, exist_ok=True)
+
+    _bilingual("fetch_templates.start")
+
+    try:
+        manifest = official_templates.fetch(data_dir, version=args.version)
+    except official_templates.FetchError as exc:
+        _bilingual("fetch_templates.failed")
+        raise SystemExit(f"  {exc}")
+
+    _bilingual("fetch_templates.done", files=manifest["files"], meta_version=manifest["meta_version"])
+    print(f"  {official_templates.official_dir(data_dir)}")
+
+
 def _cmd_run(args: argparse.Namespace) -> None:
     app = create_app(args.data_dir)
     uvicorn.run(app, host=args.host, port=args.port)
@@ -262,6 +285,18 @@ def cli() -> None:
     )
     fetch_ui.add_argument("--data-dir", default=DEFAULT_DATA_DIR, help="Data directory (default: ./data).")
     fetch_ui.set_defaults(func=_cmd_fetch_comfy_ui)
+
+    fetch_templates = sub.add_parser(
+        "fetch-comfy-templates",
+        help="Download the official ComfyUI workflow-template library for the /comfy editor.",
+    )
+    fetch_templates.add_argument(
+        "--version",
+        default=None,
+        help="comfyui-workflow-templates release to fetch (default: latest on PyPI).",
+    )
+    fetch_templates.add_argument("--data-dir", default=DEFAULT_DATA_DIR, help="Data directory (default: ./data).")
+    fetch_templates.set_defaults(func=_cmd_fetch_comfy_templates)
 
     args = parser.parse_args()
     args.func(args)
