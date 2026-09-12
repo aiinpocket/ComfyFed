@@ -23,6 +23,16 @@ class ComfyError(Exception):
     """Raised when ComfyUI reports a /prompt submission or execution error."""
 
 
+class JobCancelled(Exception):
+    """Raised out of `run_workflow` when the caller's cancel event trips.
+
+    Deliberately NOT a `ComfyError`: a cancellation is not a failure. The
+    agent runner catches it separately and winds the job down silently --
+    no `job_failed` (nor `job_done`) is reported for a cancelled job,
+    because the platform already knows: it is the side that cancelled.
+    """
+
+
 def _client_or_new(client: Optional[httpx.Client]) -> tuple[httpx.Client, bool]:
     if client is not None:
         return client, False
@@ -132,12 +142,81 @@ def _is_prompt_running(comfy_url: str, prompt_id: str, client: httpx.Client) -> 
     return False
 
 
+def _queue_placement(comfy_url: str, prompt_id: str, client: httpx.Client) -> str:
+    """Where ComfyUI's `/queue` currently places `prompt_id`.
+
+    Returns `"running"` (it is the prompt actually executing on the GPU),
+    `"pending"` (queued behind other work), `"absent"` (on neither list --
+    it already finished, or was never accepted) or `"unknown"` (`/queue`
+    unreachable or shaped unexpectedly).
+    """
+    try:
+        resp = client.get(f"{comfy_url.rstrip('/')}/queue")
+        resp.raise_for_status()
+        body = resp.json()
+    except Exception:
+        return "unknown"
+
+    for key, placement in (("queue_running", "running"), ("queue_pending", "pending")):
+        for item in body.get(key) or []:
+            # Queue entries are positional arrays: [number, prompt_id, ...].
+            if isinstance(item, (list, tuple)) and prompt_id in item:
+                return placement
+    return "absent"
+
+
+def interrupt_or_dequeue(comfy_url: str, prompt_id: str, client: Optional[httpx.Client] = None) -> str:
+    """Stop `prompt_id` at ComfyUI, choosing the right mechanism for where it is.
+
+    ComfyUI has two distinct cancel operations and they are not
+    interchangeable on a worker shared with other work (another platform's
+    jobs, or the operator's own panel session):
+
+    - `POST /interrupt` takes no prompt id at all: it aborts whatever is
+      executing *right now*. Correct when our prompt is the running one,
+      catastrophic when it isn't -- it would kill somebody else's render.
+    - `POST /queue {"delete": [prompt_id]}` removes a specific *pending*
+      prompt without touching the running one.
+
+    So `/queue` is read first and the decision made from what it says:
+    `running` -> interrupt, `pending` -> delete, `absent` -> do nothing at
+    all (the prompt already finished; there is nothing of ours to stop and
+    interrupting would hit an unrelated prompt). Only when `/queue` itself
+    is unreadable does this fall back to `/interrupt`, on the grounds that a
+    ComfyUI we cannot query is almost certainly still grinding on our
+    prompt -- the one case where guessing beats doing nothing.
+
+    Returns what it did: `"interrupted"`, `"dequeued"` or `"absent"`. Raises
+    on an HTTP failure of the call it chose; the caller (runner's
+    `job_cancelled` branch) logs it -- the cancel event alone is already
+    enough to wind the run down.
+    """
+    c, owns = _client_or_new(client)
+    try:
+        base = comfy_url.rstrip("/")
+        placement = _queue_placement(comfy_url, prompt_id, c)
+        if placement == "pending":
+            resp = c.post(f"{base}/queue", json={"delete": [prompt_id]})
+            resp.raise_for_status()
+            return "dequeued"
+        if placement == "absent":
+            return "absent"
+        resp = c.post(f"{base}/interrupt")
+        resp.raise_for_status()
+        return "interrupted"
+    finally:
+        if owns:
+            c.close()
+
+
 def run_workflow(
     comfy_url: str,
     workflow: dict,
     on_progress: Optional[Callable[[float], None]] = None,
     client: Optional[httpx.Client] = None,
     expected_seconds: float = _DEFAULT_EXPECTED_SECONDS,
+    cancel_event=None,
+    on_prompt_id: Optional[Callable[[str], None]] = None,
 ) -> tuple[list[tuple[str, bytes, str]], Optional[float]]:
     """Submit `workflow` to ComfyUI, poll until done, and return its outputs.
 
@@ -169,9 +248,28 @@ def run_workflow(
     (see `_estimate_progress`) -- an elapsed-time ramp toward 0.9, sized by
     `expected_seconds` (default 120s). Only the final `on_progress(1.0)`
     reflects real completion.
+
+    `cancel_event` is anything with an `is_set()` (in practice the runner's
+    per-job `asyncio.Event`, read from this worker thread -- reading a flag
+    is safe across threads, and only the event loop ever sets it). It is
+    checked before submission and on every poll, and raises `JobCancelled`
+    the moment it trips: cooperative cancellation, so a run the platform has
+    already given up on stops burning GPU time instead of finishing into a
+    result nobody will accept. Stopping ComfyUI itself is the caller's job
+    (`interrupt_or_dequeue`); this only stops *waiting*.
+
+    `on_prompt_id` is called with ComfyUI's prompt id the moment `/prompt`
+    accepts the submission -- that id is what `interrupt_or_dequeue` needs,
+    and the caller has no other way to learn it while the run is in flight.
     """
     c, owns = _client_or_new(client)
+
+    def _raise_if_cancelled() -> None:
+        if cancel_event is not None and cancel_event.is_set():
+            raise JobCancelled()
+
     try:
+        _raise_if_cancelled()
         client_id = str(uuid.uuid4())
         # Clock for the exec_seconds fallback: everything after this point is
         # local to this worker, so a span measured from here never includes
@@ -190,6 +288,8 @@ def run_workflow(
             raise ComfyError(f"ComfyUI /prompt submission failed: {body}")
 
         prompt_id = body["prompt_id"]
+        if on_prompt_id is not None:
+            on_prompt_id(prompt_id)
 
         if on_progress is not None:
             on_progress(0.0)
@@ -198,6 +298,7 @@ def run_workflow(
         exec_start: Optional[float] = None
         history_entry = None
         while history_entry is None:
+            _raise_if_cancelled()
             hist_resp = c.get(f"{comfy_url.rstrip('/')}/history/{prompt_id}")
             hist_resp.raise_for_status()
             history = hist_resp.json()
@@ -215,6 +316,12 @@ def run_workflow(
                     # (writing outputs), so sit at the ceiling.
                     on_progress(_PROGRESS_CEILING)
             time.sleep(_POLL_INTERVAL_SECONDS)
+
+        # An interrupted prompt lands in /history almost immediately, so the
+        # poll loop can legitimately exit on the very iteration the cancel
+        # arrives. Re-check here so an aborted run never comes back looking
+        # like a completed one.
+        _raise_if_cancelled()
 
         # Fall back to the span since the local /prompt POST when the running
         # window was never observed (a run that finished between polls, or a

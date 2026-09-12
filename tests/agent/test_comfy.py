@@ -16,7 +16,16 @@ def _make_app():
     # `pending_polls` makes /queue report the prompt as merely *pending*
     # (simulating another workload ahead of it on a shared worker) for that
     # many calls before it starts reporting `queue_running`.
-    state = {"uploads": {}, "history_misses": 0, "queue_running": [], "pending_polls": 0}
+    state = {
+        "uploads": {},
+        "history_misses": 0,
+        "queue_running": [],
+        "pending_polls": 0,
+        # Cancellation bookkeeping: how many times `POST /interrupt` was
+        # called, and every body `POST /queue` received.
+        "interrupts": 0,
+        "queue_posts": [],
+    }
 
     @app.get("/object_info")
     def object_info():
@@ -39,6 +48,16 @@ def _make_app():
             state["pending_polls"] -= 1
             return {"queue_running": [], "queue_pending": [[0, "p1", {}]]}
         return {"queue_running": state["queue_running"], "queue_pending": []}
+
+    @app.post("/interrupt")
+    def interrupt():
+        state["interrupts"] += 1
+        return {}
+
+    @app.post("/queue")
+    async def queue_post(request: Request):
+        state["queue_posts"].append(await request.json())
+        return {}
 
     @app.get("/history/{prompt_id}")
     def history(prompt_id: str):
@@ -190,6 +209,100 @@ def test_run_workflow_sits_at_ceiling_once_off_the_queue(client, monkeypatch):
     # round to 0.0. The invariant under test is that it is a NUMBER.
     assert exec_seconds is not None
     assert exec_seconds >= 0
+
+
+# --- Cancellation ----------------------------------------------------------
+
+
+class _FlagEvent:
+    """Minimal `asyncio.Event`-shaped stand-in whose `is_set()` flips to True
+    after `trip_after` calls -- so a test can cancel *mid-poll* rather than
+    only before the loop starts."""
+
+    def __init__(self, trip_after: int = 0):
+        self._calls = 0
+        self._trip_after = trip_after
+
+    def is_set(self) -> bool:
+        self._calls += 1
+        return self._calls > self._trip_after
+
+
+def test_interrupt_or_dequeue_interrupts_the_executing_prompt(client):
+    client.app.state.mock["queue_running"] = [[0, "p1", {}]]
+
+    result = comfy.interrupt_or_dequeue(COMFY_URL, "p1", client=client)
+
+    assert result == "interrupted"
+    assert client.app.state.mock["interrupts"] == 1
+    assert client.app.state.mock["queue_posts"] == []
+
+
+def test_interrupt_or_dequeue_deletes_a_locally_queued_prompt(client):
+    # Still merely pending behind other work: interrupting would abort
+    # somebody else's currently-executing prompt, so delete ours instead.
+    client.app.state.mock["pending_polls"] = 1
+
+    result = comfy.interrupt_or_dequeue(COMFY_URL, "p1", client=client)
+
+    assert result == "dequeued"
+    assert client.app.state.mock["queue_posts"] == [{"delete": ["p1"]}]
+    assert client.app.state.mock["interrupts"] == 0
+
+
+def test_interrupt_or_dequeue_does_nothing_when_prompt_is_off_the_queue(client):
+    # Neither running nor pending -- it already finished. Interrupting here
+    # would kill an unrelated prompt on a shared worker.
+    result = comfy.interrupt_or_dequeue(COMFY_URL, "p1", client=client)
+
+    assert result == "absent"
+    assert client.app.state.mock["interrupts"] == 0
+    assert client.app.state.mock["queue_posts"] == []
+
+
+def test_run_workflow_reports_prompt_id_to_the_caller(client):
+    seen = []
+    comfy.run_workflow(
+        COMFY_URL,
+        {"1": {"class_type": "KSampler", "inputs": {}}},
+        client=client,
+        on_prompt_id=seen.append,
+    )
+    assert seen == ["p1"]
+
+
+def test_run_workflow_raises_job_cancelled_when_event_trips_mid_poll(client, monkeypatch):
+    monkeypatch.setattr(comfy.time, "sleep", lambda _s: None)
+    client.app.state.mock["history_misses"] = 10
+    client.app.state.mock["queue_running"] = [[0, "p1", {}]]
+
+    with pytest.raises(comfy.JobCancelled):
+        comfy.run_workflow(
+            COMFY_URL,
+            {"1": {"class_type": "KSampler", "inputs": {}}},
+            client=client,
+            cancel_event=_FlagEvent(trip_after=2),
+        )
+
+
+def test_run_workflow_raises_job_cancelled_before_submitting_when_already_cancelled(client):
+    with pytest.raises(comfy.JobCancelled):
+        comfy.run_workflow(
+            COMFY_URL,
+            {"1": {"class_type": "KSampler", "inputs": {}}},
+            client=client,
+            cancel_event=_FlagEvent(trip_after=0),
+        )
+
+
+def test_run_workflow_ignores_an_unset_cancel_event(client):
+    files, _exec_seconds = comfy.run_workflow(
+        COMFY_URL,
+        {"1": {"class_type": "KSampler", "inputs": {}}},
+        client=client,
+        cancel_event=_FlagEvent(trip_after=10_000),
+    )
+    assert files == [("out.png", b"PNGDATA", "")]
 
 
 def test_run_workflow_exec_seconds_excludes_queue_wait(client, monkeypatch):

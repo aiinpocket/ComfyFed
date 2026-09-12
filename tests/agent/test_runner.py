@@ -1,13 +1,16 @@
+import asyncio
 import hashlib
 import json
 import os
+import threading
+import time
 
 import httpx
 import pytest
 
 from comfyfed_agent import comfy, hardware, whitelist
 from comfyfed_agent.config import AgentConfig, PlatformEntry
-from comfyfed_agent.runner import AgentLoop, _is_safe_relative_path, cleanup_job_files
+from comfyfed_agent.runner import AgentLoop, CleanupMode, _is_safe_relative_path, cleanup_job_files
 from comfyfed_agent import runner as runner_module
 
 _real_whitelist_check = whitelist.check
@@ -48,6 +51,7 @@ class FakeConnection:
         self.job_failed = None
         self.object_info_hash = ""
         self.object_info_uploads: list[tuple[bytes, str]] = []
+        self.receipt_acks: list[tuple[str, str]] = []
 
     async def send_heartbeat(self, state, progress=0.0, job_id=None, dynamic=None, object_info_hash=None):
         self.state = state
@@ -63,6 +67,12 @@ class FakeConnection:
 
     async def send_object_info(self, gzip_payload, oi_hash):
         self.object_info_uploads.append((gzip_payload, oi_hash))
+
+    async def send_receipt_ack(self, receipt_id, worker_sig):
+        self.receipt_acks.append((receipt_id, worker_sig))
+
+    def sign_receipt_payload(self, payload: str) -> str:
+        return "sig:" + payload
 
 
 def _entry(worker_id: str) -> PlatformEntry:
@@ -362,7 +372,7 @@ def test_cleanup_job_files_removes_configured_output_and_input_files(tmp_path):
     in_file.write_bytes(b"y")
 
     cleanup_job_files(
-        success=True,
+        mode=CleanupMode.SUCCESS,
         comfy_output_dir=str(output_dir),
         comfy_input_dir=str(input_dir),
         output_files=[{"filename": "result.png", "subfolder": "sub"}],
@@ -384,7 +394,7 @@ def test_cleanup_job_files_skips_everything_on_failure(tmp_path):
     in_file.write_bytes(b"y")
 
     cleanup_job_files(
-        success=False,
+        mode=CleanupMode.FAILURE,
         comfy_output_dir=str(output_dir),
         comfy_input_dir=str(input_dir),
         output_files=[{"filename": "result.png", "subfolder": ""}],
@@ -398,7 +408,7 @@ def test_cleanup_job_files_skips_everything_on_failure(tmp_path):
 def test_cleanup_job_files_no_op_when_dirs_not_configured(tmp_path):
     # Must not raise even though there is nowhere configured to clean up.
     cleanup_job_files(
-        success=True,
+        mode=CleanupMode.SUCCESS,
         comfy_output_dir=None,
         comfy_input_dir=None,
         output_files=[{"filename": "result.png", "subfolder": ""}],
@@ -413,7 +423,7 @@ def test_cleanup_job_files_refuses_path_traversal(tmp_path):
     canary.write_bytes(b"do-not-delete")
 
     cleanup_job_files(
-        success=True,
+        mode=CleanupMode.SUCCESS,
         comfy_output_dir=str(output_dir),
         comfy_input_dir=None,
         output_files=[{"filename": "canary.txt", "subfolder": ".."}],
@@ -446,7 +456,7 @@ def test_cleanup_job_files_refuses_hardened_traversal_and_drive_escapes(tmp_path
     canary.write_bytes(b"do-not-delete")
 
     cleanup_job_files(
-        success=True,
+        mode=CleanupMode.SUCCESS,
         comfy_output_dir=str(output_dir),
         comfy_input_dir=None,
         output_files=[{"filename": unsafe_filename, "subfolder": ""}],
@@ -463,7 +473,7 @@ def test_cleanup_job_files_still_deletes_normal_nested_output_path(tmp_path):
     out_file.write_bytes(b"x")
 
     cleanup_job_files(
-        success=True,
+        mode=CleanupMode.SUCCESS,
         comfy_output_dir=str(output_dir),
         comfy_input_dir=None,
         output_files=[{"filename": "file.png", "subfolder": "subfolder"}],
@@ -553,3 +563,182 @@ async def _noop_coro():
 
 async def _bytes_coro(value: bytes) -> bytes:
     return value
+
+
+# --- Concurrent job task + server-driven cancellation -----------------------
+
+
+def _slow_run_workflow(started: threading.Event, prompt_id: str = "p-slow"):
+    """A `comfy.run_workflow` stand-in that blocks (in its worker thread) until
+    the cancel event trips, exactly as the real polling loop would."""
+
+    def _run(*args, cancel_event=None, on_prompt_id=None, **kwargs):
+        if on_prompt_id is not None:
+            on_prompt_id(prompt_id)
+        started.set()
+        deadline = time.monotonic() + 10.0
+        while cancel_event is None or not cancel_event.is_set():
+            if time.monotonic() > deadline:  # pragma: no cover - test safety net
+                raise AssertionError("cancel event never tripped")
+            time.sleep(0.01)
+        raise comfy.JobCancelled()
+
+    return _run
+
+
+async def _await_flag(flag: threading.Event, timeout: float = 10.0) -> None:
+    deadline = time.monotonic() + timeout
+    while not flag.is_set():
+        if time.monotonic() > deadline:  # pragma: no cover - test safety net
+            raise AssertionError("timed out waiting for the job to start")
+        await asyncio.sleep(0.01)
+
+
+def _job_message(job_id: str, input_assets=None) -> dict:
+    return {
+        "type": "job",
+        "job_id": job_id,
+        "workflow_json": json.dumps({"1": {"class_type": "KSampler", "inputs": {}}}),
+        "input_assets": list(input_assets or []),
+    }
+
+
+@pytest.fixture()
+def cancellable_loop(two_platform_loop, monkeypatch):
+    """`two_platform_loop` plus a slow fake ComfyUI and an interrupt spy."""
+    started = threading.Event()
+    interrupts: list[tuple[str, str]] = []
+
+    monkeypatch.setattr(comfy, "run_workflow", _slow_run_workflow(started))
+
+    def _spy_interrupt(comfy_url, prompt_id, **kwargs):
+        interrupts.append((comfy_url, prompt_id))
+        return "interrupted"
+
+    monkeypatch.setattr(comfy, "interrupt_or_dequeue", _spy_interrupt)
+
+    two_platform_loop.test_started = started
+    two_platform_loop.test_interrupts = interrupts
+    return two_platform_loop
+
+
+async def test_job_cancelled_mid_run_interrupts_cleans_up_and_reports_nothing(
+    cancellable_loop, monkeypatch, tmp_path
+):
+    loop = cancellable_loop
+    conn_a = loop.connections["worker-a"]
+    conn_b = loop.connections["worker-b"]
+
+    input_dir = tmp_path / "input"
+    input_dir.mkdir()
+    in_file = input_dir / "ref.png"
+    in_file.write_bytes(b"y")
+    loop.config.comfy_input_dir = str(input_dir)
+
+    monkeypatch.setattr(AgentLoop, "_download_input", lambda self, *a, **k: _bytes_coro(b"ref-bytes"))
+    monkeypatch.setattr(comfy, "upload_input", lambda *a, **k: None)
+
+    await loop._handle_message(conn_a, _job_message("job-cancel", ["ref.png"]))
+    await _await_flag(loop.test_started)
+
+    # The receive loop is still free to process this while the job runs.
+    await loop._handle_message(conn_a, {"type": "job_cancelled", "job_id": "job-cancel"})
+    await asyncio.wait_for(loop._current_job_task, timeout=10)
+
+    assert loop.test_interrupts == [(loop.config.comfy_url, "p-slow")]
+    assert conn_a.job_done is None, "a cancelled job must not report job_done"
+    assert conn_a.job_failed is None, "a cancelled job must not report job_failed"
+    assert not in_file.exists(), "staged inputs must be cleaned up on cancel"
+    assert conn_a.heartbeats[-1]["state"] == "idle"
+    assert conn_b.heartbeats[-1]["state"] == "idle"
+
+
+def test_cleanup_job_files_cancelled_mode_cleans_inputs_and_outputs(tmp_path):
+    output_dir = tmp_path / "output"
+    input_dir = tmp_path / "input"
+    output_dir.mkdir()
+    input_dir.mkdir()
+    out_file = output_dir / "partial.png"
+    out_file.write_bytes(b"x")
+    in_file = input_dir / "ref.png"
+    in_file.write_bytes(b"y")
+
+    cleanup_job_files(
+        mode=CleanupMode.CANCELLED,
+        comfy_output_dir=str(output_dir),
+        comfy_input_dir=str(input_dir),
+        output_files=[{"filename": "partial.png", "subfolder": ""}],
+        input_filenames=["ref.png"],
+    )
+
+    assert not out_file.exists()
+    assert not in_file.exists()
+
+
+async def test_job_cancelled_for_unknown_job_is_ignored_quietly(cancellable_loop):
+    loop = cancellable_loop
+    conn_a = loop.connections["worker-a"]
+
+    await loop._handle_message(conn_a, _job_message("job-live"))
+    await _await_flag(loop.test_started)
+
+    await loop._handle_message(conn_a, {"type": "job_cancelled", "job_id": "some-other-job"})
+
+    assert loop.test_interrupts == []
+    assert not loop._current_job_task.done(), "the running job must be untouched"
+
+    # Unwind.
+    await loop._handle_message(conn_a, {"type": "job_cancelled", "job_id": "job-live"})
+    await asyncio.wait_for(loop._current_job_task, timeout=10)
+
+
+async def test_receipt_message_is_processed_while_a_job_is_running(cancellable_loop):
+    loop = cancellable_loop
+    conn_a = loop.connections["worker-a"]
+
+    await loop._handle_message(conn_a, _job_message("job-concurrent"))
+    await _await_flag(loop.test_started)
+
+    await loop._handle_message(conn_a, {"type": "receipt", "receipt_id": "r-1", "payload": "p"})
+
+    assert conn_a.receipt_acks == [("r-1", "sig:p")]
+
+    await loop._handle_message(conn_a, {"type": "job_cancelled", "job_id": "job-concurrent"})
+    await asyncio.wait_for(loop._current_job_task, timeout=10)
+
+
+async def test_normal_completion_through_the_spawned_task_is_unchanged(
+    two_platform_loop, monkeypatch, tmp_path
+):
+    loop = two_platform_loop
+    conn_a = loop.connections["worker-a"]
+
+    output_dir = tmp_path / "output"
+    output_dir.mkdir()
+    out_file = output_dir / "result.png"
+    out_file.write_bytes(b"x")
+    loop.config.comfy_output_dir = str(output_dir)
+
+    monkeypatch.setattr(comfy, "run_workflow", lambda *a, **k: ([("result.png", b"bytes", "")], 1.0))
+    monkeypatch.setattr(AgentLoop, "_upload_artifact", lambda self, *a, **k: _noop_coro())
+
+    await loop._handle_message(conn_a, _job_message("job-normal"))
+    await asyncio.wait_for(loop._current_job_task, timeout=10)
+
+    assert conn_a.job_done == ("job-normal", ["result.png"], 1.0)
+    assert not out_file.exists()
+    assert conn_a.heartbeats[-1]["state"] == "idle"
+
+
+async def test_shutdown_reaps_a_still_running_job_task(cancellable_loop):
+    loop = cancellable_loop
+    conn_a = loop.connections["worker-a"]
+
+    await loop._handle_message(conn_a, _job_message("job-shutdown"))
+    await _await_flag(loop.test_started)
+
+    task = loop._current_job_task
+    await asyncio.wait_for(loop.shutdown(), timeout=10)
+
+    assert task.done()
+    assert not loop._job_tasks
