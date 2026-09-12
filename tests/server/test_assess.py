@@ -170,6 +170,17 @@ def test_extract_treats_loadaudio_audio_input_as_an_asset():
     assert needs.assets == {"voice.wav", "ref.png"}
 
 
+def test_extract_treats_loadvideo_file_input_as_an_asset():
+    # Core LoadVideo names its asset field `file` (video_upload combo).
+    # Mirrored client-side in web/src/lib/workflow.ts.
+    workflow = {
+        "1": {"class_type": "LoadVideo", "inputs": {"file": "clip.mp4"}},
+        "2": {"class_type": "GetVideoComponents", "inputs": {"video": ["1", 0]}},
+    }
+    needs = assess.extract(workflow)
+    assert needs.assets == {"clip.mp4"}
+
+
 def test_verdict_backend_override_mismatch_is_ineligible():
     worker = _worker("w1")
     worker.backend = "rocm"

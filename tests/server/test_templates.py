@@ -213,7 +213,7 @@ def test_package_data_is_locatable_via_importlib_resources():
     for name in templates.TEMPLATE_NAMES:
         assert os.path.isfile(os.path.join(root, f"{name}.json"))
         assert os.path.isfile(os.path.join(root, f"{name}-1.webp"))
-    assert templates.asset_names() == ["amyntas_ref.png"]
+    assert templates.asset_names() == ["amyntas_ref.png", "comfyfed_sample_clip.mp4"]
     assert os.path.isfile(os.path.join(templates.assets_dir(), "amyntas_ref.png"))
 
 
@@ -381,7 +381,9 @@ def test_seed_staging_does_not_clobber_an_existing_file(tmp_path):
     with open(target, "wb") as f:
         f.write(b"mine")
 
-    assert templates.seed_staging(staging) == []
+    # Only the untouched sample clip gets seeded; the pre-existing image is
+    # left alone.
+    assert templates.seed_staging(staging) == ["comfyfed_sample_clip.mp4"]
     with open(target, "rb") as f:
         assert f.read() == b"mine"
 
@@ -445,6 +447,46 @@ def test_object_info_offers_staged_images_in_upload_dropdowns(client):
 
     # Nodes with no upload widget are untouched.
     assert body["CLIPTextEncode"]["input"]["required"]["text"] == ["STRING", {"multiline": True}]
+
+
+def test_object_info_offers_staged_files_by_media_kind(client):
+    """Videos land in `file`/video_upload dropdowns, images in `image` ones —
+    never crosswise (a staged mp4 in a LoadImage list would just fail at
+    execution)."""
+    csrf = _login(client)
+    _register_worker_with(
+        client,
+        csrf,
+        {
+            "LoadImage": {
+                "input": {"required": {"image": [["w.png"], {"image_upload": True}]}},
+            },
+            "LoadVideo": {
+                "input": {"required": {"file": [["w.mp4"], {"video_upload": True}]}},
+            },
+            "LoadAudio": {
+                "input": {"required": {"audio": [["w.wav"], {"audio_upload": True}]}},
+            },
+        },
+    )
+    for name in ("clip.mp4", "voice.wav"):
+        with open(os.path.join(comfyapi.staging_dir(client.data_dir), name), "wb") as f:
+            f.write(b"x")
+
+    body = client.get("/comfy/api/object_info").json()
+
+    image_options = body["LoadImage"]["input"]["required"]["image"][0]
+    video_options = body["LoadVideo"]["input"]["required"]["file"][0]
+    audio_options = body["LoadAudio"]["input"]["required"]["audio"][0]
+
+    assert "clip.mp4" in video_options and "comfyfed_sample_clip.mp4" in video_options
+    assert "voice.wav" in audio_options
+    # No cross-contamination in any direction.
+    assert not any(n.endswith((".mp4", ".wav")) for n in image_options)
+    assert not any(n.endswith((".png", ".wav")) for n in video_options)
+    assert not any(n.endswith((".png", ".mp4")) for n in audio_options)
+    # Images (packaged amyntas_ref.png) still reach the image dropdown.
+    assert "amyntas_ref.png" in image_options
 
 
 def test_object_info_injection_does_not_duplicate_or_poison_the_cache(client):

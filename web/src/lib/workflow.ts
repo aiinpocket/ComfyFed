@@ -21,10 +21,10 @@ const MODEL_FIELD_NAMES = new Set([
 
 const MODEL_EXTENSIONS = ['.safetensors', '.ckpt', '.pt', '.sft', '.gguf'];
 
-const ASSET_NODE_CLASSES = new Set(['LoadImage', 'LoadImageMask', 'LoadAudio']);
+const ASSET_NODE_CLASSES = new Set(['LoadImage', 'LoadImageMask', 'LoadAudio', 'LoadVideo']);
 
 /** Input fields on those classes that name an uploaded file. */
-const ASSET_FIELD_NAMES = ['image', 'audio', 'video'];
+const ASSET_FIELD_NAMES = ['image', 'audio', 'video', 'file'];
 
 export interface WorkflowSummary {
   nodeCount: number;

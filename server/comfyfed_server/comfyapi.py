@@ -360,6 +360,15 @@ def _merge_options(spec: list, names: list[str]) -> Optional[list]:
     return None
 
 
+# Which staged-file extensions belong in which upload dropdown. Keys match
+# the three core upload-field conventions handled in `_with_staged_images`.
+_UPLOAD_FIELD_EXTENSIONS = {
+    "image": {".png", ".jpg", ".jpeg", ".webp", ".gif", ".bmp"},
+    "audio": {".wav", ".mp3", ".flac", ".ogg", ".m4a"},
+    "file": {".mp4", ".webm", ".mov", ".mkv", ".avi"},
+}
+
+
 def _with_staged_images(object_info: dict, names: list[str]) -> dict:
     """Offer every staged filename in the `image` dropdown of upload nodes.
 
@@ -372,15 +381,33 @@ def _with_staged_images(object_info: dict, names: list[str]) -> dict:
     resolves it perfectly well.
 
     "Upload node" is detected the way ComfyUI itself marks one: a required
-    `image` input whose config carries `image_upload`. That catches
-    `LoadImage`, `LoadImageMask` and any custom node following the same
-    convention, without hard-coding a class list.
+    input whose config carries the matching `*_upload` flag. Three core
+    conventions exist -- `image`/`image_upload` (`LoadImage`,
+    `LoadImageMask`), `audio`/`audio_upload` (`LoadAudio`) and
+    `file`/`video_upload` (`LoadVideo`) -- and any custom node following one
+    of them is caught too, without hard-coding a class list.
 
     Node defs are copied on write, because the caller's dict is the shared
     `/object_info` union cache.
     """
     if not names or not isinstance(object_info, dict):
         return object_info
+
+    # Staged files are offered only to dropdowns of their own media kind: an
+    # mp4 in a LoadImage list would just be a confusing selection that fails
+    # at execution. A name with an extension none of the kinds claim is
+    # offered everywhere -- graceful for exotic formats a custom node might
+    # accept.
+    known = {ext for exts in _UPLOAD_FIELD_EXTENSIONS.values() for ext in exts}
+
+    def names_for(field_name: str) -> list[str]:
+        exts = _UPLOAD_FIELD_EXTENSIONS[field_name]
+        return [
+            n for n in names
+            if os.path.splitext(n)[1].lower() in exts or os.path.splitext(n)[1].lower() not in known
+        ]
+
+    upload_fields = (("image", "image_upload"), ("audio", "audio_upload"), ("file", "video_upload"))
 
     result = object_info
     for node_name, node_def in object_info.items():
@@ -389,21 +416,24 @@ def _with_staged_images(object_info: dict, names: list[str]) -> dict:
         required = node_def.get("input", {}).get("required") if isinstance(node_def.get("input"), dict) else None
         if not isinstance(required, dict):
             continue
-        spec = required.get("image")
-        if not isinstance(spec, list) or len(spec) < 2 or not isinstance(spec[1], dict):
-            continue
-        if not spec[1].get("image_upload"):
-            continue
-        merged = _merge_options(spec, names)
-        if merged is None or merged == spec:
-            continue
-        if result is object_info:
-            result = dict(object_info)
-        patched_def = dict(node_def)
-        patched_input = dict(patched_def["input"])
-        patched_input["required"] = {**required, "image": merged}
-        patched_def["input"] = patched_input
-        result[node_name] = patched_def
+        for field_name, upload_flag in upload_fields:
+            spec = required.get(field_name)
+            if not isinstance(spec, list) or len(spec) < 2 or not isinstance(spec[1], dict):
+                continue
+            if not spec[1].get(upload_flag):
+                continue
+            merged = _merge_options(spec, names_for(field_name))
+            if merged is None or merged == spec:
+                continue
+            if result is object_info:
+                result = dict(object_info)
+            patched_def = dict(result[node_name]) if result[node_name] is node_def else result[node_name]
+            patched_input = dict(patched_def["input"])
+            patched_required = dict(patched_input.get("required") or {})
+            patched_required[field_name] = merged
+            patched_input["required"] = patched_required
+            patched_def["input"] = patched_input
+            result[node_name] = patched_def
     return result
 
 

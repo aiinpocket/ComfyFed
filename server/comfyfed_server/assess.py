@@ -35,11 +35,12 @@ _MODEL_EXTENSIONS = (".safetensors", ".ckpt", ".pt", ".sft", ".gguf")
 
 # Node classes whose inputs name a file the submitter must upload with the job.
 # Mirrored client-side in web/src/lib/workflow.ts -- keep the two lists in step.
-_ASSET_NODE_CLASSES = {"LoadImage", "LoadImageMask", "LoadAudio"}
+_ASSET_NODE_CLASSES = {"LoadImage", "LoadImageMask", "LoadAudio", "LoadVideo"}
 
 # Input fields on those classes that carry an asset filename. The spec calls
-# for image/audio/video fields; ComfyUI's core LoadAudio uses `audio`.
-_ASSET_FIELD_NAMES = ("image", "audio", "video")
+# for image/audio/video fields; ComfyUI's core LoadAudio uses `audio` and
+# core LoadVideo uses `file`.
+_ASSET_FIELD_NAMES = ("image", "audio", "video", "file")
 
 _VRAM_FUDGE_FACTOR = 1.15
 
