@@ -1158,3 +1158,98 @@ async def test_periodic_heartbeat_only_names_the_job_on_its_own_platform(
 
     await loop._handle_message(conn_a, {"type": "job_cancelled", "job_id": "job-scoped"})
     await asyncio.wait_for(task, timeout=10)
+
+
+# --- Re-review round 2 ------------------------------------------------------
+
+
+async def _run_connection_loop_briefly(loop, conn, seconds: float = 0.1) -> None:
+    loop_task = asyncio.create_task(loop._connection_loop(conn))
+    await asyncio.sleep(seconds)
+    loop_task.cancel()
+    try:
+        await loop_task
+    except asyncio.CancelledError:
+        pass
+
+
+async def test_heartbeat_keeps_naming_the_running_job_when_another_platform_dispatches(
+    cancellable_loop, monkeypatch
+):
+    """A second platform's job queues behind the single-job lock. That must
+    not stop platform A's heartbeat naming the job that is actually RUNNING
+    -- otherwise "learns within one heartbeat" dies for the whole rest of
+    job A's run, in exactly the multi-platform case federation exists for.
+
+    The waiting platform's own heartbeat carries no job_id: its job has not
+    started, and naming it would have the server mark it running and start
+    its wall clock early.
+    """
+    loop = cancellable_loop
+    conn_a = loop.connections["worker-a"]
+    conn_b = loop.connections["worker-b"]
+
+    monkeypatch.setattr(runner_module, "_HEARTBEAT_INTERVAL_SECONDS", 0)
+    monkeypatch.setattr(runner_module, "_RECV_POLL_TIMEOUT_SECONDS", 0.01)
+
+    await loop._handle_message(conn_a, _job_message("job-a"))
+    task_a = loop._current_job_task
+    await _await_flag(loop.test_started)
+
+    # Platform B dispatches while A's job is mid-run: spawned, but parked on
+    # the job lock until A finishes.
+    await loop._handle_message(conn_b, _job_message("job-b"))
+    task_b = loop._current_job_task
+    await asyncio.sleep(0.05)
+    assert not task_b.done()
+
+    conn_a.heartbeats.clear()
+    conn_b.heartbeats.clear()
+    await _run_connection_loop_briefly(loop, conn_a)
+    await _run_connection_loop_briefly(loop, conn_b)
+
+    assert conn_a.heartbeats, "the periodic heartbeat never fired"
+    assert all(hb["job_id"] == "job-a" for hb in conn_a.heartbeats)
+    assert conn_b.heartbeats
+    assert all(hb["job_id"] is None for hb in conn_b.heartbeats)
+
+    # Unwind both.
+    await loop._handle_message(conn_a, {"type": "job_cancelled", "job_id": "job-a"})
+    await asyncio.wait_for(task_a, timeout=10)
+    await loop._handle_message(conn_b, {"type": "job_cancelled", "job_id": "job-b"})
+    await asyncio.wait_for(task_b, timeout=10)
+
+
+async def test_held_completion_backs_off_when_the_socket_is_live_but_uploads_fail(
+    two_platform_loop, monkeypatch
+):
+    """An artifact upload that cannot reach the platform over HTTP while the
+    WebSocket is perfectly healthy must still be paced -- otherwise the
+    documented 1s->30s backoff is skipped entirely and the agent hammers a
+    failing endpoint as fast as it answers."""
+    loop = two_platform_loop
+    conn_a = loop.connections["worker-a"]
+
+    monkeypatch.setattr(runner_module, "_REPORT_RETRY_START_SECONDS", 0.2)
+    monkeypatch.setattr(comfy, "run_workflow", lambda *a, **k: ([("result.png", b"bytes", "")], 1.0))
+
+    assert conn_a.ws is not None, "this test is about a LIVE socket"
+    attempts: list[float] = []
+
+    async def _unreachable_then_ok(self, entry, job_id, filename, content):
+        attempts.append(time.monotonic())
+        if len(attempts) < 3:
+            raise runner_module.PlatformUnavailable("connection refused")
+
+    monkeypatch.setattr(AgentLoop, "_upload_artifact", _unreachable_then_ok)
+
+    await loop._handle_message(conn_a, _job_message("job-http-backoff"))
+    task = loop._current_job_task
+    await asyncio.wait_for(task, timeout=10)
+
+    assert len(attempts) == 3
+    gaps = [b - a for a, b in zip(attempts, attempts[1:])]
+    assert gaps[0] >= 0.15, f"first retry was not paced: {gaps}"
+    assert gaps[1] >= gaps[0], f"backoff did not grow: {gaps}"
+    assert conn_a.job_done == ("job-http-backoff", ["result.png"], 1.0)
+    assert conn_a.job_failed is None

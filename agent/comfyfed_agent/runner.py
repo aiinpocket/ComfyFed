@@ -337,6 +337,11 @@ class _JobHandle:
     cancel_event: asyncio.Event = field(default_factory=asyncio.Event)
     prompt_id: Optional[str] = None
     task: Optional[asyncio.Task] = None
+    # True from the moment this job wins `job_lock` until it finishes. The
+    # single-job invariant means at most one handle has it set, and it is
+    # what "busy with THIS job" means: a second platform's job that has been
+    # dispatched but is still parked on the lock is emphatically not running.
+    running: bool = False
     # True while the run is over and only the hand-off (artifact uploads +
     # job_done) is left. Such a job must not be cancel-evented by shutdown:
     # there is nothing left to abort, only a result to deliver or preserve.
@@ -448,6 +453,7 @@ class AgentLoop:
                 raise comfy.JobCancelled()
 
         async with self.job_lock:
+            handle.running = True
             try:
                 # The platform may have cancelled while this job waited for
                 # the lock, or between dispatch and here.
@@ -535,6 +541,7 @@ class AgentLoop:
                     logger.exception("runner: job %s failed", job_id)
                     await conn.send_job_failed(job_id, str(exc))
             finally:
+                handle.running = False
                 if cancelled:
                     # Last look at the prompt id: a cancel that raced the
                     # `/prompt` POST had nothing to stop when it arrived.
@@ -618,21 +625,34 @@ class AgentLoop:
                     "holding the completion, retrying in %.0fs",
                     job_id, exc, backoff,
                 )
-                await self._wait_for_live_connection(conn, backoff)
+                await self._wait_before_retry(conn, backoff)
                 backoff = min(backoff * 2, _REPORT_RETRY_MAX_SECONDS)
 
-    async def _wait_for_live_connection(self, conn: PlatformConnection, timeout: float) -> None:
-        """Sleep until `conn` has a socket again, or `timeout` elapses.
+    async def _wait_before_retry(self, conn: PlatformConnection, backoff: float) -> None:
+        """Pace the next hand-off attempt: sleep `backoff`, cut short only if
+        a socket that was down comes back.
 
+        The two transport failures behind a held completion want different
+        things. A dead WebSocket has a definite recovery signal --
         `_run_platform` reconnects on the SAME `PlatformConnection` object,
-        replacing `.ws` in place, so that attribute is the signal a held
-        completion waits on. The timeout keeps this a backoff rather than a
-        promise: a retry against a socket that is merely about to die simply
-        fails again and backs off further.
+        replacing `.ws` in place -- so waiting on that attribute resumes the
+        moment it is worth resuming. An artifact upload that failed over
+        HTTP has no such signal (it runs on its own client against
+        `entry.platform_url`, entirely independent of this socket), and the
+        socket being alive says nothing about it: returning immediately on
+        that basis would retry a failing endpoint as fast as it can answer,
+        with no cooldown at all. So the backoff is always actually slept
+        unless the specific thing it was waiting for has happened.
         """
-        deadline = time.monotonic() + timeout
-        while getattr(conn, "ws", None) is None and time.monotonic() < deadline:
-            await asyncio.sleep(min(0.25, timeout))
+        socket_was_down = getattr(conn, "ws", None) is None
+        deadline = time.monotonic() + backoff
+        while True:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                return
+            await asyncio.sleep(min(0.25, remaining))
+            if socket_was_down and getattr(conn, "ws", None) is not None:
+                return
 
     async def _download_input(self, entry: PlatformEntry, job_id: str, filename: str) -> bytes:
         path = f"/api/agent/jobs/{job_id}/inputs/{filename}"
@@ -740,14 +760,28 @@ class AgentLoop:
         heartbeat is worse than naming none: that platform never issued the
         id, would read it as not-owned, and would push a `job_cancelled`
         that aborts a healthy run.
+
+        Two deliberate choices, both about what happens when a second
+        platform dispatches while the first platform's job is running:
+
+        - The answer is derived from `handle.running`, not from
+          `_current_job_id`. That pointer means "most recently spawned",
+          and a second platform's job is spawned the moment it arrives even
+          though `job_lock` parks it until the first finishes -- so keying
+          on it would blank out the RUNNING job's id on its own platform's
+          heartbeats for the rest of its run, which is precisely the gap
+          this whole mechanism exists to close.
+        - The waiting platform's heartbeat carries no job_id (its `state`
+          still goes busy, as the job broadcast already made it). Naming a
+          job that has not started would have the server flip it to
+          `running` and stamp `started_at`, starting its wall clock -- and
+          the billing bound derived from it -- while it is still queued
+          behind another platform's work.
         """
-        job_id = self._current_job_id
-        if job_id is None:
-            return None
-        handle = self._jobs.get(job_id)
-        if handle is None or handle.conn is not conn:
-            return None
-        return job_id
+        for handle in self._jobs.values():
+            if handle.running and handle.conn is conn:
+                return handle.job_id
+        return None
 
     async def _handle_job_cancelled(self, conn: PlatformConnection, message: dict) -> None:
         """Platform says this job is no longer ours: stop ComfyUI and wind down.
