@@ -1,0 +1,533 @@
+import io
+import json
+import os
+from datetime import datetime, timedelta, timezone
+
+import pytest
+from fastapi.testclient import TestClient
+
+from comfyfed_server import app as app_module
+from comfyfed_server import bootstrap, db, dispatch
+
+
+@pytest.fixture()
+def client(tmp_path):
+    data_dir = str(tmp_path)
+    result = bootstrap.ensure_installed(data_dir, lang="en", url="http://h", interactive=False)
+    app = app_module.create_app(data_dir)
+    c = TestClient(app)
+    c.admin_password = result.admin_password
+    c.data_dir = data_dir
+    return c
+
+
+def _login(client):
+    r = client.post("/api/auth/login", json={"password": client.admin_password})
+    assert r.status_code == 200
+    return r.json()["csrf"]
+
+
+def _register_worker(client, csrf, name, **kwargs):
+    r = client.post("/api/workers/tokens", json={"name": name}, headers={"X-CSRF": csrf})
+    token = r.json()["bundle"]["register_token"]
+    reg = client.post("/api/agent/register", json={"token": token, "name": name, "pubkey": "ab" * 32})
+    worker_id = reg.json()["worker_id"]
+
+    if kwargs:
+        with db.get_session() as session:
+            worker = session.get(db.Worker, worker_id)
+            for key, value in kwargs.items():
+                setattr(worker, key, json.dumps(value) if isinstance(value, (dict, list)) else value)
+            session.commit()
+
+    return worker_id
+
+
+SIMPLE_WORKFLOW = {
+    "1": {
+        "class_type": "KSampler",
+        "inputs": {"seed": 1},
+    },
+}
+
+
+def _submit(client, csrf, workflow=None, requirements=None, files=None):
+    data = {"workflow_json": json.dumps(workflow if workflow is not None else SIMPLE_WORKFLOW)}
+    if requirements is not None:
+        data["requirements"] = json.dumps(requirements)
+    return client.post(
+        "/api/jobs",
+        data=data,
+        files=files or [],
+        headers={"X-CSRF": csrf},
+    )
+
+
+def test_submit_job_creates_queued_job(client):
+    csrf = _login(client)
+    r = _submit(client, csrf)
+    assert r.status_code == 200
+    job_id = r.json()["job_id"]
+
+    listed = client.get("/api/jobs", headers={"X-CSRF": csrf}).json()
+    job = next(j for j in listed if j["id"] == job_id)
+    assert job["status"] == "queued"
+
+
+def test_submit_missing_assets_400(client):
+    csrf = _login(client)
+    workflow = {"1": {"class_type": "LoadImage", "inputs": {"image": "ref.png"}}}
+    r = _submit(client, csrf, workflow=workflow)
+    assert r.status_code == 400
+    assert r.json()["error"]["code"] == "jobs.missing_assets"
+    assert "ref.png" in r.json()["error"]["message"]
+
+
+def test_submit_with_asset_upload_succeeds(client):
+    csrf = _login(client)
+    workflow = {"1": {"class_type": "LoadImage", "inputs": {"image": "ref.png"}}}
+    files = [("assets", ("ref.png", io.BytesIO(b"fake-png-bytes"), "image/png"))]
+    r = _submit(client, csrf, workflow=workflow, files=files)
+    assert r.status_code == 200
+    job_id = r.json()["job_id"]
+
+    detail = client.get(f"/api/jobs/{job_id}", headers={"X-CSRF": csrf}).json()
+    assert detail["input_assets"] == ["ref.png"]
+
+
+def test_dispatch_pick_is_atomic_across_two_workers(client):
+    csrf = _login(client)
+    w1 = _register_worker(client, csrf, "w1")
+    w2 = _register_worker(client, csrf, "w2")
+
+    r1 = _submit(client, csrf)
+    r2 = _submit(client, csrf)
+    assert r1.status_code == 200 and r2.status_code == 200
+
+    job_a = dispatch.pick_job_for(w1)
+    job_b = dispatch.pick_job_for(w2)
+
+    assert job_a is not None
+    assert job_a.id != (job_b.id if job_b else None)
+    # Only two jobs existed; a third pick should find nothing left.
+    job_c = dispatch.pick_job_for(w1)
+    assert job_c is None
+
+
+def test_dispatch_pick_skips_ineligible_without_blocking_later_jobs(client):
+    csrf = _login(client)
+    # Worker knows no custom nodes for the exotic job, but IS connected
+    # (nonempty node_classes), so the node check applies and it's ineligible.
+    worker = _register_worker(client, csrf, "w1", node_classes=["KSampler", "CheckpointLoaderSimple"])
+
+    exotic_workflow = {"1": {"class_type": "SomeExoticNode", "inputs": {}}}
+    _submit(client, csrf, workflow=exotic_workflow)
+    r2 = _submit(client, csrf)  # simple workflow the worker CAN run
+    job2_id = r2.json()["job_id"]
+
+    picked = dispatch.pick_job_for(worker)
+    assert picked is not None
+    assert picked.id == job2_id
+
+
+def test_requeue_stale_returns_job_to_queue_and_it_can_be_repicked(client):
+    csrf = _login(client)
+    w1 = _register_worker(client, csrf, "w1")
+    w2 = _register_worker(client, csrf, "w2")
+
+    r = _submit(client, csrf)
+    job_id = r.json()["job_id"]
+
+    picked = dispatch.pick_job_for(w1)
+    assert picked is not None and picked.id == job_id
+    dispatch.mark_running(job_id, w1)
+
+    stale_time = datetime.now(timezone.utc).replace(tzinfo=None) - timedelta(seconds=91)
+    with db.get_session() as session:
+        worker = session.get(db.Worker, w1)
+        worker.last_seen = stale_time
+        session.commit()
+
+    now = datetime.now(timezone.utc).replace(tzinfo=None)
+    count = dispatch.requeue_stale(now)
+    assert count == 1
+
+    with db.get_session() as session:
+        job = session.get(db.Job, job_id)
+        assert job.status == "queued"
+        assert job.worker_id is None
+        assert job.progress == 0
+        worker = session.get(db.Worker, w1)
+        assert worker.status == "offline"
+
+    repicked = dispatch.pick_job_for(w2)
+    assert repicked is not None
+    assert repicked.id == job_id
+
+
+def test_assessment_endpoint_reports_per_worker_verdicts(client):
+    csrf = _login(client)
+    _register_worker(client, csrf, "w1", model_inventory=[{"name": "sd_xl_base.safetensors", "size": 4.0}])
+
+    r = _submit(client, csrf)
+    job_id = r.json()["job_id"]
+
+    res = client.get(f"/api/jobs/{job_id}/assessment", headers={"X-CSRF": csrf})
+    assert res.status_code == 200
+    workers = res.json()["workers"]
+    assert len(workers) == 1
+    assert workers[0]["verdict"] == "eligible"
+
+
+def test_asset_download_only_for_assigned_worker(client):
+    csrf = _login(client)
+
+    # Register two workers with real keypairs so we can sign agent requests.
+    from nacl.signing import SigningKey
+
+    def register_with_key(name):
+        sk = SigningKey.generate()
+        pubkey_hex = bytes(sk.verify_key).hex()
+        r = client.post("/api/workers/tokens", json={"name": name}, headers={"X-CSRF": csrf})
+        token = r.json()["bundle"]["register_token"]
+        reg = client.post("/api/agent/register", json={"token": token, "name": name, "pubkey": pubkey_hex})
+        return reg.json()["worker_id"], sk
+
+    w1_id, w1_key = register_with_key("agent1")
+    w2_id, w2_key = register_with_key("agent2")
+
+    workflow = {"1": {"class_type": "LoadImage", "inputs": {"image": "ref.png"}}}
+    files = [("assets", ("ref.png", io.BytesIO(b"fake-png-bytes"), "image/png"))]
+    r = _submit(client, csrf, workflow=workflow, files=files)
+    job_id = r.json()["job_id"]
+
+    # Assign the job to worker 1 directly via dispatch.
+    with db.get_session() as session:
+        job = session.get(db.Job, job_id)
+        job.status = "assigned"
+        job.worker_id = w1_id
+        session.commit()
+
+    def sign_and_get(worker_id, signing_key, path):
+        import secrets
+        import time
+
+        ts = str(int(time.time()))
+        nonce = secrets.token_hex(8)
+        message = f"GET\n{path}\n{ts}\n{nonce}\n".encode()
+        sig = signing_key.sign(message).signature.hex()
+        return client.get(
+            path,
+            headers={
+                "X-Worker-Id": worker_id,
+                "X-Ts": ts,
+                "X-Nonce": nonce,
+                "X-Sig": sig,
+            },
+        )
+
+    path = f"/api/agent/jobs/{job_id}/inputs/ref.png"
+
+    ok = sign_and_get(w1_id, w1_key, path)
+    assert ok.status_code == 200
+    assert ok.content == b"fake-png-bytes"
+
+    forbidden = sign_and_get(w2_id, w2_key, path)
+    assert forbidden.status_code == 403
+    assert forbidden.json()["error"]["code"] == "jobs.not_assigned"
+
+
+def test_requeue_stale_requeues_a_worker_that_never_heartbeated(client):
+    """I1: a handshaked-but-dead agent's job must not be stranded.
+
+    `last_seen` is None until the first heartbeat, so a worker that took a job
+    push and then died was previously skipped by the staleness sweep forever.
+    """
+    csrf = _login(client)
+    w1 = _register_worker(client, csrf, "w1")
+    w2 = _register_worker(client, csrf, "w2")
+
+    r = _submit(client, csrf)
+    job_id = r.json()["job_id"]
+
+    picked = dispatch.pick_job_for(w1)
+    assert picked is not None and picked.id == job_id
+
+    old = datetime.now(timezone.utc).replace(tzinfo=None) - timedelta(seconds=200)
+    with db.get_session() as session:
+        worker = session.get(db.Worker, w1)
+        worker.last_seen = None
+        worker.created_at = old  # registered long ago, never checked in
+        # Keep w2 fresh so the sweep doesn't take it offline too.
+        session.get(db.Worker, w2).last_seen = datetime.now(timezone.utc).replace(tzinfo=None)
+        session.commit()
+
+    count = dispatch.requeue_stale(datetime.now(timezone.utc).replace(tzinfo=None))
+    assert count == 1
+
+    with db.get_session() as session:
+        job = session.get(db.Job, job_id)
+        assert job.status == "queued"
+        assert job.worker_id is None
+        assert session.get(db.Worker, w1).status == "offline"
+
+
+def test_requeue_stale_leaves_a_freshly_registered_worker_alone(client):
+    """The created_at fallback must not requeue a worker that just joined."""
+    csrf = _login(client)
+    w1 = _register_worker(client, csrf, "w1")
+
+    r = _submit(client, csrf)
+    job_id = r.json()["job_id"]
+    assert dispatch.pick_job_for(w1) is not None
+
+    assert dispatch.requeue_stale(datetime.now(timezone.utc).replace(tzinfo=None)) == 0
+    with db.get_session() as session:
+        assert session.get(db.Job, job_id).status == "assigned"
+
+
+def test_upload_with_dot_dot_filename_is_400_not_500(client):
+    """M1: a bare '..' asset name used to reach os.path.basename and blow up."""
+    csrf = _login(client)
+    workflow = {"1": {"class_type": "LoadImage", "inputs": {"image": ".."}}}
+    files = [("assets", ("..", io.BytesIO(b"evil"), "application/octet-stream"))]
+    r = _submit(client, csrf, workflow=workflow, files=files)
+
+    assert r.status_code == 400
+    assert r.json()["error"]["code"] == "jobs.bad_asset_name"
+
+
+def test_upload_with_traversal_filename_is_400(client):
+    csrf = _login(client)
+    files = [("assets", ("../../etc/passwd", io.BytesIO(b"evil"), "application/octet-stream"))]
+    r = _submit(client, csrf, files=files)
+
+    assert r.status_code == 400
+    assert r.json()["error"]["code"] == "jobs.bad_asset_name"
+
+
+def _fail_job(job_id, worker_id):
+    with db.get_session() as session:
+        job = session.get(db.Job, job_id)
+        job.status = "failed"
+        job.worker_id = worker_id
+        job.error = "boom"
+        job.progress = 0.4
+        job.started_at = datetime.now(timezone.utc).replace(tzinfo=None)
+        job.finished_at = datetime.now(timezone.utc).replace(tzinfo=None)
+        session.commit()
+
+
+def test_retry_requeues_a_failed_job_and_clears_the_last_attempt(client):
+    csrf = _login(client)
+    w1 = _register_worker(client, csrf, "w1")
+    job_id = _submit(client, csrf).json()["job_id"]
+    _fail_job(job_id, w1)
+
+    r = client.post(f"/api/jobs/{job_id}/retry", headers={"X-CSRF": csrf})
+    assert r.status_code == 200
+
+    with db.get_session() as session:
+        job = session.get(db.Job, job_id)
+        assert job.status == "queued"
+        assert job.worker_id is None
+        assert job.error is None
+        assert job.progress == 0
+        assert job.started_at is None
+        assert job.finished_at is None
+
+    # And it is dispatchable again.
+    assert dispatch.pick_job_for(w1) is not None
+
+
+def test_retry_on_a_non_failed_job_is_409(client):
+    csrf = _login(client)
+    job_id = _submit(client, csrf).json()["job_id"]  # still queued
+
+    r = client.post(f"/api/jobs/{job_id}/retry", headers={"X-CSRF": csrf})
+    assert r.status_code == 409
+    assert r.json()["error"]["code"] == "jobs.not_retryable"
+
+
+def test_retry_unknown_job_is_404(client):
+    csrf = _login(client)
+    r = client.post("/api/jobs/does-not-exist/retry", headers={"X-CSRF": csrf})
+    assert r.status_code == 404
+    assert r.json()["error"]["code"] == "jobs.not_found"
+
+
+def test_retry_requires_csrf(client):
+    csrf = _login(client)
+    job_id = _submit(client, csrf).json()["job_id"]
+    r = client.post(f"/api/jobs/{job_id}/retry")
+    assert r.status_code == 403
+    assert r.json()["error"]["code"] == "auth.csrf"
+
+
+def test_artifact_download_streams_the_stored_file(client):
+    from comfyfed_server import storage
+
+    csrf = _login(client)
+    job_id = _submit(client, csrf).json()["job_id"]
+
+    store = storage.get_store(client.data_dir)
+    store.put(job_id, "out.png", io.BytesIO(b"RESULT-BYTES"))
+
+    r = client.get(f"/api/jobs/{job_id}/artifacts/out.png", headers={"X-CSRF": csrf})
+    assert r.status_code == 200
+    assert r.content == b"RESULT-BYTES"
+    assert r.headers["content-length"] == str(len(b"RESULT-BYTES"))
+
+
+def test_artifact_download_missing_file_is_404(client):
+    csrf = _login(client)
+    job_id = _submit(client, csrf).json()["job_id"]
+    r = client.get(f"/api/jobs/{job_id}/artifacts/nope.png", headers={"X-CSRF": csrf})
+    assert r.status_code == 404
+    assert r.json()["error"]["code"] == "jobs.artifact_not_found"
+
+
+def test_artifact_store_path_rejects_traversal_and_missing_files(client):
+    """`path()` is what the download route hands to FileResponse, so it must
+    apply the same sanitising as `open()` (and not exist-check its way out)."""
+    import pytest as _pytest
+
+    from comfyfed_server import storage
+
+    csrf = _login(client)
+    job_id = _submit(client, csrf).json()["job_id"]
+    store = storage.get_store(client.data_dir)
+
+    with _pytest.raises(ValueError):
+        store.path(job_id, "../../secrets.txt")
+    with _pytest.raises(ValueError):
+        store.path(job_id, "..")
+    with _pytest.raises(FileNotFoundError):
+        store.path(job_id, "never-written.png")
+
+    store.put(job_id, "ok.png", io.BytesIO(b"x"))
+    assert os.path.isfile(store.path(job_id, "ok.png"))
+
+
+def test_artifact_store_base_path_is_not_implemented_by_default():
+    """A non-local backend must raise, so its route can redirect instead."""
+    import pytest as _pytest
+
+    from comfyfed_server import storage
+
+    class _Remote(storage.ArtifactStore):
+        def put(self, job_id, filename, stream):
+            return filename
+
+        def open(self, job_id, filename):
+            raise FileNotFoundError
+
+        def url(self, job_id, filename):
+            return "https://example.invalid/x"
+
+    with _pytest.raises(NotImplementedError):
+        _Remote().path("j", "f.png")
+
+
+# A realistic flux workflow: loader values are CATEGORY-relative bare names.
+FLUX_WORKFLOW = {
+    "1": {"class_type": "UNETLoader", "inputs": {"unet_name": "flux1-dev.safetensors"}},
+    "2": {
+        "class_type": "DualCLIPLoader",
+        "inputs": {"clip_name1": "t5xxl_fp16.safetensors", "clip_name2": "clip_l.safetensors"},
+    },
+    "3": {"class_type": "VAELoader", "inputs": {"vae_name": "ae.safetensors"}},
+    "4": {"class_type": "KSampler", "inputs": {"seed": 1, "model": ["1", 0]}},
+}
+
+# The same models as the agent reports them: relative to the models ROOT.
+FLUX_ROOT_RELATIVE_INVENTORY = [
+    {"name": "diffusion_models/flux1-dev.safetensors", "size": 11.9},
+    {"name": "text_encoders/t5xxl_fp16.safetensors", "size": 9.8},
+    {"name": "text_encoders/clip_l.safetensors", "size": 0.25},
+    {"name": "vae/ae.safetensors", "size": 0.3},
+]
+
+
+def test_flux_job_fits_a_16gb_card_and_dispatches(client):
+    """End-to-end guard for the live-reproduced failure on rtx5080-main.
+
+    Two separate defects had to be fixed for this to pass, and this test
+    covers both:
+
+    1. The worker's inventory is models-root-relative
+       ("diffusion_models/flux1-dev.safetensors") while the workflow's loader
+       values are category-relative ("flux1-dev.safetensors"). Exact-string
+       comparison judged every model missing.
+    2. Peak VRAM is the LARGEST single model (11.9 * 1.15 = 13.7), not the sum
+       of all four (25.6, which would still have blocked a 16 GB card).
+       ComfyUI loads and offloads models around the diffusion pass.
+    """
+    csrf = _login(client)
+    worker_id = _register_worker(
+        client,
+        csrf,
+        "rtx5080-main",
+        node_classes=["UNETLoader", "DualCLIPLoader", "VAELoader", "KSampler"],
+        model_inventory=FLUX_ROOT_RELATIVE_INVENTORY,
+        hardware={"vram_gb": 16.0},
+        dynamic={"free_disk_gb": 500.0},
+    )
+
+    job_id = _submit(client, csrf, workflow=FLUX_WORKFLOW).json()["job_id"]
+
+    detail = client.get(f"/api/jobs/{job_id}", headers={"X-CSRF": csrf}).json()
+    assert detail["est_vram_gb"] == pytest.approx(11.9 * 1.15)  # 13.685
+
+    entry = client.get(f"/api/jobs/{job_id}/assessment", headers={"X-CSRF": csrf}).json()["workers"][0]
+    assert entry["missing_models"] == []
+    assert entry["verdict"] == "eligible", entry
+
+    # And it actually dispatches, which is the whole point.
+    picked = dispatch.pick_job_for(worker_id)
+    assert picked is not None and picked.id == job_id
+
+
+def test_an_oversized_single_model_is_still_blocked_on_vram(client):
+    """The gate still catches absurd mismatches: a 24 GB model on an 8 GB card."""
+    csrf = _login(client)
+    _register_worker(
+        client,
+        csrf,
+        "small-card",
+        node_classes=["UNETLoader", "KSampler"],
+        model_inventory=[{"name": "diffusion_models/huge-model.safetensors", "size": 24.0}],
+        hardware={"vram_gb": 8.0},
+        dynamic={"free_disk_gb": 500.0},
+    )
+
+    workflow = {"1": {"class_type": "UNETLoader", "inputs": {"unet_name": "huge-model.safetensors"}}}
+    job_id = _submit(client, csrf, workflow=workflow).json()["job_id"]
+
+    detail = client.get(f"/api/jobs/{job_id}", headers={"X-CSRF": csrf}).json()
+    assert detail["est_vram_gb"] == pytest.approx(24.0 * 1.15)
+
+    entry = client.get(f"/api/jobs/{job_id}/assessment", headers={"X-CSRF": csrf}).json()["workers"][0]
+    assert entry["verdict"] == "ineligible"
+    assert any(r.startswith("vram:") for r in entry["reasons"])
+
+
+def test_flux_job_with_a_genuinely_absent_model_is_still_ineligible(client):
+    """The looser matching must not turn real misses into false eligibility."""
+    csrf = _login(client)
+    _register_worker(
+        client,
+        csrf,
+        "w1",
+        node_classes=["UNETLoader", "KSampler"],
+        model_inventory=[{"name": "diffusion_models/some-other-model.safetensors", "size": 4.0}],
+        hardware={"vram_gb": 16.0},
+    )
+
+    workflow = {"1": {"class_type": "UNETLoader", "inputs": {"unet_name": "flux1-dev.safetensors"}}}
+    job_id = _submit(client, csrf, workflow=workflow).json()["job_id"]
+
+    assessment = client.get(f"/api/jobs/{job_id}/assessment", headers={"X-CSRF": csrf}).json()
+    entry = assessment["workers"][0]
+    assert entry["verdict"] == "ineligible"
+    assert entry["missing_models"] == ["flux1-dev.safetensors"]

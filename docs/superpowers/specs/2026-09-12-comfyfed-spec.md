@@ -61,7 +61,8 @@ worker 斷線（>90s 無心跳）→ assigned/running 的任務自動回 queued 
 - 派工：平台推給「online 且 idle **且能力符合**」的 worker（WS push）；worker 接單後對**其他已註冊平台**廣播 busy。
 - **硬體與能力回報（定案，2026-09-12 架構審查後擴充）**：worker 上線握手時回報——硬體檔案（GPU 型號、VRAM 總量、CPU 型號/核心數、RAM 總量、模型目錄磁碟可用空間、agent 版本）＋**運算後端（cuda/rocm/mps/cpu）與 torch 版本**＋**已安裝節點類別清單**（取自本機 ComfyUI `/object_info`，即 custom nodes 的真實庫存）；心跳夾動態值（VRAM/RAM/磁碟可用量）。
 - **自動任務評估引擎（定案）**：需求**由平台從 workflow 自動推導**，不依賴使用者手填（可進階覆寫，但預設全自動——使用者多非 IT 背景）：
-  - 解析 workflow → ①node class 集合 ②**引用的模型檔清單**（掃描 loader 節點的 ckpt_name/unet_name/clip_name/vae_name/lora_name 等欄位）③**VRAM 粗估**（引用模型檔大小加總×係數，模型大小查聯邦庫存）
+  - 解析 workflow → ①node class 集合 ②**引用的模型檔清單**（掃描 loader 節點的 ckpt_name/unet_name/clip_name/vae_name/lora_name 等欄位——LoRA 與 checkpoint 同級對待，皆入庫存/判定/分發）③**VRAM 粗估**（最大單一引用模型×1.15──ComfyUI 順序載入/卸載，峰值由最大模型主導；聯邦庫存查大小）④**輸入素材清單**（LoadImage/LoadImageMask 等節點的 image/audio/video 欄位——如角色固定形象參考圖）
+  - **任務輸入素材隨任務走（定案，2026-09-12）**：模型靠庫存/分發，但參考圖等輸入素材是任務私有的——送任務時平台自動偵測 workflow 引用的輸入檔並要求附檔（multipart 上傳，存 `data/job_inputs/<job_id>/`）；agent 領工後以簽名請求下載附檔、POST 本機 ComfyUI `/upload/image` 放進 input 目錄，再送 `/prompt`。缺附檔的任務在送出前就被 UI 擋下，不會派出去才失敗。
   - worker 心跳夾**本地模型庫存**（檔名＋大小；雜湊 Phase 2 補），平台隨時知道誰有什麼
   - 每個 worker 對每個 job 得出三態判定：
     - `eligible`——節點✓ backend✓ VRAM✓ 模型全有 → 直接派
@@ -80,6 +81,7 @@ worker 斷線（>90s 無心跳）→ assigned/running 的任務自動回 queued 
 - **Phase 1（本計畫）**：平台核心＋Agent 核心端到端可用——安裝→登入→發識別碼→worker 註冊上線→送 workflow→派工執行→結果回傳→收據入帳→儀表板可視。
 - **Phase 2**：模型 manifest＋平台中繼下載；ComfyUI 相容 API 面板（原生 Comfy 前端直連平台）；`/object_info` 能力交集。
 - **Phase 3**：成員間 P2P 分塊傳輸；貢獻報表進階（分潤試算）；多管理員。
+- **未來方向：ComfyFed Cloud（2026-09-12 提出）**——平台端移植 Cloudflare Workers＋D1＋R2 的免自架部署形態：D1=SQLite（schema 近乎原樣）、R2=ArtifactStore 的 S3 介面（presigned 直傳、零出口費）、agent 長連 WS 改由 Durable Objects（hibernation）承接、派工迴圈改 DO alarms、Ed25519 驗簽走 WebCrypto。價值：DDNS/固定IP/NAT/TLS 痛點全消失。定位：**自架 Python 版仍是本體**（內網/離線場景＋資料自主），Cloud 版是第二部署形態；現有架構決策（outbound-only WS、S3 介面、簽章收據）已刻意為此保留可移植性。
 
 ## 9.5 架構審查補強（2026-09-12 定案，全部納入 Phase 1）
 

@@ -1,0 +1,67 @@
+html,
+body,
+#root {
+  height: 100%;
+}
+
+body {
+  margin: 0;
+  -webkit-font-smoothing: antialiased;
+  -moz-osx-font-smoothing: grayscale;
+}
+
+/* Slim, unobtrusive scrollbars that match the console chrome. */
+* {
+  scrollbar-width: thin;
+  scrollbar-color: #303648 transparent;
+}
+
+*::-webkit-scrollbar {
+  width: 9px;
+  height: 9px;
+}
+
+*::-webkit-scrollbar-thumb {
+  background: #303648;
+  border-radius: 999px;
+}
+
+*::-webkit-scrollbar-thumb:hover {
+  background: #3d4459;
+}
+
+*::-webkit-scrollbar-track {
+  background: transparent;
+}
+
+/* Status dot heartbeat, used while a worker is running a job. */
+@keyframes cf-pulse {
+  0% {
+    opacity: 1;
+    transform: scale(1);
+  }
+  50% {
+    opacity: 0.55;
+    transform: scale(0.86);
+  }
+  100% {
+    opacity: 1;
+    transform: scale(1);
+  }
+}
+
+.cf-pulse {
+  animation: cf-pulse 1.8s ease-in-out infinite;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .cf-pulse {
+    animation: none;
+  }
+}
+
+/* Table rows sit on card surfaces; keep separators subtle. */
+.mantine-Table-td,
+.mantine-Table-th {
+  border-color: #232838 !important;
+}
