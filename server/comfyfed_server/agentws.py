@@ -46,7 +46,7 @@ from fastapi import APIRouter, WebSocket, WebSocketDisconnect
 from nacl.exceptions import BadSignatureError
 from nacl.signing import SigningKey, VerifyKey
 
-from . import db, dispatch, metrics, security, workers
+from . import db, dispatch, metrics, panelws, security, workers
 
 logger = logging.getLogger(__name__)
 
@@ -189,15 +189,37 @@ async def _handle_message(worker_id: str, conn: _Connection, message: dict) -> N
             # applied, so a worker cannot mint contribution records for jobs
             # it does not own by sending someone else's job_id.
             if dispatch.mark_done(job_id, worker_id, message.get("result_files") or []):
+                _notify_panel_job_done(job_id)
                 await _create_and_push_receipt(worker_id, conn, job_id)
         elif msg_type == "job_failed":
-            dispatch.mark_failed(message.get("job_id"), worker_id, message.get("error") or "")
+            job_id = message.get("job_id")
+            error = message.get("error") or ""
+            if dispatch.mark_failed(job_id, worker_id, error):
+                panelws.job_failed(job_id, error)
         elif msg_type == "receipt_ack":
             _handle_receipt_ack(worker_id, message)
         else:
             logger.warning("agentws: unknown message type %r from worker %s", msg_type, worker_id)
     except Exception:
         logger.exception("agentws: error handling %r message from worker %s", msg_type, worker_id)
+
+
+def _notify_panel_job_done(job_id: Optional[str]) -> None:
+    """Fetch the just-finished job and hand it to `panelws.job_done`.
+
+    A separate lookup rather than reusing the row `dispatch.mark_done`
+    already touched: that call's session has already closed by the time it
+    returns, and `job_outputs` needs `result_files`/`workflow_json` off a
+    live row. Built and dispatched while the session is still open so nothing
+    on `job` is accessed post-detach.
+    """
+    if not job_id:
+        return
+    with db.get_session() as session:
+        job = session.get(db.Job, job_id)
+        if job is None:
+            return
+        panelws.job_done(job)
 
 
 def _handle_hello(worker_id: str, message: dict) -> None:
@@ -248,6 +270,7 @@ def _handle_heartbeat(worker_id: str, conn: _Connection, message: dict) -> bool:
                 if isinstance(progress, (int, float)):
                     job.progress = float(progress)
                     session.commit()
+                    panelws.job_progress(job_id, job.progress)
 
     # The agent broadcasts a busy heartbeat carrying the job_id the moment it
     # picks the job up (see agent runner.handle_job), and that is the only
@@ -256,7 +279,8 @@ def _handle_heartbeat(worker_id: str, conn: _Connection, message: dict) -> bool:
     # job_done receipt's gpu_seconds is computed from). Ownership and status
     # are gated inside dispatch.mark_running.
     if state == "busy" and message.get("job_id"):
-        dispatch.mark_running(message["job_id"], worker_id)
+        if dispatch.mark_running(message["job_id"], worker_id):
+            panelws.job_running(message["job_id"])
 
     try:
         m = metrics.get_metrics()

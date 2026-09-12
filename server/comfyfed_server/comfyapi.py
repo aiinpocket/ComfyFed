@@ -28,9 +28,16 @@ federation rather than a single GPU:
   worker defines the node set. When no worker is online the response is an
   empty dict plus `X-ComfyFed-No-Workers: 1`, so the panel can say "no
   workers" instead of "ComfyUI has no nodes".
-* `/view?type=input` is 404 until Task 3 adds input staging.
+* `/view?type=input` and `/upload/image` are backed by a flat staging
+  directory (`<data_dir>/comfy_staging/`), not ComfyUI's `input/` folder with
+  subfolders -- a prompt referencing a staged filename gets it COPIED into
+  the job's own inputs at submission time (see `_default_resolve_asset`), so
+  the same staged file can be reused across several prompts.
 * `prompt_id` is the ComfyFed job id, so a prompt submitted here is the same
   row the console's `/api/jobs` shows.
+* `/ws` is served by `create_ws_router` (not this module's admin-gated
+  router) and relays federation job lifecycle events -- see its docstring
+  for why it is split out and how it authenticates.
 """
 
 from __future__ import annotations
@@ -40,17 +47,50 @@ import mimetypes
 import os
 from typing import Callable, Optional
 
-from fastapi import APIRouter, Depends, Request
+from fastapi import APIRouter, Depends, File, Form, Request, UploadFile, WebSocket, WebSocketDisconnect
 from fastapi.responses import FileResponse, JSONResponse, Response
 
-from . import assess, auth, db, jobs, storage, workers
+from . import assess, auth, db, jobs, panelws, storage, workers
 
 # Node classes whose id keys a history entry's `outputs`. The ComfyUI frontend
 # looks up the images it should display under the id of the node that saved
-# them; when a workflow has none of these we fall back to `_FALLBACK_OUTPUT_KEY`
-# so the artifacts are still reachable.
+# them; when a workflow has none of these we fall back to `FALLBACK_OUTPUT_KEY`
+# so the artifacts are still reachable. Public: `panelws.job_done` uses it too.
 _OUTPUT_NODE_CLASSES = {"SaveImage", "SaveVideo", "SaveAudio"}
-_FALLBACK_OUTPUT_KEY = "comfyfed"
+FALLBACK_OUTPUT_KEY = "comfyfed"
+
+# Flat staging area for images/masks/audio uploaded through the ComfyUI
+# frontend's upload widgets, ahead of being referenced by a submitted prompt.
+# Unlike ComfyUI's own `input/`, there are no subfolders: a name here is
+# reusable across any number of prompts (see `_default_resolve_asset`), and
+# staged files are never cleaned up automatically -- Phase 1.5 leaves that
+# to the admin.
+_STAGING_DIRNAME = "comfy_staging"
+
+# WebSocket close code for an unauthenticated `/ws` connection, mirroring
+# agentws's convention for its own agent socket.
+_CLOSE_UNAUTHORIZED = 4401
+
+
+def staging_dir(data_dir: str) -> str:
+    return os.path.join(data_dir, _STAGING_DIRNAME)
+
+
+def _default_resolve_asset(data_dir: str, name: str) -> Optional[str]:
+    """Look `name` up in the staging directory. `None` if unsafe or absent.
+
+    Used as `create_router`'s default `resolve_asset` so `/prompt` submissions
+    actually pick up files uploaded via `/upload/image` without every caller
+    having to wire that together -- tests can still override the hook to
+    isolate themselves from the filesystem.
+    """
+    try:
+        safe_name = storage.sanitize_path_component(name, what="asset filename")
+    except ValueError:
+        return None
+    path = os.path.join(staging_dir(data_dir), safe_name)
+    return path if os.path.isfile(path) else None
+
 
 _RUNNING_STATUSES = ("assigned", "running")
 _PENDING_STATUSES = ("queued",)
@@ -120,20 +160,30 @@ def _queue_entry(number: int, job: db.Job) -> list:
     return [number, job.id, workflow, extra_data, _output_node_ids(workflow)]
 
 
-def _history_entry(number: int, job: db.Job) -> dict:
-    workflow = _workflow_of(job)
-    files = _result_files(job)
+def job_outputs(job: db.Job) -> dict:
+    """Build the `{node_id: {"images": [...]}}` mapping ComfyUI's frontend
+    expects for a job's outputs.
 
-    outputs: dict = {}
-    if files:
-        node_ids = _output_node_ids(workflow)
-        key = node_ids[0] if node_ids else _FALLBACK_OUTPUT_KEY
-        outputs[key] = {
+    Shared by `_history_entry` (`GET /history`) and `panelws.job_done` (the
+    WS `executed` event), so a done job's outputs can never drift between the
+    two surfaces. Empty until the job has result files.
+    """
+    files = _result_files(job)
+    if not files:
+        return {}
+    node_ids = _output_node_ids(_workflow_of(job))
+    key = node_ids[0] if node_ids else FALLBACK_OUTPUT_KEY
+    return {
+        key: {
             "images": [
                 {"filename": name, "subfolder": "", "type": "output"} for name in files
             ]
         }
+    }
 
+
+def _history_entry(number: int, job: db.Job) -> dict:
+    outputs = job_outputs(job)
     succeeded = job.status == "done"
     messages: list = []
     if not succeeded and job.error:
@@ -178,12 +228,16 @@ def create_router(
 ) -> APIRouter:
     """Build the `/comfy/api` router.
 
-    `resolve_asset(filename) -> path | None` is the hook Task 3 fills in with
-    the input-staging lookup: given a filename a submitted prompt references,
-    it returns a local path to copy into the job's inputs, or None if the file
-    was never staged. With the default (None) nothing is resolvable, so any
-    prompt referencing an input asset is rejected as an invalid prompt.
+    `resolve_asset(filename) -> path | None` given a filename a submitted
+    prompt references, returns a local path to copy into the job's inputs, or
+    None if the file is unavailable. Defaults to `_default_resolve_asset`,
+    which looks the name up in `<data_dir>/comfy_staging/`; tests pass their
+    own to isolate themselves from the filesystem.
     """
+    resolver = resolve_asset if resolve_asset is not None else (
+        lambda name: _default_resolve_asset(data_dir, name)
+    )
+
     r = APIRouter(prefix="/comfy/api", dependencies=[Depends(auth.require_admin)])
 
     @r.get("/object_info")
@@ -230,11 +284,10 @@ def create_router(
 
         needs = assess.extract(prompt)
         resolved: dict[str, str] = {}
-        if resolve_asset is not None:
-            for name in sorted(needs.assets):
-                path = resolve_asset(name)
-                if path:
-                    resolved[name] = path
+        for name in sorted(needs.assets):
+            path = resolver(name)
+            if path:
+                resolved[name] = path
 
         try:
             job_id = jobs.create_job(
@@ -260,6 +313,34 @@ def create_router(
             number = session.query(db.Job).filter(db.Job.status.in_(_PENDING_STATUSES)).count()
 
         return JSONResponse(content={"prompt_id": job_id, "number": number, "node_errors": {}})
+
+    @r.post("/upload/image")
+    async def upload_image(
+        image: UploadFile = File(...),
+        overwrite: Optional[str] = Form(default=None),
+    ) -> Response:
+        # `overwrite` is accepted (the stock frontend's upload widget sends
+        # it) but not branched on: ComfyUI's own dance -- auto-rename with a
+        # " (1)" suffix unless overwrite=true -- exists to avoid clobbering a
+        # previous upload by accident. ComfyFed's staging area is flat and
+        # short-lived by design (a staged file is meant to be reused by name
+        # across prompts), so a same-name upload always just replaces it.
+        del overwrite
+
+        if not image.filename:
+            return Response(status_code=400)
+        try:
+            filename = storage.sanitize_path_component(image.filename, what="asset filename")
+        except ValueError:
+            return Response(status_code=400)
+
+        staging = staging_dir(data_dir)
+        os.makedirs(staging, exist_ok=True)
+        content = await image.read()
+        with open(os.path.join(staging, filename), "wb") as f:
+            f.write(content)
+
+        return JSONResponse(content={"name": filename, "subfolder": "", "type": "input"})
 
     @r.get("/queue")
     def get_queue() -> Response:
@@ -317,8 +398,14 @@ def create_router(
             # ever be a traversal attempt or a request we cannot satisfy.
             return Response(status_code=404)
 
+        if type == "input":
+            path = os.path.join(staging_dir(data_dir), safe_name)
+            if not os.path.isfile(path):
+                return Response(status_code=404)
+            media_type = mimetypes.guess_type(safe_name)[0] or "application/octet-stream"
+            return FileResponse(path, media_type=media_type, filename=safe_name)
+
         if type != "output":
-            # Task 3 adds input staging; until then nothing but outputs exist.
             return Response(status_code=404)
 
         with db.get_session() as session:
@@ -343,5 +430,52 @@ def create_router(
 
         media_type = mimetypes.guess_type(safe_name)[0] or "application/octet-stream"
         return FileResponse(path, media_type=media_type, filename=safe_name)
+
+    return r
+
+
+def create_ws_router() -> APIRouter:
+    """Build the `/comfy/api/ws` panel WebSocket router.
+
+    Deliberately a SEPARATE router from `create_router`, not another route on
+    it: FastAPI applies a router's `dependencies` to its websocket routes too
+    (`APIRouter.add_api_websocket_route` copies `self.dependencies`), and
+    `auth.require_admin` raising `HTTPException` mid-handshake does not
+    reliably translate into a client-visible close code across FastAPI/
+    Starlette versions. Real ComfyUI's own `/ws` also accepts unconditionally
+    and only then reacts, so this does the same: accept, check the session
+    cookie, and close with 4401 (mirroring `agentws`'s convention for its
+    agent socket) if it doesn't authenticate.
+
+    Once connected, a client receives the initial `status` message (per
+    `server.py`'s `websocket_handler`) and then every federation job event
+    `panelws.post_event` broadcasts -- this router never reads anything back
+    from the socket beyond noticing it closed.
+    """
+    r = APIRouter(prefix="/comfy/api")
+
+    @r.websocket("/ws")
+    async def panel_ws(websocket: WebSocket) -> None:
+        await websocket.accept()
+
+        payload = auth._read_session_payload(websocket.cookies.get("cf_session"))
+        if not payload or not payload.get("authenticated"):
+            await websocket.close(code=_CLOSE_UNAUTHORIZED)
+            return
+
+        sid = panelws.register(websocket)
+        try:
+            await websocket.send_json(
+                {"type": "status", "data": {"status": panelws.queue_status(), "sid": sid}}
+            )
+            while True:
+                # The panel client only ever listens; any inbound message (or
+                # the disconnect it eventually raises) just keeps this
+                # coroutine alive until the connection ends.
+                await websocket.receive_text()
+        except WebSocketDisconnect:
+            pass
+        finally:
+            panelws.unregister(sid)
 
     return r

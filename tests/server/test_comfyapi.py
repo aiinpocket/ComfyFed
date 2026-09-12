@@ -10,6 +10,7 @@ frontend is the client, so `/prompt` errors are `{"error": {...},
 import gzip
 import io
 import json
+import os
 
 import pytest
 from fastapi.testclient import TestClient
@@ -333,3 +334,87 @@ def test_view_rejects_path_traversal(client):
     _login(client)
     r = client.get("/comfy/api/view", params={"filename": "../../etc/passwd"})
     assert r.status_code == 400
+
+
+# --- upload/image + input staging -------------------------------------------
+
+
+def test_upload_image_requires_admin_session(client):
+    r = client.post("/comfy/api/upload/image", files={"image": ("a.png", b"data", "image/png")})
+    assert r.status_code == 401
+
+
+def test_upload_image_lands_in_staging_and_response_shape(client):
+    _login(client)
+    r = client.post(
+        "/comfy/api/upload/image", files={"image": ("ref.png", b"PNGDATA", "image/png")}
+    )
+    assert r.status_code == 200
+    assert r.json() == {"name": "ref.png", "subfolder": "", "type": "input"}
+
+    staged = os.path.join(client.data_dir, "comfy_staging", "ref.png")
+    assert os.path.isfile(staged)
+    with open(staged, "rb") as f:
+        assert f.read() == b"PNGDATA"
+
+
+def test_upload_image_same_name_overwrites(client):
+    _login(client)
+    client.post("/comfy/api/upload/image", files={"image": ("ref.png", b"OLD", "image/png")})
+    r = client.post(
+        "/comfy/api/upload/image",
+        data={"overwrite": "true"},
+        files={"image": ("ref.png", b"NEW", "image/png")},
+    )
+    assert r.status_code == 200
+
+    staged = os.path.join(client.data_dir, "comfy_staging", "ref.png")
+    with open(staged, "rb") as f:
+        assert f.read() == b"NEW"
+
+
+def test_upload_image_rejects_path_traversal_filename(client):
+    _login(client)
+    r = client.post(
+        "/comfy/api/upload/image",
+        files={"image": ("../../etc/passwd", b"data", "image/png")},
+    )
+    assert r.status_code == 400
+
+
+def test_view_input_type_serves_staged_file(client):
+    _login(client)
+    client.post("/comfy/api/upload/image", files={"image": ("ref.png", b"STAGED", "image/png")})
+
+    r = client.get("/comfy/api/view?filename=ref.png&type=input")
+    assert r.status_code == 200
+    assert r.content == b"STAGED"
+
+
+def test_view_input_type_missing_staged_file_404(client):
+    _login(client)
+    r = client.get("/comfy/api/view?filename=nope.png&type=input")
+    assert r.status_code == 404
+
+
+def test_prompt_copies_staged_asset_into_job_inputs(client):
+    _login(client)
+    client.post("/comfy/api/upload/image", files={"image": ("ref.png", b"STAGED", "image/png")})
+
+    prompt = {"1": {"class_type": "LoadImage", "inputs": {"image": "ref.png"}}}
+    r = client.post("/comfy/api/prompt", json={"prompt": prompt})
+    assert r.status_code == 200
+    job_id = r.json()["prompt_id"]
+
+    job_input = os.path.join(client.data_dir, "job_inputs", job_id, "ref.png")
+    assert os.path.isfile(job_input)
+    with open(job_input, "rb") as f:
+        assert f.read() == b"STAGED"
+
+    # Copy, not move: the staged file is still there for reuse by another prompt.
+    staged = os.path.join(client.data_dir, "comfy_staging", "ref.png")
+    assert os.path.isfile(staged)
+
+    with db.get_session() as session:
+        job = session.get(db.Job, job_id)
+        assert json.loads(job.input_assets) == ["ref.png"]
