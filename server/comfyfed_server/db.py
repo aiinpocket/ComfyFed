@@ -1,0 +1,151 @@
+"""SQLite database layer: SQLAlchemy 2.x ORM models + Alembic-managed schema."""
+
+from __future__ import annotations
+
+import os
+import uuid
+from contextlib import contextmanager
+from datetime import datetime, timezone
+from typing import Iterator, Optional
+
+from alembic import command
+from alembic.config import Config
+from sqlalchemy import Boolean, DateTime, Float, Integer, String, create_engine, event
+from sqlalchemy.engine import Engine
+from sqlalchemy.orm import DeclarativeBase, Mapped, Session, mapped_column, sessionmaker
+
+
+def _utcnow() -> datetime:
+    """Timezone-naive UTC now, for SQLite-friendly storage."""
+    return datetime.now(timezone.utc).replace(tzinfo=None)
+
+
+def _uuid_str() -> str:
+    return str(uuid.uuid4())
+
+
+class Base(DeclarativeBase):
+    pass
+
+
+class Setting(Base):
+    __tablename__ = "settings"
+
+    key: Mapped[str] = mapped_column(String, primary_key=True)
+    value: Mapped[str] = mapped_column(String)
+
+
+class Worker(Base):
+    __tablename__ = "workers"
+
+    id: Mapped[str] = mapped_column(String, primary_key=True, default=_uuid_str)
+    name: Mapped[str] = mapped_column(String)
+    pubkey: Mapped[str] = mapped_column(String)
+    status: Mapped[str] = mapped_column(String, default="offline", server_default="offline")
+    last_seen: Mapped[Optional[datetime]] = mapped_column(DateTime, nullable=True)
+    disabled: Mapped[bool] = mapped_column(Boolean, default=False, server_default="0")
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=_utcnow)
+    hardware: Mapped[str] = mapped_column(String, default="{}", server_default="{}")
+    dynamic: Mapped[str] = mapped_column(String, default="{}", server_default="{}")
+    backend: Mapped[str] = mapped_column(String, default="", server_default="")
+    torch_version: Mapped[str] = mapped_column(String, default="", server_default="")
+    node_classes: Mapped[str] = mapped_column(String, default="[]", server_default="[]")
+    model_inventory: Mapped[str] = mapped_column(String, default="[]", server_default="[]")
+
+
+class RegisterToken(Base):
+    __tablename__ = "register_tokens"
+
+    token: Mapped[str] = mapped_column(String, primary_key=True)
+    worker_name: Mapped[str] = mapped_column(String)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=_utcnow)
+    used: Mapped[bool] = mapped_column(Boolean, default=False, server_default="0")
+
+
+class Job(Base):
+    __tablename__ = "jobs"
+
+    id: Mapped[str] = mapped_column(String, primary_key=True, default=_uuid_str)
+    workflow_json: Mapped[str] = mapped_column(String)
+    status: Mapped[str] = mapped_column(String, default="queued", server_default="queued")
+    worker_id: Mapped[Optional[str]] = mapped_column(String, nullable=True)
+    progress: Mapped[float] = mapped_column(Float, default=0, server_default="0")
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=_utcnow)
+    started_at: Mapped[Optional[datetime]] = mapped_column(DateTime, nullable=True)
+    finished_at: Mapped[Optional[datetime]] = mapped_column(DateTime, nullable=True)
+    error: Mapped[Optional[str]] = mapped_column(String, nullable=True)
+    result_files: Mapped[str] = mapped_column(String, default="[]", server_default="[]")
+    requirements: Mapped[str] = mapped_column(String, default="{}", server_default="{}")
+    required_nodes: Mapped[str] = mapped_column(String, default="[]", server_default="[]")
+    required_models: Mapped[str] = mapped_column(String, default="[]", server_default="[]")
+    est_vram_gb: Mapped[Optional[float]] = mapped_column(Float, nullable=True)
+
+
+class Receipt(Base):
+    __tablename__ = "receipts"
+
+    id: Mapped[str] = mapped_column(String, primary_key=True, default=_uuid_str)
+    job_id: Mapped[str] = mapped_column(String)
+    worker_id: Mapped[str] = mapped_column(String)
+    gpu_seconds: Mapped[float] = mapped_column(Float)
+    platform_sig: Mapped[str] = mapped_column(String)
+    worker_sig: Mapped[Optional[str]] = mapped_column(String, nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=_utcnow)
+
+
+class LoginAttempt(Base):
+    __tablename__ = "login_attempts"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    at: Mapped[datetime] = mapped_column(DateTime, default=_utcnow)
+    ok: Mapped[bool] = mapped_column(Boolean)
+
+
+_engine: Optional[Engine] = None
+_SessionFactory: Optional[sessionmaker] = None
+
+
+def _package_dir() -> str:
+    return os.path.dirname(os.path.abspath(__file__))
+
+
+def _alembic_dir() -> str:
+    # server/comfyfed_server/db.py -> server/alembic
+    return os.path.join(os.path.dirname(_package_dir()), "alembic")
+
+
+def _set_sqlite_pragma(dbapi_connection, connection_record) -> None:
+    cursor = dbapi_connection.cursor()
+    cursor.execute("PRAGMA journal_mode=WAL")
+    cursor.close()
+
+
+def init_db(path: str) -> None:
+    """Create parent dirs, build the engine, and run Alembic migrations to head."""
+    global _engine, _SessionFactory
+
+    parent = os.path.dirname(os.path.abspath(path))
+    if parent:
+        os.makedirs(parent, exist_ok=True)
+
+    url = f"sqlite+pysqlite:///{path}"
+    _engine = create_engine(url)
+    event.listen(_engine, "connect", _set_sqlite_pragma)
+
+    alembic_cfg = Config()
+    alembic_cfg.set_main_option("script_location", _alembic_dir())
+    alembic_cfg.set_main_option("sqlalchemy.url", url)
+    command.upgrade(alembic_cfg, "head")
+
+    _SessionFactory = sessionmaker(bind=_engine, expire_on_commit=False)
+
+
+@contextmanager
+def get_session() -> Iterator[Session]:
+    if _SessionFactory is None:
+        raise RuntimeError("Database not initialized: call init_db(path) first.")
+    session = _SessionFactory()
+    try:
+        yield session
+    finally:
+        session.close()
