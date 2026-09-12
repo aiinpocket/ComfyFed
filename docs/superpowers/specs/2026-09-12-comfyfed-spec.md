@@ -60,7 +60,14 @@ worker 斷線（>90s 無心跳）→ assigned/running 的任務自動回 queued 
 ```
 - 派工：平台推給「online 且 idle **且能力符合**」的 worker（WS push）；worker 接單後對**其他已註冊平台**廣播 busy。
 - **硬體與能力回報（定案，2026-09-12 架構審查後擴充）**：worker 上線握手時回報——硬體檔案（GPU 型號、VRAM 總量、CPU 型號/核心數、RAM 總量、模型目錄磁碟可用空間、agent 版本）＋**運算後端（cuda/rocm/mps/cpu）與 torch 版本**＋**已安裝節點類別清單**（取自本機 ComfyUI `/object_info`，即 custom nodes 的真實庫存）；心跳夾動態值（VRAM/RAM/磁碟可用量）。
-- **派工雙重比對**：①硬體需求（`min_vram_gb`、`min_free_disk_gb`、`gpu_name_contains`、`backend`）②**節點交集**——平台解析 workflow 的 node class 集合，必須 ⊆ worker 回報的節點清單才派發（CUDA 限定的 custom node 自然不會落到 MPS 機器，因為那台根本沒裝或 backend 不符）。無符合者留佇列，UI 標示「無可用 worker 符合需求」＋缺哪些節點/條件。
+- **自動任務評估引擎（定案）**：需求**由平台從 workflow 自動推導**，不依賴使用者手填（可進階覆寫，但預設全自動——使用者多非 IT 背景）：
+  - 解析 workflow → ①node class 集合 ②**引用的模型檔清單**（掃描 loader 節點的 ckpt_name/unet_name/clip_name/vae_name/lora_name 等欄位）③**VRAM 粗估**（引用模型檔大小加總×係數，模型大小查聯邦庫存）
+  - worker 心跳夾**本地模型庫存**（檔名＋大小；雜湊 Phase 2 補），平台隨時知道誰有什麼
+  - 每個 worker 對每個 job 得出三態判定：
+    - `eligible`——節點✓ backend✓ VRAM✓ 模型全有 → 直接派
+    - `eligible_after_fetch`——**只缺模型**且聯邦內其他成員有、且磁碟裝得下 → 可派（先補模型再開工：Phase 2 平台中繼、Phase 3 P2P；Phase 1 此類顯示「僅缺模型，待模型分發功能開通」）
+    - `ineligible(reasons)`——缺節點安裝／backend 不符／VRAM 不足等**硬缺口** → 不派，UI 明列原因（「worker-A 缺 IPAdapter 節點」「worker-B VRAM 估需 18GB 僅 12GB」）
+  - 派工優先序：eligible ＞ eligible_after_fetch（省頻寬）；全部 ineligible 才留佇列＋標示原因。
 - Worker 端執行：收 job → 白名單檢查 → POST 本機 ComfyUI `/prompt` → 輪詢 history/進度 → 上傳產物（圖/影片）→ 回報完成 → 雙方簽收據。
 
 ## 8. 模型分發（Phase 2+，方向已定案）

@@ -214,8 +214,12 @@ def test_i18n_both_languages():
 - Consumes: `db`, `require_admin`, `verify_agent`
 - Produces:
   - `POST /api/jobs {workflow_json, requirements?}`（admin, csrf）→ `{job_id}`（status=queued）；requirements JSON 選填：`{min_vram_gb?: float, min_free_disk_gb?: float, gpu_name_contains?: str}` 存 `Job.requirements: str='{}'`（Task 2 的 Job 表加此欄）；`GET /api/jobs?status=`（admin）；`GET /api/jobs/{id}`
-  - job 建立時平台解析 workflow：`required_nodes = sorted({node["class_type"] for node in workflow.values()})` 存入 Job.required_nodes
-  - `dispatch.worker_meets(worker, job) -> bool`：①requirements 對照 worker.hardware＋worker.dynamic（VRAM 用靜態 vram_gb、磁碟用動態 free_disk_gb、gpu_name_contains／backend 大小寫不敏感）②`set(job.required_nodes) ⊆ set(worker.node_classes)`——**節點交集比對**（CUDA 限定 custom node 不會派到 MPS 機器）
+  - 新模組 `server/comfyfed_server/assess.py`——**自動任務評估引擎**（使用者不需手填需求）：
+    - `assess.extract(workflow: dict) -> JobNeeds(nodes: set, models: set, est_vram_gb: float|None)`：nodes=各 node 的 class_type；models=掃描 inputs 中的模型欄位（欄位名 ∈ {ckpt_name, unet_name, clip_name, clip_name1, clip_name2, vae_name, lora_name, model_name, control_net_name, style_model_name, upscale_model_name}，值為 str 且以 .safetensors/.ckpt/.pt/.sft/.gguf 結尾）；est_vram_gb=Σ(引用模型大小，查各 worker 回報庫存取最大已知值)×1.15，查無任何大小→None（不做 VRAM 判定）
+    - `assess.verdict(worker, needs, requirements_override: dict) -> Verdict(kind: "eligible"|"eligible_after_fetch"|"ineligible", reasons: list[str], missing_models: list[str])`：缺節點/backend 不符/est_vram>vram_gb/override 不符→ineligible（reasons 用穩定 code 如 `missing_nodes:IPAdapter`、`vram:18.2>12`）；僅缺模型且聯邦內其他 worker 庫存有＋free_disk 夠→eligible_after_fetch；全過→eligible
+  - Job 表欄位改：`required_nodes: str='[]'`, `required_models: str='[]'`, `est_vram_gb: float|None`, `requirements: str='{}'`（=進階覆寫，預設空）
+  - `dispatch.pick_job_for` 只派 verdict=eligible（Phase 1；eligible_after_fetch 標記於 job 供 UI 顯示「僅缺模型，待模型分發開通」）
+  - `GET /api/jobs/{id}/assessment`（admin）→ 每個 worker 的三態判定＋原因（前端翻譯 reason codes）
   - `dispatch.pick_job_for(worker_id) -> Job|None`：原子性把「最舊且 worker_meets 通過」的 queued job 改 assigned＋綁 worker（跳過不符合的，不阻塞後面的 job）
   - `dispatch.requeue_stale(now) -> int`：worker last_seen 距今 >90s 的 assigned/running job → queued、worker_id=None、progress=0；worker.status='offline'
   - `dispatch.mark_running/mark_done(job_id, result_files)/mark_failed(job_id, error)`
@@ -234,7 +238,8 @@ def test_i18n_both_languages():
 - Produces（WS `/api/agent/ws`，JSON 訊息，`type` 欄位）：
   - 握手：server 送 `{"type":"challenge","nonce"}` → agent 回 `{"type":"auth","worker_id","sig"}`（sign(nonce)）→ server 回 `{"type":"ready"}`；失敗即關閉 code 4401
   - 握手成功後 agent 立即送 `{"type":"hello","hardware":{gpu_name,vram_gb,cpu,cpu_cores,ram_gb,agent_version},"backend":"cuda|rocm|mps|cpu","torch_version":str,"node_classes":[...]}`——node_classes 取自本機 ComfyUI `GET /object_info` 的鍵集合（=真實安裝節點含 custom nodes），依 agent 端 node_policy 過濾後上報；server 存 Worker.hardware/backend/torch_version/node_classes（硬體採集：`nvidia-smi --query-gpu=name,memory.total`、`psutil`、`shutil.disk_usage(comfy 模型目錄)`；backend 偵測：nvidia-smi 成功→cuda、否則試 rocm-smi、`platform.system()=="Darwin"`→mps、fallback cpu）
-  - agent→server：`{"type":"heartbeat","state":"idle|busy","progress":float,"job_id":str|None,"dynamic":{free_vram_gb,free_ram_gb,free_disk_gb}}`（server 更新 last_seen/status/dynamic/job.progress）；`{"type":"job_done","job_id","result_files":[names]}`；`{"type":"job_failed","job_id","error"}`
+  - agent→server：`{"type":"heartbeat","state":"idle|busy","progress":float,"job_id":str|None,"dynamic":{free_vram_gb,free_ram_gb,free_disk_gb}}`（server 更新 last_seen/status/dynamic/job.progress）
+  - agent→server：`{"type":"inventory","models":[{"name":"diffusion_models/x.safetensors","size":123}]}`——上線後與每 10 分鐘掃描 ComfyUI models 目錄（相對路徑＋bytes）；server 存 `Worker.model_inventory: str='[]'`（Task 2 Worker 表加此欄）——評估引擎與未來 P2P tracker 的資料源；`{"type":"job_done","job_id","result_files":[names]}`；`{"type":"job_failed","job_id","error"}`
   - server→agent：`{"type":"job","job_id","workflow_json"}`（僅對 state=idle 者推）
   - server 背景迴圈每 5s：`requeue_stale()`＋為每個 idle 連線 `pick_job_for` 並推送
 - [ ] **Step 1: 失敗測試**（TestClient websocket：未簽名關閉 4401；簽名握手 ready；送 heartbeat 後 DB last_seen 更新且 status=online；enqueue job 後 idle 連線收到 job 訊息；回 job_done 後 job status=done）
@@ -285,7 +290,7 @@ def test_i18n_both_languages():
 - Produces: `npm run build` 產 `web/dist`；頁面功能：
   - Login（錯誤碼→i18n 訊息）；右上語言切換（localStorage）
   - Dashboard：worker 卡片（online/offline/busy、進度條、last_seen、**硬體摘要：GPU 型號＋VRAM、RAM、磁碟可用**）＋佇列摘要；5s 輪詢 `GET /api/workers`、`GET /api/jobs?status=queued,assigned,running`
-  - Jobs：貼上/上傳 workflow JSON 送出（**選填需求欄：min VRAM、min 磁碟、GPU 名稱包含**）；任務表（狀態、進度、結果檔下載連結；queued 且無符合 worker 時顯示「無可用 worker 符合需求」提示）
+  - Jobs：貼上/上傳 workflow JSON 送出（需求**全自動評估**；「進階」摺疊區才有手動覆寫欄）；任務表（狀態、進度、結果檔下載連結）；queued 任務點開顯示**評估明細**：每個 worker 的三態判定＋白話原因（「只缺模型 X──等模型分發功能」「缺 IPAdapter 節點」「VRAM 不足：需約 18GB／僅 12GB」）
   - Workers：新增（輸入名稱→顯示 bundle JSON＋下載按鈕）、停用
   - Reports：日期區間選擇→貢獻表
   - Settings：改密碼、platform_url、預設語言
