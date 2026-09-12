@@ -81,6 +81,7 @@ worker 斷線（>90s 無心跳）→ assigned/running 的任務自動回 queued 
 - **Phase 1（本計畫）**：平台核心＋Agent 核心端到端可用——安裝→登入→發識別碼→worker 註冊上線→送 workflow→派工執行→結果回傳→收據入帳→儀表板可視。
 - **Phase 2**：模型 manifest＋平台中繼下載；ComfyUI 相容 API 面板（原生 Comfy 前端直連平台）；`/object_info` 能力交集。
 - **Phase 3**：成員間 P2P 分塊傳輸；貢獻報表進階（分潤試算）；多管理員。
+- **未來方向：ComfyFed Cloud（2026-09-12 提出）**——平台端移植 Cloudflare Workers＋D1＋R2 的免自架部署形態：D1=SQLite（schema 近乎原樣）、R2=ArtifactStore 的 S3 介面（presigned 直傳、零出口費）、agent 長連 WS 改由 Durable Objects（hibernation）承接、派工迴圈改 DO alarms、Ed25519 驗簽走 WebCrypto。價值：DDNS/固定IP/NAT/TLS 痛點全消失。定位：**自架 Python 版仍是本體**（內網/離線場景＋資料自主），Cloud 版是第二部署形態；現有架構決策（outbound-only WS、S3 介面、簽章收據）已刻意為此保留可移植性。
 
 ## 9.5 架構審查補強（2026-09-12 定案，全部納入 Phase 1）
 
