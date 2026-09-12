@@ -51,6 +51,7 @@ class Worker(Base):
     torch_version: Mapped[str] = mapped_column(String, default="", server_default="")
     node_classes: Mapped[str] = mapped_column(String, default="[]", server_default="[]")
     model_inventory: Mapped[str] = mapped_column(String, default="[]", server_default="[]")
+    object_info_hash: Mapped[str] = mapped_column(String, default="", server_default="")
 
 
 class RegisterToken(Base):

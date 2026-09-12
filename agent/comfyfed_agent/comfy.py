@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import hashlib
+import json
 import time
 import uuid
 from typing import Callable, Optional
@@ -37,6 +39,22 @@ def get_object_info(comfy_url: str, client: Optional[httpx.Client] = None) -> di
     finally:
         if owns:
             c.close()
+
+
+def canonical_object_info_bytes(object_info: dict) -> bytes:
+    """Canonical UTF-8 JSON encoding of an `/object_info` payload.
+
+    Sorted keys and compact separators so the same object_info always
+    serializes to the exact same bytes -- this is what gets sha256'd and
+    gzipped for `POST /api/agent/object_info`, and what the server's
+    `X-OI-Hash` check must be able to reproduce independently.
+    """
+    return json.dumps(object_info, sort_keys=True, separators=(",", ":")).encode("utf-8")
+
+
+def object_info_hash(payload: bytes) -> str:
+    """sha256 hex digest of a canonical object_info payload."""
+    return hashlib.sha256(payload).hexdigest()
 
 
 def upload_input(

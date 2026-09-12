@@ -10,13 +10,22 @@ Agent -> server message contract (all JSON):
   {"type": "hello", "hardware": {...}, "backend": str, "torch_version": str,
    "node_classes": [str]}
   {"type": "heartbeat", "state": "idle"|"busy", "progress": float,
-   "job_id": str|null, "dynamic": {...}}
+   "job_id": str|null, "dynamic": {...}, "object_info_hash": str|null}
+      -- `object_info_hash` is the agent's current sha256 of its local
+         ComfyUI's canonical `/object_info` (see comfyfed_agent.comfy). When
+         it doesn't match `Worker.object_info_hash`, or the platform's stored
+         snapshot file is missing, the server replies over this same socket
+         with `{"type": "want_object_info"}` to trigger a resend.
   {"type": "inventory", "models": [{"name": str, "size": float}]}
       -- `size` is the model file size in GIGABYTES (not bytes); the server
          compares it against VRAM and free-disk figures that are also in GB.
   {"type": "job_done", "job_id": str, "result_files": [str]}
   {"type": "job_failed", "job_id": str, "error": str}
   {"type": "receipt_ack", "receipt_id": str, "worker_sig": hex}
+
+Server -> agent also includes `{"type": "want_object_info"}` (see above); the
+full object_info payload itself travels out-of-band over a signed HTTP POST
+(`/api/agent/object_info` in workers.py), not this socket.
 
 A `job_id` in any of these is only acted on when the authenticated worker
 actually owns that job (see dispatch._owned_job).
@@ -27,6 +36,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import os
 import secrets
 from dataclasses import dataclass
 from datetime import datetime, timezone
@@ -36,7 +46,7 @@ from fastapi import APIRouter, WebSocket, WebSocketDisconnect
 from nacl.exceptions import BadSignatureError
 from nacl.signing import SigningKey, VerifyKey
 
-from . import db, dispatch, metrics, security
+from . import db, dispatch, metrics, security, workers
 
 logger = logging.getLogger(__name__)
 
@@ -46,6 +56,10 @@ _CLOSE_UNAUTHORIZED = 4401
 
 # Set by create_router(data_dir); used to sign job_done receipts.
 _signing_key: Optional[SigningKey] = None
+
+# Set by create_router(data_dir); used to check for a worker's stored
+# object_info file when a heartbeat reports drift (see _handle_heartbeat).
+_data_dir: Optional[str] = None
 
 
 def _utcnow() -> datetime:
@@ -65,8 +79,9 @@ _connections: dict[str, _Connection] = {}
 
 
 def create_router(data_dir: str) -> APIRouter:
-    global _signing_key
+    global _signing_key, _data_dir
     _signing_key, _ = security.load_platform_keys(data_dir)
+    _data_dir = data_dir
 
     r = APIRouter()
 
@@ -158,7 +173,14 @@ async def _handle_message(worker_id: str, conn: _Connection, message: dict) -> N
         if msg_type == "hello":
             _handle_hello(worker_id, message)
         elif msg_type == "heartbeat":
-            _handle_heartbeat(worker_id, conn, message)
+            want_object_info = _handle_heartbeat(worker_id, conn, message)
+            if want_object_info:
+                try:
+                    await conn.ws.send_json({"type": "want_object_info"})
+                except Exception:
+                    logger.exception(
+                        "agentws: failed to send want_object_info to worker %s", worker_id
+                    )
         elif msg_type == "inventory":
             _handle_inventory(worker_id, message)
         elif msg_type == "job_done":
@@ -192,7 +214,13 @@ def _handle_hello(worker_id: str, message: dict) -> None:
         session.commit()
 
 
-def _handle_heartbeat(worker_id: str, conn: _Connection, message: dict) -> None:
+def _handle_heartbeat(worker_id: str, conn: _Connection, message: dict) -> bool:
+    """Apply a heartbeat's state to the worker row.
+
+    Returns True when the platform should ask the agent to resend its full
+    object_info: the heartbeat carries a hash that doesn't match what this
+    worker has on record, or the stored snapshot file has gone missing.
+    """
     state = message.get("state")
     if state in ("idle", "busy"):
         conn.state = state
@@ -201,7 +229,7 @@ def _handle_heartbeat(worker_id: str, conn: _Connection, message: dict) -> None:
     with db.get_session() as session:
         worker = session.get(db.Worker, worker_id)
         if worker is None:
-            return
+            return False
         worker.last_seen = _utcnow()
         if state == "idle":
             worker.status = "online"
@@ -209,6 +237,7 @@ def _handle_heartbeat(worker_id: str, conn: _Connection, message: dict) -> None:
             worker.status = "busy"
         worker.dynamic = json.dumps(dynamic)
         worker_name = worker.name
+        stored_hash = worker.object_info_hash or ""
         session.commit()
 
         job_id = message.get("job_id")
@@ -235,6 +264,20 @@ def _handle_heartbeat(worker_id: str, conn: _Connection, message: dict) -> None:
         m.set_worker_dynamic(worker_name, dynamic)
     except Exception:
         logger.exception("agentws: failed to update heartbeat metrics for worker %s", worker_id)
+
+    want_object_info = False
+    reported_hash = message.get("object_info_hash")
+    if isinstance(reported_hash, str) and reported_hash:
+        try:
+            has_file = _data_dir is not None and os.path.isfile(
+                workers.object_info_path(_data_dir, worker_id)
+            )
+        except Exception:
+            has_file = False
+        if reported_hash != stored_hash or not has_file:
+            want_object_info = True
+
+    return want_object_info
 
 
 # A single model file larger than this many GB is not plausible; a "size"

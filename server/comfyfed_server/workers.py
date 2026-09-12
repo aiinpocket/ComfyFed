@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import gzip
+import hashlib
 import json
 import os
 import secrets
@@ -15,11 +17,13 @@ from nacl.signing import VerifyKey
 from pydantic import BaseModel
 from sqlalchemy import update
 
-from . import auth, db, security
+from . import auth, db, security, storage
 
 _PLATFORM_URL_KEY = "platform_url"
 
 _RELEASES_DIRNAME = "releases"
+_OBJECT_INFO_DIRNAME = "object_info"
+_MAX_OBJECT_INFO_BYTES = 32 * 1024 * 1024
 _AGENT_VERSION_DEFAULT = "0.1.0"
 _AGENT_LATEST_KEY = "agent_latest"
 _AGENT_MIN_SUPPORTED_KEY = "agent_min_supported"
@@ -134,6 +138,49 @@ async def verify_agent(
         return worker
 
 
+def object_info_path(data_dir: str, worker_id: str) -> str:
+    """Path to a worker's stored gzipped `/object_info` snapshot.
+
+    `worker_id` must already be a trusted value (the verified worker's own
+    `id`, never anything client-supplied) -- sanitized here anyway as
+    defense in depth, matching every other place a caller-influenced value
+    becomes a path segment (see `storage.sanitize_path_component`).
+    """
+    safe_id = storage.sanitize_path_component(worker_id, what="worker id")
+    return os.path.join(data_dir, _OBJECT_INFO_DIRNAME, f"{safe_id}.json.gz")
+
+
+def load_object_info(data_dir: str, worker_id: str) -> Optional[dict]:
+    """Read, gunzip, and parse a worker's stored `/object_info` snapshot.
+
+    Produces interface for Task 2 (embedded ComfyUI editor panel): callers
+    just need the worker id and the server's data dir. Returns None if the
+    file is missing, not valid gzip, or not valid JSON -- never raises.
+    """
+    try:
+        path = object_info_path(data_dir, worker_id)
+    except ValueError:
+        return None
+
+    try:
+        with open(path, "rb") as f:
+            raw = f.read()
+        decompressed = gzip.decompress(raw)
+        return json.loads(decompressed)
+    except (OSError, gzip.BadGzipFile, json.JSONDecodeError, UnicodeDecodeError, EOFError):
+        return None
+
+
+def _write_object_info(data_dir: str, worker_id: str, gzip_bytes: bytes) -> None:
+    """Atomically write a worker's gzipped object_info snapshot to disk."""
+    path = object_info_path(data_dir, worker_id)
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    tmp_path = f"{path}.tmp-{os.getpid()}"
+    with open(tmp_path, "wb") as f:
+        f.write(gzip_bytes)
+    os.replace(tmp_path, path)
+
+
 class IssueTokenBody(BaseModel):
     name: str
 
@@ -202,6 +249,48 @@ def create_router(data_dir: str) -> APIRouter:
 
     @r.post("/api/agent/ping")
     def ping(_worker: db.Worker = Depends(verify_agent)):
+        return {"ok": True}
+
+    @r.post("/api/agent/object_info")
+    async def upload_object_info(
+        request: Request,
+        x_oi_hash: Optional[str] = Header(default=None, alias="X-OI-Hash"),
+        worker: db.Worker = Depends(verify_agent),
+    ):
+        if not x_oi_hash:
+            raise _error(400, "agent.bad_object_info", "Missing X-OI-Hash header.")
+
+        body = await request.body()
+        try:
+            decompressed = gzip.decompress(body)
+        except (gzip.BadGzipFile, OSError, EOFError):
+            raise _error(400, "agent.bad_object_info", "Invalid gzip payload.")
+
+        if len(decompressed) > _MAX_OBJECT_INFO_BYTES:
+            raise _error(
+                413, "agent.object_info_too_large", "Decompressed object_info exceeds the size limit."
+            )
+
+        try:
+            json.loads(decompressed)
+        except (TypeError, ValueError):
+            raise _error(400, "agent.bad_object_info", "Payload is not valid JSON.")
+
+        actual_hash = hashlib.sha256(decompressed).hexdigest()
+        if actual_hash != x_oi_hash:
+            raise _error(400, "agent.bad_object_info", "X-OI-Hash does not match the payload.")
+
+        # worker.id comes from verify_agent (the signature-verified worker),
+        # never from anything client-supplied -- so the stored path can't be
+        # steered to another worker's file.
+        _write_object_info(data_dir, worker.id, body)
+
+        with db.get_session() as session:
+            w = session.get(db.Worker, worker.id)
+            if w is not None:
+                w.object_info_hash = actual_hash
+                session.commit()
+
         return {"ok": True}
 
     @r.get("/api/workers")

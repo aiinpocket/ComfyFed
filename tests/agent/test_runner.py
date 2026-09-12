@@ -42,16 +42,23 @@ class FakeConnection:
         self.heartbeats: list[dict] = []
         self.job_done = None
         self.job_failed = None
+        self.object_info_hash = ""
+        self.object_info_uploads: list[tuple[bytes, str]] = []
 
-    async def send_heartbeat(self, state, progress=0.0, job_id=None, dynamic=None):
+    async def send_heartbeat(self, state, progress=0.0, job_id=None, dynamic=None, object_info_hash=None):
         self.state = state
-        self.heartbeats.append({"state": state, "progress": progress, "job_id": job_id})
+        self.heartbeats.append(
+            {"state": state, "progress": progress, "job_id": job_id, "object_info_hash": object_info_hash}
+        )
 
     async def send_job_done(self, job_id, result_files):
         self.job_done = (job_id, result_files)
 
     async def send_job_failed(self, job_id, error):
         self.job_failed = (job_id, error)
+
+    async def send_object_info(self, gzip_payload, oi_hash):
+        self.object_info_uploads.append((gzip_payload, oi_hash))
 
 
 def _entry(worker_id: str) -> PlatformEntry:
@@ -144,3 +151,76 @@ async def test_job_with_disallowed_node_is_rejected_before_running(two_platform_
     assert not ran["called"]
     assert conn_a.job_failed is not None
     assert conn_a.job_failed[0] == "job-3"
+
+
+async def test_refresh_object_info_uploads_once_then_skips_when_unchanged(two_platform_loop, monkeypatch):
+    loop = two_platform_loop
+    conn_a = loop.connections["worker-a"]
+
+    monkeypatch.setattr(comfy, "get_object_info", lambda *a, **k: {"KSampler": {"input": {}}})
+
+    await loop.refresh_object_info(conn_a)
+    assert len(conn_a.object_info_uploads) == 1
+    first_hash = conn_a.object_info_hash
+    assert first_hash
+
+    # Same object_info reported again -> hash unchanged -> no re-upload.
+    await loop.refresh_object_info(conn_a)
+    assert len(conn_a.object_info_uploads) == 1
+    assert conn_a.object_info_hash == first_hash
+
+
+async def test_refresh_object_info_reuploads_when_object_info_changes(two_platform_loop, monkeypatch):
+    loop = two_platform_loop
+    conn_a = loop.connections["worker-a"]
+
+    monkeypatch.setattr(comfy, "get_object_info", lambda *a, **k: {"KSampler": {"input": {}}})
+    await loop.refresh_object_info(conn_a)
+    first_hash = conn_a.object_info_hash
+
+    monkeypatch.setattr(
+        comfy, "get_object_info", lambda *a, **k: {"KSampler": {"input": {}}, "SaveImage": {"input": {}}}
+    )
+    await loop.refresh_object_info(conn_a)
+
+    assert len(conn_a.object_info_uploads) == 2
+    assert conn_a.object_info_hash != first_hash
+    _payload, sent_hash = conn_a.object_info_uploads[-1]
+    assert sent_hash == conn_a.object_info_hash
+
+
+async def test_want_object_info_forces_a_resend_even_if_hash_is_unchanged(two_platform_loop, monkeypatch):
+    loop = two_platform_loop
+    conn_a = loop.connections["worker-a"]
+
+    monkeypatch.setattr(comfy, "get_object_info", lambda *a, **k: {"KSampler": {"input": {}}})
+    await loop.refresh_object_info(conn_a)
+    assert len(conn_a.object_info_uploads) == 1
+
+    await loop._handle_message(conn_a, {"type": "want_object_info"})
+    assert len(conn_a.object_info_uploads) == 2
+
+
+async def test_refresh_object_info_failure_is_swallowed_and_hash_stays_unset(two_platform_loop, monkeypatch):
+    loop = two_platform_loop
+    conn_a = loop.connections["worker-a"]
+
+    def boom(*a, **k):
+        raise ConnectionError("comfy unreachable")
+
+    monkeypatch.setattr(comfy, "get_object_info", boom)
+
+    await loop.refresh_object_info(conn_a)  # must not raise
+
+    assert conn_a.object_info_uploads == []
+    assert conn_a.object_info_hash == ""
+
+
+async def test_broadcast_heartbeat_carries_each_connections_object_info_hash(two_platform_loop):
+    loop = two_platform_loop
+    conn_a = loop.connections["worker-a"]
+    conn_a.object_info_hash = "deadbeef"
+
+    await loop.broadcast_heartbeat("idle")
+
+    assert conn_a.heartbeats[-1]["object_info_hash"] == "deadbeef"

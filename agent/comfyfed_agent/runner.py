@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import gzip
 import json
 import logging
 import time
@@ -19,6 +20,7 @@ from .config import AgentConfig, PlatformEntry
 logger = logging.getLogger(__name__)
 
 _HEARTBEAT_INTERVAL_SECONDS = 30
+_OBJECT_INFO_INTERVAL_SECONDS = 600
 _RECV_POLL_TIMEOUT_SECONDS = 1.0
 _BACKOFF_START_SECONDS = 5
 _BACKOFF_MAX_SECONDS = 60
@@ -32,6 +34,10 @@ class PlatformConnection:
         self.config = config
         self.ws = None
         self.state = "idle"
+        # Last object_info hash this connection has confirmed sent to the
+        # platform (or "" before the first successful upload). Carried on
+        # every heartbeat so the platform can detect drift independently.
+        self.object_info_hash: str = ""
 
     def _ws_url(self) -> str:
         parsed = urlsplit(self.entry.platform_url)
@@ -88,6 +94,7 @@ class PlatformConnection:
         progress: float = 0.0,
         job_id: Optional[str] = None,
         dynamic: Optional[dict] = None,
+        object_info_hash: Optional[str] = None,
     ) -> None:
         self.state = state
         await self._send(
@@ -97,8 +104,19 @@ class PlatformConnection:
                 "progress": progress,
                 "job_id": job_id,
                 "dynamic": dynamic or {},
+                "object_info_hash": object_info_hash,
             }
         )
+
+    async def send_object_info(self, gzip_payload: bytes, oi_hash: str) -> None:
+        """Signed POST of a gzipped, canonical `/object_info` snapshot."""
+        path = "/api/agent/object_info"
+        headers = signing.signed_headers(self.entry, "POST", path, gzip_payload)
+        headers["X-OI-Hash"] = oi_hash
+        headers["Content-Encoding"] = "gzip"
+        async with httpx.AsyncClient(base_url=self.entry.platform_url) as client:
+            resp = await client.post(path, content=gzip_payload, headers=headers)
+            resp.raise_for_status()
 
     async def send_job_done(self, job_id: str, result_files: list[str]) -> None:
         await self._send({"type": "job_done", "job_id": job_id, "result_files": result_files})
@@ -133,9 +151,44 @@ class AgentLoop:
     ) -> None:
         for worker_id, conn in self.connections.items():
             try:
-                await conn.send_heartbeat(state, progress=progress, job_id=job_id, dynamic=dynamic)
+                await conn.send_heartbeat(
+                    state,
+                    progress=progress,
+                    job_id=job_id,
+                    dynamic=dynamic,
+                    object_info_hash=getattr(conn, "object_info_hash", None) or None,
+                )
             except Exception:
                 logger.exception("runner: failed to broadcast heartbeat to %s", worker_id)
+
+    async def refresh_object_info(self, conn: PlatformConnection, force: bool = False) -> None:
+        """Fetch ComfyUI's full `/object_info` and upload it if it changed.
+
+        Called after hello and every `_OBJECT_INFO_INTERVAL_SECONDS` from the
+        connection loop, and with `force=True` when the platform replies
+        `want_object_info` on a heartbeat (its stored hash drifted from ours,
+        or its copy went missing). Any failure -- ComfyUI unreachable, upload
+        rejected -- is logged and swallowed, leaving `conn.object_info_hash`
+        unchanged so the next attempt naturally retries.
+        """
+        try:
+            object_info = await asyncio.to_thread(comfy.get_object_info, self.config.comfy_url)
+        except Exception:
+            logger.exception("runner: failed to fetch object_info from ComfyUI")
+            return
+
+        payload = comfy.canonical_object_info_bytes(object_info)
+        oi_hash = comfy.object_info_hash(payload)
+        if not force and oi_hash == conn.object_info_hash:
+            return
+
+        try:
+            await conn.send_object_info(gzip.compress(payload), oi_hash)
+        except Exception:
+            logger.exception("runner: failed to upload object_info to %s", conn.entry.platform_url)
+            return
+
+        conn.object_info_hash = oi_hash
 
     async def handle_job(self, conn: PlatformConnection, job_msg: dict) -> None:
         """Run one job dispatched over `conn`, broadcasting busy state to every platform."""
@@ -210,11 +263,14 @@ class AgentLoop:
         elif msg_type == "receipt":
             worker_sig = conn.sign_receipt_payload(message["payload"])
             await conn.send_receipt_ack(message["receipt_id"], worker_sig)
+        elif msg_type == "want_object_info":
+            await self.refresh_object_info(conn, force=True)
         else:
             logger.warning("runner: unknown message type %r from platform", msg_type)
 
     async def _connection_loop(self, conn: PlatformConnection) -> None:
         last_heartbeat = time.monotonic()
+        last_object_info = time.monotonic()
         while True:
             try:
                 message = await asyncio.wait_for(conn.recv(), timeout=_RECV_POLL_TIMEOUT_SECONDS)
@@ -227,8 +283,14 @@ class AgentLoop:
             now = time.monotonic()
             if now - last_heartbeat >= _HEARTBEAT_INTERVAL_SECONDS:
                 dynamic = hardware.collect_dynamic(self.config.models_dir)
-                await conn.send_heartbeat(conn.state, dynamic=dynamic)
+                await conn.send_heartbeat(
+                    conn.state, dynamic=dynamic, object_info_hash=conn.object_info_hash or None
+                )
                 last_heartbeat = now
+
+            if now - last_object_info >= _OBJECT_INFO_INTERVAL_SECONDS:
+                await self.refresh_object_info(conn)
+                last_object_info = now
 
     async def _run_platform(self, conn: PlatformConnection) -> None:
         backoff = _BACKOFF_START_SECONDS
@@ -250,6 +312,8 @@ class AgentLoop:
 
                 models = hardware.scan_models(self.config.models_dir) if self.config.models_dir else []
                 await conn.send_inventory(models)
+
+                await self.refresh_object_info(conn)
 
                 backoff = _BACKOFF_START_SECONDS
                 await self._connection_loop(conn)
