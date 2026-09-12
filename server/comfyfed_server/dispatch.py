@@ -56,6 +56,10 @@ def pick_job_for(worker_id: str) -> Optional[db.Job]:
 
             needs = assess.needs_from_job(job)
             v = assess.verdict(worker, needs, requirements_override, all_workers)
+            # `warnings` (e.g. vram_offload) are explicitly NOT a bar to
+            # dispatch: an eligible-with-warning worker runs the job, just
+            # more slowly. Phase 1 does no preference ordering between a
+            # clean worker and a warned one.
             if v.kind != "eligible":
                 continue
 

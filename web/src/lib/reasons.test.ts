@@ -21,9 +21,32 @@ describe('parseReason', () => {
   it('still parses the existing reason shapes', () => {
     expect(parseReason('missing_nodes:A,B').key).toBe('missing_nodes');
     expect(parseReason('missing_models:A').tone).toBe('warning');
-    expect(parseReason('vram:18.4>12').values).toEqual({ needed: '18.4 GB', available: '12 GB' });
+    expect(parseReason('vram:46>8+16').values).toEqual({
+      needed: '46 GB',
+      available: '8 GB',
+      ram: '16 GB',
+    });
     expect(parseReason('override:min_vram_gb').key).toBe('override_min_vram');
     expect(parseReason('something_new:x').key).toBe('unknown');
+  });
+
+  it('parses vram_offload as a non-blocking warning, not an error', () => {
+    // LIVE-3: ComfyUI offloads weights to system RAM, so being over VRAM is
+    // a note about speed, not a refusal. Tone drives the colour, and a red
+    // chip here would read as "this worker cannot run it" — which is wrong.
+    const parsed = parseReason('vram_offload:25.4955>15.9');
+    expect(parsed.key).toBe('vram_offload');
+    expect(parsed.tone).toBe('warning');
+    expect(parsed.values).toEqual({ needed: '25.5 GB', available: '15.9 GB' });
+  });
+
+  it('still parses a legacy vram reason with no +ram part', () => {
+    // Emitted by a server predating the offload-aware gate.
+    expect(parseReason('vram:18.4>12').values).toEqual({
+      needed: '18.4 GB',
+      available: '12 GB',
+      ram: '0 GB',
+    });
   });
 
   it('has a translation for every reason key it can emit, in both locales', () => {
@@ -31,7 +54,8 @@ describe('parseReason', () => {
       'missing_nodes:A',
       'missing_models:A',
       'missing_models_unavailable:A',
-      'vram:9>8',
+      'vram:46>8+16',
+      'vram_offload:25.49>15.9',
       'backend:cuda!=cpu',
       'override:min_vram_gb',
       'override:min_free_disk_gb',

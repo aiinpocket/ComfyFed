@@ -57,6 +57,11 @@ class Verdict:
     kind: str  # "eligible" | "eligible_after_fetch" | "ineligible"
     reasons: list[str] = field(default_factory=list)
     missing_models: list[str] = field(default_factory=list)
+    # Non-blocking notes about an ELIGIBLE verdict: the job will run, but the
+    # submitter should know something about how. Never affects `kind`, and
+    # never appears in `reasons` -- the console renders reasons as the cause
+    # of a refusal, and a warning is not one.
+    warnings: list[str] = field(default_factory=list)
 
 
 def _is_model_value(field_name: str, value) -> bool:
@@ -280,6 +285,7 @@ def verdict(worker, needs: JobNeeds, requirements_override: dict, all_workers: l
     another worker.
     """
     reasons: list[str] = []
+    warnings: list[str] = []
     requirements_override = requirements_override or {}
 
     hardware = _worker_hardware(worker)
@@ -294,10 +300,37 @@ def verdict(worker, needs: JobNeeds, requirements_override: dict, all_workers: l
         if missing_nodes:
             reasons.append(f"missing_nodes:{','.join(sorted(missing_nodes))}")
 
+    # VRAM: a hard gate only when the weights fit NOWHERE. ComfyUI streams and
+    # offloads weights to system RAM when they do not fit in VRAM -- slower,
+    # but it runs, which is why a 15.9 GB card demonstrably executes a 22 GB
+    # flux checkpoint (and a 33B video model). The old `est > vram` hard gate
+    # contradicted that and left panel-submitted jobs queued forever with no
+    # worker ever eligible. The real ceiling is VRAM PLUS system RAM; between
+    # the two the job is eligible with a warning.
     vram_gb = hardware.get("vram_gb")
-    if needs.est_vram_gb is not None and isinstance(vram_gb, (int, float)):
-        if needs.est_vram_gb > vram_gb:
-            reasons.append(f"vram:{needs.est_vram_gb}>{vram_gb}")
+    ram_gb = hardware.get("ram_gb")
+    if not isinstance(ram_gb, (int, float)) or isinstance(ram_gb, bool):
+        # Older agents report no total RAM; free RAM from the last heartbeat is
+        # the closest available stand-in.
+        ram_gb = dynamic.get("free_ram_gb")
+    if isinstance(ram_gb, bool) or not isinstance(ram_gb, (int, float)):
+        ram_gb = None
+
+    if (
+        needs.est_vram_gb is not None
+        and isinstance(vram_gb, (int, float))
+        and not isinstance(vram_gb, bool)
+        and needs.est_vram_gb > vram_gb
+    ):
+        if ram_gb is None:
+            # RAM unknown (an older agent that reports neither total nor free
+            # RAM). We cannot prove the weights do not fit, and refusing on a
+            # missing datum is what stranded jobs before -- warn instead.
+            warnings.append(f"vram_offload:{needs.est_vram_gb}>{vram_gb}")
+        elif needs.est_vram_gb > vram_gb + ram_gb:
+            reasons.append(f"vram:{needs.est_vram_gb}>{vram_gb}+{ram_gb}")
+        else:
+            warnings.append(f"vram_offload:{needs.est_vram_gb}>{vram_gb}")
 
     min_vram_gb = requirements_override.get("min_vram_gb")
     if min_vram_gb is not None:
@@ -328,11 +361,13 @@ def verdict(worker, needs: JobNeeds, requirements_override: dict, all_workers: l
     )
 
     if reasons:
-        # Hard reasons (nodes/vram/override) always win over model status.
+        # Hard reasons (nodes/vram/override) always win over model status. A
+        # warning is dropped here on purpose: it explains how an eligible job
+        # will run, and this one is not going to run at all.
         return Verdict(kind="ineligible", reasons=reasons, missing_models=missing_models)
 
     if not missing_models:
-        return Verdict(kind="eligible", reasons=[], missing_models=[])
+        return Verdict(kind="eligible", reasons=[], missing_models=[], warnings=warnings)
 
     # Can every missing model be fetched from some other worker, and does
     # this worker have enough free disk for the total size of what's missing?
@@ -369,6 +404,7 @@ def verdict(worker, needs: JobNeeds, requirements_override: dict, all_workers: l
             kind="eligible_after_fetch",
             reasons=[f"missing_models:{','.join(missing_models)}"],
             missing_models=missing_models,
+            warnings=warnings,
         )
 
     return Verdict(

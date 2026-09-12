@@ -207,6 +207,7 @@ def create_router(data_dir: str) -> APIRouter:
                         "name": worker.name,
                         "verdict": v.kind,
                         "reasons": v.reasons,
+                        "warnings": v.warnings,
                         "missing_models": v.missing_models,
                     }
                 )

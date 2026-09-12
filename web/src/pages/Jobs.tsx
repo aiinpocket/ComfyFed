@@ -755,7 +755,7 @@ function AssessmentPanel({ jobId, estVram }: { jobId: string; estVram: number | 
                       {t(`verdict.${entry.verdict}`, { defaultValue: entry.verdict })}
                     </Badge>
                   </Group>
-                  {entry.reasons.length === 0 ? (
+                  {entry.reasons.length === 0 && (entry.warnings?.length ?? 0) === 0 ? (
                     <Text size="xs" c="dimmed">
                       {t('verdict.eligible_detail')}
                     </Text>
@@ -768,6 +768,13 @@ function AssessmentPanel({ jobId, estVram }: { jobId: string; estVram: number | 
                           c={parseReason(reason).tone === 'warning' ? 'yellow.4' : 'red.4'}
                         >
                           {translateReason(reason, t)}
+                        </Text>
+                      ))}
+                      {/* Warnings describe how an ELIGIBLE job will run, so
+                          they are always the dim/yellow note, never red. */}
+                      {(entry.warnings ?? []).map((warning) => (
+                        <Text key={warning} size="xs" c="yellow.4">
+                          {translateReason(warning, t)}
                         </Text>
                       ))}
                     </Stack>

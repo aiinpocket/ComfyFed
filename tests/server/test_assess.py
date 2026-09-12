@@ -378,3 +378,115 @@ def test_fetch_disk_headroom_is_still_a_sum_not_a_max():
     # 25 GB clears the sum.
     roomy = _worker("w2", dynamic={"free_disk_gb": 25.0})
     assert assess.verdict(roomy, needs, {}, [roomy, peer]).kind == "eligible_after_fetch"
+
+
+# --- VRAM: offload-aware gate (LIVE-3) ----------------------------------------
+#
+# ComfyUI streams and offloads weights to system RAM when they do not fit in
+# VRAM: slower, but it runs. Real-machine verification found a 15.9 GB card
+# executing a 22.17 GB flux1-dev (est 25.49) and a 33B video model, while the
+# old `est > vram` hard gate declared every worker ineligible and left the job
+# queued forever. The bar is now VRAM + system RAM; in between, eligible with
+# a non-blocking `vram_offload` warning.
+
+
+def _vram_verdict(*, est, vram=None, ram=None, free_ram=None):
+    hardware = {}
+    if vram is not None:
+        hardware["vram_gb"] = vram
+    if ram is not None:
+        hardware["ram_gb"] = ram
+    dynamic = {}
+    if free_ram is not None:
+        dynamic["free_ram_gb"] = free_ram
+
+    worker = _worker("w", node_classes=["KSampler"], hardware=hardware, dynamic=dynamic)
+    needs = assess.JobNeeds(nodes={"KSampler"}, models=set(), est_vram_gb=est)
+    return assess.verdict(worker, needs, {}, [worker])
+
+
+def test_model_fitting_in_vram_is_eligible_with_no_warning():
+    v = _vram_verdict(est=10.0, vram=15.9, ram=63.6)
+    assert v.kind == "eligible"
+    assert v.reasons == [] and v.warnings == []
+
+
+def test_model_over_vram_but_within_vram_plus_ram_warns_and_stays_eligible():
+    # The exact real-machine numbers: flux1-dev 22.17 GB * 1.15 = 25.4955.
+    v = _vram_verdict(est=22.17 * 1.15, vram=15.9, ram=63.6)
+    assert v.kind == "eligible"
+    assert v.reasons == []
+    assert v.warnings == [f"vram_offload:{22.17 * 1.15}>15.9"]
+
+
+def test_model_over_vram_plus_ram_is_hard_ineligible():
+    v = _vram_verdict(est=46.0, vram=8.0, ram=16.0)
+    assert v.kind == "ineligible"
+    assert v.reasons == ["vram:46.0>8.0+16.0"]
+    # A warning explains how an eligible job runs; this one does not run.
+    assert v.warnings == []
+
+
+def test_exactly_at_the_vram_plus_ram_ceiling_is_eligible():
+    v = _vram_verdict(est=24.0, vram=8.0, ram=16.0)
+    assert v.kind == "eligible"
+    assert v.warnings == ["vram_offload:24.0>8.0"]
+
+
+def test_free_ram_from_the_last_heartbeat_stands_in_for_missing_total_ram():
+    """Older agents report no hardware.ram_gb; the heartbeat's free RAM is the
+    closest thing available."""
+    v = _vram_verdict(est=20.0, vram=8.0, free_ram=32.0)
+    assert v.kind == "eligible"
+    assert v.warnings == ["vram_offload:20.0>8.0"]
+
+    v = _vram_verdict(est=60.0, vram=8.0, free_ram=32.0)
+    assert v.kind == "ineligible"
+    assert v.reasons == ["vram:60.0>8.0+32.0"]
+
+
+def test_unknown_ram_warns_rather_than_refusing():
+    """Refusing on a missing datum is exactly what stranded jobs before. With
+    no RAM figure at all we cannot prove the weights do not fit."""
+    v = _vram_verdict(est=100.0, vram=8.0)
+    assert v.kind == "eligible"
+    assert v.warnings == ["vram_offload:100.0>8.0"]
+
+
+def test_unknown_vram_skips_the_check_entirely():
+    v = _vram_verdict(est=100.0, ram=64.0)
+    assert v.kind == "eligible"
+    assert v.reasons == [] and v.warnings == []
+
+
+def test_min_vram_override_remains_a_hard_refusal():
+    worker = _worker(
+        "w", node_classes=["KSampler"], hardware={"vram_gb": 15.9, "ram_gb": 63.6}
+    )
+    needs = assess.JobNeeds(nodes={"KSampler"}, models=set(), est_vram_gb=25.5)
+    v = assess.verdict(worker, needs, {"min_vram_gb": 24.0}, [worker])
+    assert v.kind == "ineligible"
+    assert v.reasons == ["override:min_vram_gb"]
+
+
+def test_a_warning_survives_an_eligible_after_fetch_verdict():
+    """The job still needs a model from a peer AND will offload -- both facts
+    are true and the submitter should see each in its own place."""
+    worker = _worker(
+        "w",
+        node_classes=["KSampler"],
+        hardware={"vram_gb": 8.0, "ram_gb": 64.0},
+        dynamic={"free_disk_gb": 500.0},
+    )
+    peer = _worker(
+        "peer",
+        node_classes=["KSampler"],
+        model_inventory=[{"name": "diffusion_models/flux1-dev.safetensors", "size": 22.17}],
+    )
+    needs = assess.JobNeeds(
+        nodes={"KSampler"}, models={"flux1-dev.safetensors"}, est_vram_gb=25.5
+    )
+    v = assess.verdict(worker, needs, {}, [worker, peer])
+    assert v.kind == "eligible_after_fetch"
+    assert v.reasons == ["missing_models:flux1-dev.safetensors"]
+    assert v.warnings == ["vram_offload:25.5>8.0"]

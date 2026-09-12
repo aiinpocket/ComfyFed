@@ -185,6 +185,12 @@ export interface WorkerVerdict {
   name: string;
   verdict: VerdictKind | string;
   reasons: string[];
+  /**
+   * Non-blocking notes on an eligible verdict (e.g. `vram_offload:...`): the
+   * worker WILL run the job, so these are rendered as a dim note, never as a
+   * refusal. Optional so an older server that omits the field still parses.
+   */
+  warnings?: string[];
   missing_models: string[];
 }
 

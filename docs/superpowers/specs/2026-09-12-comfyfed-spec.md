@@ -61,13 +61,13 @@ worker 斷線（>90s 無心跳）→ assigned/running 的任務自動回 queued 
 - 派工：平台推給「online 且 idle **且能力符合**」的 worker（WS push）；worker 接單後對**其他已註冊平台**廣播 busy。
 - **硬體與能力回報（定案，2026-09-12 架構審查後擴充）**：worker 上線握手時回報——硬體檔案（GPU 型號、VRAM 總量、CPU 型號/核心數、RAM 總量、模型目錄磁碟可用空間、agent 版本）＋**運算後端（cuda/rocm/mps/cpu）與 torch 版本**＋**已安裝節點類別清單**（取自本機 ComfyUI `/object_info`，即 custom nodes 的真實庫存）；心跳夾動態值（VRAM/RAM/磁碟可用量）。
 - **自動任務評估引擎（定案）**：需求**由平台從 workflow 自動推導**，不依賴使用者手填（可進階覆寫，但預設全自動——使用者多非 IT 背景）：
-  - 解析 workflow → ①node class 集合 ②**引用的模型檔清單**（掃描 loader 節點的 ckpt_name/unet_name/clip_name/vae_name/lora_name 等欄位——LoRA 與 checkpoint 同級對待，皆入庫存/判定/分發）③**VRAM 粗估**（最大單一引用模型×1.15──ComfyUI 順序載入/卸載，峰值由最大模型主導；聯邦庫存查大小）④**輸入素材清單**（LoadImage/LoadImageMask 等節點的 image/audio/video 欄位——如角色固定形象參考圖）
+  - 解析 workflow → ①node class 集合 ②**引用的模型檔清單**（掃描 loader 節點的 ckpt_name/unet_name/clip_name/vae_name/lora_name 等欄位——LoRA 與 checkpoint 同級對待，皆入庫存/判定/分發）③**VRAM 粗估**（最大單一引用模型×1.15──ComfyUI 順序載入/卸載，峰值由最大模型主導；聯邦庫存查大小）。**此估值不是硬門檻（定案，2026-09-12 實機驗證後修正）**：ComfyUI 放不進 VRAM 時會把權重卸載到系統 RAM 串流執行，慢但跑得動（實測 15.9GB 顯卡跑得動 22GB 的 flux 與 33B 影片模型），因此比較對象是 **VRAM＋系統 RAM**；估值超過 VRAM 但塞得進 VRAM＋RAM 時仍判 `eligible`，只附一則非阻斷警告 `vram_offload:<估值>><VRAM>`。④**輸入素材清單**（LoadImage/LoadImageMask 等節點的 image/audio/video 欄位——如角色固定形象參考圖）
   - **任務輸入素材隨任務走（定案，2026-09-12）**：模型靠庫存/分發，但參考圖等輸入素材是任務私有的——送任務時平台自動偵測 workflow 引用的輸入檔並要求附檔（multipart 上傳，存 `data/job_inputs/<job_id>/`）；agent 領工後以簽名請求下載附檔、POST 本機 ComfyUI `/upload/image` 放進 input 目錄，再送 `/prompt`。缺附檔的任務在送出前就被 UI 擋下，不會派出去才失敗。
   - worker 心跳夾**本地模型庫存**（檔名＋大小；雜湊 Phase 2 補），平台隨時知道誰有什麼
   - 每個 worker 對每個 job 得出三態判定：
     - `eligible`——節點✓ backend✓ VRAM✓ 模型全有 → 直接派
     - `eligible_after_fetch`——**只缺模型**且聯邦內其他成員有、且磁碟裝得下 → 可派（先補模型再開工：Phase 2 平台中繼、Phase 3 P2P；Phase 1 此類顯示「僅缺模型，待模型分發功能開通」）
-    - `ineligible(reasons)`——缺節點安裝／backend 不符／VRAM 不足等**硬缺口** → 不派，UI 明列原因（「worker-A 缺 IPAdapter 節點」「worker-B VRAM 估需 18GB 僅 12GB」）
+    - `ineligible(reasons)`——缺節點安裝／backend 不符／**權重連 VRAM＋系統 RAM 都放不下**等**硬缺口** → 不派，UI 明列原因（「worker-A 缺 IPAdapter 節點」「worker-B 估需 40GB，VRAM 8GB＋RAM 16GB 放不下」）。VRAM 單獨不足**不再**列為硬缺口，改走上述 `vram_offload` 警告；`min_vram_gb` 進階覆寫仍是硬條件。
   - 派工優先序：eligible ＞ eligible_after_fetch（省頻寬）；全部 ineligible 才留佇列＋標示原因。
 - Worker 端執行：收 job → 白名單檢查 → POST 本機 ComfyUI `/prompt` → 輪詢 history/進度 → 上傳產物（圖/影片）→ 回報完成 → 雙方簽收據。
 
