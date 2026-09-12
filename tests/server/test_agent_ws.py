@@ -1,5 +1,6 @@
 import json
 import logging
+import math
 from datetime import datetime, timedelta, timezone
 
 import pytest
@@ -311,6 +312,90 @@ def test_job_done_without_exec_seconds_falls_back_to_wall_clock(client, caplog):
             # ~1 hour (3600s), allowing a little slack for real elapsed time.
             assert 3595 <= receipt.gpu_seconds <= 3605
         assert any("wall-clock" in rec.getMessage() for rec in caplog.records)
+
+
+def test_job_done_with_nan_exec_seconds_falls_back_to_wall_clock(client):
+    """A NaN literal survives `json.loads` as a real Python float, so it
+    passes a naive `isinstance(..., (int, float))` check and a naive
+    `< 0` comparison alike (NaN compares False to everything) -- it must be
+    rejected explicitly via `math.isfinite`, or "nan" would end up baked into
+    the signed receipt payload."""
+    csrf = _login(client)
+    worker_id, sk = _register_worker(client, csrf, "w1")
+    job_id = _submit(client, csrf)
+
+    with client.websocket_connect("/api/agent/ws") as ws:
+        challenge = ws.receive_json()
+        sig = sk.sign(challenge["nonce"].encode()).signature.hex()
+        ws.send_json({"type": "auth", "worker_id": worker_id, "sig": sig})
+        assert ws.receive_json()["type"] == "ready"
+
+        ws.send_json({"type": "heartbeat", "state": "idle", "progress": 0.0, "job_id": None, "dynamic": {}})
+        agentws.dispatch_once(worker_id)
+        assert ws.receive_json()["type"] == "job"
+
+        ws.send_json({"type": "heartbeat", "state": "busy", "progress": 0.0, "job_id": job_id, "dynamic": {}})
+        agentws.dispatch_once(worker_id)
+
+        _backdate_started_at(job_id, hours=1)
+
+        ws.send_json(
+            {
+                "type": "job_done",
+                "job_id": job_id,
+                "result_files": ["out.png"],
+                "exec_seconds": float("nan"),
+            }
+        )
+        agentws.dispatch_once(worker_id)
+
+        receipt_msg = ws.receive_json()
+        assert receipt_msg["type"] == "receipt"
+
+        with db.get_session() as session:
+            receipt = session.get(db.Receipt, receipt_msg["receipt_id"])
+            assert math.isfinite(receipt.gpu_seconds)
+            assert receipt.gpu_seconds >= 0
+            # ~1 hour wall-clock fallback, not NaN.
+            assert 3595 <= receipt.gpu_seconds <= 3605
+        assert "nan" not in receipt_msg["payload"].lower()
+
+
+def test_job_done_with_negative_wall_clock_clamps_gpu_seconds_to_zero(client):
+    """Clock skew between `started_at` and `finished_at` (or any other bug
+    producing a negative wall clock) must never reach a signed receipt as a
+    negative number -- it's clamped to 0.0."""
+    csrf = _login(client)
+    worker_id, sk = _register_worker(client, csrf, "w1")
+    job_id = _submit(client, csrf)
+
+    with client.websocket_connect("/api/agent/ws") as ws:
+        challenge = ws.receive_json()
+        sig = sk.sign(challenge["nonce"].encode()).signature.hex()
+        ws.send_json({"type": "auth", "worker_id": worker_id, "sig": sig})
+        assert ws.receive_json()["type"] == "ready"
+
+        ws.send_json({"type": "heartbeat", "state": "idle", "progress": 0.0, "job_id": None, "dynamic": {}})
+        agentws.dispatch_once(worker_id)
+        assert ws.receive_json()["type"] == "job"
+
+        ws.send_json({"type": "heartbeat", "state": "busy", "progress": 0.0, "job_id": job_id, "dynamic": {}})
+        agentws.dispatch_once(worker_id)
+
+        # started_at pushed an hour into the *future* relative to `now` -- by
+        # the time job_done sets finished_at, wall_seconds is negative.
+        _backdate_started_at(job_id, hours=-1)
+
+        ws.send_json({"type": "job_done", "job_id": job_id, "result_files": ["out.png"]})
+        agentws.dispatch_once(worker_id)
+
+        receipt_msg = ws.receive_json()
+        assert receipt_msg["type"] == "receipt"
+
+        with db.get_session() as session:
+            receipt = session.get(db.Receipt, receipt_msg["receipt_id"])
+            assert receipt.gpu_seconds == 0.0
+        assert receipt_msg["payload"] == f"{job_id}|{worker_id}|0.0"
 
 
 def test_job_done_caps_absurd_exec_seconds_at_the_wall_clock(client):

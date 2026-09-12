@@ -43,6 +43,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import math
 import os
 import secrets
 from dataclasses import dataclass
@@ -198,7 +199,11 @@ async def _handle_message(worker_id: str, conn: _Connection, message: dict) -> N
             if dispatch.mark_done(job_id, worker_id, message.get("result_files") or []):
                 _notify_panel_job_done(job_id)
                 exec_seconds = message.get("exec_seconds")
-                if not isinstance(exec_seconds, (int, float)) or isinstance(exec_seconds, bool):
+                if (
+                    not isinstance(exec_seconds, (int, float))
+                    or isinstance(exec_seconds, bool)
+                    or not math.isfinite(exec_seconds)
+                ):
                     exec_seconds = None
                 await _create_and_push_receipt(worker_id, conn, job_id, exec_seconds)
         elif msg_type == "job_failed":
@@ -371,7 +376,12 @@ async def _create_and_push_receipt(
     queue-wait as GPU time would double-charge it to every platform a shared
     worker serves. `exec_seconds` is capped at the wall-clock span (a worker
     cannot bill more than it was observably busy for this job) and falls back
-    to the wall clock entirely when missing or invalid.
+    to the wall clock entirely when missing or invalid (not a real number,
+    negative, or non-finite -- `NaN`/`Infinity` survive `json.loads` as float
+    literals, so they must be rejected explicitly rather than merely failing
+    a `< 0` comparison, which `NaN` also slips past). The final value is
+    clamped to zero so a negative wall clock (clock skew between `started_at`
+    and `finished_at`) can never reach a signed receipt.
     """
     if not job_id or _signing_key is None:
         return
@@ -384,7 +394,13 @@ async def _create_and_push_receipt(
         if job.started_at is not None and job.finished_at is not None:
             wall_seconds = (job.finished_at - job.started_at).total_seconds()
 
-        if exec_seconds is None or exec_seconds < 0:
+        if (
+            exec_seconds is None
+            or not isinstance(exec_seconds, (int, float))
+            or isinstance(exec_seconds, bool)
+            or not math.isfinite(exec_seconds)
+            or exec_seconds < 0
+        ):
             gpu_seconds = wall_seconds
             logger.info(
                 "agentws: job %s has no valid exec_seconds from worker %s, "
@@ -394,6 +410,8 @@ async def _create_and_push_receipt(
             )
         else:
             gpu_seconds = min(exec_seconds, wall_seconds)
+
+        gpu_seconds = max(0.0, gpu_seconds)
 
         payload = f"{job_id}|{worker_id}|{gpu_seconds:.1f}"
         platform_sig = _signing_key.sign(payload.encode()).signature.hex()
