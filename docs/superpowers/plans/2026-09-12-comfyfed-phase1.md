@@ -67,7 +67,7 @@ testpaths = ["tests"]
 **Interfaces:**
 - Produces: `init_db(path: str) -> None`、`get_session() -> Session`（contextmanager）、ORM classes：
   - `Setting(key: str[PK], value: str)`
-  - `Worker(id: str[PK=uuid], name: str, pubkey: str, status: str='offline', last_seen: datetime|None, disabled: bool=False, created_at)`
+  - `Worker(id: str[PK=uuid], name: str, pubkey: str, status: str='offline', last_seen: datetime|None, disabled: bool=False, created_at, hardware: str='{}', dynamic: str='{}')`——hardware=靜態檔案 JSON（gpu_name, vram_gb, cpu, cpu_cores, ram_gb, agent_version），dynamic=心跳動態 JSON（free_vram_gb, free_ram_gb, free_disk_gb）
   - `RegisterToken(token: str[PK], worker_name: str, created_at, used: bool=False)`
   - `Job(id: str[PK=uuid], workflow_json: str, status: str='queued', worker_id: str|None, progress: float=0, created_at, started_at|None, finished_at|None, error: str|None, result_files: str='[]')`
   - `Receipt(id: str[PK=uuid], job_id, worker_id, gpu_seconds: float, platform_sig: str, worker_sig: str|None, created_at)`
@@ -213,8 +213,9 @@ def test_i18n_both_languages():
 **Interfaces:**
 - Consumes: `db`, `require_admin`, `verify_agent`
 - Produces:
-  - `POST /api/jobs {workflow_json}`（admin, csrf）→ `{job_id}`（status=queued）；`GET /api/jobs?status=`（admin）；`GET /api/jobs/{id}`
-  - `dispatch.pick_job_for(worker_id) -> Job|None`：原子性把最舊 queued 改 assigned＋綁 worker
+  - `POST /api/jobs {workflow_json, requirements?}`（admin, csrf）→ `{job_id}`（status=queued）；requirements JSON 選填：`{min_vram_gb?: float, min_free_disk_gb?: float, gpu_name_contains?: str}` 存 `Job.requirements: str='{}'`（Task 2 的 Job 表加此欄）；`GET /api/jobs?status=`（admin）；`GET /api/jobs/{id}`
+  - `dispatch.worker_meets(worker, requirements) -> bool`：對照 worker.hardware＋worker.dynamic（VRAM 用靜態 vram_gb、磁碟用動態 free_disk_gb、gpu_name_contains 大小寫不敏感子字串）
+  - `dispatch.pick_job_for(worker_id) -> Job|None`：原子性把「最舊且 worker_meets 通過」的 queued job 改 assigned＋綁 worker（跳過不符合的，不阻塞後面的 job）
   - `dispatch.requeue_stale(now) -> int`：worker last_seen 距今 >90s 的 assigned/running job → queued、worker_id=None、progress=0；worker.status='offline'
   - `dispatch.mark_running/mark_done(job_id, result_files)/mark_failed(job_id, error)`
 
@@ -231,7 +232,8 @@ def test_i18n_both_languages():
 **Interfaces:**
 - Produces（WS `/api/agent/ws`，JSON 訊息，`type` 欄位）：
   - 握手：server 送 `{"type":"challenge","nonce"}` → agent 回 `{"type":"auth","worker_id","sig"}`（sign(nonce)）→ server 回 `{"type":"ready"}`；失敗即關閉 code 4401
-  - agent→server：`{"type":"heartbeat","state":"idle|busy","progress":float,"job_id":str|None}`（server 更新 last_seen/status/job.progress）；`{"type":"job_done","job_id","result_files":[names]}`；`{"type":"job_failed","job_id","error"}`
+  - 握手成功後 agent 立即送 `{"type":"hello","hardware":{gpu_name,vram_gb,cpu,cpu_cores,ram_gb,agent_version}}` → server 存 Worker.hardware（硬體採集：agent 用 `nvidia-smi --query-gpu=name,memory.total`、`psutil`（加入依賴）、`shutil.disk_usage(comfy 模型目錄)`）
+  - agent→server：`{"type":"heartbeat","state":"idle|busy","progress":float,"job_id":str|None,"dynamic":{free_vram_gb,free_ram_gb,free_disk_gb}}`（server 更新 last_seen/status/dynamic/job.progress）；`{"type":"job_done","job_id","result_files":[names]}`；`{"type":"job_failed","job_id","error"}`
   - server→agent：`{"type":"job","job_id","workflow_json"}`（僅對 state=idle 者推）
   - server 背景迴圈每 5s：`requeue_stale()`＋為每個 idle 連線 `pick_job_for` 並推送
 - [ ] **Step 1: 失敗測試**（TestClient websocket：未簽名關閉 4401；簽名握手 ready；送 heartbeat 後 DB last_seen 更新且 status=online；enqueue job 後 idle 連線收到 job 訊息；回 job_done 後 job status=done）
@@ -279,8 +281,8 @@ def test_i18n_both_languages():
 - Consumes: Task 4/5/8/10 的 REST（`api.ts` 封裝，帶 credentials 與 X-CSRF）
 - Produces: `npm run build` 產 `web/dist`；頁面功能：
   - Login（錯誤碼→i18n 訊息）；右上語言切換（localStorage）
-  - Dashboard：worker 卡片（online/offline/busy、進度條、last_seen）＋佇列摘要；5s 輪詢 `GET /api/workers`、`GET /api/jobs?status=queued,assigned,running`
-  - Jobs：貼上/上傳 workflow JSON 送出；任務表（狀態、進度、結果檔下載連結）
+  - Dashboard：worker 卡片（online/offline/busy、進度條、last_seen、**硬體摘要：GPU 型號＋VRAM、RAM、磁碟可用**）＋佇列摘要；5s 輪詢 `GET /api/workers`、`GET /api/jobs?status=queued,assigned,running`
+  - Jobs：貼上/上傳 workflow JSON 送出（**選填需求欄：min VRAM、min 磁碟、GPU 名稱包含**）；任務表（狀態、進度、結果檔下載連結；queued 且無符合 worker 時顯示「無可用 worker 符合需求」提示）
   - Workers：新增（輸入名稱→顯示 bundle JSON＋下載按鈕）、停用
   - Reports：日期區間選擇→貢獻表
   - Settings：改密碼、platform_url、預設語言

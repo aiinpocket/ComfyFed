@@ -58,7 +58,8 @@ queued → assigned → running → done
                   ↘ failed（可重試）
 worker 斷線（>90s 無心跳）→ assigned/running 的任務自動回 queued 重派其他活 worker
 ```
-- 派工：平台推給「online 且 idle」的 worker（WS push）；worker 接單後對**其他已註冊平台**廣播 busy。
+- 派工：平台推給「online 且 idle **且能力符合**」的 worker（WS push）；worker 接單後對**其他已註冊平台**廣播 busy。
+- **硬體能力回報（定案）**：worker 上線握手時回報硬體檔案（GPU 型號、VRAM 總量、CPU 型號/核心數、RAM 總量、模型目錄所在磁碟可用空間、agent 版本）；心跳夾動態值（VRAM/RAM/磁碟可用量）。任務可宣告需求（`min_vram_gb`、`min_free_disk_gb`、`gpu_name_contains` 等），派工器只派給符合者；無符合者任務留佇列並在 UI 標示「無可用 worker 符合需求」。UI worker 卡片顯示硬體摘要。
 - Worker 端執行：收 job → 白名單檢查 → POST 本機 ComfyUI `/prompt` → 輪詢 history/進度 → 上傳產物（圖/影片）→ 回報完成 → 雙方簽收據。
 
 ## 8. 模型分發（Phase 2+，方向已定案）
