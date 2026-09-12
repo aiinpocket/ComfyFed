@@ -110,3 +110,17 @@ Decisions of record:
 - Guidance lives in a POST /prompt 400 (`prompt.missing_models`) raised when every online worker is ineligible due to missing models: per-model zh-TW block with 放置路徑 models/<dir>/、官方載點（flux/ae 加註需登入 HuggingFace 同意授權）、備份載點（GCS）、「10 分鐘自動掃描、不需重啟」. No workers online → unchanged queueing behavior.
 - Panel WS sends explicit `feature_flags` all-false (assets, node_replacements, show_signin_button, extension.manager.supports_v4/.supports_csrf_post) so Manager/Asset-Browser/sign-in UI stays dormant; incoming client feature_flags frames are consumed silently. `GET /api/folder_paths` stubbed `{}`.
 - R2 (the former model-mirror custom domain) is decommissioned: worker, custom domain, bucket contents deleted 2026-09-13. Canonical mirror base: `https://storage.googleapis.com/comfyfed-models/models/`.
+
+---
+
+## Phase 1.7 addendum: job lifecycle & dispatch strategy (2026-09-13)
+
+User directives: (1) 分派策略要認真設計——worker 怎麼知道哪些任務能拉？（答：維持 server 端全局能力匹配，worker 不自選；改善的是排序）；(2) 拉取後斷線→重派→原 worker 回來回報完成的處理；(3) 更好的是回報時 server 告知任務已取消，worker 立即中止並刪除本次任務檔案，省下白跑的時間。
+
+Decisions of record:
+- `cancelled` becomes a terminal job status; cancelled jobs never produce receipts (bill 0).
+- Server pushes `{"type":"job_cancelled","job_id"}` (dedup per connection) whenever an authenticated agent references a job it no longer owns — busy heartbeat, progress, job_done/job_failed, artifact upload. Busy heartbeats carry job_id every 30s, so a zombied worker learns within one heartbeat.
+- Blip re-adoption: `Job.last_worker_id` (migration #5) records who a stale requeue took the job from. A `job_done` from that worker while the job is still `queued` re-adopts and completes it (receipt included) — the whole run is saved. Once someone else owns it (or it's terminal), the late reporter is rejected + cancelled instead.
+- Human cancellation: admin `POST /api/jobs/{id}/cancel`, console jobs-page 取消 button, and the embedded panel's native controls mapped through comfyapi (`POST /interrupt` = cancel the executing panel job; `POST /queue {"delete":[ids]}` / `{"clear":true}` = cancel queued ones).
+- Agent runs `handle_job` as a background task so the WS receive loop keeps reading mid-run (prerequisite for receiving job_cancelled at all); on cancel it interrupts ComfyUI (`/interrupt` when executing, `/queue` delete when locally queued), runs job-file cleanup in a cancel mode, sends no completion message, and returns to idle. One-job-at-a-time invariant unchanged.
+- Dispatch ranking: per tick, oldest job first over ALL idle workers — clean-eligible beats vram_offload-warned, then most free VRAM, then name for determinism. Capability matching stays server-side (the worker never chooses).
