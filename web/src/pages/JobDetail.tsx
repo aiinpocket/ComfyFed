@@ -10,6 +10,7 @@ import {
   Image,
   Loader,
   Modal,
+  Progress,
   SimpleGrid,
   Skeleton,
   Stack,
@@ -229,6 +230,24 @@ export function JobDetail() {
                     {durationBetween(job.started_at, job.finished_at) ?? '—'}
                   </Text>
                 </SimpleGrid>
+
+                {job.stage === 'fetching_models' && (
+                  <Stack gap={4}>
+                    <Text size="sm">
+                      {t('job_detail.fetching_models', {
+                        model: job.fetch_model ?? '',
+                        pct: Math.round(Math.max(0, Math.min(100, job.fetch_pct ?? 0))),
+                      })}
+                    </Text>
+                    <Progress
+                      value={Math.round(Math.max(0, Math.min(100, job.fetch_pct ?? 0)))}
+                      color="federation"
+                      size="sm"
+                      radius="xl"
+                      animated
+                    />
+                  </Stack>
+                )}
               </Stack>
             </Card>
 

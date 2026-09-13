@@ -212,9 +212,48 @@ export function Dashboard() {
   );
 }
 
-export function ProgressCell({ value, status }: { value: number; status: string }) {
+export function ProgressCell({
+  value,
+  status,
+  fetchPct,
+  fetchModel,
+}: {
+  value: number;
+  status: string;
+  /** Set only while the job carries `stage: "fetching_models"` (Task 4). */
+  fetchPct?: number;
+  fetchModel?: string;
+}) {
+  const { t } = useTranslation();
   const percent = Math.round(Math.max(0, Math.min(1, value)) * 100);
   const color = status === 'failed' ? 'red' : status === 'done' ? 'teal' : 'federation';
+
+  if (fetchPct !== undefined) {
+    const clamped = Math.round(Math.max(0, Math.min(100, fetchPct)));
+    const cell = (
+      <Group gap="xs" wrap="nowrap">
+        <Progress
+          value={clamped}
+          color="federation"
+          size="sm"
+          radius="xl"
+          style={{ flex: 1, minWidth: 60 }}
+          animated
+        />
+        <Text size="xs" c="dimmed" w={130} ta="right" style={{ fontVariantNumeric: 'tabular-nums' }}>
+          {t('jobs.fetching_models_chip', { pct: clamped })}
+        </Text>
+      </Group>
+    );
+    return fetchModel ? (
+      <Tooltip label={fetchModel} multiline maw={320}>
+        {cell}
+      </Tooltip>
+    ) : (
+      cell
+    );
+  }
+
   return (
     <Group gap="xs" wrap="nowrap">
       <Progress

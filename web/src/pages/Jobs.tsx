@@ -665,7 +665,12 @@ function JobsTable({
                     </Group>
                   </Table.Td>
                   <Table.Td style={{ minWidth: 150 }}>
-                    <ProgressCell value={job.progress} status={job.status} />
+                    <ProgressCell
+                      value={job.progress}
+                      status={job.status}
+                      fetchPct={job.stage === 'fetching_models' ? job.fetch_pct : undefined}
+                      fetchModel={job.stage === 'fetching_models' ? job.fetch_model : undefined}
+                    />
                   </Table.Td>
                   <Table.Td>
                     <Text size="sm" c={job.worker_id ? undefined : 'dimmed'}>

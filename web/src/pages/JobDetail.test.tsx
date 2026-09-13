@@ -193,6 +193,32 @@ describe('JobDetail', () => {
     });
   });
 
+  it('shows a downloading-models line with progress bar while stage is fetching_models', async () => {
+    const fetchingJob: JobDetailType = {
+      ...BASE_JOB,
+      status: 'running',
+      error: null,
+      stage: 'fetching_models',
+      fetch_pct: 17,
+      fetch_model: 'sd_xl_base_1.0.safetensors',
+    };
+    stubFetch(fetchingJob);
+    renderDetail();
+
+    expect(
+      await screen.findByText(/Downloading model: sd_xl_base_1\.0\.safetensors \(17%\)/),
+    ).toBeInTheDocument();
+  });
+
+  it('does not show a downloading-models line once stage is absent', async () => {
+    const runningJob: JobDetailType = { ...BASE_JOB, status: 'running', error: null };
+    stubFetch(runningJob);
+    renderDetail();
+
+    await screen.findByText('Running');
+    expect(screen.queryByText(/Downloading model/)).not.toBeInTheDocument();
+  });
+
   it('renders the receipt summary when one is present', async () => {
     const doneJob: JobDetailType = {
       ...BASE_JOB,
