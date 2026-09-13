@@ -71,6 +71,13 @@ MODEL_SOURCES = {
         "official": "https://huggingface.co/drbaph/MiniMax-H3-Turbo-Lora-ComfyUI/resolve/main/minimax_h3_ref2v_turbo_8step_v1.0_768p_comfyui_resized_avg_rank_64_bf16.safetensors",
         "gated": False,
     },
+    # Phase 1.8b Task 2, model registry entry #10 -- shared by the two
+    # prompt-helper templates below.
+    "qwen3vl_4b_bf16.safetensors": {
+        "dir": "text_encoders",
+        "official": "https://huggingface.co/Comfy-Org/Krea-2/resolve/main/text_encoders/qwen3vl_4b_bf16.safetensors",
+        "gated": False,
+    },
 }
 MODEL_INVENTORY = set(MODEL_SOURCES)
 FLUX_GATED_CAVEAT = "（需登入 HuggingFace 並同意 FLUX.1-dev 授權）"
@@ -86,6 +93,17 @@ ZERO_MODEL_TEMPLATE_NAMES = ("comfyfed-video-concat", "comfyfed-image-intro-vide
 MODEL_BEARING_TEMPLATE_NAMES = tuple(
     n for n in ("comfyfed-wuxia-t2i", "comfyfed-character-portrait", "comfyfed-ref2v-video")
 )
+# Phase 1.8b Task 2 added two more model-bearing templates that share a
+# single model each (rather than several) and use the same 3-group layout as
+# the zero-model templates instead of the 4-group layout the three
+# MODEL_BEARING_TEMPLATE_NAMES above use (they have no separate "load model"
+# group, nor the "這是什麼範本" intro note those three share -- their ⓪ 缺模型？
+# note plus ①②③ notes cover the same ground more compactly). They still carry
+# a "缺模型？" note with the dual official/GCS-backup link format, so the
+# note-format tests below run over both sets combined
+# (NOTE_BEARING_TEMPLATE_NAMES) rather than skipping these two.
+ONE_MODEL_TEMPLATE_NAMES = ("comfyfed-image-to-prompt", "comfyfed-text-to-prompt")
+NOTE_BEARING_TEMPLATE_NAMES = MODEL_BEARING_TEMPLATE_NAMES + ONE_MODEL_TEMPLATE_NAMES
 ZERO_MODEL_ALLOWED_NODE_TYPES = {
     "MarkdownNote",
     "LoadImage",
@@ -289,11 +307,14 @@ def test_template_workflow_is_annotated_ui_format(name):
         assert any("一" <= ch <= "鿿" for ch in text), note["id"]
         assert sum(ch.isascii() and ch.isalpha() for ch in text) > 100, note["id"]
 
-    # Every stage of the graph is boxed and titled. The model-bearing
+    # Every stage of the graph is boxed and titled. The three MODEL_BEARING
     # templates lay out 4 groups (load / subject / sample / output); the
-    # zero-model templates collapse that to 3 (①選素材 ②合併 ③輸出).
+    # zero-model templates collapse that to 3 (①選素材 ②合併 ③輸出); the two
+    # ONE_MODEL prompt-helper templates also use a 3-group layout (①素材/想法
+    # ②組裝 ③輸出) since they only have one shared loader, not a whole
+    # loader-only group's worth.
     titles = [g["title"] for g in workflow["groups"]]
-    expected_groups = 3 if name in ZERO_MODEL_TEMPLATE_NAMES else 4
+    expected_groups = 3 if name in ZERO_MODEL_TEMPLATE_NAMES + ONE_MODEL_TEMPLATE_NAMES else 4
     assert len(titles) == expected_groups, name
     assert all(t.strip() for t in titles)
 
@@ -572,7 +593,24 @@ def test_missing_models_note_exists_and_is_placed_first(name):
     assert workflow["nodes"][0]["pos"][1] < other_top_left["pos"][1]
 
 
-@pytest.mark.parametrize("name", MODEL_BEARING_TEMPLATE_NAMES)
+@pytest.mark.parametrize("name", ONE_MODEL_TEMPLATE_NAMES)
+def test_one_model_missing_models_note_exists_and_is_placed_first(name):
+    """Same placement guarantee as MODEL_BEARING's note, adapted for the
+    3-group layout: these two templates have no separate "這是什麼範本" intro
+    note, so the reference point is the ① note instead."""
+    with open(os.path.join(templates.templates_dir(), f"{name}.json"), encoding="utf-8") as f:
+        workflow = json.load(f)
+
+    assert workflow["nodes"][0]["type"] == "MarkdownNote"
+    assert workflow["nodes"][0]["title"] == MISSING_MODELS_NOTE_TITLE
+    other_top_left = next(
+        n for n in workflow["nodes"]
+        if n.get("title", "").startswith("① 用途＋紅框")
+    )
+    assert workflow["nodes"][0]["pos"][1] < other_top_left["pos"][1]
+
+
+@pytest.mark.parametrize("name", NOTE_BEARING_TEMPLATE_NAMES)
 def test_missing_models_note_mentions_every_model_the_graph_actually_uses(name):
     """Anti-drift: if a template's loaders change, its note must be updated too."""
     with open(os.path.join(templates.templates_dir(), f"{name}.json"), encoding="utf-8") as f:
@@ -586,7 +624,7 @@ def test_missing_models_note_mentions_every_model_the_graph_actually_uses(name):
         assert filename in note_text, f"{name}'s missing-models note omits {filename}"
 
 
-@pytest.mark.parametrize("name", MODEL_BEARING_TEMPLATE_NAMES)
+@pytest.mark.parametrize("name", NOTE_BEARING_TEMPLATE_NAMES)
 def test_missing_models_note_links_are_dual_official_and_gcs_backup(name):
     note_text = _missing_models_note_text(name)
 
@@ -997,3 +1035,83 @@ def test_image_intro_video_note_covers_the_amount_formula():
     combined = "\n".join(notes.values())
     assert "amount" in combined
     assert "fps" in combined
+
+
+# --- Phase 1.8b Task 2: prompt-helper templates -------------------------
+
+
+@pytest.mark.parametrize("name", ONE_MODEL_TEMPLATE_NAMES)
+def test_one_model_template_json_parses(name):
+    with open(os.path.join(templates.templates_dir(), f"{name}.json"), encoding="utf-8") as f:
+        workflow = json.load(f)
+    assert workflow["version"] == 0.4
+
+
+@pytest.mark.parametrize("name", ONE_MODEL_TEMPLATE_NAMES)
+def test_one_model_template_has_exactly_one_curated_model(name):
+    with open(os.path.join(templates.templates_dir(), f"{name}.json"), encoding="utf-8") as f:
+        workflow = json.load(f)
+    assert _loader_model_filenames(workflow) == {"qwen3vl_4b_bf16.safetensors"}, name
+
+
+@pytest.mark.parametrize("name", ONE_MODEL_TEMPLATE_NAMES)
+def test_one_model_template_links_have_slot_consistent_endpoints(name):
+    """Same off-by-one guard as the zero-model templates get."""
+    with open(os.path.join(templates.templates_dir(), f"{name}.json"), encoding="utf-8") as f:
+        workflow = json.load(f)
+
+    nodes = {n["id"]: n for n in workflow["nodes"]}
+    for link_id, src, src_slot, dst, dst_slot, wire in workflow["links"]:
+        src_outputs = nodes[src]["outputs"]
+        dst_inputs = nodes[dst]["inputs"]
+        assert 0 <= src_slot < len(src_outputs), (name, link_id)
+        assert 0 <= dst_slot < len(dst_inputs), (name, link_id)
+        assert src_outputs[src_slot]["type"] == wire, (name, link_id)
+        assert dst_inputs[dst_slot]["type"] == wire, (name, link_id)
+        assert link_id in src_outputs[src_slot]["links"], (name, link_id)
+        assert dst_inputs[dst_slot]["link"] == link_id, (name, link_id)
+
+
+def test_image_to_prompt_uses_default_template_and_links_an_image():
+    with open(
+        os.path.join(templates.templates_dir(), "comfyfed-image-to-prompt.json"), encoding="utf-8"
+    ) as f:
+        workflow = json.load(f)
+
+    text_gen = next(n for n in workflow["nodes"] if n["type"] == "TextGenerate")
+    # widgets_values tail is [..., thinking, use_default_template]; True for
+    # the image recipe per the verified-live ground truth.
+    assert text_gen["widgets_values"][-1] is True
+    assert any(i["name"] == "image" for i in text_gen["inputs"])
+
+
+def test_text_to_prompt_does_not_use_default_template_and_has_no_image_input():
+    with open(
+        os.path.join(templates.templates_dir(), "comfyfed-text-to-prompt.json"), encoding="utf-8"
+    ) as f:
+        workflow = json.load(f)
+
+    text_gen = next(n for n in workflow["nodes"] if n["type"] == "TextGenerate")
+    assert text_gen["widgets_values"][-1] is False
+    assert not any(i["name"] == "image" for i in text_gen["inputs"])
+    # The manual template wrapping must carry the literal Qwen3 chat tags and
+    # the /no_think suppression, per the verified-live recipe.
+    primitives = [n for n in workflow["nodes"] if n["type"] == "PrimitiveStringMultiline"]
+    combined = "\n".join(n["widgets_values"][0] for n in primitives)
+    assert "<|im_start|>user" in combined
+    assert "<|im_start|>assistant" in combined
+    assert "/no_think" in combined
+
+
+def test_prompt_helper_templates_save_and_preview_the_generated_text():
+    for name in ONE_MODEL_TEMPLATE_NAMES:
+        with open(
+            os.path.join(templates.templates_dir(), f"{name}.json"), encoding="utf-8"
+        ) as f:
+            workflow = json.load(f)
+        types = {n["type"] for n in workflow["nodes"]}
+        assert "SaveText" in types, name
+        assert "PreviewAny" in types, name
+        save_text = next(n for n in workflow["nodes"] if n["type"] == "SaveText")
+        assert save_text["widgets_values"][0] == "comfyfed_prompt"
+        assert save_text["widgets_values"][1] == "txt"

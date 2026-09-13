@@ -1,0 +1,501 @@
+{
+  "last_node_id": 103,
+  "last_link_id": 6,
+  "nodes": [
+    {
+      "id": 100,
+      "type": "MarkdownNote",
+      "pos": [
+        0,
+        -900
+      ],
+      "size": [
+        1620,
+        380
+      ],
+      "flags": {},
+      "order": 7,
+      "mode": 0,
+      "inputs": [],
+      "outputs": [],
+      "title": "⓪ 缺模型？/ Missing models?",
+      "properties": {},
+      "widgets_values": [
+        "**繁體中文**\n\n全新安裝沒有模型檔，這支「圖生提示詞」範本需要以下 1 個檔案：\n\n- `qwen3vl_4b_bf16.safetensors` → 放到 `ComfyUI/models/text_encoders/` → 8.27 GB\n  官方載點：https://huggingface.co/Comfy-Org/Krea-2/resolve/main/text_encoders/qwen3vl_4b_bf16.safetensors\n  備份載點：https://storage.googleapis.com/comfyfed-models/models/text_encoders/qwen3vl_4b_bf16.safetensors\n\n共約 8.27 GB。放好檔案後**不用重啟 ComfyUI 或 worker**：ComfyFed agent 每 10 分鐘自動重掃模型庫存並回報平台，評估會自動轉綠；急著馬上生效的話，手動重啟 agent 即可。\n\n---\n\n**English**\n\nA fresh install has none of these files. The \"Image to prompt\" template needs 1 file:\n\n- `qwen3vl_4b_bf16.safetensors` -> `ComfyUI/models/text_encoders/` -> 8.27 GB\n  官方載點：https://huggingface.co/Comfy-Org/Krea-2/resolve/main/text_encoders/qwen3vl_4b_bf16.safetensors\n  備份載點：https://storage.googleapis.com/comfyfed-models/models/text_encoders/qwen3vl_4b_bf16.safetensors\n\n~8.27 GB total. No restart needed after placing the file: the ComfyFed agent rescans its model inventory every 10 minutes and reports back, and the assessment turns green automatically once it does. Restart the agent if you want it to take effect immediately."
+      ],
+      "color": "#432",
+      "bgcolor": "#653"
+    },
+    {
+      "id": 1,
+      "type": "LoadImage",
+      "pos": [
+        0,
+        120
+      ],
+      "size": [
+        320,
+        350
+      ],
+      "flags": {},
+      "order": 0,
+      "mode": 0,
+      "inputs": [],
+      "outputs": [
+        {
+          "name": "IMAGE",
+          "type": "IMAGE",
+          "slot_index": 0,
+          "links": [
+            1
+          ]
+        },
+        {
+          "name": "MASK",
+          "type": "MASK",
+          "slot_index": 1,
+          "links": []
+        }
+      ],
+      "properties": {
+        "Node name for S&R": "LoadImage"
+      },
+      "widgets_values": [
+        "amyntas_ref.png",
+        "image"
+      ],
+      "title": "圖片 ← 換成你要處理的圖片 / image, swap for yours",
+      "bgcolor": "#533",
+      "color": "#a33"
+    },
+    {
+      "id": 2,
+      "type": "PrimitiveStringMultiline",
+      "pos": [
+        360,
+        120
+      ],
+      "size": [
+        420,
+        320
+      ],
+      "flags": {},
+      "order": 1,
+      "mode": 0,
+      "inputs": [],
+      "outputs": [
+        {
+          "name": "STRING",
+          "type": "STRING",
+          "slot_index": 0,
+          "links": [
+            2
+          ]
+        }
+      ],
+      "properties": {
+        "Node name for S&R": "PrimitiveStringMultiline"
+      },
+      "widgets_values": [
+        "請仔細觀察這張圖片，把「圖中人物」的外觀完整描述出來：長相、髮型髮色、服裝配件、姿勢、光線與整體氛圍。輸出一段英文提示詞（適合 AI 文生圖／生影片使用），只輸出提示詞本身，不要解釋。"
+      ],
+      "title": "指令 ← 至少改這裡 / instruction, edit here",
+      "bgcolor": "#533",
+      "color": "#a33"
+    },
+    {
+      "id": 3,
+      "type": "StringConcatenate",
+      "pos": [
+        820,
+        120
+      ],
+      "size": [
+        340,
+        150
+      ],
+      "flags": {},
+      "order": 2,
+      "mode": 0,
+      "inputs": [
+        {
+          "name": "string_a",
+          "type": "STRING",
+          "link": 2,
+          "widget": {
+            "name": "string_a"
+          }
+        }
+      ],
+      "outputs": [
+        {
+          "name": "STRING",
+          "type": "STRING",
+          "slot_index": 0,
+          "links": [
+            3
+          ]
+        }
+      ],
+      "properties": {
+        "Node name for S&R": "StringConcatenate"
+      },
+      "widgets_values": [
+        "",
+        " /no_think",
+        ""
+      ],
+      "title": "加上 /no_think（別動）/ append /no_think (leave as is)",
+      "bgcolor": "#323",
+      "color": "#535"
+    },
+    {
+      "id": 4,
+      "type": "CLIPLoader",
+      "pos": [
+        820,
+        320
+      ],
+      "size": [
+        340,
+        106
+      ],
+      "flags": {},
+      "order": 3,
+      "mode": 0,
+      "inputs": [],
+      "outputs": [
+        {
+          "name": "CLIP",
+          "type": "CLIP",
+          "slot_index": 0,
+          "links": [
+            4
+          ]
+        }
+      ],
+      "properties": {
+        "Node name for S&R": "CLIPLoader"
+      },
+      "widgets_values": [
+        "qwen3vl_4b_bf16.safetensors",
+        "qwen_image",
+        "default"
+      ],
+      "title": "文字/圖片編碼器（別動）/ text+image encoder (leave as is)",
+      "bgcolor": "#323",
+      "color": "#535"
+    },
+    {
+      "id": 5,
+      "type": "TextGenerate",
+      "pos": [
+        1220,
+        120
+      ],
+      "size": [
+        420,
+        500
+      ],
+      "flags": {},
+      "order": 4,
+      "mode": 0,
+      "inputs": [
+        {
+          "name": "clip",
+          "type": "CLIP",
+          "link": 4
+        },
+        {
+          "name": "prompt",
+          "type": "STRING",
+          "link": 3,
+          "widget": {
+            "name": "prompt"
+          }
+        },
+        {
+          "name": "image",
+          "type": "IMAGE",
+          "link": 1,
+          "shape": 7
+        }
+      ],
+      "outputs": [
+        {
+          "name": "generated_text",
+          "type": "STRING",
+          "slot_index": 0,
+          "links": [
+            5,
+            6
+          ]
+        }
+      ],
+      "properties": {
+        "Node name for S&R": "TextGenerate"
+      },
+      "widgets_values": [
+        "",
+        400,
+        "on",
+        0.05,
+        1.05,
+        0,
+        0.7,
+        64,
+        0.95,
+        0.0,
+        false,
+        true
+      ],
+      "title": "AI 寫提示詞 / AI writes the prompt"
+    },
+    {
+      "id": 6,
+      "type": "SaveText",
+      "pos": [
+        1700,
+        120
+      ],
+      "size": [
+        340,
+        150
+      ],
+      "flags": {},
+      "order": 5,
+      "mode": 0,
+      "inputs": [
+        {
+          "name": "text",
+          "type": "STRING",
+          "link": 5
+        }
+      ],
+      "outputs": [
+        {
+          "name": "text",
+          "type": "STRING",
+          "slot_index": 0,
+          "links": []
+        }
+      ],
+      "properties": {
+        "Node name for S&R": "SaveText"
+      },
+      "widgets_values": [
+        "comfyfed_prompt",
+        "txt"
+      ]
+    },
+    {
+      "id": 7,
+      "type": "PreviewAny",
+      "pos": [
+        1700,
+        320
+      ],
+      "size": [
+        340,
+        220
+      ],
+      "flags": {},
+      "order": 6,
+      "mode": 0,
+      "inputs": [
+        {
+          "name": "source",
+          "type": "STRING",
+          "link": 6
+        }
+      ],
+      "outputs": [
+        {
+          "name": "STRING",
+          "type": "STRING",
+          "slot_index": 0,
+          "links": []
+        }
+      ],
+      "properties": {
+        "Node name for S&R": "PreviewAny"
+      },
+      "widgets_values": [],
+      "title": "預覽 / Preview"
+    },
+    {
+      "id": 101,
+      "type": "MarkdownNote",
+      "pos": [
+        0,
+        -480
+      ],
+      "size": [
+        760,
+        420
+      ],
+      "flags": {},
+      "order": 8,
+      "mode": 0,
+      "inputs": [],
+      "outputs": [],
+      "title": "① 用途＋紅框=至少改這裡 / What to edit (red-framed nodes)",
+      "properties": {},
+      "widgets_values": [
+        "**繁體中文**\n\n紅框的兩個節點是你要改的地方：\n\n- `LoadImage`：換成你自己想描述的圖片（拖曳上傳，或用下拉選單選平台已有的檔案）。\n- 指令文字：預設是叫 AI 描述「圖中人物」，把這幾個字改成你想要的對象即可，例如「整個場景」「衣服的樣式」「背景的建築」。\n\n其他節點不用動——尤其是後面接的 ` /no_think`，那是用來讓模型跳過思考過程、直接輸出結果的，拿掉的話輸出會變慢，還可能夾雜多餘文字。\n\n---\n\n**English**\n\nThe two red-framed nodes are yours to edit: swap `LoadImage` for whatever picture you want described (drag your own file onto the node, or pick one already staged on the platform), and change the words \"the person in the picture\" in the instruction text to whatever you actually want described instead -- \"the whole scene\", \"the clothing style\", \"the building in the background\". Leave everything else alone, especially the trailing ` /no_think` appended after your instruction -- it tells the model to skip its thinking phase and answer directly; removing it slows generation down and can leak stray text into the result."
+      ],
+      "color": "#432",
+      "bgcolor": "#653"
+    },
+    {
+      "id": 102,
+      "type": "MarkdownNote",
+      "pos": [
+        800,
+        -480
+      ],
+      "size": [
+        480,
+        420
+      ],
+      "flags": {},
+      "order": 9,
+      "mode": 0,
+      "inputs": [],
+      "outputs": [],
+      "title": "② 這在做什麼 / What this does",
+      "properties": {},
+      "widgets_values": [
+        "**繁體中文**\n\n一句話：AI 讀這張圖，照著你的指令，寫出一段可以直接拿去生圖或生影片的英文提示詞。\n\n背後用的是 Qwen3-VL 這顆看圖又能寫字的模型：`CLIPLoader` 把它讀進來，`TextGenerate` 把圖片和你的指令一起餵給它，`use_default_template` 開著表示套用官方建議的讀圖格式。\n\n---\n\n**English**\n\nIn one line: the AI looks at your picture, follows your instruction, and writes an English prompt you can paste straight into another text-to-image or text-to-video template. Under the hood this is Qwen3-VL, a vision-and-text model loaded by `CLIPLoader`; `TextGenerate` feeds it both the image and your instruction, with `use_default_template` on so it applies the model's own recommended captioning format."
+      ],
+      "color": "#432",
+      "bgcolor": "#653"
+    },
+    {
+      "id": 103,
+      "type": "MarkdownNote",
+      "pos": [
+        1300,
+        -480
+      ],
+      "size": [
+        700,
+        420
+      ],
+      "flags": {},
+      "order": 10,
+      "mode": 0,
+      "inputs": [],
+      "outputs": [],
+      "title": "③ 結果在哪＋怎麼用 / Where the result is and how to use it",
+      "properties": {},
+      "widgets_values": [
+        "**繁體中文**\n\n跑完後結果直接顯示在 `PreviewAny`（「預覽」）節點裡——全選複製，貼到「武俠文生圖」等其他範本的提示詞欄再微調即可（這是圖生提示詞範本，寫出的是描述這張圖片的提示詞）。同時也會存成 `comfyfed_prompt.txt`，可以到 Console 的「工作」頁面下載。\n\n---\n\n**English**\n\nOnce the job finishes, the result shows up directly inside the `PreviewAny` node -- select all, copy, and paste it into the prompt field of another template (like \"Wuxia text-to-image\") to fine-tune from there (this is the image-to-prompt template, so the prompt describes the picture you fed it). It is also saved as `comfyfed_prompt.txt`, downloadable from the console's Jobs page."
+      ],
+      "color": "#432",
+      "bgcolor": "#653"
+    }
+  ],
+  "links": [
+    [
+      1,
+      1,
+      0,
+      5,
+      2,
+      "IMAGE"
+    ],
+    [
+      2,
+      2,
+      0,
+      3,
+      0,
+      "STRING"
+    ],
+    [
+      3,
+      3,
+      0,
+      5,
+      1,
+      "STRING"
+    ],
+    [
+      4,
+      4,
+      0,
+      5,
+      0,
+      "CLIP"
+    ],
+    [
+      5,
+      5,
+      0,
+      6,
+      0,
+      "STRING"
+    ],
+    [
+      6,
+      5,
+      0,
+      7,
+      0,
+      "STRING"
+    ]
+  ],
+  "groups": [
+    {
+      "id": 1,
+      "title": "①素材＋指令 / Image + instruction — 只改這裡",
+      "bounding": [
+        -20,
+        40,
+        800,
+        500
+      ],
+      "color": "#a1309b",
+      "font_size": 24,
+      "flags": {}
+    },
+    {
+      "id": 2,
+      "title": "②別動：組裝提示詞 / Don't touch: prompt assembly",
+      "bounding": [
+        800,
+        40,
+        840,
+        620
+      ],
+      "color": "#3f789e",
+      "font_size": 24,
+      "flags": {}
+    },
+    {
+      "id": 3,
+      "title": "③輸出 / Output",
+      "bounding": [
+        1680,
+        40,
+        400,
+        620
+      ],
+      "color": "#3f9e5a",
+      "font_size": 24,
+      "flags": {}
+    }
+  ],
+  "config": {},
+  "extra": {
+    "ds": {
+      "scale": 0.55,
+      "offset": [
+        420,
+        880
+      ]
+    }
+  },
+  "version": 0.4
+}

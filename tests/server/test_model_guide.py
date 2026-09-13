@@ -10,9 +10,9 @@ from comfyfed_server import model_guide
 # --- curated registry --------------------------------------------------
 
 
-def test_all_nine_curated_names_resolve(tmp_path):
+def test_all_ten_curated_names_resolve(tmp_path):
     data_dir = str(tmp_path)
-    assert len(model_guide.SOURCES) == 9
+    assert len(model_guide.SOURCES) == 10
     for name, source in model_guide.SOURCES.items():
         found = model_guide.lookup(name, data_dir)
         assert found is not None
@@ -31,6 +31,23 @@ def test_curated_flux1_dev_fields():
     )
     assert source.backup_url == "https://storage.googleapis.com/comfyfed-models/models/diffusion_models/flux1-dev.safetensors"
     assert source.gated is True
+
+
+def test_curated_qwen3vl_4b_fields():
+    """Phase 1.8b Task 2: entry #10, shared by the two prompt-helper templates."""
+    source = model_guide.SOURCES["qwen3vl_4b_bf16.safetensors"]
+    assert source.directory == "text_encoders"
+    assert source.size_gb == 8.27
+    assert source.official_page == "https://huggingface.co/Comfy-Org/Krea-2"
+    assert (
+        source.official_url
+        == "https://huggingface.co/Comfy-Org/Krea-2/resolve/main/text_encoders/qwen3vl_4b_bf16.safetensors"
+    )
+    assert (
+        source.backup_url
+        == "https://storage.googleapis.com/comfyfed-models/models/text_encoders/qwen3vl_4b_bf16.safetensors"
+    )
+    assert source.gated is False
 
 
 def test_curated_lookup_is_bare_name_only_but_matches_category_relative(tmp_path):

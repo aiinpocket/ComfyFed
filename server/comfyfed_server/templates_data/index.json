@@ -50,6 +50,24 @@
         "description": "Hold one still image for a few seconds as a title card, then play a video clip. Needs zero models -- runs on a brand-new worker.",
         "tags": ["video", "image", "intro", "no-model", "無需模型", "comfyfed"],
         "models": []
+      },
+      {
+        "name": "comfyfed-image-to-prompt",
+        "title": "圖生提示詞 / Image to prompt",
+        "mediaType": "image",
+        "mediaSubtype": "webp",
+        "description": "Upload a reference image and a short ask; a local Qwen3-VL model writes the polished English prompt for you. Ships with a sample image.",
+        "tags": ["qwen3vl", "prompt", "提示詞", "vlm", "新手", "comfyfed"],
+        "models": ["qwen3vl_4b_bf16.safetensors"]
+      },
+      {
+        "name": "comfyfed-text-to-prompt",
+        "title": "文字生提示詞 / Text to prompt",
+        "mediaType": "image",
+        "mediaSubtype": "webp",
+        "description": "Paste a rough idea and the same local Qwen3-VL model rewrites it into a structured English prompt.",
+        "tags": ["qwen3vl", "prompt", "提示詞", "llm", "新手", "comfyfed"],
+        "models": ["qwen3vl_4b_bf16.safetensors"]
       }
     ]
   }
