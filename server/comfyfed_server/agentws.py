@@ -553,8 +553,10 @@ async def _handle_heartbeat(worker_id: str, conn: _Connection, message: dict) ->
     # job_done receipt's gpu_seconds is computed from). Ownership and status
     # are gated inside dispatch.mark_running -- called unconditionally here
     # (even when job_not_owned already told us it'll fail) so the WARNING it
-    # logs for a foreign job_id keeps firing on every such heartbeat, not
-    # just the first.
+    # logs for a foreign job_id still fires on the first such heartbeat.
+    # Repeats for the same (connection, job id) are rate-limited to DEBUG via
+    # resolve_warn_level/_resolve_warn_level, so a stale agent heartbeating
+    # every ~30s for the rest of the run doesn't spam WARNING lines for it.
     if state == "busy" and job_id:
         if dispatch.mark_running(
             job_id, worker_id, resolve_warn_level=lambda jid: _resolve_warn_level(conn, jid)
