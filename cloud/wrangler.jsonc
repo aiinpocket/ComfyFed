@@ -56,7 +56,12 @@
   "assets": {
     "directory": "assets",
     "binding": "ASSETS",
-    "run_worker_first": ["/comfy/*", "/api/*"],
+    // "/comfy" (no trailing slash) is listed alongside "/comfy/*" -- a glob
+    // of "/comfy/*" is not guaranteed to also match the bare prefix, and the
+    // Worker's own `/comfy` -> `/comfy/` redirect (index.ts) must run before
+    // ASSETS ever sees that path, or an unauthenticated hit could reach the
+    // SPA fallback directly, bypassing the session gate entirely.
+    "run_worker_first": ["/comfy", "/comfy/*", "/api/*"],
     "not_found_handling": "single-page-application"
   }
 }

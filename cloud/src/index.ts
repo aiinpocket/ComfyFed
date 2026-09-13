@@ -6,6 +6,7 @@ import workersRoutes from "./routes/workers";
 import jobsRoutes from "./routes/jobs";
 import comfyapiRoutes from "./routes/comfyapi";
 import templatesRoutes from "./routes/templates";
+import { comfySessionGate, serveComfyAsset } from "./lib/gate";
 
 export { Hub } from "./do/hub";
 export type { Env };
@@ -53,6 +54,25 @@ app.use("*", async (c, next) => {
 
 app.get("/api/ping", (c) => c.json({ ok: true, mode: "cloud" }));
 
+// Session gate for the embedded panel, ported from app.py's
+// `_comfy_session_gate` -- see lib/gate.ts's docstring. Registered before
+// the `/comfy/ws` / `/comfy/api/ws` handlers and the `/comfy/api/*` /
+// `/comfy/templates/*` route mounts below: it exempts all of those by path
+// itself (see `isGateExempt`), so an unauthenticated hit to any of them
+// still reaches its own auth (401 JSON / DO cookie check) rather than being
+// redirected -- only the panel page and its static assets get the 302.
+app.use("*", comfySessionGate);
+
+// `/comfy` (no trailing slash) -> `/comfy/`, mirroring app.py's
+// `_comfy_root`: the pinned frontend derives its API base from
+// `location.pathname`, so the trailing slash is load-bearing (see that
+// handler's docstring in app.py for the full explanation). Placed after the
+// gate (an unauthenticated hit here is already redirected to `/` above) and
+// before the wildcard asset passthrough, since neither the assets binding's
+// glob patterns nor `run_worker_first` are guaranteed to normalize this on
+// their own.
+app.get("/comfy", (c) => c.redirect("/comfy/", 307));
+
 // Agent WebSocket: forwarded straight to the singleton Hub Durable Object
 // (see do/hub.ts) -- one instance for the whole deployment, per
 // progress.md's pre-flight ruling. The DO's own `fetch` handles the
@@ -85,5 +105,13 @@ app.route("/", workersRoutes);
 app.route("/", jobsRoutes);
 app.route("/", comfyapiRoutes);
 app.route("/", templatesRoutes);
+
+// Anything under `/comfy/*` not claimed by a route above (the panel's own
+// `index.html`, its JS/CSS/font/image bundle) has already passed
+// `comfySessionGate` by the time it gets here -- serve it straight from the
+// `ASSETS` binding (see gate.ts's `serveComfyAsset` docstring for why the
+// Worker must do this itself rather than relying on the platform to fall
+// through, given `run_worker_first` claims every `/comfy*` request).
+app.get("/comfy/*", (c) => serveComfyAsset(c));
 
 export default app;

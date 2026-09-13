@@ -4,10 +4,11 @@
   "version": "0.1.0",
   "type": "module",
   "scripts": {
-    "dev": "wrangler dev",
+    "dev": "node scripts/build.mjs --skip-comfy && wrangler dev",
     "test": "vitest run",
+    "build": "node scripts/build.mjs",
+    "ci-build": "npm ci && npm run build",
     "deploy": "wrangler d1 migrations apply comfyfed --remote && wrangler deploy",
-    "ci-build": "echo ci-build placeholder (Task 11)",
     "seed-official": "node scripts/seed-official.mjs"
   },
   "devDependencies": {

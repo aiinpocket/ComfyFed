@@ -192,25 +192,36 @@ describe("recursive strip parity (stripDownloadMetadata)", () => {
 // ---------------------------------------------------------------------------
 
 describe("auth gating -- requireAdmin covers every /comfy/templates/* shape (review round 1, m2)", () => {
-  it("401s a media path with no session", async () => {
-    // Seeded (unauthenticated) so a 200 would be possible if the gate were
-    // missing -- proves the 401 is the auth gate, not just a 404.
+  // Task 11 added a global `/comfy/*` session gate (src/lib/gate.ts,
+  // mirroring app.py's `_comfy_session_gate`) that now runs BEFORE these
+  // routes: `/comfy/templates/*` is not under `/comfy/api/*`, so an
+  // unauthenticated request is redirected (302) by the gate itself, the
+  // same as any other non-API `/comfy` path -- exact parity with Python,
+  // where this route sits behind the same middleware. This route's own
+  // `requireAdmin` (below) is still real and still exercised once
+  // authenticated; it's just no longer the FIRST thing an unauthenticated
+  // request hits.
+  it("redirects (gate) a media path with no session", async () => {
+    // Seeded (unauthenticated) so a 200 would be possible if some gate were
+    // missing -- proves the 302 is a real gate, not just a 404.
     await putPackagedRaw("comfyfed-wuxia-t2i-1.webp", new Uint8Array([1, 2, 3]));
     const r = await call("/comfy/templates/comfyfed-wuxia-t2i-1.webp");
-    expect(r.status).toBe(401);
+    expect(r.status).toBe(302);
   });
 
-  it("401s a workflow json path with no session", async () => {
+  it("redirects (gate) a workflow json path with no session", async () => {
     await putOfficialJson("flux_dev.json", FLUX_WORKFLOW);
     const r = await call("/comfy/templates/flux_dev.json");
-    expect(r.status).toBe(401);
+    expect(r.status).toBe(302);
   });
 });
 
 describe("GET /comfy/templates/index.json", () => {
-  it("401s with no session", async () => {
+  it("redirects (gate) with no session", async () => {
+    // See the "auth gating" describe block above: Task 11's global gate
+    // intercepts this unauthenticated request before requireAdmin does.
     const r = await call("/comfy/templates/index.json");
-    expect(r.status).toBe(401);
+    expect(r.status).toBe(302);
   });
 
   it("serves ComfyFed's packaged categories alone when no official index exists", async () => {
