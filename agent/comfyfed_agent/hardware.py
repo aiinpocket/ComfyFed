@@ -50,6 +50,10 @@ def collect_hardware(comfy_url: str) -> dict:
         "cpu_cores": psutil.cpu_count(logical=True),
         "ram_gb": round(psutil.virtual_memory().total / (1024 ** 3), 1),
         "agent_version": __version__,
+        # "Windows" | "Darwin" | "Linux" -- lets the platform tell a Mac/CPU
+        # worker apart from a headless Linux box even when `backend` alone
+        # (cuda/rocm/mps/cpu) is ambiguous (a Linux box can be "cpu" too).
+        "platform": platform.system(),
     }
 
 

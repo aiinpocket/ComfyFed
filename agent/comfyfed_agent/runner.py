@@ -106,6 +106,10 @@ class PlatformConnection:
                 "backend": backend,
                 "torch_version": torch_version,
                 "node_classes": sorted(node_classes),
+                # Protocol 2: this agent guarantees `exec_seconds` on
+                # job_done/job_failed whenever the run actually started, and
+                # understands `job_cancelled` pushes. See agentws.py.
+                "protocol": 2,
             }
         )
 

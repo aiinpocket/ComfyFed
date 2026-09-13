@@ -52,6 +52,11 @@ class Worker(Base):
     node_classes: Mapped[str] = mapped_column(String, default="[]", server_default="[]")
     model_inventory: Mapped[str] = mapped_column(String, default="[]", server_default="[]")
     object_info_hash: Mapped[str] = mapped_column(String, default="", server_default="")
+    # Agent protocol version reported in `hello` (see agentws._handle_hello).
+    # 1 = pre-Phase-1.9 agent: no guaranteed exec_seconds, doesn't understand
+    # `job_cancelled` pushes -- still served, but gets a one-time deprecation
+    # frame and is never sent job_cancelled. 2 = current comfyfed-agent.
+    protocol: Mapped[int] = mapped_column(Integer, default=1, server_default="1")
 
 
 class RegisterToken(Base):

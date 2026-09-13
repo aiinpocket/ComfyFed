@@ -100,24 +100,44 @@ def assign_jobs(idle_worker_ids: list[str]) -> list[tuple[str, db.Job]]:
                 requirements_override = {}
 
             needs = assess.needs_from_job(job)
+            is_light = not needs.models and not (needs.est_vram_gb or 0)
 
-            # (has_warnings, -free_vram, name, worker_id): sorts clean before
-            # warned, then largest free VRAM first, then name for determinism.
             candidates = []
             for candidate_id in available_worker_ids:
                 worker = workers[candidate_id]
                 v = assess.verdict(worker, needs, requirements_override, all_workers)
                 if v.kind != "eligible":
                     continue
-                candidates.append(
-                    (bool(v.warnings), -_free_vram_gb(worker), worker.name, candidate_id)
-                )
+                if is_light:
+                    # Zero-model work (e.g. stitching finished clips into a
+                    # video) needs no GPU at all -- 合併影片這類零模型工作交給
+                    # 弱 GPU／Mac，把大卡留給模型任務. Clean beats warned as
+                    # always, then a weak-backend (mps/cpu) worker beats a
+                    # real GPU, then SMALLEST free VRAM first (weakest GPU
+                    # among the rest), so the biggest cards stay free for
+                    # jobs that actually need them.
+                    candidates.append(
+                        (
+                            bool(v.warnings),
+                            worker.backend not in ("mps", "cpu"),
+                            _free_vram_gb(worker),
+                            worker.name,
+                            candidate_id,
+                        )
+                    )
+                else:
+                    # (has_warnings, -free_vram, name, worker_id): sorts
+                    # clean before warned, then largest free VRAM first, then
+                    # name for determinism.
+                    candidates.append(
+                        (bool(v.warnings), -_free_vram_gb(worker), worker.name, candidate_id)
+                    )
 
             if not candidates:
                 continue
 
             candidates.sort()
-            best_worker_id = candidates[0][3]
+            best_worker_id = candidates[0][-1]
 
             # Atomic claim: only succeeds if the job is still queued. If
             # another process/thread beat us to it, rowcount is 0 and we

@@ -158,9 +158,16 @@ export function Workers() {
                     </Table.Td>
                     <Table.Td>
                       {worker.backend ? (
-                        <Badge size="sm" variant="light" tt="uppercase" fw={600}>
-                          {worker.backend}
-                        </Badge>
+                        <Stack gap={1}>
+                          <Badge size="sm" variant="light" tt="uppercase" fw={600}>
+                            {worker.backend}
+                          </Badge>
+                          {worker.hardware?.platform && (
+                            <Text size="xs" c="dimmed">
+                              {worker.hardware.platform}
+                            </Text>
+                          )}
+                        </Stack>
                       ) : (
                         <Text size="sm" c="dimmed">
                           —

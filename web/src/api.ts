@@ -132,6 +132,8 @@ export interface WorkerHardware {
   cpu_cores?: number | null;
   ram_gb?: number | null;
   agent_version?: string | null;
+  /** "Windows" | "Darwin" | "Linux", reported since agent protocol 2. */
+  platform?: string | null;
 }
 
 export interface WorkerDynamic {

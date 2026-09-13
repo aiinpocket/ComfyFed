@@ -10,7 +10,7 @@ import pytest
 
 from comfyfed_agent import comfy, hardware, whitelist
 from comfyfed_agent.config import AgentConfig, PlatformEntry
-from comfyfed_agent.runner import AgentLoop, CleanupMode, _is_safe_relative_path, cleanup_job_files
+from comfyfed_agent.runner import AgentLoop, CleanupMode, PlatformConnection, _is_safe_relative_path, cleanup_job_files
 from comfyfed_agent import runner as runner_module
 
 _real_whitelist_check = whitelist.check
@@ -1305,3 +1305,41 @@ async def test_held_completion_backs_off_when_the_socket_is_live_but_uploads_fai
     assert gaps[1] >= gaps[0], f"backoff did not grow: {gaps}"
     assert conn_a.job_done == ("job-http-backoff", ["result.png"], 1.0)
     assert conn_a.job_failed is None
+
+
+# --- Task 6: agent protocol 2 ---------------------------------------------
+
+
+def test_collect_hardware_reports_platform_system(monkeypatch):
+    monkeypatch.setattr(hardware.platform, "system", lambda: "Linux")
+    hw = hardware.collect_hardware("http://127.0.0.1:8188")
+    assert hw["platform"] == "Linux"
+
+
+class _RecordingWS:
+    def __init__(self):
+        self.sent: list[str] = []
+
+    async def send(self, message: str) -> None:
+        self.sent.append(message)
+
+
+@pytest.mark.asyncio
+async def test_send_hello_declares_protocol_2():
+    entry = PlatformEntry(
+        platform_url="http://p",
+        platform_pubkey="aa",
+        worker_id="w1",
+        certificate="cert",
+        signing_key_hex="00" * 32,
+    )
+    conn = PlatformConnection(entry, AgentConfig())
+    conn.ws = _RecordingWS()
+
+    await conn.send_hello({"cpu": "x", "platform": "Windows"}, "cuda", "2.0", ["KSampler"])
+
+    assert len(conn.ws.sent) == 1
+    payload = json.loads(conn.ws.sent[0])
+    assert payload["type"] == "hello"
+    assert payload["protocol"] == 2
+    assert payload["hardware"]["platform"] == "Windows"

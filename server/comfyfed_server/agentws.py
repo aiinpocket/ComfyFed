@@ -72,6 +72,18 @@ _AUTH_TIMEOUT_SECONDS = 10
 _TICK_INTERVAL_SECONDS = 5
 _CLOSE_UNAUTHORIZED = 4401
 
+# Minimum `hello.protocol` that guarantees exec_seconds on job_done/job_failed
+# (when the run started) and understands `job_cancelled` pushes. Below this,
+# the agent is still fully served (backward compat) but gets a one-time
+# deprecation notice and never a job_cancelled frame it couldn't act on.
+_CURRENT_PROTOCOL = 2
+
+_DEPRECATION_MESSAGE = (
+    "agent 版本過舊：無法接收取消通知，計費將以整體耗時（wall-clock）為準。"
+    "請更新 comfyfed-agent。/ Agent is outdated: cannot receive cancellation "
+    "notices; billing falls back to wall-clock. Please update comfyfed-agent."
+)
+
 # Set by create_router(data_dir); used to sign job_done receipts.
 _signing_key: Optional[SigningKey] = None
 
@@ -148,6 +160,10 @@ class _Connection:
     worker_id: str
     loop: asyncio.AbstractEventLoop
     state: str = "idle"  # idle | busy | dispatched
+    # Agent protocol version from `hello.protocol`, defaulting to 1 (never
+    # sent a hello, or an old agent that doesn't send the field at all) --
+    # see `_handle_hello` and `_send_job_cancelled`.
+    protocol: int = 1
     # job_ids this connection has already been sent `job_cancelled` for --
     # see `_send_job_cancelled`. Scoped to the connection instance itself, so
     # a reconnect naturally starts with a clean set. Bounded (see
@@ -286,7 +302,7 @@ async def _handle_message(worker_id: str, conn: _Connection, message: dict) -> N
     msg_type = message.get("type") if isinstance(message, dict) else None
     try:
         if msg_type == "hello":
-            _handle_hello(worker_id, message)
+            await _handle_hello(worker_id, conn, message)
         elif msg_type == "heartbeat":
             want_object_info = await _handle_heartbeat(worker_id, conn, message)
             if want_object_info:
@@ -362,6 +378,11 @@ async def _send_job_cancelled(conn: "_Connection", job_id: Optional[str]) -> Non
     already told to abort.
     """
     if not job_id or job_id in conn.cancelled_jobs_sent:
+        return
+    if conn.protocol < _CURRENT_PROTOCOL:
+        # A protocol-1 agent doesn't understand this message type -- sending
+        # it would only earn a rate-limited "unknown message type" warning on
+        # its side. Skip silently; it already got the deprecation notice.
         return
     conn.cancelled_jobs_sent.add(job_id)
     try:
@@ -500,7 +521,19 @@ async def _notify_panel_job_done(job_id: Optional[str]) -> None:
         await panelws.job_done(job)
 
 
-def _handle_hello(worker_id: str, message: dict) -> None:
+def _parse_protocol(message: dict) -> int:
+    """Validate `hello.protocol`, defaulting to 1 (the version before this
+    field existed) for anything missing or malformed -- a stray string or
+    negative number must degrade to "treat as old agent", not crash hello
+    handling."""
+    protocol = message.get("protocol")
+    if not isinstance(protocol, int) or isinstance(protocol, bool) or protocol < 1:
+        return 1
+    return protocol
+
+
+async def _handle_hello(worker_id: str, conn: "_Connection", message: dict) -> None:
+    protocol = _parse_protocol(message)
     with db.get_session() as session:
         worker = session.get(db.Worker, worker_id)
         if worker is None:
@@ -509,9 +542,19 @@ def _handle_hello(worker_id: str, message: dict) -> None:
         worker.backend = message.get("backend") or ""
         worker.torch_version = message.get("torch_version") or ""
         worker.node_classes = json.dumps(message.get("node_classes") or [])
+        worker.protocol = protocol
         worker.status = "online"
         worker.last_seen = _utcnow()
         session.commit()
+
+    conn.protocol = protocol
+    if protocol < _CURRENT_PROTOCOL:
+        try:
+            await conn.ws.send_json({"type": "deprecation", "message": _DEPRECATION_MESSAGE})
+        except Exception:
+            logger.exception(
+                "agentws: failed to send deprecation notice to worker %s", worker_id
+            )
 
 
 async def _handle_heartbeat(worker_id: str, conn: _Connection, message: dict) -> bool:
@@ -789,12 +832,25 @@ async def _create_and_push_receipt(
         else:
             gpu_seconds = wall_seconds
             basis = "wall"
-            logger.info(
-                "agentws: job %s has no valid exec_seconds from worker %s, "
-                "billing the wall-clock span instead",
-                job_id,
-                worker_id,
-            )
+            if conn.protocol >= _CURRENT_PROTOCOL and job.started_at is not None:
+                # A protocol-2 agent guarantees exec_seconds once the run
+                # started (Task 5) -- missing it here is the agent breaking
+                # its own contract, not a routine fallback.
+                logger.error(
+                    "agentws: protocol violation: job %s from worker %s (protocol %s) "
+                    "has no valid exec_seconds despite having started; "
+                    "billing the wall-clock span instead",
+                    job_id,
+                    worker_id,
+                    conn.protocol,
+                )
+            else:
+                logger.info(
+                    "agentws: job %s has no valid exec_seconds from worker %s, "
+                    "billing the wall-clock span instead",
+                    job_id,
+                    worker_id,
+                )
 
         gpu_seconds = max(0.0, gpu_seconds)
 
@@ -855,6 +911,15 @@ async def _create_and_push_failure_receipt(
             if job.started_at is not None:
                 end = job.finished_at or _utcnow()
                 wall_seconds = (end - job.started_at).total_seconds()
+                if conn.protocol >= _CURRENT_PROTOCOL:
+                    logger.error(
+                        "agentws: protocol violation: job %s from worker %s (protocol %s) "
+                        "has no valid exec_seconds despite having started; "
+                        "billing the wall-clock span instead",
+                        job_id,
+                        worker_id,
+                        conn.protocol,
+                    )
             gpu_seconds = wall_seconds
             basis = "wall"
 

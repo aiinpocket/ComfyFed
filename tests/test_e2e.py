@@ -154,6 +154,7 @@ def test_full_job_lifecycle_over_the_wire(server, mock_comfy, tmp_path):
                 "backend": "cuda",
                 "torch_version": "2.4.0",
                 "node_classes": node_classes,
+                "protocol": 2,
             }
         )
         ws.send_json(

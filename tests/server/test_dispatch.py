@@ -91,6 +91,50 @@ def test_alembic_upgrade_head_from_pre_existing_db_adds_last_worker_id(tmp_path)
     assert cols["last_worker_id"][3] == 0
 
 
+def test_alembic_migration_8_adds_worker_protocol_defaulting_to_1(tmp_path):
+    """A DB already at the previous head (migration #7, receipt
+    kind/billable/basis) must upgrade to head cleanly, backfilling every
+    pre-existing worker as protocol=1 -- it predates `hello.protocol` and is
+    a pre-Phase-1.9 agent until it reconnects with a fresh hello."""
+    import sqlite3
+
+    db_path = str(tmp_path / "t.db")
+    cfg = Config()
+    cfg.set_main_option("script_location", db._alembic_dir())
+    cfg.set_main_option("sqlalchemy.url", f"sqlite+pysqlite:///{db_path}")
+
+    command.upgrade(cfg, "f6a7b8c9d0e1")  # pre-existing DB, one migration behind
+
+    conn = sqlite3.connect(db_path)
+    try:
+        conn.execute(
+            "INSERT INTO workers (id, name, pubkey, created_at) VALUES ('w1', 'w1', 'pk', '2026-01-01 00:00:00')"
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+    command.upgrade(cfg, "head")
+
+    conn = sqlite3.connect(db_path)
+    try:
+        cols = {row[1]: row for row in conn.execute("PRAGMA table_info(workers)").fetchall()}
+        protocol = conn.execute("SELECT protocol FROM workers WHERE id = 'w1'").fetchone()[0]
+    finally:
+        conn.close()
+    assert "protocol" in cols
+    assert cols["protocol"][3] == 1  # NOT NULL
+    assert protocol == 1
+
+    command.downgrade(cfg, "f6a7b8c9d0e1")
+    conn = sqlite3.connect(db_path)
+    try:
+        cols_after = {row[1] for row in conn.execute("PRAGMA table_info(workers)").fetchall()}
+    finally:
+        conn.close()
+    assert "protocol" not in cols_after
+
+
 # --- Step 2: requeue_stale records last_worker_id ------------------------
 
 
@@ -236,15 +280,81 @@ def test_assign_jobs_prefers_clean_worker_over_warned_worker(_db):
 
 
 def test_assign_jobs_ties_broken_by_largest_free_vram(_db):
+    # A model-bearing (heavy) job: keeps the pre-Task-6 heavy-job ranking.
     small_id = _make_worker("w_small", dynamic={"free_vram_gb": 4})
     big_id = _make_worker("w_big", dynamic={"free_vram_gb": 12})
-    job_id = _make_job()
+    job_id = _make_job(est_vram_gb=1)
 
     assignments = dispatch.assign_jobs([small_id, big_id])
 
     assert len(assignments) == 1
     worker_id, job = assignments[0]
     assert worker_id == big_id
+    assert job.id == job_id
+
+
+# --- Task 6: light-job dispatch preference --------------------------------
+
+
+def _make_worker_backend(worker_id, backend, dynamic=None):
+    with db.get_session() as session:
+        session.add(
+            db.Worker(
+                id=worker_id,
+                name=worker_id,
+                pubkey="pk",
+                backend=backend,
+                hardware=json.dumps({}),
+                dynamic=json.dumps(dynamic or {}),
+            )
+        )
+        session.commit()
+    return worker_id
+
+
+def test_light_job_prefers_mps_worker_over_a_32gb_cuda_worker(_db):
+    """A zero-model job (no required models, no est_vram_gb) should go to a
+    weak/Mac worker rather than stealing the biggest GPU."""
+    mac_id = _make_worker_backend("w_mac", "mps", dynamic={"free_vram_gb": 0})
+    big_cuda_id = _make_worker_backend("w_cuda_big", "cuda", dynamic={"free_vram_gb": 32})
+    job_id = _make_job()  # no models, no est_vram_gb -> light
+
+    assignments = dispatch.assign_jobs([mac_id, big_cuda_id])
+
+    assert len(assignments) == 1
+    worker_id, job = assignments[0]
+    assert worker_id == mac_id
+    assert job.id == job_id
+
+
+def test_light_job_prefers_smallest_free_vram_cuda_worker(_db):
+    """Among two GPU workers (neither weak-backend), a light job should still
+    go to the smallest free VRAM one, leaving the big card free."""
+    small_cuda_id = _make_worker_backend("w_cuda_small", "cuda", dynamic={"free_vram_gb": 8})
+    big_cuda_id = _make_worker_backend("w_cuda_big", "cuda", dynamic={"free_vram_gb": 24})
+    job_id = _make_job()
+
+    assignments = dispatch.assign_jobs([small_cuda_id, big_cuda_id])
+
+    assert len(assignments) == 1
+    worker_id, job = assignments[0]
+    assert worker_id == small_cuda_id
+    assert job.id == job_id
+
+
+def test_heavy_job_ranking_is_unchanged_by_light_job_preference(_db):
+    """A job with a real VRAM requirement must still prefer the biggest free
+    VRAM worker, exactly as before -- the light-job preference must not leak
+    into heavy-job ranking."""
+    mac_id = _make_worker_backend("w_mac", "mps", dynamic={"free_vram_gb": 0})
+    big_cuda_id = _make_worker_backend("w_cuda_big", "cuda", dynamic={"free_vram_gb": 32})
+    job_id = _make_job(est_vram_gb=10)
+
+    assignments = dispatch.assign_jobs([mac_id, big_cuda_id])
+
+    assert len(assignments) == 1
+    worker_id, job = assignments[0]
+    assert worker_id == big_cuda_id
     assert job.id == job_id
 
 
