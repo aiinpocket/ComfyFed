@@ -679,3 +679,17 @@ def test_a_warning_survives_an_eligible_after_fetch_verdict():
     assert v.kind == "eligible_after_fetch"
     assert v.reasons == ["missing_models:flux1-dev.safetensors"]
     assert v.warnings == ["vram_offload:25.5>8.0"]
+
+
+def test_extract_sees_pth_models():
+    """Caught live (Phase 2.1 T8): `.pth` was missing from _MODEL_EXTENSIONS,
+    making RealESRGAN_x4plus.pth invisible to extraction -- the upscale
+    template's missing-model gate and auto-fetch never fired for it."""
+    workflow = {
+        "2": {
+            "class_type": "UpscaleModelLoader",
+            "inputs": {"model_name": "RealESRGAN_x4plus.pth"},
+        }
+    }
+    needs = assess.extract(workflow)
+    assert "RealESRGAN_x4plus.pth" in needs.models

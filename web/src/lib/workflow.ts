@@ -19,7 +19,7 @@ const MODEL_FIELD_NAMES = new Set([
   'upscale_model_name',
 ]);
 
-const MODEL_EXTENSIONS = ['.safetensors', '.ckpt', '.pt', '.sft', '.gguf'];
+const MODEL_EXTENSIONS = ['.safetensors', '.ckpt', '.pt', '.pth', '.sft', '.gguf'];
 
 const ASSET_NODE_CLASSES = new Set(['LoadImage', 'LoadImageMask', 'LoadAudio', 'LoadVideo']);
 

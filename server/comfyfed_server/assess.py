@@ -31,7 +31,7 @@ _MODEL_FIELD_NAMES = {
     "upscale_model_name",
 }
 
-_MODEL_EXTENSIONS = (".safetensors", ".ckpt", ".pt", ".sft", ".gguf")
+_MODEL_EXTENSIONS = (".safetensors", ".ckpt", ".pt", ".pth", ".sft", ".gguf")
 
 # Node classes whose inputs name a file the submitter must upload with the job.
 # Mirrored client-side in web/src/lib/workflow.ts -- keep the two lists in step.

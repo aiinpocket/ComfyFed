@@ -30,7 +30,7 @@ const MODEL_FIELD_NAMES = new Set([
   "upscale_model_name",
 ]);
 
-const MODEL_EXTENSIONS = [".safetensors", ".ckpt", ".pt", ".sft", ".gguf"];
+const MODEL_EXTENSIONS = [".safetensors", ".ckpt", ".pt", ".pth", ".sft", ".gguf"];
 
 /** Node classes whose inputs name a file the submitter must upload with the
  * job. Mirrored client-side in web/src/lib/workflow.ts -- keep in step. */
