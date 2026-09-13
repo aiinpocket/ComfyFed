@@ -20,7 +20,7 @@ import httpx
 import websockets
 from nacl.signing import SigningKey
 
-from . import comfy, hardware, signing, whitelist
+from . import comfy, fetcher, hardware, signing, whitelist
 from .config import AgentConfig, PlatformEntry
 
 logger = logging.getLogger(__name__)
@@ -45,6 +45,18 @@ _REPORT_RETRY_MAX_SECONDS = 30.0
 # stop waiting and let the interpreter tear the loop down instead of hanging
 # forever on a wedged cleanup.
 _SIGNAL_SHUTDOWN_TIMEOUT_SECONDS = 10.0
+
+# Phase 2.1 Task 5: a `job` push carries `fetch_models` only when the
+# platform's dispatch decided this worker is `eligible_after_fetch`, which
+# itself requires the worker's `hello.auto_fetch` to have been true (see
+# `assess._eligible_after_fetch`). So a `fetch_models` push reaching a worker
+# with `auto_fetch_models` now false is always a race (the operator flipped
+# the config and restarted between hello and this push) or a server bug --
+# never a normal flow. Reported as a polite job_failed rather than crashing:
+# nothing was downloaded, nothing to clean up.
+_AUTO_FETCH_DISABLED_MESSAGE = (
+    "此 worker 未開啟自動下載 / this worker does not have auto-fetch enabled"
+)
 
 
 class PlatformUnavailable(Exception):
@@ -143,18 +155,33 @@ class PlatformConnection:
         job_id: Optional[str] = None,
         dynamic: Optional[dict] = None,
         object_info_hash: Optional[str] = None,
+        stage: Optional[str] = None,
+        fetch_pct: Optional[float] = None,
+        fetch_model: Optional[str] = None,
     ) -> None:
         self.state = state
-        await self._send(
-            {
-                "type": "heartbeat",
-                "state": state,
-                "progress": progress,
-                "job_id": job_id,
-                "dynamic": dynamic or {},
-                "object_info_hash": object_info_hash,
-            }
-        )
+        message = {
+            "type": "heartbeat",
+            "state": state,
+            "progress": progress,
+            "job_id": job_id,
+            "dynamic": dynamic or {},
+            "object_info_hash": object_info_hash,
+        }
+        # Phase 2.1 Task 5: present only while this worker is downloading a
+        # missing model before running the job it was pushed (see
+        # fetcher.fetch_and_verify_models) -- omitted entirely otherwise, so
+        # an ordinary heartbeat's wire shape is unchanged (matching
+        # agentws.py's `"stage": "fetching_models"|absent` contract, as
+        # opposed to job_id/dynamic/object_info_hash which are always
+        # present, just possibly null/empty).
+        if stage is not None:
+            message["stage"] = stage
+        if fetch_pct is not None:
+            message["fetch_pct"] = fetch_pct
+        if fetch_model is not None:
+            message["fetch_model"] = fetch_model
+        await self._send(message)
 
     async def send_object_info(self, gzip_payload: bytes, oi_hash: str) -> None:
         """Signed POST of a gzipped, canonical `/object_info` snapshot."""
@@ -469,6 +496,9 @@ class AgentLoop:
         progress: float = 0.0,
         job_id: Optional[str] = None,
         dynamic: Optional[dict] = None,
+        stage: Optional[str] = None,
+        fetch_pct: Optional[float] = None,
+        fetch_model: Optional[str] = None,
     ) -> None:
         for worker_id, conn in self.connections.items():
             try:
@@ -478,6 +508,9 @@ class AgentLoop:
                     job_id=job_id,
                     dynamic=dynamic,
                     object_info_hash=getattr(conn, "object_info_hash", None) or None,
+                    stage=stage,
+                    fetch_pct=fetch_pct,
+                    fetch_model=fetch_model,
                 )
             except Exception:
                 logger.exception("runner: failed to broadcast heartbeat to %s", worker_id)
@@ -582,6 +615,45 @@ class AgentLoop:
                 # the lock, or between dispatch and here.
                 raise_if_cancelled()
                 await self.broadcast_heartbeat("busy", progress=0.0, job_id=job_id)
+
+                fetch_models = list(job_msg.get("fetch_models") or [])
+                if fetch_models:
+                    if not self.config.auto_fetch_models:
+                        # Never a normal flow -- see _AUTO_FETCH_DISABLED_MESSAGE.
+                        # Raising here (rather than reporting directly) lets the
+                        # existing `except Exception` branch below do the
+                        # reporting, exactly like every other fetch failure.
+                        raise fetcher.FetchError(_AUTO_FETCH_DISABLED_MESSAGE)
+
+                    async def report_fetch_progress(pct: float, model_name: Optional[str]) -> None:
+                        # Runs directly on this coroutine (unlike run_workflow's
+                        # on_progress, fetching is native async, no worker
+                        # thread involved) -- so this is just a normal await,
+                        # no run_coroutine_threadsafe needed.
+                        await self.broadcast_heartbeat(
+                            "busy",
+                            progress=0.0,
+                            job_id=job_id,
+                            stage="fetching_models",
+                            fetch_pct=pct,
+                            fetch_model=model_name,
+                        )
+
+                    await fetcher.fetch_and_verify_models(
+                        entries=fetch_models,
+                        platform_pubkey_hex=conn.entry.platform_pubkey,
+                        models_dir=self.config.models_dir,
+                        max_fetch_gb=self.config.max_fetch_gb,
+                        cancel_event=handle.cancel_event,
+                        report_progress=report_fetch_progress,
+                    )
+
+                    # The manifest models just landed on disk -- push the
+                    # updated inventory now rather than waiting for the
+                    # periodic 10-minute rescan (see refresh_model_inventory),
+                    # so the server learns immediately that this worker no
+                    # longer has a gap for this job (or the next one).
+                    await self.refresh_model_inventory(conn)
 
                 workflow = comfy.namespace_outputs(json.loads(job_msg["workflow_json"]), job_id)
                 # allowed_classes does a blocking HTTP call to ComfyUI's
