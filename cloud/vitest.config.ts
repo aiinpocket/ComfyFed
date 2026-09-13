@@ -42,7 +42,32 @@ export default defineConfig({
       // its comment) so a real deployment refuses /api/setup until the
       // operator sets one via `wrangler secret put`. `miniflare.bindings`
       // merges over the wrangler-derived vars for the test Worker only.
-      miniflare: { bindings: { SETUP_TOKEN: "test-setup-token" } },
+      //
+      // `miniflare.assets.directory` overrides ONLY the `directory` field of
+      // the `assets` binding wrangler.jsonc declares (routerConfig/
+      // assetConfig -- run_worker_first, not_found_handling, etc. -- still
+      // come from the real wrangler.jsonc, since `unstable_getMiniflareWorkerOptions`
+      // merges this as a partial override, not a replacement). This is
+      // REQUIRED for the test suite to be hermetic: pointing at the real
+      // `./assets` (cloud.mjs's build output, gitignored, never committed)
+      // would make the test suite's outcome depend on whether a developer
+      // happened to have run `npm run build` locally -- Task 11's fix-round-1
+      // regression (18 templates.spec.ts tests failing once `assets/` was
+      // actually populated, because the ASSETS binding started answering
+      // with the real packaged templates instead of missing/falling through
+      // to the R2 fixtures those tests seed). `test/fixtures/assets/` is a
+      // small, deliberately-named, committed fixture set instead: one fake
+      // template JSON + one fake media file (named `comfyfed-asset-fixture*`
+      // so they can never collide with a real template name or with any of
+      // templates.spec.ts's R2-seeded fixture names), plus a placeholder
+      // `index.html` for the SPA fallback. See
+      // `test/templates.spec.ts`'s "ASSETS-served packaged path" describe
+      // block for the coverage this unlocks (closing Task 10 report concern
+      // #1: the ASSETS-binding code path was previously only ever a miss).
+      miniflare: {
+        bindings: { SETUP_TOKEN: "test-setup-token" },
+        assets: { directory: "./test/fixtures/assets" },
+      },
     }),
   ],
 });

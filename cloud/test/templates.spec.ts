@@ -216,6 +216,74 @@ describe("auth gating -- requireAdmin covers every /comfy/templates/* shape (rev
   });
 });
 
+// ---------------------------------------------------------------------------
+// ASSETS-served packaged path -- Task 11's build.mjs places ComfyFed's real
+// packaged templates under `assets/comfyfed_templates/`, read via
+// `fetchPackagedRaw`'s `env.ASSETS.fetch(...)` call BEFORE the R2 fallback
+// (see that function's docstring). Every other test in this file seeds
+// "packaged" fixtures through R2 instead (`putPackagedJson`/`putPackagedRaw`)
+// specifically because vitest.config.ts's `miniflare.assets.directory`
+// override points the test ASSETS binding at `test/fixtures/assets/` (a
+// small, hermetic, committed fixture set -- NOT the real, gitignored,
+// locally-built `cloud/assets/`, so the suite's outcome never depends on
+// whether a developer happens to have run `npm run build`; see Task 11's
+// fix-round-1 note for why this override exists at all), which is deliberately
+// empty except for two files named so they can never collide with a real
+// template or with any R2-seeded fixture name here: `comfyfed-asset-fixture.json`
+// and `comfyfed-asset-fixture-1.webp`. These tests are what actually drive a
+// request down the ASSETS-hit branch of `fetchPackagedRaw` rather than always
+// missing it -- closing Task 10 report concern #1 ("the ASSETS-binding read
+// path is real code but currently untested by anything other than falling
+// through cleanly").
+describe("ASSETS-served packaged path (test/fixtures/assets/comfyfed_templates/)", () => {
+  it("serves a JSON template straight from the ASSETS binding, raw (no stripping)", async () => {
+    const { cookie } = await loginSession();
+    const r = await call("/comfy/templates/comfyfed-asset-fixture.json", { cookie });
+    expect(r.status).toBe(200);
+    expect(r.body).toEqual({
+      id: "comfyfed-asset-fixture",
+      note:
+        'Test-only fixture for the ASSETS-served packaged-template path (see test/gate.spec.ts and test/templates.spec.ts\'s "ASSETS-served packaged path" describe block). Deliberately named so it never collides with any real ComfyFed template name or with the R2-seeded fixture names the rest of templates.spec.ts uses.',
+      nodes: [],
+    });
+  });
+
+  it("serves a media file straight from the ASSETS binding, byte-identical, with the mapped content-type", async () => {
+    const { cookie } = await loginSession();
+    const worker = (await import("../src/index")).default;
+    const { env, createExecutionContext, waitOnExecutionContext } = await import("cloudflare:test");
+    const request = new Request("http://example.com/comfy/templates/comfyfed-asset-fixture-1.webp", {
+      headers: { Cookie: cookie ?? "" },
+    });
+    const ctx = createExecutionContext();
+    const response = await worker.fetch(request, env as any, ctx);
+    await waitOnExecutionContext(ctx);
+
+    expect(response.status).toBe(200);
+    expect(response.headers.get("content-type")).toBe("image/webp");
+    const bytes = new Uint8Array(await response.arrayBuffer());
+    expect(new TextDecoder().decode(bytes)).toBe("RIFF\x00\x00\x00\x00WEBPtest-fixture-media-bytes");
+  });
+
+  it("an ASSETS hit takes priority over an R2 object at the same packaged key", async () => {
+    // Same filename seeded on BOTH sources with different content --
+    // fetchPackagedRaw must return the ASSETS copy, per its own documented
+    // "ASSETS binding first, R2 second" precedence.
+    await putPackagedJson("comfyfed-asset-fixture.json", { from: "r2-should-not-win" });
+    const { cookie } = await loginSession();
+    const r = await call("/comfy/templates/comfyfed-asset-fixture.json", { cookie });
+    expect(r.status).toBe(200);
+    expect(r.body?.id).toBe("comfyfed-asset-fixture");
+    expect(r.body?.from).toBeUndefined();
+  });
+
+  it("a filename absent from BOTH the fixture ASSETS dir and R2 still 404s (no accidental SPA-style fallback)", async () => {
+    const { cookie } = await loginSession();
+    const r = await call("/comfy/templates/comfyfed-nonexistent-fixture.json", { cookie });
+    expect(r.status).toBe(404);
+  });
+});
+
 describe("GET /comfy/templates/index.json", () => {
   it("redirects (gate) with no session", async () => {
     // See the "auth gating" describe block above: Task 11's global gate
