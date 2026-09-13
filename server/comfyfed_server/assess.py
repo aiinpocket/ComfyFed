@@ -460,14 +460,13 @@ def verdict(
     )
 
 
-def _eligible_after_fetch(
-    worker, missing_models: list[str], fetchable_models: dict[str, int] | None, dynamic: dict
-) -> bool:
-    """All the eligible_after_fetch gates -- see `verdict`'s docstring."""
-    fetchable_models = fetchable_models or {}
-    if not all(name in fetchable_models for name in missing_models):
-        return False
-
+def _worker_fetch_capacity_ok(worker, dynamic: dict, total_missing_gb: float) -> bool:
+    """Protocol/auto_fetch/disk-margin gate, independent of WHICH models are
+    missing -- shared by `_eligible_after_fetch` (per-candidate gate inside
+    `verdict`) and `partition_fleet_fetchable` (fleet-wide submission-time
+    gate). `dynamic` is the caller's already-parsed `worker.dynamic` JSON
+    (avoids re-parsing it once per candidate in `verdict`'s hot path).
+    """
     protocol = getattr(worker, "protocol", None)
     if not isinstance(protocol, int) or isinstance(protocol, bool):
         protocol = 1
@@ -477,9 +476,6 @@ def _eligible_after_fetch(
     if not getattr(worker, "auto_fetch", False):
         return False
 
-    total_missing_bytes = sum(fetchable_models[name] for name in missing_models)
-    total_missing_gb = total_missing_bytes / _BYTES_PER_GB
-
     free_disk_gb = dynamic.get("free_disk_gb")
     if not isinstance(free_disk_gb, (int, float)) or isinstance(free_disk_gb, bool):
         # Unknown free disk cannot prove the margin holds -- refuse rather
@@ -488,3 +484,111 @@ def _eligible_after_fetch(
         return False
 
     return free_disk_gb > _FETCH_DISK_MARGIN * total_missing_gb
+
+
+def _eligible_after_fetch(
+    worker, missing_models: list[str], fetchable_models: dict[str, int] | None, dynamic: dict
+) -> bool:
+    """All the eligible_after_fetch gates -- see `verdict`'s docstring."""
+    fetchable_models = fetchable_models or {}
+    if not all(name in fetchable_models for name in missing_models):
+        return False
+
+    total_missing_gb = sum(fetchable_models[name] for name in missing_models) / _BYTES_PER_GB
+    return _worker_fetch_capacity_ok(worker, dynamic, total_missing_gb)
+
+
+def partition_fleet_fetchable(
+    missing_models: set[str],
+    fetchable_models: dict[str, int] | None,
+    online_enabled_workers: list,
+) -> tuple[set[str], set[str]]:
+    """Split a fleet-wide "missing from every worker" model set into
+    `(fetchable, unfetchable)` for the submission-relaxation matrix
+    (`comfyapi.post_prompt`'s 400 predicate, `jobs.py`'s console submit
+    predicate).
+
+    This is a single COMBINED gate over the whole manifest-covered subset,
+    not a per-model one: `_worker_fetch_capacity_ok`'s disk-margin check is
+    against the sum of everything a worker would have to download for this
+    job, exactly like `_eligible_after_fetch` -- "half of the missing set
+    fits" is not a real answer to "can this worker actually run the job", so
+    it is not a real answer here either. A model is only "fetchable" when
+    (a) it has a manifest entry (`fetchable_models` -- name -> size_bytes,
+    same shape `verdict` takes) AND (b) at least one worker in
+    `online_enabled_workers` (caller-filtered: online, not disabled --
+    matching `comfyapi._online_worker_hashes`'s definition of "online") can
+    fetch the ENTIRE manifest-covered subset in one go. When no worker
+    clears that combined bar, NONE of the manifest-covered subset counts as
+    fetchable either -- it lands in `unfetchable` alongside models with no
+    manifest entry at all, matching the brief's "no online opt-in worker"
+    case.
+
+    Models with no manifest entry are always unfetchable and never affect
+    the combined-gate outcome for the ones that DO have an entry.
+    """
+    fetchable_models = fetchable_models or {}
+    manifest_covered = {name for name in missing_models if name in fetchable_models}
+    not_in_manifest = set(missing_models) - manifest_covered
+
+    if not manifest_covered:
+        return set(), set(missing_models)
+
+    total_missing_gb = sum(fetchable_models[name] for name in manifest_covered) / _BYTES_PER_GB
+    can_fetch = any(
+        _worker_fetch_capacity_ok(worker, _worker_dynamic(worker), total_missing_gb)
+        for worker in online_enabled_workers
+    )
+    if can_fetch:
+        return manifest_covered, not_in_manifest
+
+    return set(), set(missing_models)
+
+
+def fleet_wide_gaps(needs: JobNeeds, all_workers: list) -> tuple[set[str], set[str]]:
+    """`(models, node classes)` that NOT ONE worker in `all_workers` can supply.
+
+    Shared by `comfyapi.post_prompt` and `jobs.py`'s console submit predicate
+    so the two entry points can never drift on what "the fleet has no idea
+    about this model/node" means. Deliberately every worker passed in,
+    whatever its `status`/`disabled` -- the classic home federation is one
+    big GPU box holding every model plus a small always-on box holding none,
+    and refusing a prompt during the GPU box's ten-minute reboot -- for
+    models the user already owns -- is strictly worse than queueing it. Only
+    a model that exists nowhere in the federation is a real dead end.
+
+    Matching is `find_model`, i.e. `matches_model_name` semantics, so a
+    worker's `diffusion_models/flux1-dev.safetensors` satisfies a workflow's
+    `flux1-dev.safetensors`.
+
+    Node classes are computed the same way and returned alongside. A worker
+    reporting an EMPTY `node_classes` list means "unknown", not "supports
+    nothing" -- same rule as `verdict` -- so such workers are skipped for the
+    node check, and if that leaves no informative worker the node set comes
+    back empty.
+
+    With zero workers passed in, both sets are empty: an install that has
+    never had an agent connect keeps today's queue-and-wait behavior.
+    """
+    if not all_workers:
+        return set(), set()
+
+    inventories = [model_inventory(w) for w in all_workers]
+    node_class_sets = [
+        classes for classes in (set(worker_node_classes(w)) for w in all_workers) if classes
+    ]
+
+    missing_models = {
+        name
+        for name in needs.models
+        if not any(find_model(inventory, name)[0] for inventory in inventories)
+    }
+
+    missing_nodes: set[str] = set()
+    if node_class_sets:
+        missing_nodes = {
+            node for node in needs.nodes
+            if not any(node in classes for classes in node_class_sets)
+        }
+
+    return missing_models, missing_nodes

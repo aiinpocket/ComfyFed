@@ -22,7 +22,11 @@ def client(tmp_path):
     c = TestClient(app)
     c.admin_password = result.admin_password
     c.data_dir = data_dir
-    return c
+    yield c
+    # Module-level, in-memory, per-process (see model_manifest.py /
+    # agentws._fetch_progress) -- reset between tests.
+    model_manifest._poisoned_names.clear()
+    agentws._fetch_progress.clear()
 
 
 def _login(client):
@@ -168,6 +172,153 @@ def test_enqueued_job_pushed_to_idle_worker_and_job_done_marks_complete(client):
             job = session.get(db.Job, job_id)
             assert job.status == "done"
             assert json.loads(job.result_files) == ["out.png"]
+
+
+def test_job_push_omits_fetch_models_for_a_directly_eligible_worker(client):
+    """The ordinary push shape (no model gap at all) must carry no
+    `fetch_models` key -- Task 4 is purely additive."""
+    csrf = _login(client)
+    worker_id, sk = _register_worker(client, csrf, "w1")
+    job_id = _submit(client, csrf)
+
+    with client.websocket_connect("/api/agent/ws") as ws:
+        challenge = ws.receive_json()
+        sig = sk.sign(challenge["nonce"].encode()).signature.hex()
+        ws.send_json({"type": "auth", "worker_id": worker_id, "sig": sig})
+        assert ws.receive_json()["type"] == "ready"
+
+        ws.send_json({"type": "heartbeat", "state": "idle", "progress": 0.0, "job_id": None, "dynamic": {}})
+        agentws.dispatch_once(worker_id)
+
+        job_msg = ws.receive_json()
+        assert job_msg["type"] == "job"
+        assert job_msg["job_id"] == job_id
+        assert "fetch_models" not in job_msg
+
+
+def _bytes(gb: float) -> int:
+    return round(gb * (1024 ** 3))
+
+
+def _sha(label: str) -> str:
+    return hashlib.sha256(label.encode()).hexdigest()
+
+
+def test_job_push_includes_fetch_models_for_an_eligible_after_fetch_worker(client):
+    """The winning eligible_after_fetch worker's push carries `fetch_models`:
+    the full manifest entries for exactly its missing models."""
+    csrf = _login(client)
+    model_manifest.record_hash(
+        "some-worker", "diffusion_models/flux1-dev.safetensors", _bytes(22.17), _sha("flux")
+    )
+    worker_id, sk = _register_worker(client, csrf, "w1")
+    # The console submit predicate (jobs.py) needs an ONLINE, opted-in worker
+    # to accept a fetchable-missing model at submission time -- set that up
+    # before submitting, then re-declare it for real over the WS hello below
+    # (which is what actually matters for dispatch ranking).
+    with db.get_session() as session:
+        worker = session.get(db.Worker, worker_id)
+        worker.status = "online"
+        worker.protocol = 3
+        worker.auto_fetch = True
+        worker.dynamic = json.dumps({"free_disk_gb": 100.0})
+        session.commit()
+
+    workflow = {"1": {"class_type": "UNETLoader", "inputs": {"unet_name": "flux1-dev.safetensors"}}}
+    job_id = _submit(client, csrf, workflow=workflow)
+
+    with client.websocket_connect("/api/agent/ws") as ws:
+        challenge = ws.receive_json()
+        sig = sk.sign(challenge["nonce"].encode()).signature.hex()
+        ws.send_json({"type": "auth", "worker_id": worker_id, "sig": sig})
+        assert ws.receive_json()["type"] == "ready"
+
+        ws.send_json(
+            {
+                "type": "hello",
+                "hardware": {},
+                "backend": "cuda",
+                "torch_version": "",
+                "node_classes": [],
+                "protocol": 3,
+                "auto_fetch": True,
+            }
+        )
+        ws.send_json(
+            {
+                "type": "heartbeat",
+                "state": "idle",
+                "progress": 0.0,
+                "job_id": None,
+                "dynamic": {"free_disk_gb": 100.0},
+            }
+        )
+        agentws.dispatch_once(worker_id)
+
+        job_msg = ws.receive_json()
+        assert job_msg["type"] == "job"
+        assert job_msg["job_id"] == job_id
+        assert "fetch_models" in job_msg
+        entries = job_msg["fetch_models"]
+        assert len(entries) == 1
+        assert entries[0]["name"] == "flux1-dev.safetensors"
+        assert entries[0]["size_bytes"] == _bytes(22.17)
+        assert entries[0]["sha256"] == _sha("flux")
+
+    with db.get_session() as session:
+        assert session.get(db.Job, job_id).status == "assigned"
+
+
+def test_job_push_never_sent_to_a_protocol_2_worker_even_when_manifest_covers_it(client):
+    """Defensive gate: a protocol<3 agent can never be dispatched an
+    eligible_after_fetch job at all (assess._eligible_after_fetch already
+    excludes it), so the job simply stays queued rather than being pushed
+    without fetch_models."""
+    csrf = _login(client)
+    model_manifest.record_hash(
+        "some-worker", "diffusion_models/flux1-dev.safetensors", _bytes(22.17), _sha("flux")
+    )
+    worker_id, sk = _register_worker(client, csrf, "w1")
+
+    workflow = {"1": {"class_type": "UNETLoader", "inputs": {"unet_name": "flux1-dev.safetensors"}}}
+
+    with client.websocket_connect("/api/agent/ws") as ws:
+        challenge = ws.receive_json()
+        sig = sk.sign(challenge["nonce"].encode()).signature.hex()
+        ws.send_json({"type": "auth", "worker_id": worker_id, "sig": sig})
+        assert ws.receive_json()["type"] == "ready"
+
+        _send_hello_v2(ws)  # protocol 2
+        with db.get_session() as session:
+            worker = session.get(db.Worker, worker_id)
+            worker.auto_fetch = True
+            worker.dynamic = json.dumps({"free_disk_gb": 100.0})
+            session.commit()
+
+        # Registering this worker (w1) makes the model missing-everywhere but
+        # the manifest entry above still requires an ONLINE, protocol>=3,
+        # opted-in worker to be considered fetchable at submission time --
+        # a bare-registered second worker at protocol 3 supplies that so the
+        # console predicate accepts the submission (Task 4's own concern is
+        # dispatch, not submission, for this test).
+        other_id = _register_worker(client, csrf, "w2")[0]
+        with db.get_session() as session:
+            other = session.get(db.Worker, other_id)
+            other.status = "online"
+            other.protocol = 3
+            other.auto_fetch = True
+            other.dynamic = json.dumps({"free_disk_gb": 100.0})
+            session.commit()
+
+        job_id = _submit(client, csrf, workflow=workflow)
+
+        ws.send_json({"type": "heartbeat", "state": "idle", "progress": 0.0, "job_id": None, "dynamic": {"free_disk_gb": 100.0}})
+        agentws.dispatch_once(worker_id)
+
+    # w1 (protocol 2) must never win this job even though it's otherwise the
+    # only idle connection dispatch_tick sees -- it stays queued.
+    with db.get_session() as session:
+        assert session.get(db.Job, job_id).status == "queued"
 
 
 def test_job_failed_marks_job_failed(client):

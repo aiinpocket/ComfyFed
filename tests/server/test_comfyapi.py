@@ -16,7 +16,7 @@ import pytest
 from fastapi.testclient import TestClient
 
 from comfyfed_server import app as app_module
-from comfyfed_server import bootstrap, comfyapi, db, dispatch, jobs, storage, workers
+from comfyfed_server import bootstrap, comfyapi, db, dispatch, jobs, model_manifest, storage, workers
 
 
 def _pick_job_for(worker_id):
@@ -39,7 +39,10 @@ def client(tmp_path):
     c = TestClient(app)
     c.admin_password = result.admin_password
     c.data_dir = data_dir
-    return c
+    yield c
+    # Module-level, in-memory, per-process (see model_manifest.py) -- reset
+    # between tests so one test's manifest state doesn't bleed into the next.
+    model_manifest._poisoned_names.clear()
 
 
 def _login(client):
@@ -525,6 +528,89 @@ def test_prompt_with_only_missing_nodes_never_triggers_model_guidance(client):
     assert r.status_code == 200
     with db.get_session() as session:
         assert session.query(db.Job).count() == 1
+
+
+# --- Task 4: submission-relaxation matrix (fetchable missing models) ------
+
+
+def _bytes(gb: float) -> int:
+    return round(gb * (1024 ** 3))
+
+
+def _sha(label: str) -> str:
+    import hashlib
+
+    return hashlib.sha256(label.encode()).hexdigest()
+
+
+TWO_MODEL_PROMPT = {
+    "1": {"class_type": "UNETLoader", "inputs": {"unet_name": "flux1-dev.safetensors"}},
+    "2": {"class_type": "CLIPLoader", "inputs": {"clip_name": "clip_l.safetensors"}},
+}
+
+
+def test_prompt_queues_when_missing_model_is_fully_fetchable(client):
+    """A model missing from every worker no longer hard-blocks `/prompt` when
+    the manifest has a signed entry for it AND at least one online, opted-in
+    worker could fetch it (assess.partition_fleet_fetchable)."""
+    csrf = _login(client)
+    model_manifest.record_hash(
+        "some-worker", "diffusion_models/flux1-dev.safetensors", _bytes(22.17), _sha("flux")
+    )
+    fetcher = _register_worker(client, csrf, "fetcher", status="online")
+    with db.get_session() as session:
+        worker = session.get(db.Worker, fetcher)
+        worker.protocol = 3
+        worker.auto_fetch = True
+        worker.dynamic = json.dumps({"free_disk_gb": 100.0})
+        session.commit()
+
+    r = _post_prompt(client, prompt=FLUX_PROMPT)
+    assert r.status_code == 200
+    with db.get_session() as session:
+        assert session.query(db.Job).count() == 1
+
+
+def test_prompt_rejects_when_missing_model_has_no_manifest_entry(client):
+    csrf = _login(client)
+    _register_worker(client, csrf, "runner-1")
+
+    r = _post_prompt(client, prompt=FLUX_PROMPT)
+    assert r.status_code == 400
+    assert r.json()["error"]["type"] == "prompt.missing_models"
+
+
+def test_prompt_rejects_when_manifest_entry_exists_but_no_optin_worker(client):
+    csrf = _login(client)
+    model_manifest.record_hash(
+        "some-worker", "diffusion_models/flux1-dev.safetensors", _bytes(22.17), _sha("flux")
+    )
+    _register_worker(client, csrf, "runner-1")  # not opted into auto_fetch
+
+    r = _post_prompt(client, prompt=FLUX_PROMPT)
+    assert r.status_code == 400
+    assert r.json()["error"]["type"] == "prompt.missing_models"
+
+
+def test_prompt_mixed_fetchable_and_unfetchable_lists_only_unfetchable(client):
+    csrf = _login(client)
+    model_manifest.record_hash(
+        "some-worker", "diffusion_models/flux1-dev.safetensors", _bytes(22.17), _sha("flux")
+    )
+    fetcher = _register_worker(client, csrf, "fetcher", status="online")
+    with db.get_session() as session:
+        worker = session.get(db.Worker, fetcher)
+        worker.protocol = 3
+        worker.auto_fetch = True
+        worker.dynamic = json.dumps({"free_disk_gb": 100.0})
+        session.commit()
+
+    r = _post_prompt(client, prompt=TWO_MODEL_PROMPT)
+    assert r.status_code == 400
+    body = r.json()
+    assert "clip_l.safetensors" in body["error"]["message"]
+    assert "flux1-dev.safetensors" not in body["error"]["message"]
+    assert set(body["node_errors"].keys()) == {"2"}
 
 
 def test_prompt_rejection_also_names_fleet_wide_missing_nodes(client):

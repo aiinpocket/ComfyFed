@@ -43,18 +43,44 @@ def _free_vram_gb(worker: db.Worker) -> float:
     return float(free_vram)
 
 
-def assign_jobs(idle_worker_ids: list[str]) -> list[tuple[str, db.Job]]:
+def assign_jobs(
+    idle_worker_ids: list[str], fetchable_models: Optional[dict[str, int]] = None
+) -> list[tuple[str, db.Job]]:
     """Rank idle workers per queued job and atomically claim the best pair.
 
     For each queued job, oldest first, every still-unassigned idle worker's
-    `assess.verdict` is evaluated and the best eligible one picked:
+    `assess.verdict` is evaluated and the best eligible one picked, in two
+    tiers:
 
-    1. eligible with no warnings beats eligible-with-warnings (e.g. the
-       `vram_offload` note) -- a clean run beats one that will offload.
-    2. tie-break by largest free VRAM, from the worker's `dynamic` heartbeat
-       snapshot (see `_free_vram_gb`).
-    3. stable tie-break by worker name, so results are deterministic when
-       ranking is otherwise a wash.
+    1. Directly eligible (`verdict.kind == "eligible"`) candidates, ranked
+       exactly as before Phase 2.1 Task 4:
+       a. eligible with no warnings beats eligible-with-warnings (e.g. the
+          `vram_offload` note) -- a clean run beats one that will offload.
+       b. tie-break by largest free VRAM, from the worker's `dynamic`
+          heartbeat snapshot (see `_free_vram_gb`) -- or, for a "light" job
+          (see below), by the light-job preference instead.
+       c. stable tie-break by worker name, so results are deterministic when
+          ranking is otherwise a wash.
+    2. Only when tier 1 has NO candidates at all: `eligible_after_fetch`
+       candidates, ranked by (has_warnings, total_fetch_bytes ASC -- smallest
+       download first, then the SAME job-class VRAM key tier 1 uses, then
+       name). A worker that already has everything always wins over one that
+       would have to download something first, however big or small; fetch
+       ranking only decides among candidates where NOBODY already has it.
+
+    `fetchable_models` is passed straight through to `assess.verdict` (name
+    -> size_bytes from the signed manifest, `model_manifest.entries()`'s
+    shape) -- None (the default) means "nothing fetchable", the exact
+    pre-Task-4 behavior, so any other caller (tests) that doesn't pass it
+    gets tier 1 only, unchanged.
+
+    The winning candidate's `fetch_models` push payload (the manifest entries
+    for its missing models) is deliberately NOT part of this function's
+    return value -- `assign_jobs` keeps its original `(worker_id, job)` tuple
+    shape (a lot of existing tests unpack it that way) and `agentws.
+    dispatch_tick` recomputes the verdict for the one (worker, job) pair it
+    actually pushes to, right before sending the frame. See dispatch_tick's
+    docstring for that seam.
 
     Each worker is claimed for at most one job per call: once a worker wins a
     job it drops out of the candidate pool for every later job this tick.
@@ -103,10 +129,11 @@ def assign_jobs(idle_worker_ids: list[str]) -> list[tuple[str, db.Job]]:
             is_light = not needs.models and not (needs.est_vram_gb or 0)
 
             candidates = []
+            fetch_candidates = []
             for candidate_id in available_worker_ids:
                 worker = workers[candidate_id]
-                v = assess.verdict(worker, needs, requirements_override, all_workers)
-                if v.kind != "eligible":
+                v = assess.verdict(worker, needs, requirements_override, all_workers, fetchable_models)
+                if v.kind not in ("eligible", "eligible_after_fetch"):
                     continue
                 if is_light:
                     # Zero-model work (e.g. stitching finished clips into a
@@ -116,28 +143,37 @@ def assign_jobs(idle_worker_ids: list[str]) -> list[tuple[str, db.Job]]:
                     # real GPU, then SMALLEST free VRAM first (weakest GPU
                     # among the rest), so the biggest cards stay free for
                     # jobs that actually need them.
-                    candidates.append(
-                        (
-                            bool(v.warnings),
-                            worker.backend not in ("mps", "cpu"),
-                            _free_vram_gb(worker),
-                            worker.name,
-                            candidate_id,
-                        )
+                    job_class_key = (
+                        worker.backend not in ("mps", "cpu"),
+                        _free_vram_gb(worker),
                     )
                 else:
-                    # (has_warnings, -free_vram, name, worker_id): sorts
-                    # clean before warned, then largest free VRAM first, then
-                    # name for determinism.
-                    candidates.append(
-                        (bool(v.warnings), -_free_vram_gb(worker), worker.name, candidate_id)
+                    # (-free_vram,): sorts largest free VRAM first.
+                    job_class_key = (-_free_vram_gb(worker),)
+
+                if v.kind == "eligible":
+                    candidates.append((bool(v.warnings), *job_class_key, worker.name, candidate_id))
+                else:
+                    # eligible_after_fetch: only ever consulted when NO worker
+                    # is directly eligible (see below) -- ranked clean-before-
+                    # warned same as tier 1, then SMALLEST total download size
+                    # first, then the same job-class VRAM key, then name.
+                    total_fetch_bytes = sum(
+                        (fetchable_models or {}).get(name, 0) for name in v.missing_models
+                    )
+                    fetch_candidates.append(
+                        (bool(v.warnings), total_fetch_bytes, *job_class_key, worker.name, candidate_id)
                     )
 
-            if not candidates:
+            # Tier 2 (fetch-then-run) is only ever considered when tier 1
+            # (already has everything) is completely empty -- a worker that
+            # can run right now always beats one that must download first.
+            active_candidates = candidates or fetch_candidates
+            if not active_candidates:
                 continue
 
-            candidates.sort()
-            best_worker_id = candidates[0][-1]
+            active_candidates.sort()
+            best_worker_id = active_candidates[0][-1]
 
             # Atomic claim: only succeeds if the job is still queued. If
             # another process/thread beat us to it, rowcount is 0 and we

@@ -6,8 +6,8 @@ from datetime import datetime, timedelta, timezone
 import pytest
 from fastapi.testclient import TestClient
 
-from comfyfed_server import app as app_module
-from comfyfed_server import bootstrap, db, dispatch, jobs as jobs_module
+from comfyfed_server import agentws, app as app_module
+from comfyfed_server import bootstrap, db, dispatch, jobs as jobs_module, model_manifest
 
 
 def _pick_job_for(worker_id):
@@ -29,7 +29,12 @@ def client(tmp_path):
     c = TestClient(app)
     c.admin_password = result.admin_password
     c.data_dir = data_dir
-    return c
+    yield c
+    # Both module-level, in-memory, per-process (documented at their
+    # definitions) -- reset between tests so one test's manifest/fetch state
+    # doesn't bleed into the next.
+    model_manifest._poisoned_names.clear()
+    agentws._fetch_progress.clear()
 
 
 def _login(client):
@@ -844,6 +849,19 @@ def test_flux_job_with_a_genuinely_absent_model_is_still_ineligible(client):
         model_inventory=[{"name": "diffusion_models/some-other-model.safetensors", "size": 4.0}],
         hardware={"vram_gb": 16.0},
     )
+    # A second worker DOES have the model, so it is not missing fleet-wide --
+    # the console's own submit predicate (Phase 2.1 Task 4) only blocks a
+    # model missing from EVERY worker; this test is about w1's own verdict,
+    # not about whether the fleet as a whole can run the job. Peer inventory
+    # plays no part in w1's OWN eligibility (Task 3 removed that fallback --
+    # only the signed manifest can make a missing model eligible_after_fetch),
+    # so w1 stays genuinely ineligible for it regardless.
+    _register_worker(
+        client,
+        csrf,
+        "w2",
+        model_inventory=[{"name": "diffusion_models/flux1-dev.safetensors", "size": 22.17}],
+    )
 
     workflow = {"1": {"class_type": "UNETLoader", "inputs": {"unet_name": "flux1-dev.safetensors"}}}
     job_id = _submit(client, csrf, workflow=workflow).json()["job_id"]
@@ -852,3 +870,196 @@ def test_flux_job_with_a_genuinely_absent_model_is_still_ineligible(client):
     entry = assessment["workers"][0]
     assert entry["verdict"] == "ineligible"
     assert entry["missing_models"] == ["flux1-dev.safetensors"]
+
+
+# --- Task 4: console submit predicate + assessment/dict manifest wiring ----
+
+
+def _bytes(gb: float) -> int:
+    return round(gb * (1024 ** 3))
+
+
+def _sha(label: str) -> str:
+    import hashlib
+
+    return hashlib.sha256(label.encode()).hexdigest()
+
+
+FLUX_WORKFLOW = {
+    "1": {"class_type": "UNETLoader", "inputs": {"unet_name": "flux1-dev.safetensors"}},
+}
+
+TWO_MODEL_WORKFLOW = {
+    "1": {"class_type": "UNETLoader", "inputs": {"unet_name": "flux1-dev.safetensors"}},
+    "2": {"class_type": "CLIPLoader", "inputs": {"clip_name": "clip_l.safetensors"}},
+}
+
+
+def test_submit_accepts_when_missing_model_is_fully_fetchable(client):
+    """A model missing from every worker no longer hard-blocks submission
+    when the manifest has a signed entry for it AND at least one online,
+    opted-in worker could fetch it (assess.partition_fleet_fetchable)."""
+    csrf = _login(client)
+    model_manifest.record_hash(
+        "some-worker", "diffusion_models/flux1-dev.safetensors", _bytes(22.17), _sha("flux")
+    )
+    _register_worker(
+        client,
+        csrf,
+        "fetcher",
+        status="online",
+        protocol=3,
+        auto_fetch=True,
+        dynamic={"free_disk_gb": 100.0},
+    )
+
+    r = _submit(client, csrf, workflow=FLUX_WORKFLOW)
+    assert r.status_code == 200
+
+
+def test_submit_rejects_when_missing_model_has_no_manifest_entry(client):
+    csrf = _login(client)
+    _register_worker(client, csrf, "w1", status="online")
+
+    r = _submit(client, csrf, workflow=FLUX_WORKFLOW)
+    assert r.status_code == 400
+    body = r.json()
+    assert body["error"]["code"] == "jobs.missing_models"
+    assert "flux1-dev.safetensors" in body["error"]["message"]
+
+
+def test_submit_rejects_when_manifest_entry_exists_but_no_optin_worker(client):
+    """A manifest entry alone doesn't help if nobody can actually fetch it."""
+    csrf = _login(client)
+    model_manifest.record_hash(
+        "some-worker", "diffusion_models/flux1-dev.safetensors", _bytes(22.17), _sha("flux")
+    )
+    # protocol/auto_fetch left at their not-opted-in defaults.
+    _register_worker(client, csrf, "w1", status="online")
+
+    r = _submit(client, csrf, workflow=FLUX_WORKFLOW)
+    assert r.status_code == 400
+    assert r.json()["error"]["code"] == "jobs.missing_models"
+
+
+def test_submit_mixed_fetchable_and_unfetchable_lists_only_unfetchable(client):
+    """Two missing models, one fetchable and one not: 400 message names
+    ONLY the unfetchable one -- the fetchable one queues normally."""
+    csrf = _login(client)
+    model_manifest.record_hash(
+        "some-worker", "diffusion_models/flux1-dev.safetensors", _bytes(22.17), _sha("flux")
+    )
+    _register_worker(
+        client,
+        csrf,
+        "fetcher",
+        status="online",
+        protocol=3,
+        auto_fetch=True,
+        dynamic={"free_disk_gb": 100.0},
+    )
+
+    r = _submit(client, csrf, workflow=TWO_MODEL_WORKFLOW)
+    assert r.status_code == 400
+    message = r.json()["error"]["message"]
+    assert "clip_l.safetensors" in message
+    assert "flux1-dev.safetensors" not in message
+
+
+def test_submit_rejects_when_combined_fetch_set_exceeds_disk_margin(client):
+    """The disk gate is COMBINED over the whole manifest-covered missing set:
+    a worker with barely any free disk can't fetch either model, so BOTH
+    land in the 400 even though both have manifest entries."""
+    csrf = _login(client)
+    model_manifest.record_hash(
+        "some-worker", "diffusion_models/flux1-dev.safetensors", _bytes(22.17), _sha("flux")
+    )
+    model_manifest.record_hash(
+        "some-worker", "text_encoders/clip_l.safetensors", _bytes(0.23), _sha("clip")
+    )
+    _register_worker(
+        client,
+        csrf,
+        "tight",
+        status="online",
+        protocol=3,
+        auto_fetch=True,
+        dynamic={"free_disk_gb": 1.0},  # nowhere near 1.2 x (22.17 + 0.23)
+    )
+
+    r = _submit(client, csrf, workflow=TWO_MODEL_WORKFLOW)
+    assert r.status_code == 400
+    message = r.json()["error"]["message"]
+    assert "flux1-dev.safetensors" in message
+    assert "clip_l.safetensors" in message
+
+
+def test_submit_still_queues_when_missing_model_is_offline_worker_only(client):
+    """Unchanged pre-Task-4 behavior: a model present on SOME registered
+    worker's inventory (even offline/disabled) is not fleet-wide missing at
+    all -- never reaches the fetchability question."""
+    csrf = _login(client)
+    _register_worker(
+        client,
+        csrf,
+        "gpu-box",
+        status="offline",
+        model_inventory=[{"name": "diffusion_models/flux1-dev.safetensors", "size": 22.17}],
+    )
+
+    r = _submit(client, csrf, workflow=FLUX_WORKFLOW)
+    assert r.status_code == 200
+
+
+def test_job_assessment_reports_eligible_after_fetch_when_manifest_wired(client):
+    csrf = _login(client)
+    model_manifest.record_hash(
+        "some-worker", "diffusion_models/flux1-dev.safetensors", _bytes(22.17), _sha("flux")
+    )
+    worker_id = _register_worker(
+        client,
+        csrf,
+        "fetcher",
+        status="online",
+        protocol=3,
+        auto_fetch=True,
+        dynamic={"free_disk_gb": 100.0},
+    )
+
+    job_id = _submit(client, csrf, workflow=FLUX_WORKFLOW).json()["job_id"]
+
+    assessment = client.get(f"/api/jobs/{job_id}/assessment", headers={"X-CSRF": csrf}).json()
+    entry = next(w for w in assessment["workers"] if w["worker_id"] == worker_id)
+    assert entry["verdict"] == "eligible_after_fetch"
+    assert entry["missing_models"] == ["flux1-dev.safetensors"]
+
+
+def test_job_dict_includes_fetch_stage_fields_when_present(client):
+    """`_job_dict` reads agentws's transient fetch-progress store (Phase 2.1
+    Task 4's `stage`/`fetch_pct`/`fetch_model` heartbeat extension) -- see
+    `agentws._fetch_progress`."""
+    csrf = _login(client)
+    job_id = _submit(client, csrf).json()["job_id"]
+
+    agentws._fetch_progress[job_id] = {
+        "stage": "fetching_models",
+        "fetch_pct": 42.5,
+        "fetch_model": "flux1-dev.safetensors",
+    }
+
+    listed = client.get("/api/jobs", headers={"X-CSRF": csrf}).json()
+    job = next(j for j in listed if j["id"] == job_id)
+    assert job["stage"] == "fetching_models"
+    assert job["fetch_pct"] == 42.5
+    assert job["fetch_model"] == "flux1-dev.safetensors"
+
+
+def test_job_dict_omits_fetch_stage_fields_when_absent(client):
+    csrf = _login(client)
+    job_id = _submit(client, csrf).json()["job_id"]
+
+    listed = client.get("/api/jobs", headers={"X-CSRF": csrf}).json()
+    job = next(j for j in listed if j["id"] == job_id)
+    assert "stage" not in job
+    assert "fetch_pct" not in job
+    assert "fetch_model" not in job

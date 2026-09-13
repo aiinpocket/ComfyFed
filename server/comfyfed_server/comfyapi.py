@@ -53,7 +53,7 @@ from typing import Callable, Optional
 from fastapi import APIRouter, Depends, File, Form, Request, UploadFile, WebSocket, WebSocketDisconnect
 from fastapi.responses import FileResponse, JSONResponse, Response
 
-from . import agentws, assess, auth, db, jobs, model_guide, panelws, storage, workers
+from . import agentws, assess, auth, db, jobs, model_guide, model_manifest, panelws, storage, workers
 
 logger = logging.getLogger(__name__)
 
@@ -500,55 +500,44 @@ def _online_worker_hashes(session) -> list[tuple[str, str]]:
 def _fleet_wide_gaps(needs: assess.JobNeeds) -> tuple[set[str], set[str]]:
     """`(models, node classes)` that NOT ONE registered worker can supply.
 
-    Deliberately fleet-wide rather than "every worker that happens to be
-    online right now": the classic home federation is one big GPU box holding
-    every model plus a small always-on box holding none, and refusing a prompt
-    during the GPU box's ten-minute reboot -- for models the user already owns
-    -- is strictly worse than queueing it. Every registered worker row counts,
-    whatever its `status` and whether or not it is disabled, so a sleeping or
-    temporarily-disabled machine still vouches for its inventory. Only a model
-    that exists nowhere in the federation is a real dead end, and that is what
-    the admin can actually act on.
-
-    Matching is `assess.find_model`, i.e. `assess.matches_model_name`
-    semantics, so a worker's `diffusion_models/flux1-dev.safetensors`
-    satisfies a workflow's `flux1-dev.safetensors`.
-
-    Node classes are computed the same way and returned alongside, because a
-    fleet missing both would otherwise send the admin off to download 22 GB
-    for a job that still cannot run (see `post_prompt`, which appends a
-    節點 line to the guidance). A worker reporting an EMPTY `node_classes`
-    list means "unknown", not "supports nothing" -- same rule as
-    `assess.verdict` -- so such workers are skipped for the node check, and
-    if that leaves no informative worker the node set comes back empty.
-
-    With zero workers registered both sets are empty: an install that has
-    never had an agent connect keeps today's queue-and-wait behavior.
+    Thin session-fetching wrapper around `assess.fleet_wide_gaps` (the shared,
+    pure implementation `jobs.py`'s console submit predicate also calls) --
+    see that function's docstring for the fleet-wide-vs-online-only rationale.
     """
     with db.get_session() as session:
         all_workers = session.query(db.Worker).all()
-        if not all_workers:
-            return set(), set()
-        inventories = [assess.model_inventory(w) for w in all_workers]
-        node_class_sets = [
-            classes for classes in (set(assess.worker_node_classes(w)) for w in all_workers)
-            if classes
-        ]
+    return assess.fleet_wide_gaps(needs, all_workers)
 
-    missing_models = {
-        name
-        for name in needs.models
-        if not any(assess.find_model(inventory, name)[0] for inventory in inventories)
-    }
 
-    missing_nodes: set[str] = set()
-    if node_class_sets:
-        missing_nodes = {
-            node for node in needs.nodes
-            if not any(node in classes for classes in node_class_sets)
-        }
+def _online_enabled_workers(session) -> list:
+    """Workers eligible to be asked to auto-fetch: online and not disabled.
 
-    return missing_models, missing_nodes
+    Same "online" definition as `_online_worker_hashes` (`status != "offline"`,
+    `disabled == False`) -- a worker that isn't actually reachable right now,
+    or that the admin paused, must not make a missing model look fetchable to
+    a submitter, since nothing will ever come along and fetch it.
+    """
+    return (
+        session.query(db.Worker)
+        .filter(db.Worker.disabled == False)  # noqa: E712
+        .filter(db.Worker.status != "offline")
+        .all()
+    )
+
+
+def _partition_missing_models(missing_models: set[str], data_dir: str) -> tuple[set[str], set[str]]:
+    """`(fetchable, unfetchable)` split of a fleet-wide missing-model set --
+    see `assess.partition_fleet_fetchable` for the combined-gate rule. Shared
+    by `post_prompt`'s 400 predicate and `jobs.py`'s console submit predicate
+    (which imports this rather than duplicating the manifest/online-worker
+    lookup).
+    """
+    if not missing_models:
+        return set(), set()
+    with db.get_session() as session:
+        online_workers = _online_enabled_workers(session)
+    fetchable_map = {e["name"]: e["size_bytes"] for e in model_manifest.entries(data_dir)}
+    return assess.partition_fleet_fetchable(missing_models, fetchable_map, online_workers)
 
 
 def staged_image_names(data_dir: str) -> list[str]:
@@ -741,7 +730,14 @@ def create_router(
 
         needs = assess.extract(prompt)
 
-        blocking, missing_nodes = _fleet_wide_gaps(needs)
+        missing_models, missing_nodes = _fleet_wide_gaps(needs)
+        # Phase 2.1: a model missing from every worker's inventory is no
+        # longer automatically a dead end -- if the manifest has a signed
+        # entry for it AND at least one online, opted-in worker can fetch the
+        # whole missing set (see assess.partition_fleet_fetchable), it queues
+        # normally instead of being refused. Only the genuinely-unfetchable
+        # remainder still blocks submission.
+        _fetchable, blocking = _partition_missing_models(missing_models, data_dir)
         if blocking:
             names = sorted(blocking)
             guidance = model_guide.guidance_message(names, data_dir)

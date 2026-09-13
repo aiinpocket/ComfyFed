@@ -25,6 +25,7 @@ import asyncio
 import logging
 import uuid
 from dataclasses import dataclass
+from typing import Optional
 
 from fastapi import WebSocket
 
@@ -145,13 +146,31 @@ async def post_event(evt: dict) -> None:
             _connections.pop(sid, None)
 
 
-async def job_progress(job_id: str, progress: float) -> None:
-    await post_event(
-        {
-            "type": "progress",
-            "data": {"value": int(progress * 100), "max": 100, "prompt_id": job_id},
-        }
-    )
+async def job_progress(
+    job_id: str,
+    progress: float,
+    *,
+    stage: Optional[str] = None,
+    fetch_pct: Optional[float] = None,
+    fetch_model: Optional[str] = None,
+) -> None:
+    """Relay a progress update to every connected panel client.
+
+    `stage`/`fetch_pct`/`fetch_model` (Phase 2.1 Task 4) are the model
+    auto-fetch phase's extra fields (`agentws._handle_heartbeat` sourced from
+    the agent's own heartbeat) -- included in `data` only when given, so the
+    wire shape for a plain execution-progress update is byte-identical to
+    before this parameter existed. The stock ComfyUI frontend ignores unknown
+    fields on a `progress` event, so this is purely additive.
+    """
+    data = {"value": int(progress * 100), "max": 100, "prompt_id": job_id}
+    if stage is not None:
+        data["stage"] = stage
+    if fetch_pct is not None:
+        data["fetch_pct"] = fetch_pct
+    if fetch_model is not None:
+        data["fetch_model"] = fetch_model
+    await post_event({"type": "progress", "data": data})
 
 
 async def job_running(job_id: str) -> None:

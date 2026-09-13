@@ -27,7 +27,7 @@ def _utcnow():
     return datetime.now(timezone.utc).replace(tzinfo=None)
 
 
-def _make_worker(worker_id="w1", hardware=None, dynamic=None):
+def _make_worker(worker_id="w1", hardware=None, dynamic=None, model_inventory=None):
     with db.get_session() as session:
         session.add(
             db.Worker(
@@ -36,6 +36,7 @@ def _make_worker(worker_id="w1", hardware=None, dynamic=None):
                 pubkey="pk",
                 hardware=json.dumps(hardware or {}),
                 dynamic=json.dumps(dynamic or {}),
+                model_inventory=json.dumps(model_inventory or []),
             )
         )
         session.commit()
@@ -424,6 +425,149 @@ def test_assign_jobs_each_worker_gets_at_most_one_job_per_tick(_db):
         statuses = {j.id: j.status for j in session.query(db.Job).all()}
     # Exactly one of the two jobs got claimed; the other stays queued.
     assert sorted(statuses.values()) == ["assigned", "queued"]
+
+
+# --- Task 4: fetch-aware two-tier ranking ---------------------------------
+
+
+def _make_fetch_ready_worker(worker_id, dynamic=None, protocol=3, auto_fetch=True):
+    with db.get_session() as session:
+        session.add(
+            db.Worker(
+                id=worker_id,
+                name=worker_id,
+                pubkey="pk",
+                protocol=protocol,
+                auto_fetch=auto_fetch,
+                hardware=json.dumps({}),
+                dynamic=json.dumps(dynamic or {}),
+                node_classes=json.dumps(["UNETLoader"]),
+            )
+        )
+        session.commit()
+    return worker_id
+
+
+def _make_model_job(job_id="j1", models=("flux1-dev.safetensors",), status="queued"):
+    with db.get_session() as session:
+        session.add(
+            db.Job(
+                id=job_id,
+                workflow_json="{}",
+                status=status,
+                required_models=json.dumps(list(models)),
+                required_nodes=json.dumps(["UNETLoader"]),
+            )
+        )
+        session.commit()
+    return job_id
+
+
+def test_assign_jobs_falls_back_to_eligible_after_fetch_when_nobody_has_it(_db):
+    """A worker with the model missing but able to fetch it must still win
+    the job when NO worker is directly eligible."""
+    worker_id = _make_fetch_ready_worker("w1", dynamic={"free_disk_gb": 100.0})
+    job_id = _make_model_job()
+    fetchable = {"flux1-dev.safetensors": round(22.17 * 1024**3)}
+
+    assignments = dispatch.assign_jobs([worker_id], fetchable)
+
+    assert len(assignments) == 1
+    assigned_worker_id, job = assignments[0]
+    assert assigned_worker_id == worker_id
+    assert job.id == job_id
+    with db.get_session() as session:
+        assert session.get(db.Job, job_id).status == "assigned"
+
+
+def test_assign_jobs_never_prefers_fetch_candidate_over_a_directly_eligible_one(_db):
+    """A worker that already has the model wins even if it would otherwise
+    lose a fetch-ranking tiebreak (smaller free VRAM, say) -- tier 1 always
+    beats tier 2."""
+    has_it = _make_worker("w_has_it", model_inventory=[{"name": "flux1-dev.safetensors", "size": 22.17}])
+    must_fetch = _make_fetch_ready_worker("w_must_fetch", dynamic={"free_disk_gb": 100.0})
+    job_id = _make_model_job()
+    fetchable = {"flux1-dev.safetensors": round(22.17 * 1024**3)}
+
+    assignments = dispatch.assign_jobs([has_it, must_fetch], fetchable)
+
+    assert len(assignments) == 1
+    assigned_worker_id, job = assignments[0]
+    assert assigned_worker_id == has_it
+    assert job.id == job_id
+
+
+def test_assign_jobs_fetch_tier_prefers_smallest_total_download(_db):
+    """Among two fetch-eligible candidates, the one with the SMALLER total
+    missing bytes wins -- not free VRAM, not name."""
+    small_missing = _make_fetch_ready_worker(
+        "w_small_missing",
+        dynamic={"free_disk_gb": 100.0},
+    )
+    with db.get_session() as session:
+        worker = session.get(db.Worker, small_missing)
+        worker.model_inventory = json.dumps([{"name": "clip_l.safetensors", "size": 0.23}])
+        session.commit()
+    big_missing = _make_fetch_ready_worker("w_big_missing", dynamic={"free_disk_gb": 100.0})
+
+    job_id = _make_model_job(models=("flux1-dev.safetensors", "clip_l.safetensors"))
+    fetchable = {
+        "flux1-dev.safetensors": round(22.17 * 1024**3),
+        "clip_l.safetensors": round(0.23 * 1024**3),
+    }
+
+    assignments = dispatch.assign_jobs([small_missing, big_missing], fetchable)
+
+    assert len(assignments) == 1
+    assigned_worker_id, job = assignments[0]
+    # small_missing is missing only flux1-dev.safetensors (has clip_l
+    # already); big_missing is missing both -- small_missing's total
+    # download is smaller, so it wins.
+    assert assigned_worker_id == small_missing
+    assert job.id == job_id
+
+
+def test_assign_jobs_no_fetch_candidate_when_fetchable_models_not_supplied(_db):
+    """The Task-3 no-op default: omitting fetchable_models must reproduce the
+    exact pre-Task-4 behavior -- no missing-model worker is ever assigned."""
+    worker_id = _make_fetch_ready_worker("w1", dynamic={"free_disk_gb": 100.0})
+    _make_model_job()
+
+    assignments = dispatch.assign_jobs([worker_id])
+
+    assert assignments == []
+    with db.get_session() as session:
+        assert session.get(db.Job, "j1").status == "queued"
+
+
+def test_assign_jobs_fetch_tier_still_prefers_clean_over_warned(_db):
+    """has_warnings still outranks total_fetch_bytes in the fetch tier."""
+    warned = _make_fetch_ready_worker(
+        "w_warned", dynamic={"free_disk_gb": 100.0}
+    )
+    with db.get_session() as session:
+        worker = session.get(db.Worker, warned)
+        worker.hardware = json.dumps({"vram_gb": 8, "ram_gb": 64})
+        session.commit()
+    clean = _make_fetch_ready_worker("w_clean", dynamic={"free_disk_gb": 100.0})
+    with db.get_session() as session:
+        worker = session.get(db.Worker, clean)
+        worker.hardware = json.dumps({"vram_gb": 24, "ram_gb": 64})
+        session.commit()
+
+    job_id = _make_job(est_vram_gb=20)
+    with db.get_session() as session:
+        job = session.get(db.Job, job_id)
+        job.required_models = json.dumps(["flux1-dev.safetensors"])
+        job.required_nodes = json.dumps([])
+        session.commit()
+    fetchable = {"flux1-dev.safetensors": round(22.17 * 1024**3)}
+
+    assignments = dispatch.assign_jobs([warned, clean], fetchable)
+
+    assert len(assignments) == 1
+    assigned_worker_id, job = assignments[0]
+    assert assigned_worker_id == clean
 
 
 def test_cancel_job_clears_worker_id_and_records_last_worker_id(_db):
