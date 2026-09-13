@@ -5,7 +5,12 @@
   "compatibility_date": "2026-08-22",
   "compatibility_flags": ["nodejs_compat"],
   "vars": {
-    "MODE": "cloud"
+    "MODE": "cloud",
+    // First-run /api/setup gate (Task 4). This plaintext dev value is fine
+    // for local `wrangler dev` / vitest only -- a real deployment must
+    // override it with `wrangler secret put SETUP_TOKEN` (secrets shadow
+    // `vars` of the same name) rather than committing the real token here.
+    "SETUP_TOKEN": "dev-setup-token-changeme"
   },
   "d1_databases": [
     {

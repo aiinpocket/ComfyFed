@@ -58,6 +58,49 @@ export interface Setting {
   value: string;
 }
 
+export async function getSetting(db: D1Database, key: string): Promise<string | null> {
+  const row = await db.prepare("SELECT value FROM settings WHERE key = ?").bind(key).first<{ value: string }>();
+  return row ? row.value : null;
+}
+
+/** Upsert -- mirrors auth.py's `_set_setting` (get-then-insert-or-update). */
+export async function setSetting(db: D1Database, key: string, value: string): Promise<void> {
+  await db
+    .prepare(
+      `INSERT INTO settings (key, value) VALUES (?, ?)
+       ON CONFLICT(key) DO UPDATE SET value = excluded.value`
+    )
+    .bind(key, value)
+    .run();
+}
+
+const SESSION_SECRET_KEY = "session_secret";
+
+/** Mirrors auth.py's `_get_or_create_session_secret`: lazily generates and
+ * persists a 32-byte hex secret on first need (login, or any session read
+ * before a login has ever happened) instead of requiring it at setup time --
+ * though this cloud's `/api/setup` also seeds it eagerly, so in practice this
+ * lazy path only fires for pre-Task-4-shaped rows or defensive callers. */
+export async function getOrCreateSessionSecret(db: D1Database): Promise<string> {
+  const existing = await getSetting(db, SESSION_SECRET_KEY);
+  if (existing) return existing;
+  const bytes = crypto.getRandomValues(new Uint8Array(32));
+  const secret = Array.from(bytes)
+    .map((b) => b.toString(16).padStart(2, "0"))
+    .join("");
+  await setSetting(db, SESSION_SECRET_KEY, secret);
+  return secret;
+}
+
+export async function rotateSessionSecret(db: D1Database): Promise<string> {
+  const bytes = crypto.getRandomValues(new Uint8Array(32));
+  const secret = Array.from(bytes)
+    .map((b) => b.toString(16).padStart(2, "0"))
+    .join("");
+  await setSetting(db, SESSION_SECRET_KEY, secret);
+  return secret;
+}
+
 // ---------------------------------------------------------------------------
 // Workers
 
@@ -417,4 +460,31 @@ export interface LoginAttempt {
   id: number;
   at: string;
   ok: boolean;
+}
+
+export async function insertLoginAttempt(db: D1Database, at: string, ok: boolean): Promise<void> {
+  await db.prepare("INSERT INTO login_attempts (at, ok) VALUES (?, ?)").bind(at, ok ? 1 : 0).run();
+}
+
+/** Rows at/after `cutoffTimestamp`, newest first -- exactly the shape
+ * `core/auth.ts`'s `consecutiveFailures` expects (parity with auth.py's
+ * `_consecutive_failures` query). */
+export async function getRecentLoginAttempts(
+  db: D1Database,
+  cutoffTimestamp: string
+): Promise<{ at: string; ok: boolean }[]> {
+  const { results } = await db
+    .prepare("SELECT at, ok FROM login_attempts WHERE at >= ? ORDER BY at DESC")
+    .bind(cutoffTimestamp)
+    .all<{ at: string; ok: number }>();
+  return results.map((r) => ({ at: r.at, ok: r.ok !== 0 }));
+}
+
+/** Deletes attempt rows older than `beforeTimestamp`. Not a parity item --
+ * auth.py's table grows unboundedly too -- but D1/Workers has no equivalent
+ * of a long-lived server process to periodically vacuum it by hand, so the
+ * login route prunes on every write. A generous retention window (see
+ * caller) keeps this from ever affecting the 10-minute backoff logic. */
+export async function pruneLoginAttempts(db: D1Database, beforeTimestamp: string): Promise<void> {
+  await db.prepare("DELETE FROM login_attempts WHERE at < ?").bind(beforeTimestamp).run();
 }

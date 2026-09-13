@@ -1,14 +1,10 @@
 import { Hono } from "hono";
+import type { Env } from "./env";
+import authRoutes from "./routes/auth";
+import settingsRoutes from "./routes/settings";
 
 export { Hub } from "./do/hub";
-
-export interface Env {
-  DB: D1Database;
-  HUB: DurableObjectNamespace;
-  STORE: R2Bucket;
-  ASSETS: Fetcher;
-  MODE: string;
-}
+export type { Env };
 
 const NOT_MIGRATED_HTML = `<!doctype html>
 <html lang="zh-Hant">
@@ -52,5 +48,8 @@ app.use("*", async (c, next) => {
 });
 
 app.get("/api/ping", (c) => c.json({ ok: true, mode: "cloud" }));
+
+app.route("/", authRoutes);
+app.route("/", settingsRoutes);
 
 export default app;
