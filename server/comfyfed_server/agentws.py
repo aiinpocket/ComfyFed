@@ -51,6 +51,7 @@ import logging
 import math
 import os
 import secrets
+from collections import OrderedDict
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from typing import Optional
@@ -79,6 +80,64 @@ def _utcnow() -> datetime:
     return datetime.now(timezone.utc).replace(tzinfo=None)
 
 
+# Cap for every per-connection dedup/rate-limit set below. A connection lives
+# as long as the agent stays attached -- potentially days -- so anything keyed
+# by job id or message type must be bounded or it grows for the connection's
+# whole lifetime (see _BoundedSet).
+_DEDUP_CAP = 512
+
+
+class _BoundedSet:
+    """A set capped at `cap` members, evicting the oldest on overflow.
+
+    Backs `_Connection.cancelled_jobs_sent` (dedup for the `job_cancelled`
+    push) and the warned-job-id/warned-message-type sets below (rate-limiting
+    repeat WARNINGs) -- both need "have I seen this before", bounded so a
+    connection that lives for days can't grow either without limit. Eviction
+    only ever matters for `cancelled_jobs_sent`: an evicted-then-repeated job
+    id there causes a rare duplicate `job_cancelled` push, which is harmless
+    since the agent treats that push idempotently (it just aborts a run it
+    was already told to abort). For the warn sets, an eviction merely means a
+    very old job id/message type can re-earn a single WARNING -- exactly the
+    behavior wanted, just triggered a message early.
+
+    `OrderedDict` gives ordered keys for free; membership is never re-added
+    once present (every call site checks `in` before `add`), so plain
+    insertion-order (FIFO) eviction is equivalent to true LRU here -- no
+    `move_to_end` needed.
+    """
+
+    def __init__(self, cap: int = _DEDUP_CAP):
+        self._cap = cap
+        self._items: "OrderedDict[object, None]" = OrderedDict()
+
+    def __contains__(self, item) -> bool:
+        return item in self._items
+
+    def __iter__(self):
+        return iter(self._items)
+
+    def __len__(self) -> int:
+        return len(self._items)
+
+    def __eq__(self, other) -> bool:
+        if isinstance(other, _BoundedSet):
+            return set(self._items) == set(other._items)
+        if isinstance(other, (set, frozenset)):
+            return set(self._items) == other
+        return NotImplemented
+
+    def __repr__(self) -> str:
+        return f"_BoundedSet({list(self._items)!r})"
+
+    def add(self, item) -> None:
+        if item in self._items:
+            return
+        self._items[item] = None
+        if len(self._items) > self._cap:
+            self._items.popitem(last=False)
+
+
 @dataclass
 class _Connection:
     ws: WebSocket
@@ -87,8 +146,19 @@ class _Connection:
     state: str = "idle"  # idle | busy | dispatched
     # job_ids this connection has already been sent `job_cancelled` for --
     # see `_send_job_cancelled`. Scoped to the connection instance itself, so
-    # a reconnect naturally starts with a clean set.
-    cancelled_jobs_sent: set = field(default_factory=set)
+    # a reconnect naturally starts with a clean set. Bounded (see
+    # `_BoundedSet`): an evicted-then-repeated job id merely risks a rare
+    # duplicate push, which the agent treats idempotently.
+    cancelled_jobs_sent: _BoundedSet = field(default_factory=_BoundedSet)
+    # job_ids that have already earned a WARNING via `_resolve_warn_level`
+    # for a not-owned/unknown/finished reference on this connection --
+    # repeats log DEBUG instead. Separate from `cancelled_jobs_sent`: a job
+    # can be referenced (and warned about) many times before or without ever
+    # triggering a `job_cancelled` push.
+    warned_job_ids: _BoundedSet = field(default_factory=_BoundedSet)
+    # Message type names that have already earned a WARNING for being
+    # unrecognized on this connection -- see `_handle_message`.
+    warned_msg_types: _BoundedSet = field(default_factory=_BoundedSet)
 
 
 # Module-level connection registry: worker_id -> live connection state.
@@ -191,6 +261,23 @@ async def _close_unauthorized(websocket: WebSocket) -> None:
         pass
 
 
+def _resolve_warn_level(conn: _Connection, job_id: Optional[str]) -> int:
+    """WARNING the first time `job_id` earns a not-owned/unknown/finished
+    reference on this connection (see `dispatch._owned_job`); DEBUG for every
+    later one. Passed as `_owned_job`'s `resolve_warn_level` so the decision
+    and the bookkeeping happen together, exactly at the three branches that
+    would otherwise log an unconditional WARNING -- the already-DEBUG steady
+    -state branches never call this at all, so they can't poison the set with
+    a job id that was never actually warning-worthy.
+    """
+    if not job_id:
+        return logging.WARNING
+    if job_id in conn.warned_job_ids:
+        return logging.DEBUG
+    conn.warned_job_ids.add(job_id)
+    return logging.WARNING
+
+
 async def _handle_message(worker_id: str, conn: _Connection, message: dict) -> None:
     msg_type = message.get("type") if isinstance(message, dict) else None
     try:
@@ -212,14 +299,22 @@ async def _handle_message(worker_id: str, conn: _Connection, message: dict) -> N
         elif msg_type == "job_failed":
             job_id = message.get("job_id")
             error = message.get("error") or ""
-            if dispatch.mark_failed(job_id, worker_id, error):
+            if dispatch.mark_failed(
+                job_id, worker_id, error, resolve_warn_level=lambda jid: _resolve_warn_level(conn, jid)
+            ):
                 await panelws.job_failed(job_id, error)
             elif job_id and _job_not_owned_by(job_id, worker_id):
                 await _send_job_cancelled(conn, job_id)
         elif msg_type == "receipt_ack":
             _handle_receipt_ack(worker_id, message)
         else:
-            logger.warning("agentws: unknown message type %r from worker %s", msg_type, worker_id)
+            # Rate-limited the same way as job-id warnings above: a stale or
+            # misbehaving agent that keeps sending the same bogus type would
+            # otherwise put one WARNING per message in the log forever.
+            key = msg_type if isinstance(msg_type, str) else repr(msg_type)
+            level = logging.DEBUG if key in conn.warned_msg_types else logging.WARNING
+            conn.warned_msg_types.add(key)
+            logger.log(level, "agentws: unknown message type %r from worker %s", msg_type, worker_id)
     except Exception:
         logger.exception("agentws: error handling %r message from worker %s", msg_type, worker_id)
 
@@ -251,6 +346,12 @@ async def _send_job_cancelled(conn: "_Connection", job_id: Optional[str]) -> Non
     this pushed on every single message for as long as it kept doing so. The
     set lives on the `_Connection` itself, so a fresh connection (reconnect)
     naturally starts clean without any explicit clearing.
+
+    The set is bounded (`_BoundedSet`, cap 512), so on a very long-lived
+    connection an old job id can eventually be evicted and, if somehow
+    referenced again, cause a second `job_cancelled` push for it. Harmless:
+    the agent treats this push idempotently, simply aborting a run it was
+    already told to abort.
     """
     if not job_id or job_id in conn.cancelled_jobs_sent:
         return
@@ -344,10 +445,13 @@ async def _handle_job_done(worker_id: str, conn: "_Connection", message: dict) -
     job_id = message.get("job_id")
     result_files = message.get("result_files") or []
 
-    done = dispatch.mark_done(job_id, worker_id, result_files)
+    def _resolve(jid: Optional[str]) -> int:
+        return _resolve_warn_level(conn, jid)
+
+    done = dispatch.mark_done(job_id, worker_id, result_files, resolve_warn_level=_resolve)
     if not done and job_id and _job_not_owned_by(job_id, worker_id):
         if dispatch.try_readopt(job_id, worker_id):
-            done = dispatch.mark_done(job_id, worker_id, result_files)
+            done = dispatch.mark_done(job_id, worker_id, result_files, resolve_warn_level=_resolve)
         else:
             await _send_job_cancelled(conn, job_id)
 
@@ -452,7 +556,9 @@ async def _handle_heartbeat(worker_id: str, conn: _Connection, message: dict) ->
     # logs for a foreign job_id keeps firing on every such heartbeat, not
     # just the first.
     if state == "busy" and job_id:
-        if dispatch.mark_running(job_id, worker_id):
+        if dispatch.mark_running(
+            job_id, worker_id, resolve_warn_level=lambda jid: _resolve_warn_level(conn, jid)
+        ):
             await panelws.job_running(job_id)
 
     try:

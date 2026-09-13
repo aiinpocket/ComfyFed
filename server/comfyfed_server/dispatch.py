@@ -286,7 +286,13 @@ def try_readopt(job_id: str, worker_id: str) -> bool:
         return True
 
 
-def _owned_job(session, job_id: Optional[str], worker_id: str, statuses) -> Optional[db.Job]:
+def _owned_job(
+    session,
+    job_id: Optional[str],
+    worker_id: str,
+    statuses,
+    resolve_warn_level=None,
+) -> Optional[db.Job]:
     """Fetch `job_id` only if `worker_id` currently owns it in one of `statuses`.
 
     Every worker-driven status transition goes through this gate: the agent
@@ -313,18 +319,32 @@ def _owned_job(session, job_id: Optional[str], worker_id: str, statuses) -> Opti
       is the normal steady state: the agent heartbeats every 30s for the whole
       length of a job, and only the first one has anything to do. Logging those
       at WARNING would bury the forgery signal under hundreds of lines per job.
+
+    `resolve_warn_level`, when given, is called as `resolve_warn_level(job_id)`
+    at each of the three genuinely-wrong branches above (never at a DEBUG
+    branch) to get the level to log at instead of the hardcoded WARNING --
+    letting a caller rate-limit repeat offenses (see agentws._resolve_warn_level)
+    without this function needing to know anything about connections or LRUs.
+    Defaults to None, which reproduces the unconditional-WARNING behavior
+    above exactly -- every caller other than agentws (and any direct test of
+    this module) is unaffected.
     """
     if not job_id:
         return None
+
+    def _warn_level() -> int:
+        return resolve_warn_level(job_id) if resolve_warn_level is not None else logging.WARNING
+
     job = session.get(db.Job, job_id)
     if job is None:
-        logger.warning("dispatch: worker %s referenced unknown job %s", worker_id, job_id)
+        logger.log(_warn_level(), "dispatch: worker %s referenced unknown job %s", worker_id, job_id)
         return None
 
     if job.worker_id != worker_id:
         was_ours_and_is_over = job.last_worker_id == worker_id and job.status in _TERMINAL_STATUSES
-        log = logger.debug if was_ours_and_is_over else logger.warning
-        log(
+        level = logging.DEBUG if was_ours_and_is_over else _warn_level()
+        logger.log(
+            level,
             "dispatch: worker %s may not transition job %s owned by %s (status=%s)",
             worker_id,
             job_id,
@@ -334,8 +354,9 @@ def _owned_job(session, job_id: Optional[str], worker_id: str, statuses) -> Opti
         return None
 
     if job.status not in statuses:
-        log = logger.warning if job.status in _TERMINAL_STATUSES else logger.debug
-        log(
+        level = _warn_level() if job.status in _TERMINAL_STATUSES else logging.DEBUG
+        logger.log(
+            level,
             "dispatch: worker %s's job %s is %s, not %s; ignoring.",
             worker_id,
             job_id,
@@ -347,10 +368,10 @@ def _owned_job(session, job_id: Optional[str], worker_id: str, statuses) -> Opti
     return job
 
 
-def mark_running(job_id: str, worker_id: str) -> bool:
+def mark_running(job_id: str, worker_id: str, resolve_warn_level=None) -> bool:
     """Move an assigned job of `worker_id` to running. Returns whether it acted."""
     with db.get_session() as session:
-        job = _owned_job(session, job_id, worker_id, ("assigned",))
+        job = _owned_job(session, job_id, worker_id, ("assigned",), resolve_warn_level)
         if job is None:
             return False
         job.status = "running"
@@ -361,10 +382,10 @@ def mark_running(job_id: str, worker_id: str) -> bool:
     return True
 
 
-def mark_done(job_id: str, worker_id: str, result_files: list) -> bool:
+def mark_done(job_id: str, worker_id: str, result_files: list, resolve_warn_level=None) -> bool:
     """Complete an assigned/running job of `worker_id`. Returns whether it acted."""
     with db.get_session() as session:
-        job = _owned_job(session, job_id, worker_id, _OWNED_STATUSES)
+        job = _owned_job(session, job_id, worker_id, _OWNED_STATUSES, resolve_warn_level)
         if job is None:
             return False
         job.status = "done"
@@ -377,10 +398,10 @@ def mark_done(job_id: str, worker_id: str, result_files: list) -> bool:
     return True
 
 
-def mark_failed(job_id: str, worker_id: str, error: str) -> bool:
+def mark_failed(job_id: str, worker_id: str, error: str, resolve_warn_level=None) -> bool:
     """Fail an assigned/running job of `worker_id`. Returns whether it acted."""
     with db.get_session() as session:
-        job = _owned_job(session, job_id, worker_id, _OWNED_STATUSES)
+        job = _owned_job(session, job_id, worker_id, _OWNED_STATUSES, resolve_warn_level)
         if job is None:
             return False
         job.status = "failed"

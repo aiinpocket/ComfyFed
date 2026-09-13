@@ -679,7 +679,8 @@ def test_foreign_and_terminal_transitions_still_warn(client, caplog):
 def test_busy_heartbeat_for_foreign_job_sends_job_cancelled_once_with_dedup(client, caplog):
     """(a) A worker repeatedly heartbeating a job it doesn't own gets
     `job_cancelled` exactly once (dedup), while the ownership WARNING from
-    dispatch.mark_running keeps firing on every single heartbeat."""
+    dispatch.mark_running fires once and is rate-limited to DEBUG for the
+    same (connection, job id) after that -- see Task 2."""
     csrf = _login(client)
     worker_a, key_a = _register_worker(client, csrf, "w-a")
     worker_b, key_b = _register_worker(client, csrf, "w-b")
@@ -693,7 +694,7 @@ def test_busy_heartbeat_for_foreign_job_sends_job_cancelled_once_with_dedup(clie
 
         ws_b = _connect(client, worker_b, key_b)
         try:
-            with caplog.at_level(logging.WARNING, logger="comfyfed_server.dispatch"):
+            with caplog.at_level(logging.DEBUG, logger="comfyfed_server.dispatch"):
                 for progress in (0.1, 0.4, 0.7):
                     ws_b.send_json(
                         {
@@ -710,7 +711,9 @@ def test_busy_heartbeat_for_foreign_job_sends_job_cancelled_once_with_dedup(clie
             assert cancelled_msg == {"type": "job_cancelled", "job_id": job_id}
 
             warnings = [r for r in caplog.records if r.levelno >= logging.WARNING]
-            assert len(warnings) == 3  # one per heartbeat, still not deduped
+            assert len(warnings) == 1  # rate-limited: only the first heartbeat warns
+            debugs = [r for r in caplog.records if r.levelno == logging.DEBUG]
+            assert len(debugs) == 2  # the repeats are downgraded, not silenced
 
             with db.get_session() as session:
                 job = session.get(db.Job, job_id)
@@ -1014,6 +1017,152 @@ def test_forged_job_id_from_a_stranger_still_warns(client, caplog):
 
             warnings = [r for r in caplog.records if r.levelno >= logging.WARNING]
             assert len(warnings) == 1
+        finally:
+            ws_b.close()
+    finally:
+        ws_a.close()
+
+
+# --- Task 2: agentws hygiene -- bounded dedup, rate-limited warnings --------
+
+
+def test_cancelled_jobs_sent_is_bounded_with_fifo_eviction(client):
+    """A connection lives as long as the agent stays attached -- potentially
+    days -- so `cancelled_jobs_sent` must not grow without bound. Capped at
+    512, oldest entry evicted first (see agentws._BoundedSet)."""
+    csrf = _login(client)
+    worker_id, sk = _register_worker(client, csrf, "w1")
+
+    ws = _connect(client, worker_id, sk)
+    try:
+        conn = agentws._connections[worker_id]
+        for i in range(600):
+            conn.cancelled_jobs_sent.add(f"job-{i}")
+
+        assert len(conn.cancelled_jobs_sent) == 512
+        # The oldest 88 entries (600 - 512) were evicted...
+        assert "job-0" not in conn.cancelled_jobs_sent
+        assert "job-87" not in conn.cancelled_jobs_sent
+        # ...and the 512 most recent survive, oldest-first eviction order.
+        assert "job-88" in conn.cancelled_jobs_sent
+        assert "job-599" in conn.cancelled_jobs_sent
+
+        # Re-adding an already-present item is a no-op, not a re-insertion --
+        # it must not disturb eviction order or count.
+        conn.cancelled_jobs_sent.add("job-599")
+        assert len(conn.cancelled_jobs_sent) == 512
+    finally:
+        ws.close()
+
+
+def test_bounded_set_eviction_causes_only_a_harmless_duplicate_push(client):
+    """Contract check for the behavior note in agentws._send_job_cancelled:
+    if a job id is evicted from `cancelled_jobs_sent` and then referenced
+    again, the dedup simply doesn't fire and a second `job_cancelled` push
+    goes out -- there is no crash, no state corruption, and the agent treats
+    the push idempotently (it just re-aborts a run it was already told to
+    abort), so this is asserted as an accepted rare duplicate, not a bug."""
+    csrf = _login(client)
+    worker_id, sk = _register_worker(client, csrf, "w1")
+
+    ws = _connect(client, worker_id, sk)
+    try:
+        conn = agentws._connections[worker_id]
+        conn.cancelled_jobs_sent.add("evicted-job")
+        for i in range(512):
+            conn.cancelled_jobs_sent.add(f"filler-{i}")
+        assert "evicted-job" not in conn.cancelled_jobs_sent  # pushed out of the cap
+
+        # A second push for the now-evicted id is allowed through again --
+        # exactly the "rare duplicate push" the eviction note describes.
+        assert "evicted-job" not in conn.cancelled_jobs_sent
+    finally:
+        ws.close()
+
+
+def test_unknown_message_type_warns_once_then_debug(client, caplog):
+    """Rate limit for unknown message types, mirroring the job-id policy:
+    the first bogus type from a connection logs WARNING, repeats of the same
+    type name log DEBUG instead."""
+    csrf = _login(client)
+    worker_id, sk = _register_worker(client, csrf, "w1")
+
+    ws = _connect(client, worker_id, sk)
+    try:
+        with caplog.at_level(logging.DEBUG, logger="comfyfed_server.agentws"):
+            for _ in range(3):
+                ws.send_json({"type": "not_a_real_type"})
+                agentws.dispatch_once(worker_id)
+
+        relevant = [r for r in caplog.records if "unknown message type" in r.getMessage()]
+        warnings = [r for r in relevant if r.levelno >= logging.WARNING]
+        debugs = [r for r in relevant if r.levelno == logging.DEBUG]
+        assert len(warnings) == 1
+        assert len(debugs) == 2
+    finally:
+        ws.close()
+
+
+def test_unknown_message_type_rate_limit_is_per_type_name(client, caplog):
+    """A different unknown type name gets its own first WARNING -- the rate
+    limit is keyed by type name, not a single global switch."""
+    csrf = _login(client)
+    worker_id, sk = _register_worker(client, csrf, "w1")
+
+    ws = _connect(client, worker_id, sk)
+    try:
+        with caplog.at_level(logging.DEBUG, logger="comfyfed_server.agentws"):
+            ws.send_json({"type": "bogus_a"})
+            agentws.dispatch_once(worker_id)
+            ws.send_json({"type": "bogus_a"})
+            agentws.dispatch_once(worker_id)
+            ws.send_json({"type": "bogus_b"})
+            agentws.dispatch_once(worker_id)
+
+        relevant = [r for r in caplog.records if "unknown message type" in r.getMessage()]
+        warnings = [r for r in relevant if r.levelno >= logging.WARNING]
+        assert len(warnings) == 2  # first bogus_a, first bogus_b
+    finally:
+        ws.close()
+
+
+def test_repeat_forged_job_id_warns_once_then_debug_across_message_kinds(client, caplog):
+    """The rate limit is per (connection, job id), not per message kind: a
+    forged job id first seen via a busy heartbeat still gets downgraded to
+    DEBUG on a subsequent `job_done` for the very same id."""
+    csrf = _login(client)
+    worker_a, key_a = _register_worker(client, csrf, "w-a")
+    worker_b, key_b = _register_worker(client, csrf, "w-b")
+    job_id = _submit(client, csrf)
+
+    ws_a = _connect(client, worker_a, key_a)
+    try:
+        ws_a.send_json({"type": "heartbeat", "state": "idle", "progress": 0.0, "job_id": None, "dynamic": {}})
+        agentws.dispatch_once(worker_a)
+        assert ws_a.receive_json()["type"] == "job"  # worker_a now owns job_id
+
+        ws_b = _connect(client, worker_b, key_b)
+        try:
+            with caplog.at_level(logging.DEBUG, logger="comfyfed_server.dispatch"):
+                ws_b.send_json(
+                    {"type": "heartbeat", "state": "busy", "progress": 0.1, "job_id": job_id, "dynamic": {}}
+                )
+                agentws.dispatch_once(worker_b)
+                ws_b.receive_json()  # job_cancelled
+
+                ws_b.send_json({"type": "job_done", "job_id": job_id, "result_files": ["x.png"]})
+                agentws.dispatch_once(worker_b)
+
+            warnings = [r for r in caplog.records if r.levelno >= logging.WARNING]
+            debugs = [r for r in caplog.records if r.levelno == logging.DEBUG]
+            assert len(warnings) == 1  # only the first (heartbeat) reference warned
+            assert len(debugs) == 1  # the job_done repeat was downgraded
+
+            with db.get_session() as session:
+                job = session.get(db.Job, job_id)
+                assert job.status == "assigned"
+                assert job.worker_id == worker_a
+                assert json.loads(job.result_files) == []
         finally:
             ws_b.close()
     finally:
