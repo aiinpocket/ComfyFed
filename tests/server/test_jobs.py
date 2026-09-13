@@ -1063,3 +1063,24 @@ def test_job_dict_omits_fetch_stage_fields_when_absent(client):
     assert "stage" not in job
     assert "fetch_pct" not in job
     assert "fetch_model" not in job
+
+
+def test_job_dict_omits_invalid_fetch_pct_and_model_rather_than_sending_null(client):
+    """`stage` can be present while `fetch_pct`/`fetch_model` are None (the
+    agent sent a malformed value -- see `_handle_heartbeat`); those two keys
+    must be OMITTED from the dict, not sent as an explicit `null`, matching
+    `panelws.job_progress`'s omit-if-None style for the same data."""
+    csrf = _login(client)
+    job_id = _submit(client, csrf).json()["job_id"]
+
+    agentws._fetch_progress[job_id] = {
+        "stage": "fetching_models",
+        "fetch_pct": None,
+        "fetch_model": None,
+    }
+
+    listed = client.get("/api/jobs", headers={"X-CSRF": csrf}).json()
+    job = next(j for j in listed if j["id"] == job_id)
+    assert job["stage"] == "fetching_models"
+    assert "fetch_pct" not in job
+    assert "fetch_model" not in job

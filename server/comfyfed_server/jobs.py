@@ -146,10 +146,13 @@ def _job_dict(job: db.Job) -> dict:
     # Phase 2.1: transient model-auto-fetch progress (stage/fetch_pct/
     # fetch_model), NOT a Job column -- see agentws._fetch_progress's
     # docstring. Added only while the job is actually in that phase, so an
-    # ordinary job's dict shape is unchanged.
+    # ordinary job's dict shape is unchanged. A field the agent didn't send
+    # a valid value for (fetch_pct/fetch_model can be None -- see
+    # _handle_heartbeat) is OMITTED rather than sent as an explicit null,
+    # matching panelws.job_progress's omit-if-None style for the same data.
     fetch_progress = agentws.get_fetch_progress(job.id)
     if fetch_progress:
-        d.update(fetch_progress)
+        d.update({k: v for k, v in fetch_progress.items() if v is not None})
     return d
 
 
