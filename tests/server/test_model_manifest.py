@@ -13,7 +13,7 @@ from nacl.exceptions import BadSignatureError
 from nacl.signing import SigningKey, VerifyKey
 
 from comfyfed_server import app as app_module
-from comfyfed_server import bootstrap, db, model_manifest, security
+from comfyfed_server import bootstrap, db, model_guide, model_manifest, security
 
 
 @pytest.fixture()
@@ -155,6 +155,37 @@ def test_entries_excludes_a_poisoned_name_even_with_an_agreed_row_present(data_d
     assert "clip_l.safetensors" not in names
 
 
+def test_poison_survives_a_restart_because_the_conflicting_rows_persist(data_dir, caplog):
+    """The poisoned-name set is documented as in-memory/per-process, forgotten
+    on restart -- but the conflicting `model_hashes` rows that caused it are
+    real DB rows, not memory, so the very next matching report reproduces
+    the same conflict and re-poisons the name. Simulate a restart by
+    clearing the in-memory set directly (what a fresh process would start
+    with) without touching the DB, then feed a fresh report for the same
+    (name, size) that still disagrees with what's stored.
+    """
+    model_manifest.record_hash("worker-first", "clip_l.safetensors", _bytes(0.23), _sha("a"))
+    model_manifest.record_hash("worker-second", "clip_l.safetensors", _bytes(0.23), _sha("b"))
+    assert "clip_l.safetensors" in model_manifest.poisoned_names()
+
+    # Simulate a process restart: the in-memory poisoned set is gone, but
+    # the two disagreeing model_hashes rows are still on disk.
+    model_manifest._poisoned_names.clear()
+    assert "clip_l.safetensors" not in model_manifest.poisoned_names()
+    names = {e["name"] for e in model_manifest.entries(data_dir)}
+    assert "clip_l.safetensors" in names  # not yet re-poisoned this process
+
+    # A fresh inventory report for the same (name, size) -- e.g. worker-second
+    # (or any worker) reconnecting and reporting inventory again -- still
+    # disagrees with the first-seen row, so it reproduces the conflict.
+    with caplog.at_level(logging.WARNING, logger="comfyfed_server.model_manifest"):
+        model_manifest.record_hash("worker-second", "clip_l.safetensors", _bytes(0.23), _sha("b"))
+
+    assert "clip_l.safetensors" in model_manifest.poisoned_names()
+    names = {e["name"] for e in model_manifest.entries(data_dir)}
+    assert "clip_l.safetensors" not in names
+
+
 def test_entries_size_bytes_comes_from_the_learned_row_not_model_guide_size_gb(data_dir):
     """clip_l.safetensors' curated size_gb is 0.23; report a deliberately
     DIFFERENT learned size so the two can't be confused."""
@@ -164,6 +195,32 @@ def test_entries_size_bytes_comes_from_the_learned_row_not_model_guide_size_gb(d
     entry = next(e for e in model_manifest.entries(data_dir) if e["name"] == "clip_l.safetensors")
     assert entry["size_bytes"] == _bytes(0.5)
     assert entry["size_bytes"] != _bytes(0.23)
+
+
+def test_entries_skips_a_candidate_whose_name_contains_the_payload_delimiter(data_dir, monkeypatch):
+    """`|` is the field delimiter in the signed payload
+    (`name|directory|sha256|size_bytes`) -- a source whose name or directory
+    contains one could shift which substring later gets parsed as which
+    field, so it must never reach a signature. Simulate via a harvested-style
+    source injected straight into `model_guide.SOURCES` (a harvested entry's
+    name/directory come off a workflow JSON on disk -- untrusted relative to
+    this process, exactly the case this guard exists for).
+    """
+    evil_name = "evil|1234|deadbeef|.safetensors"
+    evil_source = model_guide.ModelSource(
+        name=evil_name,
+        directory="checkpoints",
+        size_gb=1.0,
+        official_page=None,
+        official_url="https://example.invalid/evil.safetensors",
+        backup_url=None,
+        gated=False,
+    )
+    monkeypatch.setitem(model_guide.SOURCES, evil_name, evil_source)
+    model_manifest.record_hash("w1", f"checkpoints/{evil_name}", _bytes(1.0), _sha("evil"))
+
+    names = {e["name"] for e in model_manifest.entries(data_dir)}
+    assert evil_name not in names
 
 
 # --- routes: auth ----------------------------------------------------------

@@ -158,6 +158,24 @@ def entries(data_dir: str) -> list[dict]:
         if row is None or row.name in _poisoned_names:
             continue
 
+        # Defensive: `|` is the field delimiter in the signed payload below.
+        # `source.name`/`source.directory` should never legitimately contain
+        # one (model filenames and category folders don't use it), but a
+        # harvested entry's `name`/`directory` come straight off a workflow
+        # JSON on disk -- untrusted input relative to this process. Letting
+        # one through would let a crafted `directory` value (e.g.
+        # containing an extra `|1234|sha|`) shift which substring the
+        # signature is later parsed as covering, forging a payload the
+        # platform never actually intended to sign for.
+        if "|" in source.name or "|" in source.directory:
+            logger.warning(
+                "model_manifest: skipping manifest candidate with a '|' in "
+                "name or directory (payload delimiter): name=%r directory=%r",
+                source.name,
+                source.directory,
+            )
+            continue
+
         payload = f"{source.name}|{source.directory}|{row.sha256}|{row.size_bytes}"
         sig = signing_key.sign(payload.encode()).signature.hex()
 
