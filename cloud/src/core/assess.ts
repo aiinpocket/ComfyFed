@@ -186,7 +186,9 @@ export function verdict(
     return { kind: "eligible", reasons: [], missingModels: [], warnings };
   }
 
-  const otherWorkers = allWorkers.filter((w) => w !== worker);
+  // Compare by id, not object identity: the two lists come from independent
+  // D1 reads, so reference equality would never exclude self (reviewer m1).
+  const otherWorkers = allWorkers.filter((w) => w.id !== worker.id);
   let totalMissingSize = 0;
   let allAvailableElsewhere = true;
   for (const modelName of missingModels) {
