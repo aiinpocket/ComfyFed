@@ -13,7 +13,7 @@ put it (`guidance_message`) under a one-line `message` summary
 
 Two sources feed the model->download-info lookup, checked in this order:
 
-1. `SOURCES` -- nine models curated by hand for the workflows ComfyFed ships
+1. `SOURCES` -- models curated by hand for the workflows ComfyFed ships
    or has verified (the FLUX.1-dev family and the MiniMax-H3 pipeline). Each
    entry carries an official page, a direct official download URL, our own
    GCS mirror as a backup, and whether the official source is access-gated.
