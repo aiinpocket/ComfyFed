@@ -1,3 +1,4 @@
+import asyncio
 import json
 import logging
 import math
@@ -1372,6 +1373,43 @@ def test_cancel_of_assigned_but_not_yet_running_job_mints_no_receipt(client):
 
         with db.get_session() as session:
             assert session.query(db.Receipt).filter(db.Receipt.job_id == job_id).count() == 0
+    finally:
+        ws.close()
+
+
+def test_cancel_and_notify_pushes_receipt_across_event_loops(client):
+    """`cancel_and_notify` (and therefore `_mint_cancelled_receipt` /
+    `_push_receipt_frame`) can be invoked from a different event loop than
+    the one the target connection was accepted on -- e.g. an admin/panel
+    HTTP handler running under its own async context relative to a
+    long-lived agent websocket. `asyncio.run(...)` here genuinely starts a
+    fresh loop distinct from `TestClient`'s (mirrors the `relay()` helper in
+    test_comfy_panel_ws.py, which exercises `panelws`'s equivalent
+    cross-loop branch the same way): before the fix for review finding M1,
+    `_push_receipt_frame` awaited `conn.ws.send_json` directly regardless of
+    which loop `conn` belonged to, which fails against a foreign loop and
+    was then silently swallowed by the bare `except Exception` around the
+    send -- the worker would never see the frame to counter-sign. Pushing
+    `job_cancelled` already had the loop-check/`run_coroutine_threadsafe`
+    guard (`push_job_cancelled`); the receipt push now mirrors it."""
+    csrf = _login(client)
+    worker_id, sk = _register_worker(client, csrf, "w1")
+    job_id = _submit(client, csrf)
+
+    ws = _run_to_running(client, csrf, worker_id, sk, job_id)
+    try:
+        assert asyncio.run(agentws.cancel_and_notify(job_id, reason="cross-loop cancel"))
+
+        cancelled_msg = ws.receive_json()
+        assert cancelled_msg == {"type": "job_cancelled", "job_id": job_id}
+        receipt_msg = ws.receive_json()
+        assert receipt_msg["type"] == "receipt"
+        assert receipt_msg["kind"] == "cancelled"
+        assert receipt_msg["billable"] is False
+
+        with db.get_session() as session:
+            receipts = session.query(db.Receipt).filter(db.Receipt.job_id == job_id).all()
+            assert len(receipts) == 1
     finally:
         ws.close()
 

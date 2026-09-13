@@ -670,6 +670,21 @@ def _sign_and_store_receipt(
     return receipt.id, payload, platform_sig
 
 
+async def _send_receipt_frame(conn: "_Connection", receipt_id: str, frame: dict) -> None:
+    """Actually send `frame` over `conn`'s socket, swallowing (and logging)
+    any failure -- the receipt row is already committed by the time this
+    runs, so a send failure here just means the push is missed, not that
+    anything about the receipt itself needs to be undone. Split out from
+    `_push_receipt_frame` so it can be handed to `run_coroutine_threadsafe`
+    as a plain coroutine when the caller is on a different event loop than
+    the one `conn` was accepted on (see `_push_receipt_frame`).
+    """
+    try:
+        await conn.ws.send_json(frame)
+    except Exception:
+        logger.exception("agentws: failed to push receipt %s to worker %s", receipt_id, conn.worker_id)
+
+
 async def _push_receipt_frame(
     worker_id: str,
     receipt_id: str,
@@ -692,6 +707,21 @@ async def _push_receipt_frame(
     and the worker's next `receipt_ack` -- whenever it reconnects -- can
     never arrive for a frame it was never sent, so nothing here needs to
     replay it; the report simply shows it as unacked in the meantime.
+
+    Mirrors `push_job_cancelled`'s cross-event-loop handling: the cancel
+    entry points (the admin cancel API, `/comfy/api/interrupt`,
+    `/comfy/api/queue`) can run on a different event loop than the one the
+    target connection was accepted on (routine under `TestClient`, and for
+    any future worker-thread caller) -- awaiting `conn.ws.send_json`
+    directly in that case doesn't raise cleanly, it hangs or fails against
+    the wrong loop's internals, and the bare `except Exception` around the
+    send would then quietly eat that failure, leaving the worker never
+    counter-signing a receipt it was never actually sent. Scheduling the
+    send on the connection's own loop via `run_coroutine_threadsafe` avoids
+    that entirely; the job_done/job_failed callers that pass `conn` directly
+    are always already running on that connection's own loop (the message
+    that triggered them was received there), so this is a no-op check for
+    them, not a behavior change.
     """
     target = conn or _connections.get(worker_id)
     if target is None:
@@ -700,20 +730,24 @@ async def _push_receipt_frame(
             worker_id, receipt_id, kind,
         )
         return
-    try:
-        await target.ws.send_json(
-            {
-                "type": "receipt",
-                "receipt_id": receipt_id,
-                "payload": payload,
-                "platform_sig": platform_sig,
-                "kind": kind,
-                "billable": billable,
-                "basis": basis,
-            }
-        )
-    except Exception:
-        logger.exception("agentws: failed to push receipt %s to worker %s", receipt_id, worker_id)
+
+    frame = {
+        "type": "receipt",
+        "receipt_id": receipt_id,
+        "payload": payload,
+        "platform_sig": platform_sig,
+        "kind": kind,
+        "billable": billable,
+        "basis": basis,
+    }
+
+    current = asyncio.get_running_loop()
+    if target.loop is current:
+        await _send_receipt_frame(target, receipt_id, frame)
+    else:
+        asyncio.run_coroutine_threadsafe(
+            _send_receipt_frame(target, receipt_id, frame), target.loop
+        ).result(timeout=5)
 
 
 async def _create_and_push_receipt(
