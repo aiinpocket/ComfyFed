@@ -56,8 +56,29 @@ from . import agentws, assess, auth, db, jobs, model_guide, panelws, storage, wo
 # looks up the images it should display under the id of the node that saved
 # them; when a workflow has none of these we fall back to `FALLBACK_OUTPUT_KEY`
 # so the artifacts are still reachable. Public: `panelws.job_done` uses it too.
-_OUTPUT_NODE_CLASSES = {"SaveImage", "SaveVideo", "SaveAudio"}
+# `SaveText` is included here (it's a real output node, so it belongs in
+# `outputs_to_execute` too -- see `_queue_entry`) but NOT in
+# `_MEDIA_OUTPUT_NODE_CLASSES` below: a workflow with a SaveText node must
+# never have its media files keyed under the SaveText id.
+_OUTPUT_NODE_CLASSES = {"SaveImage", "SaveVideo", "SaveAudio", "SaveText"}
+_MEDIA_OUTPUT_NODE_CLASSES = {"SaveImage", "SaveVideo", "SaveAudio"}
+_TEXT_OUTPUT_NODE_CLASS = "SaveText"
+# The node novices actually look at to read a generated prompt. It produces
+# no file of its own, so it is never a candidate output key for media and
+# never appears in `_OUTPUT_NODE_CLASSES` -- `job_outputs` locates its ids
+# separately and duplicates the SaveText node's text payload onto each one.
+_PREVIEW_ANY_CLASS = "PreviewAny"
 FALLBACK_OUTPUT_KEY = "comfyfed"
+
+_TEXT_ARTIFACT_EXT = ".txt"
+_TEXT_ARTIFACT_MAX_BYTES = 100_000
+
+# Set by `create_router` (mirrors `agentws._data_dir`): `job_outputs` needs it
+# to read a `.txt` artifact's content from the store, but it is shared by
+# `panelws.job_done` (no `data_dir` in scope there) and `_history_entry`
+# (which does have one) alike, so a module-level value set once at app
+# startup is simpler than threading `data_dir` through both call paths.
+_data_dir: Optional[str] = None
 
 # Flat staging area for images/masks/audio uploaded through the ComfyUI
 # frontend's upload widgets, ahead of being referenced by a submitted prompt.
@@ -177,12 +198,16 @@ def _result_files(job: db.Job) -> list[str]:
     return [f for f in files if isinstance(f, str)]
 
 
-def _output_node_ids(workflow: dict) -> list[str]:
+def _node_ids_of_class(workflow: dict, classes) -> list[str]:
     return sorted(
         node_id
         for node_id, node in workflow.items()
-        if isinstance(node, dict) and node.get("class_type") in _OUTPUT_NODE_CLASSES
+        if isinstance(node, dict) and node.get("class_type") in classes
     )
+
+
+def _output_node_ids(workflow: dict) -> list[str]:
+    return _node_ids_of_class(workflow, _OUTPUT_NODE_CLASSES)
 
 
 def _queue_entry(number: int, job: db.Job) -> list:
@@ -194,13 +219,63 @@ def _queue_entry(number: int, job: db.Job) -> list:
     return [number, job.id, workflow, extra_data, _output_node_ids(workflow)]
 
 
+def _read_text_artifact(job: db.Job, filename: str) -> Optional[str]:
+    """Best-effort read of a `.txt` artifact's content for the panel preview.
+
+    Capped at `_TEXT_ARTIFACT_MAX_BYTES` (a generated prompt can run long,
+    and this is a preview, not a download -- the full file is still
+    reachable via `files`). Any failure (store misconfigured, artifact
+    missing, ...) returns `None` so the caller falls back to a files-only
+    entry instead of ever raising out of `job_outputs`.
+    """
+    if _data_dir is None:
+        return None
+    try:
+        store = storage.get_store(_data_dir)
+        with store.open(job.id, filename) as f:
+            raw = f.read(_TEXT_ARTIFACT_MAX_BYTES)
+    except Exception:  # noqa: BLE001 -- "never raise" is the explicit contract here
+        return None
+    return raw.decode("utf-8", errors="replace")
+
+
+def _merge_output(result: dict, key: str, payload: dict) -> None:
+    """Add `payload`'s lists into `result[key]`, creating or extending it.
+
+    A plain `result[key] = payload` would let two different pieces of
+    `job_outputs` clobber each other when they happen to land on the same
+    node id (notably the `FALLBACK_OUTPUT_KEY` collision between media and
+    text when a workflow has neither a recognised media output node nor a
+    `SaveText` node).
+    """
+    existing = result.setdefault(key, {})
+    for field, values in payload.items():
+        existing.setdefault(field, []).extend(values)
+
+
 def job_outputs(job: db.Job) -> dict:
-    """Build the `{node_id: {"images": [...]}}` mapping ComfyUI's frontend
-    expects for a job's outputs.
+    """Build the `{node_id: {...}}` mapping ComfyUI's frontend expects for a
+    job's outputs.
 
     Shared by `_history_entry` (`GET /history`) and `panelws.job_done` (the
     WS `executed` event), so a done job's outputs can never drift between the
     two surfaces. Empty until the job has result files.
+
+    Result files split by extension:
+
+    * Everything but `.txt` is today's `images` mapping, keyed to the first
+      *media* output node id (`_MEDIA_OUTPUT_NODE_CLASSES`) or
+      `FALLBACK_OUTPUT_KEY`.
+    * `.txt` files become a `{"text": [...], "files": [...]}` mapping keyed
+      to the workflow's `SaveText` node id (or `FALLBACK_OUTPUT_KEY` if the
+      workflow has none, so the files stay reachable even then). The same
+      `{"text": [...]}` is ALSO duplicated onto every `PreviewAny` node id --
+      that is the node novices actually look at, and duplicating is how both
+      render the result. `text` is omitted entirely (not an empty list) when
+      no artifact content could be read, so a missing/unreadable `.txt`
+      degrades to a files-only entry rather than a misleading blank preview.
+
+    A job with both media and text files gets both mappings side by side.
 
     `subfolder` carries the JOB ID, which is what makes an old history entry
     still resolvable. ComfyUI names outputs from a node-side prefix
@@ -216,15 +291,49 @@ def job_outputs(job: db.Job) -> dict:
     files = _result_files(job)
     if not files:
         return {}
-    node_ids = _output_node_ids(_workflow_of(job))
-    key = node_ids[0] if node_ids else FALLBACK_OUTPUT_KEY
-    return {
-        key: {
-            "images": [
-                {"filename": name, "subfolder": job.id, "type": "output"} for name in files
-            ]
-        }
-    }
+
+    text_files = [f for f in files if os.path.splitext(f)[1].lower() == _TEXT_ARTIFACT_EXT]
+    media_files = [f for f in files if f not in text_files]
+
+    workflow = _workflow_of(job)
+    result: dict = {}
+
+    if media_files:
+        media_ids = _node_ids_of_class(workflow, _MEDIA_OUTPUT_NODE_CLASSES)
+        key = media_ids[0] if media_ids else FALLBACK_OUTPUT_KEY
+        _merge_output(
+            result,
+            key,
+            {
+                "images": [
+                    {"filename": name, "subfolder": job.id, "type": "output"}
+                    for name in media_files
+                ]
+            },
+        )
+
+    if text_files:
+        texts = [
+            content
+            for content in (_read_text_artifact(job, name) for name in text_files)
+            if content is not None
+        ]
+        file_entries = [
+            {"filename": name, "subfolder": job.id, "type": "output"} for name in text_files
+        ]
+
+        save_text_ids = _node_ids_of_class(workflow, {_TEXT_OUTPUT_NODE_CLASS})
+        save_target = save_text_ids[0] if save_text_ids else FALLBACK_OUTPUT_KEY
+        save_payload: dict = {"files": file_entries}
+        if texts:
+            save_payload["text"] = texts
+        _merge_output(result, save_target, save_payload)
+
+        if texts:
+            for preview_id in _node_ids_of_class(workflow, {_PREVIEW_ANY_CLASS}):
+                _merge_output(result, preview_id, {"text": texts})
+
+    return result
 
 
 def _history_entry(number: int, job: db.Job) -> dict:
@@ -449,6 +558,9 @@ def create_router(
     which looks the name up in `<data_dir>/comfy_staging/`; tests pass their
     own to isolate themselves from the filesystem.
     """
+    global _data_dir
+    _data_dir = data_dir
+
     resolver = resolve_asset if resolve_asset is not None else (
         lambda name: _default_resolve_asset(data_dir, name)
     )

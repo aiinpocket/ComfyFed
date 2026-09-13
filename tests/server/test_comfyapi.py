@@ -624,6 +624,110 @@ def test_history_falls_back_to_comfyfed_output_key(client):
     assert list(outputs) == ["comfyfed"]
 
 
+# --- text outputs (SaveText / PreviewAny) -----------------------------------
+
+TEXT_PROMPT = {
+    "1": {"class_type": "TextGenerate", "inputs": {}},
+    "2": {"class_type": "SaveText", "inputs": {"text": ["1", 0]}},
+    "3": {"class_type": "PreviewAny", "inputs": {"source": ["1", 0]}},
+}
+
+
+def test_history_text_only_job_populates_save_text_and_preview_any(client):
+    csrf = _login(client)
+    prompt_id = _post_prompt(client, prompt=TEXT_PROMPT).json()["prompt_id"]
+    _finish_job(client, csrf, prompt_id, result_files=["comfyfed_prompt.txt"], artifact_bytes=b"a lovely prompt")
+
+    outputs = client.get("/comfy/api/history").json()[prompt_id]["outputs"]
+
+    # Media never appears for a text-only job.
+    assert set(outputs) == {"2", "3"}
+
+    assert outputs["2"] == {
+        "text": ["a lovely prompt"],
+        "files": [
+            {"filename": "comfyfed_prompt.txt", "subfolder": prompt_id, "type": "output"}
+        ],
+    }
+    # PreviewAny is the node novices actually look at -- duplicate just the
+    # text, no files (PreviewAny never produces a file).
+    assert outputs["3"] == {"text": ["a lovely prompt"]}
+
+
+def test_history_mixed_media_and_text_job(client):
+    csrf = _login(client)
+    prompt = {
+        "1": {"class_type": "KSampler", "inputs": {}},
+        "2": {"class_type": "SaveImage", "inputs": {"images": ["1", 0]}},
+        "3": {"class_type": "SaveText", "inputs": {"text": ["1", 0]}},
+    }
+    prompt_id = _post_prompt(client, prompt=prompt).json()["prompt_id"]
+    csrf_dummy = csrf  # keep name used below for clarity
+    worker_id = _register_worker(client, csrf_dummy, f"runner-{prompt_id[:6]}")
+    picked = _pick_job_for(worker_id)
+    assert picked is not None and picked.id == prompt_id
+    assert dispatch.mark_running(prompt_id, worker_id)
+
+    store = storage.get_store(client.data_dir)
+    store.put(prompt_id, "out.png", io.BytesIO(b"png-bytes"))
+    store.put(prompt_id, "out.txt", io.BytesIO(b"text-bytes"))
+    assert dispatch.mark_done(prompt_id, worker_id, ["out.png", "out.txt"])
+
+    outputs = client.get("/comfy/api/history").json()[prompt_id]["outputs"]
+    assert set(outputs) == {"2", "3"}
+    assert outputs["2"] == {
+        "images": [{"filename": "out.png", "subfolder": prompt_id, "type": "output"}]
+    }
+    assert outputs["3"] == {
+        "text": ["text-bytes"],
+        "files": [{"filename": "out.txt", "subfolder": prompt_id, "type": "output"}],
+    }
+
+
+def test_history_text_artifact_unreadable_falls_back_to_files_only(client):
+    csrf = _login(client)
+    prompt_id = _post_prompt(client, prompt=TEXT_PROMPT).json()["prompt_id"]
+
+    # Drive the job to done WITHOUT actually storing the artifact bytes, so
+    # the content read fails but result_files still names it.
+    worker_id = _register_worker(client, csrf, f"runner-{prompt_id[:6]}")
+    picked = _pick_job_for(worker_id)
+    assert picked is not None and picked.id == prompt_id
+    assert dispatch.mark_running(prompt_id, worker_id)
+    assert dispatch.mark_done(prompt_id, worker_id, ["missing.txt"])
+
+    outputs = client.get("/comfy/api/history").json()[prompt_id]["outputs"]
+    assert "text" not in outputs["2"]
+    assert outputs["2"]["files"] == [
+        {"filename": "missing.txt", "subfolder": prompt_id, "type": "output"}
+    ]
+    # Nothing readable to duplicate onto PreviewAny.
+    assert "3" not in outputs
+
+
+def test_history_text_artifact_content_capped_at_100kb(client):
+    csrf = _login(client)
+    prompt_id = _post_prompt(client, prompt=TEXT_PROMPT).json()["prompt_id"]
+    big = (b"x" * 150_000)
+    _finish_job(client, csrf, prompt_id, result_files=["big.txt"], artifact_bytes=big)
+
+    outputs = client.get("/comfy/api/history").json()[prompt_id]["outputs"]
+    assert len(outputs["2"]["text"][0]) == 100_000
+
+
+def test_history_text_file_without_save_text_node_uses_fallback_key(client):
+    csrf = _login(client)
+    prompt = {"1": {"class_type": "KSampler", "inputs": {}}}
+    prompt_id = _post_prompt(client, prompt=prompt).json()["prompt_id"]
+    _finish_job(client, csrf, prompt_id, result_files=["notes.txt"], artifact_bytes=b"hello")
+
+    outputs = client.get("/comfy/api/history").json()[prompt_id]["outputs"]
+    assert list(outputs) == [comfyapi.FALLBACK_OUTPUT_KEY]
+    assert outputs[comfyapi.FALLBACK_OUTPUT_KEY]["files"] == [
+        {"filename": "notes.txt", "subfolder": prompt_id, "type": "output"}
+    ]
+
+
 # --- view ------------------------------------------------------------------
 
 
