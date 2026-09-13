@@ -83,9 +83,10 @@ def _curated(
     )
 
 
-# The nine curated models, verified 2026-09-13 -- see
+# The ten curated models, verified 2026-09-13 -- see
 # docs/superpowers/plans/2026-09-13-phase1_6-official-templates.md, "The
-# curated model source registry".
+# curated model source registry", and the Phase 1.8b addendum's model
+# registry table for entry #10 (qwen3vl_4b_bf16.safetensors).
 SOURCES: dict[str, ModelSource] = {
     "flux1-dev.safetensors": _curated(
         "flux1-dev.safetensors",
@@ -166,6 +167,21 @@ SOURCES: dict[str, ModelSource] = {
         0.91,
         "https://huggingface.co/drbaph/MiniMax-H3-Turbo-Lora-ComfyUI",
         "minimax_h3_ref2v_turbo_8step_v1.0_768p_comfyui_resized_avg_rank_64_bf16.safetensors",
+    ),
+    # Direct URL has a `text_encoders/` path segment before the filename
+    # (unlike the flat FLUX text-encoder layout), so this is built manually
+    # rather than via `_curated`, same as the MiniMax-H3 entries above.
+    "qwen3vl_4b_bf16.safetensors": ModelSource(
+        name="qwen3vl_4b_bf16.safetensors",
+        directory="text_encoders",
+        size_gb=8.27,
+        official_page="https://huggingface.co/Comfy-Org/Krea-2",
+        official_url=(
+            "https://huggingface.co/Comfy-Org/Krea-2/resolve/main/"
+            "text_encoders/qwen3vl_4b_bf16.safetensors"
+        ),
+        backup_url=f"{_GCS_BACKUP_BASE}/text_encoders/qwen3vl_4b_bf16.safetensors",
+        gated=False,
     ),
 }
 

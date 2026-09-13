@@ -624,6 +624,189 @@ def test_history_falls_back_to_comfyfed_output_key(client):
     assert list(outputs) == ["comfyfed"]
 
 
+# --- text outputs (SaveText / PreviewAny) -----------------------------------
+
+TEXT_PROMPT = {
+    "1": {"class_type": "TextGenerate", "inputs": {}},
+    "2": {"class_type": "SaveText", "inputs": {"text": ["1", 0]}},
+    "3": {"class_type": "PreviewAny", "inputs": {"source": ["1", 0]}},
+}
+
+
+def test_history_text_only_job_populates_save_text_and_preview_any(client):
+    csrf = _login(client)
+    prompt_id = _post_prompt(client, prompt=TEXT_PROMPT).json()["prompt_id"]
+    _finish_job(client, csrf, prompt_id, result_files=["comfyfed_prompt.txt"], artifact_bytes=b"a lovely prompt")
+
+    outputs = client.get("/comfy/api/history").json()[prompt_id]["outputs"]
+
+    # Media never appears for a text-only job.
+    assert set(outputs) == {"2", "3"}
+
+    assert outputs["2"] == {
+        "text": ["a lovely prompt"],
+        "files": [
+            {"filename": "comfyfed_prompt.txt", "subfolder": prompt_id, "type": "output"}
+        ],
+    }
+    # PreviewAny is the node novices actually look at -- duplicate just the
+    # text, no files (PreviewAny never produces a file).
+    assert outputs["3"] == {"text": ["a lovely prompt"]}
+
+
+def test_history_mixed_media_and_text_job(client):
+    csrf = _login(client)
+    prompt = {
+        "1": {"class_type": "KSampler", "inputs": {}},
+        "2": {"class_type": "SaveImage", "inputs": {"images": ["1", 0]}},
+        "3": {"class_type": "SaveText", "inputs": {"text": ["1", 0]}},
+    }
+    prompt_id = _post_prompt(client, prompt=prompt).json()["prompt_id"]
+    csrf_dummy = csrf  # keep name used below for clarity
+    worker_id = _register_worker(client, csrf_dummy, f"runner-{prompt_id[:6]}")
+    picked = _pick_job_for(worker_id)
+    assert picked is not None and picked.id == prompt_id
+    assert dispatch.mark_running(prompt_id, worker_id)
+
+    store = storage.get_store(client.data_dir)
+    store.put(prompt_id, "out.png", io.BytesIO(b"png-bytes"))
+    store.put(prompt_id, "out.txt", io.BytesIO(b"text-bytes"))
+    assert dispatch.mark_done(prompt_id, worker_id, ["out.png", "out.txt"])
+
+    outputs = client.get("/comfy/api/history").json()[prompt_id]["outputs"]
+    assert set(outputs) == {"2", "3"}
+    assert outputs["2"] == {
+        "images": [{"filename": "out.png", "subfolder": prompt_id, "type": "output"}]
+    }
+    assert outputs["3"] == {
+        "text": ["text-bytes"],
+        "files": [{"filename": "out.txt", "subfolder": prompt_id, "type": "output"}],
+    }
+
+
+def test_history_text_artifact_unreadable_falls_back_to_files_only(client):
+    csrf = _login(client)
+    prompt_id = _post_prompt(client, prompt=TEXT_PROMPT).json()["prompt_id"]
+
+    # Drive the job to done WITHOUT actually storing the artifact bytes, so
+    # the content read fails but result_files still names it.
+    worker_id = _register_worker(client, csrf, f"runner-{prompt_id[:6]}")
+    picked = _pick_job_for(worker_id)
+    assert picked is not None and picked.id == prompt_id
+    assert dispatch.mark_running(prompt_id, worker_id)
+    assert dispatch.mark_done(prompt_id, worker_id, ["missing.txt"])
+
+    outputs = client.get("/comfy/api/history").json()[prompt_id]["outputs"]
+    assert "text" not in outputs["2"]
+    assert outputs["2"]["files"] == [
+        {"filename": "missing.txt", "subfolder": prompt_id, "type": "output"}
+    ]
+    # Nothing readable to duplicate onto PreviewAny.
+    assert "3" not in outputs
+
+
+def test_history_text_artifact_content_capped_at_100kb(client):
+    csrf = _login(client)
+    prompt_id = _post_prompt(client, prompt=TEXT_PROMPT).json()["prompt_id"]
+    big = (b"x" * 150_000)
+    _finish_job(client, csrf, prompt_id, result_files=["big.txt"], artifact_bytes=big)
+
+    outputs = client.get("/comfy/api/history").json()[prompt_id]["outputs"]
+    assert len(outputs["2"]["text"][0]) == 100_000
+
+
+def test_history_text_file_without_save_text_node_uses_fallback_key(client):
+    csrf = _login(client)
+    prompt = {"1": {"class_type": "KSampler", "inputs": {}}}
+    prompt_id = _post_prompt(client, prompt=prompt).json()["prompt_id"]
+    _finish_job(client, csrf, prompt_id, result_files=["notes.txt"], artifact_bytes=b"hello")
+
+    outputs = client.get("/comfy/api/history").json()[prompt_id]["outputs"]
+    assert list(outputs) == [comfyapi.FALLBACK_OUTPUT_KEY]
+    assert outputs[comfyapi.FALLBACK_OUTPUT_KEY]["files"] == [
+        {"filename": "notes.txt", "subfolder": prompt_id, "type": "output"}
+    ]
+
+
+def test_read_text_artifact_memoizes_per_job_and_filename(client, monkeypatch):
+    """M2: `_read_text_artifact` must not re-open the store and re-read disk
+    for a `(job_id, filename)` it already served -- artifacts are immutable
+    once written, and `GET /history`'s per-job fan-out was hitting the store
+    (a fresh DB session for the `artifact_store` setting, plus a file read)
+    on every single poll."""
+    comfyapi._text_artifact_cache.clear()
+    csrf = _login(client)
+    prompt_id = _post_prompt(client, prompt=TEXT_PROMPT).json()["prompt_id"]
+    _finish_job(
+        client, csrf, prompt_id, result_files=["comfyfed_prompt.txt"], artifact_bytes=b"cached text"
+    )
+
+    with db.get_session() as session:
+        job = session.get(db.Job, prompt_id)
+
+        calls = []
+        original_open = storage.LocalStore.open
+
+        def counting_open(self, job_id, filename):
+            calls.append((job_id, filename))
+            return original_open(self, job_id, filename)
+
+        monkeypatch.setattr(storage.LocalStore, "open", counting_open)
+
+        first = comfyapi._read_text_artifact(job, "comfyfed_prompt.txt")
+        second = comfyapi._read_text_artifact(job, "comfyfed_prompt.txt")
+
+        assert first == second == "cached text"
+        assert len(calls) == 1
+
+
+def test_read_text_artifact_does_not_cache_a_failed_read(client):
+    """A retry after a late-arriving upload must still succeed -- caching a
+    `None` (missing-file) result would make that failure permanent for the
+    process's lifetime instead of just until the file shows up."""
+    comfyapi._text_artifact_cache.clear()
+    csrf = _login(client)
+    prompt_id = _post_prompt(client, prompt=TEXT_PROMPT).json()["prompt_id"]
+    worker_id = _register_worker(client, csrf, f"runner-{prompt_id[:6]}")
+    picked = _pick_job_for(worker_id)
+    assert picked is not None and picked.id == prompt_id
+    assert dispatch.mark_running(prompt_id, worker_id)
+    assert dispatch.mark_done(prompt_id, worker_id, ["late.txt"])
+
+    with db.get_session() as session:
+        job = session.get(db.Job, prompt_id)
+        assert comfyapi._read_text_artifact(job, "late.txt") is None
+
+        # The worker's upload lands after the first (failed) read.
+        storage.get_store(client.data_dir).put(prompt_id, "late.txt", io.BytesIO(b"finally"))
+
+        assert comfyapi._read_text_artifact(job, "late.txt") == "finally"
+
+
+def test_read_text_artifact_cache_evicts_oldest_past_128_entries(client):
+    """Drives the real eviction path through `_read_text_artifact` itself
+    (not a re-implementation of the cap) -- 129 distinct jobs must leave
+    exactly 128 entries, with the very first one evicted."""
+    comfyapi._text_artifact_cache.clear()
+    csrf = _login(client)
+    jobs = []
+    for i in range(129):
+        prompt_id = _post_prompt(client, prompt=TEXT_PROMPT).json()["prompt_id"]
+        _finish_job(
+            client, csrf, prompt_id, result_files=[f"n{i}.txt"], artifact_bytes=f"t{i}".encode()
+        )
+        jobs.append(prompt_id)
+
+    with db.get_session() as session:
+        for i, prompt_id in enumerate(jobs):
+            job = session.get(db.Job, prompt_id)
+            comfyapi._read_text_artifact(job, f"n{i}.txt")
+
+    assert len(comfyapi._text_artifact_cache) == 128
+    assert (jobs[0], "n0.txt") not in comfyapi._text_artifact_cache
+    assert (jobs[128], "n128.txt") in comfyapi._text_artifact_cache
+
+
 # --- view ------------------------------------------------------------------
 
 

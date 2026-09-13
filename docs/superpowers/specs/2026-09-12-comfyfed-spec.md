@@ -125,3 +125,15 @@ Decisions of record:
 - Known limitation (2026-09-13): `db.Job` has no origin field, so the panel's native controls cannot tell panel-submitted work from console-submitted work — `POST /interrupt` cancels the federation's oldest assigned/running job whoever submitted it, and `{"clear":true}` cancels every non-terminal job; both are admin-only, and scoping them needs a job origin column (product decision still owed).
 - Agent runs `handle_job` as a background task so the WS receive loop keeps reading mid-run (prerequisite for receiving job_cancelled at all); on cancel it interrupts ComfyUI (`/interrupt` when executing, `/queue` delete when locally queued), runs job-file cleanup in a cancel mode, sends no completion message, and returns to idle. One-job-at-a-time invariant unchanged.
 - Dispatch ranking: per tick, oldest job first over ALL idle workers — clean-eligible beats vram_offload-warned, then most free VRAM, then name for determinism. Capability matching stays server-side (the worker never chooses).
+
+---
+
+## Phase 1.8b addendum: prompt-helper templates (2026-09-13)
+
+User directive: 新手最大的問題是不會描述想要的東西。兩支範本：①上傳樣本圖＋簡單要求（如「我要圖中女生的描述」）→ AI 產出形容詞豐富的提示詞供複製；②貼上隨意文字 → 模型整理成合適提示詞。
+
+Decisions of record:
+- Generation model = full Qwen3-VL-4B（Comfy-Org/Krea-2 `qwen3vl_4b_bf16.safetensors`，8.88GB，視覺塔＋BaseGenerate）via core `TextGenerate`. 32B heretic nvfp4 重打包經實測**無法生成**（輸出逗號串——量化只保編碼用途）；klein 4B 重打包被剝掉視覺塔（文字可生成但看不見圖）。Qwen2.5-VL（qwen_image 官方 encoder）的 config 無 stop_tokens，TextGenerate 直接報錯。
+- 圖生提示詞走內建模板＋` /no_think` 尾綴；文字生提示詞必須關閉內建模板、手動 `<|im_start|>` chat 包裹（否則編碼模板立即 EOS、輸出空字串）。chat 標記藏在「別動」節點，新手只碰想法欄。
+- 文字結果雙路呈現：panel 內 `PreviewAny`/`SaveText` 節點即席顯示（server 端 `job_outputs` 把 .txt artifacts 讀出為 `text` payload 映射到對應節點 id），同時以 .txt artifact 回傳 console。
+- 新模型入 curated registry（#10）＋GCS 鏡像。

@@ -97,9 +97,11 @@ _DATA_DIRNAME = "templates_data"
 _ASSETS_SUBDIR = "assets"
 
 # The templates the library ships, in the order `index.json` lists them. The
-# first three carry models (loader nodes + a "缺模型？" note); the last two
-# are zero-model templates (LoadVideo/LoadImage + video-compositing nodes
-# only) that a brand-new worker can run with nothing downloaded.
+# first three carry several models each (loader nodes + a "缺模型？" note);
+# the next two are zero-model templates (LoadVideo/LoadImage + video-
+# compositing nodes only) that a brand-new worker can run with nothing
+# downloaded; the last two (Phase 1.8b) carry exactly one model each (the
+# shared Qwen3-VL text/vision encoder) behind their own "缺模型？" note.
 # Content types stated outright rather than via `mimetypes`, whose Windows
 # backend answers from the registry: there, `.webp` is frequently unknown and
 # `.json` can come back as `text/plain`. The frontend *checks* that
@@ -129,6 +131,8 @@ TEMPLATE_NAMES = (
     "comfyfed-ref2v-video",
     "comfyfed-video-concat",
     "comfyfed-image-intro-video",
+    "comfyfed-image-to-prompt",
+    "comfyfed-text-to-prompt",
 )
 
 

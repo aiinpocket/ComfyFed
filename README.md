@@ -224,8 +224,9 @@ comfyfed-server fetch-comfy-templates --data-dir ./data
 | `minimax_h3_video_vae_fp16.safetensors` | 4.85 GB | `models/vae/` | [官方](https://huggingface.co/Comfy-Org/MiniMax-H3/resolve/main/vae/minimax_h3_video_vae_fp16.safetensors) | [備份](https://storage.googleapis.com/comfyfed-models/models/vae/minimax_h3_video_vae_fp16.safetensors) |
 | `minimax_h3_audio_vae_fp32.safetensors` | 0.56 GB | `models/vae/` | [官方](https://huggingface.co/Comfy-Org/MiniMax-H3/resolve/main/vae/minimax_h3_audio_vae_fp32.safetensors) | [備份](https://storage.googleapis.com/comfyfed-models/models/vae/minimax_h3_audio_vae_fp32.safetensors) |
 | `minimax_h3_ref2v_turbo_8step_v1.0_768p_comfyui_resized_avg_rank_64_bf16.safetensors` | 0.91 GB | `models/loras/` | [官方](https://huggingface.co/drbaph/MiniMax-H3-Turbo-Lora-ComfyUI/resolve/main/minimax_h3_ref2v_turbo_8step_v1.0_768p_comfyui_resized_avg_rank_64_bf16.safetensors) | [備份](https://storage.googleapis.com/comfyfed-models/models/loras/minimax_h3_ref2v_turbo_8step_v1.0_768p_comfyui_resized_avg_rank_64_bf16.safetensors) |
+| `qwen3vl_4b_bf16.safetensors` | 8.27 GB | `models/text_encoders/` | [官方](https://huggingface.co/Comfy-Org/Krea-2/resolve/main/text_encoders/qwen3vl_4b_bf16.safetensors) | [備份](https://storage.googleapis.com/comfyfed-models/models/text_encoders/qwen3vl_4b_bf16.safetensors) |
 
-全部裝齊約 **72 GB**；只跑武俠文生圖／角色立繪兩支 Flux 範本約 **31.8 GB**，只跑參考圖生影片約 **40.5 GB**。每支範本的畫布上也有一則「⓪ 缺模型？」便條紙，列出該範本自己需要哪幾個檔案。
+全部裝齊約 **80.3 GB**；只跑武俠文生圖／角色立繪兩支 Flux 範本約 **31.8 GB**，只跑參考圖生影片約 **40.5 GB**，兩支提示詞小幫手範本（圖生提示詞／文字生提示詞）共用同一顆模型，只需 **8.27 GB**。每支範本的畫布上也有一則「⓪ 缺模型？」便條紙，列出該範本自己需要哪幾個檔案。
 
 **不用重啟**：放好檔案後不必重啟 ComfyUI 或 agent——agent 每 10 分鐘會自動重掃本機模型庫存並回報平台，工作評估之後就會自動轉綠。真的等不及的話，手動重啟 agent 可以讓它立刻生效。
 
@@ -575,11 +576,14 @@ matching subfolder of the worker's `ComfyUI/models/`.
 | `minimax_h3_video_vae_fp16.safetensors` | 4.85 GB | `models/vae/` | [Official](https://huggingface.co/Comfy-Org/MiniMax-H3/resolve/main/vae/minimax_h3_video_vae_fp16.safetensors) | [Backup](https://storage.googleapis.com/comfyfed-models/models/vae/minimax_h3_video_vae_fp16.safetensors) |
 | `minimax_h3_audio_vae_fp32.safetensors` | 0.56 GB | `models/vae/` | [Official](https://huggingface.co/Comfy-Org/MiniMax-H3/resolve/main/vae/minimax_h3_audio_vae_fp32.safetensors) | [Backup](https://storage.googleapis.com/comfyfed-models/models/vae/minimax_h3_audio_vae_fp32.safetensors) |
 | `minimax_h3_ref2v_turbo_8step_v1.0_768p_comfyui_resized_avg_rank_64_bf16.safetensors` | 0.91 GB | `models/loras/` | [Official](https://huggingface.co/drbaph/MiniMax-H3-Turbo-Lora-ComfyUI/resolve/main/minimax_h3_ref2v_turbo_8step_v1.0_768p_comfyui_resized_avg_rank_64_bf16.safetensors) | [Backup](https://storage.googleapis.com/comfyfed-models/models/loras/minimax_h3_ref2v_turbo_8step_v1.0_768p_comfyui_resized_avg_rank_64_bf16.safetensors) |
+| `qwen3vl_4b_bf16.safetensors` | 8.27 GB | `models/text_encoders/` | [Official](https://huggingface.co/Comfy-Org/Krea-2/resolve/main/text_encoders/qwen3vl_4b_bf16.safetensors) | [Backup](https://storage.googleapis.com/comfyfed-models/models/text_encoders/qwen3vl_4b_bf16.safetensors) |
 
-Everything together is about **72 GB**; the two Flux templates (wuxia,
+Everything together is about **80.3 GB**; the two Flux templates (wuxia,
 character portrait) need about **31.8 GB**; the reference-to-video template
-alone needs about **40.5 GB**. Each template's canvas also carries a "⓪
-Missing models?" note listing exactly what that template needs.
+alone needs about **40.5 GB**; the two prompt-helper templates (image-to-
+prompt, text-to-prompt) share a single model and need only **8.27 GB**. Each
+template's canvas also carries a "⓪ Missing models?" note listing exactly
+what that template needs.
 
 **No restart required**: once the files are in place you do not need to
 restart ComfyUI or the agent — it rescans its local model inventory every 10
