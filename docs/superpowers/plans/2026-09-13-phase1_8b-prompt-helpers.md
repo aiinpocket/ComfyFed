@@ -13,7 +13,7 @@
 ## Global Constraints
 
 - zh-TW-first bilingual notes matching existing template voice; suite green at every commit (`.venv/Scripts/python.exe -m pytest tests -q`, base 552; known flake tests/server/test_auth.py::test_read_session_payload_rejects_absent_and_tampered_cookies — rerun, don't chase).
-- data/comfy_frontend/ untouched. No models.aiinpocket.com. GCS base `https://storage.googleapis.com/comfyfed-models/models/`.
+- data/comfy_frontend/ untouched. The decommissioned R2 mirror domain must not reappear. GCS base `https://storage.googleapis.com/comfyfed-models/models/`.
 - Verified-live TextGenerate facts (ground truth):
   - CLIPLoader widgets for the model: `["qwen3vl_4b_bf16.safetensors", "qwen_image", "default"]` (type qwen_image reaches the generic qwen3vl path: vision + generation).
   - 圖生提示詞 recipe: `use_default_template=True`, image linked, instruction text ends with ` /no_think` (suppresses Qwen3's think block).
