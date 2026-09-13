@@ -191,6 +191,22 @@ describe("recursive strip parity (stripDownloadMetadata)", () => {
 
 // ---------------------------------------------------------------------------
 
+describe("auth gating -- requireAdmin covers every /comfy/templates/* shape (review round 1, m2)", () => {
+  it("401s a media path with no session", async () => {
+    // Seeded (unauthenticated) so a 200 would be possible if the gate were
+    // missing -- proves the 401 is the auth gate, not just a 404.
+    await putPackagedRaw("comfyfed-wuxia-t2i-1.webp", new Uint8Array([1, 2, 3]));
+    const r = await call("/comfy/templates/comfyfed-wuxia-t2i-1.webp");
+    expect(r.status).toBe(401);
+  });
+
+  it("401s a workflow json path with no session", async () => {
+    await putOfficialJson("flux_dev.json", FLUX_WORKFLOW);
+    const r = await call("/comfy/templates/flux_dev.json");
+    expect(r.status).toBe(401);
+  });
+});
+
 describe("GET /comfy/templates/index.json", () => {
   it("401s with no session", async () => {
     const r = await call("/comfy/templates/index.json");
@@ -246,6 +262,25 @@ describe("GET /comfy/templates/index.json", () => {
     const second = await call("/comfy/templates/index.json", { cookie });
     expect(first.body).toEqual(second.body);
     expect(second.body).toEqual([COMFYFED_CATEGORY, FLUX_CATEGORY]);
+  });
+
+  it("re-reads a comfyfed_templates R2 override when ITS etag changes, even with the official side untouched (review round 1, m1)", async () => {
+    const { cookie } = await loginSession();
+    await putPackagedJson("index.json", [COMFYFED_CATEGORY]);
+    await putOfficialJson("index.json", [FLUX_CATEGORY]);
+
+    const first = await call("/comfy/templates/index.json", { cookie });
+    expect(first.body).toEqual([COMFYFED_CATEGORY, FLUX_CATEGORY]);
+
+    // An operator overrides ComfyFed's OWN packaged index via the R2
+    // fallback -- only the packaged side's etag changes, official is
+    // untouched. Serving the stale cached merge here would silently hide
+    // the override.
+    const overrideCategory = { ...COMFYFED_CATEGORY, title: "ComfyFed v2" };
+    await putPackagedJson("index.json", [overrideCategory]);
+
+    const second = await call("/comfy/templates/index.json", { cookie });
+    expect(second.body).toEqual([overrideCategory, FLUX_CATEGORY]);
   });
 });
 
@@ -443,5 +478,42 @@ describe("staging seed (seed_staging parity)", () => {
 
     const after = await store().head("staging/amyntas_ref.png");
     expect(after).toBeNull();
+  });
+
+  it("retries a staging asset on the next request after a transient R2 put failure (review round 1, M1)", async () => {
+    const { cookie } = await loginSession();
+    await putPackagedJson("index.json", [COMFYFED_CATEGORY]);
+    await putPackagedRaw("assets/amyntas_ref.png", new Uint8Array([1, 2, 3]));
+    await putPackagedRaw("assets/comfyfed_sample_clip.mp4", new Uint8Array([4, 5, 6]));
+
+    const realPut = store().put.bind(store());
+    let failNextAmyntas = true;
+    (store() as any).put = (key: string, ...rest: unknown[]) => {
+      if (failNextAmyntas && key === "staging/amyntas_ref.png") {
+        failNextAmyntas = false;
+        throw new Error("simulated transient R2 failure");
+      }
+      return (realPut as any)(key, ...rest);
+    };
+
+    try {
+      // First request: the put for amyntas_ref.png throws. It must NOT be
+      // memoized as seeded -- the other asset (comfyfed_sample_clip.mp4)
+      // still succeeds independently.
+      await call("/comfy/templates/index.json", { cookie });
+      expect(await store().head("staging/amyntas_ref.png")).toBeNull();
+      expect(await store().head("staging/comfyfed_sample_clip.mp4")).not.toBeNull();
+
+      // Second request: the transient failure is over, so this retries and
+      // succeeds this time -- proving the earlier all-or-nothing memoization
+      // flag (which would have permanently skipped every asset after one
+      // failure) is gone.
+      await call("/comfy/templates/index.json", { cookie });
+      const seeded = await store().get("staging/amyntas_ref.png");
+      expect(seeded).not.toBeNull();
+      expect(new Uint8Array(await seeded!.arrayBuffer())).toEqual(new Uint8Array([1, 2, 3]));
+    } finally {
+      (store() as any).put = realPut;
+    }
   });
 });

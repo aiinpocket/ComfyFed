@@ -66,10 +66,15 @@
  * `comfyfed_sample_clip.mp4` -- `templates_data/assets/` on the Python
  * side) are copied into R2 `staging/<name>` if not already present, so a
  * template's LoadImage/LoadVideo node resolves on the very first run.
- * Memoized per isolate (a module-level flag, `stagingSeeded`) and per-file
- * idempotent (an existing `staging/<name>` object is left alone, exactly
- * like Python's "admin may have replaced it deliberately" rationale) --
- * `clearTemplatesCacheForTests` resets both caches for test isolation.
+ * Memoized per isolate on a PER-ASSET basis (a module-level `Set`,
+ * `seededAssets`) rather than one all-or-nothing flag: a name is only
+ * memoized once its copy has actually succeeded (or was already present),
+ * so a transient failure (a throwing R2 `put`, a not-yet-available packaged
+ * source) retries just that asset on the next request instead of giving up
+ * on the whole batch forever. Per-file idempotent otherwise too (an existing
+ * `staging/<name>` object is left alone, exactly like Python's "admin may
+ * have replaced it deliberately" rationale) -- `clearTemplatesCacheForTests`
+ * resets both caches for test isolation.
  */
 
 import { Hono } from "hono";
@@ -219,38 +224,64 @@ async function loadOfficialJson(store: R2Bucket, filename: string): Promise<unkn
 }
 
 // ---------------------------------------------------------------------------
-// Index merge, cached per-isolate on the official index object's R2 etag.
+// Index merge, cached per-isolate on a compound token built from R2 HEADs of
+// BOTH sides that can change at runtime: the official index object AND the
+// `comfyfed_templates/` R2 override (an operator may put an override there
+// even once Task 11 ships real ASSETS-bound files -- see `fetchPackagedRaw`).
+// The ASSETS-binding copy is NOT part of the token: it's build-time static
+// for the life of an isolate, so there's nothing to invalidate against
+// (review round 1, m1: an R2 override's etag must be part of the cache key,
+// or a stale "ours" half could be served forever once cached -- chosen over
+// the "invalidate whenever the packaged lookup misses" alternative because
+// it's exactly as simple and additionally catches an override being EDITED,
+// not just added/removed).
 
 interface MergedCacheEntry {
-  etag: string | null;
+  key: string;
   value: unknown[] | null;
 }
 
 const mergedIndexCache = new Map<string, MergedCacheEntry>();
-let stagingSeeded = false;
+
+/** `official:<etag-or-none>|packaged:<etag-or-none>` for `officialFilename`'s
+ * official-side object and `packagedFilename`'s `comfyfed_templates/` R2
+ * override (the two are the same file for the base `index.json` case, but
+ * differ for a locale index -- see `localizedMergedIndex`, whose "ours" half
+ * is always the base `index.json`). Returns the official HEAD alongside the
+ * token so callers don't need a second `head` call to know whether the
+ * official side exists at all. */
+async function cacheToken(
+  env: Env,
+  officialFilename: string,
+  packagedFilename: string
+): Promise<{ token: string; officialHead: R2Object | null }> {
+  const [officialHead, packagedHead] = await Promise.all([
+    env.STORE.head(`${OFFICIAL_PREFIX}${officialFilename}`),
+    env.STORE.head(`${COMFYFED_PREFIX}${packagedFilename}`),
+  ]);
+  const token = `official:${officialHead?.etag ?? "none"}|packaged:${packagedHead?.etag ?? "none"}`;
+  return { token, officialHead: officialHead ?? null };
+}
 
 /** Test-only escape hatch: resets both the index-merge cache and the
- * staging-seed memoization flag, mirroring the other route files'
- * `clear*ForTests` exports (see `comfyapi.ts`'s
- * `clearObjectInfoCacheForTests`). */
+ * staging-seed memoization, mirroring the other route files' `clear*ForTests`
+ * exports (see `comfyapi.ts`'s `clearObjectInfoCacheForTests`). */
 export function clearTemplatesCacheForTests(): void {
   mergedIndexCache.clear();
-  stagingSeeded = false;
+  seededAssets.clear();
 }
 
 /** `index.json`: ComfyFed's packaged categories, then the official
  * library's, if present and parseable -- ports `_merged_index`. */
 async function mergedIndex(env: Env): Promise<unknown[] | null> {
-  const key = `${OFFICIAL_PREFIX}index.json`;
-  const head = await env.STORE.head(key);
-  const etag = head?.etag ?? null;
+  const { token, officialHead } = await cacheToken(env, "index.json", "index.json");
 
   const cached = mergedIndexCache.get("index.json");
-  if (cached && cached.etag === etag) return cached.value;
+  if (cached && cached.key === token) return cached.value;
 
   const ours = await loadPackagedJson(env, "index.json");
   const oursList = Array.isArray(ours) ? ours : [];
-  const official = etag !== null ? await loadOfficialJson(env.STORE, "index.json") : null;
+  const official = officialHead ? await loadOfficialJson(env.STORE, "index.json") : null;
 
   let value: unknown[] | null;
   if (Array.isArray(official)) {
@@ -259,7 +290,7 @@ async function mergedIndex(env: Env): Promise<unknown[] | null> {
     value = Array.isArray(ours) ? ours : null;
   }
 
-  mergedIndexCache.set("index.json", { etag, value });
+  mergedIndexCache.set("index.json", { key: token, value });
   return value;
 }
 
@@ -268,16 +299,14 @@ async function mergedIndex(env: Env): Promise<unknown[] | null> {
  * `template_file` index branch. The "ours" half is always the base
  * `index.json`, never a localized packaged file. */
 async function localizedMergedIndex(env: Env, filename: string): Promise<unknown[] | null> {
-  const key = `${OFFICIAL_PREFIX}${filename}`;
-  const head = await env.STORE.head(key);
-  const etag = head?.etag ?? null;
+  const { token, officialHead } = await cacheToken(env, filename, "index.json");
 
-  const cacheKey = `locale:${filename}`;
-  const cached = mergedIndexCache.get(cacheKey);
-  if (cached && cached.etag === etag) return cached.value;
+  const cacheMapKey = `locale:${filename}`;
+  const cached = mergedIndexCache.get(cacheMapKey);
+  if (cached && cached.key === token) return cached.value;
 
   let value: unknown[] | null = null;
-  if (etag !== null) {
+  if (officialHead) {
     const official = await loadOfficialJson(env.STORE, filename);
     if (Array.isArray(official)) {
       const ours = await loadPackagedJson(env, "index.json");
@@ -285,7 +314,7 @@ async function localizedMergedIndex(env: Env, filename: string): Promise<unknown
     }
   }
 
-  mergedIndexCache.set(cacheKey, { etag, value });
+  mergedIndexCache.set(cacheMapKey, { key: token, value });
   return value;
 }
 
@@ -294,21 +323,35 @@ async function localizedMergedIndex(env: Env, filename: string): Promise<unknown
 // (ASSETS binding first, R2 `comfyfed_templates/assets/<name>` fallback,
 // same two-source lookup as everything else packaged in this file).
 
-async function seedStagingOnce(env: Env): Promise<void> {
-  if (stagingSeeded) return;
-  stagingSeeded = true; // memoize the ATTEMPT, not success -- one try per isolate
+// Per-ASSET memoization (review round 1, M1): each name is only added here
+// AFTER its copy into R2 `staging/` has actually succeeded (or was already
+// present). A transient failure -- the R2 `put` throwing, or the packaged
+// source not being available yet -- leaves that name OUT of the set, so the
+// very next `/comfy/templates/*` request retries just that asset, instead of
+// the earlier all-or-nothing `stagingSeeded` boolean permanently giving up
+// on every asset in the batch after one failure.
+const seededAssets = new Set<string>();
 
+async function seedStagingOnce(env: Env): Promise<void> {
   for (const name of SEED_ASSET_NAMES) {
+    if (seededAssets.has(name)) continue;
+
     try {
       const key = stagingKey(name);
       const existing = await env.STORE.head(key);
-      if (existing) continue; // an admin may have replaced it deliberately
+      if (existing) {
+        seededAssets.add(name); // an admin may have replaced it deliberately
+        continue;
+      }
 
       const body = await fetchPackagedRaw(env, `assets/${name}`);
-      if (body === null) continue;
+      if (body === null) continue; // packaged source not available (yet) -- retry next request
+
       await env.STORE.put(key, body);
+      seededAssets.add(name); // only mark done once the put actually succeeded
     } catch (err) {
       console.warn("templates: could not seed staging asset", name, err);
+      // Deliberately NOT added to seededAssets -- retried on the next request.
     }
   }
 }
