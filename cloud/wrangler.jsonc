@@ -13,6 +13,17 @@
     // value to this file). vitest.config.ts injects a test-only value via
     // `miniflare.bindings` so the test suite can exercise the success path
     // without touching this file.
+    //
+    // PLATFORM_ED25519_SEED (Task 5's worker registration/cert signing) is
+    // also intentionally NOT set here. When absent, the platform seed is
+    // lazily generated and persisted in the `settings` D1 table instead
+    // (see db/queries.ts's `resolvePlatformSeed`) -- fine for a first
+    // deploy, but an operator who wants to control/rotate the platform's
+    // identity deterministically should set this via
+    // `wrangler secret put PLATFORM_ED25519_SEED` (64 lowercase hex chars,
+    // a raw 32-byte Ed25519 seed). Once set, it always wins over the D1
+    // row -- the D1 row is never read or written in that case, so rotating
+    // the secret rotates the platform identity predictably.
   },
   "d1_databases": [
     {

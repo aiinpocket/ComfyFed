@@ -23,6 +23,8 @@
  * without parsing timestamps back into JS `Date` objects.
  */
 
+import { hexToBytes } from "../lib/hex";
+
 // ---------------------------------------------------------------------------
 // JSON helpers -- every parse mirrors Python's `try: json.loads(x or default)
 // except (TypeError, ValueError): fallback` pattern: malformed JSON degrades
@@ -132,6 +134,47 @@ export async function getOrCreatePlatformSeed(db: D1Database): Promise<string> {
     .join("");
   await setSetting(db, PLATFORM_SEED_KEY, seed);
   return seed;
+}
+
+/** Throws a clear, startup-style error if `seedHex` isn't exactly 32 bytes
+ * of strict lowercase/uppercase hex (reuses `lib/hex.ts`'s `hexToBytes`,
+ * which already rejects odd length and non-hex characters). Exported so
+ * callers that want to fail fast on boot (rather than on first use) can
+ * validate an operator-supplied secret eagerly. */
+export function assertValidPlatformSeedHex(seedHex: string): void {
+  let bytes: Uint8Array;
+  try {
+    bytes = hexToBytes(seedHex);
+  } catch (err) {
+    throw new Error(
+      `PLATFORM_ED25519_SEED is not valid hex: ${err instanceof Error ? err.message : String(err)}`
+    );
+  }
+  if (bytes.length !== 32) {
+    throw new Error(`PLATFORM_ED25519_SEED must be exactly 32 bytes (64 hex chars), got ${bytes.length} bytes`);
+  }
+}
+
+/**
+ * Resolves the platform Ed25519 signing seed for register-token issuance
+ * and registration certificates. `envSeedHex` (the `PLATFORM_ED25519_SEED`
+ * secret, see env.ts) wins deterministically whenever it's set: validated
+ * strictly (throws immediately on bad hex/length -- a clear, startup-style
+ * failure rather than silently falling back or signing with garbage), and
+ * in that case the D1 `settings.platform_seed` row is NEVER read or
+ * written -- this is what makes rotating the secret rotate the platform's
+ * identity in a predictable, operator-controlled way (no stale D1 row left
+ * shadowing it, no lazy-generate race with a concurrent first request).
+ * Only when the env is absent does this fall back to the lazy
+ * D1-persisted seed (`getOrCreatePlatformSeed`), preserving the original
+ * behavior for a deployment that hasn't set the secret yet.
+ */
+export async function resolvePlatformSeed(db: D1Database, envSeedHex: string | undefined): Promise<string> {
+  if (envSeedHex) {
+    assertValidPlatformSeedHex(envSeedHex);
+    return envSeedHex;
+  }
+  return getOrCreatePlatformSeed(db);
 }
 
 // ---------------------------------------------------------------------------

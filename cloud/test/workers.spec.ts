@@ -1,10 +1,12 @@
 import { afterEach, describe, expect, it } from "vitest";
-import { env } from "cloudflare:test";
+import { env, createExecutionContext, waitOnExecutionContext } from "cloudflare:test";
 import { call, db, SETUP_TOKEN } from "./helpers/http";
-import { toSqliteTimestamp } from "../src/db/queries";
+import { toSqliteTimestamp, resolvePlatformSeed, getSetting } from "../src/db/queries";
 import { signRequest, verifyHex } from "../src/lib/signing";
 import { verifyAgentRequest } from "../src/lib/verify_agent";
+import { derivePublicKeyHexFromSeed } from "../src/lib/ed25519";
 import { hexToBytes, bytesToHex } from "../src/lib/hex";
+import workersApp from "../src/routes/workers";
 import golden from "./fixtures/golden.json";
 
 // vitest-pool-workers isolates D1 storage per test FILE (see task-1-report.md
@@ -120,6 +122,76 @@ describe("POST /api/workers/tokens", () => {
     const r1 = await call("/api/workers/tokens", { json: { name: "a" }, cookie, headers: { "X-CSRF": csrf } });
     const r2 = await call("/api/workers/tokens", { json: { name: "b" }, cookie, headers: { "X-CSRF": csrf } });
     expect(r1.body.bundle.platform_pubkey).toBe(r2.body.bundle.platform_pubkey);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// resolvePlatformSeed -- PLATFORM_ED25519_SEED env override vs. lazy D1 row
+
+describe("resolvePlatformSeed", () => {
+  const VALID_ENV_SEED = "11".repeat(32); // 64 hex chars = 32 bytes
+
+  it("uses the env seed when set, and never touches the D1 row", async () => {
+    const seed = await resolvePlatformSeed(db(), VALID_ENV_SEED);
+    expect(seed).toBe(VALID_ENV_SEED);
+    expect(await getSetting(db(), "platform_seed")).toBeNull();
+  });
+
+  it("falls back to the lazily-generated D1 row when the env is absent", async () => {
+    const seed = await resolvePlatformSeed(db(), undefined);
+    expect(seed).toMatch(/^[0-9a-f]{64}$/);
+    expect(await getSetting(db(), "platform_seed")).toBe(seed);
+
+    // Second call reuses the same persisted row rather than regenerating.
+    const again = await resolvePlatformSeed(db(), undefined);
+    expect(again).toBe(seed);
+  });
+
+  it("falls back to the D1 row for an empty-string env value too", async () => {
+    const seed = await resolvePlatformSeed(db(), "");
+    expect(seed).toMatch(/^[0-9a-f]{64}$/);
+  });
+
+  it("throws a clear error for a non-hex env seed", async () => {
+    await expect(resolvePlatformSeed(db(), "not-hex-at-all")).rejects.toThrow(/PLATFORM_ED25519_SEED/);
+    expect(await getSetting(db(), "platform_seed")).toBeNull();
+  });
+
+  it("throws a clear error for a wrong-length (but validly-hex) env seed", async () => {
+    await expect(resolvePlatformSeed(db(), "ab")).rejects.toThrow(/32 bytes/);
+    expect(await getSetting(db(), "platform_seed")).toBeNull();
+  });
+
+  it("route wiring: POST /api/workers/tokens derives platform_pubkey from a bound PLATFORM_ED25519_SEED, D1 row untouched", async () => {
+    const { cookie, csrf } = await adminSession();
+    const envWithSeed = { ...(env as any), PLATFORM_ED25519_SEED: VALID_ENV_SEED };
+    const request = new Request("http://example.com/api/workers/tokens", {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        ...(cookie ? { Cookie: cookie } : {}),
+        "X-CSRF": csrf,
+      },
+      body: JSON.stringify({ name: "env-seeded" }),
+    });
+    const ctx = createExecutionContext();
+    const response = await workersApp.fetch(request, envWithSeed, ctx);
+    await waitOnExecutionContext(ctx);
+
+    expect(response.status).toBe(200);
+    const body = await response.json<any>();
+    const expectedPubkey = await derivePublicKeyHexFromSeed(VALID_ENV_SEED);
+    expect(body.bundle.platform_pubkey).toBe(expectedPubkey);
+    expect(await getSetting(db(), "platform_seed")).toBeNull();
+  });
+
+  it("route wiring: falls back to the D1-persisted seed when PLATFORM_ED25519_SEED isn't bound", async () => {
+    const { cookie, csrf } = await adminSession();
+    const r = await call("/api/workers/tokens", { json: { name: "d1-seeded" }, cookie, headers: { "X-CSRF": csrf } });
+    expect(r.status).toBe(200);
+    const persisted = await getSetting(db(), "platform_seed");
+    expect(persisted).toMatch(/^[0-9a-f]{64}$/);
+    expect(r.body.bundle.platform_pubkey).toBe(await derivePublicKeyHexFromSeed(persisted!));
   });
 });
 

@@ -39,7 +39,7 @@ import { Hono } from "hono";
 import type { Env } from "../env";
 import {
   getSetting,
-  getOrCreatePlatformSeed,
+  resolvePlatformSeed,
   getAllWorkers,
   insertWorker,
   updateWorkerObjectInfoHash,
@@ -113,7 +113,7 @@ app.post("/api/workers/tokens", requireCsrf, async (c) => {
   const token = generateRegisterToken();
   await insertRegisterToken(c.env.DB, token, name, toSqliteTimestamp(new Date()));
   const platformUrl = (await getSetting(c.env.DB, PLATFORM_URL_KEY)) || "";
-  const seed = await getOrCreatePlatformSeed(c.env.DB);
+  const seed = await resolvePlatformSeed(c.env.DB, c.env.PLATFORM_ED25519_SEED);
   const platformPubkey = await derivePublicKeyHexFromSeed(seed);
 
   return c.json({
@@ -148,7 +148,7 @@ app.post("/api/agent/register", async (c) => {
   const workerId = crypto.randomUUID();
   await insertWorker(c.env.DB, workerId, workerName, pubkey, toSqliteTimestamp(new Date()));
 
-  const seed = await getOrCreatePlatformSeed(c.env.DB);
+  const seed = await resolvePlatformSeed(c.env.DB, c.env.PLATFORM_ED25519_SEED);
   const { signatureHex } = await signRegistration(seed, workerId, pubkey);
 
   return c.json({ worker_id: workerId, certificate: signatureHex });

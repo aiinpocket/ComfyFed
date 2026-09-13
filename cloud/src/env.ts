@@ -15,4 +15,9 @@ export interface Env {
    * SETUP_TOKEN`; the test suite injects a value via vitest.config.ts's
    * `miniflare.bindings` instead. */
   SETUP_TOKEN: string | undefined;
+  /** Platform Ed25519 signing seed (hex, 32 bytes / 64 chars), set via
+   * `wrangler secret put PLATFORM_ED25519_SEED`. Optional -- see
+   * `db/queries.ts`'s `resolvePlatformSeed` for the env-wins-over-D1
+   * resolution order and why. */
+  PLATFORM_ED25519_SEED: string | undefined;
 }
