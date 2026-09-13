@@ -40,6 +40,20 @@
     "hint": "The password was printed by the installer on first run.",
     "error": "Sign-in failed."
   },
+  "setup": {
+    "subtitle": "First run — create the admin password.",
+    "token": "Setup token",
+    "token_placeholder": "SETUP_TOKEN from the deployment secrets",
+    "password": "New admin password",
+    "password_placeholder": "Choose an admin password",
+    "confirm_password": "Confirm new password",
+    "confirm_password_placeholder": "Type it again",
+    "password_rule": "At least 8 characters.",
+    "password_too_short": "Must be at least 8 characters.",
+    "password_mismatch": "The two passwords do not match.",
+    "submit": "Create admin password",
+    "hint": "The setup token was set by whoever deployed this cloud instance."
+  },
   "worker_status": {
     "online": "Online",
     "busy": "Busy",
@@ -282,6 +296,9 @@
     "auth.csrf": "Your session expired. Please sign in again.",
     "auth.too_many_attempts": "Too many failed attempts. Wait a moment and try again.",
     "auth.password_too_short": "The new password must be at least 8 characters.",
+    "setup.already_done": "Setup has already been completed.",
+    "setup.bad_token": "Invalid setup token.",
+    "setup.password_too_short": "Admin password must be at least 8 characters.",
     "jobs.invalid_workflow": "The workflow JSON could not be read by the server.",
     "jobs.missing_assets": "The workflow references input files that were not attached.",
     "jobs.bad_asset_name": "One of the attached files has an unusable name.",

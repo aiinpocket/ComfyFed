@@ -80,7 +80,12 @@ npm run deploy      # 套用 D1 migrations（--remote）+ wrangler deploy
 
 ### 首次設定
 
-⚠ 目前**沒有** `/setup` 的網頁精靈——這是純 API 端點，跟自架版 CLI 精靈（`comfyfed-server install`）不是同一種體驗，之後可能會補一個網頁版。先用 curl 完成初次設定：
+打開網址，畫面會直接引導你建立管理員密碼（需要你在 secrets 設的 `SETUP_TOKEN`）：開啟 `https://your-name.workers.dev/`，主控台偵測到還沒設定過，會顯示「建立管理員密碼」畫面，輸入 `SETUP_TOKEN` 和你要用的管理員密碼（至少 8 碼）並送出即可。設定完成後畫面會回到一般登入畫面，用剛剛設的密碼登入（Dashboard / Workers / Jobs / Reports / Settings，跟自架版一模一樣）。
+
+<details>
+<summary>備用方案：用 curl 完成初次設定</summary>
+
+網頁打不開，或想用腳本自動化時，可以直接呼叫 API：
 
 ```bash
 curl -X POST https://your-name.workers.dev/api/setup \
@@ -88,7 +93,9 @@ curl -X POST https://your-name.workers.dev/api/setup \
   -d '{"token": "剛剛設定的 SETUP_TOKEN", "password": "你要用的管理員密碼（至少 8 碼）"}'
 ```
 
-回傳 `{"ok": true}` 就設定完成了。之後打開 `https://your-name.workers.dev/`，用剛剛設的密碼登入主控台（Dashboard / Workers / Jobs / Reports / Settings，跟自架版一模一樣）。
+回傳 `{"ok": true}` 就設定完成了，一樣打開 `https://your-name.workers.dev/` 用剛剛設的密碼登入。
+
+</details>
 
 ### Workers Builds（接 GitHub 自動部署）
 
@@ -141,7 +148,7 @@ npm run seed-official
 | 資料庫 | 本機 SQLite 檔案 | Cloudflare D1（SQLite-backed） |
 | 檔案儲存 | 本機檔案系統 | Cloudflare R2 |
 | 長連線 | 進程內 WebSocket 管理 | Durable Object（Hub）+ hibernatable WebSocket |
-| 首次安裝 | `comfyfed-server install` 互動精靈 | `POST /api/setup`（純 API，見上） |
+| 首次安裝 | `comfyfed-server install` 互動精靈 | 開網頁即引導設定管理員密碼（`POST /api/setup`，curl 備用方案見上） |
 | 部署/更新 | 自己 `git pull` + 重啟行程 | `npm run deploy`，或接 Workers Builds 自動部署 |
 | TLS | 需要自己接反向代理（Caddy/nginx） | Cloudflare 自動處理 |
 | 產出檔大小上限 | 無（受本機磁碟限制） | 100MB（免費方案，`direct` 模式）；設定 `R2_S3_*` 後無此限制 |
@@ -226,7 +233,12 @@ Deployment prints your URL, something like `https://comfyfed-cloud.<your-account
 
 ### First-run setup
 
-⚠ There is currently **no** `/setup` web wizard — it's an API-only endpoint, unlike the self-hosted CLI wizard (`comfyfed-server install`); a web version may be added later. Complete first-run setup with curl:
+Open the URL and the console walks you straight into creating the admin password (you'll need the `SETUP_TOKEN` you set in secrets): visit `https://your-name.workers.dev/`, and since the console detects setup hasn't run yet, it shows a "create admin password" screen. Enter the `SETUP_TOKEN` and the admin password you want (8+ chars) and submit. Once setup succeeds, the screen returns to the normal login form — sign in with that password (Dashboard / Workers / Jobs / Reports / Settings — identical to the self-hosted console).
+
+<details>
+<summary>Fallback: complete first-run setup with curl</summary>
+
+If the web page isn't reachable, or you're scripting the deploy, call the API directly:
 
 ```bash
 curl -X POST https://your-name.workers.dev/api/setup \
@@ -234,7 +246,9 @@ curl -X POST https://your-name.workers.dev/api/setup \
   -d '{"token": "the SETUP_TOKEN you set above", "password": "the admin password you want (8+ chars)"}'
 ```
 
-A `{"ok": true}` response means setup is done. Open `https://your-name.workers.dev/` and log into the console (Dashboard / Workers / Jobs / Reports / Settings — identical to the self-hosted one) with that password.
+A `{"ok": true}` response means setup is done — open `https://your-name.workers.dev/` and log in with that password.
+
+</details>
 
 ### Workers Builds (connect GitHub for automatic deploys)
 
@@ -287,7 +301,7 @@ Fetches the `comfyui-workflow-templates` package from PyPI, verifies every file'
 | Database | Local SQLite file | Cloudflare D1 (SQLite-backed) |
 | File storage | Local filesystem | Cloudflare R2 |
 | Long-lived connections | In-process WebSocket manager | Durable Object (Hub) + hibernatable WebSockets |
-| First-run setup | `comfyfed-server install` interactive wizard | `POST /api/setup` (API-only, see above) |
+| First-run setup | `comfyfed-server install` interactive wizard | The web console walks you through it (`POST /api/setup`; curl fallback above) |
 | Deploy/update | `git pull` + restart the process yourself | `npm run deploy`, or Workers Builds auto-deploy |
 | TLS | Bring your own reverse proxy (Caddy/nginx) | Handled automatically by Cloudflare |
 | Artifact size cap | None (limited by local disk) | 100MB on the free plan (`direct` mode); lifted by setting `R2_S3_*` |

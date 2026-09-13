@@ -40,6 +40,20 @@
     "hint": "密碼在第一次執行安裝時會印在畫面上。",
     "error": "登入失敗。"
   },
+  "setup": {
+    "subtitle": "首次啟用 — 請建立管理員密碼。",
+    "token": "初始設定金鑰",
+    "token_placeholder": "部署密鑰中設定的 SETUP_TOKEN",
+    "password": "新管理員密碼",
+    "password_placeholder": "設定管理員密碼",
+    "confirm_password": "確認新密碼",
+    "confirm_password_placeholder": "再輸入一次",
+    "password_rule": "長度至少 8 個字元。",
+    "password_too_short": "長度至少要 8 個字元。",
+    "password_mismatch": "兩次輸入的密碼不一致。",
+    "submit": "建立管理員密碼",
+    "hint": "初始設定金鑰是部署這個雲端執行個體的人所設定的。"
+  },
   "worker_status": {
     "online": "上線",
     "busy": "忙碌",
@@ -282,6 +296,9 @@
     "auth.csrf": "工作階段已過期，請重新登入。",
     "auth.too_many_attempts": "失敗次數過多，請稍候再試。",
     "auth.password_too_short": "新密碼至少要 8 個字元。",
+    "setup.already_done": "系統已完成初始設定。",
+    "setup.bad_token": "初始設定金鑰不正確。",
+    "setup.password_too_short": "管理員密碼長度至少需要 8 個字元。",
     "jobs.invalid_workflow": "伺服器無法讀取這份工作流 JSON。",
     "jobs.missing_assets": "工作流引用了沒有附上的輸入檔。",
     "jobs.bad_asset_name": "其中一個附檔的檔名不能使用。",
