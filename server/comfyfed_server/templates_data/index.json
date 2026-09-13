@@ -90,7 +90,7 @@
         "mediaType": "image",
         "mediaSubtype": "webp",
         "description": "Cut a start-second + length span out of a video clip. Needs zero models -- runs on a brand-new worker.",
-        "tags": ["video", "剪輯", "新手", "零模型"],
+        "tags": ["video", "剪輯", "新手", "零模型", "comfyfed"],
         "models": []
       },
       {
@@ -99,7 +99,7 @@
         "mediaType": "image",
         "mediaSubtype": "webp",
         "description": "4x super-resolution upscale of a still image via RealESRGAN. Ships with a sample image.",
-        "tags": ["image", "放大", "新手"],
+        "tags": ["image", "放大", "新手", "comfyfed"],
         "models": ["RealESRGAN_x4plus.pth"]
       }
     ]
