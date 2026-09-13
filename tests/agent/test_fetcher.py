@@ -149,6 +149,96 @@ async def test_one_bad_entry_among_several_aborts_the_whole_batch(tmp_path):
     assert list(tmp_path.rglob("*")) == []  # nothing downloaded, not even the good one
 
 
+# --- fail-closed entry shape validation (sha256 / size_bytes) ----------------
+
+
+def _entry_with_raw_fields(signing_key, *, name, directory, sha256, size_bytes, url="http://models.example/f.bin"):
+    """Build a manifest entry with attacker/bug-controlled `sha256`/
+    `size_bytes` values, still signed correctly over exactly those raw
+    values -- so a valid signature can never stand in for a shaped-correctly
+    check, isolating the fail-closed entry-shape validation from the
+    (already covered) signature-verification gate."""
+    payload = f"{name}|{directory}|{sha256}|{size_bytes}"
+    sig = signing_key.sign(payload.encode()).signature.hex()
+    return {
+        "name": name,
+        "directory": directory,
+        "url": url,
+        "backup_url": None,
+        "sha256": sha256,
+        "size_bytes": size_bytes,
+        "sig": sig,
+    }
+
+
+@pytest.mark.parametrize(
+    "sha256",
+    [
+        "",
+        None,
+        "not-a-valid-hash",
+        "ab" * 31,  # 62 hex chars, one short of 64
+        "zz" * 32,  # right length, non-hex characters
+    ],
+)
+async def test_malformed_sha256_is_rejected_before_download(tmp_path, sha256):
+    signing_key, pubkey_hex = _keypair()
+    entry = _entry_with_raw_fields(
+        signing_key, name="model.safetensors", directory="checkpoints", sha256=sha256, size_bytes=100
+    )
+
+    class _ExplodingClient:
+        def __init__(self, *a, **k):
+            raise AssertionError("must not even construct a client for a malformed manifest entry")
+
+    with pytest.raises(fetcher.FetchError) as exc_info:
+        await fetcher.fetch_and_verify_models(
+            entries=[entry],
+            platform_pubkey_hex=pubkey_hex,
+            models_dir=str(tmp_path),
+            max_fetch_gb=100,
+            cancel_event=asyncio.Event(),
+            report_progress=_noop_progress,
+            client_factory=_ExplodingClient,
+        )
+
+    assert "模型清單條目無效" in str(exc_info.value)
+    assert "model.safetensors" in str(exc_info.value)
+    assert list(tmp_path.rglob("*")) == []
+
+
+@pytest.mark.parametrize("size_bytes", [0, -5, 12.5, True])
+async def test_malformed_size_bytes_is_rejected_before_download(tmp_path, size_bytes):
+    signing_key, pubkey_hex = _keypair()
+    valid_sha256 = hashlib.sha256(b"x").hexdigest()
+    entry = _entry_with_raw_fields(
+        signing_key,
+        name="model.safetensors",
+        directory="checkpoints",
+        sha256=valid_sha256,
+        size_bytes=size_bytes,
+    )
+
+    class _ExplodingClient:
+        def __init__(self, *a, **k):
+            raise AssertionError("must not even construct a client for a malformed manifest entry")
+
+    with pytest.raises(fetcher.FetchError) as exc_info:
+        await fetcher.fetch_and_verify_models(
+            entries=[entry],
+            platform_pubkey_hex=pubkey_hex,
+            models_dir=str(tmp_path),
+            max_fetch_gb=100,
+            cancel_event=asyncio.Event(),
+            report_progress=_noop_progress,
+            client_factory=_ExplodingClient,
+        )
+
+    assert "模型清單條目無效" in str(exc_info.value)
+    assert "model.safetensors" in str(exc_info.value)
+    assert list(tmp_path.rglob("*")) == []
+
+
 # --- successful download -----------------------------------------------------
 
 
@@ -415,7 +505,9 @@ async def test_unsafe_directory_is_rejected(tmp_path, bad_directory):
         )
 
 
-@pytest.mark.parametrize("bad_name", ["../evil.bin", "..", ".", "/etc/passwd", "sub/name.bin"])
+@pytest.mark.parametrize(
+    "bad_name", ["../evil.bin", "..", ".", "/etc/passwd", "sub/name.bin", "model.bin:hidden"]
+)
 async def test_unsafe_name_is_rejected(tmp_path, bad_name):
     signing_key, pubkey_hex = _keypair()
     entry = _signed_entry(signing_key, name=bad_name, directory="checkpoints", content=b"x")

@@ -38,6 +38,7 @@ import hashlib
 import logging
 import ntpath
 import os
+import re
 import shutil
 import time
 from typing import Awaitable, Callable, Optional
@@ -61,6 +62,8 @@ _PART_SUFFIX = ".part"
 # the brief's "at most ~every 2 seconds or 5% steps".
 _PROGRESS_MIN_INTERVAL_SECONDS = 2.0
 _PROGRESS_MIN_PCT_STEP = 5.0
+
+_SHA256_HEX_RE = re.compile(r"^[0-9a-fA-F]{64}$")
 
 
 class FetchError(Exception):
@@ -98,19 +101,48 @@ def _is_safe_relative_path(path: str) -> bool:
 
 def _sanitize_name(name: object) -> str:
     """A manifest entry's `name` must be a single, safe path segment (a bare
-    filename) -- never a traversal or an absolute/drive-relative path."""
+    filename) -- never a traversal or an absolute/drive-relative path, and
+    never containing a `:` (on Windows/NTFS, `name:stream` addresses an
+    alternate data stream of `name` rather than creating a file called
+    `name:stream` -- silently writing into/reading out of a hidden stream
+    instead of the visible file a later scan or delete would expect)."""
     if (
         not isinstance(name, str)
         or not name
         or os.path.basename(name) != name
         or name in (".", "..")
         or ntpath.splitdrive(name)[0]
+        or ":" in name
     ):
         raise FetchError(
             f"模型清單名稱不安全，拒絕下載：{name!r} / "
             f"unsafe model name in fetch manifest, refusing to download: {name!r}"
         )
     return name
+
+
+def _validate_entry_shape(entry: dict) -> None:
+    """Fail closed on a manifest entry whose `sha256`/`size_bytes` are not
+    shaped so that `_download_one` can actually verify them.
+
+    `_download_one`'s hash/size checks are conditional (`if expected_sha256`,
+    `isinstance(expected_size, int)`) so a download can be VERIFIED against
+    whatever is present -- but that means an entry with a falsy/malformed
+    `sha256` (missing, empty, not 64 hex chars) or a non-positive/non-int
+    `size_bytes` would have its download checks silently skipped instead of
+    failed, landing an unverified file. Checked for every entry BEFORE any
+    signature verification or download, so a malformed entry is rejected
+    the same way a bad signature is: nothing downloaded, one clear error.
+    """
+    name = entry.get("name")
+    sha256 = entry.get("sha256")
+    size_bytes = entry.get("size_bytes")
+    sha256_ok = isinstance(sha256, str) and bool(_SHA256_HEX_RE.match(sha256))
+    size_ok = (
+        isinstance(size_bytes, int) and not isinstance(size_bytes, bool) and size_bytes > 0
+    )
+    if not sha256_ok or not size_ok:
+        raise FetchError(f"模型清單條目無效：{name} / invalid manifest entry: {name}")
 
 
 def _sanitize_directory(directory: object) -> str:
@@ -333,6 +365,7 @@ async def fetch_and_verify_models(
         )
 
     for entry in entries:
+        _validate_entry_shape(entry)
         _verify_entry_signature(entry, platform_pubkey_hex)
 
     _check_budget_and_disk(entries, max_fetch_gb, models_dir)
