@@ -836,6 +836,34 @@ export async function getReceiptsForJob(db: D1Database, jobId: string): Promise<
   return results.map(rowToReceipt);
 }
 
+/** Receipts with `created_at` in `[start, end]` (either bound optional) --
+ * mirrors receipts.py's `contributions` route query. `start`/`end` must
+ * already be `toSqliteTimestamp`-shaped strings (naive-UTC), so the
+ * comparison is a plain lexicographic one, same as `getStaleWorkers`. No
+ * `ORDER BY`: SQLite/D1 return rows in rowid (insertion) order by default,
+ * matching the Python side's unordered `query.all()`. */
+export async function getReceiptsInRange(
+  db: D1Database,
+  start: string | null,
+  end: string | null
+): Promise<Receipt[]> {
+  let sql = "SELECT * FROM receipts WHERE 1=1";
+  const binds: string[] = [];
+  if (start !== null) {
+    sql += " AND created_at >= ?";
+    binds.push(start);
+  }
+  if (end !== null) {
+    sql += " AND created_at <= ?";
+    binds.push(end);
+  }
+  const { results } = await db
+    .prepare(sql)
+    .bind(...binds)
+    .all<ReceiptRow>();
+  return results.map(rowToReceipt);
+}
+
 export async function getReceiptById(db: D1Database, id: string): Promise<Receipt | null> {
   const row = await db.prepare("SELECT * FROM receipts WHERE id = ?").bind(id).first<ReceiptRow>();
   return row ? rowToReceipt(row) : null;
