@@ -64,6 +64,20 @@ export function sqliteTimestampToIsoformat(s: string): string {
   return iso.endsWith(".000000") ? iso.slice(0, -7) : iso;
 }
 
+/** Parses a `toSqliteTimestamp`-shaped string (naive UTC) into epoch
+ * milliseconds -- ports the `int(job.created_at.timestamp() * 1000)` half of
+ * comfyapi.py's `_queue_entry` (`extra_data.create_time`). Small, local
+ * parse rather than `new Date(sqliteTimestampToIsoformat(s))` because the
+ * isoformat helper drops an all-zero fractional part, which `Date`'s parser
+ * handles fine anyway -- this is just the more direct of the two. */
+export function sqliteTimestampToEpochMs(s: string): number {
+  const [datePart, timePart] = s.split(" ");
+  const [hh, mm, rest] = (timePart ?? "00:00:00").split(":");
+  const [ss, frac] = (rest ?? "00").split(".");
+  const millis = (frac ?? "0").padEnd(6, "0").slice(0, 3);
+  return new Date(`${datePart}T${hh}:${mm}:${ss}.${millis}Z`).getTime();
+}
+
 // ---------------------------------------------------------------------------
 // Settings
 
@@ -677,6 +691,79 @@ export async function mergeJobResultHash(db: D1Database, jobId: string, filename
  * heartbeat carries one for a job this worker still owns. */
 export async function updateJobProgress(db: D1Database, jobId: string, progress: number): Promise<void> {
   await db.prepare("UPDATE jobs SET progress = ? WHERE id = ?").bind(progress, jobId).run();
+}
+
+/** Workers that are online (`status != 'offline'`) AND not disabled, ordered
+ * oldest-registered first -- mirrors comfyapi.py's `_online_worker_hashes`
+ * query (`GET /object_info`'s fleet). */
+export async function getOnlineEnabledWorkers(db: D1Database): Promise<Worker[]> {
+  const { results } = await db
+    .prepare("SELECT * FROM workers WHERE disabled = 0 AND status != 'offline' ORDER BY created_at ASC, id ASC")
+    .all<WorkerRow>();
+  return results.map(rowToWorker);
+}
+
+/** Jobs matching `statuses`, restricted to a given `origin` and (for
+ * `panel`) excluding panel-hidden rows -- mirrors comfyapi.py's `GET
+ * /comfy/api/queue` (origin-agnostic caller passes no `origin`) and `GET
+ * /comfy/api/history` (`origin: "panel"`, `panelHiddenExcluded: true`)
+ * queries. */
+export async function getJobsByStatusAndOrigin(
+  db: D1Database,
+  statuses: string[],
+  opts: { origin?: string; excludePanelHidden?: boolean; orderBy?: "created_at" | "finished_at" } = {}
+): Promise<Job[]> {
+  const placeholders = statuses.map(() => "?").join(",");
+  const clauses = [`status IN (${placeholders})`];
+  const binds: unknown[] = [...statuses];
+  if (opts.origin !== undefined) {
+    clauses.push("origin = ?");
+    binds.push(opts.origin);
+  }
+  if (opts.excludePanelHidden) {
+    clauses.push("panel_hidden = 0");
+  }
+  const order =
+    opts.orderBy === "finished_at" ? "ORDER BY finished_at ASC, created_at ASC" : "ORDER BY created_at ASC, id ASC";
+  const { results } = await db
+    .prepare(`SELECT * FROM jobs WHERE ${clauses.join(" AND ")} ${order}`)
+    .bind(...binds)
+    .all<JobRow>();
+  return results.map(rowToJob);
+}
+
+/** All jobs, oldest-created first (ties broken by id) -- backs
+ * comfyapi.py's `_numbers_by_job_id` (every job in the federation, not
+ * scoped to any origin -- the queue `number` a panel sees must stay
+ * consistent with console-submitted jobs interleaved in submission order). */
+export async function getAllJobsOrderedByCreatedAt(db: D1Database): Promise<Job[]> {
+  const { results } = await db.prepare("SELECT * FROM jobs ORDER BY created_at ASC, id ASC").all<JobRow>();
+  return results.map(rowToJob);
+}
+
+export async function getJobByIdAndOrigin(db: D1Database, id: string, origin: string): Promise<Job | null> {
+  const row = await db.prepare("SELECT * FROM jobs WHERE id = ? AND origin = ?").bind(id, origin).first<JobRow>();
+  return row ? rowToJob(row) : null;
+}
+
+/** Sets `panel_hidden = 1` on every terminal (`done`/`failed`), `origin =
+ * 'panel'` job matching `ids` (or every such job when `ids` is undefined) --
+ * mirrors comfyapi.py's `POST /comfy/api/history` hide mutation. Returns the
+ * number of rows touched (unused by the caller today, kept for parity with
+ * every other bulk-write helper's return shape in this file). */
+export async function hidePanelHistoryJobs(db: D1Database, ids?: string[]): Promise<number> {
+  const clauses = ["status IN ('done', 'failed')", "origin = 'panel'"];
+  const binds: unknown[] = [];
+  if (ids !== undefined) {
+    if (ids.length === 0) return 0;
+    clauses.push(`id IN (${ids.map(() => "?").join(",")})`);
+    binds.push(...ids);
+  }
+  const result = await db
+    .prepare(`UPDATE jobs SET panel_hidden = 1 WHERE ${clauses.join(" AND ")}`)
+    .bind(...binds)
+    .run();
+  return result.meta.changes ?? 0;
 }
 
 /** Whether any job is currently queued, assigned, or running -- the Hub

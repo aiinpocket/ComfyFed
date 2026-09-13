@@ -68,6 +68,24 @@ function* iterModelRefs(workflow: Record<string, unknown>): Generator<[string, s
   }
 }
 
+/** Map each model name referenced by `workflow` to the nodes that reference
+ * it -- ports assess.py's `model_nodes`. Returns `{model_name: [[node_id,
+ * class_type], ...]}`, in workflow iteration order, using the SAME walker
+ * (`iterModelRefs`) `extract` uses -- see that generator's docstring for why
+ * this must never fork into a second walk. Used by `/comfy/api/prompt`'s
+ * missing-model rejection to build per-node `node_errors` entries so the
+ * ComfyUI panel's Errors tab can show guidance on the actual offending
+ * node(s). */
+export function modelNodes(workflow: Record<string, unknown>): Map<string, [string, string][]> {
+  const result = new Map<string, [string, string][]>();
+  for (const [nodeId, classType, modelName] of iterModelRefs(workflow)) {
+    const list = result.get(modelName);
+    if (list) list.push([nodeId, classType]);
+    else result.set(modelName, [[nodeId, classType]]);
+  }
+  return result;
+}
+
 /** Extract nodes/models/assets referenced by a ComfyUI API-format workflow
  * -- ports assess.py's `extract`. `workflow` maps node_id -> `{class_type,
  * inputs}`. */

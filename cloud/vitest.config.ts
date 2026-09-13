@@ -1,3 +1,5 @@
+/// <reference types="node" />
+import { readFileSync } from "node:fs";
 import { defineConfig } from "vitest/config";
 import { cloudflareTest, readD1Migrations } from "@cloudflare/vitest-pool-workers";
 
@@ -17,9 +19,18 @@ import { cloudflareTest, readD1Migrations } from "@cloudflare/vitest-pool-worker
 // runtime. See task-1-report.md for the full writeup of this approach.
 const migrations = await readD1Migrations("migrations");
 
+// Task 9's build-parity check for the embedded `comfyfed.js` panel
+// extension (core/comfyfed_ext.ts's `COMFYFED_EXT_JS`): read the REAL
+// Python-side file here at Node config time (same reason `readD1Migrations`
+// runs here rather than in-worker -- no `fs` inside workerd) and thread it
+// into the worker as a global, same pattern as `__D1_MIGRATIONS__` above.
+// test/comfyfed-ext.spec.ts compares the embedded TS constant against this.
+const comfyfedExtJsSource = readFileSync("../server/comfyfed_server/panel_ext/comfyfed.js", "utf8");
+
 export default defineConfig({
   define: {
     __D1_MIGRATIONS__: JSON.stringify(migrations),
+    __COMFYFED_EXT_JS_SOURCE__: JSON.stringify(comfyfedExtJsSource),
   },
   test: {
     setupFiles: ["./test/apply-migrations.ts"],
