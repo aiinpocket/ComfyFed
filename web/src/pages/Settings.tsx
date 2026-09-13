@@ -24,7 +24,7 @@ import {
 import { useEffect, useState } from 'react';
 import { useTranslation } from 'react-i18next';
 
-import { ApiError, api } from '../api';
+import { ApiError, api, type ObjectInfoMode } from '../api';
 import { Mono, SectionHeader } from '../components/Primitives';
 import { persistLang, type Lang } from '../i18n';
 
@@ -47,10 +47,30 @@ export function Settings({ platformUrl }: SettingsProps) {
   const [savingUrl, setSavingUrl] = useState(false);
   const [savingLang, setSavingLang] = useState(false);
 
+  // Task 7's object_info merge mode, GET /api/settings so a console that
+  // opens straight to this page (not seeded by a prior POST) still shows it.
+  const [objectInfoMode, setObjectInfoMode] = useState<ObjectInfoMode | null>(null);
+  const [savingObjectInfoMode, setSavingObjectInfoMode] = useState(false);
+
   useEffect(() => {
     setSavedUrl(platformUrl);
     setUrlDraft(platformUrl);
   }, [platformUrl]);
+
+  useEffect(() => {
+    let cancelled = false;
+    api
+      .getSettings()
+      .then((settings) => {
+        if (!cancelled) setObjectInfoMode(settings.object_info_mode as ObjectInfoMode);
+      })
+      .catch(() => {
+        /* left null; the segmented control below just won't render yet */
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, []);
 
   const urlValid = urlDraft.startsWith('http://') || urlDraft.startsWith('https://');
   const urlDirty = urlDraft !== savedUrl;
@@ -99,6 +119,21 @@ export function Settings({ platformUrl }: SettingsProps) {
       notifyFailure(t('settings.language_save_failed'), caught);
     } finally {
       setSavingLang(false);
+    }
+  };
+
+  const changeObjectInfoMode = async (value: string) => {
+    const mode = value as ObjectInfoMode;
+    const previous = objectInfoMode;
+    setObjectInfoMode(mode);
+    setSavingObjectInfoMode(true);
+    try {
+      await api.updateSettings({ object_info_mode: mode });
+    } catch (caught) {
+      setObjectInfoMode(previous);
+      notifyFailure(t('settings.object_info_save_failed'), caught);
+    } finally {
+      setSavingObjectInfoMode(false);
     }
   };
 
@@ -278,6 +313,27 @@ export function Settings({ platformUrl }: SettingsProps) {
               />
             </Stack>
           </Card>
+
+          {objectInfoMode && (
+            <Card style={cardStyle}>
+              <Stack gap="sm">
+                <Text fw={600}>{t('settings.object_info_heading')}</Text>
+                <Text size="sm" c="dimmed">
+                  {t('settings.object_info_hint')}
+                </Text>
+                <SegmentedControl
+                  value={objectInfoMode}
+                  disabled={savingObjectInfoMode}
+                  onChange={(value) => void changeObjectInfoMode(value)}
+                  data={[
+                    { value: 'union', label: t('settings.object_info_union') },
+                    { value: 'intersection', label: t('settings.object_info_intersection') },
+                  ]}
+                  styles={{ root: { background: theme.other.surfaces.raised } }}
+                />
+              </Stack>
+            </Card>
+          )}
         </Stack>
       </SimpleGrid>
     </Stack>

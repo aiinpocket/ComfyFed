@@ -159,9 +159,13 @@ export interface Worker {
 
 export type JobStatus = 'queued' | 'assigned' | 'running' | 'done' | 'failed' | 'cancelled';
 
+/** Who submitted the job: the console's own `/api/jobs`, or the ComfyUI-compatible panel surface. */
+export type JobOrigin = 'panel' | 'console';
+
 export interface Job {
   id: string;
   status: JobStatus | string;
+  origin: JobOrigin | string;
   progress: number;
   worker_id: string | null;
   created_at: string | null;
@@ -171,6 +175,15 @@ export interface Job {
   est_vram_gb: number | null;
 }
 
+/** Dual-signed job receipt summary, embedded in `GET /api/jobs/{id}` once one exists. */
+export interface JobReceipt {
+  gpu_seconds: number;
+  kind: 'completed' | 'failed' | 'cancelled' | string;
+  billable: boolean;
+  basis: 'exec' | 'wall' | string;
+  acked: boolean;
+}
+
 export interface JobDetail extends Job {
   workflow_json: Record<string, unknown>;
   requirements: Record<string, unknown>;
@@ -178,6 +191,7 @@ export interface JobDetail extends Job {
   required_models: string[];
   started_at: string | null;
   finished_at: string | null;
+  receipt: JobReceipt | null;
 }
 
 export type VerdictKind = 'eligible' | 'eligible_after_fetch' | 'ineligible';
@@ -223,9 +237,18 @@ export interface RequirementsOverride {
   backend?: Backend;
 }
 
+export type ObjectInfoMode = 'union' | 'intersection';
+
 export interface SettingsUpdate {
   platform_url?: string;
   lang?: string;
+  object_info_mode?: ObjectInfoMode;
+}
+
+export interface SettingsState {
+  platform_url: string;
+  lang: string;
+  object_info_mode: ObjectInfoMode | string;
 }
 
 /* -------------------------------------------------------------- endpoints */
@@ -307,7 +330,11 @@ export const api = {
     return postJson(`/api/jobs/${encodeURIComponent(jobId)}/cancel`, {});
   },
 
-  updateSettings(update: SettingsUpdate): Promise<{ platform_url: string; lang: string }> {
+  getSettings(): Promise<SettingsState> {
+    return getJson<SettingsState>('/api/settings');
+  },
+
+  updateSettings(update: SettingsUpdate): Promise<SettingsState> {
     return postJson('/api/settings', update);
   },
 

@@ -1,0 +1,209 @@
+// @vitest-environment jsdom
+/**
+ * Phase 1.9 Task 9: the console job detail page.
+ *
+ * The whole point of this page is the full-error-text fix for the
+ * truncated-tooltip complaint on the Jobs table, plus rendering a .txt
+ * artifact's content inline instead of forcing a download. Both are
+ * exercised end to end against a mocked `fetch`, the same seam `api.ts`
+ * itself uses.
+ */
+import '@testing-library/jest-dom/vitest';
+
+import { MantineProvider } from '@mantine/core';
+import { cleanup, fireEvent, render, screen, waitFor, within } from '@testing-library/react';
+import { MemoryRouter, Route, Routes } from 'react-router-dom';
+import { afterEach, describe, expect, it, vi } from 'vitest';
+
+import type { JobDetail as JobDetailType, Worker } from '../api';
+import '../i18n';
+import { theme } from '../theme';
+import { JobDetail } from './JobDetail';
+
+if (!window.matchMedia) {
+  window.matchMedia = ((query: string) => ({
+    matches: false,
+    media: query,
+    onchange: null,
+    addListener: () => {},
+    removeListener: () => {},
+    addEventListener: () => {},
+    removeEventListener: () => {},
+    dispatchEvent: () => false,
+  })) as unknown as typeof window.matchMedia;
+}
+
+if (!('ResizeObserver' in window)) {
+  class FakeResizeObserver {
+    observe() {}
+    unobserve() {}
+    disconnect() {}
+  }
+  (window as unknown as { ResizeObserver: unknown }).ResizeObserver = FakeResizeObserver;
+}
+
+const LONG_ERROR = (
+  'CUDA out of memory. Tried to allocate 2.00 GiB. This is the full model guidance text that ' +
+  'used to be truncated in the Jobs table tooltip and must now be readable in full on this page ' +
+  'without any clipping whatsoever, repeated to make sure truncation would show up: '
+)
+  .repeat(3)
+  .trim();
+
+const BASE_JOB: JobDetailType = {
+  id: 'job-aaaaaaaa-1111',
+  status: 'failed',
+  origin: 'console',
+  progress: 0.4,
+  worker_id: 'w1',
+  created_at: '2026-09-13T00:00:00Z',
+  error: LONG_ERROR,
+  result_files: [],
+  input_assets: ['ref.png'],
+  est_vram_gb: null,
+  workflow_json: {},
+  requirements: {},
+  required_nodes: [],
+  required_models: [],
+  started_at: '2026-09-13T00:00:01Z',
+  finished_at: '2026-09-13T00:00:05Z',
+  receipt: null,
+};
+
+const WORKER: Worker = {
+  id: 'w1',
+  name: 'runner-1',
+  status: 'busy',
+  last_seen: '2026-09-13T00:00:00Z',
+  disabled: false,
+  hardware: {},
+  dynamic: {},
+  backend: 'cuda',
+  torch_version: '2.0',
+  model_count: 0,
+};
+
+function jsonResponse(body: unknown, status = 200): Response {
+  return new Response(JSON.stringify(body), {
+    status,
+    headers: { 'Content-Type': 'application/json' },
+  });
+}
+
+function stubFetch(job: JobDetailType, opts: { workers?: Worker[]; artifacts?: Record<string, string> } = {}) {
+  const workers = opts.workers ?? [WORKER];
+  const artifacts = opts.artifacts ?? {};
+  const fetchMock = vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+    const url = typeof input === 'string' ? input : input.toString();
+    const method = init?.method ?? 'GET';
+
+    if (/^\/api\/jobs\/[^/]+$/.test(url) && method === 'GET') {
+      return jsonResponse(job);
+    }
+    if (url === '/api/workers' && method === 'GET') {
+      return jsonResponse(workers);
+    }
+    for (const [filename, content] of Object.entries(artifacts)) {
+      if (url === `/api/jobs/${job.id}/artifacts/${filename}` && method === 'GET') {
+        return new Response(content, { status: 200, headers: { 'Content-Type': 'text/plain' } });
+      }
+    }
+    if (/\/cancel$/.test(url) && method === 'POST') {
+      return jsonResponse({ status: 'cancelled' });
+    }
+    if (/\/retry$/.test(url) && method === 'POST') {
+      return jsonResponse({ ok: true, job_id: job.id });
+    }
+    return jsonResponse({ error: { code: 'http_error', message: 'not stubbed' } }, 404);
+  });
+  vi.stubGlobal('fetch', fetchMock);
+  return fetchMock;
+}
+
+function renderDetail(id = BASE_JOB.id) {
+  return render(
+    <MantineProvider theme={theme}>
+      <MemoryRouter initialEntries={[`/jobs/${id}`]}>
+        <Routes>
+          <Route path="/jobs/:id" element={<JobDetail />} />
+        </Routes>
+      </MemoryRouter>
+    </MantineProvider>,
+  );
+}
+
+describe('JobDetail', () => {
+  afterEach(() => {
+    cleanup();
+    vi.unstubAllGlobals();
+  });
+
+  it('renders the full error text rather than a truncated version', async () => {
+    stubFetch(BASE_JOB);
+    renderDetail();
+
+    expect(await screen.findByText(LONG_ERROR)).toBeInTheDocument();
+  });
+
+  it('renders a .txt artifact content inline in a copyable block', async () => {
+    const doneJob: JobDetailType = {
+      ...BASE_JOB,
+      status: 'done',
+      error: null,
+      result_files: ['notes.txt'],
+    };
+    stubFetch(doneJob, { artifacts: { 'notes.txt': 'seed: 12345\nsteps: 20' } });
+    renderDetail();
+
+    expect(await screen.findByText(/seed: 12345/)).toBeInTheDocument();
+  });
+
+  it('shows a cancel action for a non-terminal (running) job', async () => {
+    const runningJob: JobDetailType = { ...BASE_JOB, status: 'running', error: null };
+    stubFetch(runningJob);
+    renderDetail();
+
+    expect(await screen.findByRole('button', { name: 'Cancel' })).toBeInTheDocument();
+  });
+
+  it('hides the cancel action for a terminal (done) job', async () => {
+    const doneJob: JobDetailType = { ...BASE_JOB, status: 'done', error: null, result_files: [] };
+    stubFetch(doneJob);
+    renderDetail();
+
+    await screen.findByText('Done');
+    expect(screen.queryByRole('button', { name: 'Cancel' })).not.toBeInTheDocument();
+  });
+
+  it('posts to the cancel endpoint when the cancel action is confirmed', async () => {
+    const queuedJob: JobDetailType = { ...BASE_JOB, status: 'queued', error: null };
+    const fetchMock = stubFetch(queuedJob);
+    renderDetail();
+
+    fireEvent.click(await screen.findByRole('button', { name: 'Cancel' }));
+    const dialog = await screen.findByRole('dialog');
+    fireEvent.click(await within(dialog).findByRole('button', { name: 'Cancel job' }));
+
+    await waitFor(() => {
+      const cancelCall = fetchMock.mock.calls.find(([reqUrl, reqInit]) => {
+        const url = typeof reqUrl === 'string' ? reqUrl : reqUrl.toString();
+        return url === `/api/jobs/${queuedJob.id}/cancel` && reqInit?.method === 'POST';
+      });
+      expect(cancelCall).toBeDefined();
+    });
+  });
+
+  it('renders the receipt summary when one is present', async () => {
+    const doneJob: JobDetailType = {
+      ...BASE_JOB,
+      status: 'done',
+      error: null,
+      result_files: [],
+      receipt: { gpu_seconds: 42, kind: 'completed', billable: true, basis: 'exec', acked: true },
+    };
+    stubFetch(doneJob);
+    renderDetail();
+
+    expect(await screen.findByText('42s')).toBeInTheDocument();
+  });
+});

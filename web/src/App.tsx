@@ -7,6 +7,7 @@ import { api, onUnauthorized, setCsrf } from './api';
 import { AppLayout } from './components/AppLayout';
 import { Logo } from './components/Logo';
 import { Dashboard } from './pages/Dashboard';
+import { JobDetail } from './pages/JobDetail';
 import { Jobs } from './pages/Jobs';
 import { Login } from './pages/Login';
 import { Reports } from './pages/Reports';
@@ -78,6 +79,7 @@ export function App() {
       <Routes>
         <Route path="/dashboard" element={<Dashboard />} />
         <Route path="/jobs" element={<Jobs />} />
+        <Route path="/jobs/:id" element={<JobDetail />} />
         <Route path="/workers" element={<Workers />} />
         <Route path="/reports" element={<Reports />} />
         <Route path="/settings" element={<Settings platformUrl={platformUrl} />} />

@@ -10,6 +10,7 @@ import '@testing-library/jest-dom/vitest';
 
 import { MantineProvider } from '@mantine/core';
 import { cleanup, fireEvent, render, screen, waitFor, within } from '@testing-library/react';
+import { MemoryRouter } from 'react-router-dom';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 
 import type { Job, Worker } from '../api';
@@ -46,6 +47,7 @@ if (!('ResizeObserver' in window)) {
 const RUNNING_JOB: Job = {
   id: 'job-running-0001',
   status: 'running',
+  origin: 'console',
   progress: 0.5,
   worker_id: 'w1',
   created_at: '2026-09-13T00:00:00Z',
@@ -58,6 +60,7 @@ const RUNNING_JOB: Job = {
 const DONE_JOB: Job = {
   id: 'job-done-0002',
   status: 'done',
+  origin: 'console',
   progress: 1,
   worker_id: 'w1',
   created_at: '2026-09-13T00:00:00Z',
@@ -70,6 +73,7 @@ const DONE_JOB: Job = {
 const CANCELLED_JOB: Job = {
   id: 'job-cancelled-0003',
   status: 'cancelled',
+  origin: 'console',
   progress: 0,
   worker_id: 'w1',
   created_at: '2026-09-13T00:00:00Z',
@@ -102,7 +106,9 @@ function jsonResponse(body: unknown, status = 200): Response {
 function renderJobs() {
   return render(
     <MantineProvider theme={theme}>
-      <Jobs />
+      <MemoryRouter>
+        <Jobs />
+      </MemoryRouter>
     </MantineProvider>,
   );
 }

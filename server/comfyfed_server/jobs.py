@@ -106,7 +106,20 @@ def _job_dict(job: db.Job) -> dict:
     }
 
 
-def _job_dict_full(job: db.Job) -> dict:
+def _receipt_dict(receipt: db.Receipt) -> dict:
+    return {
+        "gpu_seconds": receipt.gpu_seconds,
+        "kind": receipt.kind,
+        "billable": receipt.billable,
+        "basis": receipt.basis,
+        # Same "acked" name/semantics as reports.py's per-receipt listing:
+        # the worker has countersigned this receipt (dual-signature flow in
+        # agentws.py) once `worker_sig` is set.
+        "acked": receipt.worker_sig is not None,
+    }
+
+
+def _job_dict_full(job: db.Job, receipt: Optional["db.Receipt"] = None) -> dict:
     d = _job_dict(job)
     d["workflow_json"] = json.loads(job.workflow_json)
     d["requirements"] = json.loads(job.requirements or "{}")
@@ -115,6 +128,7 @@ def _job_dict_full(job: db.Job) -> dict:
     d["started_at"] = job.started_at.isoformat() if job.started_at else None
     d["finished_at"] = job.finished_at.isoformat() if job.finished_at else None
     d["result_hashes"] = json.loads(job.result_hashes or "{}")
+    d["receipt"] = _receipt_dict(receipt) if receipt is not None else None
     return d
 
 
@@ -192,7 +206,15 @@ def create_router(data_dir: str) -> APIRouter:
             job = session.get(db.Job, job_id)
             if job is None:
                 raise _error(404, "jobs.not_found", "Job not found.")
-            return _job_dict_full(job)
+            # A retried job can accumulate more than one receipt across
+            # attempts; the newest one is what the detail page should show.
+            receipt = (
+                session.query(db.Receipt)
+                .filter(db.Receipt.job_id == job_id)
+                .order_by(db.Receipt.created_at.desc())
+                .first()
+            )
+            return _job_dict_full(job, receipt)
 
     @r.get("/api/jobs/{job_id}/assessment")
     def get_job_assessment(job_id: str, _payload: dict = Depends(auth.require_admin)):
