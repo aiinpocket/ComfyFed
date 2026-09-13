@@ -23,9 +23,10 @@ def client(tmp_path):
     c.admin_password = result.admin_password
     c.data_dir = data_dir
     yield c
-    # Module-level, in-memory, per-process (see model_manifest.py /
-    # agentws._fetch_progress) -- reset between tests.
-    model_manifest._poisoned_names.clear()
+    # Module-level, in-memory, per-process (see agentws._fetch_progress) --
+    # reset between tests. Hash-conflict state is persisted on the
+    # model_hashes row itself now (migration c9d0e1f2a3b4) and each test
+    # gets a fresh tmp_path database, so there's nothing to reset for that.
     agentws._fetch_progress.clear()
 
 
@@ -865,8 +866,11 @@ def test_inventory_hash_conflict_between_two_workers_poisons_the_name(client, ca
         r.levelno == logging.WARNING and worker_a in r.message and worker_b in r.message
         for r in caplog.records
     )
-    assert "clip_l.safetensors" in model_manifest.poisoned_names()
-    model_manifest._poisoned_names.discard("clip_l.safetensors")
+    size_bytes = round(0.23 * (1024 ** 3))
+    with db.get_session() as session:
+        row = session.get(db.ModelHash, ("clip_l.safetensors", size_bytes))
+        assert row is not None
+        assert row.conflict is True
 
 
 def test_repeated_busy_heartbeat_is_a_silent_no_op(client, caplog):

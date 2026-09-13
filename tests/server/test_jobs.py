@@ -30,10 +30,8 @@ def client(tmp_path):
     c.admin_password = result.admin_password
     c.data_dir = data_dir
     yield c
-    # Both module-level, in-memory, per-process (documented at their
-    # definitions) -- reset between tests so one test's manifest/fetch state
-    # doesn't bleed into the next.
-    model_manifest._poisoned_names.clear()
+    # Module-level, in-memory, per-process (see agentws.py) -- reset between
+    # tests so one test's fetch-progress state doesn't bleed into the next.
     agentws._fetch_progress.clear()
 
 

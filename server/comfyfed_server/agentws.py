@@ -122,11 +122,12 @@ _data_dir: Optional[str] = None
 
 # job_id -> {"stage": "fetching_models", "fetch_pct": float, "fetch_model": str}
 # for a job currently in the pre-run model-download phase (Phase 2.1 Task 5's
-# agent side). Deliberately NOT a Job column: this is live, second-by-second
-# state for exactly as long as an agent is downloading, same "transient,
-# in-memory, per-process" shape as model_manifest's poisoned-name set --
-# there is nothing here worth surviving a server restart (a fresh heartbeat
-# repopulates it within one tick). `jobs._job_dict` reads it via
+# agent side). Deliberately NOT a Job column: this is live, second-by-second,
+# transient, in-memory, per-process state -- there is nothing here worth
+# surviving a server restart (a fresh heartbeat repopulates it within one
+# tick), unlike a hash conflict (see `db.ModelHash.conflict`), which IS
+# persisted precisely because it must survive one. `jobs._job_dict` reads it
+# via
 # `get_fetch_progress` to add the stage fields to the console's job payload
 # "when present" (see task-4-brief.md); cleared on every transition that
 # ends or restarts a job's lifecycle so a stale stage never lingers after the

@@ -40,9 +40,6 @@ def client(tmp_path):
     c.admin_password = result.admin_password
     c.data_dir = data_dir
     yield c
-    # Module-level, in-memory, per-process (see model_manifest.py) -- reset
-    # between tests so one test's manifest state doesn't bleed into the next.
-    model_manifest._poisoned_names.clear()
 
 
 def _login(client):

@@ -281,24 +281,17 @@ export class Hub extends DurableObject<Env> {
    * deliberately not persisted across hibernation eviction. */
   private readonly ephemeral = new Map<WebSocket, Ephemeral>();
 
-  /** Model names with a learned sha256 conflict between two workers --
-   * excluded from the fetch manifest until this DO instance is evicted. See
-   * `core/model_manifest.ts`'s docstring for why this lives HERE (per-DO-
-   * instance, in-memory) rather than as shared module state: this Hub DO is
-   * the only place `inventory` messages (and therefore conflicts) arrive, so
-   * it is the only place that can ever learn of one. Ports model_manifest.
-   * py's `_poisoned_names`, with the same "not persisted, forgotten on
-   * restart/eviction" caveat its docstring documents. */
-  private readonly poisonedModelNames = new Set<string>();
-
   /** job_id -> transient model-auto-fetch progress, for exactly as long as a
    * job is in the pre-run download phase -- ports agentws.py's
    * `_fetch_progress`. Deliberately NOT DO storage/a D1 column: this is
    * live, second-by-second state that a fresh heartbeat repopulates within
    * one tick, so losing it on eviction is harmless (same "nothing here is
-   * worth surviving a restart" reasoning as `poisonedModelNames` and
-   * `ephemeral`). Read by `routes/jobs.ts`'s `jobDict` via
-   * `/internal/fetch_progress` (mirrors `queries.getDynamic`'s seam). */
+   * worth surviving a restart" reasoning as `ephemeral`). A model-hash
+   * CONFLICT, by contrast, is persisted on the `model_hashes` row itself
+   * (migration 0005_model_hash_conflict.sql) rather than tracked here --
+   * see `core/model_manifest.ts`'s docstring. Read by `routes/jobs.ts`'s
+   * `jobDict` via `/internal/fetch_progress` (mirrors `queries.getDynamic`'s
+   * seam). */
   private readonly fetchProgress = new Map<
     string,
     { stage: string; fetchPct: number | null; fetchModel: string | null }
@@ -879,10 +872,10 @@ export class Hub extends DurableObject<Env> {
    * that hashes but predates the exact `size_bytes` field fall back to
    * reconstructing it from the rounded-to-3-decimal-places GB `size` --
    * lossy (~1 MB resolution), kept only so those agents' reports aren't
-   * dropped outright. A conflict (`recordHash`'s `poisoned: true`) adds the
-   * name to this DO instance's own `poisonedModelNames` set -- see that
-   * field's docstring for why the set lives here rather than as shared
-   * module state. */
+   * dropped outright. A conflict (`recordHash`'s `conflict: true`) is
+   * already persisted on the `model_hashes` row by the time this returns --
+   * nothing further to track here (fix round 1: replaced the old in-memory
+   * `poisonedModelNames` DO field). */
   private async recordModelHashes(workerId: string, models: unknown[]): Promise<void> {
     for (const entry of models) {
       if (typeof entry !== "object" || entry === null || Array.isArray(entry)) continue;
@@ -903,8 +896,7 @@ export class Hub extends DurableObject<Env> {
         exactSizeBytes = Math.round(size * 1024 ** 3);
       }
 
-      const result = await modelManifest.recordHash(this.env.DB, workerId, name, exactSizeBytes, sha256);
-      if (result.poisoned) this.poisonedModelNames.add(name);
+      await modelManifest.recordHash(this.env.DB, workerId, name, exactSizeBytes, sha256);
     }
   }
 
@@ -1316,7 +1308,7 @@ export class Hub extends DurableObject<Env> {
     if (hasQueuedWork) {
       try {
         const seed = await resolvePlatformSeed(db, this.env.PLATFORM_ED25519_SEED);
-        const manifestEntries = await modelManifest.entries(db, this.env.STORE, seed, this.poisonedModelNames);
+        const manifestEntries = await modelManifest.entries(db, this.env.STORE, seed);
         for (const e of manifestEntries) {
           fetchableModels[e.name] = e.size_bytes;
           manifestByName.set(e.name, e);

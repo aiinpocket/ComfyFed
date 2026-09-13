@@ -9,12 +9,11 @@ import { signRequest } from "../src/lib/signing";
 import golden from "./fixtures/golden.json";
 
 // Ports the highest-value cases from tests/server/test_model_manifest.py --
-// see that file for the full Python suite this mirrors. The poisoned-name
-// set is a documented cloud divergence (see model_manifest.ts's docstring):
-// Python keeps it as module-level state `entries()` always consults, while
-// the cloud port takes it as an explicit parameter (the Hub DO's own
-// in-memory set) -- these tests pass it explicitly rather than relying on
-// hidden global state.
+// see that file for the full Python suite this mirrors. Fix round 1: a hash
+// conflict is a persisted `model_hashes.conflict` column (migration
+// 0005_model_hash_conflict.sql), not an in-memory set -- `entries()` takes
+// no poisoned-name parameter at all; exclusion is a plain SQL predicate any
+// caller gets automatically.
 
 function store(): R2Bucket {
   return (env as any).STORE as R2Bucket;
@@ -52,42 +51,45 @@ describe("recordHash", () => {
   it("a first report inserts a row", async () => {
     const sha = await shaHex("a");
     const result = await modelManifest.recordHash(db(), "w1", "text_encoders/clip_l.safetensors", bytesFor(0.23), sha);
-    expect(result.poisoned).toBe(false);
+    expect(result.conflict).toBe(false);
 
     const row = await db()
       .prepare("SELECT * FROM model_hashes WHERE name = ? AND size_bytes = ?")
       .bind("text_encoders/clip_l.safetensors", bytesFor(0.23))
-      .first<{ sha256: string; first_worker_id: string }>();
+      .first<{ sha256: string; first_worker_id: string; conflict: number }>();
     expect(row?.sha256).toBe(sha);
     expect(row?.first_worker_id).toBe("w1");
+    expect(row?.conflict).toBe(0);
   });
 
   it("a matching repeat is a no-op (first_worker_id untouched)", async () => {
     const sha = await shaHex("a");
     await modelManifest.recordHash(db(), "w1", "clip_l.safetensors", bytesFor(0.23), sha);
     const result = await modelManifest.recordHash(db(), "w2", "clip_l.safetensors", bytesFor(0.23), sha);
-    expect(result.poisoned).toBe(false);
+    expect(result.conflict).toBe(false);
 
     const row = await db()
       .prepare("SELECT * FROM model_hashes WHERE name = ? AND size_bytes = ?")
       .bind("clip_l.safetensors", bytesFor(0.23))
-      .first<{ sha256: string; first_worker_id: string }>();
+      .first<{ sha256: string; first_worker_id: string; conflict: number }>();
     expect(row?.first_worker_id).toBe("w1");
     expect(row?.sha256).toBe(sha);
+    expect(row?.conflict).toBe(0);
   });
 
-  it("a conflict does not overwrite the first-seen row and reports poisoned", async () => {
+  it("a conflict does not overwrite the first-seen hash but persists conflict=1 on the row", async () => {
     const shaA = await shaHex("a");
     const shaB = await shaHex("b");
     await modelManifest.recordHash(db(), "worker-first", "clip_l.safetensors", bytesFor(0.23), shaA);
     const result = await modelManifest.recordHash(db(), "worker-second", "clip_l.safetensors", bytesFor(0.23), shaB);
 
-    expect(result.poisoned).toBe(true);
+    expect(result.conflict).toBe(true);
     const row = await db()
       .prepare("SELECT * FROM model_hashes WHERE name = ? AND size_bytes = ?")
       .bind("clip_l.safetensors", bytesFor(0.23))
-      .first<{ sha256: string }>();
+      .first<{ sha256: string; conflict: number }>();
     expect(row?.sha256).toBe(shaA); // first-seen hash kept
+    expect(row?.conflict).toBe(1);
   });
 
   it("different exact sizes are independent keys -- no conflict", async () => {
@@ -95,8 +97,8 @@ describe("recordHash", () => {
     const shaB = await shaHex("b");
     const r1 = await modelManifest.recordHash(db(), "w1", "clip_l.safetensors", bytesFor(0.23), shaA);
     const r2 = await modelManifest.recordHash(db(), "w2", "clip_l.safetensors", bytesFor(9.12), shaB);
-    expect(r1.poisoned).toBe(false);
-    expect(r2.poisoned).toBe(false);
+    expect(r1.conflict).toBe(false);
+    expect(r2.conflict).toBe(false);
   });
 });
 
@@ -147,34 +149,32 @@ describe("entries", () => {
     expect(ok).toBe(false);
   });
 
-  it("excludes a poisoned name when the caller passes it, even with an agreed row present", async () => {
+  it("excludes a conflicted name even with an agreed first-seen row present", async () => {
     // The row itself is the FIRST-seen one (never deleted by a conflict) --
-    // poisoning is about "two workers disagree on this name", which the
+    // conflict=true is about "two workers disagree on this name", which the
     // first-seen row surviving does not resolve.
     await modelManifest.recordHash(db(), "w1", "text_encoders/clip_l.safetensors", bytesFor(0.23), await shaHex("a"));
-    const conflict = await modelManifest.recordHash(
+    const result = await modelManifest.recordHash(
       db(),
       "w2",
       "text_encoders/clip_l.safetensors",
       bytesFor(0.23),
       await shaHex("b")
     );
-    expect(conflict.poisoned).toBe(true);
+    expect(result.conflict).toBe(true);
 
-    const entries = await modelManifest.entries(db(), store(), await seed(), new Set(["text_encoders/clip_l.safetensors"]));
+    const entries = await modelManifest.entries(db(), store(), await seed());
     expect(entries.some((e) => e.name === "clip_l.safetensors")).toBe(false);
   });
 
-  it("cloud divergence: entries() called with NO poisoned-name set still includes a conflicted name", async () => {
-    // Documented in model_manifest.ts's docstring: the poisoned-name set is
-    // per-DO-instance state the Hub DO tracks itself, not shared module
-    // state -- a caller (a plain route) that doesn't have it simply gets an
-    // unfiltered manifest read, same as `entries()`'s own default parameter.
+  it("fix round 1: exclusion is a persisted column, so it holds immediately with no in-memory state at all", async () => {
+    // Unlike the old in-memory poisoned-name design, there is no set for a
+    // caller to forget to pass -- `entries()` takes no such parameter.
     await modelManifest.recordHash(db(), "w1", "text_encoders/clip_l.safetensors", bytesFor(0.23), await shaHex("a"));
     await modelManifest.recordHash(db(), "w2", "text_encoders/clip_l.safetensors", bytesFor(0.23), await shaHex("b"));
 
     const entries = await modelManifest.entries(db(), store(), await seed());
-    expect(entries.some((e) => e.name === "clip_l.safetensors")).toBe(true);
+    expect(entries.some((e) => e.name === "clip_l.safetensors")).toBe(false);
   });
 
   it("size_bytes comes from the learned row, not model_guide's curated size_gb", async () => {

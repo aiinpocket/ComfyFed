@@ -1,7 +1,7 @@
 /**
  * Server-learned model hashes + the platform-signed fetch manifest. Ported
  * from `server/comfyfed_server/model_manifest.py`, read in full -- see that
- * module's docstring for the full consensus/poison/signing rationale this
+ * module's docstring for the full consensus/conflict/signing rationale this
  * mirrors.
  *
  * Two pieces:
@@ -11,38 +11,25 @@
  *    `agentws._handle_inventory` -> `model_manifest.record_hash`). Two
  *    workers reporting DIFFERENT hashes for the same (name, size_bytes) is a
  *    same-name-different-content collision -- never silently overwritten:
- *    the first-seen hash wins and the name is "poisoned" (excluded from the
- *    manifest).
+ *    the first-seen hash wins and the row is marked `conflict = true`
+ *    (`queries.markModelHashConflict`), excluding it from the manifest.
  *
  * 2. `entries` builds the signed fetch manifest: joins `model_guide`'s
- *    name -> download-source lookup with the learned hashes above. Only a
- *    model with BOTH a known source URL and an agreed sha256 becomes a
- *    manifest entry, each carrying a platform Ed25519 signature over its own
- *    `name|directory|sha256|size_bytes` (see `lib/signing.ts`'s
+ *    name -> download-source lookup with the learned, non-conflicted hashes
+ *    above (`queries.getAllModelHashes` already filters `conflict = 0` in
+ *    SQL). Only a model with BOTH a known source URL and an agreed sha256
+ *    becomes a manifest entry, each carrying a platform Ed25519 signature
+ *    over its own `name|directory|sha256|size_bytes` (see `lib/signing.ts`'s
  *    `buildManifestEntryPayload`).
  *
- * POISONED-NAME SET -- DOCUMENTED CLOUD DIVERGENCE from the Python source.
- * Python's `_poisoned_names` is a single module-level `set`, shared by every
- * caller of `entries()` because the whole server is one process. The cloud
- * port has no such single process: `recordHash` runs inside the Hub Durable
- * Object (the only place `inventory` messages arrive), while `entries()` is
- * also called from plain Worker-isolate HTTP routes (`routes/workers.ts`'s
- * manifest endpoints, `routes/comfyapi.ts`/`routes/jobs.ts`'s submission
- * gates) that have no access to the DO's in-memory state and no cheap way to
- * ask for it on every request/tick without adding a DO round-trip to routes
- * that don't otherwise need one.
- *
- * This module therefore takes the poisoned-name set as an explicit
- * parameter (`entries`'s `poisonedNames`, default empty): the Hub DO (the
- * only caller that actually tracks poisoning, via its own per-instance
- * `Set<string>` -- see `do/hub.ts`'s `poisonedModelNames` field) passes its
- * set; every other caller passes none, which means a poisoned name can still
- * surface in a plain-route manifest read or submission-time fetchability
- * check until the DO reasserts the poison on its own next `entries()` call
- * (e.g. the next dispatch tick). This is the same class of already-accepted
- * gap the Python docstring calls out for a restart/second-replica losing the
- * set -- a brief staleness window, not a security boundary -- so it is
- * accepted here too rather than adding a DO round-trip to every plain route.
+ * Fix round 1 (Task 7 review, m1): the conflict flag is a persisted D1
+ * column (migration 0005_model_hash_conflict.sql), not an in-memory,
+ * per-DO-instance set -- the earlier design here couldn't be seen by a
+ * plain HTTP route (`routes/workers.ts`'s manifest endpoints, `routes/
+ * comfyapi.ts`/`routes/jobs.ts`'s submission gates) with no access to the
+ * Hub DO's memory, and was forgotten on DO eviction. Persisting it makes
+ * exclusion a plain SQL predicate every caller gets for free, with no
+ * coordination and no staleness window.
  */
 
 import { matchesModelName } from "./assess";
@@ -64,9 +51,10 @@ export interface ManifestEntry {
 
 export interface RecordHashResult {
   /** True when this report conflicted with an already-learned hash for the
-   * same (name, size_bytes) -- the caller (the Hub DO) should add `name` to
-   * its own poisoned-name set (see this module's docstring). */
-  poisoned: boolean;
+   * same (name, size_bytes) -- the row has already been marked
+   * `conflict = true` in D1 by the time this returns; the caller does not
+   * need to track anything else. */
+  conflict: boolean;
 }
 
 /** Learn one inventory entry's sha256 for (name, size_bytes) -- ports
@@ -89,17 +77,18 @@ export async function recordHash(
     workerId,
     toSqliteTimestamp(new Date())
   );
-  if (inserted) return { poisoned: false };
+  if (inserted) return { conflict: false };
 
   const existing = await queries.getModelHash(db, name, sizeBytes);
-  if (existing === null || existing.sha256 === sha256) return { poisoned: false };
+  if (existing === null || existing.sha256 === sha256) return { conflict: false };
 
   console.warn(
     `model_manifest: sha256 conflict for ${name} (size_bytes=${sizeBytes}): ` +
       `worker ${workerId} reported ${sha256}, worker ${existing.firstWorkerId} previously reported ` +
       `${existing.sha256} -- keeping the first-seen hash and excluding this name from the fetch manifest`
   );
-  return { poisoned: true };
+  await queries.markModelHashConflict(db, name, sizeBytes);
+  return { conflict: true };
 }
 
 /** First `model_hashes` row whose (inventory-relative) name matches
@@ -113,14 +102,10 @@ function findHashRow(rows: queries.ModelHashRow[], sourceKey: string): queries.M
 }
 
 /** Build the signed fetch-manifest entry list -- ports `model_manifest.
- * entries()`. `poisonedNames` -- see this module's docstring for why this is
- * an explicit parameter rather than shared module state. */
-export async function entries(
-  db: D1Database,
-  store: R2Bucket,
-  seedHex: string,
-  poisonedNames: ReadonlySet<string> = new Set()
-): Promise<ManifestEntry[]> {
+ * entries()`. `queries.getAllModelHashes` already excludes conflicted rows
+ * in SQL, so there is no in-memory set for this function (or its caller) to
+ * consult. */
+export async function entries(db: D1Database, store: R2Bucket, seedHex: string): Promise<ManifestEntry[]> {
   const harvested = await modelGuide.harvest(store);
   const names = new Set([...Object.keys(modelGuide.SOURCES), ...Object.keys(harvested)]);
 
@@ -132,7 +117,7 @@ export async function entries(
     if (source === null || !source.officialUrl) continue;
 
     const row = findHashRow(hashRows, name);
-    if (row === null || poisonedNames.has(row.name)) continue;
+    if (row === null) continue;
 
     // Defensive: `|` is the field delimiter in the signed payload below --
     // see model_manifest.py's docstring for why a harvested entry's

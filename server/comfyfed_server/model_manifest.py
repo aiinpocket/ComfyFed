@@ -33,14 +33,14 @@ pin the real byte length. An agent that hashes but predates the exact
 falls back to `round(size * 1024**3)` for those reports and documents the
 approximation there, at the one call site that needs it, rather than here.
 
-The poisoned-name set is an in-memory, per-process, module-level `set`. It
-is NOT persisted and NOT shared across server processes/replicas -- a
-restart (or a second replica behind a load balancer) forgets it and would
-re-admit a previously-poisoned name unless the conflicting hash rows are
-still both present in `model_hashes` (they are, so the very next reporting
-worker's entry reproduces the same conflict and re-poisons it; the only
-gap is a brief window right after restart during which a stale manifest
-entry could theoretically be served).
+A hash conflict is recorded directly on the `model_hashes` row (`conflict`,
+added by migration `c9d0e1f2a3b4`) rather than in an in-memory, per-process
+set -- this is a persistent replacement for an earlier in-memory
+`_poisoned_names` design, which forgot every conflict on restart and had no
+way to be consulted by a second replica behind a load balancer. `entries()`
+now excludes any row with `conflict=True` as a plain SQL predicate: no
+process/replica coordination needed, and a restart changes nothing about
+which names are excluded.
 """
 
 from __future__ import annotations
@@ -54,20 +54,9 @@ from . import assess, auth, db, model_guide, security, workers
 
 logger = logging.getLogger(__name__)
 
-# Model names (as reported in inventory -- i.e. relative to the agent's
-# models root, NOT model_guide's bare name) that have a hash conflict
-# between two or more workers. Excluded from `entries()` until the process
-# restarts. Per-process, in-memory, documented above -- never persisted.
-_poisoned_names: set[str] = set()
-
 
 def _utcnow() -> datetime:
     return datetime.now(timezone.utc).replace(tzinfo=None)
-
-
-def poisoned_names() -> frozenset[str]:
-    """Read-only snapshot of the current poisoned-name set (tests, admin UI)."""
-    return frozenset(_poisoned_names)
 
 
 def record_hash(worker_id: str, name: str, size_bytes: int, sha256: str) -> None:
@@ -84,9 +73,11 @@ def record_hash(worker_id: str, name: str, size_bytes: int, sha256: str) -> None
     INSERT OR IGNORE semantics: a first report for (name, size_bytes) is
     stored as-is; a later report for the same key with a MATCHING sha256 is
     a no-op; a later report with a DIFFERENT sha256 is a genuine conflict --
-    logged at WARNING with both worker ids, the existing row is left
-    untouched, and `name` is added to the poisoned set so `entries()`
-    excludes it.
+    logged at WARNING with both worker ids, the existing row's sha256/
+    first_worker_id are left untouched, and its `conflict` column is set to
+    True so `entries()` excludes it. Persistent, not in-memory: unlike the
+    old per-process poisoned-name set, this survives a restart and is
+    visible to every replica immediately (see this module's docstring).
     """
     with db.get_session() as session:
         existing = session.get(db.ModelHash, (name, size_bytes))
@@ -118,7 +109,8 @@ def record_hash(worker_id: str, name: str, size_bytes: int, sha256: str) -> None
             existing.first_worker_id,
             existing.sha256,
         )
-        _poisoned_names.add(name)
+        existing.conflict = True
+        session.commit()
 
 
 def _find_hash_row(rows: list, source_key: str):
@@ -137,16 +129,22 @@ def entries(data_dir: str) -> list[dict]:
     """Build the signed fetch-manifest entry list.
 
     Only models with BOTH a known download source (curated or harvested,
-    with a non-empty `official_url`) AND an agreed, non-poisoned learned
-    sha256 become entries. Each entry's `sig` is a platform Ed25519
-    signature (hex) over `f"{name}|{directory}|{sha256}|{size_bytes}"`.
+    with a non-empty `official_url`) AND an agreed, non-conflicting learned
+    sha256 (`model_hashes.conflict == False`) become entries. Each entry's
+    `sig` is a platform Ed25519 signature (hex) over
+    `f"{name}|{directory}|{sha256}|{size_bytes}"`.
     """
     signing_key, _ = security.load_platform_keys(data_dir)
 
     names = set(model_guide.SOURCES.keys()) | set(model_guide.harvest(data_dir).keys())
 
     with db.get_session() as session:
-        hash_rows = list(session.query(db.ModelHash).all())
+        # Persistent exclusion (migration c9d0e1f2a3b4): a conflicted row is
+        # never a candidate, full stop -- no in-memory set to consult, and
+        # this is correct across a restart or another replica immediately.
+        hash_rows = list(
+            session.query(db.ModelHash).filter(db.ModelHash.conflict == False).all()  # noqa: E712
+        )
 
     result: list[dict] = []
     for name in sorted(names):
@@ -155,7 +153,7 @@ def entries(data_dir: str) -> list[dict]:
             continue
 
         row = _find_hash_row(hash_rows, name)
-        if row is None or row.name in _poisoned_names:
+        if row is None:
             continue
 
         # Defensive: `|` is the field delimiter in the signed payload below.

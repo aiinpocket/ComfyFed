@@ -1126,8 +1126,8 @@ export async function pruneUploadTokens(db: D1Database, nowSeconds: number): Pro
 // ---------------------------------------------------------------------------
 // Model hashes (Phase 2.1 Task 7) -- the (name, size_bytes) -> sha256
 // consensus table `core/model_manifest.ts`'s `recordHash`/`entries` read and
-// write. See migrations/0004_model_hashes.sql; parity source:
-// `server/comfyfed_server/db.py`'s `ModelHash` model.
+// write. See migrations/0004_model_hashes.sql + 0005_model_hash_conflict.sql;
+// parity source: `server/comfyfed_server/db.py`'s `ModelHash` model.
 
 export interface ModelHashRow {
   name: string;
@@ -1135,6 +1135,13 @@ export interface ModelHashRow {
   sha256: string;
   firstWorkerId: string;
   createdAt: string;
+  /** Set when a later report for this (name, size_bytes) disagreed with the
+   * first-seen sha256 above (see `recordHash`). Persisted (fix round 1,
+   * migration 0005) rather than tracked in an in-memory, per-DO-instance
+   * set -- `getAllModelHashes` (and therefore `model_manifest.entries()`)
+   * excludes any row with this set, correct across a DO eviction or a
+   * request handled by a plain route with no DO state at all. */
+  conflict: boolean;
 }
 
 interface ModelHashDbRow {
@@ -1143,6 +1150,7 @@ interface ModelHashDbRow {
   sha256: string;
   first_worker_id: string;
   created_at: string;
+  conflict: number;
 }
 
 function rowToModelHash(row: ModelHashDbRow): ModelHashRow {
@@ -1152,6 +1160,7 @@ function rowToModelHash(row: ModelHashDbRow): ModelHashRow {
     sha256: row.sha256,
     firstWorkerId: row.first_worker_id,
     createdAt: row.created_at,
+    conflict: row.conflict !== 0,
   };
 }
 
@@ -1190,9 +1199,22 @@ export async function insertModelHashIfAbsent(
   return (result.meta.changes ?? 0) === 1;
 }
 
-/** Every learned hash row -- mirrors `model_manifest.entries()`'s
- * `session.query(db.ModelHash).all()`. */
+/** Marks an existing (name, size_bytes) row as conflicted -- the row's
+ * sha256/first_worker_id are left untouched (the first-seen hash is kept);
+ * only `conflict` flips to true. Mirrors `model_manifest.record_hash`'s
+ * `existing.conflict = True` write on the Python side. */
+export async function markModelHashConflict(db: D1Database, name: string, sizeBytes: number): Promise<void> {
+  await db
+    .prepare("UPDATE model_hashes SET conflict = 1 WHERE name = ? AND size_bytes = ?")
+    .bind(name, sizeBytes)
+    .run();
+}
+
+/** Every NON-conflicted learned hash row -- mirrors `model_manifest.
+ * entries()`'s `session.query(db.ModelHash).filter(conflict == False).all()`.
+ * A plain SQL predicate, not an in-memory set: correct for any caller
+ * (a Durable Object instance or a stateless route) with no coordination. */
 export async function getAllModelHashes(db: D1Database): Promise<ModelHashRow[]> {
-  const { results } = await db.prepare("SELECT * FROM model_hashes").all<ModelHashDbRow>();
+  const { results } = await db.prepare("SELECT * FROM model_hashes WHERE conflict = 0").all<ModelHashDbRow>();
   return results.map(rowToModelHash);
 }

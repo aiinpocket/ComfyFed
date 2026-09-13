@@ -287,10 +287,10 @@ app.get("/api/agent/version", async (c) => {
 //
 // Both return `{entries: [...]}` from `model_manifest.entries()` -- the agent
 // route (signed-agent auth) is also called internally by dispatch/auto-fetch
-// code (`do/hub.ts`'s dispatch tick), not just over HTTP. Neither route has
-// access to the Hub DO's in-memory poisoned-name set -- see
-// `core/model_manifest.ts`'s docstring for why that's an accepted,
-// documented divergence rather than a bug.
+// code (`do/hub.ts`'s dispatch tick), not just over HTTP. A hash conflict is
+// excluded via a plain SQL predicate (`queries.getAllModelHashes`'s
+// `conflict = 0`), so this route (and every other caller) sees exactly the
+// same exclusion the Hub DO sees, with no in-memory state to be missing.
 
 app.get("/api/agent/manifest", async (c) => {
   const outcome = await verifyAgent(c, new Uint8Array());

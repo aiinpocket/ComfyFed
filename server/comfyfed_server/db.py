@@ -77,6 +77,12 @@ class ModelHash(Base):
     sha256: Mapped[str] = mapped_column(String)
     first_worker_id: Mapped[str] = mapped_column(String)
     created_at: Mapped[datetime] = mapped_column(DateTime, default=_utcnow)
+    # Set when a later report for this (name, size_bytes) disagreed with the
+    # first-seen sha256 above (see model_manifest.record_hash). Persistent
+    # replacement for the old in-memory, per-process poisoned-name set --
+    # `model_manifest.entries()` excludes any row with this set, and it
+    # survives a restart/second-replica since it lives on the row itself.
+    conflict: Mapped[bool] = mapped_column(Boolean, default=False, server_default="0")
 
 
 class RegisterToken(Base):

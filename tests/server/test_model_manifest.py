@@ -21,10 +21,6 @@ def data_dir(tmp_path):
     d = str(tmp_path)
     bootstrap.ensure_installed(d, lang="en", url="http://h", interactive=False)
     yield d
-    # The poisoned-name set is module-level/per-process (documented in
-    # model_manifest.py) -- reset between tests so one test's conflict
-    # doesn't bleed into the next.
-    model_manifest._poisoned_names.clear()
 
 
 def _sha(label: str) -> str:
@@ -60,10 +56,10 @@ def test_record_hash_matching_repeat_is_a_noop(data_dir):
         row = session.get(db.ModelHash, ("clip_l.safetensors", _bytes(0.23)))
         assert row.first_worker_id == "w1"  # untouched, not overwritten
         assert row.sha256 == _sha("a")
-    assert "clip_l.safetensors" not in model_manifest.poisoned_names()
+        assert row.conflict is False
 
 
-def test_record_hash_conflict_does_not_overwrite_and_warns_with_both_worker_ids(data_dir, caplog):
+def test_record_hash_conflict_does_not_overwrite_the_hash_but_marks_the_row_conflicted(data_dir, caplog):
     model_manifest.record_hash("worker-first", "clip_l.safetensors", _bytes(0.23), _sha("a"))
     with caplog.at_level(logging.WARNING, logger="comfyfed_server.model_manifest"):
         model_manifest.record_hash("worker-second", "clip_l.safetensors", _bytes(0.23), _sha("b"))
@@ -71,6 +67,7 @@ def test_record_hash_conflict_does_not_overwrite_and_warns_with_both_worker_ids(
     with db.get_session() as session:
         row = session.get(db.ModelHash, ("clip_l.safetensors", _bytes(0.23)))
         assert row.sha256 == _sha("a")  # first-seen hash kept
+        assert row.conflict is True
 
     assert any(
         r.levelno == logging.WARNING
@@ -78,7 +75,6 @@ def test_record_hash_conflict_does_not_overwrite_and_warns_with_both_worker_ids(
         and "worker-second" in r.message
         for r in caplog.records
     )
-    assert "clip_l.safetensors" in model_manifest.poisoned_names()
 
 
 def test_record_hash_different_sizes_are_independent_keys(data_dir):
@@ -86,10 +82,13 @@ def test_record_hash_different_sizes_are_independent_keys(data_dir):
     model_manifest.record_hash("w1", "clip_l.safetensors", _bytes(0.23), _sha("a"))
     model_manifest.record_hash("w2", "clip_l.safetensors", _bytes(9.12), _sha("b"))
 
-    assert "clip_l.safetensors" not in model_manifest.poisoned_names()
     with db.get_session() as session:
-        assert session.get(db.ModelHash, ("clip_l.safetensors", _bytes(0.23))).sha256 == _sha("a")
-        assert session.get(db.ModelHash, ("clip_l.safetensors", _bytes(9.12))).sha256 == _sha("b")
+        row1 = session.get(db.ModelHash, ("clip_l.safetensors", _bytes(0.23)))
+        row2 = session.get(db.ModelHash, ("clip_l.safetensors", _bytes(9.12)))
+        assert row1.sha256 == _sha("a")
+        assert row1.conflict is False
+        assert row2.sha256 == _sha("b")
+        assert row2.conflict is False
 
 
 # --- entries(): the signed manifest ---------------------------------------
@@ -142,11 +141,12 @@ def test_entries_signature_does_not_verify_against_a_tampered_field(data_dir):
         verify_key.verify(tampered.encode(), bytes.fromhex(entry["sig"]))
 
 
-def test_entries_excludes_a_poisoned_name_even_with_an_agreed_row_present(data_dir):
-    """A poisoned name's ORIGINAL (first-seen) row is still in model_hashes
-    (never deleted), but the manifest must still exclude it -- poisoning is
-    about "two workers disagree on this name", which the first-seen row
-    surviving does not resolve.
+def test_entries_excludes_a_conflicted_name_even_with_an_agreed_first_row_present(data_dir):
+    """A conflicted name's ORIGINAL (first-seen) row is still in
+    model_hashes (never deleted, sha256/first_worker_id untouched), but the
+    manifest must still exclude it -- `conflict=True` means "two workers
+    disagree on this name", which the first-seen row surviving does not
+    resolve.
     """
     model_manifest.record_hash("w1", "text_encoders/clip_l.safetensors", _bytes(0.23), _sha("a"))
     model_manifest.record_hash("w2", "text_encoders/clip_l.safetensors", _bytes(0.23), _sha("b"))
@@ -155,33 +155,26 @@ def test_entries_excludes_a_poisoned_name_even_with_an_agreed_row_present(data_d
     assert "clip_l.safetensors" not in names
 
 
-def test_poison_survives_a_restart_because_the_conflicting_rows_persist(data_dir, caplog):
-    """The poisoned-name set is documented as in-memory/per-process, forgotten
-    on restart -- but the conflicting `model_hashes` rows that caused it are
-    real DB rows, not memory, so the very next matching report reproduces
-    the same conflict and re-poisons the name. Simulate a restart by
-    clearing the in-memory set directly (what a fresh process would start
-    with) without touching the DB, then feed a fresh report for the same
-    (name, size) that still disagrees with what's stored.
+def test_conflict_exclusion_survives_a_restart_because_it_is_a_persisted_column(data_dir, caplog):
+    """Fix round 1: `conflict` is a real, persisted `model_hashes` column
+    (migration c9d0e1f2a3b4), not the old in-memory/per-process poisoned-name
+    set -- so unlike that design, nothing needs to be "re-learned" after a
+    restart. Simulate a restart by simply calling `entries()` again with a
+    fresh `data_dir`-scoped session (there is no in-memory state left to
+    clear) -- the exclusion holds immediately, before any new inventory
+    report ever arrives.
     """
     model_manifest.record_hash("worker-first", "clip_l.safetensors", _bytes(0.23), _sha("a"))
-    model_manifest.record_hash("worker-second", "clip_l.safetensors", _bytes(0.23), _sha("b"))
-    assert "clip_l.safetensors" in model_manifest.poisoned_names()
-
-    # Simulate a process restart: the in-memory poisoned set is gone, but
-    # the two disagreeing model_hashes rows are still on disk.
-    model_manifest._poisoned_names.clear()
-    assert "clip_l.safetensors" not in model_manifest.poisoned_names()
-    names = {e["name"] for e in model_manifest.entries(data_dir)}
-    assert "clip_l.safetensors" in names  # not yet re-poisoned this process
-
-    # A fresh inventory report for the same (name, size) -- e.g. worker-second
-    # (or any worker) reconnecting and reporting inventory again -- still
-    # disagrees with the first-seen row, so it reproduces the conflict.
     with caplog.at_level(logging.WARNING, logger="comfyfed_server.model_manifest"):
         model_manifest.record_hash("worker-second", "clip_l.safetensors", _bytes(0.23), _sha("b"))
 
-    assert "clip_l.safetensors" in model_manifest.poisoned_names()
+    with db.get_session() as session:
+        row = session.get(db.ModelHash, ("clip_l.safetensors", _bytes(0.23)))
+        assert row.conflict is True
+
+    # "Restart": nothing to reset (no module-level state exists to survive
+    # or be forgotten) -- the exclusion is simply read straight from the row
+    # every time, so it is correct on the very next call, immediately.
     names = {e["name"] for e in model_manifest.entries(data_dir)}
     assert "clip_l.safetensors" not in names
 
@@ -234,7 +227,6 @@ def client(tmp_path):
     c = TestClient(app)
     c.admin_password = result.admin_password
     yield c
-    model_manifest._poisoned_names.clear()
 
 
 def _login(client):
