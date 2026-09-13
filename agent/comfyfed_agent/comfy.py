@@ -395,7 +395,10 @@ def run_workflow(
         results: list[tuple[str, bytes, str]] = []
         outputs = history_entry.get("outputs") or {}
         for node_output in outputs.values():
-            for key in ("images", "gifs", "videos"):
+            # "files" is how text-writing output nodes (`SaveText`) list what
+            # they saved; the entries carry the same filename/subfolder/type
+            # shape as the media keys.
+            for key in ("images", "gifs", "videos", "files"):
                 for item in node_output.get(key, []) or []:
                     subfolder = item.get("subfolder", "")
                     params = {
