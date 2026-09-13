@@ -186,6 +186,56 @@ def test_object_info_worker_count_is_zero_with_no_workers(client):
     assert r.headers["X-ComfyFed-No-Workers"] == "1"
 
 
+def test_object_info_intersection_mode_drops_classes_missing_on_any_worker(client):
+    csrf = _login(client)
+    _register_worker(
+        client, csrf, "w1", object_info={"KSampler": {"input": {}}, "Shared": {"v": 1}}
+    )
+    _register_worker(
+        client, csrf, "w2", object_info={"LoadImage": {"input": {}}, "Shared": {"v": 2}}
+    )
+
+    r = client.post(
+        "/api/settings", json={"object_info_mode": "intersection"}, headers={"X-CSRF": csrf}
+    )
+    assert r.status_code == 200
+
+    body = client.get("/comfy/api/object_info").json()
+    # Only present on w1/w2 both -> KSampler and LoadImage are each on just
+    # one worker and are dropped; Shared is on both and survives.
+    assert set(body) == {"Shared"}
+    # Value-level merge for a surviving class stays the plain first-worker-
+    # wins pick -- intersection only governs class *presence*.
+    assert body["Shared"] == {"v": 1}
+
+
+def test_object_info_intersection_mode_keeps_classes_on_every_worker(client):
+    csrf = _login(client)
+    _register_worker(client, csrf, "w1", object_info={"KSampler": {}, "Shared": {}})
+    _register_worker(client, csrf, "w2", object_info={"KSampler": {}, "Shared": {}})
+
+    client.post("/api/settings", json={"object_info_mode": "intersection"}, headers={"X-CSRF": csrf})
+
+    body = client.get("/comfy/api/object_info").json()
+    assert set(body) == {"KSampler", "Shared"}
+
+
+def test_object_info_mode_change_misses_the_cache(client):
+    """The cache is keyed on (fleet, mode): flipping the setting must not
+    keep serving the other mode's stale answer."""
+    csrf = _login(client)
+    _register_worker(client, csrf, "w1", object_info={"KSampler": {}})
+    _register_worker(client, csrf, "w2", object_info={"LoadImage": {}})
+
+    assert set(client.get("/comfy/api/object_info").json()) == {"KSampler", "LoadImage"}
+
+    client.post("/api/settings", json={"object_info_mode": "intersection"}, headers={"X-CSRF": csrf})
+    assert set(client.get("/comfy/api/object_info").json()) == set()
+
+    client.post("/api/settings", json={"object_info_mode": "union"}, headers={"X-CSRF": csrf})
+    assert set(client.get("/comfy/api/object_info").json()) == {"KSampler", "LoadImage"}
+
+
 def test_object_info_cache_invalidates_when_worker_hash_changes(client):
     csrf = _login(client)
     worker_id = _register_worker(client, csrf, "w1", object_info={"NodeA": {}})

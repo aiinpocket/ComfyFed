@@ -84,6 +84,7 @@ import json
 import logging
 import os
 import shutil
+from collections import OrderedDict
 from importlib import resources
 
 from fastapi import APIRouter, HTTPException
@@ -194,6 +195,38 @@ def _load_json(path: str) -> list | dict | None:
         return None
 
 
+# (path -> (mtime, parsed JSON)) cache for the index files: `index.json` and
+# `index.<locale>.json`, packaged and official copies alike. The key space is
+# a small, fixed set of literal filenames (unlike the per-workflow cache
+# below, this is never one entry per request), so a plain unbounded dict is
+# fine -- mirrors `model_guide.harvest`'s (mtime signature, result) cache.
+# Plain dict + mtime compare, no locks needed: FastAPI's threadpool may run
+# this concurrently, but a rebuild is idempotent (worst case two threads
+# re-read the same unchanged file and one write clobbers the other with an
+# equal value), so nothing corrupts.
+_index_json_cache: dict[str, tuple[float, list | dict | None]] = {}
+
+
+def _load_json_cached(path: str) -> list | dict | None:
+    """`_load_json`, memoized on `path`'s mtime so a second request for an
+    unchanged index file does zero re-reads. A file that starts missing (no
+    mtime) or goes missing between calls is never cached -- there is nothing
+    to invalidate against, so it is simplest to just re-check every time."""
+    try:
+        mtime = os.path.getmtime(path)
+    except OSError:
+        _index_json_cache.pop(path, None)
+        return None
+
+    cached = _index_json_cache.get(path)
+    if cached is not None and cached[0] == mtime:
+        return cached[1]
+
+    data = _load_json(path)
+    _index_json_cache[path] = (mtime, data)
+    return data
+
+
 _DOWNLOAD_KEYS = ("url", "hash", "hash_type")
 
 
@@ -231,12 +264,53 @@ def _strip_download_metadata(workflow):
     return result
 
 
+# (path -> (mtime, stripped JSON)) cache for official workflow files, bounded
+# LRU: the official library can carry hundreds of `<name>.json` workflows, so
+# an unbounded cache (unlike `_index_json_cache` above, whose key space is a
+# handful of literal index filenames) would hold every one ever served for
+# the process lifetime. `_MAX_STRIPPED_CACHE` caps it; the oldest entry is
+# evicted first via `OrderedDict.move_to_end`/`popitem(last=False)`. Plain
+# dict + mtime compare, no locks: FastAPI's threadpool may run this
+# concurrently, but a rebuild is idempotent, so a race just re-strips the
+# same file twice rather than corrupting anything.
+_MAX_STRIPPED_CACHE = 256
+_stripped_workflow_cache: "OrderedDict[str, tuple[float, dict]]" = OrderedDict()
+
+
+def _cached_stripped_workflow(path: str) -> dict | None:
+    """`_strip_download_metadata(_load_json(path))`, memoized on `path`'s
+    mtime -- None if the file is missing/unreadable/malformed or not a JSON
+    object (a workflow is always a dict; anything else is not our shape)."""
+    try:
+        mtime = os.path.getmtime(path)
+    except OSError:
+        _stripped_workflow_cache.pop(path, None)
+        return None
+
+    cached = _stripped_workflow_cache.get(path)
+    if cached is not None and cached[0] == mtime:
+        _stripped_workflow_cache.move_to_end(path)
+        return cached[1]
+
+    workflow = _load_json(path)
+    if not isinstance(workflow, dict):
+        _stripped_workflow_cache.pop(path, None)
+        return None
+
+    stripped = _strip_download_metadata(workflow)
+    _stripped_workflow_cache[path] = (mtime, stripped)
+    _stripped_workflow_cache.move_to_end(path)
+    while len(_stripped_workflow_cache) > _MAX_STRIPPED_CACHE:
+        _stripped_workflow_cache.popitem(last=False)
+    return stripped
+
+
 def _merged_index(data_dir: str, index_name: str) -> list | None:
     """ComfyFed's categories from `index_name` (packaged) followed by the
     official library's categories from the same-named file in `official_dir`,
     if it exists and parses. None if neither side has anything to serve."""
-    ours = _load_json(os.path.join(templates_dir(), index_name))
-    official = _load_json(os.path.join(official_templates.official_dir(data_dir), index_name))
+    ours = _load_json_cached(os.path.join(templates_dir(), index_name))
+    official = _load_json_cached(os.path.join(official_templates.official_dir(data_dir), index_name))
 
     if not isinstance(official, list):
         if official is not None:
@@ -294,10 +368,10 @@ def create_router(data_dir: str) -> APIRouter:
             return JSONResponse(merged)
 
         if filename.startswith("index.") and filename.endswith(".json") and filename != "index.json":
-            official = _load_json(os.path.join(official_dir, filename))
+            official = _load_json_cached(os.path.join(official_dir, filename))
             if not isinstance(official, list):
                 raise HTTPException(status_code=404, detail="Not found")
-            ours = _load_json(os.path.join(templates_dir(), "index.json"))
+            ours = _load_json_cached(os.path.join(templates_dir(), "index.json"))
             ours_list = ours if isinstance(ours, list) else []
             return JSONResponse(ours_list + official)
 
@@ -317,9 +391,9 @@ def create_router(data_dir: str) -> APIRouter:
         media_type = _MEDIA_TYPES.get(extension, "application/octet-stream")
 
         if source == "official" and extension == ".json":
-            workflow = _load_json(path)
-            if isinstance(workflow, dict):
-                return JSONResponse(_strip_download_metadata(workflow))
+            stripped = _cached_stripped_workflow(path)
+            if stripped is not None:
+                return JSONResponse(stripped)
 
         return FileResponse(path, media_type=media_type)
 

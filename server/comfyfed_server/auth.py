@@ -16,6 +16,9 @@ _SESSION_SECRET_KEY = "session_secret"
 _ADMIN_PASSWORD_HASH_KEY = "admin_password_hash"
 _LANG_KEY = "lang"
 _PLATFORM_URL_KEY = "platform_url"
+_OBJECT_INFO_MODE_KEY = "object_info_mode"
+_OBJECT_INFO_MODES = ("union", "intersection")
+_DEFAULT_OBJECT_INFO_MODE = "union"
 
 SESSION_COOKIE_NAME = "cf_session"
 _COOKIE_MAX_AGE = 7 * 24 * 3600  # 7 days
@@ -230,9 +233,26 @@ def change_password(
 class SettingsBody(BaseModel):
     platform_url: Optional[str] = None
     lang: Optional[str] = None
+    object_info_mode: Optional[str] = None
 
 
 settings_router = APIRouter()
+
+
+def _current_settings(db_session) -> dict:
+    return {
+        "platform_url": _get_setting(db_session, _PLATFORM_URL_KEY) or "",
+        "lang": _get_setting(db_session, _LANG_KEY) or "en",
+        "object_info_mode": _get_setting(db_session, _OBJECT_INFO_MODE_KEY) or _DEFAULT_OBJECT_INFO_MODE,
+    }
+
+
+@settings_router.get("/api/settings")
+def read_settings(_payload: dict = Depends(require_admin)):
+    """Current server-level settings, for a console that opens straight to the
+    Settings page rather than seeding itself from a prior POST's response."""
+    with db.get_session() as db_session:
+        return _current_settings(db_session)
 
 
 @settings_router.post("/api/settings")
@@ -245,6 +265,12 @@ def update_settings(
     `platform_url` is validated as an absolute http(s) URL because it is baked
     verbatim into every worker registration bundle -- a relative or malformed
     value would silently produce agents that can never connect back.
+
+    `object_info_mode` governs Task 7's `/comfy/api/object_info` merge:
+    `union` (default) serves every node class any online worker defines,
+    `intersection` serves only classes every online worker defines. See
+    `comfyapi._merged_object_info` for why the combo-value merge stays
+    union-shaped either way.
     """
     updates: dict[str, str] = {}
 
@@ -261,12 +287,18 @@ def update_settings(
             raise _error(400, "settings.bad_lang", "Language must be one of: zh-TW, en.")
         updates[_LANG_KEY] = body.lang
 
+    if body.object_info_mode is not None:
+        if body.object_info_mode not in _OBJECT_INFO_MODES:
+            raise _error(
+                400,
+                "settings.bad_object_info_mode",
+                "object_info_mode 必須是 union 或 intersection 其中之一。",
+            )
+        updates[_OBJECT_INFO_MODE_KEY] = body.object_info_mode
+
     with db.get_session() as db_session:
         for key, value in updates.items():
             _set_setting(db_session, key, value)
         db_session.commit()
 
-        return {
-            "platform_url": _get_setting(db_session, _PLATFORM_URL_KEY) or "",
-            "lang": _get_setting(db_session, _LANG_KEY) or "en",
-        }
+        return _current_settings(db_session)

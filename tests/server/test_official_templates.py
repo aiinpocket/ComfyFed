@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import hashlib
 import os
+import tempfile
 import zipfile
 from io import BytesIO
 
@@ -69,6 +70,22 @@ def _pkg_json(url: str, payload: bytes):
     }
 
 
+def _fake_download_for(downloads: dict):
+    """Build a `_download` fake matching the real seam's contract: writes
+    `payload` to a temp file and returns `(path, sha256_hex)`."""
+
+    def _fake_download(url):
+        if url not in downloads:
+            raise AssertionError(f"unexpected _download url: {url}")
+        payload = downloads[url]
+        tmp = tempfile.NamedTemporaryFile(delete=False)
+        tmp.write(payload)
+        tmp.close()
+        return tmp.name, hashlib.sha256(payload).hexdigest()
+
+    return _fake_download
+
+
 def _install_fakes(monkeypatch, *, meta=None, core_should_not_be_fetched=True):
     meta = meta if meta is not None else _meta_json()
     json_url = "http://example/json-pkg.whl"
@@ -95,13 +112,8 @@ def _install_fakes(monkeypatch, *, meta=None, core_should_not_be_fetched=True):
             raise AssertionError(f"unexpected _get_json url: {url}")
         return responses[url]
 
-    def _fake_download(url):
-        if url not in downloads:
-            raise AssertionError(f"unexpected _download url: {url}")
-        return downloads[url]
-
     monkeypatch.setattr(official_templates, "_get_json", _fake_get_json)
-    monkeypatch.setattr(official_templates, "_download", _fake_download)
+    monkeypatch.setattr(official_templates, "_download", _fake_download_for(downloads))
     return seen_urls
 
 
@@ -164,7 +176,9 @@ def test_fetch_raises_on_sha256_mismatch_and_leaves_official_dir_untouched(tmp_p
     monkeypatch.setattr(
         official_templates,
         "_download",
-        lambda url: b"corrupted" if "json-pkg" in url else _MEDIA_WHEEL,
+        _fake_download_for(
+            {"http://example/json-pkg.whl": b"corrupted", "http://example/media-pkg.whl": _MEDIA_WHEEL}
+        ),
     )
 
     with pytest.raises(official_templates.FetchError, match="sha256 mismatch"):
@@ -206,7 +220,7 @@ def test_fetch_rerun_replaces_stale_content(tmp_path, monkeypatch):
     monkeypatch.setattr(
         official_templates,
         "_download",
-        lambda url: {json_url: smaller_wheel, media_url: _MEDIA_WHEEL}[url],
+        _fake_download_for({json_url: smaller_wheel, media_url: _MEDIA_WHEEL}),
     )
 
     official_templates.fetch(data_dir)
@@ -214,6 +228,99 @@ def test_fetch_rerun_replaces_stale_content(tmp_path, monkeypatch):
     assert os.path.isfile(os.path.join(out, "bar.json"))
     assert not os.path.exists(os.path.join(out, "foo.json"))
     assert not os.path.exists(os.path.join(out, "foo-1.webp"))
+
+
+# --- Task 7: streaming download with a size cap -------------------------
+
+
+class _FakeStreamResponse:
+    """Stands in for the `httpx.stream(...)` context manager: yields fixed
+    chunks and never raises from `raise_for_status`."""
+
+    def __init__(self, chunks):
+        self._chunks = chunks
+
+    def raise_for_status(self):
+        pass
+
+    def iter_bytes(self):
+        yield from self._chunks
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc_info):
+        return False
+
+
+def test_download_streams_to_a_temp_file_and_hashes_it(monkeypatch):
+    payload = b"a" * 1000 + b"b" * 1000
+    chunks = [payload[:1000], payload[1000:]]
+
+    monkeypatch.setattr(
+        official_templates.httpx, "stream", lambda *a, **k: _FakeStreamResponse(chunks)
+    )
+
+    path, digest = official_templates._download("http://example/some.whl")
+    try:
+        assert digest == hashlib.sha256(payload).hexdigest()
+        with open(path, "rb") as f:
+            assert f.read() == payload
+    finally:
+        os.unlink(path)
+
+
+def test_download_cap_is_512mb():
+    assert official_templates._MAX_WHEEL_BYTES == 512 * 1024 * 1024
+
+
+def test_download_aborts_mid_stream_past_the_cap_and_cleans_up(monkeypatch):
+    # A small cap (rather than the real 512 MB) keeps this test fast and
+    # light on memory while still proving the abort happens mid-stream --
+    # partway through the second chunk -- not only after a full (and,
+    # pre-Task-7, unbounded) download completed.
+    monkeypatch.setattr(official_templates, "_MAX_WHEEL_BYTES", 150)
+    chunks = [b"x" * 100, b"y" * 100, b"z" * 100]  # crosses 150 bytes in chunk 2
+
+    written_paths = []
+    real_named_temp_file = tempfile.NamedTemporaryFile
+
+    def _tracking_named_temp_file(*args, **kwargs):
+        f = real_named_temp_file(*args, **kwargs)
+        written_paths.append(f.name)
+        return f
+
+    monkeypatch.setattr(
+        official_templates.httpx, "stream", lambda *a, **k: _FakeStreamResponse(chunks)
+    )
+    monkeypatch.setattr(official_templates.tempfile, "NamedTemporaryFile", _tracking_named_temp_file)
+
+    with pytest.raises(official_templates.FetchError, match="上限，已中止下載"):
+        official_templates._download("http://example/huge.whl")
+
+    assert written_paths and not os.path.exists(written_paths[0])
+
+
+def test_fetch_aborts_with_zh_tw_error_when_a_sub_package_wheel_is_oversize(tmp_path, monkeypatch):
+    """`fetch()` propagates `_download`'s cap error untouched (it already
+    carries the zh-TW message) and leaves no `official_dir` behind, same
+    guarantee as the sha256-mismatch path."""
+    _install_fakes(monkeypatch)
+    data_dir = str(tmp_path)
+
+    def _fake_download(url):
+        if "json-pkg" in url:
+            raise official_templates.FetchError(
+                f"下載檔案超過 {official_templates._MAX_WHEEL_BYTES // (1024 * 1024)} MB 上限，已中止下載：{url}"
+            )
+        return _fake_download_for({url: _MEDIA_WHEEL})(url)
+
+    monkeypatch.setattr(official_templates, "_download", _fake_download)
+
+    with pytest.raises(official_templates.FetchError, match="512 MB"):
+        official_templates.fetch(data_dir)
+
+    assert not os.path.exists(official_templates.official_dir(data_dir))
 
 
 def test_fetch_with_explicit_version_queries_that_release(tmp_path, monkeypatch):
@@ -228,7 +335,9 @@ def test_fetch_with_explicit_version_queries_that_release(tmp_path, monkeypatch)
         return _pkg_json("http://example/media-pkg.whl", _MEDIA_WHEEL)
 
     monkeypatch.setattr(official_templates, "_get_json", _fake_get_json)
-    monkeypatch.setattr(official_templates, "_download", lambda url: _MEDIA_WHEEL)
+    monkeypatch.setattr(
+        official_templates, "_download", _fake_download_for({"http://example/media-pkg.whl": _MEDIA_WHEEL})
+    )
 
     manifest = official_templates.fetch(data_dir, version="0.9.0")
     assert manifest["meta_version"] == "0.9.0"

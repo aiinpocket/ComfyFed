@@ -146,7 +146,11 @@ def test_update_settings_writes_platform_url_and_lang(client):
         headers={"X-CSRF": csrf},
     )
     assert r.status_code == 200
-    assert r.json() == {"platform_url": "https://fed.example", "lang": "zh-TW"}
+    assert r.json() == {
+        "platform_url": "https://fed.example",
+        "lang": "zh-TW",
+        "object_info_mode": "union",
+    }
 
     me = client.get("/api/auth/me").json()
     assert me["platform_url"] == "https://fed.example"
@@ -186,6 +190,34 @@ def test_update_settings_requires_csrf(client):
 def test_update_settings_requires_login(client):
     r = client.post("/api/settings", json={"lang": "en"}, headers={"X-CSRF": "x"})
     assert r.status_code == 401
+
+
+def test_get_settings_reports_defaults_before_any_write(client):
+    _csrf(client)
+    r = client.get("/api/settings")
+    assert r.status_code == 200
+    assert r.json() == {"platform_url": "http://h", "lang": "en", "object_info_mode": "union"}
+
+
+def test_get_settings_requires_login(client):
+    r = client.get("/api/settings")
+    assert r.status_code == 401
+
+
+def test_update_settings_writes_object_info_mode(client):
+    csrf = _csrf(client)
+    r = client.post("/api/settings", json={"object_info_mode": "intersection"}, headers={"X-CSRF": csrf})
+    assert r.status_code == 200
+    assert r.json()["object_info_mode"] == "intersection"
+
+    assert client.get("/api/settings").json()["object_info_mode"] == "intersection"
+
+
+def test_update_settings_rejects_an_unknown_object_info_mode(client):
+    csrf = _csrf(client)
+    r = client.post("/api/settings", json={"object_info_mode": "bogus"}, headers={"X-CSRF": csrf})
+    assert r.status_code == 400
+    assert r.json()["error"]["code"] == "settings.bad_object_info_mode"
 
 
 # --- the public session-reading surface (M4) -----------------------------------
