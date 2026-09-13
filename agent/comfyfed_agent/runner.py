@@ -9,6 +9,7 @@ import json
 import logging
 import ntpath
 import os
+import signal
 import time
 from dataclasses import dataclass, field
 from enum import Enum
@@ -36,6 +37,14 @@ _BACKOFF_MAX_SECONDS = 60
 # to hand it over until the agent stops.
 _REPORT_RETRY_START_SECONDS = 1.0
 _REPORT_RETRY_MAX_SECONDS = 30.0
+
+# Hard cap on the whole "signal received -> jobs wound down -> loop stopped"
+# sequence (see `AgentLoop._graceful_shutdown_and_stop`). A ghost ComfyUI
+# prompt is a known, designed-for recovery path (the server's stale-job
+# requeue); a process that never exits on Ctrl-C is not, so on timeout we
+# stop waiting and let the interpreter tear the loop down instead of hanging
+# forever on a wedged cleanup.
+_SIGNAL_SHUTDOWN_TIMEOUT_SECONDS = 10.0
 
 
 class PlatformUnavailable(Exception):
@@ -424,6 +433,11 @@ class AgentLoop:
         # Most recently spawned job (diagnostics, and what tests await).
         self._current_job_task: Optional[asyncio.Task] = None
         self._current_job_id: Optional[str] = None
+        # Set the instant the first SIGINT/SIGTERM/SIGBREAK is handled, so a
+        # second signal (impatient operator, or a stuck cleanup) is
+        # recognised as "already shutting down" and forces an immediate exit
+        # instead of layering a second wind-down on top of the first.
+        self._shutdown_in_progress = False
 
     async def broadcast_heartbeat(
         self,
@@ -973,6 +987,108 @@ class AgentLoop:
         self._stop_tasks.clear()
         self._jobs.clear()
 
+    def _install_signal_handlers(self, loop: asyncio.AbstractEventLoop) -> None:
+        """Install SIGINT/SIGTERM (and SIGBREAK on Windows) handlers.
+
+        Windows' asyncio does not support `loop.add_signal_handler` (POSIX
+        only), and a `signal.signal` handler always runs on the main thread
+        outside the event loop's own control flow -- so it must not touch
+        asyncio state directly. It only schedules `_on_os_signal` back onto
+        the loop via `call_soon_threadsafe`, which is the one thread-safe way
+        to hand control back to a coroutine world from a signal handler.
+
+        Ctrl-C in a real console (and CTRL_BREAK on Windows) previously had
+        no handler at all here, so the interpreter's default action killed
+        the process instantly (exit 0xC000013A) with no chance to run
+        `shutdown()` -- the dispatched ComfyUI prompt kept rendering as a
+        ghost with nobody left to report or cancel it. See T3m9.
+        """
+
+        def _handler(signum, _frame) -> None:
+            loop.call_soon_threadsafe(self._on_os_signal, signum, loop)
+
+        sig_names = ["SIGINT", "SIGTERM"]
+        if hasattr(signal, "SIGBREAK"):  # Windows only (Ctrl-Break / console close)
+            sig_names.append("SIGBREAK")
+
+        for name in sig_names:
+            sig = getattr(signal, name)
+            try:
+                signal.signal(sig, _handler)
+            except (ValueError, OSError):
+                # ValueError: not the main thread (e.g. under some test
+                # runners). OSError: platform refuses this signal. Either
+                # way, logging and moving on beats crashing agent startup
+                # over best-effort shutdown handling.
+                logger.debug("runner: could not install a handler for %s", name)
+
+    def _on_os_signal(self, signum: int, loop: asyncio.AbstractEventLoop) -> None:
+        """Runs on the event loop (via `call_soon_threadsafe`) the instant a
+        console signal is delivered.
+
+        Idempotent: the first signal starts the graceful wind-down; any
+        signal after that (an operator hitting Ctrl-C twice, or one arriving
+        while cleanup is already stuck) skips straight to `os._exit` --
+        there is nothing more cooperative left to try.
+        """
+        if self._shutdown_in_progress:
+            logger.warning(
+                "再次收到中止訊號，強制立即結束 / received a second interrupt signal (%s), "
+                "forcing immediate exit",
+                signum,
+            )
+            os._exit(1)
+            return
+
+        self._shutdown_in_progress = True
+        logger.info(
+            "收到中止訊號，正在停止 ComfyUI 工作並清理… / received signal %s, "
+            "stopping the ComfyUI job and cleaning up",
+            signum,
+        )
+        loop.create_task(
+            self._graceful_shutdown_and_stop(loop), name="comfyfed-signal-shutdown"
+        )
+
+    async def _graceful_shutdown_and_stop(self, loop: asyncio.AbstractEventLoop) -> None:
+        """Run the full graceful wind-down (`shutdown`) under a hard cap, then
+        stop the event loop so the process actually exits.
+
+        `shutdown()` already does the real work reused from server-driven
+        cancellation: trip every running job's `cancel_event`, call
+        `_stop_comfy_prompt` (which does `comfy.interrupt_or_dequeue` against
+        ComfyUI), and run `cleanup_job_files` with `CleanupMode.CANCELLED` --
+        never a completion or failure report, because the server's stale-job
+        timeout is the designed recovery for a job this process is
+        abandoning. This wrapper only adds the timeout and the actual
+        process exit.
+        """
+        try:
+            await asyncio.wait_for(self.shutdown(), timeout=_SIGNAL_SHUTDOWN_TIMEOUT_SECONDS)
+        except asyncio.TimeoutError:
+            logger.warning(
+                "清理逾時，強制結束程序 / graceful shutdown timed out after %.0fs, forcing exit",
+                _SIGNAL_SHUTDOWN_TIMEOUT_SECONDS,
+            )
+            os._exit(1)
+            return
+        except Exception:
+            logger.exception("runner: graceful shutdown raised unexpectedly, forcing exit")
+            os._exit(1)
+            return
+
+        loop.stop()
+
+    @property
+    def shutdown_in_progress(self) -> bool:
+        """True from the first console signal onward.
+
+        Public so the CLI entry point (`main._cmd_run`) can tell a clean,
+        signal-initiated `loop.stop()` apart from any other `RuntimeError`
+        `asyncio.run` might raise -- see `_graceful_shutdown_and_stop`.
+        """
+        return self._shutdown_in_progress
+
     async def _handle_message(self, conn: PlatformConnection, message: dict) -> None:
         msg_type = message.get("type")
         if msg_type == "job":
@@ -1066,7 +1182,17 @@ class AgentLoop:
     async def run(self) -> None:
         if not self.connections:
             return
+        loop = asyncio.get_running_loop()
+        self._install_signal_handlers(loop)
         try:
             await asyncio.gather(*(self._run_platform(conn) for conn in self.connections.values()))
         finally:
-            await self.shutdown()
+            # A signal already ran (and awaited) the full graceful shutdown
+            # via `_graceful_shutdown_and_stop` before stopping the loop --
+            # running it a second time here would re-enter `shutdown()` on
+            # an already-empty job table, which is harmless but pointless,
+            # and would race `os._exit` on a stuck cleanup. Only run it here
+            # for the ordinary "gather raised" path (e.g. every platform
+            # connection failing outright) that no signal ever touched.
+            if not self._shutdown_in_progress:
+                await self.shutdown()

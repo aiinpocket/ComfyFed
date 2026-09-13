@@ -78,6 +78,13 @@ MODEL_SOURCES = {
         "official": "https://huggingface.co/Comfy-Org/Krea-2/resolve/main/text_encoders/qwen3vl_4b_bf16.safetensors",
         "gated": False,
     },
+    # Phase 1.10 Task 1, model registry entry #11 -- the image-upscale
+    # template's single model.
+    "RealESRGAN_x4plus.pth": {
+        "dir": "upscale_models",
+        "official": "https://github.com/xinntao/Real-ESRGAN/releases/download/v0.1.0/RealESRGAN_x4plus.pth",
+        "gated": False,
+    },
 }
 MODEL_INVENTORY = set(MODEL_SOURCES)
 FLUX_GATED_CAVEAT = "（需登入 HuggingFace 並同意 FLUX.1-dev 授權）"
@@ -89,7 +96,14 @@ MISSING_MODELS_NOTE_TITLE = "⓪ 缺模型？/ Missing models?"
 # sense for a template with loaders/models is scoped to the other three via
 # MODEL_BEARING_TEMPLATE_NAMES, so it keeps checking those three exactly as
 # strictly as before instead of silently covering fewer templates.
-ZERO_MODEL_TEMPLATE_NAMES = ("comfyfed-video-concat", "comfyfed-image-intro-video")
+# Phase 1.10 Task 1 added "comfyfed-video-trim" as a third zero-model
+# template: it needs no loaders, no "缺模型？" note, and the same 3-group
+# layout as the other two.
+ZERO_MODEL_TEMPLATE_NAMES = (
+    "comfyfed-video-concat",
+    "comfyfed-image-intro-video",
+    "comfyfed-video-trim",
+)
 MODEL_BEARING_TEMPLATE_NAMES = tuple(
     n for n in ("comfyfed-wuxia-t2i", "comfyfed-character-portrait", "comfyfed-ref2v-video")
 )
@@ -103,7 +117,32 @@ MODEL_BEARING_TEMPLATE_NAMES = tuple(
 # note-format tests below run over both sets combined
 # (NOTE_BEARING_TEMPLATE_NAMES) rather than skipping these two.
 ONE_MODEL_TEMPLATE_NAMES = ("comfyfed-image-to-prompt", "comfyfed-text-to-prompt")
-NOTE_BEARING_TEMPLATE_NAMES = MODEL_BEARING_TEMPLATE_NAMES + ONE_MODEL_TEMPLATE_NAMES
+# Phase 1.10 Task 1 added two more note-bearing, 3-group templates:
+# "comfyfed-flf2v-video" (the full FIVE-model H3 stack, same models as
+# comfyfed-ref2v-video, but laid out with the compact ①②③ notes instead of
+# the 4-group "這是什麼範本" layout) and "comfyfed-image-upscale" (a single
+# curated model, entry #11). Neither fits MODEL_BEARING_TEMPLATE_NAMES (wrong
+# group count) nor ONE_MODEL_TEMPLATE_NAMES (that tuple's own tests assert
+# EXACTLY the shared qwen3vl_4b model), so they get their own tuples below
+# and their own placement tests, while still joining NOTE_BEARING_TEMPLATE_NAMES
+# for the generic note-mentions-every-model / dual-link checks.
+FLF2V_TEMPLATE_NAMES = ("comfyfed-flf2v-video",)
+IMAGE_UPSCALE_TEMPLATE_NAMES = ("comfyfed-image-upscale",)
+NOTE_BEARING_TEMPLATE_NAMES = (
+    MODEL_BEARING_TEMPLATE_NAMES
+    + ONE_MODEL_TEMPLATE_NAMES
+    + FLF2V_TEMPLATE_NAMES
+    + IMAGE_UPSCALE_TEMPLATE_NAMES
+)
+# Every template using the compact 3-group layout (① edit region, ②, ③),
+# rather than the 4-group "load models / subject / sample / output" layout
+# the three MODEL_BEARING_TEMPLATE_NAMES templates use.
+THREE_GROUP_TEMPLATE_NAMES = (
+    ZERO_MODEL_TEMPLATE_NAMES
+    + ONE_MODEL_TEMPLATE_NAMES
+    + FLF2V_TEMPLATE_NAMES
+    + IMAGE_UPSCALE_TEMPLATE_NAMES
+)
 ZERO_MODEL_ALLOWED_NODE_TYPES = {
     "MarkdownNote",
     "LoadImage",
@@ -115,6 +154,7 @@ ZERO_MODEL_ALLOWED_NODE_TYPES = {
     "SaveVideo",
     "ImageScale",
     "RepeatImageBatch",
+    "ImageFromBatch",
 }
 
 
@@ -314,7 +354,7 @@ def test_template_workflow_is_annotated_ui_format(name):
     # ②組裝 ③輸出) since they only have one shared loader, not a whole
     # loader-only group's worth.
     titles = [g["title"] for g in workflow["groups"]]
-    expected_groups = 3 if name in ZERO_MODEL_TEMPLATE_NAMES + ONE_MODEL_TEMPLATE_NAMES else 4
+    expected_groups = 3 if name in THREE_GROUP_TEMPLATE_NAMES else 4
     assert len(titles) == expected_groups, name
     assert all(t.strip() for t in titles)
 
@@ -343,11 +383,15 @@ def test_subject_specific_notes_are_not_shared_between_templates():
     template makes, so sharing one verbatim means it is describing the wrong
     thing.
     """
-    shareable = "① 模型載入器 / Model loaders"
+    # comfyfed-flf2v-video deliberately copies comfyfed-ref2v-video's ⓪
+    # missing-models note verbatim (Phase 1.10 Task 1) -- both ship exactly
+    # the same five H3-stack models, so the note legitimately says the same
+    # thing twice.
+    shareable = {"① 模型載入器 / Model loaders", MISSING_MODELS_NOTE_TITLE}
     seen: dict[str, str] = {}
     for name in templates.TEMPLATE_NAMES:
         for title, text in _notes_by_title(name).items():
-            if title == shareable:
+            if title in shareable:
                 continue
             owner = seen.setdefault(text, name)
             assert owner == name, f"{name} reuses {owner}'s note verbatim: {title}"
@@ -561,13 +605,15 @@ def test_object_info_injection_does_not_duplicate_or_poison_the_cache(client):
 
 
 def _loader_model_filenames(workflow):
-    """Every `.safetensors` widget value in the graph -- i.e. the checkpoint,
-    text-encoder, VAE and LoRA files a loader node names, regardless of which
-    loader type carries it."""
+    """Every `.safetensors`/`.pth` widget value in the graph -- i.e. the
+    checkpoint, text-encoder, VAE, LoRA, and upscale-model files a loader
+    node names, regardless of which loader type carries it. `.pth` covers
+    Phase 1.10's RealESRGAN entry, which ships as a `.pth` rather than a
+    `.safetensors` file."""
     names = set()
     for node in workflow["nodes"]:
         for value in node.get("widgets_values", []):
-            if isinstance(value, str) and value.endswith(".safetensors"):
+            if isinstance(value, str) and value.endswith((".safetensors", ".pth")):
                 names.add(value)
     return names
 
@@ -608,6 +654,63 @@ def test_one_model_missing_models_note_exists_and_is_placed_first(name):
         if n.get("title", "").startswith("① 用途＋紅框")
     )
     assert workflow["nodes"][0]["pos"][1] < other_top_left["pos"][1]
+
+
+def test_flf2v_missing_models_note_exists_and_is_placed_first():
+    """Same placement guarantee as the others, adapted for flf2v's 3-group
+    layout: its reference point is the "① 用途＋紅框" note, not "這是什麼範本"
+    (MODEL_BEARING) nor "① 用途＋紅框" prefixed differently (ONE_MODEL uses the
+    exact same prefix by coincidence, but flf2v is checked on its own name to
+    avoid conflating the two groups' fixtures)."""
+    with open(
+        os.path.join(templates.templates_dir(), "comfyfed-flf2v-video.json"), encoding="utf-8"
+    ) as f:
+        workflow = json.load(f)
+
+    assert workflow["nodes"][0]["type"] == "MarkdownNote"
+    assert workflow["nodes"][0]["title"] == MISSING_MODELS_NOTE_TITLE
+    other_top_left = next(
+        n for n in workflow["nodes"] if n.get("title", "").startswith("① 用途＋紅框")
+    )
+    assert workflow["nodes"][0]["pos"][1] < other_top_left["pos"][1]
+
+
+def test_flf2v_uses_exactly_the_ref2v_five_model_stack():
+    """Phase 1.10 Task 1: flf2v's model stack must be EXACTLY comfyfed-ref2v-
+    video's, per the plan's verified-live facts -- no drift, no extras."""
+    with open(
+        os.path.join(templates.templates_dir(), "comfyfed-ref2v-video.json"), encoding="utf-8"
+    ) as f:
+        ref2v = json.load(f)
+    with open(
+        os.path.join(templates.templates_dir(), "comfyfed-flf2v-video.json"), encoding="utf-8"
+    ) as f:
+        flf2v = json.load(f)
+
+    assert _loader_model_filenames(flf2v) == _loader_model_filenames(ref2v)
+    assert len(_loader_model_filenames(flf2v)) == 5
+
+
+def test_image_upscale_missing_models_note_exists_and_is_placed_first():
+    with open(
+        os.path.join(templates.templates_dir(), "comfyfed-image-upscale.json"), encoding="utf-8"
+    ) as f:
+        workflow = json.load(f)
+
+    assert workflow["nodes"][0]["type"] == "MarkdownNote"
+    assert workflow["nodes"][0]["title"] == MISSING_MODELS_NOTE_TITLE
+    other_top_left = next(
+        n for n in workflow["nodes"] if n.get("title", "").startswith("① 換圖就好")
+    )
+    assert workflow["nodes"][0]["pos"][1] < other_top_left["pos"][1]
+
+
+def test_image_upscale_has_exactly_one_curated_model():
+    with open(
+        os.path.join(templates.templates_dir(), "comfyfed-image-upscale.json"), encoding="utf-8"
+    ) as f:
+        workflow = json.load(f)
+    assert _loader_model_filenames(workflow) == {"RealESRGAN_x4plus.pth"}
 
 
 @pytest.mark.parametrize("name", NOTE_BEARING_TEMPLATE_NAMES)
@@ -1136,6 +1239,33 @@ def test_image_intro_video_note_covers_the_amount_formula():
     combined = "\n".join(notes.values())
     assert "amount" in combined
     assert "fps" in combined
+
+
+# --- Phase 1.10 Task 1: flf2v / video-trim / image-upscale --------------
+
+
+def test_video_trim_note_covers_the_frame_math_formula():
+    notes = _notes_by_title("comfyfed-video-trim")
+    combined = "\n".join(notes.values())
+    assert "幀 = 秒 × fps" in combined or "frames = seconds" in combined.lower()
+    assert "24" in combined
+
+
+def test_video_trim_note_is_honest_about_the_audio_sync_boundary():
+    """Verified-live fact: CreateVideo pairs trimmed frames with the FULL,
+    untrimmed audio track -- perfect sync only holds when the trim starts at
+    0s. The note must say so rather than implying audio always lines up."""
+    notes = _notes_by_title("comfyfed-video-trim")
+    combined = "\n".join(notes.values())
+    assert "0 秒" in combined or "0s" in combined
+    assert "從頭" in combined or "starts from 0" in combined.lower()
+
+
+def test_video_trim_index_entry_has_no_models():
+    with open(os.path.join(templates.templates_dir(), "index.json"), encoding="utf-8") as f:
+        index = json.load(f)
+    entry = next(t for t in index[0]["templates"] if t["name"] == "comfyfed-video-trim")
+    assert entry["models"] == []
 
 
 # --- Phase 1.8b Task 2: prompt-helper templates -------------------------

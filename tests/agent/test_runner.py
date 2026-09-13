@@ -1343,3 +1343,127 @@ async def test_send_hello_declares_protocol_2():
     assert payload["type"] == "hello"
     assert payload["protocol"] == 2
     assert payload["hardware"]["platform"] == "Windows"
+
+
+# --- Console-signal (Ctrl-C / Ctrl-Break) shutdown --------------------------
+#
+# T3m9: the agent had no console-signal handling at all, so Ctrl-C (or
+# CTRL_BREAK on Windows) killed the process instantly with zero cleanup --
+# the dispatched ComfyUI prompt kept running as a ghost. A real OS signal
+# can't be delivered inside pytest, so these exercise the pieces the signal
+# handler drives directly: handler installation, the idempotent
+# first-signal/second-signal dispatch, and the graceful-shutdown-and-stop
+# coroutine it schedules.
+
+
+class _FakeLoop:
+    """Stand-in for the running event loop as seen by `_on_os_signal`."""
+
+    def __init__(self):
+        self.stopped = False
+        self.created_tasks: list = []
+
+    def call_soon_threadsafe(self, callback, *args):
+        # The tests below call `_on_os_signal` directly (as
+        # `call_soon_threadsafe` would eventually do on the real loop), so
+        # this is only exercised by the handler-installation test.
+        callback(*args)
+
+    def create_task(self, coro, name=None):
+        task = asyncio.ensure_future(coro)
+        self.created_tasks.append(task)
+        return task
+
+    def stop(self):
+        self.stopped = True
+
+
+def test_install_signal_handlers_covers_sigint_sigterm_and_sigbreak(two_platform_loop, monkeypatch):
+    import signal as signal_module
+
+    installed = {}
+
+    def _fake_signal(sig, handler):
+        installed[sig] = handler
+
+    monkeypatch.setattr(runner_module.signal, "signal", _fake_signal)
+
+    loop = _FakeLoop()
+    two_platform_loop._install_signal_handlers(loop)
+
+    assert signal_module.SIGINT in installed
+    assert signal_module.SIGTERM in installed
+    if hasattr(signal_module, "SIGBREAK"):
+        assert signal_module.SIGBREAK in installed
+
+
+async def test_first_signal_schedules_graceful_shutdown_and_sets_flag(two_platform_loop, monkeypatch):
+    loop = two_platform_loop
+    scheduled = asyncio.Event()
+
+    async def _fake_graceful(fake_loop):
+        scheduled.set()
+
+    monkeypatch.setattr(AgentLoop, "_graceful_shutdown_and_stop", lambda self, fake_loop: _fake_graceful(fake_loop))
+
+    fake_loop = _FakeLoop()
+    loop._on_os_signal(2, fake_loop)  # signal.SIGINT == 2
+
+    assert loop._shutdown_in_progress is True
+    await asyncio.wait_for(scheduled.wait(), timeout=10)
+
+
+def test_second_signal_forces_immediate_exit(two_platform_loop, monkeypatch):
+    loop = two_platform_loop
+    loop._shutdown_in_progress = True  # as if a first signal already landed
+
+    exit_calls = []
+    monkeypatch.setattr(runner_module.os, "_exit", lambda code: exit_calls.append(code))
+
+    fake_loop = _FakeLoop()
+    loop._on_os_signal(2, fake_loop)
+
+    assert exit_calls == [1]
+    assert not fake_loop.created_tasks, "a forced exit must not also schedule a graceful shutdown"
+
+
+async def test_graceful_shutdown_and_stop_interrupts_comfyui_and_reports_nothing(cancellable_loop):
+    """The coroutine a signal schedules must reuse the same cancellation
+    machinery as a server-driven cancel: interrupt/dequeue the ComfyUI
+    prompt, run CANCELLED cleanup, and never report completion -- then stop
+    the loop."""
+    loop = cancellable_loop
+    conn_a = loop.connections["worker-a"]
+
+    await loop._handle_message(conn_a, _job_message("job-sigint"))
+    await _await_flag(loop.test_started)
+
+    fake_loop = _FakeLoop()
+    await asyncio.wait_for(loop._graceful_shutdown_and_stop(fake_loop), timeout=10)
+
+    assert loop.test_interrupts == [(loop.config.comfy_url, "p-slow")]
+    assert conn_a.job_done is None, "a signal-driven shutdown must not report completion"
+    assert conn_a.job_failed is None, "a signal-driven shutdown must not report failure"
+    assert fake_loop.stopped is True
+    assert not loop._jobs, "the job handle must be reaped"
+
+
+async def test_graceful_shutdown_and_stop_forces_exit_on_timeout(cancellable_loop, monkeypatch):
+    """A cleanup that never finishes inside the hard cap must not hang the
+    process forever -- it exits instead."""
+    loop = cancellable_loop
+
+    async def _hang_forever():
+        await asyncio.sleep(3600)
+
+    monkeypatch.setattr(loop, "shutdown", _hang_forever)
+    monkeypatch.setattr(runner_module, "_SIGNAL_SHUTDOWN_TIMEOUT_SECONDS", 0.05)
+
+    exit_calls = []
+    monkeypatch.setattr(runner_module.os, "_exit", lambda code: exit_calls.append(code))
+
+    fake_loop = _FakeLoop()
+    await asyncio.wait_for(loop._graceful_shutdown_and_stop(fake_loop), timeout=10)
+
+    assert exit_calls == [1]
+    assert fake_loop.stopped is False, "a forced exit must not also claim a clean stop"

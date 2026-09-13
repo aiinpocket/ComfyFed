@@ -60,7 +60,21 @@ def _cmd_run(args: argparse.Namespace) -> None:
                 print(f"新版本可用 / A new version is available: {decision.latest} (auto_update is off).")
 
     print(f"Starting agent loop for {len(cfg.platforms)} platform(s)...")
-    asyncio.run(AgentLoop(cfg, args.config).run())
+    agent_loop = AgentLoop(cfg, args.config)
+    try:
+        asyncio.run(agent_loop.run())
+    except RuntimeError as exc:
+        # `_graceful_shutdown_and_stop` calls `loop.stop()` from a task once
+        # a console signal (Ctrl-C / CTRL_BREAK) has been handled and the job
+        # wound down cleanly -- but `asyncio.run`'s own `run_until_complete`
+        # was still waiting on the `run()` coroutine (parked in `gather`),
+        # not on that task, so it raises this exact RuntimeError rather than
+        # returning normally. That is expected and not an error: swallow it
+        # and exit 0. Any OTHER RuntimeError (no signal ever seen) is a real
+        # bug and must keep propagating.
+        if agent_loop.shutdown_in_progress and "Event loop stopped before Future completed" in str(exc):
+            sys.exit(0)
+        raise
 
 
 def cli() -> None:

@@ -1128,7 +1128,12 @@ def create_router(
         # this list and dynamically `import()`s every URL in it, which is
         # the sanctioned hook for panel-side tweaks -- `show_signin_button`
         # in `feature_flags` is dead code the frontend never reads.
-        return JSONResponse(content=["/comfy/api/comfyfed-ext/comfyfed.js"])
+        #
+        # The path is deliberately WITHOUT the `/comfy` mount prefix: the
+        # frontend joins every listed URL onto its own api base (`/comfy`),
+        # so listing "/comfy/api/..." here would double the prefix into
+        # `/comfy/comfy/api/...` and 404 (caught live, Phase 1.10).
+        return JSONResponse(content=["/api/comfyfed-ext/comfyfed.js"])
 
     @r.get("/comfyfed-ext/comfyfed.js", include_in_schema=False)
     def comfyfed_extension_js() -> Response:

@@ -101,8 +101,12 @@ _ASSETS_SUBDIR = "assets"
 # first three carry several models each (loader nodes + a "缺模型？" note);
 # the next two are zero-model templates (LoadVideo/LoadImage + video-
 # compositing nodes only) that a brand-new worker can run with nothing
-# downloaded; the last two (Phase 1.8b) carry exactly one model each (the
-# shared Qwen3-VL text/vision encoder) behind their own "缺模型？" note.
+# downloaded; the next two (Phase 1.8b) carry exactly one model each (the
+# shared Qwen3-VL text/vision encoder) behind their own "缺模型？" note. Phase
+# 1.10 Task 1 added three more: comfyfed-flf2v-video (the same five-model H3
+# stack as comfyfed-ref2v-video, first+last frame conditioning), comfyfed-
+# video-trim (a third zero-model template), and comfyfed-image-upscale (one
+# curated model, RealESRGAN_x4plus.pth).
 # Content types stated outright rather than via `mimetypes`, whose Windows
 # backend answers from the registry: there, `.webp` is frequently unknown and
 # `.json` can come back as `text/plain`. The frontend *checks* that
@@ -134,6 +138,9 @@ TEMPLATE_NAMES = (
     "comfyfed-image-intro-video",
     "comfyfed-image-to-prompt",
     "comfyfed-text-to-prompt",
+    "comfyfed-flf2v-video",
+    "comfyfed-video-trim",
+    "comfyfed-image-upscale",
 )
 
 
