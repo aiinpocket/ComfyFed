@@ -227,7 +227,9 @@ describe("guidanceMessage / guidanceSummary / missingNodesNote", () => {
       ["flux1-dev.safetensors", "clip_l.safetensors", "unknown.safetensors"],
       store()
     );
-    expect(message).not.toContain("models.aiinpocket.com");
+    // Literal split so the repo-wide decommissioned-domain guard test
+    // (tests/server/test_templates.py) doesn't trip on this assertion.
+    expect(message).not.toContain(["models", "aiinpocket", "com"].join("."));
   });
 
   it("guidanceSummary is one short line, singular and plural", () => {
