@@ -352,9 +352,13 @@ describe("cloud end-to-end", () => {
       // 13. Counter-sign the receipt with the golden key and ack it.
       const workerSig = await signHex(seedHex, new TextEncoder().encode(receipt.payload));
       agent.send(JSON.stringify({ type: "receipt_ack", receipt_id: receipt.receipt_id, worker_sig: workerSig }));
-      // receipt_ack has no reply frame -- poll the DB for the write, same
-      // pattern hub.spec.ts's job_done test uses.
-      await new Promise((r) => setTimeout(r, 50));
+      // receipt_ack has no reply frame -- poll the DB until the worker_sig
+      // lands (a fixed sleep was load-flaky: 3 failures in 11 suite runs).
+      for (let i = 0; i < 100; i++) {
+        const rows = await getReceiptsForJob(db(), jobId);
+        if (rows[0]?.workerSig) break;
+        await new Promise((r) => setTimeout(r, 25));
+      }
 
       // -----------------------------------------------------------------
       // 14. Verify the receipt row directly.
