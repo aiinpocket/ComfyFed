@@ -245,6 +245,19 @@ def test_session_cookie_name_and_reader_are_public_and_agree(client):
 
 
 def test_read_session_payload_rejects_absent_and_tampered_cookies(client):
+    """Root cause of the former flake (Phase 1.9 Task 8): the tamper mutation
+    used to flip the *last* character of the token. That character is the
+    last of the signature's final base64 group, and for a 20-byte sha1 HMAC
+    digest (20 % 3 == 2) that final base64 character encodes only 4 real bits
+    plus 2 always-zero padding bits. 'A' (base64 index 0) and 'B' (index 1)
+    differ only in those discarded padding bits, so ~1/16 of randomly-keyed
+    sessions produced a "tampered" string that decodes to the exact same
+    signature bytes as the original -- the mutation was a silent no-op and
+    the assertion flaked (~6% failure rate, reproduced 20000x in-process).
+    Fixing at the root: mutate the second-to-last character instead, which
+    sits in a fully-populated base64 group and therefore always changes the
+    decoded signature bytes (reproduced 20000x in-process with zero flakes).
+    """
     from comfyfed_server import auth
 
     _csrf(client)
@@ -253,8 +266,11 @@ def test_read_session_payload_rejects_absent_and_tampered_cookies(client):
     assert auth.read_session_payload(None) is None
     assert auth.read_session_payload("") is None
     assert auth.read_session_payload("not-a-token") is None
-    # Flip a character in the signed value: the signature must stop matching.
-    tampered = good[:-1] + ("A" if good[-1] != "A" else "B")
+    # Flip the second-to-last character of the signed value (not the last --
+    # see docstring): the signature must stop matching.
+    pos = -2
+    replacement = "A" if good[pos] != "A" else "Z"
+    tampered = good[:pos] + replacement + good[pos + 1 :]
     assert auth.read_session_payload(tampered) is None
 
 

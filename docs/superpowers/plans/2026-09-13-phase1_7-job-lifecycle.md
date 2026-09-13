@@ -13,7 +13,7 @@
 ## Global Constraints
 
 - All user-facing strings zh-TW first with en translation where the console i18n catalog is touched (existing react-i18next pattern; server messages follow existing zh-TW conventions).
-- Full suite green at every task commit (`.venv/Scripts/python.exe -m pytest tests -q` from repo root — 442 passing at branch point; `tests/server/test_auth.py::test_read_session_payload_rejects_absent_and_tampered_cookies` is a known pre-existing flake: rerun to confirm, don't chase). Console: `cd web && npx vitest run` (11 passing at branch point).
+- Full suite green at every task commit (`.venv/Scripts/python.exe -m pytest tests -q` from repo root — 442 passing at branch point; `tests/server/test_auth.py::test_read_session_payload_rejects_absent_and_tampered_cookies` is a known pre-existing flake: rerun to confirm, don't chase) (resolved in Phase 1.9 Task 8 — root cause: the tamper flipped the token's last base64 char, whose bits are partly discarded padding, so ~6% of runs produced an alias that still decoded to the same signature). Console: `cd web && npx vitest run` (11 passing at branch point).
 - Never modify files under `data/comfy_frontend/`.
 - Alembic migration must be additive and reversible (`last_worker_id` nullable TEXT, no backfill needed).
 - A cancelled job bills nothing: no receipt row is ever created for it.
