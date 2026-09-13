@@ -1073,7 +1073,3 @@ export async function claimUploadToken(db: D1Database, token: string): Promise<b
     .run();
   return (result.meta.changes ?? 0) === 1;
 }
-
-export async function deleteUploadToken(db: D1Database, token: string): Promise<void> {
-  await db.prepare("DELETE FROM upload_tokens WHERE token = ?").bind(token).run();
-}

@@ -1,4 +1,4 @@
-import { afterEach, describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 import { env } from "cloudflare:test";
 import { call, db, SETUP_TOKEN } from "./helpers/http";
 import { toSqliteTimestamp } from "../src/db/queries";
@@ -430,6 +430,40 @@ describe("origin scoping: interrupt and queue mutations only ever touch panel jo
     const consoleRow = await db().prepare("SELECT status FROM jobs WHERE id = ?").bind(consoleJob).first<{ status: string }>();
     expect(panelRow?.status).toBe("cancelled");
     expect(consoleRow?.status).toBe("queued");
+  });
+
+  it("POST /interrupt still answers 200 empty when the Hub DO call throws (M1, panel fire-and-forget parity)", async () => {
+    const { cookie } = await loginSession();
+    const jobId = (await postPrompt(cookie)).body.prompt_id;
+    await db().prepare("UPDATE jobs SET status = 'running' WHERE id = ?").bind(jobId).run();
+
+    const hub = (env as any).HUB;
+    const getSpy = vi.spyOn(hub, "get").mockReturnValue({
+      fetch: vi.fn().mockRejectedValue(new Error("DO evicted")),
+    });
+    try {
+      const r = await call("/comfy/api/interrupt", { method: "POST", cookie });
+      expect(r.status).toBe(200);
+      expect(r.body).toEqual({});
+    } finally {
+      getSpy.mockRestore();
+    }
+  });
+
+  it("POST /queue delete still answers 200 when the Hub DO call throws for one job (M1)", async () => {
+    const { cookie, csrf } = await loginSession();
+    const panelJob = (await postPrompt(cookie)).body.prompt_id;
+
+    const hub = (env as any).HUB;
+    const getSpy = vi.spyOn(hub, "get").mockReturnValue({
+      fetch: vi.fn().mockRejectedValue(new Error("DO evicted")),
+    });
+    try {
+      const r = await call("/comfy/api/queue", { json: { delete: [panelJob] }, cookie });
+      expect(r.status).toBe(200);
+    } finally {
+      getSpy.mockRestore();
+    }
   });
 });
 

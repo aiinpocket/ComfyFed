@@ -1,4 +1,4 @@
-import { afterEach, describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 import worker from "../src/index";
 import { env, createExecutionContext, waitOnExecutionContext } from "cloudflare:test";
 import { call, db, SETUP_TOKEN } from "./helpers/http";
@@ -566,6 +566,41 @@ describe("POST /api/jobs/{id}/cancel", () => {
     expect(again.status).toBe(409);
     expect(again.body.error.code).toBe("jobs.already_terminal");
     expect(again.body.status).toBe("cancelled");
+  });
+
+  it("502s with a bilingual error envelope when the Hub DO call throws (M1)", async () => {
+    const { cookie, csrf } = await adminSession();
+    const submit = await submitJob(cookie, csrf, SIMPLE_WORKFLOW);
+
+    const hub = (env as any).HUB;
+    const getSpy = vi.spyOn(hub, "get").mockReturnValue({
+      fetch: vi.fn().mockRejectedValue(new Error("DO evicted")),
+    });
+    try {
+      const r = await call(`/api/jobs/${submit.body.job_id}/cancel`, { method: "POST", cookie, headers: { "X-CSRF": csrf } });
+      expect(r.status).toBe(502);
+      expect(r.body.error.code).toBe("jobs.hub_unavailable");
+      expect(r.body.error.message).toContain("/");
+    } finally {
+      getSpy.mockRestore();
+    }
+  });
+
+  it("502s when the Hub DO answers non-OK for cancel (M1)", async () => {
+    const { cookie, csrf } = await adminSession();
+    const submit = await submitJob(cookie, csrf, SIMPLE_WORKFLOW);
+
+    const hub = (env as any).HUB;
+    const getSpy = vi.spyOn(hub, "get").mockReturnValue({
+      fetch: vi.fn().mockResolvedValue(new Response("boom", { status: 500 })),
+    });
+    try {
+      const r = await call(`/api/jobs/${submit.body.job_id}/cancel`, { method: "POST", cookie, headers: { "X-CSRF": csrf } });
+      expect(r.status).toBe(502);
+      expect(r.body.error.code).toBe("jobs.hub_unavailable");
+    } finally {
+      getSpy.mockRestore();
+    }
   });
 });
 

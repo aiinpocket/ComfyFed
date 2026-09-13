@@ -44,6 +44,15 @@ import { requireAdmin, requireCsrf, errorJson } from "../lib/guard";
 import { bytesToBase64Url } from "../lib/base64";
 import { bytesToHex } from "../lib/hex";
 import { presignUrl, r2S3Host } from "../lib/sigv4";
+import { bilingualMessage } from "../core/auth";
+
+// Cloud-only (no Python parity source -- the monolith calls its dispatcher
+// in-process and has no DO that can be unreachable), so bilingual like
+// SETUP_MESSAGES rather than the English-only Python-ported strings above.
+const HUB_UNAVAILABLE = {
+  en: "Cancel could not be delivered; try again.",
+  zhTW: "取消請求無法送達，請再試一次。",
+};
 
 const UPLOAD_TOKEN_TTL_SECONDS = 600;
 const S3_PRESIGN_TTL_SECONDS = 600;
@@ -649,12 +658,27 @@ app.post("/api/jobs/:jobId/cancel", requireCsrf, async (c) => {
   if (!existing) return errorJson(c, 404, "jobs.not_found", "Job not found.");
 
   const stub = c.env.HUB.get(c.env.HUB.idFromName("hub"));
-  const res = await stub.fetch("http://hub.internal/internal/cancel", {
-    method: "POST",
-    headers: { "content-type": "application/json" },
-    body: JSON.stringify({ job_id: jobId, reason: "cancelled by admin" }),
-  });
-  const result = await res.json<{ cancelled: boolean; worker_id: string | null }>();
+  let res: Response;
+  try {
+    res = await stub.fetch("http://hub.internal/internal/cancel", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ job_id: jobId, reason: "cancelled by admin" }),
+    });
+  } catch (err) {
+    console.warn("jobs: Hub DO cancel call threw", err);
+    return errorJson(c, 502, "jobs.hub_unavailable", bilingualMessage(HUB_UNAVAILABLE));
+  }
+  if (!res.ok) {
+    return errorJson(c, 502, "jobs.hub_unavailable", bilingualMessage(HUB_UNAVAILABLE));
+  }
+  let result: { cancelled: boolean; worker_id: string | null };
+  try {
+    result = await res.json();
+  } catch (err) {
+    console.warn("jobs: Hub DO cancel response was not JSON", err);
+    return errorJson(c, 502, "jobs.hub_unavailable", bilingualMessage(HUB_UNAVAILABLE));
+  }
 
   if (!result.cancelled) {
     const job = await queries.getJobById(c.env.DB, jobId);

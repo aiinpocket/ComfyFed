@@ -292,8 +292,26 @@ function mergeOptions(spec: unknown, names: string[]): unknown[] | null {
   return null;
 }
 
-function arraysEqual(a: unknown[], b: unknown[]): boolean {
-  return a.length === b.length && a.every((v, i) => v === b[i]);
+// n1 (final review): must be a deep structural check, not shallow ===, since
+// `mergeOptions` always allocates a fresh options array/object for element 0
+// even when `names` contributed nothing new -- a shallow `===` per element
+// would never short-circuit the "nothing changed" skip below, so every
+// request would copy the node def for no reason. Matches Python's `merged ==
+// spec` (dict/list structural equality).
+function deepEqual(a: unknown, b: unknown): boolean {
+  if (a === b) return true;
+  if (Array.isArray(a) && Array.isArray(b)) {
+    return a.length === b.length && a.every((v, i) => deepEqual(v, b[i]));
+  }
+  if (typeof a === "object" && a !== null && typeof b === "object" && b !== null && !Array.isArray(a) && !Array.isArray(b)) {
+    const aKeys = Object.keys(a as Record<string, unknown>);
+    const bKeys = Object.keys(b as Record<string, unknown>);
+    return (
+      aKeys.length === bKeys.length &&
+      aKeys.every((k) => Object.prototype.hasOwnProperty.call(b, k) && deepEqual((a as Record<string, unknown>)[k], (b as Record<string, unknown>)[k]))
+    );
+  }
+  return false;
 }
 
 function withStagedImages(objectInfo: Record<string, unknown>, names: string[]): Record<string, unknown> {
@@ -327,7 +345,7 @@ function withStagedImages(objectInfo: Record<string, unknown>, names: string[]):
       if (!(spec[1] as Record<string, unknown>)[uploadFlag]) continue;
 
       const merged = mergeOptions(spec, namesFor(fieldName));
-      if (merged === null || arraysEqual(merged, spec)) continue;
+      if (merged === null || deepEqual(merged, spec)) continue;
 
       if (result === objectInfo) result = { ...objectInfo };
       const patchedDef = { ...(result[nodeName] as Record<string, unknown>) };
@@ -541,7 +559,16 @@ app.post("/comfy/api/interrupt", async (c) => {
   const running = await queries.getJobsByStatusAndOrigin(c.env.DB, RUNNING_STATUSES, { origin: "panel" });
   const job = running[0];
   if (job) {
-    await cancelJobViaHub(c.env, job.id, "interrupted from panel");
+    // Fire-and-forget, matching Python's /interrupt (comfyapi.py) which
+    // returns 200 unconditionally with no DO/dispatcher equivalent to fail --
+    // if the Hub DO is unreachable we log and still answer 200 empty, same as
+    // the sibling /comfy/api/queue cancel loop below, rather than surfacing a
+    // 502 on a route the panel UI doesn't check the body of.
+    try {
+      await cancelJobViaHub(c.env, job.id, "interrupted from panel");
+    } catch (err) {
+      console.warn("comfyapi: interrupt cancel failed for job", job.id, err);
+    }
   }
   return c.json({});
 });
@@ -701,11 +728,19 @@ app.get("/comfy/api/view", async (c) => {
   } else {
     // Legacy fallback: scan done jobs newest-first for the filename.
     const done = await queries.listJobs(c.env.DB, ["done"]);
-    const newestFirst = done.slice().sort((a, b) => {
-      const aKey = a.finishedAt ?? a.createdAt;
-      const bKey = b.finishedAt ?? b.createdAt;
-      return aKey < bKey ? 1 : aKey > bKey ? -1 : 0;
-    });
+    // n2 (final review): two-key sort matching comfyapi.py's `ORDER BY
+    // finished_at DESC, created_at DESC` -- `updateJobDone` always sets
+    // `finished_at`, so today ties never reach the tiebreaker, but comparing
+    // by `finished_at` alone (falling back to `created_at` only when
+    // `finished_at` is entirely absent) would silently drop the tiebreak the
+    // day that invariant changes.
+    const cmp = (x: string | null, y: string | null): number => {
+      if (x === y) return 0;
+      if (x === null) return 1; // null sorts oldest (DESC puts it last)
+      if (y === null) return -1;
+      return x < y ? 1 : -1;
+    };
+    const newestFirst = done.slice().sort((a, b) => cmp(a.finishedAt, b.finishedAt) || cmp(a.createdAt, b.createdAt));
     const found = newestFirst.find((job) => resultFilesOf(job).includes(safeName));
     if (!found) return c.body(null, 404);
     jobId = found.id;
