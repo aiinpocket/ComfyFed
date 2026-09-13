@@ -1480,7 +1480,7 @@ class _RecordingWS:
 
 
 @pytest.mark.asyncio
-async def test_send_hello_declares_protocol_2():
+async def test_send_hello_declares_protocol_3_and_auto_fetch_false_by_default():
     entry = PlatformEntry(
         platform_url="http://p",
         platform_pubkey="aa",
@@ -1496,8 +1496,27 @@ async def test_send_hello_declares_protocol_2():
     assert len(conn.ws.sent) == 1
     payload = json.loads(conn.ws.sent[0])
     assert payload["type"] == "hello"
-    assert payload["protocol"] == 2
+    assert payload["protocol"] == 3
+    assert payload["auto_fetch"] is False
     assert payload["hardware"]["platform"] == "Windows"
+
+
+@pytest.mark.asyncio
+async def test_send_hello_reports_auto_fetch_true_from_config():
+    entry = PlatformEntry(
+        platform_url="http://p",
+        platform_pubkey="aa",
+        worker_id="w1",
+        certificate="cert",
+        signing_key_hex="00" * 32,
+    )
+    conn = PlatformConnection(entry, AgentConfig(auto_fetch_models=True))
+    conn.ws = _RecordingWS()
+
+    await conn.send_hello({"cpu": "x", "platform": "Windows"}, "cuda", "2.0", ["KSampler"])
+
+    payload = json.loads(conn.ws.sent[0])
+    assert payload["auto_fetch"] is True
 
 
 # --- Console-signal (Ctrl-C / Ctrl-Break) shutdown --------------------------

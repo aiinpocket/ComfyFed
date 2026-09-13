@@ -115,10 +115,16 @@ class PlatformConnection:
                 "backend": backend,
                 "torch_version": torch_version,
                 "node_classes": sorted(node_classes),
-                # Protocol 2: this agent guarantees `exec_seconds` on
+                # Protocol 3: adds `auto_fetch` (below) and lazy sha256
+                # hashes on inventory entries (see hardware.scan_models) --
+                # groundwork for Phase 2.1 model auto-distribution. Still
+                # guarantees everything protocol 2 did: `exec_seconds` on
                 # job_done/job_failed whenever the run actually started, and
-                # understands `job_cancelled` pushes. See agentws.py.
-                "protocol": 2,
+                # understands `job_cancelled` pushes. See agentws.py. A
+                # server that doesn't know protocol 3 yet just ignores the
+                # unknown fields.
+                "protocol": 3,
+                "auto_fetch": self.config.auto_fetch_models,
             }
         )
 
@@ -1306,7 +1312,11 @@ class AgentLoop:
                 )
                 await conn.send_hello(hw, backend, torch_version, allowed)
 
-                models = hardware.scan_models(self.config.models_dir) if self.config.models_dir else []
+                models = (
+                    hardware.scan_models(self.config.models_dir, hash_models=self.config.hash_models)
+                    if self.config.models_dir
+                    else []
+                )
                 await conn.send_inventory(models)
 
                 await self.refresh_object_info(conn)
