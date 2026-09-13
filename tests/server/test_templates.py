@@ -1095,12 +1095,20 @@ def test_text_to_prompt_does_not_use_default_template_and_has_no_image_input():
     assert text_gen["widgets_values"][-1] is False
     assert not any(i["name"] == "image" for i in text_gen["inputs"])
     # The manual template wrapping must carry the literal Qwen3 chat tags and
-    # the /no_think suppression, per the verified-live recipe.
-    primitives = [n for n in workflow["nodes"] if n["type"] == "PrimitiveStringMultiline"]
-    combined = "\n".join(n["widgets_values"][0] for n in primitives)
-    assert "<|im_start|>user" in combined
-    assert "<|im_start|>assistant" in combined
-    assert "/no_think" in combined
+    # the /no_think suppression, per the verified-live recipe. /no_think sits
+    # at the HEAD of the instruction, not after the user's text: trailing it
+    # behind a keyword-styled idea made the model echo "no_think" as a style
+    # keyword (caught live with a mixed zh/en idea). The instruction also has
+    # to say the idea may be Chinese or English — the user-facing bilingual
+    # input promise.
+    primitives = [n["widgets_values"][0] for n in workflow["nodes"] if n["type"] == "PrimitiveStringMultiline"]
+    prefix = next(v for v in primitives if v.startswith("<|im_start|>user"))
+    assert prefix.startswith("<|im_start|>user\n/no_think ")
+    assert "使用者的想法可能是中文或英文" in prefix
+    assert prefix.endswith("想法：")
+    suffix = next(v for v in primitives if "<|im_start|>assistant" in v)
+    assert suffix == "<|im_end|>\n<|im_start|>assistant\n"
+    assert "/no_think" not in suffix
 
 
 def test_prompt_helper_templates_save_and_preview_the_generated_text():
