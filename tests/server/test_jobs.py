@@ -7,7 +7,7 @@ import pytest
 from fastapi.testclient import TestClient
 
 from comfyfed_server import app as app_module
-from comfyfed_server import bootstrap, db, dispatch
+from comfyfed_server import bootstrap, db, dispatch, jobs as jobs_module
 
 
 def _pick_job_for(worker_id):
@@ -83,6 +83,52 @@ def test_submit_job_creates_queued_job(client):
     listed = client.get("/api/jobs", headers={"X-CSRF": csrf}).json()
     job = next(j for j in listed if j["id"] == job_id)
     assert job["status"] == "queued"
+
+
+def test_create_job_stamps_the_given_origin(client):
+    """`create_job` is the single assess-and-persist path shared by the
+    console and the panel -- each caller must be able to stamp its own
+    origin onto the row it creates."""
+    console_id = jobs_module.create_job(
+        json.dumps(SIMPLE_WORKFLOW), SIMPLE_WORKFLOW, origin="console"
+    )
+    panel_id = jobs_module.create_job(
+        json.dumps(SIMPLE_WORKFLOW), SIMPLE_WORKFLOW, origin="panel"
+    )
+
+    with db.get_session() as session:
+        assert session.get(db.Job, console_id).origin == "console"
+        assert session.get(db.Job, panel_id).origin == "panel"
+
+
+def test_console_submit_stamps_console_origin(client):
+    """Console's `POST /api/jobs` funnels through `create_job(origin=...)` --
+    the list and detail responses must both surface it, since the console is
+    the audit surface that has to tell panel- and console-submitted jobs
+    apart."""
+    csrf = _login(client)
+    job_id = _submit(client, csrf).json()["job_id"]
+
+    listed = client.get("/api/jobs", headers={"X-CSRF": csrf}).json()
+    job = next(j for j in listed if j["id"] == job_id)
+    assert job["origin"] == "console"
+
+    detail = client.get(f"/api/jobs/{job_id}", headers={"X-CSRF": csrf}).json()
+    assert detail["origin"] == "console"
+
+
+def test_console_jobs_list_includes_panel_hidden_jobs_too(client):
+    """Console is the audit surface -- it must list every job regardless of
+    `panel_hidden`, unlike the panel's `/comfy/api/history`."""
+    csrf = _login(client)
+    job_id = _submit(client, csrf).json()["job_id"]
+    with db.get_session() as session:
+        job = session.get(db.Job, job_id)
+        job.panel_hidden = True
+        session.commit()
+
+    listed = client.get("/api/jobs", headers={"X-CSRF": csrf}).json()
+    assert any(j["id"] == job_id for j in listed)
 
 
 def test_submit_missing_assets_400(client):
@@ -680,6 +726,111 @@ def test_min_vram_override_stays_a_hard_refusal(client):
     entry = client.get(f"/api/jobs/{job_id}/assessment", headers={"X-CSRF": csrf}).json()["workers"][0]
     assert entry["verdict"] == "ineligible"
     assert "override:min_vram_gb" in entry["reasons"]
+
+
+def test_job_detail_has_no_receipt_before_one_is_minted(client):
+    csrf = _login(client)
+    job_id = _submit(client, csrf).json()["job_id"]
+
+    detail = client.get(f"/api/jobs/{job_id}", headers={"X-CSRF": csrf}).json()
+    assert detail["receipt"] is None
+
+
+def test_job_detail_embeds_the_receipt_summary(client):
+    """Task 9: the console job detail page reads the receipt straight off
+    `GET /api/jobs/{id}` rather than needing a separate lookup -- same field
+    names/semantics as `reports.contributions`'s per-receipt listing."""
+    csrf = _login(client)
+    w1 = _register_worker(client, csrf, "w1")
+    job_id = _submit(client, csrf).json()["job_id"]
+
+    with db.get_session() as session:
+        receipt = db.Receipt(
+            job_id=job_id,
+            worker_id=w1,
+            gpu_seconds=12.5,
+            platform_sig="sig-platform",
+            worker_sig="sig-worker",
+            kind="completed",
+            billable=True,
+            basis="exec",
+        )
+        session.add(receipt)
+        session.commit()
+
+    detail = client.get(f"/api/jobs/{job_id}", headers={"X-CSRF": csrf}).json()
+    assert detail["receipt"] == {
+        "gpu_seconds": 12.5,
+        "kind": "completed",
+        "billable": True,
+        "basis": "exec",
+        "acked": True,
+    }
+
+
+def test_job_detail_receipt_unacked_when_worker_sig_missing(client):
+    csrf = _login(client)
+    w1 = _register_worker(client, csrf, "w1")
+    job_id = _submit(client, csrf).json()["job_id"]
+
+    with db.get_session() as session:
+        receipt = db.Receipt(
+            job_id=job_id,
+            worker_id=w1,
+            gpu_seconds=3.0,
+            platform_sig="sig-platform",
+            worker_sig=None,
+            kind="failed",
+            billable=False,
+            basis="wall",
+        )
+        session.add(receipt)
+        session.commit()
+
+    detail = client.get(f"/api/jobs/{job_id}", headers={"X-CSRF": csrf}).json()
+    assert detail["receipt"]["acked"] is False
+    assert detail["receipt"]["billable"] is False
+    assert detail["receipt"]["kind"] == "failed"
+    assert detail["receipt"]["basis"] == "wall"
+
+
+def test_job_detail_uses_the_newest_receipt_when_a_job_was_retried(client):
+    csrf = _login(client)
+    w1 = _register_worker(client, csrf, "w1")
+    job_id = _submit(client, csrf).json()["job_id"]
+
+    with db.get_session() as session:
+        session.add(
+            db.Receipt(
+                job_id=job_id,
+                worker_id=w1,
+                gpu_seconds=1.0,
+                platform_sig="s1",
+                worker_sig="w1sig",
+                kind="failed",
+                billable=False,
+                basis="wall",
+                created_at=datetime.now(timezone.utc).replace(tzinfo=None) - timedelta(minutes=5),
+            )
+        )
+        session.add(
+            db.Receipt(
+                job_id=job_id,
+                worker_id=w1,
+                gpu_seconds=9.0,
+                platform_sig="s2",
+                worker_sig="w2sig",
+                kind="completed",
+                billable=True,
+                basis="exec",
+                created_at=datetime.now(timezone.utc).replace(tzinfo=None),
+            )
+        )
+        session.commit()
+
+    detail = client.get(f"/api/jobs/{job_id}", headers={"X-CSRF": csrf}).json()
+    assert detail["receipt"]["gpu_seconds"] == 9.0
+    assert detail["receipt"]["kind"] == "completed"
 
 
 def test_flux_job_with_a_genuinely_absent_model_is_still_ineligible(client):

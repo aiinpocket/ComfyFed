@@ -865,6 +865,107 @@ def test_own_template_workflow_still_served_byte_identical(client, name):
     assert r.content == expected
 
 
+def _count_json_loads(monkeypatch):
+    """Wrap `templates.json.load` to count real reads, without changing its
+    behavior -- used to prove the mtime caches skip the read entirely on a
+    cache hit."""
+    calls = []
+    real_load = json.load
+
+    def _counting_load(f):
+        calls.append(1)
+        return real_load(f)
+
+    monkeypatch.setattr(templates.json, "load", _counting_load)
+    return calls
+
+
+def test_merged_index_reads_source_files_once_then_caches(client, monkeypatch):
+    """Task 7: the merged `index.json` -- both the packaged and official
+    copies -- is cached by (path, mtime); a second identical request must not
+    re-open or re-parse either file."""
+    _login(client)
+    _seed_official_dir(client.data_dir)
+
+    first = client.get("/comfy/templates/index.json")
+    assert first.status_code == 200
+
+    calls = _count_json_loads(monkeypatch)
+    second = client.get("/comfy/templates/index.json")
+    assert second.status_code == 200
+    assert second.json() == first.json()
+    assert calls == []
+
+
+def test_merged_index_cache_invalidates_when_official_index_mtime_changes(client):
+    _login(client)
+    official_dir = _seed_official_dir(client.data_dir)
+
+    first = client.get("/comfy/templates/index.json").json()
+    assert len(first) == 2
+
+    # Replace the official index with a file carrying a different mtime.
+    index_path = os.path.join(official_dir, "index.json")
+    extra_category = {**_FLUX_CATEGORY, "title": "Flux v2"}
+    with open(index_path, "w", encoding="utf-8") as f:
+        json.dump([_FLUX_CATEGORY, extra_category], f)
+    new_time = os.path.getmtime(index_path) + 5
+    os.utime(index_path, (new_time, new_time))
+
+    second = client.get("/comfy/templates/index.json").json()
+    assert len(second) == 3
+    assert second[2] == extra_category
+
+
+def test_stripped_workflow_json_is_cached_across_requests(client, monkeypatch):
+    _login(client)
+    _seed_official_dir(client.data_dir)
+
+    first = client.get("/comfy/templates/flux_dev.json")
+    assert first.status_code == 200
+
+    calls = _count_json_loads(monkeypatch)
+    second = client.get("/comfy/templates/flux_dev.json")
+    assert second.status_code == 200
+    assert second.json() == first.json()
+    assert calls == []
+
+
+def test_stripped_workflow_cache_invalidates_when_file_mtime_changes(client):
+    _login(client)
+    official_dir = _seed_official_dir(client.data_dir)
+
+    first = client.get("/comfy/templates/flux_dev.json").json()
+    assert first["nodes"][0]["properties"]["models"][0]["name"] == "flux1-dev.safetensors"
+
+    path = os.path.join(official_dir, "flux_dev.json")
+    updated = {**_FLUX_WORKFLOW, "id": "flux_dev_v2"}
+    with open(path, "w", encoding="utf-8") as f:
+        json.dump(updated, f)
+    new_time = os.path.getmtime(path) + 5
+    os.utime(path, (new_time, new_time))
+
+    second = client.get("/comfy/templates/flux_dev.json").json()
+    assert second["id"] == "flux_dev_v2"
+
+
+def test_stripped_workflow_cache_is_bounded_to_256_entries(client):
+    """Bounded LRU: the official library can carry hundreds of workflows, so
+    the per-file stripped-JSON cache must not grow without limit."""
+    _login(client)
+    official_dir = _seed_official_dir(client.data_dir)
+
+    for i in range(300):
+        with open(os.path.join(official_dir, f"extra_{i}.json"), "w", encoding="utf-8") as f:
+            json.dump({"version": 0.4, "nodes": [], "links": [], "id": f"extra_{i}"}, f)
+
+    for i in range(300):
+        r = client.get(f"/comfy/templates/extra_{i}.json")
+        assert r.status_code == 200
+
+    assert len(templates._stripped_workflow_cache) <= templates._MAX_STRIPPED_CACHE
+
+
 def test_official_media_file_is_served(client):
     _login(client)
     _seed_official_dir(client.data_dir)

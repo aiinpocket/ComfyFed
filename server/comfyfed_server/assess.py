@@ -73,6 +73,30 @@ def _is_model_value(field_name: str, value) -> bool:
     return value.endswith(_MODEL_EXTENSIONS)
 
 
+def _iter_model_refs(workflow: dict):
+    """Yield `(node_id, class_type, model_name)` for every model-valued input
+    field in `workflow`, in the workflow's own iteration order.
+
+    Single walker shared by `extract` (which only needs the set of names) and
+    `model_nodes` (which needs the node each name came from) -- see the
+    module's model-name contract docstring for why extraction rules must not
+    be duplicated between them.
+    """
+    for node_id, node in (workflow or {}).items():
+        if not isinstance(node, dict):
+            continue
+        class_type = node.get("class_type")
+        class_type = class_type if isinstance(class_type, str) else ""
+
+        inputs = node.get("inputs")
+        if not isinstance(inputs, dict):
+            continue
+
+        for field_name, value in inputs.items():
+            if _is_model_value(field_name, value):
+                yield str(node_id), class_type, value
+
+
 def extract(workflow: dict) -> JobNeeds:
     """Extract nodes/models/assets referenced by a ComfyUI API-format workflow.
 
@@ -93,17 +117,31 @@ def extract(workflow: dict) -> JobNeeds:
         if not isinstance(inputs, dict):
             continue
 
-        for field_name, value in inputs.items():
-            if _is_model_value(field_name, value):
-                models.add(value)
-
         if class_type in _ASSET_NODE_CLASSES:
             for asset_field in _ASSET_FIELD_NAMES:
                 value = inputs.get(asset_field)
                 if isinstance(value, str):
                     assets.add(value)
 
+    for _node_id, _class_type, model_name in _iter_model_refs(workflow):
+        models.add(model_name)
+
     return JobNeeds(nodes=nodes, models=models, est_vram_gb=None, assets=assets)
+
+
+def model_nodes(prompt: dict) -> dict[str, list[tuple[str, str]]]:
+    """Map each model name referenced by `prompt` to the nodes that reference it.
+
+    Returns `{model_name: [(node_id, class_type), ...]}`, in workflow
+    iteration order, using the same extraction rules as `extract` (both walk
+    `_iter_model_refs` -- see its docstring). Used to build per-node
+    `node_errors` entries for a missing-models rejection so the ComfyUI panel
+    Errors tab can show guidance on the actual offending node(s).
+    """
+    result: dict[str, list[tuple[str, str]]] = {}
+    for node_id, class_type, model_name in _iter_model_refs(prompt):
+        result.setdefault(model_name, []).append((node_id, class_type))
+    return result
 
 
 def needs_from_job(job) -> JobNeeds:

@@ -38,7 +38,6 @@ import shutil
 import tempfile
 import zipfile
 from datetime import datetime, timezone
-from io import BytesIO
 
 import httpx
 
@@ -56,6 +55,15 @@ _TEMPLATES_SEGMENT = "/templates/"
 _REQUIRES_RE = re.compile(r"^([A-Za-z0-9._-]+)\s*==\s*([A-Za-z0-9.]+)")
 
 _DOWNLOAD_TIMEOUT = 300
+
+# Hard cap per sub-package wheel. The official library has grown new media
+# sub-packages before and could again; a runaway/compromised PyPI response
+# must not be allowed to fill the disk (or, before this cap existed, memory --
+# the old bytearray-buffering `_download` held the whole wheel in RAM before
+# writing anything). 512 MB is generous headroom over any real wheel here
+# (the -json and -media-* packages today are a few MB to a few tens of MB
+# each) while still being a real stop, not a formality.
+_MAX_WHEEL_BYTES = 512 * 1024 * 1024
 
 
 class FetchError(RuntimeError):
@@ -86,17 +94,45 @@ def _get_json(url: str) -> dict:
         raise FetchError(f"Could not read {url}: {exc}") from exc
 
 
-def _download(url: str) -> bytes:
-    """Mockable seam: stream `url` into memory and return the bytes."""
+def _download(url: str) -> tuple[str, str]:
+    """Mockable seam: stream `url` to a `NamedTemporaryFile`, hashing as it
+    goes, and return `(temp file path, sha256 hex digest)`.
+
+    Streams straight to disk instead of buffering the whole wheel in memory
+    (the old `bytearray` approach here) and aborts mid-stream -- deleting the
+    partial temp file -- the moment `_MAX_WHEEL_BYTES` is exceeded, rather
+    than only checking after a possibly-huge response finished downloading.
+    The caller owns the returned file and must remove it once done (`fetch`
+    does this in a `finally`, success or failure) so a size check up front
+    (e.g. a `Content-Length` header) would not be enough on its own: a
+    misbehaving or compromised server can lie about or omit it.
+    """
+    tmp = tempfile.NamedTemporaryFile(delete=False)
     try:
-        with httpx.stream("GET", url, timeout=_DOWNLOAD_TIMEOUT, follow_redirects=True) as resp:
-            resp.raise_for_status()
-            chunks = bytearray()
-            for chunk in resp.iter_bytes():
-                chunks.extend(chunk)
-            return bytes(chunks)
-    except Exception as exc:
-        raise FetchError(f"Download failed: {exc}") from exc
+        try:
+            with httpx.stream("GET", url, timeout=_DOWNLOAD_TIMEOUT, follow_redirects=True) as resp:
+                resp.raise_for_status()
+                hasher = hashlib.sha256()
+                total = 0
+                for chunk in resp.iter_bytes():
+                    total += len(chunk)
+                    if total > _MAX_WHEEL_BYTES:
+                        raise FetchError(
+                            f"下載檔案超過 {_MAX_WHEEL_BYTES // (1024 * 1024)} MB 上限，已中止下載：{url}"
+                        )
+                    hasher.update(chunk)
+                    tmp.write(chunk)
+        except FetchError:
+            raise
+        except Exception as exc:
+            raise FetchError(f"Download failed: {exc}") from exc
+    except BaseException:
+        tmp.close()
+        os.unlink(tmp.name)
+        raise
+
+    tmp.close()
+    return tmp.name, hasher.hexdigest()
 
 
 def _parse_sub_packages(requires_dist: list[str]) -> dict[str, str]:
@@ -152,12 +188,17 @@ def _member_basename(name: str) -> str | None:
     return basename
 
 
-def _extract_templates(wheel_bytes: bytes, dest_dir: str) -> int:
-    """Flatten every `.../templates/<file>` member of the wheel into
-    `dest_dir`. Returns the number of files written."""
+def _extract_templates(wheel_path: str, dest_dir: str) -> int:
+    """Flatten every `.../templates/<file>` member of the wheel at
+    `wheel_path` into `dest_dir`. Returns the number of files written.
+
+    Opens the wheel straight off disk (rather than the old `BytesIO(bytes)`)
+    now that `_download` streams to a temp file instead of buffering the
+    whole wheel in memory.
+    """
     os.makedirs(dest_dir, exist_ok=True)
     written = 0
-    with zipfile.ZipFile(BytesIO(wheel_bytes)) as archive:
+    with zipfile.ZipFile(wheel_path) as archive:
         for name in archive.namelist():
             basename = _member_basename(name)
             if basename is None:
@@ -204,16 +245,20 @@ def fetch(data_dir: str, version: str | None = None) -> dict:
         for name, pkg_version in packages.items():
             package_json = _get_json(f"https://pypi.org/pypi/{name}/{pkg_version}/json")
             url, expected_sha256 = _wheel_url_and_sha256(package_json)
-            payload = _download(url)
+            wheel_path, digest = _download(url)
+            try:
+                if digest != expected_sha256:
+                    raise FetchError(
+                        f"sha256 mismatch for {name}=={pkg_version}: "
+                        f"expected {expected_sha256}, got {digest}"
+                    )
 
-            digest = hashlib.sha256(payload).hexdigest()
-            if digest != expected_sha256:
-                raise FetchError(
-                    f"sha256 mismatch for {name}=={pkg_version}: "
-                    f"expected {expected_sha256}, got {digest}"
-                )
-
-            total_files += _extract_templates(payload, tmp_dir)
+                total_files += _extract_templates(wheel_path, tmp_dir)
+            finally:
+                try:
+                    os.unlink(wheel_path)
+                except OSError:
+                    pass
 
         if total_files == 0:
             raise FetchError("No template files found in any fetched sub-package wheel.")

@@ -16,7 +16,7 @@ import pytest
 from fastapi.testclient import TestClient
 
 from comfyfed_server import app as app_module
-from comfyfed_server import bootstrap, comfyapi, db, dispatch, storage, workers
+from comfyfed_server import bootstrap, comfyapi, db, dispatch, jobs, storage, workers
 
 
 def _pick_job_for(worker_id):
@@ -122,6 +122,7 @@ def _finish_job(client, csrf, job_id, *, result_files, artifact_bytes=b"png-byte
         ("post", "/comfy/api/prompt"),
         ("post", "/comfy/api/interrupt"),
         ("post", "/comfy/api/queue"),
+        ("post", "/comfy/api/history"),
     ],
 )
 def test_all_routes_require_admin_session(client, method, path):
@@ -157,6 +158,24 @@ def test_object_info_no_online_workers_returns_empty_with_header(client):
     assert r.headers.get("X-ComfyFed-No-Workers") == "1"
 
 
+def test_object_info_no_online_workers_returns_empty_regardless_of_mode(client):
+    """The empty-fleet early return must fire before the mode branch is ever
+    consulted -- intersection mode with zero online workers gets the exact
+    same `{}` + no-workers-header response as union, not an empty result
+    produced by the intersection-of-nothing logic taking a different path."""
+    csrf = _login(client)
+    r = client.post(
+        "/api/settings", json={"object_info_mode": "intersection"}, headers={"X-CSRF": csrf}
+    )
+    assert r.status_code == 200
+
+    r = client.get("/comfy/api/object_info")
+    assert r.status_code == 200
+    assert r.json() == {}
+    assert r.headers.get("X-ComfyFed-No-Workers") == "1"
+    assert r.headers["X-ComfyFed-Worker-Count"] == "0"
+
+
 def test_object_info_reports_source_worker_count_in_a_header(client):
     """M5: how many workers the union came from, without polluting the body.
 
@@ -183,6 +202,56 @@ def test_object_info_worker_count_is_zero_with_no_workers(client):
     r = client.get("/comfy/api/object_info")
     assert r.headers["X-ComfyFed-Worker-Count"] == "0"
     assert r.headers["X-ComfyFed-No-Workers"] == "1"
+
+
+def test_object_info_intersection_mode_drops_classes_missing_on_any_worker(client):
+    csrf = _login(client)
+    _register_worker(
+        client, csrf, "w1", object_info={"KSampler": {"input": {}}, "Shared": {"v": 1}}
+    )
+    _register_worker(
+        client, csrf, "w2", object_info={"LoadImage": {"input": {}}, "Shared": {"v": 2}}
+    )
+
+    r = client.post(
+        "/api/settings", json={"object_info_mode": "intersection"}, headers={"X-CSRF": csrf}
+    )
+    assert r.status_code == 200
+
+    body = client.get("/comfy/api/object_info").json()
+    # Only present on w1/w2 both -> KSampler and LoadImage are each on just
+    # one worker and are dropped; Shared is on both and survives.
+    assert set(body) == {"Shared"}
+    # Value-level merge for a surviving class stays the plain first-worker-
+    # wins pick -- intersection only governs class *presence*.
+    assert body["Shared"] == {"v": 1}
+
+
+def test_object_info_intersection_mode_keeps_classes_on_every_worker(client):
+    csrf = _login(client)
+    _register_worker(client, csrf, "w1", object_info={"KSampler": {}, "Shared": {}})
+    _register_worker(client, csrf, "w2", object_info={"KSampler": {}, "Shared": {}})
+
+    client.post("/api/settings", json={"object_info_mode": "intersection"}, headers={"X-CSRF": csrf})
+
+    body = client.get("/comfy/api/object_info").json()
+    assert set(body) == {"KSampler", "Shared"}
+
+
+def test_object_info_mode_change_misses_the_cache(client):
+    """The cache is keyed on (fleet, mode): flipping the setting must not
+    keep serving the other mode's stale answer."""
+    csrf = _login(client)
+    _register_worker(client, csrf, "w1", object_info={"KSampler": {}})
+    _register_worker(client, csrf, "w2", object_info={"LoadImage": {}})
+
+    assert set(client.get("/comfy/api/object_info").json()) == {"KSampler", "LoadImage"}
+
+    client.post("/api/settings", json={"object_info_mode": "intersection"}, headers={"X-CSRF": csrf})
+    assert set(client.get("/comfy/api/object_info").json()) == set()
+
+    client.post("/api/settings", json={"object_info_mode": "union"}, headers={"X-CSRF": csrf})
+    assert set(client.get("/comfy/api/object_info").json()) == {"KSampler", "LoadImage"}
 
 
 def test_object_info_cache_invalidates_when_worker_hash_changes(client):
@@ -297,9 +366,92 @@ def test_prompt_rejects_when_no_registered_worker_has_the_model(client):
         "備份載點：https://storage.googleapis.com/comfyfed-models/models/diffusion_models/flux1-dev.safetensors"
         in details
     )
-    assert body["node_errors"] == {}
+    node_errors = body["node_errors"]
+    assert set(node_errors.keys()) == {"1"}
+    node_entry = node_errors["1"]
+    assert node_entry["class_type"] == "UNETLoader"
+    assert node_entry["dependent_outputs"] == []
+    assert len(node_entry["errors"]) == 1
+    err = node_entry["errors"][0]
+    assert err["type"] == "comfyfed.missing_model"
+    assert err["message"] == "缺少模型：flux1-dev.safetensors，無法執行——詳見下方下載指引"
+    assert "\n" not in err["message"]
+    assert err["extra_info"] == {}
+    assert (
+        "官方載點：https://huggingface.co/black-forest-labs/FLUX.1-dev/resolve/main/flux1-dev.safetensors"
+        in err["details"]
+    )
+    assert "備份載點：" in err["details"]
+    # per-node details is ONLY that model's own block -- not the shared
+    # header or any other missing model's block.
+    assert "無法執行：聯邦裡所有已註冊的 worker" not in err["details"]
+
     with db.get_session() as session:
         assert session.query(db.Job).count() == 0
+
+
+TWO_MODELS_ONE_NODE_PROMPT = {
+    "1": {
+        "class_type": "DualCLIPLoader",
+        "inputs": {"clip_name1": "clip_l.safetensors", "clip_name2": "t5xxl_fp16.safetensors"},
+    },
+    "2": {"class_type": "SaveText", "inputs": {}},
+}
+
+ONE_MODEL_TWO_NODES_PROMPT = {
+    "1": {"class_type": "CheckpointLoaderSimple", "inputs": {"ckpt_name": "flux1-dev.safetensors"}},
+    "2": {"class_type": "UNETLoader", "inputs": {"unet_name": "flux1-dev.safetensors"}},
+}
+
+
+def test_prompt_rejection_node_errors_one_model_referenced_by_two_nodes(client):
+    csrf = _login(client)
+    _register_worker(client, csrf, "runner-1")
+
+    r = _post_prompt(client, prompt=ONE_MODEL_TWO_NODES_PROMPT)
+    assert r.status_code == 400
+    node_errors = r.json()["node_errors"]
+
+    assert set(node_errors.keys()) == {"1", "2"}
+    assert node_errors["1"]["class_type"] == "CheckpointLoaderSimple"
+    assert node_errors["2"]["class_type"] == "UNETLoader"
+    for node_id in ("1", "2"):
+        entry = node_errors[node_id]
+        assert entry["dependent_outputs"] == []
+        assert len(entry["errors"]) == 1
+        assert entry["errors"][0]["message"] == (
+            "缺少模型：flux1-dev.safetensors，無法執行——詳見下方下載指引"
+        )
+
+
+def test_prompt_rejection_node_errors_two_models_referenced_by_one_node(client):
+    csrf = _login(client)
+    _register_worker(client, csrf, "runner-1")
+
+    r = _post_prompt(client, prompt=TWO_MODELS_ONE_NODE_PROMPT)
+    assert r.status_code == 400
+    node_errors = r.json()["node_errors"]
+
+    assert set(node_errors.keys()) == {"1"}
+    entry = node_errors["1"]
+    assert entry["class_type"] == "DualCLIPLoader"
+    assert entry["dependent_outputs"] == []
+    assert len(entry["errors"]) == 2
+    messages = {e["message"] for e in entry["errors"]}
+    assert messages == {
+        "缺少模型：clip_l.safetensors，無法執行——詳見下方下載指引",
+        "缺少模型：t5xxl_fp16.safetensors，無法執行——詳見下方下載指引",
+    }
+    details_by_message = {e["message"]: e["details"] for e in entry["errors"]}
+    assert "clip_l.safetensors" in details_by_message[
+        "缺少模型：clip_l.safetensors，無法執行——詳見下方下載指引"
+    ]
+    assert "t5xxl_fp16.safetensors" in details_by_message[
+        "缺少模型：t5xxl_fp16.safetensors，無法執行——詳見下方下載指引"
+    ]
+    for e in entry["errors"]:
+        assert e["type"] == "comfyfed.missing_model"
+        assert e["extra_info"] == {}
 
 
 def test_prompt_still_queues_when_no_workers_registered(client):
@@ -490,6 +642,32 @@ def test_interrupt_does_not_touch_only_queued_jobs(client):
         assert session.get(db.Job, job_id).status == "queued"
 
 
+def test_interrupt_skips_a_console_origin_job_even_if_older_and_running(client):
+    """`/interrupt` is the panel's own "stop what I'm looking at" button --
+    it must never reach into a console-submitted job just because it happens
+    to be the oldest running one."""
+    csrf = _login(client)
+    console_job_id = jobs.create_job(
+        json.dumps(SIMPLE_PROMPT), SIMPLE_PROMPT, origin="console"
+    )
+    panel_job_id = _post_prompt(client).json()["prompt_id"]
+
+    worker_id = _register_worker(client, csrf, "runner")
+    with db.get_session() as session:
+        for job_id in (console_job_id, panel_job_id):
+            job = session.get(db.Job, job_id)
+            job.status = "running"
+            job.worker_id = worker_id
+        session.commit()
+
+    r = client.post("/comfy/api/interrupt")
+    assert r.status_code == 200
+
+    with db.get_session() as session:
+        assert session.get(db.Job, console_job_id).status == "running"
+        assert session.get(db.Job, panel_job_id).status == "cancelled"
+
+
 def test_queue_delete_cancels_listed_jobs_only(client):
     csrf = _login(client)
     job_a = _post_prompt(client).json()["prompt_id"]
@@ -542,6 +720,39 @@ def test_queue_clear_cancels_every_non_terminal_job(client):
         assert session.get(db.Job, running_id).status == "cancelled"
         # A job that already finished is left alone.
         assert session.get(db.Job, done_id).status == "done"
+
+
+def test_queue_clear_leaves_console_origin_jobs_queued(client):
+    """`{"clear": true}` is the panel's "empty my queue" button -- it must
+    never cancel a job the console submitted, even though both funnel
+    through the same `jobs` table."""
+    _login(client)
+    console_job_id = jobs.create_job(
+        json.dumps(SIMPLE_PROMPT), SIMPLE_PROMPT, origin="console"
+    )
+    panel_job_id = _post_prompt(client).json()["prompt_id"]
+
+    r = client.post("/comfy/api/queue", json={"clear": True})
+    assert r.status_code == 200
+
+    with db.get_session() as session:
+        assert session.get(db.Job, console_job_id).status == "queued"
+        assert session.get(db.Job, panel_job_id).status == "cancelled"
+
+
+def test_queue_delete_ignores_a_named_console_origin_job(client):
+    """Even explicitly named, a console job must survive `{"delete": [...]}`
+    from the panel -- origin scoping, not just default queue semantics."""
+    _login(client)
+    console_job_id = jobs.create_job(
+        json.dumps(SIMPLE_PROMPT), SIMPLE_PROMPT, origin="console"
+    )
+
+    r = client.post("/comfy/api/queue", json={"delete": [console_job_id]})
+    assert r.status_code == 200
+
+    with db.get_session() as session:
+        assert session.get(db.Job, console_job_id).status == "queued"
 
 
 def test_queue_delete_with_empty_body_is_a_noop(client):
@@ -713,6 +924,142 @@ def test_history_text_artifact_content_capped_at_100kb(client):
 
     outputs = client.get("/comfy/api/history").json()[prompt_id]["outputs"]
     assert len(outputs["2"]["text"][0]) == 100_000
+
+
+# --- history delete (panel_hidden) ------------------------------------
+
+
+def test_history_delete_hides_named_terminal_panel_job(client):
+    """The live frontend's `deleteItem('history', id)` posts `{"delete":
+    [id]}` to `/history` (verified against the shipped dist) -- ComfyFed
+    must never actually delete the row (receipts reference it), only hide it
+    from the panel's own history view."""
+    csrf = _login(client)
+    prompt_id = _post_prompt(client).json()["prompt_id"]
+    _finish_job(client, csrf, prompt_id, result_files=["out.png"])
+
+    r = client.post("/comfy/api/history", json={"delete": [prompt_id]})
+    assert r.status_code == 200
+    assert r.json() == {}
+
+    assert client.get("/comfy/api/history").json() == {}
+
+    with db.get_session() as session:
+        job = session.get(db.Job, prompt_id)
+        assert job is not None
+        assert job.status == "done"
+        assert job.panel_hidden is True
+
+
+def test_history_delete_ignores_a_non_terminal_job(client):
+    _login(client)
+    prompt_id = _post_prompt(client).json()["prompt_id"]
+
+    r = client.post("/comfy/api/history", json={"delete": [prompt_id]})
+    assert r.status_code == 200
+
+    with db.get_session() as session:
+        assert session.get(db.Job, prompt_id).panel_hidden is False
+
+
+def test_history_delete_ignores_a_console_origin_job(client):
+    csrf = _login(client)
+    console_job_id = jobs.create_job(
+        json.dumps(SIMPLE_PROMPT), SIMPLE_PROMPT, origin="console"
+    )
+    with db.get_session() as session:
+        job = session.get(db.Job, console_job_id)
+        job.status = "done"
+        session.commit()
+
+    r = client.post("/comfy/api/history", json={"delete": [console_job_id]})
+    assert r.status_code == 200
+
+    with db.get_session() as session:
+        assert session.get(db.Job, console_job_id).panel_hidden is False
+
+
+def test_history_clear_hides_all_terminal_panel_jobs(client):
+    csrf = _login(client)
+    done_id = _post_prompt(client).json()["prompt_id"]
+    _finish_job(client, csrf, done_id, result_files=["out.png"])
+
+    failed_id = _post_prompt(client).json()["prompt_id"]
+    worker_id = _register_worker(client, csrf, "runner2")
+    picked = _pick_job_for(worker_id)
+    assert picked is not None and picked.id == failed_id
+    dispatch.mark_failed(failed_id, worker_id, "boom")
+
+    still_queued_id = _post_prompt(client).json()["prompt_id"]
+
+    r = client.post("/comfy/api/history", json={"clear": True})
+    assert r.status_code == 200
+
+    assert client.get("/comfy/api/history").json() == {}
+
+    with db.get_session() as session:
+        assert session.get(db.Job, done_id).panel_hidden is True
+        assert session.get(db.Job, failed_id).panel_hidden is True
+        # Never terminal, so clear does not touch it.
+        assert session.get(db.Job, still_queued_id).panel_hidden is False
+
+
+def test_history_excludes_a_console_origin_job(client):
+    """GET /history is scoped to origin == "panel", matching POST
+    /history's write scope -- a console job must never appear in the
+    panel's own history list (it could never be hidden from it either,
+    since panel_hidden is only ever set by panel-origin history mutations).
+    The console's all-seeing surface is /api/jobs, not this endpoint."""
+    _login(client)
+    console_job_id = jobs.create_job(
+        json.dumps(SIMPLE_PROMPT), SIMPLE_PROMPT, origin="console"
+    )
+    with db.get_session() as session:
+        job = session.get(db.Job, console_job_id)
+        job.status = "done"
+        session.commit()
+
+    assert client.get("/comfy/api/history").json() == {}
+    assert client.get(f"/comfy/api/history/{console_job_id}").json() == {}
+
+
+def test_history_clear_clears_everything_the_panel_can_see(client):
+    """A panel-origin done job disappears from GET /history after clear,
+    while a console-origin done job -- invisible to GET /history to begin
+    with -- is untouched by the panel's clear and stays visible to the
+    console's /api/jobs."""
+    csrf = _login(client)
+    panel_job_id = _post_prompt(client).json()["prompt_id"]
+    _finish_job(client, csrf, panel_job_id, result_files=["out.png"])
+
+    console_job_id = jobs.create_job(
+        json.dumps(SIMPLE_PROMPT), SIMPLE_PROMPT, origin="console"
+    )
+    with db.get_session() as session:
+        job = session.get(db.Job, console_job_id)
+        job.status = "done"
+        session.commit()
+
+    r = client.post("/comfy/api/history", json={"clear": True})
+    assert r.status_code == 200
+
+    assert client.get("/comfy/api/history").json() == {}
+
+    with db.get_session() as session:
+        assert session.get(db.Job, panel_job_id).panel_hidden is True
+        console_job = session.get(db.Job, console_job_id)
+        assert console_job.panel_hidden is False
+        assert console_job.status == "done"
+
+
+def test_history_get_by_prompt_id_omits_a_panel_hidden_job(client):
+    csrf = _login(client)
+    prompt_id = _post_prompt(client).json()["prompt_id"]
+    _finish_job(client, csrf, prompt_id, result_files=["out.png"])
+
+    client.post("/comfy/api/history", json={"delete": [prompt_id]})
+
+    assert client.get(f"/comfy/api/history/{prompt_id}").json() == {}
 
 
 def test_history_text_file_without_save_text_node_uses_fallback_key(client):
@@ -1026,7 +1373,7 @@ def test_prompt_copies_staged_asset_into_job_inputs(client):
     [
         ("/comfy/api/features", {}),
         ("/comfy/api/users", {"storage": "server", "migrated": False}),
-        ("/comfy/api/extensions", []),
+        ("/comfy/api/extensions", ["/comfy/api/comfyfed-ext/comfyfed.js"]),
         ("/comfy/api/embeddings", []),
         ("/comfy/api/models", []),
         ("/comfy/api/i18n", {}),
@@ -1043,6 +1390,23 @@ def test_bootstrap_routes_return_the_empty_upstream_shape(client, path, expected
 
 def test_bootstrap_routes_require_a_session(client):
     assert client.get("/comfy/api/features").status_code == 401
+
+
+def test_panel_extension_js_is_served(client):
+    # The frontend fetches `/comfy/api/extensions` and dynamically imports
+    # every module URL it lists; this is how ComfyFed hides the dead
+    # Comfy-cloud login button without patching the pinned frontend dist.
+    _login(client)
+    r = client.get("/comfy/api/comfyfed-ext/comfyfed.js")
+    assert r.status_code == 200
+    assert r.headers["content-type"].startswith("application/javascript")
+    body = r.text
+    assert body
+    assert "display:none" in body.replace(" ", "")
+
+
+def test_panel_extension_js_requires_a_session(client):
+    assert client.get("/comfy/api/comfyfed-ext/comfyfed.js").status_code == 401
 
 
 def test_system_stats_reports_no_local_devices(client):

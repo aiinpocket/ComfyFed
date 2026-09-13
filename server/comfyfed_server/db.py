@@ -52,6 +52,11 @@ class Worker(Base):
     node_classes: Mapped[str] = mapped_column(String, default="[]", server_default="[]")
     model_inventory: Mapped[str] = mapped_column(String, default="[]", server_default="[]")
     object_info_hash: Mapped[str] = mapped_column(String, default="", server_default="")
+    # Agent protocol version reported in `hello` (see agentws._handle_hello).
+    # 1 = pre-Phase-1.9 agent: no guaranteed exec_seconds, doesn't understand
+    # `job_cancelled` pushes -- still served, but gets a one-time deprecation
+    # frame and is never sent job_cancelled. 2 = current comfyfed-agent.
+    protocol: Mapped[int] = mapped_column(Integer, default=1, server_default="1")
 
 
 class RegisterToken(Base):
@@ -88,6 +93,19 @@ class Job(Base):
     est_vram_gb: Mapped[Optional[float]] = mapped_column(Float, nullable=True)
     input_assets: Mapped[str] = mapped_column(String, default="[]", server_default="[]")
     result_hashes: Mapped[str] = mapped_column(String, default="{}", server_default="{}")
+    # Who submitted this job: "panel" (the ComfyUI-compatible surface at
+    # `/comfy/api/*`) or "console" (ComfyFed's own `/api/jobs`). Both funnel
+    # through `jobs.create_job`, which is what lets `/comfy/api/interrupt`,
+    # `/comfy/api/queue`, and the panel's history view act only on jobs the
+    # panel itself submitted, leaving console-submitted jobs alone -- the
+    # console stays the one surface that sees and controls everything.
+    origin: Mapped[str] = mapped_column(String, default="console", server_default="console")
+    # Soft-delete flag for the panel's own history view only (`GET
+    # /comfy/api/history` excludes these); the row is never actually
+    # deleted, because receipts reference jobs by id. Console's `/api/jobs`
+    # ignores this entirely -- it is the audit surface and must always show
+    # everything.
+    panel_hidden: Mapped[bool] = mapped_column(Boolean, default=False, server_default="0")
 
 
 class Receipt(Base):
@@ -100,6 +118,22 @@ class Receipt(Base):
     platform_sig: Mapped[str] = mapped_column(String)
     worker_sig: Mapped[Optional[str]] = mapped_column(String, nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime, default=_utcnow)
+    # What kind of job outcome this receipt records ("completed" | "failed" |
+    # "cancelled") -- see agentws._create_and_push_receipt /
+    # _create_and_push_failure_receipt / _mint_cancelled_receipt. Every
+    # existing row predates this column and was a normal completion, hence
+    # the "completed" backfill in migration #7.
+    kind: Mapped[str] = mapped_column(String, default="completed", server_default="completed")
+    # Whether this receipt counts toward billed GPU time. Failed and
+    # cancelled runs still record their gpu_seconds (for capacity/health
+    # reporting) but must never be billed for work the platform didn't
+    # actually get a usable result for.
+    billable: Mapped[bool] = mapped_column(Boolean, default=True, server_default="1")
+    # How `gpu_seconds` was derived: "exec" (the agent's own measured GPU
+    # execution time) or "wall" (a wall-clock fallback -- assigned/running
+    # span, or started_at-to-cancel span). Mirrors the exec/wall distinction
+    # `_create_and_push_receipt` already logs for completed jobs.
+    basis: Mapped[str] = mapped_column(String, default="exec", server_default="exec")
 
 
 class LoginAttempt(Base):

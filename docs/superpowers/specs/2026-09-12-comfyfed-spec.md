@@ -80,8 +80,9 @@ worker 斷線（>90s 無心跳）→ assigned/running 的任務自動回 queued 
 
 - **Phase 1（本計畫）**：平台核心＋Agent 核心端到端可用——安裝→登入→發識別碼→worker 註冊上線→送 workflow→派工執行→結果回傳→收據入帳→儀表板可視。
 - **Phase 1.5（2026-09-12 使用者定案提前）：內嵌 ComfyUI 工作流編輯器**——「要使用者自己在別處做好 workflow 再貼 JSON」對非 IT 使用者不可用。平台內嵌**官方 ComfyUI 前端**（comfyui-frontend-package 靜態包，pinned 版本＋SHA256，`comfyfed-server fetch-comfy-ui` 下載）於 `/comfy`（admin session 保護），平台實作 ComfyUI 相容 API（`/comfy/api/*`）：`object_info`=**在線 worker 能力聯集**（agent 以簽名請求回傳完整 /object_info JSON，gzip＋hash 去重，存平台檔案系統）、`prompt`→聯邦 job、`queue`/`history`/`view`→佇列與 artifacts 映射、`upload/image`→任務附檔管線、WS 進度轉發。Console 任務頁保留貼 JSON 作為進階路徑，主按鈕改為開啟編輯器。
-- **Phase 2**：模型 manifest＋平台中繼下載；`/object_info` 能力交集模式（保守選項）。
+- **Phase 2**：模型 manifest＋平台中繼下載；`/object_info` 能力交集模式（保守選項，**已於 Phase 1.9 提前實作** `auth`/`comfyapi` 的 `object_info_mode: union|intersection`）。
 - **Phase 3**：成員間 P2P 分塊傳輸；貢獻報表進階（分潤試算）；多管理員。
+- **Phase 1.9（backlog zero，2026-09-13）**：job origin 欄位＋範圍限定（面板原生控制只動面板自己送的工作）；面板任務歷史可刪除；node_errors 前端引導文案；隱藏面板內失效的 Comfy-cloud 登入按鈕；失敗／取消任務不計費（收據 0）；agent 通訊協定升級到 v2；派工優先序偏好弱 GPU／Mac 之類的機器優先接零模型需求的工作，把重活留給有模型的機器；範本快取與下載上限；一個間歇性 flake 已根治（非重跑掩蓋）；console 新增任務詳情頁（完整錯誤引導＋artifacts）；專案採用 AGPL-3.0 授權。
 - **未來方向：ComfyFed Cloud（2026-09-12 提出）**——平台端移植 Cloudflare Workers＋D1＋R2 的免自架部署形態：D1=SQLite（schema 近乎原樣）、R2=ArtifactStore 的 S3 介面（presigned 直傳、零出口費）、agent 長連 WS 改由 Durable Objects（hibernation）承接、派工迴圈改 DO alarms、Ed25519 驗簽走 WebCrypto。價值：DDNS/固定IP/NAT/TLS 痛點全消失。定位：**自架 Python 版仍是本體**（內網/離線場景＋資料自主），Cloud 版是第二部署形態；現有架構決策（outbound-only WS、S3 介面、簽章收據）已刻意為此保留可移植性。
 
 ## 9.5 架構審查補強（2026-09-12 定案，全部納入 Phase 1）
@@ -107,7 +108,7 @@ User directives: (1) 官方範本要引入，但保留 ComfyFed 平台專用分�
 Decisions of record:
 - Official templates come from the PyPI `comfyui-workflow-templates` split packages (`-json` + `-media-*`; `-core` skipped), fetched by a new `fetch-comfy-templates` CLI into `data/comfy_templates_official/`, merged after ComfyFed's own categories in the served `/comfy/templates/index*.json`.
 - Served official workflow JSONs get `models[].url/hash/hash_type` stripped server-side (frontend's Download button requires url+directory) — the frontend bundle itself is never patched.
-- Guidance lives in a POST /prompt 400 (`prompt.missing_models`) raised when every online worker is ineligible due to missing models: per-model zh-TW block with 放置路徑 models/<dir>/、官方載點（flux/ae 加註需登入 HuggingFace 同意授權）、備份載點（GCS）、「10 分鐘自動掃描、不需重啟」. No workers online → unchanged queueing behavior.
+- Guidance lives in a POST /prompt 400 (`prompt.missing_models`) raised when a model is missing fleet-wide — `comfyapi.missing_models_and_nodes` checks every *registered* worker's reported inventory, whatever its `status` and whether or not it is disabled (a sleeping or temporarily-disabled machine still vouches for its inventory; only a model absent from the whole fleet is a real dead end), not just workers currently online: per-model zh-TW block with 放置路徑 models/<dir>/、官方載點（flux/ae 加註需登入 HuggingFace 同意授權）、備份載點（GCS）、「10 分鐘自動掃描、不需重啟」. Zero registered workers → unchanged queueing behavior.
 - Panel WS sends explicit `feature_flags` all-false (assets, node_replacements, show_signin_button, extension.manager.supports_v4/.supports_csrf_post) so Manager/Asset-Browser/sign-in UI stays dormant; incoming client feature_flags frames are consumed silently. `GET /api/folder_paths` stubbed `{}`.
 - R2 (the former model-mirror custom domain) is decommissioned: worker, custom domain, bucket contents deleted 2026-09-13. Canonical mirror base: `https://storage.googleapis.com/comfyfed-models/models/`.
 
@@ -122,7 +123,7 @@ Decisions of record:
 - Server pushes `{"type":"job_cancelled","job_id"}` (dedup per connection) whenever an authenticated agent references a job it no longer owns — busy heartbeat, progress, job_done/job_failed, artifact upload. Busy heartbeats carry job_id every 30s, so a zombied worker learns within one heartbeat.
 - Blip re-adoption: `Job.last_worker_id` (migration #5) records who a stale requeue took the job from. A `job_done` from that worker while the job is still `queued` re-adopts and completes it (receipt included) — the whole run is saved. Once someone else owns it (or it's terminal), the late reporter is rejected + cancelled instead.
 - Human cancellation: admin `POST /api/jobs/{id}/cancel`, console jobs-page 取消 button, and the embedded panel's native controls mapped through comfyapi (`POST /interrupt` = cancel the executing panel job; `POST /queue {"delete":[ids]}` / `{"clear":true}` = cancel queued ones).
-- Known limitation (2026-09-13): `db.Job` has no origin field, so the panel's native controls cannot tell panel-submitted work from console-submitted work — `POST /interrupt` cancels the federation's oldest assigned/running job whoever submitted it, and `{"clear":true}` cancels every non-terminal job; both are admin-only, and scoping them needs a job origin column (product decision still owed).
+- Origin scoping shipped in Phase 1.9: `db.Job.origin` (`"console"|"panel"`) now lets the panel's native controls act only on panel-submitted work — `POST /interrupt` and `{"clear":true}` no longer reach console-submitted jobs.
 - Agent runs `handle_job` as a background task so the WS receive loop keeps reading mid-run (prerequisite for receiving job_cancelled at all); on cancel it interrupts ComfyUI (`/interrupt` when executing, `/queue` delete when locally queued), runs job-file cleanup in a cancel mode, sends no completion message, and returns to idle. One-job-at-a-time invariant unchanged.
 - Dispatch ranking: per tick, oldest job first over ALL idle workers — clean-eligible beats vram_offload-warned, then most free VRAM, then name for determinism. Capability matching stays server-side (the worker never chooses).
 

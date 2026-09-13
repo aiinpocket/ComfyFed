@@ -10,7 +10,7 @@ import pytest
 
 from comfyfed_agent import comfy, hardware, whitelist
 from comfyfed_agent.config import AgentConfig, PlatformEntry
-from comfyfed_agent.runner import AgentLoop, CleanupMode, _is_safe_relative_path, cleanup_job_files
+from comfyfed_agent.runner import AgentLoop, CleanupMode, PlatformConnection, _is_safe_relative_path, cleanup_job_files
 from comfyfed_agent import runner as runner_module
 
 _real_whitelist_check = whitelist.check
@@ -68,8 +68,8 @@ class FakeConnection:
     async def send_job_done(self, job_id, result_files, exec_seconds=None):
         self.job_done = (job_id, result_files, exec_seconds)
 
-    async def send_job_failed(self, job_id, error):
-        self.job_failed = (job_id, error)
+    async def send_job_failed(self, job_id, error, exec_seconds=None):
+        self.job_failed = (job_id, error, exec_seconds)
 
     async def send_object_info(self, gzip_payload, oi_hash):
         self.object_info_uploads.append((gzip_payload, oi_hash))
@@ -160,8 +160,33 @@ async def test_job_failure_sends_job_failed_and_returns_to_idle(two_platform_loo
 
     await loop.handle_job(conn_a, job_msg)
 
-    assert conn_a.job_failed == ("job-2", "kaboom")
+    assert conn_a.job_failed == ("job-2", "kaboom", None)
     assert conn_a.heartbeats[-1]["state"] == "idle"
+
+
+async def test_job_failure_after_prompt_started_carries_exec_seconds(two_platform_loop, monkeypatch):
+    """A ComfyUI-reported execution error (as opposed to a /prompt submission
+    rejection) happens after the prompt actually started running, so
+    `ComfyError.exec_seconds` carries the same measurement the success path
+    would have -- the platform must not bill for it (kind=failed,
+    billable=0), but it should still know work was actually done."""
+    loop = two_platform_loop
+    conn_a = loop.connections["worker-a"]
+
+    def boom(*args, **kwargs):
+        raise comfy.ComfyError("ComfyUI job execution failed", exec_seconds=3.25)
+
+    monkeypatch.setattr(comfy, "run_workflow", boom)
+
+    job_msg = {
+        "job_id": "job-2b",
+        "workflow_json": json.dumps({"1": {"class_type": "KSampler", "inputs": {}}}),
+        "input_assets": [],
+    }
+
+    await loop.handle_job(conn_a, job_msg)
+
+    assert conn_a.job_failed == ("job-2b", "ComfyUI job execution failed", 3.25)
 
 
 async def test_job_with_disallowed_node_is_rejected_before_running(two_platform_loop, monkeypatch):
@@ -361,7 +386,7 @@ async def test_handle_job_reports_job_failed_when_artifact_upload_never_verifies
 
     await loop.handle_job(conn_a, job_msg)
 
-    assert conn_a.job_failed == ("job-hash-fail", "artifact upload failed")
+    assert conn_a.job_failed == ("job-hash-fail", "artifact upload failed", 1.0)
 
 
 # --- Worker-side job file cleanup -------------------------------------------
@@ -1079,7 +1104,7 @@ async def test_a_genuine_upload_rejection_still_fails_the_job(two_platform_loop,
     task = loop._current_job_task
     await asyncio.wait_for(task, timeout=10)
 
-    assert conn_a.job_failed == ("job-rejected", "artifact upload failed")
+    assert conn_a.job_failed == ("job-rejected", "artifact upload failed", 1.0)
 
 
 # --- Final review Major 3: the cancel handler must not block the loop ------
@@ -1280,3 +1305,41 @@ async def test_held_completion_backs_off_when_the_socket_is_live_but_uploads_fai
     assert gaps[1] >= gaps[0], f"backoff did not grow: {gaps}"
     assert conn_a.job_done == ("job-http-backoff", ["result.png"], 1.0)
     assert conn_a.job_failed is None
+
+
+# --- Task 6: agent protocol 2 ---------------------------------------------
+
+
+def test_collect_hardware_reports_platform_system(monkeypatch):
+    monkeypatch.setattr(hardware.platform, "system", lambda: "Linux")
+    hw = hardware.collect_hardware("http://127.0.0.1:8188")
+    assert hw["platform"] == "Linux"
+
+
+class _RecordingWS:
+    def __init__(self):
+        self.sent: list[str] = []
+
+    async def send(self, message: str) -> None:
+        self.sent.append(message)
+
+
+@pytest.mark.asyncio
+async def test_send_hello_declares_protocol_2():
+    entry = PlatformEntry(
+        platform_url="http://p",
+        platform_pubkey="aa",
+        worker_id="w1",
+        certificate="cert",
+        signing_key_hex="00" * 32,
+    )
+    conn = PlatformConnection(entry, AgentConfig())
+    conn.ws = _RecordingWS()
+
+    await conn.send_hello({"cpu": "x", "platform": "Windows"}, "cuda", "2.0", ["KSampler"])
+
+    assert len(conn.ws.sent) == 1
+    payload = json.loads(conn.ws.sent[0])
+    assert payload["type"] == "hello"
+    assert payload["protocol"] == 2
+    assert payload["hardware"]["platform"] == "Windows"

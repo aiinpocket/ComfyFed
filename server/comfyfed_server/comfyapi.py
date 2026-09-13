@@ -43,15 +43,19 @@ federation rather than a single GPU:
 from __future__ import annotations
 
 import json
+import logging
 import mimetypes
 import os
 from collections import OrderedDict
+from importlib import resources
 from typing import Callable, Optional
 
 from fastapi import APIRouter, Depends, File, Form, Request, UploadFile, WebSocket, WebSocketDisconnect
 from fastapi.responses import FileResponse, JSONResponse, Response
 
 from . import agentws, assess, auth, db, jobs, model_guide, panelws, storage, workers
+
+logger = logging.getLogger(__name__)
 
 # Node classes whose id keys a history entry's `outputs`. The ComfyUI frontend
 # looks up the images it should display under the id of the node that saved
@@ -169,13 +173,78 @@ _RUNNING_STATUSES = ("assigned", "running")
 _PENDING_STATUSES = ("queued",)
 _HISTORY_STATUSES = ("done", "failed")
 
-# object_info union cache: (frozenset of (worker_id, object_info_hash)) -> dict.
-# Keyed by the exact set of contributing workers and their content hashes, so a
-# worker going offline, being disabled, or re-uploading its snapshot all miss
-# the cache naturally. Only the newest key is kept -- the frontend polls this
-# route constantly with the same fleet, so one entry is the whole win, and
-# unbounded growth across fleet churn is not.
-_object_info_cache: dict[frozenset, dict] = {}
+# object_info merge cache: (frozenset of (worker_id, object_info_hash), mode)
+# -> dict. Keyed by the exact set of contributing workers, their content
+# hashes, AND the merge mode (Task 7's `object_info_mode` setting), so a
+# worker going offline, being disabled, re-uploading its snapshot, or an admin
+# flipping union/intersection all miss the cache naturally. Only the newest
+# key is kept -- the frontend polls this route constantly with the same fleet
+# and mode, so one entry is the whole win, and unbounded growth across fleet
+# churn is not.
+_object_info_cache: dict[tuple[frozenset, str], dict] = {}
+
+_OBJECT_INFO_MODE_KEY = "object_info_mode"
+_OBJECT_INFO_MODES = ("union", "intersection")
+_DEFAULT_OBJECT_INFO_MODE = "union"
+
+
+def _object_info_mode(session) -> str:
+    """Read the `object_info_mode` setting (own copy of the key -- see
+    `auth._OBJECT_INFO_MODE_KEY`, `metrics._METRICS_PUBLIC_KEY` and
+    `storage._ARTIFACT_STORE_SETTING_KEY` for the same each-consumer-reads-
+    its-own-setting pattern). Falls back to the default on an unset or
+    corrupted (pre-Task-7 admin tooling, hand-edited DB) value rather than
+    raising, since a bad setting must not take `/object_info` down."""
+    row = session.get(db.Setting, _OBJECT_INFO_MODE_KEY)
+    if row is not None and row.value in _OBJECT_INFO_MODES:
+        return row.value
+    return _DEFAULT_OBJECT_INFO_MODE
+
+
+def _merge_object_info(data_dir: str, fleet: list[tuple[str, str]], mode: str) -> dict:
+    """Build the `/object_info` merge over `fleet` (online, enabled workers).
+
+    `union` (default): every node class any contributing worker defines,
+    first-worker-wins on a same-named class -- unchanged from pre-Task-7
+    behaviour.
+
+    `intersection`: only node classes EVERY contributing worker defines --
+    "every class in the result is dispatchable to any worker in the fleet"
+    is the whole point, so a class only one worker knows about would be a
+    trap (submit succeeds, dispatch to the wrong worker fails). The per-class
+    *value* kept for a surviving class is still the plain first-worker-wins
+    union pick, not a deep per-field merge: 交集模式保證派得出去，下拉內容仍聯集
+    因為模型檔各 worker 本就不同 -- e.g. two workers' CheckpointLoaderSimple both
+    survive intersection (both have the class), but each worker's own
+    checkpoint filenames differ, and there is no single "the" combo list to
+    reconcile beyond picking one worker's -- narrowing node-class *presence*
+    is Task 7's job, not reconciling per-worker model inventories.
+
+    Workers whose snapshot failed to parse (`load_object_info` returned
+    something other than a dict) contribute nothing either way, same as
+    today: they neither add classes to the union nor constrain the
+    intersection, since we have no information from them to intersect with.
+    """
+    worker_infos: list[dict] = []
+    for worker_id, _hash in fleet:
+        info = workers.load_object_info(data_dir, worker_id)
+        if isinstance(info, dict):
+            worker_infos.append(info)
+
+    merged: dict = {}
+    for info in worker_infos:
+        for node_name, node_def in info.items():
+            # First worker wins: a node present on several workers is the
+            # same node, and picking one keeps the union stable.
+            merged.setdefault(node_name, node_def)
+
+    if mode == "intersection" and worker_infos:
+        common = set(worker_infos[0])
+        for info in worker_infos[1:]:
+            common &= set(info)
+        merged = {name: node_def for name, node_def in merged.items() if name in common}
+
+    return merged
 
 
 def clear_object_info_cache() -> None:
@@ -623,6 +692,7 @@ def create_router(
     def object_info() -> Response:
         with db.get_session() as session:
             fleet = _online_worker_hashes(session)
+            mode = _object_info_mode(session)
 
         if not fleet:
             return JSONResponse(
@@ -630,21 +700,12 @@ def create_router(
                 headers={"X-ComfyFed-No-Workers": "1", _WORKER_COUNT_HEADER: "0"},
             )
 
-        key = frozenset(fleet)
+        key = (frozenset(fleet), mode)
         cached = _object_info_cache.get(key)
         if cached is None:
-            merged: dict = {}
-            for worker_id, _hash in fleet:
-                info = workers.load_object_info(data_dir, worker_id)
-                if not isinstance(info, dict):
-                    continue
-                for node_name, node_def in info.items():
-                    # First worker wins: a node present on several workers is
-                    # the same node, and picking one keeps the union stable.
-                    merged.setdefault(node_name, node_def)
+            cached = _merge_object_info(data_dir, fleet, mode)
             _object_info_cache.clear()
-            _object_info_cache[key] = merged
-            cached = merged
+            _object_info_cache[key] = cached
 
         return JSONResponse(
             content=_with_staged_images(cached, staged_image_names(data_dir)),
@@ -691,10 +752,34 @@ def create_router(
             # and as the leading half of the dialog's `message + ": " +
             # details`, so a multi-line blob in `message` renders either as a
             # collapsed one-line headline or twice over.
+            #
+            # node_errors mirrors the same missing models onto the actual
+            # offending node(s): the panel's Errors tab reads its scrollable
+            # details box ONLY from node_errors[<id>].errors[].details, never
+            # from this top-level error, so without this an admin sees just
+            # the one-line summary there and has to fall back to the legacy
+            # dialog to read the download guidance at all.
+            node_errors: dict = {}
+            model_node_map = assess.model_nodes(prompt)
+            for name in names:
+                for node_id, class_type in model_node_map.get(name, []):
+                    entry = node_errors.setdefault(
+                        node_id,
+                        {"class_type": class_type, "dependent_outputs": [], "errors": []},
+                    )
+                    entry["errors"].append(
+                        {
+                            "type": "comfyfed.missing_model",
+                            "message": model_guide.guidance_summary([name]),
+                            "details": model_guide.model_guidance_block(name, data_dir),
+                            "extra_info": {},
+                        }
+                    )
             return _comfy_error(
                 "prompt.missing_models",
                 model_guide.guidance_summary(names),
                 guidance,
+                node_errors,
             )
 
         resolved: dict[str, str] = {}
@@ -705,7 +790,7 @@ def create_router(
 
         try:
             job_id = jobs.create_job(
-                json.dumps(prompt), prompt, available_assets=set(resolved)
+                json.dumps(prompt), prompt, available_assets=set(resolved), origin="panel"
             )
         except jobs.MissingAssetsError as exc:
             return _comfy_error(
@@ -779,17 +864,20 @@ def create_router(
         """Cancel whatever the panel currently sees as executing.
 
         Upstream's `/interrupt` targets the single job ComfyUI itself is
-        running; ComfyFed's federation equivalent is the oldest job in
-        `_RUNNING_STATUSES` (the same ordering `GET /queue` reports as
-        `queue_running`) -- the one the panel's own UI would be showing as
-        the active prompt. A no-op (still 200) when nothing is running,
-        matching upstream's fire-and-forget contract: the real ComfyUI
-        answers `/interrupt` with an empty 200 unconditionally too.
+        running; ComfyFed's federation equivalent is the oldest `origin ==
+        "panel"` job in `_RUNNING_STATUSES` (the same ordering `GET /queue`
+        reports as `queue_running`) -- the one the panel's own UI would be
+        showing as the active prompt. Scoped to panel-origin jobs only: a
+        console-submitted job running at the same time is none of the
+        panel's business, even if it happens to be older. A no-op (still
+        200) when nothing is running, matching upstream's fire-and-forget
+        contract: the real ComfyUI answers `/interrupt` with an empty 200
+        unconditionally too.
         """
         with db.get_session() as session:
             job = (
                 session.query(db.Job)
-                .filter(db.Job.status.in_(_RUNNING_STATUSES))
+                .filter(db.Job.status.in_(_RUNNING_STATUSES), db.Job.origin == "panel")
                 .order_by(db.Job.created_at.asc())
                 .first()
             )
@@ -808,6 +896,10 @@ def create_router(
         pending queue -- ComfyFed has no separate "local queue" to distinguish
         it from jobs already dispatched to a worker, so `assigned`/`running`
         jobs are cancelled too).
+
+        Both branches are scoped to `origin == "panel"` jobs: this is the
+        panel's own queue view, so it must never reach into (or even name,
+        via an explicit id in `delete`) a job the console submitted.
         """
         try:
             body = await request.json()
@@ -821,25 +913,59 @@ def create_router(
                 job_ids = [
                     j.id
                     for j in session.query(db.Job)
-                    .filter(db.Job.status.in_(_PENDING_STATUSES + _RUNNING_STATUSES))
+                    .filter(
+                        db.Job.status.in_(_PENDING_STATUSES + _RUNNING_STATUSES),
+                        db.Job.origin == "panel",
+                    )
                     .all()
                 ]
         else:
             requested = body.get("delete")
-            job_ids = [pid for pid in requested if isinstance(pid, str)] if isinstance(requested, list) else []
+            requested_ids = (
+                [pid for pid in requested if isinstance(pid, str)] if isinstance(requested, list) else []
+            )
+            if requested_ids:
+                with db.get_session() as session:
+                    job_ids = [
+                        j.id
+                        for j in session.query(db.Job)
+                        .filter(db.Job.id.in_(requested_ids), db.Job.origin == "panel")
+                        .all()
+                    ]
+            else:
+                job_ids = []
 
         for job_id in job_ids:
-            await agentws.cancel_and_notify(job_id, reason="removed from panel queue")
+            try:
+                await agentws.cancel_and_notify(job_id, reason="removed from panel queue")
+            except Exception:
+                # One job's cancel/notify blowing up must not 500 the whole
+                # sweep or skip the rest of `job_ids` -- a partially-applied
+                # `{"clear": true}` (or a `delete` list with several ids)
+                # would otherwise leave later jobs queued/running with no
+                # indication to the panel of what actually happened.
+                logger.warning("comfyapi: cancel_and_notify failed for job %s", job_id, exc_info=True)
 
         return JSONResponse(content={})
 
     @r.get("/history")
     def get_history(max_items: Optional[int] = None) -> Response:
+        """Scoped to `origin == "panel"`, matching `POST /history`'s write
+        scope: the panel's history is the panel's own, and a console job
+        that this endpoint could never let the panel hide (`panel_hidden`
+        is set only by panel-origin history mutations) must never appear
+        here in the first place. The console's all-seeing audit surface is
+        `/api/jobs`, which ignores `panel_hidden` and `origin` both.
+        """
         with db.get_session() as session:
             numbers = _numbers_by_job_id(session)
             query = (
                 session.query(db.Job)
-                .filter(db.Job.status.in_(_HISTORY_STATUSES))
+                .filter(
+                    db.Job.status.in_(_HISTORY_STATUSES),
+                    db.Job.panel_hidden == False,  # noqa: E712
+                    db.Job.origin == "panel",
+                )
                 .order_by(db.Job.finished_at.asc(), db.Job.created_at.asc())
             )
             rows = query.all()
@@ -852,12 +978,59 @@ def create_router(
     def get_history_prompt_id(prompt_id: str) -> Response:
         with db.get_session() as session:
             job = session.get(db.Job, prompt_id)
-            if job is None or job.status not in _HISTORY_STATUSES:
+            if (
+                job is None
+                or job.status not in _HISTORY_STATUSES
+                or job.panel_hidden
+                or job.origin != "panel"
+            ):
                 # Upstream returns {} for an unknown prompt id, never a 404.
                 return JSONResponse(content={})
             numbers = _numbers_by_job_id(session)
             out = {job.id: _history_entry(numbers.get(job.id, 0), job)}
         return JSONResponse(content=out)
+
+    @r.post("/history")
+    async def post_history(request: Request) -> Response:
+        """ComfyUI-compat history mutation, mirroring `/queue`'s shapes:
+        `{"delete": [prompt_ids]}` and `{"clear": true}` (verified against
+        the shipped frontend dist -- `ComfyApi.deleteItem('history', id)`
+        posts `{"delete": [id]}` and `clearItems('history')` posts
+        `{"clear": true}`, both to `/history`).
+
+        Unlike `/queue`, this never cancels or deletes anything -- it only
+        sets `panel_hidden` on terminal, panel-origin jobs, so `GET
+        /history` stops showing them while the row (and any receipt that
+        references it) survives. Console's `/api/jobs` ignores
+        `panel_hidden` entirely and keeps listing everything.
+        """
+        try:
+            body = await request.json()
+        except (ValueError, TypeError):
+            body = None
+        if not isinstance(body, dict):
+            body = {}
+
+        with db.get_session() as session:
+            query = session.query(db.Job).filter(
+                db.Job.status.in_(_HISTORY_STATUSES), db.Job.origin == "panel"
+            )
+            if not body.get("clear"):
+                requested = body.get("delete")
+                requested_ids = (
+                    [pid for pid in requested if isinstance(pid, str)]
+                    if isinstance(requested, list)
+                    else []
+                )
+                if not requested_ids:
+                    return JSONResponse(content={})
+                query = query.filter(db.Job.id.in_(requested_ids))
+
+            for job in query.all():
+                job.panel_hidden = True
+            session.commit()
+
+        return JSONResponse(content={})
 
     @r.get("/view")
     def view(filename: str = "", type: str = "output", subfolder: str = "") -> Response:
@@ -950,7 +1123,20 @@ def create_router(
 
     @r.get("/extensions")
     def extensions() -> Response:
-        return JSONResponse(content=[])
+        # One real entry: a tiny JS module that hides the dead Comfy-cloud
+        # login button (see `panel_ext/comfyfed.js`). The frontend fetches
+        # this list and dynamically `import()`s every URL in it, which is
+        # the sanctioned hook for panel-side tweaks -- `show_signin_button`
+        # in `feature_flags` is dead code the frontend never reads.
+        return JSONResponse(content=["/comfy/api/comfyfed-ext/comfyfed.js"])
+
+    @r.get("/comfyfed-ext/comfyfed.js", include_in_schema=False)
+    def comfyfed_extension_js() -> Response:
+        # Packaged the same way as `templates_data/` (see `templates.py`):
+        # `importlib.resources` off the package, so a source checkout and an
+        # installed wheel both resolve to the same bytes.
+        path = str(resources.files(__package__).joinpath("panel_ext", "comfyfed.js"))
+        return FileResponse(path, media_type="application/javascript")
 
     @r.get("/embeddings")
     def embeddings() -> Response:

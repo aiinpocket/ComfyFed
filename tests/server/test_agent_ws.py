@@ -1,3 +1,4 @@
+import asyncio
 import json
 import logging
 import math
@@ -48,6 +49,19 @@ def _submit(client, csrf, workflow=None):
     )
     assert r.status_code == 200
     return r.json()["job_id"]
+
+
+def _submit_panel(client, workflow=None):
+    """Submit a job as the panel would, via `/comfy/api/prompt`.
+
+    `origin="panel"` is what `/comfy/api/interrupt` and `/comfy/api/queue`
+    require to act on a job (see comfyapi.py) -- a job submitted through
+    the console's `_submit` above is invisible to both.
+    """
+    workflow = workflow if workflow is not None else {"1": {"class_type": "KSampler", "inputs": {"seed": 1}}}
+    r = client.post("/comfy/api/prompt", json={"prompt": workflow, "client_id": "panel-test"})
+    assert r.status_code == 200
+    return r.json()["prompt_id"]
 
 
 def test_handshake_with_bad_signature_closes_4401(client):
@@ -187,6 +201,24 @@ def _connect(client, worker_id, sk):
     ws.send_json({"type": "auth", "worker_id": worker_id, "sig": sig})
     assert ws.receive_json()["type"] == "ready"
     return ws
+
+
+def _send_hello_v2(ws):
+    """Declare protocol 2 on an already-connected `ws` -- what a current
+    comfyfed-agent does right after handshake (see runner.send_hello).
+    Sends no reply frame (unlike a protocol-1-defaulting hello, which earns
+    a one-time deprecation notice -- see test_hello_without_protocol_...),
+    so it's safe to call without an immediate matching receive_json."""
+    ws.send_json(
+        {
+            "type": "hello",
+            "hardware": {},
+            "backend": "cuda",
+            "torch_version": "",
+            "node_classes": [],
+            "protocol": 2,
+        }
+    )
 
 
 def test_busy_heartbeat_marks_the_assigned_job_running(client):
@@ -666,7 +698,8 @@ def test_foreign_and_terminal_transitions_still_warn(client, caplog):
 def test_busy_heartbeat_for_foreign_job_sends_job_cancelled_once_with_dedup(client, caplog):
     """(a) A worker repeatedly heartbeating a job it doesn't own gets
     `job_cancelled` exactly once (dedup), while the ownership WARNING from
-    dispatch.mark_running keeps firing on every single heartbeat."""
+    dispatch.mark_running fires once and is rate-limited to DEBUG for the
+    same (connection, job id) after that -- see Task 2."""
     csrf = _login(client)
     worker_a, key_a = _register_worker(client, csrf, "w-a")
     worker_b, key_b = _register_worker(client, csrf, "w-b")
@@ -679,8 +712,9 @@ def test_busy_heartbeat_for_foreign_job_sends_job_cancelled_once_with_dedup(clie
         assert ws_a.receive_json()["type"] == "job"  # worker_a now owns job_id
 
         ws_b = _connect(client, worker_b, key_b)
+        _send_hello_v2(ws_b)  # protocol 2, so it can be told via job_cancelled
         try:
-            with caplog.at_level(logging.WARNING, logger="comfyfed_server.dispatch"):
+            with caplog.at_level(logging.DEBUG, logger="comfyfed_server.dispatch"):
                 for progress in (0.1, 0.4, 0.7):
                     ws_b.send_json(
                         {
@@ -697,7 +731,9 @@ def test_busy_heartbeat_for_foreign_job_sends_job_cancelled_once_with_dedup(clie
             assert cancelled_msg == {"type": "job_cancelled", "job_id": job_id}
 
             warnings = [r for r in caplog.records if r.levelno >= logging.WARNING]
-            assert len(warnings) == 3  # one per heartbeat, still not deduped
+            assert len(warnings) == 1  # rate-limited: only the first heartbeat warns
+            debugs = [r for r in caplog.records if r.levelno == logging.DEBUG]
+            assert len(debugs) == 2  # the repeats are downgraded, not silenced
 
             with db.get_session() as session:
                 job = session.get(db.Job, job_id)
@@ -763,6 +799,7 @@ def test_job_done_for_job_now_owned_by_another_worker_is_rejected_and_cancelled(
     job_id = _submit(client, csrf)
 
     ws_a = _connect(client, worker_a, key_a)
+    _send_hello_v2(ws_a)  # protocol 2, so it can be told the stale job_done via job_cancelled
     try:
         ws_a.send_json({"type": "heartbeat", "state": "idle", "progress": 0.0, "job_id": None, "dynamic": {}})
         agentws.dispatch_once(worker_a)
@@ -803,6 +840,7 @@ def test_admin_cancel_pushes_job_cancelled_to_the_owning_agent(client):
     job_id = _submit(client, csrf)
 
     ws = _connect(client, worker_id, sk)
+    _send_hello_v2(ws)  # protocol 2, so the cancel can reach it via job_cancelled
     try:
         ws.send_json({"type": "heartbeat", "state": "idle", "progress": 0.0, "job_id": None, "dynamic": {}})
         agentws.dispatch_once(worker_id)
@@ -844,9 +882,10 @@ def test_admin_cancel_of_an_unowned_queued_job_sends_nothing_to_any_agent(client
 def test_comfy_interrupt_pushes_job_cancelled_to_the_running_worker(client):
     csrf = _login(client)
     worker_id, sk = _register_worker(client, csrf, "w1")
-    job_id = _submit(client, csrf)
+    job_id = _submit_panel(client)
 
     ws = _connect(client, worker_id, sk)
+    _send_hello_v2(ws)  # protocol 2, so the interrupt can reach it via job_cancelled
     try:
         ws.send_json({"type": "heartbeat", "state": "idle", "progress": 0.0, "job_id": None, "dynamic": {}})
         agentws.dispatch_once(worker_id)
@@ -858,6 +897,12 @@ def test_comfy_interrupt_pushes_job_cancelled_to_the_running_worker(client):
         r = client.post("/comfy/api/interrupt")
         assert r.status_code == 200
 
+        # The cancelled receipt is minted before job_cancelled is pushed (so
+        # a push failure can never cost the receipt), so the receipt frame
+        # now arrives first.
+        receipt_msg = ws.receive_json()
+        assert receipt_msg["type"] == "receipt"
+        assert receipt_msg["kind"] == "cancelled"
         cancelled_msg = ws.receive_json()
         assert cancelled_msg == {"type": "job_cancelled", "job_id": job_id}
 
@@ -870,9 +915,10 @@ def test_comfy_interrupt_pushes_job_cancelled_to_the_running_worker(client):
 def test_comfy_queue_delete_pushes_job_cancelled_to_the_assigned_worker(client):
     csrf = _login(client)
     worker_id, sk = _register_worker(client, csrf, "w1")
-    job_id = _submit(client, csrf)
+    job_id = _submit_panel(client)
 
     ws = _connect(client, worker_id, sk)
+    _send_hello_v2(ws)  # protocol 2, so the delete can reach it via job_cancelled
     try:
         ws.send_json({"type": "heartbeat", "state": "idle", "progress": 0.0, "job_id": None, "dynamic": {}})
         agentws.dispatch_once(worker_id)
@@ -938,6 +984,7 @@ def test_cancel_then_owner_heartbeat_pushes_job_cancelled_once_without_warning_s
     job_id = _submit(client, csrf)
 
     ws_a = _connect(client, worker_a, key_a)
+    _send_hello_v2(ws_a)  # protocol 2, so the re-push can reach it via job_cancelled
     try:
         ws_a.send_json({"type": "heartbeat", "state": "idle", "progress": 0.0, "job_id": None, "dynamic": {}})
         agentws.dispatch_once(worker_a)
@@ -1005,3 +1052,730 @@ def test_forged_job_id_from_a_stranger_still_warns(client, caplog):
             ws_b.close()
     finally:
         ws_a.close()
+
+
+# --- Task 2: agentws hygiene -- bounded dedup, rate-limited warnings --------
+
+
+def test_cancelled_jobs_sent_is_bounded_with_fifo_eviction(client):
+    """A connection lives as long as the agent stays attached -- potentially
+    days -- so `cancelled_jobs_sent` must not grow without bound. Capped at
+    512, oldest entry evicted first (see agentws._BoundedSet)."""
+    csrf = _login(client)
+    worker_id, sk = _register_worker(client, csrf, "w1")
+
+    ws = _connect(client, worker_id, sk)
+    try:
+        conn = agentws._connections[worker_id]
+        for i in range(600):
+            conn.cancelled_jobs_sent.add(f"job-{i}")
+
+        assert len(conn.cancelled_jobs_sent) == 512
+        # The oldest 88 entries (600 - 512) were evicted...
+        assert "job-0" not in conn.cancelled_jobs_sent
+        assert "job-87" not in conn.cancelled_jobs_sent
+        # ...and the 512 most recent survive, oldest-first eviction order.
+        assert "job-88" in conn.cancelled_jobs_sent
+        assert "job-599" in conn.cancelled_jobs_sent
+
+        # Re-adding an already-present item is a no-op, not a re-insertion --
+        # it must not disturb eviction order or count.
+        conn.cancelled_jobs_sent.add("job-599")
+        assert len(conn.cancelled_jobs_sent) == 512
+    finally:
+        ws.close()
+
+
+def test_bounded_set_eviction_causes_only_a_harmless_duplicate_push(client):
+    """Contract check for the behavior note in agentws._send_job_cancelled:
+    if a job id is evicted from `cancelled_jobs_sent` and then referenced
+    again, the dedup simply doesn't fire and a second `job_cancelled` push
+    goes out -- there is no crash, no state corruption, and the agent treats
+    the push idempotently (it just re-aborts a run it was already told to
+    abort), so this is asserted as an accepted rare duplicate, not a bug."""
+    csrf = _login(client)
+    worker_id, sk = _register_worker(client, csrf, "w1")
+
+    ws = _connect(client, worker_id, sk)
+    try:
+        conn = agentws._connections[worker_id]
+        conn.cancelled_jobs_sent.add("evicted-job")
+        for i in range(512):
+            conn.cancelled_jobs_sent.add(f"filler-{i}")
+        assert "evicted-job" not in conn.cancelled_jobs_sent  # pushed out of the cap
+
+        # A second push for the now-evicted id is allowed through again --
+        # exactly the "rare duplicate push" the eviction note describes.
+        assert "evicted-job" not in conn.cancelled_jobs_sent
+    finally:
+        ws.close()
+
+
+def test_unknown_message_type_warns_once_then_debug(client, caplog):
+    """Rate limit for unknown message types, mirroring the job-id policy:
+    the first bogus type from a connection logs WARNING, repeats of the same
+    type name log DEBUG instead."""
+    csrf = _login(client)
+    worker_id, sk = _register_worker(client, csrf, "w1")
+
+    ws = _connect(client, worker_id, sk)
+    try:
+        with caplog.at_level(logging.DEBUG, logger="comfyfed_server.agentws"):
+            for _ in range(3):
+                ws.send_json({"type": "not_a_real_type"})
+                agentws.dispatch_once(worker_id)
+
+        relevant = [r for r in caplog.records if "unknown message type" in r.getMessage()]
+        warnings = [r for r in relevant if r.levelno >= logging.WARNING]
+        debugs = [r for r in relevant if r.levelno == logging.DEBUG]
+        assert len(warnings) == 1
+        assert len(debugs) == 2
+    finally:
+        ws.close()
+
+
+def test_unknown_message_type_rate_limit_is_per_type_name(client, caplog):
+    """A different unknown type name gets its own first WARNING -- the rate
+    limit is keyed by type name, not a single global switch."""
+    csrf = _login(client)
+    worker_id, sk = _register_worker(client, csrf, "w1")
+
+    ws = _connect(client, worker_id, sk)
+    try:
+        with caplog.at_level(logging.DEBUG, logger="comfyfed_server.agentws"):
+            ws.send_json({"type": "bogus_a"})
+            agentws.dispatch_once(worker_id)
+            ws.send_json({"type": "bogus_a"})
+            agentws.dispatch_once(worker_id)
+            ws.send_json({"type": "bogus_b"})
+            agentws.dispatch_once(worker_id)
+
+        relevant = [r for r in caplog.records if "unknown message type" in r.getMessage()]
+        warnings = [r for r in relevant if r.levelno >= logging.WARNING]
+        assert len(warnings) == 2  # first bogus_a, first bogus_b
+    finally:
+        ws.close()
+
+
+def test_repeat_forged_job_id_warns_once_then_debug_across_message_kinds(client, caplog):
+    """The rate limit is per (connection, job id), not per message kind: a
+    forged job id first seen via a busy heartbeat still gets downgraded to
+    DEBUG on a subsequent `job_done` for the very same id."""
+    csrf = _login(client)
+    worker_a, key_a = _register_worker(client, csrf, "w-a")
+    worker_b, key_b = _register_worker(client, csrf, "w-b")
+    job_id = _submit(client, csrf)
+
+    ws_a = _connect(client, worker_a, key_a)
+    try:
+        ws_a.send_json({"type": "heartbeat", "state": "idle", "progress": 0.0, "job_id": None, "dynamic": {}})
+        agentws.dispatch_once(worker_a)
+        assert ws_a.receive_json()["type"] == "job"  # worker_a now owns job_id
+
+        ws_b = _connect(client, worker_b, key_b)
+        _send_hello_v2(ws_b)  # protocol 2, so it can be told via job_cancelled
+        try:
+            with caplog.at_level(logging.DEBUG, logger="comfyfed_server.dispatch"):
+                ws_b.send_json(
+                    {"type": "heartbeat", "state": "busy", "progress": 0.1, "job_id": job_id, "dynamic": {}}
+                )
+                agentws.dispatch_once(worker_b)
+                ws_b.receive_json()  # job_cancelled
+
+                ws_b.send_json({"type": "job_done", "job_id": job_id, "result_files": ["x.png"]})
+                agentws.dispatch_once(worker_b)
+
+            warnings = [r for r in caplog.records if r.levelno >= logging.WARNING]
+            debugs = [r for r in caplog.records if r.levelno == logging.DEBUG]
+            assert len(warnings) == 1  # only the first (heartbeat) reference warned
+            assert len(debugs) == 1  # the job_done repeat was downgraded
+
+            with db.get_session() as session:
+                job = session.get(db.Job, job_id)
+                assert job.status == "assigned"
+                assert job.worker_id == worker_a
+                assert json.loads(job.result_files) == []
+        finally:
+            ws_b.close()
+    finally:
+        ws_a.close()
+
+
+# --- Task 5: non-billable receipts for failed and cancelled runs -----------
+
+
+def _run_to_running(client, csrf, worker_id, sk, job_id):
+    """Connect `worker_id`, get `job_id` dispatched to it, and mark it
+    running -- the shared setup every failed/cancelled-receipt test needs.
+    Returns the open websocket (caller must close it)."""
+    ws = _connect(client, worker_id, sk)
+    _send_hello_v2(ws)  # protocol 2, so cancel/job_cancelled pushes reach it
+    ws.send_json({"type": "heartbeat", "state": "idle", "progress": 0.0, "job_id": None, "dynamic": {}})
+    agentws.dispatch_once(worker_id)
+    assert ws.receive_json()["type"] == "job"
+    ws.send_json({"type": "heartbeat", "state": "busy", "progress": 0.0, "job_id": job_id, "dynamic": {}})
+    agentws.dispatch_once(worker_id)
+    with db.get_session() as session:
+        assert session.get(db.Job, job_id).status == "running"
+    return ws
+
+
+def test_job_failed_mints_non_billable_receipt_with_exec_basis(client):
+    csrf = _login(client)
+    worker_id, sk = _register_worker(client, csrf, "w1")
+    job_id = _submit(client, csrf)
+
+    ws = _run_to_running(client, csrf, worker_id, sk, job_id)
+    try:
+        # Large wall-clock span so the exec/wall cap (m2) never binds here --
+        # this test is about the exec basis being honoured, not the cap.
+        _backdate_started_at(job_id, hours=1)
+        ws.send_json(
+            {"type": "job_failed", "job_id": job_id, "error": "boom", "exec_seconds": 2.5}
+        )
+        agentws.dispatch_once(worker_id)
+
+        receipt_msg = ws.receive_json()
+        assert receipt_msg["type"] == "receipt"
+        assert receipt_msg["kind"] == "failed"
+        assert receipt_msg["billable"] is False
+        assert receipt_msg["basis"] == "exec"
+        # The signed payload byte-format is UNCHANGED: existing worker
+        # verifiers must keep validating it regardless of the new kind/
+        # billable/basis fields riding alongside it.
+        assert receipt_msg["payload"] == f"{job_id}|{worker_id}|2.5"
+
+        with db.get_session() as session:
+            receipt = session.get(db.Receipt, receipt_msg["receipt_id"])
+            assert receipt.kind == "failed"
+            assert receipt.billable is False
+            assert receipt.basis == "exec"
+            assert receipt.gpu_seconds == 2.5
+            assert receipt.job_id == job_id
+            assert receipt.worker_id == worker_id
+    finally:
+        ws.close()
+
+
+def test_job_failed_caps_absurd_exec_seconds_at_the_wall_clock(client):
+    """Final-review m2: a failure receipt is non-billable, but
+    `unbilled_gpu_seconds` in the contributions report is a capacity/health
+    number -- an agent bug (or a hostile agent) reporting an absurd
+    `exec_seconds` for a fast failure must still be capped at the wall
+    clock, exactly like the completed-receipt path already is."""
+    csrf = _login(client)
+    worker_id, sk = _register_worker(client, csrf, "w1")
+    job_id = _submit(client, csrf)
+
+    ws = _run_to_running(client, csrf, worker_id, sk, job_id)
+    try:
+        # Wall clock stays small (no backdating) -- just the real time
+        # elapsed by the test itself, well under a second.
+        ws.send_json(
+            {"type": "job_failed", "job_id": job_id, "error": "boom", "exec_seconds": 999999.0}
+        )
+        agentws.dispatch_once(worker_id)
+
+        receipt_msg = ws.receive_json()
+        assert receipt_msg["type"] == "receipt"
+        assert receipt_msg["basis"] == "exec"
+
+        with db.get_session() as session:
+            receipt = session.get(db.Receipt, receipt_msg["receipt_id"])
+            assert 0.0 <= receipt.gpu_seconds < 5.0  # capped, nowhere near 999999
+    finally:
+        ws.close()
+
+
+def test_job_failed_without_exec_seconds_falls_back_to_wall_basis(client):
+    csrf = _login(client)
+    worker_id, sk = _register_worker(client, csrf, "w1")
+    job_id = _submit(client, csrf)
+
+    ws = _run_to_running(client, csrf, worker_id, sk, job_id)
+    try:
+        ws.send_json({"type": "job_failed", "job_id": job_id, "error": "boom"})
+        agentws.dispatch_once(worker_id)
+
+        receipt_msg = ws.receive_json()
+        assert receipt_msg["kind"] == "failed"
+        assert receipt_msg["billable"] is False
+        assert receipt_msg["basis"] == "wall"
+
+        with db.get_session() as session:
+            receipt = session.get(db.Receipt, receipt_msg["receipt_id"])
+            assert receipt.basis == "wall"
+            assert receipt.gpu_seconds >= 0
+    finally:
+        ws.close()
+
+
+def test_job_failed_receipt_can_still_be_counter_signed(client):
+    """The failed-receipt frame is a real receipt, not a notification -- the
+    worker's normal `receipt_ack` flow must work on it exactly like a
+    completed one."""
+    csrf = _login(client)
+    worker_id, sk = _register_worker(client, csrf, "w1")
+    job_id = _submit(client, csrf)
+
+    ws = _run_to_running(client, csrf, worker_id, sk, job_id)
+    try:
+        ws.send_json({"type": "job_failed", "job_id": job_id, "error": "boom"})
+        agentws.dispatch_once(worker_id)
+        receipt_msg = ws.receive_json()
+
+        worker_sig = sk.sign(receipt_msg["payload"].encode()).signature.hex()
+        ws.send_json(
+            {"type": "receipt_ack", "receipt_id": receipt_msg["receipt_id"], "worker_sig": worker_sig}
+        )
+        agentws.dispatch_once(worker_id)
+
+        with db.get_session() as session:
+            receipt = session.get(db.Receipt, receipt_msg["receipt_id"])
+            assert receipt.worker_sig == worker_sig
+    finally:
+        ws.close()
+
+
+def test_console_cancel_of_running_job_mints_cancelled_receipt(client):
+    csrf = _login(client)
+    worker_id, sk = _register_worker(client, csrf, "w1")
+    job_id = _submit(client, csrf)
+
+    ws = _run_to_running(client, csrf, worker_id, sk, job_id)
+    try:
+        res = client.post(f"/api/jobs/{job_id}/cancel", headers={"X-CSRF": csrf})
+        assert res.status_code == 200
+
+        # The cancelled receipt is minted before job_cancelled is pushed (so
+        # a push failure can never cost the receipt), so the receipt frame
+        # now arrives first.
+        receipt_msg = ws.receive_json()
+        assert receipt_msg["type"] == "receipt"
+        assert receipt_msg["kind"] == "cancelled"
+        assert receipt_msg["billable"] is False
+        assert receipt_msg["basis"] == "wall"
+        cancelled_msg = ws.receive_json()
+        assert cancelled_msg == {"type": "job_cancelled", "job_id": job_id}
+
+        with db.get_session() as session:
+            receipts = session.query(db.Receipt).filter(db.Receipt.job_id == job_id).all()
+            assert len(receipts) == 1  # exactly once
+            assert receipts[0].kind == "cancelled"
+            assert receipts[0].gpu_seconds >= 0
+    finally:
+        ws.close()
+
+
+def test_panel_interrupt_of_running_job_mints_cancelled_receipt(client):
+    csrf = _login(client)
+    worker_id, sk = _register_worker(client, csrf, "w1")
+    job_id = _submit_panel(client)
+
+    ws = _run_to_running(client, csrf, worker_id, sk, job_id)
+    try:
+        res = client.post("/comfy/api/interrupt")
+        assert res.status_code == 200
+
+        receipt_msg = ws.receive_json()  # receipt now precedes job_cancelled
+        assert receipt_msg["kind"] == "cancelled"
+        assert receipt_msg["billable"] is False
+        ws.receive_json()  # job_cancelled
+
+        with db.get_session() as session:
+            assert session.query(db.Receipt).filter(db.Receipt.job_id == job_id).count() == 1
+    finally:
+        ws.close()
+
+
+def test_panel_queue_delete_of_running_job_mints_cancelled_receipt(client):
+    csrf = _login(client)
+    worker_id, sk = _register_worker(client, csrf, "w1")
+    job_id = _submit_panel(client)
+
+    ws = _run_to_running(client, csrf, worker_id, sk, job_id)
+    try:
+        res = client.post("/comfy/api/queue", json={"delete": [job_id]})
+        assert res.status_code == 200
+
+        receipt_msg = ws.receive_json()  # receipt now precedes job_cancelled
+        assert receipt_msg["kind"] == "cancelled"
+        ws.receive_json()  # job_cancelled
+
+        with db.get_session() as session:
+            assert session.query(db.Receipt).filter(db.Receipt.job_id == job_id).count() == 1
+    finally:
+        ws.close()
+
+
+def test_cancel_of_queued_job_mints_no_receipt(client):
+    """Nothing ran, so nothing is owed a receipt at all -- billable or not."""
+    csrf = _login(client)
+    job_id = _submit(client, csrf)
+
+    res = client.post(f"/api/jobs/{job_id}/cancel", headers={"X-CSRF": csrf})
+    assert res.status_code == 200
+
+    with db.get_session() as session:
+        assert session.query(db.Receipt).filter(db.Receipt.job_id == job_id).count() == 0
+
+
+def test_cancel_of_assigned_but_not_yet_running_job_mints_no_receipt(client):
+    """`started_at` is only set by the busy heartbeat (mark_running); a job
+    merely handed to a worker but not yet started has burned no GPU time."""
+    csrf = _login(client)
+    worker_id, sk = _register_worker(client, csrf, "w1")
+    job_id = _submit(client, csrf)
+
+    ws = _connect(client, worker_id, sk)
+    try:
+        ws.send_json({"type": "heartbeat", "state": "idle", "progress": 0.0, "job_id": None, "dynamic": {}})
+        agentws.dispatch_once(worker_id)
+        assert ws.receive_json()["type"] == "job"
+
+        with db.get_session() as session:
+            assert session.get(db.Job, job_id).status == "assigned"
+
+        res = client.post(f"/api/jobs/{job_id}/cancel", headers={"X-CSRF": csrf})
+        assert res.status_code == 200
+
+        with db.get_session() as session:
+            assert session.query(db.Receipt).filter(db.Receipt.job_id == job_id).count() == 0
+    finally:
+        ws.close()
+
+
+def test_cancel_and_notify_pushes_receipt_across_event_loops(client):
+    """`cancel_and_notify` (and therefore `_mint_cancelled_receipt` /
+    `_push_receipt_frame`) can be invoked from a different event loop than
+    the one the target connection was accepted on -- e.g. an admin/panel
+    HTTP handler running under its own async context relative to a
+    long-lived agent websocket. `asyncio.run(...)` here genuinely starts a
+    fresh loop distinct from `TestClient`'s (mirrors the `relay()` helper in
+    test_comfy_panel_ws.py, which exercises `panelws`'s equivalent
+    cross-loop branch the same way): before the fix for review finding M1,
+    `_push_receipt_frame` awaited `conn.ws.send_json` directly regardless of
+    which loop `conn` belonged to, which fails against a foreign loop and
+    was then silently swallowed by the bare `except Exception` around the
+    send -- the worker would never see the frame to counter-sign. Pushing
+    `job_cancelled` already had the loop-check/`run_coroutine_threadsafe`
+    guard (`push_job_cancelled`); the receipt push now mirrors it."""
+    csrf = _login(client)
+    worker_id, sk = _register_worker(client, csrf, "w1")
+    job_id = _submit(client, csrf)
+
+    ws = _run_to_running(client, csrf, worker_id, sk, job_id)
+    try:
+        assert asyncio.run(agentws.cancel_and_notify(job_id, reason="cross-loop cancel"))
+
+        # The cancelled receipt is minted before job_cancelled is pushed (so
+        # a push failure can never cost the receipt), so the receipt frame
+        # now arrives first.
+        receipt_msg = ws.receive_json()
+        assert receipt_msg["type"] == "receipt"
+        assert receipt_msg["kind"] == "cancelled"
+        assert receipt_msg["billable"] is False
+        cancelled_msg = ws.receive_json()
+        assert cancelled_msg == {"type": "job_cancelled", "job_id": job_id}
+
+        with db.get_session() as session:
+            receipts = session.query(db.Receipt).filter(db.Receipt.job_id == job_id).all()
+            assert len(receipts) == 1
+    finally:
+        ws.close()
+
+
+def test_cancel_of_running_job_with_offline_worker_still_writes_receipt(client):
+    """The owning worker may be offline at cancel time (an admin cancelling
+    a job whose agent has already dropped/crashed). The receipt must still
+    be written -- worker_sig NULL until an ack ever arrives -- rather than
+    the mint being skipped just because there is nobody to push it to."""
+    csrf = _login(client)
+    worker_id, sk = _register_worker(client, csrf, "w1")
+    job_id = _submit(client, csrf)
+
+    ws = _run_to_running(client, csrf, worker_id, sk, job_id)
+    ws.close()  # simulate the worker dropping off before the cancel lands
+
+    res = client.post(f"/api/jobs/{job_id}/cancel", headers={"X-CSRF": csrf})
+    assert res.status_code == 200
+
+    with db.get_session() as session:
+        receipts = session.query(db.Receipt).filter(db.Receipt.job_id == job_id).all()
+        assert len(receipts) == 1
+        assert receipts[0].kind == "cancelled"
+        assert receipts[0].billable is False
+        assert receipts[0].worker_sig is None
+
+
+def test_cancel_and_notify_still_mints_receipt_when_job_cancelled_push_raises(client, monkeypatch, caplog):
+    """Final-review M2: `push_job_cancelled` can raise (a wedged or closed
+    target event loop surfaces as `TimeoutError`/`RuntimeError` from
+    `run_coroutine_threadsafe(...).result()`, uncaught by anything below the
+    HTTP handler). The cancelled receipt must still be minted -- the mint no
+    longer sits downstream of the push -- and `cancel_and_notify` must not
+    propagate the failure to its caller (an HTTP handler cancelling several
+    jobs in a loop)."""
+    csrf = _login(client)
+    worker_id, sk = _register_worker(client, csrf, "w1")
+    job_id = _submit(client, csrf)
+
+    ws = _run_to_running(client, csrf, worker_id, sk, job_id)
+    try:
+        def _boom(*args, **kwargs):
+            raise TimeoutError("wedged target loop")
+
+        monkeypatch.setattr(agentws, "push_job_cancelled", _boom)
+
+        with caplog.at_level(logging.WARNING, logger="comfyfed_server.agentws"):
+            result = asyncio.run(agentws.cancel_and_notify(job_id, reason="push failure"))
+
+        assert result is True
+        assert any("push job_cancelled" in rec.message for rec in caplog.records)
+
+        with db.get_session() as session:
+            assert session.get(db.Job, job_id).status == "cancelled"
+            receipts = session.query(db.Receipt).filter(db.Receipt.job_id == job_id).all()
+            assert len(receipts) == 1
+            assert receipts[0].kind == "cancelled"
+    finally:
+        ws.close()
+
+
+def test_cancel_and_notify_isolates_panelws_notify_failure(client, monkeypatch, caplog):
+    """A `panelws.job_cancelled` failure must not cost the already-minted
+    receipt or the agent push, and must not propagate."""
+    csrf = _login(client)
+    worker_id, sk = _register_worker(client, csrf, "w1")
+    job_id = _submit(client, csrf)
+
+    ws = _run_to_running(client, csrf, worker_id, sk, job_id)
+    try:
+        async def _boom(*args, **kwargs):
+            raise RuntimeError("panel loop closed")
+
+        monkeypatch.setattr(agentws.panelws, "job_cancelled", _boom)
+
+        with caplog.at_level(logging.WARNING, logger="comfyfed_server.agentws"):
+            result = asyncio.run(agentws.cancel_and_notify(job_id, reason="panel failure"))
+
+        assert result is True
+        assert any("panelws.job_cancelled" in rec.message for rec in caplog.records)
+
+        ws.receive_json()  # receipt
+        ws.receive_json()  # job_cancelled
+
+        with db.get_session() as session:
+            assert session.query(db.Receipt).filter(db.Receipt.job_id == job_id).count() == 1
+    finally:
+        ws.close()
+
+
+def test_panel_queue_clear_continues_past_one_jobs_notify_failure(client, monkeypatch):
+    """Final-review M2: `POST /comfy/api/queue {"clear": true}` cancels every
+    matching job in a loop -- one job's `cancel_and_notify` blowing up must
+    not 500 the request or leave later jobs untouched."""
+    csrf = _login(client)
+    worker_id, sk = _register_worker(client, csrf, "w1")
+    job_a = _submit_panel(client)
+    job_b = _submit_panel(client)
+
+    ws = _connect(client, worker_id, sk)
+    try:
+        ws.send_json({"type": "heartbeat", "state": "idle", "progress": 0.0, "job_id": None, "dynamic": {}})
+        agentws.dispatch_once(worker_id)
+        first = ws.receive_json()
+        assert first["type"] == "job"
+        running_job = first["job_id"]
+        queued_job = job_b if running_job == job_a else job_a
+
+        real_cancel_and_notify = agentws.cancel_and_notify
+
+        async def _flaky(job_id, *, reason):
+            if job_id == running_job:
+                raise RuntimeError("boom")
+            return await real_cancel_and_notify(job_id, reason=reason)
+
+        import comfyfed_server.comfyapi as comfyapi_module
+
+        monkeypatch.setattr(comfyapi_module.agentws, "cancel_and_notify", _flaky)
+
+        res = client.post("/comfy/api/queue", json={"clear": True})
+        assert res.status_code == 200
+
+        with db.get_session() as session:
+            # running_job's cancel_and_notify blew up entirely, but the loop
+            # in post_queue must not abort on that -- the OTHER job in the
+            # same sweep is still cancelled.
+            assert session.get(db.Job, queued_job).status == "cancelled"
+    finally:
+        ws.close()
+
+
+# --- Task 6: agent protocol 2 ----------------------------------------------
+
+
+def test_hello_records_reported_protocol_and_platform(client):
+    csrf = _login(client)
+    worker_id, sk = _register_worker(client, csrf, "w1")
+
+    ws = _connect(client, worker_id, sk)
+    try:
+        ws.send_json(
+            {
+                "type": "hello",
+                "hardware": {"cpu": "x", "platform": "Linux"},
+                "backend": "cuda",
+                "torch_version": "2.0",
+                "node_classes": [],
+                "protocol": 2,
+            }
+        )
+        agentws.dispatch_once(worker_id)
+
+        with db.get_session() as session:
+            worker = session.get(db.Worker, worker_id)
+            assert worker.protocol == 2
+            assert json.loads(worker.hardware)["platform"] == "Linux"
+    finally:
+        ws.close()
+
+
+def test_hello_without_protocol_defaults_to_1_and_sends_deprecation_frame(client):
+    csrf = _login(client)
+    worker_id, sk = _register_worker(client, csrf, "w1")
+
+    ws = _connect(client, worker_id, sk)
+    try:
+        ws.send_json(
+            {
+                "type": "hello",
+                "hardware": {"cpu": "x"},
+                "backend": "cuda",
+                "torch_version": "2.0",
+                "node_classes": [],
+            }
+        )
+        frame = ws.receive_json()
+        assert frame["type"] == "deprecation"
+        assert "agent 版本過舊" in frame["message"]
+        assert "outdated" in frame["message"].lower()
+
+        with db.get_session() as session:
+            worker = session.get(db.Worker, worker_id)
+            assert worker.protocol == 1
+    finally:
+        ws.close()
+
+
+def test_hello_with_protocol_2_sends_no_deprecation_frame(client):
+    csrf = _login(client)
+    worker_id, sk = _register_worker(client, csrf, "w1")
+    job_id = _submit(client, csrf)
+
+    ws = _connect(client, worker_id, sk)
+    try:
+        ws.send_json(
+            {
+                "type": "hello",
+                "hardware": {"cpu": "x"},
+                "backend": "cuda",
+                "torch_version": "2.0",
+                "node_classes": [],
+                "protocol": 2,
+            }
+        )
+        ws.send_json({"type": "heartbeat", "state": "idle", "progress": 0.0, "job_id": None, "dynamic": {}})
+        agentws.dispatch_once(worker_id)
+
+        # The first (and only) frame this connection receives is the job
+        # push -- no deprecation frame was ever sent.
+        job_msg = ws.receive_json()
+        assert job_msg["type"] == "job"
+        assert job_msg["job_id"] == job_id
+    finally:
+        ws.close()
+
+
+def test_job_cancelled_is_not_pushed_to_a_protocol_1_worker(client, caplog):
+    """A protocol-1 worker (the default for a freshly registered worker that
+    has never sent a `hello` with `protocol: 2`) can't act on `job_cancelled`
+    -- it would only log an unknown-message-type warning -- so the server
+    must skip the push silently rather than sending it."""
+    csrf = _login(client)
+    worker_a, key_a = _register_worker(client, csrf, "w-a")
+    worker_b, key_b = _register_worker(client, csrf, "w-b")
+    job_id = _submit(client, csrf)
+
+    ws_a = _connect(client, worker_a, key_a)
+    try:
+        ws_a.send_json({"type": "heartbeat", "state": "idle", "progress": 0.0, "job_id": None, "dynamic": {}})
+        agentws.dispatch_once(worker_a)
+        assert ws_a.receive_json()["type"] == "job"  # worker_a now owns job_id
+
+        # worker_b is protocol 1 by default (no hello sent).
+        ws_b = _connect(client, worker_b, key_b)
+        try:
+            with caplog.at_level(logging.DEBUG, logger="comfyfed_server.dispatch"):
+                ws_b.send_json(
+                    {
+                        "type": "heartbeat",
+                        "state": "busy",
+                        "progress": 0.1,
+                        "job_id": job_id,
+                        "dynamic": {},
+                    }
+                )
+                agentws.dispatch_once(worker_b)
+
+            # No job_cancelled was ever queued to push to worker_b.
+            assert agentws._connections[worker_b].cancelled_jobs_sent == set()
+        finally:
+            ws_b.close()
+    finally:
+        ws_a.close()
+
+
+def test_job_done_missing_exec_seconds_for_protocol_2_logs_error(client, caplog):
+    """A protocol-2 agent guarantees `exec_seconds` once the run started
+    (Task 5) -- omitting it is a protocol violation, not a routine fallback,
+    so it must log at ERROR (still falling back to wall-clock billing)."""
+    csrf = _login(client)
+    worker_id, sk = _register_worker(client, csrf, "w1")
+    job_id = _submit(client, csrf)
+
+    ws = _connect(client, worker_id, sk)
+    try:
+        ws.send_json(
+            {
+                "type": "hello",
+                "hardware": {"cpu": "x"},
+                "backend": "cuda",
+                "torch_version": "2.0",
+                "node_classes": [],
+                "protocol": 2,
+            }
+        )
+        agentws.dispatch_once(worker_id)
+
+        ws.send_json({"type": "heartbeat", "state": "idle", "progress": 0.0, "job_id": None, "dynamic": {}})
+        agentws.dispatch_once(worker_id)
+        assert ws.receive_json()["type"] == "job"
+
+        ws.send_json({"type": "heartbeat", "state": "busy", "progress": 0.5, "job_id": job_id, "dynamic": {}})
+        agentws.dispatch_once(worker_id)
+
+        with caplog.at_level(logging.ERROR, logger="comfyfed_server.agentws"):
+            ws.send_json({"type": "job_done", "job_id": job_id, "result_files": ["out.png"]})
+            agentws.dispatch_once(worker_id)
+            ws.receive_json()  # receipt frame
+
+        errors = [r for r in caplog.records if r.levelno >= logging.ERROR]
+        assert len(errors) == 1
+        assert "protocol violation" in errors[0].message.lower()
+
+        with db.get_session() as session:
+            receipt = session.query(db.Receipt).filter(db.Receipt.job_id == job_id).one()
+            assert receipt.basis == "wall"
+    finally:
+        ws.close()

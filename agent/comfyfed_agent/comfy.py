@@ -28,7 +28,20 @@ _MIN_EXPECTED_SECONDS = 30.0
 
 
 class ComfyError(Exception):
-    """Raised when ComfyUI reports a /prompt submission or execution error."""
+    """Raised when ComfyUI reports a /prompt submission or execution error.
+
+    `exec_seconds` carries the same GPU-execution measurement `run_workflow`
+    returns on success (see its docstring), when the failure happened after
+    the prompt was observed running -- i.e. a ComfyUI-reported execution
+    error, as opposed to a /prompt submission rejection (node_errors, a
+    top-level error) where nothing ever ran. `None` (the default) means
+    "unmeasurable" and must be treated the same as a run that never started:
+    `agentws`/the platform bills nothing for it.
+    """
+
+    def __init__(self, message: str, exec_seconds: Optional[float] = None):
+        super().__init__(message)
+        self.exec_seconds = exec_seconds
 
 
 class JobCancelled(Exception):
@@ -387,7 +400,7 @@ def run_workflow(
 
         status = history_entry.get("status") or {}
         if status.get("status_str") == "error":
-            raise ComfyError(f"ComfyUI job execution failed: {status}")
+            raise ComfyError(f"ComfyUI job execution failed: {status}", exec_seconds=exec_seconds)
 
         if on_progress is not None:
             on_progress(1.0)

@@ -146,7 +146,11 @@ def test_update_settings_writes_platform_url_and_lang(client):
         headers={"X-CSRF": csrf},
     )
     assert r.status_code == 200
-    assert r.json() == {"platform_url": "https://fed.example", "lang": "zh-TW"}
+    assert r.json() == {
+        "platform_url": "https://fed.example",
+        "lang": "zh-TW",
+        "object_info_mode": "union",
+    }
 
     me = client.get("/api/auth/me").json()
     assert me["platform_url"] == "https://fed.example"
@@ -188,6 +192,34 @@ def test_update_settings_requires_login(client):
     assert r.status_code == 401
 
 
+def test_get_settings_reports_defaults_before_any_write(client):
+    _csrf(client)
+    r = client.get("/api/settings")
+    assert r.status_code == 200
+    assert r.json() == {"platform_url": "http://h", "lang": "en", "object_info_mode": "union"}
+
+
+def test_get_settings_requires_login(client):
+    r = client.get("/api/settings")
+    assert r.status_code == 401
+
+
+def test_update_settings_writes_object_info_mode(client):
+    csrf = _csrf(client)
+    r = client.post("/api/settings", json={"object_info_mode": "intersection"}, headers={"X-CSRF": csrf})
+    assert r.status_code == 200
+    assert r.json()["object_info_mode"] == "intersection"
+
+    assert client.get("/api/settings").json()["object_info_mode"] == "intersection"
+
+
+def test_update_settings_rejects_an_unknown_object_info_mode(client):
+    csrf = _csrf(client)
+    r = client.post("/api/settings", json={"object_info_mode": "bogus"}, headers={"X-CSRF": csrf})
+    assert r.status_code == 400
+    assert r.json()["error"]["code"] == "settings.bad_object_info_mode"
+
+
 # --- the public session-reading surface (M4) -----------------------------------
 
 
@@ -213,6 +245,19 @@ def test_session_cookie_name_and_reader_are_public_and_agree(client):
 
 
 def test_read_session_payload_rejects_absent_and_tampered_cookies(client):
+    """Root cause of the former flake (Phase 1.9 Task 8): the tamper mutation
+    used to flip the *last* character of the token. That character is the
+    last of the signature's final base64 group, and for a 20-byte sha1 HMAC
+    digest (20 % 3 == 2) that final base64 character encodes only 4 real bits
+    plus 2 always-zero padding bits. 'A' (base64 index 0) and 'B' (index 1)
+    differ only in those discarded padding bits, so ~1/16 of randomly-keyed
+    sessions produced a "tampered" string that decodes to the exact same
+    signature bytes as the original -- the mutation was a silent no-op and
+    the assertion flaked (~6% failure rate, reproduced 20000x in-process).
+    Fixing at the root: mutate the second-to-last character instead, which
+    sits in a fully-populated base64 group and therefore always changes the
+    decoded signature bytes (reproduced 20000x in-process with zero flakes).
+    """
     from comfyfed_server import auth
 
     _csrf(client)
@@ -221,8 +266,11 @@ def test_read_session_payload_rejects_absent_and_tampered_cookies(client):
     assert auth.read_session_payload(None) is None
     assert auth.read_session_payload("") is None
     assert auth.read_session_payload("not-a-token") is None
-    # Flip a character in the signed value: the signature must stop matching.
-    tampered = good[:-1] + ("A" if good[-1] != "A" else "B")
+    # Flip the second-to-last character of the signed value (not the last --
+    # see docstring): the signature must stop matching.
+    pos = -2
+    replacement = "A" if good[pos] != "A" else "Z"
+    tampered = good[:pos] + replacement + good[pos + 1 :]
     assert auth.read_session_payload(tampered) is None
 
 

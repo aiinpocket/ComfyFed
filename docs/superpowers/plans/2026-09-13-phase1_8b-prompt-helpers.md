@@ -1,6 +1,6 @@
 # Phase 1.8b: Prompt-Helper Templates Implementation Plan
 
-> **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
+> **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [x]`) syntax for tracking.
 
 **Goal:** Two templates that solve the "使用者不知道怎麼描述想要的東西" problem: (1) 圖生提示詞 — upload a reference image + a simple ask, a local VLM writes the polished English prompt; (2) 文字生提示詞 — paste a rough idea, the same model rewrites it into a structured prompt. Both results display in the panel and come back as a .txt artifact the user can copy anywhere.
 
@@ -12,7 +12,7 @@
 
 ## Global Constraints
 
-- zh-TW-first bilingual notes matching existing template voice; suite green at every commit (`.venv/Scripts/python.exe -m pytest tests -q`, base 552; known flake tests/server/test_auth.py::test_read_session_payload_rejects_absent_and_tampered_cookies — rerun, don't chase).
+- zh-TW-first bilingual notes matching existing template voice; suite green at every commit (`.venv/Scripts/python.exe -m pytest tests -q`, base 552; known flake tests/server/test_auth.py::test_read_session_payload_rejects_absent_and_tampered_cookies — rerun, don't chase) (resolved in Phase 1.9 Task 8 — root cause: the tamper flipped the token's last base64 char, whose bits are partly discarded padding, so ~6% of runs produced an alias that still decoded to the same signature).
 - data/comfy_frontend/ untouched. The decommissioned R2 mirror domain must not reappear. GCS base `https://storage.googleapis.com/comfyfed-models/models/`.
 - Verified-live TextGenerate facts (ground truth):
   - CLIPLoader widgets for the model: `["qwen3vl_4b_bf16.safetensors", "qwen_image", "default"]` (type qwen_image reaches the generic qwen3vl path: vision + generation).

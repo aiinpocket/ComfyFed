@@ -136,6 +136,7 @@ def test_panel_drives_a_job_end_to_end(server, tmp_path):
                 "backend": "cuda",
                 "torch_version": "2.4.0",
                 "node_classes": sorted(OBJECT_INFO),
+                "protocol": 2,
             }
         )
         ws.send_json(

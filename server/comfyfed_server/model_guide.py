@@ -338,8 +338,18 @@ def guidance_message(missing: list[str], data_dir: str) -> str:
     One block per model (curated, harvested, or unknown -- see
     `_render_block`), joined by blank lines, with the shared header first.
     """
-    blocks = [_HEADER] + [_render_block(name, lookup(name, data_dir)) for name in missing]
+    blocks = [_HEADER] + [model_guidance_block(name, data_dir) for name in missing]
     return "\n\n".join(blocks)
+
+
+def model_guidance_block(name: str, data_dir: str) -> str:
+    """The single-model guidance block (`【name】` + path/official/backup)
+    used both as one paragraph of `guidance_message` and, standalone, as the
+    per-node `node_errors[...].errors[].details` string in
+    `comfyapi.post_prompt` -- same lookup, same rendering, one source of
+    truth for what an admin is told about a given model.
+    """
+    return _render_block(name, lookup(name, data_dir))
 
 
 def guidance_summary(missing: list[str]) -> str:

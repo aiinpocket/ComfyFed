@@ -47,6 +47,7 @@ import {
 } from '@tabler/icons-react';
 import { Fragment, useCallback, useEffect, useMemo, useState } from 'react';
 import { useTranslation } from 'react-i18next';
+import { Link } from 'react-router-dom';
 
 import {
   ApiError,
@@ -640,9 +641,16 @@ function JobsTable({
                     )}
                   </Table.Td>
                   <Table.Td>
-                    <Mono title={job.id} c="">
-                      {shortId(job.id)}
-                    </Mono>
+                    <Anchor
+                      component={Link}
+                      to={`/jobs/${job.id}`}
+                      size="sm"
+                      onClick={(event) => event.stopPropagation()}
+                    >
+                      <Mono title={job.id} c="">
+                        {shortId(job.id)}
+                      </Mono>
+                    </Anchor>
                   </Table.Td>
                   <Table.Td>
                     <Group gap={6} wrap="nowrap">
