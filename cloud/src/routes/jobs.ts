@@ -53,6 +53,27 @@ const SHA256_HEX_RE = /^[0-9a-f]{64}$/;
 // Small shared helpers (duplicated in spirit from routes/workers.ts, which
 // keeps the same small per-file copies rather than a cross-route import)
 
+/** Manually pumps `readable` into `writable` chunk-by-chunk. See the caller
+ * in the raw-PUT route for why this can't just be `readable.pipeTo(writable)`
+ * when `writable` belongs to a `FixedLengthStream`. Propagates a write
+ * failure (e.g. `FixedLengthStream`'s "too many bytes" throw) by rejecting,
+ * same as `pipeTo` would. */
+async function pumpStream(readable: ReadableStream<Uint8Array>, writable: WritableStream<Uint8Array>): Promise<void> {
+  const reader = readable.getReader();
+  const writer = writable.getWriter();
+  try {
+    while (true) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      await writer.write(value);
+    }
+    await writer.close();
+  } catch (err) {
+    await writer.abort(err).catch(() => undefined);
+    throw err;
+  }
+}
+
 function requestInfo(url: string): { path: string; query: string } {
   const u = new URL(url);
   return { path: u.pathname, query: u.search ? u.search.slice(1) : "" };
@@ -479,22 +500,54 @@ app.put("/api/agent/jobs/:jobId/artifacts/raw/:token", async (c) => {
   }
 
   const key = artifactKey(jobId, row.filename);
-  const [toStore, toDigest] = body.tee();
+
   // `crypto.DigestStream` (Workers-specific) hashes bytes as they're piped
-  // through it -- no whole-body buffer needed to verify sha256. The other
-  // branch of the tee streams straight to R2 in parallel.
+  // through it -- no whole-body buffer needed to verify sha256. One tee
+  // branch feeds it directly; the other feeds R2.
+  const [toStore, toDigest] = body.tee();
   const digestStream = new crypto.DigestStream("SHA-256");
   const digestDone = toDigest.pipeTo(digestStream);
-  const storeDone = c.env.STORE.put(key, toStore);
-  await Promise.all([digestDone, storeDone]);
+
+  // Enforce the declared size WHILE streaming, not only after the fact: the
+  // Content-Length pre-check above is a fast-path best-effort (a chunked
+  // request has no such header at all). `FixedLengthStream(row.size)` is
+  // the real guard -- its writable side throws the MOMENT more bytes than
+  // declared are written to it (or if the source closes having written
+  // fewer), aborting the pipe mid-flight rather than letting a full
+  // oversized body land in R2 before anyone notices. It also happens to be
+  // exactly what `R2Bucket.put` needs here: a plain `TransformStream`'s
+  // readable side loses the "known length" R2 requires (`put` throws
+  // "Provided readable stream must have a known length" otherwise), while
+  // `FixedLengthStream`'s readable side carries it through.
+  let storeDone: Promise<unknown>;
+  if (row.size !== null) {
+    const { readable, writable } = new FixedLengthStream(row.size);
+    // A manual reader/writer pump, not `toStore.pipeTo(writable)`: workerd
+    // doesn't implement `pipeTo` directly between two identity-transform-
+    // backed streams (a `tee()` branch piped straight into another
+    // `TransformStream`/`FixedLengthStream`'s writable throws "Inter-
+    // TransformStream ReadableStream.pipeTo() is not implemented") --
+    // pumping chunk-by-chunk through explicit `getReader()`/`getWriter()`
+    // calls sidesteps that internal optimization path entirely.
+    const pumpDone = pumpStream(toStore, writable);
+    storeDone = Promise.all([pumpDone, c.env.STORE.put(key, readable)]);
+  } else {
+    storeDone = c.env.STORE.put(key, toStore);
+  }
+
+  try {
+    await Promise.all([digestDone, storeDone]);
+  } catch {
+    // The size guard aborted the pipeline mid-stream (or some other
+    // stream-level failure) -- clean up whatever partial object R2 may
+    // have written and report it as the size violation it almost
+    // certainly is.
+    await c.env.STORE.delete(key).catch(() => undefined);
+    return errorJson(c, 413, "jobs.artifact_too_large", "Upload exceeds the declared size.");
+  }
 
   const computedSha256 = bytesToHex(new Uint8Array(await digestStream.digest));
-  const bytesWritten = Number(digestStream.bytesWritten);
 
-  if (row.size !== null && bytesWritten !== row.size) {
-    await c.env.STORE.delete(key).catch(() => undefined);
-    return errorJson(c, 400, "artifact.hash_mismatch", "Uploaded artifact size does not match the declared size.");
-  }
   if (computedSha256 !== row.sha256) {
     await c.env.STORE.delete(key).catch(() => undefined);
     return errorJson(c, 400, "artifact.hash_mismatch", "Uploaded artifact does not match the declared sha256.");

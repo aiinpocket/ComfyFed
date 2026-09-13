@@ -8,12 +8,16 @@
  * plus a `staging/<filename>` prefix with no equivalent in Phase 1 (used by
  * Task 9/10's template-asset staging flow, not by anything in this file).
  *
- * `sanitizePathComponent` is a byte-for-byte port of storage.py's function of
- * the same name -- see that docstring for the full Windows-device-name /
- * trailing-dot-or-space rationale. Every place a client-supplied name
- * becomes an R2 key segment here (artifact filename, job-input filename)
- * must go through it, exactly like the Python source's single-definition-of-
- * "safe" contract.
+ * `sanitizePathComponent` matches storage.py's function of the same name in
+ * every case Python actually rejects (empty, `.`/`..`, a value whose
+ * basename differs from itself, Windows device names, trailing dot/space) --
+ * but it is deliberately a STRICTER SUPERSET, not a byte-for-byte port: it
+ * splits on both `/` and `\` unconditionally, on every platform, where
+ * Python's `os.path.basename` only treats `\` as a separator on Windows (see
+ * `basename`'s docstring below for why that divergence is intentional, not
+ * an oversight). Every place a client-supplied name becomes an R2 key
+ * segment here (artifact filename, job-input filename) must go through it,
+ * exactly like the Python source's single-definition-of-"safe" contract.
  */
 
 const ARTIFACTS_PREFIX = "artifacts";
@@ -41,8 +45,9 @@ function basename(value: string): string {
   return parts[parts.length - 1] ?? "";
 }
 
-/** Reduce `value` to a single, safe path segment, or throw. Ports
- * `storage.sanitize_path_component` exactly -- see this file's docstring. */
+/** Reduce `value` to a single, safe path segment, or throw. Matches
+ * `storage.sanitize_path_component`'s rejections, plus the stricter
+ * both-separator basename split -- see this file's docstring. */
 export function sanitizePathComponent(value: string, what = "path component"): string {
   const fail = (): never => {
     throw new Error(`Invalid ${what}: ${JSON.stringify(value)}`);

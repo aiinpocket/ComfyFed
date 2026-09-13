@@ -51,11 +51,17 @@ async function raw(
   if (opts.cookie) headers["Cookie"] = opts.cookie;
   const method = opts.method ?? (opts.body !== undefined ? "POST" : "GET");
   const canCarryBody = method !== "GET" && method !== "HEAD";
+  const bodyToSend = canCarryBody ? (opts.body ?? undefined) : undefined;
   const request = new Request(`http://example.com${path}`, {
     method,
     headers,
-    body: canCarryBody ? (opts.body ?? undefined) : undefined,
-  });
+    body: bodyToSend,
+    // Required by the fetch spec whenever the body is a ReadableStream
+    // (used by the size-limiting streaming test below to send a body with
+    // no Content-Length header at all, forcing the mid-stream enforcement
+    // path rather than the Content-Length pre-check).
+    ...(bodyToSend instanceof ReadableStream ? { duplex: "half" } : {}),
+  } as RequestInit);
   const ctx = createExecutionContext();
   const response = await worker.fetch(request, env as any, ctx);
   await waitOnExecutionContext(ctx);
@@ -378,6 +384,51 @@ describe("POST /api/agent/jobs/{id}/artifacts/presign + raw PUT (direct mode)", 
       headers: { "content-length": String(oversized.length) },
     });
     expect(put.status).toBe(413);
+  });
+
+  it("413s a chunked (no Content-Length) PUT that exceeds the declared size DURING the stream, without ever storing the full oversized object", async () => {
+    const worker = await registerWorker();
+    const jobId = await createAssignedJob(worker);
+    const declaredContent = new TextEncoder().encode("small");
+    const sha256 = Array.from(new Uint8Array(await crypto.subtle.digest("SHA-256", declaredContent)))
+      .map((b) => b.toString(16).padStart(2, "0"))
+      .join("");
+
+    const presignPath = `/api/agent/jobs/${jobId}/artifacts/presign`;
+    const presignBody = new TextEncoder().encode(
+      JSON.stringify({ filename: "out.bin", sha256, size: declaredContent.length })
+    );
+    const pr = await signedCall(worker, "POST", presignPath, presignBody);
+
+    // A hand-built ReadableStream body carries no Content-Length header at
+    // all (unlike a plain Uint8Array body, which fetch sets automatically),
+    // so the pre-check based on that header cannot be what catches this --
+    // only the mid-stream counting TransformStream can. Each chunk alone is
+    // under the declared size; only their sum exceeds it, and the sum is
+    // well over a naive single-chunk check too.
+    const chunks = [
+      new TextEncoder().encode("aa"),
+      new TextEncoder().encode("bb"),
+      new TextEncoder().encode("cc-this-pushes-it-over-the-declared-limit-by-a-lot"),
+    ];
+    let i = 0;
+    const stream = new ReadableStream<Uint8Array>({
+      pull(controller) {
+        if (i < chunks.length) {
+          controller.enqueue(chunks[i++]!);
+        } else {
+          controller.close();
+        }
+      },
+    });
+
+    const put = await raw(pr.body.url, { method: "PUT", body: stream as unknown as BodyInit });
+    expect(put.status).toBe(413);
+
+    // No full (or partial) object should be left behind -- the streaming
+    // guard's cleanup deletes whatever R2 had started writing.
+    const stored = await store().get(`artifacts/${jobId}/out.bin`);
+    expect(stored).toBeNull();
   });
 
   it("400s a PUT whose bytes don't match the declared sha256", async () => {
