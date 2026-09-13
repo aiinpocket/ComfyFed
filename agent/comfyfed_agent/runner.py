@@ -71,6 +71,11 @@ class PlatformConnection:
         # platform (or "" before the first successful upload). Carried on
         # every heartbeat so the platform can detect drift independently.
         self.object_info_hash: str = ""
+        # Digest of the last model inventory this connection actually sent
+        # (or "" before the first send). Lets refresh_model_inventory tell a
+        # genuine change from a no-op rescan without resending the whole
+        # (possibly large) model list just to compare it.
+        self.model_inventory_hash: str = ""
 
     def _ws_url(self) -> str:
         parsed = urlsplit(self.entry.platform_url)
@@ -185,6 +190,19 @@ class PlatformConnection:
 
     def sign_receipt_payload(self, payload: str) -> str:
         return self._sign(payload.encode())
+
+
+def _model_inventory_digest(models: list[dict]) -> str:
+    """Stable digest of a model inventory, for change detection.
+
+    Sorted by name (scan_models' own order is os.walk's, which is not
+    guaranteed stable across calls) and dumped with sorted keys so two scans
+    that found the exact same files/sizes/hashes always hash identically --
+    the whole point being to skip resending an `inventory` message when
+    nothing actually changed.
+    """
+    canonical = json.dumps(sorted(models, key=lambda m: m["name"]), sort_keys=True)
+    return hashlib.sha256(canonical.encode()).hexdigest()
 
 
 def _is_safe_relative_path(path: str) -> bool:
@@ -492,6 +510,43 @@ class AgentLoop:
             return
 
         conn.object_info_hash = oi_hash
+
+    async def refresh_model_inventory(self, conn: PlatformConnection) -> None:
+        """Rescan the local model inventory and push it only if it changed.
+
+        Piggybacks the same `_OBJECT_INFO_INTERVAL_SECONDS` timer as
+        `refresh_object_info` (see `_connection_loop`) rather than a second
+        interval of its own: this is also what makes the lazy-hash
+        convergence in `hardware.scan_models` real. A single hello-time scan
+        would schedule at most one background hash and then never look
+        again, so a models folder with several un-hashed files would sit
+        forever with only the first one ever gaining a `sha256`. Re-scanning
+        periodically lets each pass pick up the next still-unhashed file.
+
+        A digest comparison (`_model_inventory_digest`) keeps a rescan that
+        found nothing new from pushing a chatty no-op `inventory` message
+        every 10 minutes -- only an actual change (a new/removed/resized
+        file, or a hash finishing in the background) triggers a send.
+        """
+        if not self.config.models_dir:
+            return
+
+        models = await asyncio.to_thread(
+            hardware.scan_models, self.config.models_dir, self.config.hash_models
+        )
+        digest = _model_inventory_digest(models)
+        if digest == conn.model_inventory_hash:
+            return
+
+        try:
+            await conn.send_inventory(models)
+        except Exception:
+            logger.exception(
+                "runner: failed to push updated model inventory to %s", conn.entry.platform_url
+            )
+            return
+
+        conn.model_inventory_hash = digest
 
     async def handle_job(self, conn: PlatformConnection, job_msg: dict) -> None:
         """Run one job dispatched over `conn`, broadcasting busy state to every platform.
@@ -1292,6 +1347,7 @@ class AgentLoop:
 
             if now - last_object_info >= _OBJECT_INFO_INTERVAL_SECONDS:
                 await self.refresh_object_info(conn)
+                await self.refresh_model_inventory(conn)
                 last_object_info = now
 
     async def _run_platform(self, conn: PlatformConnection) -> None:
@@ -1318,6 +1374,7 @@ class AgentLoop:
                     else []
                 )
                 await conn.send_inventory(models)
+                conn.model_inventory_hash = _model_inventory_digest(models)
 
                 await self.refresh_object_info(conn)
 

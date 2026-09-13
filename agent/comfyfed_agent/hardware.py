@@ -246,6 +246,9 @@ def scan_models(models_dir: str, hash_models: bool = True) -> list[dict]:
       means every model eventually gets caught up over several passes.
     - a file whose hash is already being computed by a still-running thread
       from a previous call is left alone rather than scheduled again.
+    - any sidecar entry for a file no longer found on disk (deleted or
+      moved) is pruned on the spot, so the cache stays bounded by what's
+      actually present instead of accumulating forever.
 
     `hash_models=False` disables all of the above: entries simply omit
     `sha256`, the sidecar cache is neither read nor written, and nothing is
@@ -285,6 +288,29 @@ def scan_models(models_dir: str, hash_models: bool = True) -> list[dict]:
                     candidates.append((size_bytes, full_path, rel_path, mtime))
 
             results.append(entry)
+
+    if hash_models and cache:
+        # Prune sidecar entries for files that no longer exist (deleted or
+        # moved models) so the cache doesn't grow without bound. Re-load
+        # under the lock in case a background `_hash_worker` wrote a fresh
+        # entry between our read above and now -- pruning must never race
+        # away a hash that just finished.
+        seen = {entry["name"] for entry in results}
+        stale_keys = [rel_path for rel_path in cache if rel_path not in seen]
+        if stale_keys:
+            with _HASH_LOCK:
+                fresh_cache = _load_hash_cache(cache_path)
+                changed = False
+                for rel_path in stale_keys:
+                    if fresh_cache.pop(rel_path, None) is not None:
+                        changed = True
+                if changed:
+                    try:
+                        _save_hash_cache_atomic(cache_path, fresh_cache)
+                    except OSError:
+                        logger.warning(
+                            "hardware: failed to prune hash cache %s", cache_path, exc_info=True
+                        )
 
     if hash_models and candidates:
         candidates.sort(key=lambda c: c[0])  # smallest first

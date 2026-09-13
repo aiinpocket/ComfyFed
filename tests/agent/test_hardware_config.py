@@ -225,6 +225,58 @@ def test_scan_models_tolerates_corrupt_cache_file(tmp_path):
     _wait_for_hash(models_dir, "a.bin")
 
 
+def test_scan_models_prunes_sidecar_entries_for_deleted_files(tmp_path):
+    models_dir = tmp_path / "models"
+    models_dir.mkdir()
+    keep = models_dir / "keep.bin"
+    gone = models_dir / "gone.bin"
+    keep.write_bytes(b"keep me")
+    gone.write_bytes(b"delete me")
+
+    # Only one hash is scheduled per pass, so rescan until both converge.
+    deadline = time.monotonic() + 5.0
+    while time.monotonic() < deadline:
+        hardware.scan_models(str(models_dir))
+        cache_path = models_dir / ".comfyfed_hashes.json"
+        try:
+            cache = json.loads(cache_path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            cache = {}
+        if "keep.bin" in cache and "gone.bin" in cache:
+            break
+        time.sleep(0.05)
+    else:
+        raise AssertionError("keep.bin and gone.bin were never both hashed")
+
+    cache_path = models_dir / ".comfyfed_hashes.json"
+    cache = json.loads(cache_path.read_text(encoding="utf-8"))
+    assert set(cache) == {"keep.bin", "gone.bin"}
+
+    os.remove(gone)
+    hardware.scan_models(str(models_dir))
+
+    cache = json.loads(cache_path.read_text(encoding="utf-8"))
+    assert set(cache) == {"keep.bin"}
+
+
+def test_scan_models_prune_is_a_noop_when_hash_models_false(tmp_path):
+    models_dir = tmp_path / "models"
+    models_dir.mkdir()
+    gone = models_dir / "gone.bin"
+    gone.write_bytes(b"delete me")
+
+    hardware.scan_models(str(models_dir))
+    _wait_for_hash(models_dir, "gone.bin")
+
+    os.remove(gone)
+    # A hash_models=False pass must not touch the sidecar at all.
+    cache_path = models_dir / ".comfyfed_hashes.json"
+    before = cache_path.read_text(encoding="utf-8")
+    hardware.scan_models(str(models_dir), hash_models=False)
+    after = cache_path.read_text(encoding="utf-8")
+    assert before == after
+
+
 def test_config_hash_models_and_fetch_defaults(tmp_path):
     path = tmp_path / "agent.json"
     AgentConfig().save(str(path))

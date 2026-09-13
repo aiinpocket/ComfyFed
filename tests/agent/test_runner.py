@@ -52,6 +52,8 @@ class FakeConnection:
         self.object_info_hash = ""
         self.object_info_uploads: list[tuple[bytes, str]] = []
         self.receipt_acks: list[tuple[str, str]] = []
+        self.model_inventory_hash = ""
+        self.inventories: list[list[dict]] = []
         # A live socket, as far as the reporting retry is concerned; a test
         # simulates a blip by setting it to None (what `close()` does).
         self.ws = object()
@@ -73,6 +75,9 @@ class FakeConnection:
 
     async def send_object_info(self, gzip_payload, oi_hash):
         self.object_info_uploads.append((gzip_payload, oi_hash))
+
+    async def send_inventory(self, models):
+        self.inventories.append(models)
 
     async def send_receipt_ack(self, receipt_id, worker_sig):
         self.receipt_acks.append((receipt_id, worker_sig))
@@ -276,6 +281,95 @@ async def test_refresh_object_info_failure_is_swallowed_and_hash_stays_unset(two
 
     assert conn_a.object_info_uploads == []
     assert conn_a.object_info_hash == ""
+
+
+# --- Fix round 1 M1: periodic model inventory rescan ------------------------
+
+
+async def test_refresh_model_inventory_pushes_when_a_file_is_added(two_platform_loop, tmp_path):
+    loop = two_platform_loop
+    loop.config.models_dir = str(tmp_path)
+    conn_a = loop.connections["worker-a"]
+
+    (tmp_path / "a.safetensors").write_bytes(b"one")
+    await loop.refresh_model_inventory(conn_a)
+    assert len(conn_a.inventories) == 1
+    first_hash = conn_a.model_inventory_hash
+    assert first_hash
+
+    (tmp_path / "b.safetensors").write_bytes(b"two")
+    await loop.refresh_model_inventory(conn_a)
+
+    assert len(conn_a.inventories) == 2
+    assert conn_a.model_inventory_hash != first_hash
+    names = {m["name"] for m in conn_a.inventories[-1]}
+    assert names == {"a.safetensors", "b.safetensors"}
+
+
+async def test_refresh_model_inventory_skips_send_when_unchanged(two_platform_loop, tmp_path):
+    loop = two_platform_loop
+    loop.config.models_dir = str(tmp_path)
+    conn_a = loop.connections["worker-a"]
+
+    (tmp_path / "a.safetensors").write_bytes(b"one")
+    await loop.refresh_model_inventory(conn_a)
+    assert len(conn_a.inventories) == 1
+    first_hash = conn_a.model_inventory_hash
+
+    # Nothing changed on disk -> rescanning must not push a no-op message.
+    await loop.refresh_model_inventory(conn_a)
+    assert len(conn_a.inventories) == 1
+    assert conn_a.model_inventory_hash == first_hash
+
+
+async def test_refresh_model_inventory_noop_without_models_dir(two_platform_loop):
+    loop = two_platform_loop
+    conn_a = loop.connections["worker-a"]
+    assert loop.config.models_dir is None
+
+    await loop.refresh_model_inventory(conn_a)
+    assert conn_a.inventories == []
+
+
+async def test_refresh_model_inventory_failure_is_swallowed_and_hash_stays_unset(
+    two_platform_loop, tmp_path, monkeypatch
+):
+    loop = two_platform_loop
+    loop.config.models_dir = str(tmp_path)
+    conn_a = loop.connections["worker-a"]
+    (tmp_path / "a.safetensors").write_bytes(b"one")
+
+    async def boom(*a, **k):
+        raise ConnectionError("socket down")
+
+    monkeypatch.setattr(conn_a, "send_inventory", boom)
+
+    await loop.refresh_model_inventory(conn_a)  # must not raise
+    assert conn_a.model_inventory_hash == ""
+
+
+async def test_connection_loop_rescans_models_on_the_object_info_timer(
+    two_platform_loop, tmp_path, monkeypatch
+):
+    """The brief's shipped missing-model guidance promises a worker rescans
+    and reports within 10 minutes with no restart -- so the periodic
+    object_info timer must also drive a model rescan+push, piggybacking the
+    same interval rather than a separate one."""
+    loop = two_platform_loop
+    loop.config.models_dir = str(tmp_path)
+    conn_a = loop.connections["worker-a"]
+
+    monkeypatch.setattr(comfy, "get_object_info", lambda *a, **k: {"KSampler": {"input": {}}})
+    monkeypatch.setattr(runner_module, "_OBJECT_INFO_INTERVAL_SECONDS", 0)
+    monkeypatch.setattr(runner_module, "_HEARTBEAT_INTERVAL_SECONDS", 9999)
+    monkeypatch.setattr(runner_module, "_RECV_POLL_TIMEOUT_SECONDS", 0.01)
+
+    (tmp_path / "a.safetensors").write_bytes(b"one")
+
+    await _run_connection_loop_briefly(loop, conn_a, seconds=0.1)
+
+    assert conn_a.inventories, "expected the periodic timer to push a model inventory update"
+    assert {m["name"] for m in conn_a.inventories[-1]} == {"a.safetensors"}
 
 
 async def test_broadcast_heartbeat_carries_each_connections_object_info_hash(two_platform_loop):
