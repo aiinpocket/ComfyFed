@@ -15,7 +15,17 @@ describe("D1 migration 0001_initial", () => {
       .all<{ name: string }>();
     const names = rows.results.map((r) => r.name).filter((n) => !n.startsWith("sqlite_") && !n.startsWith("_cf_") && !n.startsWith("d1_"));
     expect(names.sort()).toEqual(
-      ["jobs", "login_attempts", "nonces", "receipts", "register_tokens", "settings", "upload_tokens", "workers"].sort()
+      [
+        "jobs",
+        "login_attempts",
+        "model_hashes",
+        "nonces",
+        "receipts",
+        "register_tokens",
+        "settings",
+        "upload_tokens",
+        "workers",
+      ].sort()
     );
   });
 

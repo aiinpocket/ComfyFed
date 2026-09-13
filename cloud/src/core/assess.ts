@@ -214,17 +214,123 @@ function asNumber(value: unknown): number | null {
   return typeof value === "number" && Number.isFinite(value) ? value : null;
 }
 
+// ---------------------------------------------------------------------------
+// Phase 2.1: eligible_after_fetch (server-signed manifest auto-download) --
+// ports assess.py's `_MIN_AUTO_FETCH_PROTOCOL` / `_FETCH_DISK_MARGIN` /
+// `_BYTES_PER_GB` / `_worker_fetch_capacity_ok` / `_eligible_after_fetch` /
+// `partition_fleet_fetchable` / `fleet_wide_gaps`.
+
+/** `fetchableModels` maps a missing model's name (workflow-declared,
+ * category-relative shape -- same as `needs.models`) to its exact
+ * `size_bytes`, as published by `model_manifest.entries()`. */
+export type FetchableModels = Record<string, number>;
+
+/** hello.protocol below which an agent cannot receive fetch_models at all
+ * (it predates lazy hashing / lazy inventory sha256). */
+const MIN_AUTO_FETCH_PROTOCOL = 3;
+
+/** free_disk_gb must exceed the total download size by this factor -- not
+ * just clear it -- so a fetch never lands a worker at (near-)zero free disk. */
+const FETCH_DISK_MARGIN = 1.2;
+
+const BYTES_PER_GB = 1024 ** 3;
+
+/** Protocol/auto_fetch/disk-margin gate, independent of WHICH models are
+ * missing -- shared by `verdict`'s per-candidate gate and
+ * `partitionFleetFetchable`'s fleet-wide submission-time gate. Ports
+ * `assess._worker_fetch_capacity_ok`. */
+function workerFetchCapacityOk(worker: Worker, dynamic: Record<string, unknown>, totalMissingGb: number): boolean {
+  const protocol = typeof worker.protocol === "number" && Number.isInteger(worker.protocol) ? worker.protocol : 1;
+  if (protocol < MIN_AUTO_FETCH_PROTOCOL) return false;
+  if (!worker.autoFetch) return false;
+
+  const freeDiskGb = asNumber(dynamic["free_disk_gb"]);
+  if (freeDiskGb === null) {
+    // Unknown free disk cannot prove the margin holds -- refuse rather than
+    // warn (unlike the VRAM offload gate above).
+    return false;
+  }
+  return freeDiskGb > FETCH_DISK_MARGIN * totalMissingGb;
+}
+
+/** All the eligible_after_fetch gates -- ports `assess._eligible_after_fetch`. */
+function eligibleAfterFetch(
+  worker: Worker,
+  missingModels: string[],
+  fetchableModels: FetchableModels | null | undefined,
+  dynamic: Record<string, unknown>
+): boolean {
+  const map = fetchableModels ?? {};
+  if (!missingModels.every((name) => Object.prototype.hasOwnProperty.call(map, name))) return false;
+
+  const totalMissingGb = missingModels.reduce((sum, name) => sum + map[name]!, 0) / BYTES_PER_GB;
+  return workerFetchCapacityOk(worker, dynamic, totalMissingGb);
+}
+
+/** Splits a fleet-wide "missing from every worker" model set into
+ * `[fetchable, unfetchable]` for the submission-relaxation matrix -- ports
+ * `assess.partition_fleet_fetchable`. See that Python docstring for why this
+ * is a single COMBINED gate over the whole manifest-covered subset, not a
+ * per-model one. */
+export function partitionFleetFetchable(
+  missingModels: ReadonlySet<string>,
+  fetchableModels: FetchableModels | null | undefined,
+  onlineEnabledWorkers: Worker[]
+): [fetchable: Set<string>, unfetchable: Set<string>] {
+  const map = fetchableModels ?? {};
+  const manifestCovered = new Set([...missingModels].filter((name) => Object.prototype.hasOwnProperty.call(map, name)));
+  const notInManifest = new Set([...missingModels].filter((name) => !manifestCovered.has(name)));
+
+  if (manifestCovered.size === 0) return [new Set(), new Set(missingModels)];
+
+  const totalMissingGb = [...manifestCovered].reduce((sum, name) => sum + map[name]!, 0) / BYTES_PER_GB;
+  const canFetch = onlineEnabledWorkers.some((worker) => workerFetchCapacityOk(worker, worker.dynamic, totalMissingGb));
+  if (canFetch) return [manifestCovered, notInManifest];
+
+  return [new Set(), new Set(missingModels)];
+}
+
+/** `[models, node classes]` that NOT ONE worker in `allWorkers` can supply --
+ * ports `assess.fleet_wide_gaps`. Deliberately every worker passed in,
+ * whatever its status/disabled (see that Python docstring). */
+export function fleetWideGaps(
+  needs: JobNeeds,
+  allWorkers: Worker[]
+): [missingModels: Set<string>, missingNodes: Set<string>] {
+  if (allWorkers.length === 0) return [new Set(), new Set()];
+
+  const inventories = allWorkers.map((w) => w.modelInventory);
+  const nodeClassSets = allWorkers.map((w) => new Set(w.nodeClasses)).filter((s) => s.size > 0);
+
+  const missingModels = new Set(
+    [...needs.models].filter((name) => !inventories.some((inventory) => findModel(inventory, name)[0]))
+  );
+
+  let missingNodes = new Set<string>();
+  if (nodeClassSets.length > 0) {
+    missingNodes = new Set([...needs.nodes].filter((node) => !nodeClassSets.some((classes) => classes.has(node))));
+  }
+
+  return [missingModels, missingNodes];
+}
+
 /** Judge whether `worker` can run a job needing `needs` -- ports
  * `assess.verdict`. `requirementsOverride` is the job's advanced-override
  * dict (`min_vram_gb`, `min_free_disk_gb`, `gpu_name_contains`, `backend`).
- * `allWorkers` is the full federation worker list, used to determine
- * whether a model missing from `worker`'s own inventory is fetchable from
- * a peer. */
+ * `allWorkers` is the full federation worker list (kept for callers/other
+ * assessment helpers that need it; `verdict` itself no longer searches peer
+ * inventories for a missing model -- see `fetchableModels` below).
+ *
+ * `fetchableModels` is the signed manifest's name -> size_bytes map
+ * (`model_manifest.entries()`'s shape). Undefined/null (the default) means
+ * "nothing is fetchable" -- a caller that doesn't compile it gets the exact
+ * same behavior as before this parameter existed. */
 export function verdict(
   worker: Worker,
   needs: JobNeeds,
   requirementsOverride: Record<string, unknown>,
-  allWorkers: Worker[]
+  allWorkers: Worker[],
+  fetchableModels?: FetchableModels | null
 ): Verdict {
   const reasons: string[] = [];
   const warnings: string[] = [];
@@ -305,30 +411,7 @@ export function verdict(
     return { kind: "eligible", reasons: [], missingModels: [], warnings };
   }
 
-  // Compare by id, not object identity: the two lists come from independent
-  // D1 reads, so reference equality would never exclude self (reviewer m1).
-  const otherWorkers = allWorkers.filter((w) => w.id !== worker.id);
-  let totalMissingSize = 0;
-  let allAvailableElsewhere = true;
-  for (const modelName of missingModels) {
-    let foundSize: number | null = null;
-    for (const other of otherWorkers) {
-      const [found, size] = findModel(other.modelInventory, modelName);
-      if (!found) continue;
-      const candidate = size ?? 0;
-      if (foundSize === null || candidate > foundSize) foundSize = candidate;
-    }
-    if (foundSize === null) {
-      allAvailableElsewhere = false;
-      break;
-    }
-    totalMissingSize += foundSize;
-  }
-
-  const freeDiskGb = asNumber(dynamic["free_disk_gb"]);
-  const diskOk = freeDiskGb === null ? true : freeDiskGb >= totalMissingSize;
-
-  if (allAvailableElsewhere && diskOk) {
+  if (eligibleAfterFetch(worker, missingModels, fetchableModels, dynamic)) {
     return {
       kind: "eligible_after_fetch",
       reasons: [`missing_models:${missingModels.join(",")}`],

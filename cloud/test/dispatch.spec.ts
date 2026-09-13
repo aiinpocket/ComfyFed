@@ -43,13 +43,21 @@ function uniqueId(base: string): string {
 
 async function makeWorker(
   label = "w",
-  opts: { hardware?: Record<string, unknown>; dynamic?: Record<string, unknown>; backend?: string } = {}
+  opts: {
+    hardware?: Record<string, unknown>;
+    dynamic?: Record<string, unknown>;
+    backend?: string;
+    protocol?: number;
+    autoFetch?: boolean;
+    nodeClasses?: string[];
+    modelInventory?: unknown[];
+  } = {}
 ): Promise<string> {
   const id = uniqueId(label);
   await db()
     .prepare(
-      `INSERT INTO workers (id, name, pubkey, created_at, hardware, dynamic, backend)
-       VALUES (?, ?, 'pk', ?, ?, ?, ?)`
+      `INSERT INTO workers (id, name, pubkey, created_at, hardware, dynamic, backend, protocol, auto_fetch, node_classes, model_inventory)
+       VALUES (?, ?, 'pk', ?, ?, ?, ?, ?, ?, ?, ?)`
     )
     .bind(
       id,
@@ -57,7 +65,11 @@ async function makeWorker(
       toSqliteTimestamp(now()),
       JSON.stringify(opts.hardware ?? {}),
       JSON.stringify(opts.dynamic ?? {}),
-      opts.backend ?? ""
+      opts.backend ?? "",
+      opts.protocol ?? 1,
+      opts.autoFetch ? 1 : 0,
+      JSON.stringify(opts.nodeClasses ?? []),
+      JSON.stringify(opts.modelInventory ?? [])
     )
     .run();
   return id;
@@ -75,13 +87,14 @@ async function makeJob(
     lastWorkerId?: string | null;
     estVramGb?: number | null;
     createdAt?: Date;
+    requiredModels?: string[];
   } = {}
 ): Promise<string> {
   const id = opts.id ? uniqueId(opts.id) : uniqueId("j");
   await db()
     .prepare(
-      `INSERT INTO jobs (id, workflow_json, status, worker_id, last_worker_id, est_vram_gb, created_at)
-       VALUES (?, '{}', ?, ?, ?, ?, ?)`
+      `INSERT INTO jobs (id, workflow_json, status, worker_id, last_worker_id, est_vram_gb, created_at, required_models)
+       VALUES (?, '{}', ?, ?, ?, ?, ?, ?)`
     )
     .bind(
       id,
@@ -89,7 +102,8 @@ async function makeJob(
       opts.workerId ?? null,
       opts.lastWorkerId ?? null,
       opts.estVramGb ?? null,
-      toSqliteTimestamp(opts.createdAt ?? now())
+      toSqliteTimestamp(opts.createdAt ?? now()),
+      JSON.stringify(opts.requiredModels ?? [])
     )
     .run();
   return id;
@@ -316,6 +330,82 @@ describe("assignJobs (light job preference)", () => {
     expect(assignments).toHaveLength(1);
     expect(assignments[0]!.workerId).toBe(smallCudaId);
     expect(assignments[0]!.job.id).toBe(jobId);
+  });
+});
+
+// --- assignJobs: two-tier fetch ranking (Phase 2.1 Task 7) -------------------
+// Ports dispatch.py's `assign_jobs` fetch-tier docstring cases: tier 2
+// (eligible_after_fetch) is only ever consulted when tier 1 (already has
+// everything) is completely empty, and among tier-2 candidates the smallest
+// total download wins.
+
+const GB = 1024 ** 3;
+
+describe("assignJobs (fetch tier)", () => {
+  it("a directly-eligible worker always wins over one that would have to fetch first", async () => {
+    const hasItId = await makeWorker("w_has_it", {
+      protocol: 3,
+      autoFetch: true,
+      dynamic: { free_disk_gb: 100, free_vram_gb: 1 },
+      modelInventory: [{ name: "ckpt.safetensors", size: 1 }],
+    });
+    const mustFetchId = await makeWorker("w_must_fetch", {
+      protocol: 3,
+      autoFetch: true,
+      dynamic: { free_disk_gb: 100, free_vram_gb: 24 },
+      modelInventory: [],
+    });
+    const jobId = await makeJob({ requiredModels: ["ckpt.safetensors"] });
+
+    const assignments = await dispatch.assignJobs(db(), [hasItId, mustFetchId], { "ckpt.safetensors": 1 * GB });
+
+    expect(assignments).toHaveLength(1);
+    expect(assignments[0]!.workerId).toBe(hasItId);
+    expect(assignments[0]!.job.id).toBe(jobId);
+  });
+
+  it("among fetch-only candidates, the smallest total download wins", async () => {
+    // Both need to fetch "a.safetensors"; w_small_dl already has
+    // "b.safetensors" so its total download is 1 GB, while w_big_dl is
+    // missing both and would have to download 2 GB total.
+    const smallDownloadId = await makeWorker("w_small_dl", {
+      protocol: 3,
+      autoFetch: true,
+      dynamic: { free_disk_gb: 100 },
+      modelInventory: [{ name: "b.safetensors", size: 1 }],
+    });
+    const bigDownloadId = await makeWorker("w_big_dl", {
+      protocol: 3,
+      autoFetch: true,
+      dynamic: { free_disk_gb: 100 },
+      modelInventory: [],
+    });
+    const jobId = await makeJob({ requiredModels: ["a.safetensors", "b.safetensors"] });
+
+    const assignments = await dispatch.assignJobs(db(), [smallDownloadId, bigDownloadId], {
+      "a.safetensors": 1 * GB,
+      "b.safetensors": 1 * GB,
+    });
+
+    expect(assignments).toHaveLength(1);
+    expect(assignments[0]!.workerId).toBe(smallDownloadId);
+    expect(assignments[0]!.job.id).toBe(jobId);
+  });
+
+  it("no worker is eligible_after_fetch without fetchableModels -- job stays queued", async () => {
+    const workerId = await makeWorker("w1", { protocol: 3, autoFetch: true, dynamic: { free_disk_gb: 100 } });
+    await makeJob({ requiredModels: ["ckpt.safetensors"] });
+
+    const assignments = await dispatch.assignJobs(db(), [workerId]); // no fetchableModels arg
+    expect(assignments).toEqual([]);
+  });
+
+  it("a worker that hasn't opted into auto_fetch never enters tier 2", async () => {
+    const workerId = await makeWorker("w1", { protocol: 3, autoFetch: false, dynamic: { free_disk_gb: 100 } });
+    await makeJob({ requiredModels: ["ckpt.safetensors"] });
+
+    const assignments = await dispatch.assignJobs(db(), [workerId], { "ckpt.safetensors": 1 * GB });
+    expect(assignments).toEqual([]);
   });
 });
 

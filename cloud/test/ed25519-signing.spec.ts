@@ -5,6 +5,7 @@ import {
   buildReceiptPayload,
   buildRegistrationPayload,
   buildReleasePayload,
+  buildManifestEntryPayload,
   buildCanonicalRequestMessage,
   signRequest,
   verifySignedRequest,
@@ -36,6 +37,14 @@ describe("golden vector parity", () => {
       it("release signature payload/signature verifies against the fixture pubkey", async () => {
         const s = kp.release_sample;
         const payload = buildReleasePayload(s.version, s.sha256_hex);
+        expect(payload).toBe(s.payload);
+        const ok = await verifyHex(kp.pubkey_hex, encoder.encode(payload), s.signature_hex);
+        expect(ok).toBe(true);
+      });
+
+      it("fetch-manifest entry payload/signature verifies against the fixture pubkey (Task 7)", async () => {
+        const s = kp.manifest_entry_sample;
+        const payload = buildManifestEntryPayload(s.name, s.directory, s.sha256_hex, s.size_bytes);
         expect(payload).toBe(s.payload);
         const ok = await verifyHex(kp.pubkey_hex, encoder.encode(payload), s.signature_hex);
         expect(ok).toBe(true);

@@ -37,7 +37,7 @@ import type { Env } from "../env";
 import * as queries from "../db/queries";
 import { toSqliteTimestamp, sqliteTimestampToIsoformat } from "../db/queries";
 import type { Job, Receipt } from "../db/queries";
-import { extract, estimateVram, needsFromJob, verdict } from "../core/assess";
+import { extract, estimateVram, needsFromJob, verdict, fleetWideGaps, partitionFleetFetchable, type JobNeeds, type FetchableModels } from "../core/assess";
 import { sanitizePathComponentOrThrow, artifactKey, jobInputKey } from "../lib/store";
 import { verifyAgentRequest, type VerifyAgentResult } from "../lib/verify_agent";
 import { requireAdmin, requireCsrf, errorJson } from "../lib/guard";
@@ -45,6 +45,9 @@ import { bytesToBase64Url } from "../lib/base64";
 import { bytesToHex } from "../lib/hex";
 import { presignUrl, r2S3Host } from "../lib/sigv4";
 import { bilingualMessage } from "../core/auth";
+import * as modelGuide from "../core/model_guide";
+import * as modelManifest from "../core/model_manifest";
+import { resolvePlatformSeed } from "../db/queries";
 
 // Cloud-only (no Python parity source -- the monolith calls its dispatcher
 // in-process and has no DO that can be unreachable), so bilingual like
@@ -128,8 +131,15 @@ async function wakeHub(env: Env): Promise<void> {
 // Job -> JSON dict shaping -- ports jobs.py's `_job_dict` / `_job_dict_full`
 // / `_receipt_dict` exactly (field names/shape).
 
-function jobDict(job: Job): Record<string, unknown> {
-  return {
+/** Ports jobs.py's `_job_dict`. `hub` (optional) enables the Phase 2.1
+ * transient model-auto-fetch progress fields (stage/fetch_pct/fetch_model,
+ * NOT a Job column -- see `do/hub.ts`'s `fetchProgress` field docstring):
+ * added only while the job is actually in that phase, mirroring
+ * `agentws._fetch_progress`'s "omit rather than send an explicit null" for a
+ * field the agent didn't report a valid value for. Callers that don't have
+ * (or don't need) a `hub` binding skip the extra DO round-trip entirely. */
+async function jobDict(job: Job, hub?: DurableObjectNamespace): Promise<Record<string, unknown>> {
+  const d: Record<string, unknown> = {
     id: job.id,
     status: job.status,
     origin: job.origin,
@@ -141,6 +151,15 @@ function jobDict(job: Job): Record<string, unknown> {
     input_assets: job.inputAssets,
     est_vram_gb: job.estVramGb,
   };
+  if (hub) {
+    const progress = await queries.getFetchProgress(hub, job.id);
+    if (progress) {
+      if (progress.stage !== null) d.stage = progress.stage;
+      if (progress.fetch_pct !== null) d.fetch_pct = progress.fetch_pct;
+      if (progress.fetch_model !== null) d.fetch_model = progress.fetch_model;
+    }
+  }
+  return d;
 }
 
 function receiptDict(receipt: Receipt): Record<string, unknown> {
@@ -164,9 +183,9 @@ function parseJsonObject(text: string): Record<string, unknown> {
   }
 }
 
-function jobDictFull(job: Job, receipt: Receipt | null): Record<string, unknown> {
+async function jobDictFull(job: Job, receipt: Receipt | null, hub?: DurableObjectNamespace): Promise<Record<string, unknown>> {
   return {
-    ...jobDict(job),
+    ...(await jobDict(job, hub)),
     workflow_json: parseJsonObject(job.workflowJson),
     requirements: job.requirements,
     required_nodes: job.requiredNodes,
@@ -187,6 +206,28 @@ function workerOwnsArtifactUpload(job: Job, workerId: string): boolean {
   const ownsIt = job.workerId === workerId && (job.status === "assigned" || job.status === "running");
   const inBlipWindow = job.status === "queued" && job.lastWorkerId === workerId;
   return ownsIt || inBlipWindow;
+}
+
+// ---------------------------------------------------------------------------
+// Submission-relaxation gate (Phase 2.1 Task 7) -- ports jobs.py's
+// `unfetchable_missing_models`: the console submit predicate, fleet-wide
+// missing models that are ALSO not fetchable by anyone (see
+// `assess.partitionFleetFetchable`). Builds the manifest's name -> size_bytes
+// map with exactly ONE `model_manifest.entries()` read per request.
+
+async function unfetchableMissingModels(env: Env, needs: JobNeeds): Promise<Set<string>> {
+  const allWorkers = await queries.getAllWorkers(env.DB);
+  const [missingModels] = fleetWideGaps(needs, allWorkers);
+  if (missingModels.size === 0) return new Set();
+
+  const onlineWorkers = await queries.getOnlineEnabledWorkers(env.DB);
+  const seed = await resolvePlatformSeed(env.DB, env.PLATFORM_ED25519_SEED);
+  const manifestEntries = await modelManifest.entries(env.DB, env.STORE, seed);
+  const fetchableMap: FetchableModels = {};
+  for (const e of manifestEntries) fetchableMap[e.name] = e.size_bytes;
+
+  const [, unfetchable] = partitionFleetFetchable(missingModels, fetchableMap, onlineWorkers);
+  return unfetchable;
 }
 
 const app = new Hono<{ Bindings: Env }>();
@@ -250,6 +291,12 @@ app.post("/api/jobs", requireCsrf, async (c) => {
     );
   }
 
+  const unfetchable = await unfetchableMissingModels(c.env, needs);
+  if (unfetchable.size > 0) {
+    const names = [...unfetchable].sort();
+    return errorJson(c, 400, "jobs.missing_models", await modelGuide.guidanceMessage(names, c.env.STORE));
+  }
+
   const allWorkers = await queries.getAllWorkers(c.env.DB);
   const estVramGb = estimateVram(needs.models, allWorkers);
 
@@ -286,7 +333,7 @@ app.get("/api/jobs", requireAdmin, async (c) => {
         .filter((s) => s.length > 0)
     : undefined;
   const jobs = await queries.listJobs(c.env.DB, statuses);
-  return c.json(jobs.map(jobDict));
+  return c.json(await Promise.all(jobs.map((job) => jobDict(job, c.env.HUB))));
 });
 
 // --- GET /api/jobs/{id} ---------------------------------------------------
@@ -301,7 +348,7 @@ app.get("/api/jobs/:jobId", requireAdmin, async (c) => {
   // across attempts; the detail view shows the latest.
   const receipt = receipts.length > 0 ? receipts.slice().sort((a, b) => (a.createdAt < b.createdAt ? 1 : -1))[0]! : null;
 
-  return c.json(jobDictFull(job, receipt));
+  return c.json(await jobDictFull(job, receipt, c.env.HUB));
 });
 
 // --- GET /api/jobs/{id}/assessment ----------------------------------------
@@ -314,8 +361,16 @@ app.get("/api/jobs/:jobId/assessment", requireAdmin, async (c) => {
   const needs = needsFromJob(job);
   const allWorkers = (await queries.getAllWorkers(c.env.DB)).filter((w) => !w.disabled);
 
+  // Phase 2.1: same signed manifest dispatch/submission use, so the
+  // assessment display's eligible_after_fetch column matches what would
+  // actually happen at dispatch time -- built once, ONE manifest read.
+  const seed = await resolvePlatformSeed(c.env.DB, c.env.PLATFORM_ED25519_SEED);
+  const manifestEntries = await modelManifest.entries(c.env.DB, c.env.STORE, seed);
+  const fetchableModels: FetchableModels = {};
+  for (const e of manifestEntries) fetchableModels[e.name] = e.size_bytes;
+
   const results = allWorkers.map((worker) => {
-    const v = verdict(worker, needs, job.requirements, allWorkers);
+    const v = verdict(worker, needs, job.requirements, allWorkers, fetchableModels);
     return {
       worker_id: worker.id,
       name: worker.name,

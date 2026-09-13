@@ -38,10 +38,11 @@ import { Hono } from "hono";
 import type { Env } from "../env";
 import * as queries from "../db/queries";
 import type { Job } from "../db/queries";
-import { toSqliteTimestamp, sqliteTimestampToEpochMs } from "../db/queries";
-import { extract, estimateVram, modelNodes, findModel } from "../core/assess";
+import { toSqliteTimestamp, sqliteTimestampToEpochMs, resolvePlatformSeed } from "../db/queries";
+import { extract, estimateVram, modelNodes, fleetWideGaps, partitionFleetFetchable, type FetchableModels } from "../core/assess";
 import { jobOutputs } from "../core/outputs";
 import * as modelGuide from "../core/model_guide";
+import * as modelManifest from "../core/model_manifest";
 import {
   sanitizePathComponent,
   sanitizePathComponentOrThrow,
@@ -166,26 +167,16 @@ async function numbersByJobId(db: D1Database): Promise<Map<string, number>> {
   return map;
 }
 
-/** `(missingModels, missingNodes)` that NOT ONE registered worker can
- * supply, fleet-wide (every registered worker, online or not, disabled or
- * not) -- ports `_fleet_wide_gaps`. */
-function fleetWideGaps(
-  allWorkers: queries.Worker[],
-  needs: { models: Set<string>; nodes: Set<string> }
-): { missingModels: string[]; missingNodes: string[] } {
-  if (allWorkers.length === 0) return { missingModels: [], missingNodes: [] };
-
-  const missingModels = [...needs.models]
-    .filter((name) => !allWorkers.some((w) => findModel(w.modelInventory, name)[0]))
-    .sort();
-
-  const nodeClassSets = allWorkers.map((w) => new Set(w.nodeClasses)).filter((s) => s.size > 0);
-  let missingNodes: string[] = [];
-  if (nodeClassSets.length > 0) {
-    missingNodes = [...needs.nodes].filter((node) => !nodeClassSets.some((s) => s.has(node))).sort();
-  }
-
-  return { missingModels, missingNodes };
+/** Builds the signed manifest's name -> size_bytes map with ONE
+ * `model_manifest.entries()` read -- shared by every submission-relaxation
+ * call site in this file (and `routes/jobs.ts`'s own copy) so a single
+ * request/tick never re-reads the manifest more than once. */
+async function fetchableModelsMap(env: Env): Promise<FetchableModels> {
+  const seed = await resolvePlatformSeed(env.DB, env.PLATFORM_ED25519_SEED);
+  const entries = await modelManifest.entries(env.DB, env.STORE, seed);
+  const map: FetchableModels = {};
+  for (const e of entries) map[e.name] = e.size_bytes;
+  return map;
 }
 
 // ---------------------------------------------------------------------------
@@ -446,13 +437,27 @@ app.post("/comfy/api/prompt", async (c) => {
 
   const needs = extract(promptObj);
   const allWorkers = await queries.getAllWorkers(c.env.DB);
-  const { missingModels, missingNodes } = fleetWideGaps(allWorkers, needs);
+  const [missingModelsSet, missingNodesSet] = fleetWideGaps(needs, allWorkers);
 
-  if (missingModels.length > 0) {
-    const names = missingModels;
+  // Phase 2.1: a model missing from every worker's inventory is no longer
+  // automatically a dead end -- if the manifest has a signed entry for it
+  // AND at least one online, opted-in worker can fetch the whole missing set
+  // (see assess.partitionFleetFetchable), it queues normally instead of
+  // being refused. Only the genuinely-unfetchable remainder still blocks
+  // submission. ONE manifest read for this whole request.
+  let blocking = missingModelsSet;
+  if (missingModelsSet.size > 0) {
+    const onlineWorkers = await queries.getOnlineEnabledWorkers(c.env.DB);
+    const fetchableMap = await fetchableModelsMap(c.env);
+    const [, unfetchable] = partitionFleetFetchable(missingModelsSet, fetchableMap, onlineWorkers);
+    blocking = unfetchable;
+  }
+
+  if (blocking.size > 0) {
+    const names = [...blocking].sort();
     let guidance = await modelGuide.guidanceMessage(names, c.env.STORE);
-    if (missingNodes.length > 0) {
-      guidance += "\n\n" + modelGuide.missingNodesNote(missingNodes);
+    if (missingNodesSet.size > 0) {
+      guidance += "\n\n" + modelGuide.missingNodesNote([...missingNodesSet].sort());
     }
 
     const nodeErrors: Record<string, { class_type: string; dependent_outputs: unknown[]; errors: unknown[] }> = {};

@@ -163,6 +163,27 @@ def build_signed_request_sample(signing_key: SigningKey) -> dict:
     }
 
 
+def build_manifest_entry_sample(signing_key: SigningKey) -> dict:
+    """`model_manifest.entries()`'s per-entry signed payload:
+    `f"{name}|{directory}|{sha256}|{size_bytes}"` -- confirmed against
+    comfyfed_server/model_manifest.py and ported to cloud/src/core/
+    model_manifest.ts + cloud/src/lib/signing.ts's buildManifestEntryPayload.
+    """
+    name = "clip_l.safetensors"
+    directory = "text_encoders"
+    sha256_hex = hashlib.sha256(b"clip_l-golden-vector").hexdigest()
+    size_bytes = 246973974
+    payload = f"{name}|{directory}|{sha256_hex}|{size_bytes}"
+    return {
+        "name": name,
+        "directory": directory,
+        "sha256_hex": sha256_hex,
+        "size_bytes": size_bytes,
+        "payload": payload,
+        "signature_hex": sign_hex(signing_key, payload.encode()),
+    }
+
+
 def build_signed_request_sample_no_query(signing_key: SigningKey) -> dict:
     method = "GET"
     path = "/api/agent/ping"
@@ -196,6 +217,7 @@ def main() -> None:
                 "receipt_cases": build_receipt_cases(signing_key),
                 "registration_sample": build_registration_sample(signing_key, kp["pubkey_hex"]),
                 "release_sample": build_release_sample(signing_key),
+                "manifest_entry_sample": build_manifest_entry_sample(signing_key),
                 "signed_request_sample": build_signed_request_sample(signing_key),
                 "signed_request_sample_no_query": build_signed_request_sample_no_query(signing_key),
             }
