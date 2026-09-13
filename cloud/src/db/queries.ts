@@ -472,6 +472,77 @@ export async function getJobById(db: D1Database, id: string): Promise<Job | null
   return row ? rowToJob(row) : null;
 }
 
+export interface NewJob {
+  id: string;
+  workflowJson: string;
+  requirements: Record<string, unknown>;
+  requiredNodes: string[];
+  requiredModels: string[];
+  estVramGb: number | null;
+  inputAssets: string[];
+  origin: string;
+  createdAt: string;
+}
+
+/** Inserts a freshly-assessed queued job row -- mirrors `jobs.create_job`'s
+ * `db.Job(...)` insert. Relies on the migration's column DEFAULTs for
+ * everything Python's ORM also leaves at its model default (status='queued',
+ * progress=0, result_files/result_hashes='{}'/'[]', panel_hidden=0). */
+export async function insertJob(db: D1Database, job: NewJob): Promise<void> {
+  await db
+    .prepare(
+      `INSERT INTO jobs (id, workflow_json, requirements, required_nodes, required_models, est_vram_gb,
+                          input_assets, origin, created_at)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`
+    )
+    .bind(
+      job.id,
+      job.workflowJson,
+      JSON.stringify(job.requirements),
+      JSON.stringify(job.requiredNodes),
+      JSON.stringify(job.requiredModels),
+      job.estVramGb,
+      JSON.stringify(job.inputAssets),
+      job.origin,
+      job.createdAt
+    )
+    .run();
+}
+
+/** All jobs, oldest first, optionally filtered to a set of statuses --
+ * mirrors `jobs.list_jobs`'s `?status=a,b,c` query-param filter. */
+export async function listJobs(db: D1Database, statuses?: string[]): Promise<Job[]> {
+  if (statuses && statuses.length > 0) {
+    const placeholders = statuses.map(() => "?").join(",");
+    const { results } = await db
+      .prepare(`SELECT * FROM jobs WHERE status IN (${placeholders}) ORDER BY created_at ASC`)
+      .bind(...statuses)
+      .all<JobRow>();
+    return results.map(rowToJob);
+  }
+  const { results } = await db.prepare("SELECT * FROM jobs ORDER BY created_at ASC").all<JobRow>();
+  return results.map(rowToJob);
+}
+
+/** Requeues a failed job for retry -- mirrors `jobs.retry_job`'s row reset
+ * (status, worker_id, error, progress, started_at, finished_at). Returns
+ * whether the row was still `failed` at the moment of the UPDATE (the same
+ * atomic-guard shape as `claimJob`), so a caller can't retry a job that
+ * raced into a different terminal state between its own read and this
+ * write. */
+export async function retryFailedJob(db: D1Database, jobId: string): Promise<boolean> {
+  const result = await db
+    .prepare(
+      `UPDATE jobs
+       SET status = 'queued', worker_id = NULL, error = NULL, progress = 0,
+           started_at = NULL, finished_at = NULL
+       WHERE id = ? AND status = 'failed'`
+    )
+    .bind(jobId)
+    .run();
+  return (result.meta.changes ?? 0) === 1;
+}
+
 export async function getQueuedJobsOrderedByCreatedAt(db: D1Database): Promise<Job[]> {
   const { results } = await db
     .prepare("SELECT * FROM jobs WHERE status = 'queued' ORDER BY created_at ASC, id ASC")
@@ -586,6 +657,19 @@ export async function updateJobFailed(
     .prepare("UPDATE jobs SET status = 'failed', error = ?, finished_at = ? WHERE id = ?")
     .bind(error, finishedAt, jobId)
     .run();
+}
+
+/** Merges one filename->sha256 entry into a job's `result_hashes` JSON
+ * column -- shared by every artifact-upload route (legacy multipart, the
+ * presigned "direct" raw PUT, and the S3-mode confirm) so all three record a
+ * verified artifact's hash the exact same way jobs.py's `upload_job_artifact`
+ * does. No-op if the job no longer exists (mirrors that route's own
+ * `if job is not None` guard). */
+export async function mergeJobResultHash(db: D1Database, jobId: string, filename: string, sha256: string): Promise<void> {
+  const job = await getJobById(db, jobId);
+  if (!job) return;
+  const hashes = { ...job.resultHashes, [filename]: sha256 };
+  await db.prepare("UPDATE jobs SET result_hashes = ? WHERE id = ?").bind(JSON.stringify(hashes), jobId).run();
 }
 
 /** Updates a running job's progress fraction -- mirrors agentws.py's
@@ -810,4 +894,76 @@ export async function tryInsertNonce(
     .bind(workerId, nonce, expiresAt)
     .run();
   return (result.meta.changes ?? 0) === 1;
+}
+
+// ---------------------------------------------------------------------------
+// Upload tokens (Task 8) -- one-time tokens backing the presigned "direct"
+// artifact upload protocol. See migrations/0003_upload_tokens.sql.
+
+export interface UploadToken {
+  token: string;
+  jobId: string;
+  filename: string;
+  sha256: string;
+  size: number | null;
+  expiresAt: number;
+  used: boolean;
+}
+
+export async function insertUploadToken(
+  db: D1Database,
+  token: string,
+  jobId: string,
+  filename: string,
+  sha256: string,
+  size: number | null,
+  expiresAt: number
+): Promise<void> {
+  await db
+    .prepare(
+      "INSERT INTO upload_tokens (token, job_id, filename, sha256, size, expires_at) VALUES (?, ?, ?, ?, ?, ?)"
+    )
+    .bind(token, jobId, filename, sha256, size, expiresAt)
+    .run();
+}
+
+export async function getUploadToken(db: D1Database, token: string): Promise<UploadToken | null> {
+  const row = await db
+    .prepare("SELECT * FROM upload_tokens WHERE token = ?")
+    .bind(token)
+    .first<{
+      token: string;
+      job_id: string;
+      filename: string;
+      sha256: string;
+      size: number | null;
+      expires_at: number;
+      used: number;
+    }>();
+  if (!row) return null;
+  return {
+    token: row.token,
+    jobId: row.job_id,
+    filename: row.filename,
+    sha256: row.sha256,
+    size: row.size,
+    expiresAt: row.expires_at,
+    used: row.used !== 0,
+  };
+}
+
+/** Atomically claims a token (`used` 0 -> 1). Returns whether THIS call was
+ * the one that claimed it -- a replayed PUT against an already-used token
+ * loses the race and must 409 rather than re-store bytes, exactly like
+ * `claimRegisterToken`'s single-winner guarantee. */
+export async function claimUploadToken(db: D1Database, token: string): Promise<boolean> {
+  const result = await db
+    .prepare("UPDATE upload_tokens SET used = 1 WHERE token = ? AND used = 0")
+    .bind(token)
+    .run();
+  return (result.meta.changes ?? 0) === 1;
+}
+
+export async function deleteUploadToken(db: D1Database, token: string): Promise<void> {
+  await db.prepare("DELETE FROM upload_tokens WHERE token = ?").bind(token).run();
 }

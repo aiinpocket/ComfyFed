@@ -290,6 +290,10 @@ export class Hub extends DurableObject<Env> {
     if (url.pathname === "/internal/dynamic" && request.method === "GET") {
       return this.handleInternalDynamic(url);
     }
+    if (url.pathname === "/internal/wake" && request.method === "POST") {
+      await this.scheduleAlarmIfNeeded();
+      return new Response(null, { status: 202 });
+    }
     return new Response("not found", { status: 404 });
   }
 

@@ -1,0 +1,103 @@
+/**
+ * R2 artifact/input-asset storage helpers, ported from
+ * `server/comfyfed_server/storage.py`. Phase 1's `LocalStore` wrote to
+ * `<data_dir>/artifacts/<job_id>/<filename>` and `<data_dir>/job_inputs/
+ * <job_id>/<filename>` on local disk; this cloud port keeps the exact same
+ * two-segment key shape against the `STORE` R2 binding instead --
+ * `artifacts/<job_id>/<filename>` and `job_inputs/<job_id>/<filename>` --
+ * plus a `staging/<filename>` prefix with no equivalent in Phase 1 (used by
+ * Task 9/10's template-asset staging flow, not by anything in this file).
+ *
+ * `sanitizePathComponent` is a byte-for-byte port of storage.py's function of
+ * the same name -- see that docstring for the full Windows-device-name /
+ * trailing-dot-or-space rationale. Every place a client-supplied name
+ * becomes an R2 key segment here (artifact filename, job-input filename)
+ * must go through it, exactly like the Python source's single-definition-of-
+ * "safe" contract.
+ */
+
+const ARTIFACTS_PREFIX = "artifacts";
+const JOB_INPUTS_PREFIX = "job_inputs";
+const STAGING_PREFIX = "staging";
+
+const WINDOWS_DEVICE_NAMES = new Set([
+  "con",
+  "prn",
+  "aux",
+  "nul",
+  ...Array.from({ length: 9 }, (_, i) => `com${i + 1}`),
+  ...Array.from({ length: 9 }, (_, i) => `lpt${i + 1}`),
+]);
+
+/** Basename-only path traversal check: `path.basename` for POSIX-style
+ * separators (Workers has no `path` module, and R2 keys are always `/`-
+ * separated) plus a manual backslash split, since storage.py's
+ * `os.path.basename` behaves per-OS but the Python docstring is explicit
+ * that a name must be valid/invalid identically on every host -- matching
+ * that intent means treating BOTH `/` and `\` as separators here regardless
+ * of platform, not just `/`. */
+function basename(value: string): string {
+  const parts = value.split(/[/\\]/);
+  return parts[parts.length - 1] ?? "";
+}
+
+/** Reduce `value` to a single, safe path segment, or throw. Ports
+ * `storage.sanitize_path_component` exactly -- see this file's docstring. */
+export function sanitizePathComponent(value: string, what = "path component"): string {
+  const fail = (): never => {
+    throw new Error(`Invalid ${what}: ${JSON.stringify(value)}`);
+  };
+  if (!value) fail();
+  const base = basename(value);
+  if (base !== value || base === "" || base === "." || base === "..") fail();
+  const last = base[base.length - 1];
+  if (last === "." || last === " ") fail();
+  const stem = base.split(".", 1)[0]!.toLowerCase();
+  if (WINDOWS_DEVICE_NAMES.has(stem)) fail();
+  return base;
+}
+
+export class InvalidPathComponent extends Error {}
+
+/** Same as `sanitizePathComponent` but throws `InvalidPathComponent`
+ * (distinguishable from a generic `Error`) -- routes catch this specific
+ * type to render the `jobs.bad_asset_name` 400, matching jobs.py's
+ * `except ValueError` around the same call. */
+export function sanitizePathComponentOrThrow(value: string, what = "path component"): string {
+  try {
+    return sanitizePathComponent(value, what);
+  } catch (err) {
+    throw new InvalidPathComponent(err instanceof Error ? err.message : String(err));
+  }
+}
+
+export function artifactKey(jobId: string, filename: string): string {
+  return `${ARTIFACTS_PREFIX}/${sanitizePathComponent(jobId, "job id")}/${sanitizePathComponent(filename, "artifact filename")}`;
+}
+
+export function jobInputKey(jobId: string, filename: string): string {
+  return `${JOB_INPUTS_PREFIX}/${sanitizePathComponent(jobId, "job id")}/${sanitizePathComponent(filename, "asset filename")}`;
+}
+
+export function stagingKey(filename: string): string {
+  return `${STAGING_PREFIX}/${sanitizePathComponent(filename, "staging filename")}`;
+}
+
+/** Ports `LocalStore.url` -- the API path clients fetch a stored artifact
+ * from (console download route). */
+export function artifactUrl(jobId: string, filename: string): string {
+  return `/api/jobs/${sanitizePathComponent(jobId, "job id")}/artifacts/${sanitizePathComponent(filename, "artifact filename")}`;
+}
+
+/** Store `filename`'s bytes under `job_id` in R2 -- ports `LocalStore.put`.
+ * Returns the stored (sanitized) filename. */
+export async function putArtifact(
+  store: R2Bucket,
+  jobId: string,
+  filename: string,
+  body: ReadableStream | ArrayBuffer | ArrayBufferView | Blob
+): Promise<string> {
+  const name = sanitizePathComponent(filename, "artifact filename");
+  await store.put(artifactKey(jobId, name), body);
+  return name;
+}

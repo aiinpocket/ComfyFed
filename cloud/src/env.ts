@@ -20,4 +20,16 @@ export interface Env {
    * `db/queries.ts`'s `resolvePlatformSeed` for the env-wins-over-D1
    * resolution order and why. */
   PLATFORM_ED25519_SEED: string | undefined;
+  /** Optional R2 S3-compatible API credentials (Task 8's presign upload
+   * protocol). When ALL FOUR are present, `POST
+   * /api/agent/jobs/{id}/artifacts/presign` returns an aws4-sigv4-signed S3
+   * PUT URL (`mode: "s3"`) instead of the platform-mediated "direct" upload
+   * token flow -- lets a deployment's agents upload straight to R2's S3
+   * endpoint, bypassing the Worker entirely for the bytes themselves. Absent
+   * (the default) means every presign request gets `mode: "direct"`. Set via
+   * `wrangler secret put R2_S3_*`; see `lib/sigv4.ts`. */
+  R2_S3_ACCOUNT_ID: string | undefined;
+  R2_S3_ACCESS_KEY_ID: string | undefined;
+  R2_S3_SECRET_ACCESS_KEY: string | undefined;
+  R2_S3_BUCKET: string | undefined;
 }
