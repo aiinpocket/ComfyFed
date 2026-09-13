@@ -196,22 +196,31 @@ def _load_json(path: str) -> list | dict | None:
 
 
 # (path -> (mtime, parsed JSON)) cache for the index files: `index.json` and
-# `index.<locale>.json`, packaged and official copies alike. The key space is
-# a small, fixed set of literal filenames (unlike the per-workflow cache
-# below, this is never one entry per request), so a plain unbounded dict is
-# fine -- mirrors `model_guide.harvest`'s (mtime signature, result) cache.
-# Plain dict + mtime compare, no locks needed: FastAPI's threadpool may run
-# this concurrently, but a rebuild is idempotent (worst case two threads
-# re-read the same unchanged file and one write clobbers the other with an
-# equal value), so nothing corrupts.
+# `index.<locale>.json`, packaged and official copies alike. Each source file
+# is its OWN independent cache entry, keyed on its own path/mtime -- there is
+# no single combined key for "the packaged file + the official file"; a
+# caller like `_merged_index` looks up the packaged and official paths as two
+# separate `_load_json_cached` calls and concatenates their (independently
+# cached) results fresh on every request. So a change to only one side (e.g.
+# a fresh `official_templates.fetch()`) invalidates only that side's entry,
+# not the other's. The key space is a small, fixed set of literal filenames
+# (unlike the per-workflow cache below, this is never one entry per request),
+# so a plain unbounded dict is fine -- mirrors `model_guide.harvest`'s (mtime
+# signature, result) cache. Plain dict + mtime compare, no locks needed:
+# FastAPI's threadpool may run this concurrently, but a rebuild is idempotent
+# (worst case two threads re-read the same unchanged file and one write
+# clobbers the other with an equal value), so nothing corrupts.
 _index_json_cache: dict[str, tuple[float, list | dict | None]] = {}
 
 
 def _load_json_cached(path: str) -> list | dict | None:
-    """`_load_json`, memoized on `path`'s mtime so a second request for an
-    unchanged index file does zero re-reads. A file that starts missing (no
-    mtime) or goes missing between calls is never cached -- there is nothing
-    to invalidate against, so it is simplest to just re-check every time."""
+    """`_load_json` for a single file, memoized on `path`'s own mtime so a
+    second request for that unchanged file does zero re-reads. Each `path` is
+    an independent cache entry (see `_index_json_cache` above) -- this is not
+    a combined cache over several files at once. A file that starts missing
+    (no mtime) or goes missing between calls is never cached -- there is
+    nothing to invalidate against, so it is simplest to just re-check every
+    time."""
     try:
         mtime = os.path.getmtime(path)
     except OSError:

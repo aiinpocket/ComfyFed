@@ -158,6 +158,24 @@ def test_object_info_no_online_workers_returns_empty_with_header(client):
     assert r.headers.get("X-ComfyFed-No-Workers") == "1"
 
 
+def test_object_info_no_online_workers_returns_empty_regardless_of_mode(client):
+    """The empty-fleet early return must fire before the mode branch is ever
+    consulted -- intersection mode with zero online workers gets the exact
+    same `{}` + no-workers-header response as union, not an empty result
+    produced by the intersection-of-nothing logic taking a different path."""
+    csrf = _login(client)
+    r = client.post(
+        "/api/settings", json={"object_info_mode": "intersection"}, headers={"X-CSRF": csrf}
+    )
+    assert r.status_code == 200
+
+    r = client.get("/comfy/api/object_info")
+    assert r.status_code == 200
+    assert r.json() == {}
+    assert r.headers.get("X-ComfyFed-No-Workers") == "1"
+    assert r.headers["X-ComfyFed-Worker-Count"] == "0"
+
+
 def test_object_info_reports_source_worker_count_in_a_header(client):
     """M5: how many workers the union came from, without polluting the body.
 
