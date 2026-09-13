@@ -217,10 +217,7 @@
       "properties": {
         "Node name for S&R": "CreateVideo"
       },
-      "widgets_values": [
-        "auto",
-        "sRGB"
-      ]
+      "widgets_values": []
     },
     {
       "id": 5,
