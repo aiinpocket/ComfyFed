@@ -59,10 +59,15 @@ app.get("/api/ping", (c) => c.json({ ok: true, mode: "cloud" }));
 // Session gate for the embedded panel, ported from app.py's
 // `_comfy_session_gate` -- see lib/gate.ts's docstring. Registered before
 // the `/comfy/ws` / `/comfy/api/ws` handlers and the `/comfy/api/*` /
-// `/comfy/templates/*` route mounts below: it exempts all of those by path
-// itself (see `isGateExempt`), so an unauthenticated hit to any of them
-// still reaches its own auth (401 JSON / DO cookie check) rather than being
-// redirected -- only the panel page and its static assets get the 302.
+// `/comfy/templates/*` route mounts below. `isGateExempt` (lib/gate.ts)
+// exempts only `/comfy/api/*` and `/comfy/ws` by path -- an unauthenticated
+// hit to either still reaches its own auth (401 JSON / DO cookie check)
+// rather than being redirected. `/comfy/templates/*` is NOT exempt: it goes
+// through this same 302-to-`/` gate like the panel page and its static
+// assets, matching Python (`templates.py`'s router has no
+// `Depends(require_admin)` and relies entirely on `_comfy_session_gate`) --
+// `requireAdmin` on those routes is defense-in-depth, never the primary gate
+// for an anonymous caller (final-review.md m1).
 app.use("*", comfySessionGate);
 
 // `/comfy` (no trailing slash) -> `/comfy/`, mirroring app.py's

@@ -206,5 +206,15 @@ describe("GET /api/reports/contributions", () => {
     const r = await call("/api/reports/contributions?from=not-a-date", { method: "GET", cookie });
     expect(r.status).toBe(400);
     expect(r.body.error.code).toBe("reports.bad_date");
+    expect(r.body.error.message).toBe("Not a valid ISO-8601 date: 'not-a-date'");
+  });
+
+  it("repr()-quotes a malformed date containing a single quote like Python's {value!r} (n3, final review)", async () => {
+    const { cookie } = await adminSession();
+    const r = await call("/api/reports/contributions?from=" + encodeURIComponent("o'clock"), { method: "GET", cookie });
+    expect(r.status).toBe(400);
+    // Python's repr("o'clock") switches to double quotes rather than
+    // backslash-escaping the apostrophe: "o'clock".
+    expect(r.body.error.message).toBe('Not a valid ISO-8601 date: "o\'clock"');
   });
 });

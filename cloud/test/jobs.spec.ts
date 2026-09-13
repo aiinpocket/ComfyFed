@@ -463,6 +463,51 @@ describe("POST /api/agent/jobs/{id}/artifacts/presign + raw PUT (direct mode)", 
     });
     expect(r.status).toBe(404);
   });
+
+  it("400s a presign body missing a numeric size (m4, final review)", async () => {
+    const worker = await registerWorker();
+    const jobId = await createAssignedJob(worker);
+    const sha256 = Array.from(new Uint8Array(await crypto.subtle.digest("SHA-256", new TextEncoder().encode("x"))))
+      .map((b) => b.toString(16).padStart(2, "0"))
+      .join("");
+
+    const presignPath = `/api/agent/jobs/${jobId}/artifacts/presign`;
+    for (const badBody of [
+      JSON.stringify({ filename: "out.bin", sha256 }), // size omitted entirely
+      JSON.stringify({ filename: "out.bin", sha256, size: "12" }), // string, not numeric
+      JSON.stringify({ filename: "out.bin", sha256, size: -1 }), // negative
+      JSON.stringify({ filename: "out.bin", sha256, size: null }),
+    ]) {
+      const pr = await signedCall(worker, "POST", presignPath, new TextEncoder().encode(badBody));
+      expect(pr.status).toBe(400);
+      expect(pr.body.error.code).toBe("jobs.bad_asset_name");
+      // Bilingual: contains both the zh-TW and English halves joined by " / ".
+      expect(pr.body.error.message).toContain("/");
+    }
+  });
+
+  it("prunes expired upload_tokens rows on the presign write path (m3, final review)", async () => {
+    const worker = await registerWorker();
+    const jobId = await createAssignedJob(worker);
+    const sha256 = Array.from(new Uint8Array(await crypto.subtle.digest("SHA-256", new TextEncoder().encode("x"))))
+      .map((b) => b.toString(16).padStart(2, "0"))
+      .join("");
+
+    // Seed an already-expired row directly (as if a prior presign call's
+    // token TTL lapsed without ever being used or pruned).
+    await db()
+      .prepare("INSERT INTO upload_tokens (token, job_id, filename, sha256, size, expires_at) VALUES (?, ?, ?, ?, ?, ?)")
+      .bind("stale-token", jobId, "old.bin", sha256, 1, Math.floor(Date.now() / 1000) - 3600)
+      .run();
+
+    const presignPath = `/api/agent/jobs/${jobId}/artifacts/presign`;
+    const presignBody = new TextEncoder().encode(JSON.stringify({ filename: "new.bin", sha256, size: 1 }));
+    const pr = await signedCall(worker, "POST", presignPath, presignBody);
+    expect(pr.status).toBe(200);
+
+    const stale = await db().prepare("SELECT 1 FROM upload_tokens WHERE token = ?").bind("stale-token").first();
+    expect(stale).toBeNull();
+  });
 });
 
 describe("POST /api/agent/jobs/{id}/artifacts/presign (s3 mode)", () => {

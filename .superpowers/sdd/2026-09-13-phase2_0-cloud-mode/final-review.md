@@ -366,3 +366,66 @@ Skipped (not cheap enough to bundle into this pass, left for a follow-up):
 
 Verification: `cd cloud && npm test` → **449 passed** / 29 files, exit 0;
 `cd cloud && npx tsc --noEmit` → clean, exit 0.
+
+---
+
+## Final fix wave, round 2 (controller-adjudicated: take the rest)
+
+**m1 — fixed.** Corrected the `index.ts` comment above `comfySessionGate`'s
+mount: it now says `isGateExempt` exempts only `/comfy/api/*` and
+`/comfy/ws`, that `/comfy/templates/*` is NOT exempt (goes through the same
+302-to-`/` gate as the panel page/assets, matching Python's
+`templates.py`/`_comfy_session_gate` split), and that `requireAdmin` on those
+routes is defense-in-depth only, never the primary gate for an anonymous
+caller.
+
+**m3 — fixed.** Added `queries.pruneUploadTokens(db, nowSeconds)` (mirrors
+`pruneNonces`: `DELETE FROM upload_tokens WHERE expires_at < ?`), called at
+the top of the presign handler in `jobs.ts` before either the s3 or direct
+branch. `deleteUploadToken` (already deleted in round 1 as dead code, m2)
+stays deleted: a single-token delete on the claim path would have been
+redundant now that expiry-based pruning runs on every presign call and
+covers both used and unused expired rows with one predicate. Test:
+`jobs.spec.ts` seeds an expired row directly, calls presign, asserts the
+stale row is gone.
+
+**m4 — fixed.** Presign now requires a numeric, non-negative `size`; a
+missing/non-numeric/negative `size` is a `400 jobs.bad_asset_name` with a new
+bilingual `PRESIGN_SIZE_REQUIRED` message (cloud-only, no Python parity
+source, same treatment as `HUB_UNAVAILABLE`). Verified the real Python agent
+(`agent/comfyfed_agent/runner.py:804`, `_try_presign`) already sends
+`size: len(content)` on every presign request — **no agent-side change
+needed**, this is a pure cloud-side tightening. Effect: `upload_tokens.size`
+is now always non-null for a direct-mode token, so `PUT
+.../artifacts/raw/:token`'s `FixedLengthStream` guard is unconditionally
+installed. Tests: `jobs.spec.ts` — 400 for size omitted / stringified /
+negative / explicit `null`.
+
+**m5 — fixed.** Added `cloud/scripts/check-assets.mjs` and wired it as
+`package.json`'s `predeploy` script (npm runs it automatically before
+`deploy`). It checks `cloud/assets/index.html` exists and, if not, exits 1
+with a bilingual message pointing at `npm run ci-build` and explaining why
+`deploy` itself doesn't build (avoids Workers Builds double-paying to
+package `web/`). Manually verified both branches (renamed `index.html` away
+and back) — exit 1 with the message when missing, exit 0/silent when
+present. No automated test: this only runs under `npm`'s lifecycle hook
+outside the Workers runtime the vitest suite exercises, same category as the
+other `scripts/*.mjs` files, none of which have unit tests.
+
+**n3 — fixed, one-line-equivalent.** `reports.ts:130` rendered
+`` `'${err.value}'` `` where Python's `receipts.py:35` uses `{value!r}`;
+diverges for a value containing a quote character (a user-supplied `?from=`/
+`?to=` query param, so reachable, not hypothetical). Added a small
+`pyStrRepr()` helper approximating Python's string `repr()` (switches to
+double quotes when the value contains `'` and no `"`, backslash-escapes the
+chosen quote char and `\` otherwise) and used it in place of the raw
+template literal. Tests: `reports.spec.ts` — exact message for the plain
+case, plus a new case asserting `"o'clock"` renders as `"o'clock"` (Python's
+quote-switching behavior), not `'o'clock'`.
+
+Verification: `cd cloud && npm test` → **452 passed** / 29 files, exit 0
+(3 new: m3 pruning, m4 four bad-size cases, n3 quote-switch case; `hub.spec.ts`
+had one unrelated pre-existing flake on the first run, confirmed by an
+isolated re-run passing 16/16 and the full suite passing clean on the next
+run — no file this pass touched is anywhere near `do/hub.ts`);
+`cd cloud && npx tsc --noEmit` → clean, exit 0.

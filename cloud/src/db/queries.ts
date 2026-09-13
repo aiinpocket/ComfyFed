@@ -1073,3 +1073,12 @@ export async function claimUploadToken(db: D1Database, token: string): Promise<b
     .run();
   return (result.meta.changes ?? 0) === 1;
 }
+
+/** Mirrors `pruneNonces`: opportunistic cleanup on the same write path that
+ * grows the table, rather than a separate cron/alarm. Deletes every row past
+ * its TTL regardless of `used` -- an expired-but-unused token is just as
+ * dead as an expired-and-used one, so a single `expires_at` predicate covers
+ * both without needing a second column check (final-review.md m3). */
+export async function pruneUploadTokens(db: D1Database, nowSeconds: number): Promise<void> {
+  await db.prepare("DELETE FROM upload_tokens WHERE expires_at < ?").bind(nowSeconds).run();
+}

@@ -54,6 +54,12 @@ const HUB_UNAVAILABLE = {
   zhTW: "取消請求無法送達，請再試一次。",
 };
 
+// Also cloud-only (Task 8's presign protocol has no Python parity source).
+const PRESIGN_SIZE_REQUIRED = {
+  en: "A numeric 'size' (bytes) is required.",
+  zhTW: "必須提供數值型別的 size（位元組數）。",
+};
+
 const UPLOAD_TOKEN_TTL_SECONDS = 600;
 const S3_PRESIGN_TTL_SECONDS = 600;
 const SHA256_HEX_RE = /^[0-9a-f]{64}$/;
@@ -442,7 +448,22 @@ app.post("/api/agent/jobs/:jobId/artifacts/presign", async (c) => {
   if (!SHA256_HEX_RE.test(sha256)) {
     return errorJson(c, 400, "jobs.bad_asset_name", "sha256 must be a 64-character hex string.");
   }
+  // m4 (final review): a numeric `size` is required, not merely accepted --
+  // without it, the raw-PUT handler's `FixedLengthStream` guard (jobs.ts's
+  // PUT .../artifacts/raw/:token) never gets installed and an authenticated
+  // agent's body streams into R2 unbounded. The real Python agent
+  // (`agent/comfyfed_agent/runner.py:804`) always sends `size: len(content)`
+  // in this body, so rejecting its absence here is a cloud-only tightening,
+  // not a break: no agent-side change needed.
   const size = typeof parsed.size === "number" && Number.isFinite(parsed.size) && parsed.size >= 0 ? parsed.size : null;
+  if (size === null) {
+    return errorJson(c, 400, "jobs.bad_asset_name", bilingualMessage(PRESIGN_SIZE_REQUIRED));
+  }
+
+  // m3 (final review): mirror `verify_agent.ts`'s `pruneNonces` -- prune on
+  // this same write path rather than a separate cron, so `upload_tokens`
+  // doesn't grow unbounded for the life of the deployment.
+  await queries.pruneUploadTokens(c.env.DB, Math.floor(Date.now() / 1000));
 
   const { R2_S3_ACCOUNT_ID, R2_S3_ACCESS_KEY_ID, R2_S3_SECRET_ACCESS_KEY, R2_S3_BUCKET } = c.env;
   if (R2_S3_ACCOUNT_ID && R2_S3_ACCESS_KEY_ID && R2_S3_SECRET_ACCESS_KEY && R2_S3_BUCKET) {

@@ -28,6 +28,19 @@ class BadDateError extends Error {
   }
 }
 
+/** Approximates Python's `repr()` for a plain string: single-quoted unless
+ * the value contains a `'` and no `"`, in which case Python switches to
+ * double quotes instead of escaping; a `\` or the chosen quote char inside
+ * the value is backslash-escaped either way. `n3` (final review): the
+ * previous `` `'${value}'` `` diverged from `{value!r}` (receipts.py:35) for
+ * any value containing a quote character -- this query param is
+ * user-supplied (`?from=`/`?to=`), so that's reachable, not hypothetical. */
+function pyStrRepr(value: string): string {
+  const quote = value.includes("'") && !value.includes('"') ? '"' : "'";
+  const escaped = value.replace(/\\/g, "\\\\").replaceAll(quote, `\\${quote}`);
+  return `${quote}${escaped}${quote}`;
+}
+
 // Accepts a date, or a date+time (space or "T" separated) with optional
 // fractional seconds and an optional "Z"/"+HH:MM"/"-HH:MM" offset --
 // roughly the subset of ISO-8601 Python's `datetime.fromisoformat` accepts,
@@ -127,7 +140,7 @@ app.get("/api/reports/contributions", requireAdmin, async (c) => {
     if (toParam) end = parseDateParam(toParam);
   } catch (err) {
     if (err instanceof BadDateError) {
-      return errorJson(c, 400, "reports.bad_date", `Not a valid ISO-8601 date: '${err.value}'`);
+      return errorJson(c, 400, "reports.bad_date", `Not a valid ISO-8601 date: ${pyStrRepr(err.value)}`);
     }
     throw err;
   }

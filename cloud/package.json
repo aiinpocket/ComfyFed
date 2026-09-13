@@ -8,6 +8,7 @@
     "test": "vitest run",
     "build": "node scripts/build.mjs",
     "ci-build": "npm ci && npm run build",
+    "predeploy": "node scripts/check-assets.mjs",
     "deploy": "wrangler d1 migrations apply comfyfed --remote && wrangler deploy",
     "seed-official": "node scripts/seed-official.mjs"
   },
