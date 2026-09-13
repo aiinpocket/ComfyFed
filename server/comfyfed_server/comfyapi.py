@@ -46,6 +46,7 @@ import json
 import mimetypes
 import os
 from collections import OrderedDict
+from importlib import resources
 from typing import Callable, Optional
 
 from fastapi import APIRouter, Depends, File, Form, Request, UploadFile, WebSocket, WebSocketDisconnect
@@ -1038,7 +1039,20 @@ def create_router(
 
     @r.get("/extensions")
     def extensions() -> Response:
-        return JSONResponse(content=[])
+        # One real entry: a tiny JS module that hides the dead Comfy-cloud
+        # login button (see `panel_ext/comfyfed.js`). The frontend fetches
+        # this list and dynamically `import()`s every URL in it, which is
+        # the sanctioned hook for panel-side tweaks -- `show_signin_button`
+        # in `feature_flags` is dead code the frontend never reads.
+        return JSONResponse(content=["/comfy/api/comfyfed-ext/comfyfed.js"])
+
+    @r.get("/comfyfed-ext/comfyfed.js", include_in_schema=False)
+    def comfyfed_extension_js() -> Response:
+        # Packaged the same way as `templates_data/` (see `templates.py`):
+        # `importlib.resources` off the package, so a source checkout and an
+        # installed wheel both resolve to the same bytes.
+        path = str(resources.files(__package__).joinpath("panel_ext", "comfyfed.js"))
+        return FileResponse(path, media_type="application/javascript")
 
     @r.get("/embeddings")
     def embeddings() -> Response:

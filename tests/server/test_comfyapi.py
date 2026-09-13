@@ -1257,7 +1257,7 @@ def test_prompt_copies_staged_asset_into_job_inputs(client):
     [
         ("/comfy/api/features", {}),
         ("/comfy/api/users", {"storage": "server", "migrated": False}),
-        ("/comfy/api/extensions", []),
+        ("/comfy/api/extensions", ["/comfy/api/comfyfed-ext/comfyfed.js"]),
         ("/comfy/api/embeddings", []),
         ("/comfy/api/models", []),
         ("/comfy/api/i18n", {}),
@@ -1274,6 +1274,23 @@ def test_bootstrap_routes_return_the_empty_upstream_shape(client, path, expected
 
 def test_bootstrap_routes_require_a_session(client):
     assert client.get("/comfy/api/features").status_code == 401
+
+
+def test_panel_extension_js_is_served(client):
+    # The frontend fetches `/comfy/api/extensions` and dynamically imports
+    # every module URL it lists; this is how ComfyFed hides the dead
+    # Comfy-cloud login button without patching the pinned frontend dist.
+    _login(client)
+    r = client.get("/comfy/api/comfyfed-ext/comfyfed.js")
+    assert r.status_code == 200
+    assert r.headers["content-type"].startswith("application/javascript")
+    body = r.text
+    assert body
+    assert "display:none" in body.replace(" ", "")
+
+
+def test_panel_extension_js_requires_a_session(client):
+    assert client.get("/comfy/api/comfyfed-ext/comfyfed.js").status_code == 401
 
 
 def test_system_stats_reports_no_local_devices(client):
