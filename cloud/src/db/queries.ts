@@ -741,11 +741,6 @@ export async function getAllJobsOrderedByCreatedAt(db: D1Database): Promise<Job[
   return results.map(rowToJob);
 }
 
-export async function getJobByIdAndOrigin(db: D1Database, id: string, origin: string): Promise<Job | null> {
-  const row = await db.prepare("SELECT * FROM jobs WHERE id = ? AND origin = ?").bind(id, origin).first<JobRow>();
-  return row ? rowToJob(row) : null;
-}
-
 /** Sets `panel_hidden = 1` on every terminal (`done`/`failed`), `origin =
  * 'panel'` job matching `ids` (or every such job when `ids` is undefined) --
  * mirrors comfyapi.py's `POST /comfy/api/history` hide mutation. Returns the
