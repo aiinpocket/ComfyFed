@@ -45,6 +45,7 @@ from __future__ import annotations
 import json
 import mimetypes
 import os
+from collections import OrderedDict
 from typing import Callable, Optional
 
 from fastapi import APIRouter, Depends, File, Form, Request, UploadFile, WebSocket, WebSocketDisconnect
@@ -72,6 +73,23 @@ FALLBACK_OUTPUT_KEY = "comfyfed"
 
 _TEXT_ARTIFACT_EXT = ".txt"
 _TEXT_ARTIFACT_MAX_BYTES = 100_000
+
+# `_read_text_artifact` memo cache, keyed by `(job_id, filename)`. Artifacts
+# are immutable once a worker writes them, so a successful read never goes
+# stale -- caching it turns `GET /history`'s per-job fan-out (M2 in the final
+# review: every done job with a `.txt` output re-opens a store, hits the DB
+# for the `artifact_store` setting, and re-reads up to 100 KB from disk, on
+# EVERY poll) into a single disk read per artifact for the process lifetime.
+# Capped at `_TEXT_ARTIFACT_CACHE_MAX` entries, evicting the oldest
+# (`OrderedDict` insertion order) -- an unbounded cache would let a
+# long-running admin session accumulate ~20 MB+ of text forever. A FAILED
+# read (missing file, misconfigured store, ...) is deliberately NEVER
+# cached: `job_outputs`'s documented contract is that a late-arriving upload
+# should be picked up by a retry, and caching `None` would make that
+# permanent for the process's lifetime instead of just until the file shows
+# up.
+_TEXT_ARTIFACT_CACHE_MAX = 128
+_text_artifact_cache: "OrderedDict[tuple[str, str], str]" = OrderedDict()
 
 # Set by `create_router` (mirrors `agentws._data_dir`): `job_outputs` needs it
 # to read a `.txt` artifact's content from the store, but it is shared by
@@ -207,6 +225,16 @@ def _node_ids_of_class(workflow: dict, classes) -> list[str]:
 
 
 def _output_node_ids(workflow: dict) -> list[str]:
+    """Node ids for the queue entry's `outputs_to_execute` slot -- deliberately
+    `_OUTPUT_NODE_CLASSES` (media + `SaveText`), NOT the separate concept of
+    "every node id `job_outputs` can key a payload onto" (which also includes
+    `PreviewAny`, kept out here on purpose since it produces no file of its
+    own). These are two different sets that happen to share most of their
+    membership; don't fold `_PREVIEW_ANY_CLASS` into `_OUTPUT_NODE_CLASSES` to
+    "fix" this -- the agent re-derives real output nodes by submitting the
+    prompt to its own ComfyUI, and only the panel's queue view reads this
+    field, so there is no functional bug here today.
+    """
     return _node_ids_of_class(workflow, _OUTPUT_NODE_CLASSES)
 
 
@@ -222,12 +250,24 @@ def _queue_entry(number: int, job: db.Job) -> list:
 def _read_text_artifact(job: db.Job, filename: str) -> Optional[str]:
     """Best-effort read of a `.txt` artifact's content for the panel preview.
 
+    Memoized in `_text_artifact_cache` per `(job.id, filename)` -- see that
+    cache's comment for why this is sound (artifacts are immutable) and why
+    a failed read is never cached (a retry after a late upload must still
+    succeed). `job_outputs` stays synchronous either way; this only removes
+    repeat disk/DB work across calls, it does not change when the work runs.
+
     Capped at `_TEXT_ARTIFACT_MAX_BYTES` (a generated prompt can run long,
     and this is a preview, not a download -- the full file is still
     reachable via `files`). Any failure (store misconfigured, artifact
     missing, ...) returns `None` so the caller falls back to a files-only
     entry instead of ever raising out of `job_outputs`.
     """
+    cache_key = (job.id, filename)
+    cached = _text_artifact_cache.get(cache_key)
+    if cached is not None:
+        _text_artifact_cache.move_to_end(cache_key)
+        return cached
+
     if _data_dir is None:
         return None
     try:
@@ -236,7 +276,13 @@ def _read_text_artifact(job: db.Job, filename: str) -> Optional[str]:
             raw = f.read(_TEXT_ARTIFACT_MAX_BYTES)
     except Exception:  # noqa: BLE001 -- "never raise" is the explicit contract here
         return None
-    return raw.decode("utf-8", errors="replace")
+
+    text = raw.decode("utf-8", errors="replace")
+    _text_artifact_cache[cache_key] = text
+    _text_artifact_cache.move_to_end(cache_key)
+    if len(_text_artifact_cache) > _TEXT_ARTIFACT_CACHE_MAX:
+        _text_artifact_cache.popitem(last=False)
+    return text
 
 
 def _merge_output(result: dict, key: str, payload: dict) -> None:
@@ -322,6 +368,12 @@ def job_outputs(job: db.Job) -> dict:
             {"filename": name, "subfolder": job.id, "type": "output"} for name in text_files
         ]
 
+        # Only the FIRST `SaveText` node (sorted by id) gets a payload; a
+        # second one in the same workflow gets no key at all, and its
+        # preview stays blank (`WidgetTextPreview` also only ever reads
+        # `files[0]`). Not hit by any shipped template (one SaveText each) --
+        # documented here rather than fixed so the contract is explicit if a
+        # future template adds a second one.
         save_text_ids = _node_ids_of_class(workflow, {_TEXT_OUTPUT_NODE_CLASS})
         save_target = save_text_ids[0] if save_text_ids else FALLBACK_OUTPUT_KEY
         save_payload: dict = {"files": file_entries}

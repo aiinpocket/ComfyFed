@@ -8,6 +8,7 @@ envelopes per `server.py` / `execution.py`.
 """
 
 import asyncio
+import io
 import time
 
 import pytest
@@ -15,7 +16,7 @@ from fastapi.testclient import TestClient
 from starlette.websockets import WebSocketDisconnect
 
 from comfyfed_server import app as app_module
-from comfyfed_server import bootstrap, comfyapi, db, dispatch, panelws
+from comfyfed_server import bootstrap, comfyapi, db, dispatch, panelws, storage
 
 
 def _pick_job_for(worker_id):
@@ -249,6 +250,10 @@ def test_executing_event_on_job_running(client):
 
 
 def test_job_done_sends_executed_then_executing_none_then_status(client):
+    """Upstream's `executed` message carries exactly one node's UI dict, so a
+    single-output-node job must still get exactly one `executed` event, and
+    it must carry that node's payload directly (not the whole
+    `{node_id: {...}}` map ComfyUI history uses)."""
     csrf = _login(client)
     job_id = _post_prompt(client)
     worker_id = _register_worker(client, csrf, "runner")
@@ -270,15 +275,13 @@ def test_job_done_sends_executed_then_executing_none_then_status(client):
             assert executed["data"]["node"] == "2"
             assert executed["data"]["display_node"] == "2"
             assert executed["data"]["output"] == {
-                "2": {
-                    "images": [
-                        {
-                            "filename": "out_00001_.png",
-                            "subfolder": job_id,
-                            "type": "output",
-                        }
-                    ]
-                }
+                "images": [
+                    {
+                        "filename": "out_00001_.png",
+                        "subfolder": job_id,
+                        "type": "output",
+                    }
+                ]
             }
 
             completion = ws.receive_json()
@@ -290,6 +293,65 @@ def test_job_done_sends_executed_then_executing_none_then_status(client):
             status = ws.receive_json()
             assert status["type"] == "status"
             assert status["data"]["status"] == {"exec_info": {"queue_remaining": 0}}
+
+
+def test_job_done_sends_one_executed_event_per_output_node(client):
+    """A text job's `SaveText` and `PreviewAny` nodes are two different
+    output node ids in `job_outputs` -- each must get its OWN `executed`
+    event carrying ONLY its own payload, never the sibling node's data and
+    never the whole map. This is the exact upstream contract
+    (`ComfyApp.addApiUpdateHandlers` -> `setNodeOutputsByExecutionId(node,
+    output)` / `getNodeByExecutionId(node).onExecuted(output)`) that a
+    combined-map `executed` event violates."""
+    prompt = {
+        "1": {"class_type": "PrimitiveStringMultiline", "inputs": {"value": "hi"}},
+        "8": {"class_type": "SaveText", "inputs": {"text": ["1", 0], "filename_prefix": "p"}},
+        "9": {"class_type": "PreviewAny", "inputs": {"source": ["1", 0]}},
+    }
+    csrf = _login(client)
+    job_id = _post_prompt(client, prompt)
+    worker_id = _register_worker(client, csrf, "runner")
+    _pick_job_for(worker_id)
+    dispatch.mark_running(job_id, worker_id)
+    dispatch.mark_done(job_id, worker_id, ["p_00001_.txt"])
+
+    storage.get_store(client.data_dir).put(job_id, "p_00001_.txt", io.BytesIO(b"hi"))
+
+    with db.get_session() as session:
+        job = session.get(db.Job, job_id)
+        with client.websocket_connect("/comfy/api/ws") as ws:
+            ws.receive_json()  # initial status
+            ws.receive_json()  # feature_flags
+
+            relay(panelws.job_done(job))
+
+            first = ws.receive_json()
+            second = ws.receive_json()
+            events_by_node = {first["data"]["node"]: first, second["data"]["node"]: second}
+
+            assert set(events_by_node) == {"8", "9"}
+
+            save_text_evt = events_by_node["8"]
+            assert save_text_evt["type"] == "executed"
+            assert save_text_evt["data"]["display_node"] == "8"
+            assert save_text_evt["data"]["output"] == {
+                "text": ["hi"],
+                "files": [{"filename": "p_00001_.txt", "subfolder": job_id, "type": "output"}],
+            }
+
+            preview_evt = events_by_node["9"]
+            assert preview_evt["type"] == "executed"
+            assert preview_evt["data"]["display_node"] == "9"
+            assert preview_evt["data"]["output"] == {"text": ["hi"]}
+
+            completion = ws.receive_json()
+            assert completion == {
+                "type": "executing",
+                "data": {"node": None, "prompt_id": job_id},
+            }
+
+            status = ws.receive_json()
+            assert status["type"] == "status"
 
 
 def test_job_failed_sends_execution_error(client):

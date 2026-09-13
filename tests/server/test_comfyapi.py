@@ -728,6 +728,85 @@ def test_history_text_file_without_save_text_node_uses_fallback_key(client):
     ]
 
 
+def test_read_text_artifact_memoizes_per_job_and_filename(client, monkeypatch):
+    """M2: `_read_text_artifact` must not re-open the store and re-read disk
+    for a `(job_id, filename)` it already served -- artifacts are immutable
+    once written, and `GET /history`'s per-job fan-out was hitting the store
+    (a fresh DB session for the `artifact_store` setting, plus a file read)
+    on every single poll."""
+    comfyapi._text_artifact_cache.clear()
+    csrf = _login(client)
+    prompt_id = _post_prompt(client, prompt=TEXT_PROMPT).json()["prompt_id"]
+    _finish_job(
+        client, csrf, prompt_id, result_files=["comfyfed_prompt.txt"], artifact_bytes=b"cached text"
+    )
+
+    with db.get_session() as session:
+        job = session.get(db.Job, prompt_id)
+
+        calls = []
+        original_open = storage.LocalStore.open
+
+        def counting_open(self, job_id, filename):
+            calls.append((job_id, filename))
+            return original_open(self, job_id, filename)
+
+        monkeypatch.setattr(storage.LocalStore, "open", counting_open)
+
+        first = comfyapi._read_text_artifact(job, "comfyfed_prompt.txt")
+        second = comfyapi._read_text_artifact(job, "comfyfed_prompt.txt")
+
+        assert first == second == "cached text"
+        assert len(calls) == 1
+
+
+def test_read_text_artifact_does_not_cache_a_failed_read(client):
+    """A retry after a late-arriving upload must still succeed -- caching a
+    `None` (missing-file) result would make that failure permanent for the
+    process's lifetime instead of just until the file shows up."""
+    comfyapi._text_artifact_cache.clear()
+    csrf = _login(client)
+    prompt_id = _post_prompt(client, prompt=TEXT_PROMPT).json()["prompt_id"]
+    worker_id = _register_worker(client, csrf, f"runner-{prompt_id[:6]}")
+    picked = _pick_job_for(worker_id)
+    assert picked is not None and picked.id == prompt_id
+    assert dispatch.mark_running(prompt_id, worker_id)
+    assert dispatch.mark_done(prompt_id, worker_id, ["late.txt"])
+
+    with db.get_session() as session:
+        job = session.get(db.Job, prompt_id)
+        assert comfyapi._read_text_artifact(job, "late.txt") is None
+
+        # The worker's upload lands after the first (failed) read.
+        storage.get_store(client.data_dir).put(prompt_id, "late.txt", io.BytesIO(b"finally"))
+
+        assert comfyapi._read_text_artifact(job, "late.txt") == "finally"
+
+
+def test_read_text_artifact_cache_evicts_oldest_past_128_entries(client):
+    """Drives the real eviction path through `_read_text_artifact` itself
+    (not a re-implementation of the cap) -- 129 distinct jobs must leave
+    exactly 128 entries, with the very first one evicted."""
+    comfyapi._text_artifact_cache.clear()
+    csrf = _login(client)
+    jobs = []
+    for i in range(129):
+        prompt_id = _post_prompt(client, prompt=TEXT_PROMPT).json()["prompt_id"]
+        _finish_job(
+            client, csrf, prompt_id, result_files=[f"n{i}.txt"], artifact_bytes=f"t{i}".encode()
+        )
+        jobs.append(prompt_id)
+
+    with db.get_session() as session:
+        for i, prompt_id in enumerate(jobs):
+            job = session.get(db.Job, prompt_id)
+            comfyapi._read_text_artifact(job, f"n{i}.txt")
+
+    assert len(comfyapi._text_artifact_cache) == 128
+    assert (jobs[0], "n0.txt") not in comfyapi._text_artifact_cache
+    assert (jobs[128], "n128.txt") in comfyapi._text_artifact_cache
+
+
 # --- view ------------------------------------------------------------------
 
 

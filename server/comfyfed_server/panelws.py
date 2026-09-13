@@ -207,33 +207,44 @@ async def job_cancelled(job_id: str) -> None:
 
 
 async def job_done(job: "db.Job") -> None:
-    """Emit `executed` + the completion `executing` signal + a refreshed `status`.
+    """Emit one `executed` per output node, then the completion `executing`
+    signal, then a refreshed `status`.
 
-    `outputs`/`node` are computed by `comfyapi.job_outputs`, the same helper
-    `GET /history` uses, so a done job's outputs can never drift between the
-    two surfaces. Imported lazily to avoid a module-import cycle (comfyapi
-    imports this module to serve `/comfy/api/ws`).
+    Upstream's `executed` message carries exactly ONE node's UI dict in
+    `data.output`, keyed by `data.node`/`data.display_node` -- never the whole
+    `{node_id: {...}}` map (see `ComfyApp.addApiUpdateHandlers` in the pinned
+    frontend bundle: it does `setNodeOutputsByExecutionId(node, output)` and
+    `getNodeByExecutionId(node).onExecuted(output)`). Sending the full map
+    under a single node id silently clears that node's preview widget
+    (`output.text`/`output.images` come back `undefined`) and never reaches
+    any other node -- notably `PreviewAny`, which is why this iterates every
+    entry from `comfyapi.job_outputs` instead of sending it once.
+
+    `job_outputs` is the same helper `GET /history` uses, so a done job's
+    outputs can never drift between the two surfaces. Imported lazily to
+    avoid a module-import cycle (comfyapi imports this module to serve
+    `/comfy/api/ws`).
     """
     from . import comfyapi
 
-    outputs = comfyapi.job_outputs(job)
-    node = next(iter(outputs), comfyapi.FALLBACK_OUTPUT_KEY)
+    outputs = comfyapi.job_outputs(job) or {comfyapi.FALLBACK_OUTPUT_KEY: {}}
 
-    await post_event(
-        {
-            "type": "executed",
-            "data": {
-                "prompt_id": job.id,
-                "output": outputs,
-                "node": node,
-                # Same value as "node" -- ComfyFed jobs have no distinct
-                # real/display node id, but upstream's shape always carries
-                # both (execution.py), and the pinned frontend may read
-                # display_node for gallery routing.
-                "display_node": node,
-            },
-        }
-    )
+    for node_id, payload in outputs.items():
+        await post_event(
+            {
+                "type": "executed",
+                "data": {
+                    "prompt_id": job.id,
+                    "output": payload,
+                    "node": node_id,
+                    # Same value as "node" -- ComfyFed jobs have no distinct
+                    # real/display node id, but upstream's shape always carries
+                    # both (execution.py), and the pinned frontend may read
+                    # display_node for gallery routing.
+                    "display_node": node_id,
+                },
+            }
+        )
     await post_event({"type": "executing", "data": {"node": None, "prompt_id": job.id}})
     await post_event({"type": "status", "data": {"status": queue_status()}})
 

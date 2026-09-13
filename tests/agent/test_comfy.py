@@ -8,7 +8,7 @@ from comfyfed_agent import comfy, whitelist
 COMFY_URL = "http://fake-comfy:8188"
 
 
-def _make_app():
+def _make_app(outputs=None):
     app = FastAPI()
     # `history_misses` makes /history return "not finished yet" that many
     # times, so a test can exercise the in-progress polling path;
@@ -67,7 +67,9 @@ def _make_app():
         return {
             prompt_id: {
                 "status": {"status_str": "success"},
-                "outputs": {
+                "outputs": outputs
+                if outputs is not None
+                else {
                     "9": {"images": [{"filename": "out.png", "subfolder": "", "type": "output"}]}
                 },
             }
@@ -75,6 +77,8 @@ def _make_app():
 
     @app.get("/view")
     def view(filename: str, subfolder: str = "", type: str = "output"):
+        if filename.endswith(".txt"):
+            return Response(content=b"TXTDATA", media_type="text/plain")
         return Response(content=b"PNGDATA", media_type="image/png")
 
     @app.post("/upload/image")
@@ -125,6 +129,30 @@ def test_run_workflow_returns_output_files(client):
     # round to 0.0. The invariant under test is that it is a NUMBER.
     assert exec_seconds is not None
     assert exec_seconds >= 0
+
+
+def test_run_workflow_collects_files_keyed_text_outputs():
+    """`SaveText` (and any other text-writing output node) lists what it saved
+    under the `"files"` key, not `"images"`/`"gifs"`/`"videos"` -- mirrors the
+    ground-truth line the plan got wrong (comfy.py already collects
+    "images","gifs","videos","files"), which shipped with zero test coverage
+    (final review M1). A bare `"text"` key with no `"files"` entry alongside
+    it must NOT trigger a `/view` fetch -- only `files` entries are
+    downloadable artifacts."""
+    outputs = {
+        "10": {
+            "text": ["a lovely prompt"],
+            "files": [{"filename": "p.txt", "subfolder": "job1", "type": "output"}],
+        },
+        "11": {"text": ["a lovely prompt"]},
+    }
+    test_client = TestClient(_make_app(outputs=outputs))
+    files, _exec_seconds = comfy.run_workflow(
+        COMFY_URL,
+        {"1": {"class_type": "KSampler", "inputs": {}}},
+        client=test_client,
+    )
+    assert files == [("p.txt", b"TXTDATA", "job1")]
 
 
 def test_run_workflow_raises_on_prompt_error(client):
