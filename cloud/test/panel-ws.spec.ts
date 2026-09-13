@@ -1,5 +1,5 @@
 import { afterEach, describe, expect, it } from "vitest";
-import { env } from "cloudflare:test";
+import { env, runDurableObjectAlarm, runInDurableObject } from "cloudflare:test";
 import { call, db, SETUP_TOKEN } from "./helpers/http";
 import { toSqliteTimestamp, getJobById } from "../src/db/queries";
 import { connectAgent, connectPanel, collectMessages, hub, nextMessage, openPanelWs } from "./helpers/ws";
@@ -415,5 +415,50 @@ describe("/internal/event", () => {
       })
     );
     expect(response.status).toBe(202);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Alarm re-arm: must key off AGENT connections only, not "any socket"
+// (review round 1, M1) -- a lone panel client must never be what keeps the
+// 5s dispatch tick alive forever, since it has no work the alarm could
+// dispatch. See do/hub.ts's `alarm()` comment for the parity reasoning
+// (agentws.py's dispatch loop only ever consults `agentws._connections`,
+// which never held panel sockets).
+
+describe("alarm re-arm (agent-kind filter)", () => {
+  it("does NOT re-arm when only a panel client is connected (zero agents, zero active jobs)", async () => {
+    const cookie = await loginCookie();
+    const panel = await connectPanel(cookie);
+    await collectMessages(panel, 2); // status, feature_flags
+
+    // Seed an armed alarm directly (as if a previous tick had re-armed it),
+    // so this test proves the NEXT run declines to re-arm rather than just
+    // observing "never armed in the first place".
+    await runInDurableObject(hub(), async (_instance, state) => {
+      await state.storage.setAlarm(Date.now() + 5_000);
+    });
+
+    const ran = await runDurableObjectAlarm(hub());
+    expect(ran).toBe(true);
+
+    const alarmAfter = await runInDurableObject(hub(), (_instance, state) => state.storage.getAlarm());
+    expect(alarmAfter).toBeNull();
+
+    panel.close();
+  });
+
+  it("DOES re-arm when an agent is connected (even with no panel clients)", async () => {
+    const kp = KEYPAIRS[0]!;
+    const workerId = await makeWorker({ pubkeyHex: kp.pubkey_hex });
+    const agent = await connectAgent(workerId, kp.seed_hex); // handshake already arms it once
+
+    const ran = await runDurableObjectAlarm(hub());
+    expect(ran).toBe(true);
+
+    const alarmAfter = await runInDurableObject(hub(), (_instance, state) => state.storage.getAlarm());
+    expect(alarmAfter).not.toBeNull();
+
+    agent.close();
   });
 });

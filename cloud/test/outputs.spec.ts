@@ -143,4 +143,43 @@ describe("jobOutputs", () => {
     expect(out["3"]).toBeDefined();
     expect(out["9"]).toBeUndefined();
   });
+
+  it("evicts the oldest entry once the cache exceeds 128 distinct keys (LRU), forcing a re-read from R2 (review round 1, m2)", async () => {
+    clearTextArtifactCacheForTests();
+    const real = store();
+    let reads = 0;
+    // Read-counting wrapper around the real R2 binding -- `jobOutputs` only
+    // ever calls `.get()` on the store it's given, so that's the only
+    // method this needs to intercept.
+    const countingStore = { get: (key: string) => (reads++, real.get(key)) } as unknown as R2Bucket;
+    const workflow = { "7": { class_type: "SaveText" } };
+
+    // Seed 129 distinct artifacts (cap is 128) -- filling the cache past its
+    // cap evicts the very FIRST one inserted (`job-lru-0`), FIFO, matching
+    // Python's `OrderedDict.popitem(last=False)`.
+    for (let i = 0; i < 129; i++) {
+      const jobId = `job-lru-${i}`;
+      await real.put(`artifacts/${jobId}/note.txt`, `content-${i}`);
+      await jobOutputs(
+        job({ id: jobId, workflowJson: JSON.stringify(workflow), resultFiles: ["note.txt"] }),
+        countingStore
+      );
+    }
+    expect(reads).toBe(129);
+
+    // The evicted entry (job-lru-0) must hit R2 again on re-read.
+    await jobOutputs(
+      job({ id: "job-lru-0", workflowJson: JSON.stringify(workflow), resultFiles: ["note.txt"] }),
+      countingStore
+    );
+    expect(reads).toBe(130);
+
+    // A still-cached entry (job-lru-128, the most recently inserted) must
+    // NOT hit R2 again.
+    await jobOutputs(
+      job({ id: "job-lru-128", workflowJson: JSON.stringify(workflow), resultFiles: ["note.txt"] }),
+      countingStore
+    );
+    expect(reads).toBe(130);
+  });
 });
