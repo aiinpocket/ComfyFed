@@ -213,8 +213,13 @@ def _hash_worker(full_path: str, rel_path: str, cache_path: str, size_bytes: int
 def scan_models(models_dir: str, hash_models: bool = True) -> list[dict]:
     """Walk `models_dir` and return the local model inventory.
 
-    Returns `[{"name": "relative/posix/path", "size": <GB>, "sha256": <hex>}, ...]`.
-    `sha256` is present only once known -- see below.
+    Returns `[{"name": "relative/posix/path", "size": <GB>, "size_bytes": <int>,
+    "sha256": <hex>}, ...]`. `sha256` is present only once known -- see below.
+    `size_bytes` is the file's EXACT `os.stat().st_size` -- additive
+    alongside `size` (GB, rounded, kept for display/back-compat with older
+    server builds and the VRAM/disk estimates) so the server's signed
+    fetch-manifest trust payload (Phase 2.1 Task 2) can pin the real byte
+    length instead of reconstructing an approximation from rounded GB.
 
     `name` is relative to the models ROOT and therefore keeps its category
     directory: `diffusion_models/flux1-dev.safetensors`, not
@@ -278,6 +283,7 @@ def scan_models(models_dir: str, hash_models: bool = True) -> list[dict]:
             entry = {
                 "name": rel_path,
                 "size": round(size_bytes / (1024 ** 3), 3),
+                "size_bytes": size_bytes,
             }
 
             if hash_models:

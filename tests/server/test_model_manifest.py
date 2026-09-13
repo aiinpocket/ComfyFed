@@ -31,40 +31,45 @@ def _sha(label: str) -> str:
     return hashlib.sha256(label.encode()).hexdigest()
 
 
+def _bytes(gb: float) -> int:
+    """Exact byte count for a GB figure, matching what an agent's
+    `os.stat().st_size` would be for a file of exactly this size -- used to
+    build test fixtures that call `record_hash` with an exact size_bytes,
+    same as `agentws._record_model_hashes` does for a Task 1+ agent."""
+    return round(gb * (1024 ** 3))
+
+
 # --- record_hash: consensus + conflict -----------------------------------
 
 
 def test_record_hash_first_report_inserts_row(data_dir):
-    model_manifest.record_hash("w1", "text_encoders/clip_l.safetensors", 0.23, _sha("a"))
+    model_manifest.record_hash("w1", "text_encoders/clip_l.safetensors", _bytes(0.23), _sha("a"))
 
     with db.get_session() as session:
-        size_bytes = round(0.23 * (1024 ** 3))
-        row = session.get(db.ModelHash, ("text_encoders/clip_l.safetensors", size_bytes))
+        row = session.get(db.ModelHash, ("text_encoders/clip_l.safetensors", _bytes(0.23)))
         assert row is not None
         assert row.sha256 == _sha("a")
         assert row.first_worker_id == "w1"
 
 
 def test_record_hash_matching_repeat_is_a_noop(data_dir):
-    model_manifest.record_hash("w1", "clip_l.safetensors", 0.23, _sha("a"))
-    model_manifest.record_hash("w2", "clip_l.safetensors", 0.23, _sha("a"))
+    model_manifest.record_hash("w1", "clip_l.safetensors", _bytes(0.23), _sha("a"))
+    model_manifest.record_hash("w2", "clip_l.safetensors", _bytes(0.23), _sha("a"))
 
-    size_bytes = round(0.23 * (1024 ** 3))
     with db.get_session() as session:
-        row = session.get(db.ModelHash, ("clip_l.safetensors", size_bytes))
+        row = session.get(db.ModelHash, ("clip_l.safetensors", _bytes(0.23)))
         assert row.first_worker_id == "w1"  # untouched, not overwritten
         assert row.sha256 == _sha("a")
     assert "clip_l.safetensors" not in model_manifest.poisoned_names()
 
 
 def test_record_hash_conflict_does_not_overwrite_and_warns_with_both_worker_ids(data_dir, caplog):
-    model_manifest.record_hash("worker-first", "clip_l.safetensors", 0.23, _sha("a"))
+    model_manifest.record_hash("worker-first", "clip_l.safetensors", _bytes(0.23), _sha("a"))
     with caplog.at_level(logging.WARNING, logger="comfyfed_server.model_manifest"):
-        model_manifest.record_hash("worker-second", "clip_l.safetensors", 0.23, _sha("b"))
+        model_manifest.record_hash("worker-second", "clip_l.safetensors", _bytes(0.23), _sha("b"))
 
-    size_bytes = round(0.23 * (1024 ** 3))
     with db.get_session() as session:
-        row = session.get(db.ModelHash, ("clip_l.safetensors", size_bytes))
+        row = session.get(db.ModelHash, ("clip_l.safetensors", _bytes(0.23)))
         assert row.sha256 == _sha("a")  # first-seen hash kept
 
     assert any(
@@ -77,14 +82,14 @@ def test_record_hash_conflict_does_not_overwrite_and_warns_with_both_worker_ids(
 
 
 def test_record_hash_different_sizes_are_independent_keys(data_dir):
-    """Same name, different (rounded) size -> different PK, no conflict."""
-    model_manifest.record_hash("w1", "clip_l.safetensors", 0.23, _sha("a"))
-    model_manifest.record_hash("w2", "clip_l.safetensors", 9.12, _sha("b"))
+    """Same name, different exact size -> different PK, no conflict."""
+    model_manifest.record_hash("w1", "clip_l.safetensors", _bytes(0.23), _sha("a"))
+    model_manifest.record_hash("w2", "clip_l.safetensors", _bytes(9.12), _sha("b"))
 
     assert "clip_l.safetensors" not in model_manifest.poisoned_names()
     with db.get_session() as session:
-        assert session.get(db.ModelHash, ("clip_l.safetensors", round(0.23 * 1024 ** 3))).sha256 == _sha("a")
-        assert session.get(db.ModelHash, ("clip_l.safetensors", round(9.12 * 1024 ** 3))).sha256 == _sha("b")
+        assert session.get(db.ModelHash, ("clip_l.safetensors", _bytes(0.23))).sha256 == _sha("a")
+        assert session.get(db.ModelHash, ("clip_l.safetensors", _bytes(9.12))).sha256 == _sha("b")
 
 
 # --- entries(): the signed manifest ---------------------------------------
@@ -96,14 +101,14 @@ def test_entries_excludes_model_with_no_learned_hash(data_dir):
 
 
 def test_entries_excludes_hash_with_no_matching_source(data_dir):
-    model_manifest.record_hash("w1", "loras/totally_unknown_model.safetensors", 1.0, _sha("a"))
+    model_manifest.record_hash("w1", "loras/totally_unknown_model.safetensors", _bytes(1.0), _sha("a"))
     names = {e["name"] for e in model_manifest.entries(data_dir)}
     assert "totally_unknown_model.safetensors" not in names
 
 
 def test_entries_includes_curated_model_with_agreed_hash_and_valid_signature(data_dir):
     sha = _sha("clip")
-    model_manifest.record_hash("w1", "text_encoders/clip_l.safetensors", 0.23, sha)
+    model_manifest.record_hash("w1", "text_encoders/clip_l.safetensors", _bytes(0.23), sha)
 
     entries = model_manifest.entries(data_dir)
     matches = [e for e in entries if e["name"] == "clip_l.safetensors"]
@@ -118,7 +123,7 @@ def test_entries_includes_curated_model_with_agreed_hash_and_valid_signature(dat
         "https://storage.googleapis.com/comfyfed-models/models/text_encoders/clip_l.safetensors"
     )
     assert entry["sha256"] == sha
-    assert entry["size_bytes"] == round(0.23 * (1024 ** 3))
+    assert entry["size_bytes"] == _bytes(0.23)
     assert isinstance(entry["size_bytes"], int)
 
     _, verify_key = security.load_platform_keys(data_dir)
@@ -128,7 +133,7 @@ def test_entries_includes_curated_model_with_agreed_hash_and_valid_signature(dat
 
 def test_entries_signature_does_not_verify_against_a_tampered_field(data_dir):
     sha = _sha("clip")
-    model_manifest.record_hash("w1", "text_encoders/clip_l.safetensors", 0.23, sha)
+    model_manifest.record_hash("w1", "text_encoders/clip_l.safetensors", _bytes(0.23), sha)
     entry = next(e for e in model_manifest.entries(data_dir) if e["name"] == "clip_l.safetensors")
 
     _, verify_key = security.load_platform_keys(data_dir)
@@ -143,22 +148,22 @@ def test_entries_excludes_a_poisoned_name_even_with_an_agreed_row_present(data_d
     about "two workers disagree on this name", which the first-seen row
     surviving does not resolve.
     """
-    model_manifest.record_hash("w1", "text_encoders/clip_l.safetensors", 0.23, _sha("a"))
-    model_manifest.record_hash("w2", "text_encoders/clip_l.safetensors", 0.23, _sha("b"))
+    model_manifest.record_hash("w1", "text_encoders/clip_l.safetensors", _bytes(0.23), _sha("a"))
+    model_manifest.record_hash("w2", "text_encoders/clip_l.safetensors", _bytes(0.23), _sha("b"))
 
     names = {e["name"] for e in model_manifest.entries(data_dir)}
     assert "clip_l.safetensors" not in names
 
 
-def test_entries_size_bytes_comes_from_inventory_not_model_guide_size_gb(data_dir):
+def test_entries_size_bytes_comes_from_the_learned_row_not_model_guide_size_gb(data_dir):
     """clip_l.safetensors' curated size_gb is 0.23; report a deliberately
     DIFFERENT learned size so the two can't be confused."""
     sha = _sha("clip")
-    model_manifest.record_hash("w1", "text_encoders/clip_l.safetensors", 0.5, sha)
+    model_manifest.record_hash("w1", "text_encoders/clip_l.safetensors", _bytes(0.5), sha)
 
     entry = next(e for e in model_manifest.entries(data_dir) if e["name"] == "clip_l.safetensors")
-    assert entry["size_bytes"] == round(0.5 * (1024 ** 3))
-    assert entry["size_bytes"] != round(0.23 * (1024 ** 3))
+    assert entry["size_bytes"] == _bytes(0.5)
+    assert entry["size_bytes"] != _bytes(0.23)
 
 
 # --- routes: auth ----------------------------------------------------------
@@ -209,7 +214,7 @@ def test_agent_manifest_returns_entries_for_a_verified_agent(client):
     csrf = _login(client)
     worker_id, sk = _register_worker(client, csrf, "w1")
     sha = _sha("clip")
-    model_manifest.record_hash("other-worker", "text_encoders/clip_l.safetensors", 0.23, sha)
+    model_manifest.record_hash("other-worker", "text_encoders/clip_l.safetensors", _bytes(0.23), sha)
 
     r = _agent_get(client, worker_id, sk, "/api/agent/manifest")
     assert r.status_code == 200
@@ -225,7 +230,7 @@ def test_models_manifest_requires_admin_session(client):
 def test_models_manifest_returns_entries_for_admin(client):
     csrf = _login(client)
     sha = _sha("clip")
-    model_manifest.record_hash("w1", "text_encoders/clip_l.safetensors", 0.23, sha)
+    model_manifest.record_hash("w1", "text_encoders/clip_l.safetensors", _bytes(0.23), sha)
 
     r = client.get("/api/models/manifest", headers={"X-CSRF": csrf})
     assert r.status_code == 200

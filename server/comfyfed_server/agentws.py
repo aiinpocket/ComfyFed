@@ -16,12 +16,18 @@ Agent -> server message contract (all JSON):
          it doesn't match `Worker.object_info_hash`, or the platform's stored
          snapshot file is missing, the server replies over this same socket
          with `{"type": "want_object_info"}` to trigger a resend.
-  {"type": "inventory", "models": [{"name": str, "size": float, "sha256": str|absent}]}
+  {"type": "inventory", "models": [{"name": str, "size": float,
+   "size_bytes": int|absent, "sha256": str|absent}]}
       -- `size` is the model file size in GIGABYTES (not bytes); the server
          compares it against VRAM and free-disk figures that are also in GB.
          `sha256` (Phase 2.1 Task 1 agents) is present once the agent has
-         hashed the file; fed into `model_manifest.record_hash` for every
-         entry that carries one -- see `_record_model_hashes`.
+         hashed the file; `size_bytes` (same agents) is the file's EXACT
+         `os.stat().st_size`, additive alongside `size`. Both are fed into
+         `model_manifest.record_hash` for every entry that carries a
+         `sha256` -- see `_record_model_hashes`, which falls back to
+         reconstructing size_bytes from the rounded `size` when an entry
+         has a `sha256` but no `size_bytes` (an agent that hashes but
+         predates the exact field).
   {"type": "job_done", "job_id": str, "result_files": [str],
    "exec_seconds": float|null}
       -- `exec_seconds` is the agent's measurement of actual GPU execution
@@ -717,18 +723,35 @@ def _record_model_hashes(worker_id: str, models: list) -> None:
     """Learn a sha256 for every inventory entry that carries one (Phase 2.1
     Task 1 agents; older agents send none). Cheap skip for entries without
     it -- see `model_manifest.record_hash` for the consensus/conflict rule.
+
+    `size_bytes` is preferred when the entry carries it (an exact
+    `os.stat().st_size` from `hardware.scan_models` -- see its docstring):
+    the signed fetch-manifest trust payload must pin the real byte length,
+    not an approximation. Entries from an agent that hashes but predates
+    the exact `size_bytes` field fall back to reconstructing it from the
+    rounded-to-3-decimal-places GB `size` -- lossy (~1 MB resolution), kept
+    only so those agents' reports aren't dropped outright.
     """
     for entry in models:
         sha256 = entry.get("sha256")
         if not isinstance(sha256, str) or not sha256:
             continue
         name = entry.get("name")
-        size = entry.get("size")
         if not isinstance(name, str) or not name:
             continue
-        if not isinstance(size, (int, float)) or isinstance(size, bool):
-            continue
-        model_manifest.record_hash(worker_id, name, float(size), sha256)
+
+        size_bytes = entry.get("size_bytes")
+        if isinstance(size_bytes, int) and not isinstance(size_bytes, bool) and size_bytes > 0:
+            exact_size_bytes = size_bytes
+        else:
+            size = entry.get("size")
+            if not isinstance(size, (int, float)) or isinstance(size, bool):
+                continue
+            # Fallback for agents that hash but don't yet report exact
+            # size_bytes: reconstruct from the rounded GB figure.
+            exact_size_bytes = round(size * (1024 ** 3))
+
+        model_manifest.record_hash(worker_id, name, exact_size_bytes, sha256)
 
 
 def _sign_and_store_receipt(

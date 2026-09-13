@@ -22,14 +22,16 @@ This module:
    dispatch code) can trust a fetched file without re-deriving trust from
    the HTTP connection it came over.
 
-`size_bytes` is derived from the inventory's `size` (GIGABYTES, 3dp -- see
-`agentws._normalize_models`), NOT from `model_guide.ModelSource.size_gb`
-(hand-curated, coarser, and describes the *expected* download, not what a
-worker actually measured on disk). Rounding a GB-precision float back to
-bytes is inherently approximate, but it is the only size information the
-wire contract carries; the composite (name, size_bytes) primary key still
-does its job of separating genuinely different files reported under the
-same name.
+`size_bytes` is the inventory entry's EXACT `os.stat().st_size` (the
+`size_bytes` field `hardware.scan_models` adds alongside the display/
+compat `size` GB figure -- see its docstring), NOT `model_guide.
+ModelSource.size_gb` (hand-curated, coarser, and describes the *expected*
+download, not what a worker actually measured on disk) and NOT reconstructed
+from the rounded-to-3dp `size` GB figure -- the signed trust payload must
+pin the real byte length. An agent that hashes but predates the exact
+`size_bytes` field is the one exception: `agentws._record_model_hashes`
+falls back to `round(size * 1024**3)` for those reports and documents the
+approximation there, at the one call site that needs it, rather than here.
 
 The poisoned-name set is an in-memory, per-process, module-level `set`. It
 is NOT persisted and NOT shared across server processes/replicas -- a
@@ -68,19 +70,24 @@ def poisoned_names() -> frozenset[str]:
     return frozenset(_poisoned_names)
 
 
-def record_hash(worker_id: str, name: str, size_gb: float, sha256: str) -> None:
-    """Learn one inventory entry's sha256 for (name, size).
+def record_hash(worker_id: str, name: str, size_bytes: int, sha256: str) -> None:
+    """Learn one inventory entry's sha256 for (name, size_bytes).
 
-    `size_gb` is the inventory's `size` field (GB, see module docstring);
-    converted to an integer byte count for the `model_hashes` PK. INSERT OR
-    IGNORE semantics: a first report for (name, size_bytes) is stored as-is;
-    a later report for the same key with a MATCHING sha256 is a no-op; a
-    later report with a DIFFERENT sha256 is a genuine conflict -- logged at
-    WARNING with both worker ids, the existing row is left untouched, and
-    `name` is added to the poisoned set so `entries()` excludes it.
+    `size_bytes` must be the EXACT byte count (an agent's `os.stat().
+    st_size`, per `hardware.scan_models`'s `size_bytes` field) -- this is
+    what the manifest signs, so a caller reconstructing it from the
+    coarser, rounded-to-3-decimal-GB `size` field (only needed for an
+    agent that hashes but predates exact `size_bytes` -- see
+    `agentws._record_model_hashes`) must do so itself and document the
+    approximation at that call site, not here.
+
+    INSERT OR IGNORE semantics: a first report for (name, size_bytes) is
+    stored as-is; a later report for the same key with a MATCHING sha256 is
+    a no-op; a later report with a DIFFERENT sha256 is a genuine conflict --
+    logged at WARNING with both worker ids, the existing row is left
+    untouched, and `name` is added to the poisoned set so `entries()`
+    excludes it.
     """
-    size_bytes = round(size_gb * (1024 ** 3))
-
     with db.get_session() as session:
         existing = session.get(db.ModelHash, (name, size_bytes))
         if existing is None:

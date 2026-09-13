@@ -27,6 +27,25 @@ def test_scan_models_reports_sizes_in_gigabytes(tmp_path):
     assert entry["size"] < 1
 
 
+def test_scan_models_reports_exact_size_bytes_alongside_gb(tmp_path):
+    """`size_bytes` must be the EXACT `os.stat().st_size`, not derivable by
+    re-multiplying the rounded `size` GB figure -- the server signs the
+    fetch-manifest trust payload over this exact value (Phase 2.1 Task 2)."""
+    models_dir = tmp_path / "models"
+    (models_dir / "checkpoints").mkdir(parents=True)
+    exact_bytes = 3 * 1024 * 1024 + 7  # deliberately not a round number of GB
+    (models_dir / "checkpoints" / "sd_xl_base.safetensors").write_bytes(b"\0" * exact_bytes)
+
+    entries = hardware.scan_models(str(models_dir))
+    assert len(entries) == 1
+    entry = entries[0]
+
+    assert entry["size_bytes"] == exact_bytes
+    assert isinstance(entry["size_bytes"], int)
+    # The rounded GB figure alone could not reconstruct the exact value.
+    assert round(entry["size"] * (1024 ** 3)) != exact_bytes
+
+
 def test_scan_models_returns_empty_for_missing_dir(tmp_path):
     assert hardware.scan_models(str(tmp_path / "nope")) == []
 

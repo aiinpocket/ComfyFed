@@ -602,7 +602,53 @@ def test_byte_scale_inventory_is_converted_to_gigabytes(client):
     assert 6.0 <= detail["est_vram_gb"] <= 8.0
 
 
-def test_inventory_entries_with_sha256_are_learned_into_model_hashes(client):
+def test_inventory_entries_with_exact_size_bytes_are_learned_verbatim(client):
+    """A Task 1+ agent that also reports the file's exact `size_bytes`
+    (`hardware.scan_models`) must have THAT value stored, not a
+    reconstruction from the rounded `size` GB figure -- the signed manifest
+    payload has to pin the real byte length."""
+    csrf = _login(client)
+    worker_id, sk = _register_worker(client, csrf, "w1")
+    sha = hashlib.sha256(b"clip").hexdigest()
+    exact_size_bytes = round(0.23 * (1024 ** 3)) + 7  # deliberately off the rounded GB figure
+
+    with client.websocket_connect("/api/agent/ws") as ws:
+        challenge = ws.receive_json()
+        sig = sk.sign(challenge["nonce"].encode()).signature.hex()
+        ws.send_json({"type": "auth", "worker_id": worker_id, "sig": sig})
+        assert ws.receive_json()["type"] == "ready"
+
+        ws.send_json(
+            {
+                "type": "inventory",
+                "models": [
+                    {
+                        "name": "text_encoders/clip_l.safetensors",
+                        "size": 0.23,
+                        "size_bytes": exact_size_bytes,
+                        "sha256": sha,
+                    },
+                    {"name": "vae/no_hash_yet.safetensors", "size": 0.31},
+                ],
+            }
+        )
+        agentws.dispatch_once(worker_id)
+
+    with db.get_session() as session:
+        row = session.get(db.ModelHash, ("text_encoders/clip_l.safetensors", exact_size_bytes))
+        assert row is not None
+        assert row.sha256 == sha
+        assert row.first_worker_id == worker_id
+        # No row at the rounded-GB reconstruction -- the exact value won.
+        assert session.get(db.ModelHash, ("text_encoders/clip_l.safetensors", round(0.23 * 1024 ** 3))) is None
+        # The hash-less entry must not have produced any row at all.
+        assert session.query(db.ModelHash).count() == 1
+
+
+def test_inventory_entries_without_size_bytes_fall_back_to_rounded_gb(client):
+    """An agent that hashes but predates the exact `size_bytes` field (only
+    sends `sha256` + the rounded `size` GB) still gets learned, via the
+    documented fallback reconstruction."""
     csrf = _login(client)
     worker_id, sk = _register_worker(client, csrf, "w1")
     sha = hashlib.sha256(b"clip").hexdigest()
