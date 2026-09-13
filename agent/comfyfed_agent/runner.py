@@ -1079,6 +1079,16 @@ class AgentLoop:
 
         loop.stop()
 
+    @property
+    def shutdown_in_progress(self) -> bool:
+        """True from the first console signal onward.
+
+        Public so the CLI entry point (`main._cmd_run`) can tell a clean,
+        signal-initiated `loop.stop()` apart from any other `RuntimeError`
+        `asyncio.run` might raise -- see `_graceful_shutdown_and_stop`.
+        """
+        return self._shutdown_in_progress
+
     async def _handle_message(self, conn: PlatformConnection, message: dict) -> None:
         msg_type = message.get("type")
         if msg_type == "job":
