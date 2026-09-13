@@ -112,6 +112,33 @@ describe("handshake", () => {
     const result = await closed;
     expect(result.code).toBe(4401);
   });
+
+  it("supersedes an older connection from the same worker, and pushes target the new one", async () => {
+    const kp = KEYPAIRS[0]!;
+    const workerId = await makeWorker({ pubkeyHex: kp.pubkey_hex });
+
+    const first = await connectAgent(workerId, kp.seed_hex);
+    // Listener must be attached before the second handshake completes --
+    // that's what actually closes `first`.
+    const firstClosed = waitForClose(first);
+
+    const second = await connectAgent(workerId, kp.seed_hex);
+    const closeResult = await firstClosed;
+    expect(closeResult.code).toBe(1000);
+
+    // A push (job assignment) must reach the surviving (second) connection,
+    // never the superseded (first, now-closed) one.
+    second.send(JSON.stringify({ type: "hello", protocol: 2 }));
+    const jobId = await makeJob({ status: "queued" });
+    const pushedPromise = nextMessage(second);
+    const ran = await runDurableObjectAlarm(hub());
+    expect(ran).toBe(true);
+    const pushed = await pushedPromise;
+    expect(pushed.type).toBe("job");
+    expect(pushed.job_id).toBe(jobId);
+
+    second.close();
+  });
 });
 
 // ---------------------------------------------------------------------------

@@ -433,6 +433,29 @@ export class Hub extends DurableObject<Env> {
       return;
     }
 
+    // Supersede any existing connection already registered for this worker.
+    // Python's `_connections[worker_id] = conn` dict-overwrite makes this
+    // automatic there: a lookup by worker id always returns whichever
+    // connection registered last, and the displaced one just lingers,
+    // unreferenced, until it errors or the client drops it. This DO instead
+    // finds a worker's live connection by enumerating `ctx.getWebSockets()`,
+    // which has no such "last write wins" ordering guarantee -- left alone,
+    // a still-open older connection for the same worker could race the new
+    // one for push delivery (`findWsForWorker` could return either). Close
+    // it explicitly so exactly one connection ever answers to this worker id.
+    for (const other of this.ctx.getWebSockets()) {
+      if (other === ws) continue;
+      const otherAttachment = other.deserializeAttachment() as Attachment | null;
+      if (otherAttachment && otherAttachment.phase === "ready" && otherAttachment.workerId === worker.id) {
+        this.ephemeral.delete(other);
+        try {
+          other.close(1000, "superseded by a newer connection");
+        } catch {
+          // Best-effort -- a socket already closing/closed is fine to skip.
+        }
+      }
+    }
+
     const ready: Attachment = { phase: "ready", workerId: worker.id, protocol: 1, state: "idle" };
     ws.serializeAttachment(ready);
     this.ephemeral.set(ws, newEphemeral());
@@ -451,7 +474,10 @@ export class Hub extends DurableObject<Env> {
     this.clearHandshakeTimer(ws);
     this.ephemeral.delete(ws);
     try {
-      ws.close(CLOSE_UNAUTHORIZED, "unauthorized");
+      // No reason string -- parity with agentws.py's `_close_unauthorized`,
+      // which calls `websocket.close(code=_CLOSE_UNAUTHORIZED)` with no
+      // reason argument at all.
+      ws.close(CLOSE_UNAUTHORIZED);
     } catch {
       // agentws.py's `_close_unauthorized` swallows close failures too.
     }
