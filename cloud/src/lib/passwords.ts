@@ -5,8 +5,15 @@
  *
  *   pbkdf2$<iterations>$<b64 salt>$<b64 hash>
  *
- * PBKDF2-HMAC-SHA256, 600000 iterations (OWASP's current PBKDF2-SHA256
- * recommendation), 16-byte random salt, 32-byte derived key. Verification
+ * PBKDF2-HMAC-SHA256, 100000 iterations -- the HARD platform maximum:
+ * Cloudflare Workers' WebCrypto rejects PBKDF2 above 100,000 iterations in
+ * production (local workerd does NOT enforce it, so only a real deploy
+ * surfaces the throw -- caught live during the Phase 2.0 deployment).
+ * OWASP's 600k recommendation is therefore unreachable here; the login
+ * backoff (auth.ts) and a single high-entropy admin password are the
+ * compensating controls. The hash string is self-describing, so verify()
+ * honors whatever iteration count a stored hash carries -- 16-byte random
+ * salt, 32-byte derived key. Verification
  * uses a constant-time comparison built by XOR-accumulation (not
  * short-circuiting on the first mismatched byte) since Node's
  * `crypto.timingSafeEqual` is unavailable in the Workers runtime.
@@ -15,7 +22,7 @@
 import { bytesToBase64, base64ToBytes } from "./base64";
 
 const ALGORITHM_TAG = "pbkdf2";
-const ITERATIONS = 600_000;
+const ITERATIONS = 100_000;
 const SALT_BYTES = 16;
 const HASH_BYTES = 32;
 

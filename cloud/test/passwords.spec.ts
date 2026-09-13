@@ -2,12 +2,12 @@ import { describe, expect, it } from "vitest";
 import { hashPassword, verifyPassword } from "../src/lib/passwords";
 
 describe("passwords", () => {
-  it("hashes in the pbkdf2$iter$salt$hash format with 600000 iterations", async () => {
+  it("hashes in the pbkdf2$iter$salt$hash format with 100000 iterations (Workers platform max)", async () => {
     const hashed = await hashPassword("correct horse battery staple");
     const parts = hashed.split("$");
     expect(parts).toHaveLength(4);
     expect(parts[0]).toBe("pbkdf2");
-    expect(parts[1]).toBe("600000");
+    expect(parts[1]).toBe("100000");
     expect(parts[2]!.length).toBeGreaterThan(0);
     expect(parts[3]!.length).toBeGreaterThan(0);
   });

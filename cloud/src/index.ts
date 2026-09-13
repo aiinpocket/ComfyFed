@@ -47,6 +47,18 @@ async function isSchemaMissing(db: D1Database): Promise<boolean> {
 
 const app = new Hono<{ Bindings: Env }>();
 
+// Unhandled route errors: log the real cause (visible in `wrangler tail`)
+// and answer with the same JSON error envelope every route uses -- Hono's
+// default is a bare text "Internal Server Error", which hid the PBKDF2
+// iteration-limit throw during the first live deployment.
+app.onError((err, c) => {
+  console.error("unhandled error:", c.req.method, c.req.path, err instanceof Error ? (err.stack ?? err.message) : String(err));
+  return c.json(
+    { error: { code: "internal", message: "伺服器內部錯誤。 / Internal server error." } },
+    500
+  );
+});
+
 app.use("*", async (c, next) => {
   if (await isSchemaMissing(c.env.DB)) {
     return c.html(NOT_MIGRATED_HTML, 503);
