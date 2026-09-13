@@ -1004,6 +1004,54 @@ def test_history_clear_hides_all_terminal_panel_jobs(client):
         assert session.get(db.Job, still_queued_id).panel_hidden is False
 
 
+def test_history_excludes_a_console_origin_job(client):
+    """GET /history is scoped to origin == "panel", matching POST
+    /history's write scope -- a console job must never appear in the
+    panel's own history list (it could never be hidden from it either,
+    since panel_hidden is only ever set by panel-origin history mutations).
+    The console's all-seeing surface is /api/jobs, not this endpoint."""
+    _login(client)
+    console_job_id = jobs.create_job(
+        json.dumps(SIMPLE_PROMPT), SIMPLE_PROMPT, origin="console"
+    )
+    with db.get_session() as session:
+        job = session.get(db.Job, console_job_id)
+        job.status = "done"
+        session.commit()
+
+    assert client.get("/comfy/api/history").json() == {}
+    assert client.get(f"/comfy/api/history/{console_job_id}").json() == {}
+
+
+def test_history_clear_clears_everything_the_panel_can_see(client):
+    """A panel-origin done job disappears from GET /history after clear,
+    while a console-origin done job -- invisible to GET /history to begin
+    with -- is untouched by the panel's clear and stays visible to the
+    console's /api/jobs."""
+    csrf = _login(client)
+    panel_job_id = _post_prompt(client).json()["prompt_id"]
+    _finish_job(client, csrf, panel_job_id, result_files=["out.png"])
+
+    console_job_id = jobs.create_job(
+        json.dumps(SIMPLE_PROMPT), SIMPLE_PROMPT, origin="console"
+    )
+    with db.get_session() as session:
+        job = session.get(db.Job, console_job_id)
+        job.status = "done"
+        session.commit()
+
+    r = client.post("/comfy/api/history", json={"clear": True})
+    assert r.status_code == 200
+
+    assert client.get("/comfy/api/history").json() == {}
+
+    with db.get_session() as session:
+        assert session.get(db.Job, panel_job_id).panel_hidden is True
+        console_job = session.get(db.Job, console_job_id)
+        assert console_job.panel_hidden is False
+        assert console_job.status == "done"
+
+
 def test_history_get_by_prompt_id_omits_a_panel_hidden_job(client):
     csrf = _login(client)
     prompt_id = _post_prompt(client).json()["prompt_id"]

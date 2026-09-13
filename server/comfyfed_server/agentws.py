@@ -439,6 +439,14 @@ async def cancel_and_notify(job_id: str, *, reason: str) -> bool:
     but nobody owned it yet" and "no-op: already terminal or unknown" -- a
     caller that only wants to notify on a REAL cancellation needs the two
     told apart, so eligibility is checked up front instead.
+
+    The job's `cancelled` status is already committed by `dispatch.cancel_job`
+    before any of the notification steps below run, so a failure in either
+    the agent push or the panel notify must not stop the other, and must
+    never cost the cancelled receipt: each of the three is isolated in its
+    own try/except (logged at WARNING, matching `_handle_receipt_ack`'s
+    pattern), and the receipt mint happens independently of the (possibly
+    slow, possibly failing) cross-loop agent push rather than after it.
     """
     with db.get_session() as session:
         job = session.get(db.Job, job_id)
@@ -452,11 +460,28 @@ async def cancel_and_notify(job_id: str, *, reason: str) -> bool:
         return False
 
     owner = dispatch.cancel_job(job_id, reason=reason)
-    if owner:
-        await push_job_cancelled(owner, job_id)
+
     if was_running and owner:
-        await _mint_cancelled_receipt(owner, job_id)
-    await panelws.job_cancelled(job_id)
+        try:
+            await _mint_cancelled_receipt(owner, job_id)
+        except Exception:
+            logger.warning(
+                "agentws: failed to mint cancelled receipt for job %s owner %s", job_id, owner, exc_info=True
+            )
+
+    if owner:
+        try:
+            await push_job_cancelled(owner, job_id)
+        except Exception:
+            logger.warning(
+                "agentws: failed to push job_cancelled for job %s owner %s", job_id, owner, exc_info=True
+            )
+
+    try:
+        await panelws.job_cancelled(job_id)
+    except Exception:
+        logger.warning("agentws: panelws.job_cancelled failed for job %s", job_id, exc_info=True)
+
     return True
 
 
@@ -494,11 +519,7 @@ async def _handle_job_done(worker_id: str, conn: "_Connection", message: dict) -
     if done:
         await _notify_panel_job_done(job_id)
         exec_seconds = message.get("exec_seconds")
-        if (
-            not isinstance(exec_seconds, (int, float))
-            or isinstance(exec_seconds, bool)
-            or not math.isfinite(exec_seconds)
-        ):
+        if not _is_valid_exec_seconds(exec_seconds):
             exec_seconds = None
         await _create_and_push_receipt(worker_id, conn, job_id, exec_seconds)
 
@@ -894,6 +915,14 @@ async def _create_and_push_failure_receipt(
     (basis="wall"). A job that never started (failed while still merely
     `assigned`) has no `started_at` to measure from at all; that is
     genuinely zero measured GPU time, not a missing measurement.
+
+    When both `started_at` and `finished_at` are set, an `exec_seconds`
+    basis is still capped at that wall-clock span -- same rationale as the
+    completed-receipt path: a worker cannot bill more than it was observably
+    busy for this job, and this is `unbilled_gpu_seconds` in the
+    contributions report, a capacity/health number an agent bug (or a
+    hostile agent) should not be able to inflate without bound just because
+    this receipt happens to be non-billable.
     """
     if not job_id or _signing_key is None:
         return
@@ -905,6 +934,8 @@ async def _create_and_push_failure_receipt(
 
         if _is_valid_exec_seconds(exec_seconds):
             gpu_seconds = exec_seconds
+            if job.started_at is not None and job.finished_at is not None:
+                gpu_seconds = min(gpu_seconds, (job.finished_at - job.started_at).total_seconds())
             basis = "exec"
         else:
             wall_seconds = 0.0

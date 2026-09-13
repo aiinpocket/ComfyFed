@@ -897,6 +897,12 @@ def test_comfy_interrupt_pushes_job_cancelled_to_the_running_worker(client):
         r = client.post("/comfy/api/interrupt")
         assert r.status_code == 200
 
+        # The cancelled receipt is minted before job_cancelled is pushed (so
+        # a push failure can never cost the receipt), so the receipt frame
+        # now arrives first.
+        receipt_msg = ws.receive_json()
+        assert receipt_msg["type"] == "receipt"
+        assert receipt_msg["kind"] == "cancelled"
         cancelled_msg = ws.receive_json()
         assert cancelled_msg == {"type": "job_cancelled", "job_id": job_id}
 
@@ -1221,6 +1227,9 @@ def test_job_failed_mints_non_billable_receipt_with_exec_basis(client):
 
     ws = _run_to_running(client, csrf, worker_id, sk, job_id)
     try:
+        # Large wall-clock span so the exec/wall cap (m2) never binds here --
+        # this test is about the exec basis being honoured, not the cap.
+        _backdate_started_at(job_id, hours=1)
         ws.send_json(
             {"type": "job_failed", "job_id": job_id, "error": "boom", "exec_seconds": 2.5}
         )
@@ -1244,6 +1253,36 @@ def test_job_failed_mints_non_billable_receipt_with_exec_basis(client):
             assert receipt.gpu_seconds == 2.5
             assert receipt.job_id == job_id
             assert receipt.worker_id == worker_id
+    finally:
+        ws.close()
+
+
+def test_job_failed_caps_absurd_exec_seconds_at_the_wall_clock(client):
+    """Final-review m2: a failure receipt is non-billable, but
+    `unbilled_gpu_seconds` in the contributions report is a capacity/health
+    number -- an agent bug (or a hostile agent) reporting an absurd
+    `exec_seconds` for a fast failure must still be capped at the wall
+    clock, exactly like the completed-receipt path already is."""
+    csrf = _login(client)
+    worker_id, sk = _register_worker(client, csrf, "w1")
+    job_id = _submit(client, csrf)
+
+    ws = _run_to_running(client, csrf, worker_id, sk, job_id)
+    try:
+        # Wall clock stays small (no backdating) -- just the real time
+        # elapsed by the test itself, well under a second.
+        ws.send_json(
+            {"type": "job_failed", "job_id": job_id, "error": "boom", "exec_seconds": 999999.0}
+        )
+        agentws.dispatch_once(worker_id)
+
+        receipt_msg = ws.receive_json()
+        assert receipt_msg["type"] == "receipt"
+        assert receipt_msg["basis"] == "exec"
+
+        with db.get_session() as session:
+            receipt = session.get(db.Receipt, receipt_msg["receipt_id"])
+            assert 0.0 <= receipt.gpu_seconds < 5.0  # capped, nowhere near 999999
     finally:
         ws.close()
 
@@ -1308,13 +1347,16 @@ def test_console_cancel_of_running_job_mints_cancelled_receipt(client):
         res = client.post(f"/api/jobs/{job_id}/cancel", headers={"X-CSRF": csrf})
         assert res.status_code == 200
 
-        cancelled_msg = ws.receive_json()
-        assert cancelled_msg == {"type": "job_cancelled", "job_id": job_id}
+        # The cancelled receipt is minted before job_cancelled is pushed (so
+        # a push failure can never cost the receipt), so the receipt frame
+        # now arrives first.
         receipt_msg = ws.receive_json()
         assert receipt_msg["type"] == "receipt"
         assert receipt_msg["kind"] == "cancelled"
         assert receipt_msg["billable"] is False
         assert receipt_msg["basis"] == "wall"
+        cancelled_msg = ws.receive_json()
+        assert cancelled_msg == {"type": "job_cancelled", "job_id": job_id}
 
         with db.get_session() as session:
             receipts = session.query(db.Receipt).filter(db.Receipt.job_id == job_id).all()
@@ -1335,10 +1377,10 @@ def test_panel_interrupt_of_running_job_mints_cancelled_receipt(client):
         res = client.post("/comfy/api/interrupt")
         assert res.status_code == 200
 
-        ws.receive_json()  # job_cancelled
-        receipt_msg = ws.receive_json()
+        receipt_msg = ws.receive_json()  # receipt now precedes job_cancelled
         assert receipt_msg["kind"] == "cancelled"
         assert receipt_msg["billable"] is False
+        ws.receive_json()  # job_cancelled
 
         with db.get_session() as session:
             assert session.query(db.Receipt).filter(db.Receipt.job_id == job_id).count() == 1
@@ -1356,9 +1398,9 @@ def test_panel_queue_delete_of_running_job_mints_cancelled_receipt(client):
         res = client.post("/comfy/api/queue", json={"delete": [job_id]})
         assert res.status_code == 200
 
-        ws.receive_json()  # job_cancelled
-        receipt_msg = ws.receive_json()
+        receipt_msg = ws.receive_json()  # receipt now precedes job_cancelled
         assert receipt_msg["kind"] == "cancelled"
+        ws.receive_json()  # job_cancelled
 
         with db.get_session() as session:
             assert session.query(db.Receipt).filter(db.Receipt.job_id == job_id).count() == 1
@@ -1426,12 +1468,15 @@ def test_cancel_and_notify_pushes_receipt_across_event_loops(client):
     try:
         assert asyncio.run(agentws.cancel_and_notify(job_id, reason="cross-loop cancel"))
 
-        cancelled_msg = ws.receive_json()
-        assert cancelled_msg == {"type": "job_cancelled", "job_id": job_id}
+        # The cancelled receipt is minted before job_cancelled is pushed (so
+        # a push failure can never cost the receipt), so the receipt frame
+        # now arrives first.
         receipt_msg = ws.receive_json()
         assert receipt_msg["type"] == "receipt"
         assert receipt_msg["kind"] == "cancelled"
         assert receipt_msg["billable"] is False
+        cancelled_msg = ws.receive_json()
+        assert cancelled_msg == {"type": "job_cancelled", "job_id": job_id}
 
         with db.get_session() as session:
             receipts = session.query(db.Receipt).filter(db.Receipt.job_id == job_id).all()
@@ -1461,6 +1506,110 @@ def test_cancel_of_running_job_with_offline_worker_still_writes_receipt(client):
         assert receipts[0].kind == "cancelled"
         assert receipts[0].billable is False
         assert receipts[0].worker_sig is None
+
+
+def test_cancel_and_notify_still_mints_receipt_when_job_cancelled_push_raises(client, monkeypatch, caplog):
+    """Final-review M2: `push_job_cancelled` can raise (a wedged or closed
+    target event loop surfaces as `TimeoutError`/`RuntimeError` from
+    `run_coroutine_threadsafe(...).result()`, uncaught by anything below the
+    HTTP handler). The cancelled receipt must still be minted -- the mint no
+    longer sits downstream of the push -- and `cancel_and_notify` must not
+    propagate the failure to its caller (an HTTP handler cancelling several
+    jobs in a loop)."""
+    csrf = _login(client)
+    worker_id, sk = _register_worker(client, csrf, "w1")
+    job_id = _submit(client, csrf)
+
+    ws = _run_to_running(client, csrf, worker_id, sk, job_id)
+    try:
+        def _boom(*args, **kwargs):
+            raise TimeoutError("wedged target loop")
+
+        monkeypatch.setattr(agentws, "push_job_cancelled", _boom)
+
+        with caplog.at_level(logging.WARNING, logger="comfyfed_server.agentws"):
+            result = asyncio.run(agentws.cancel_and_notify(job_id, reason="push failure"))
+
+        assert result is True
+        assert any("push job_cancelled" in rec.message for rec in caplog.records)
+
+        with db.get_session() as session:
+            assert session.get(db.Job, job_id).status == "cancelled"
+            receipts = session.query(db.Receipt).filter(db.Receipt.job_id == job_id).all()
+            assert len(receipts) == 1
+            assert receipts[0].kind == "cancelled"
+    finally:
+        ws.close()
+
+
+def test_cancel_and_notify_isolates_panelws_notify_failure(client, monkeypatch, caplog):
+    """A `panelws.job_cancelled` failure must not cost the already-minted
+    receipt or the agent push, and must not propagate."""
+    csrf = _login(client)
+    worker_id, sk = _register_worker(client, csrf, "w1")
+    job_id = _submit(client, csrf)
+
+    ws = _run_to_running(client, csrf, worker_id, sk, job_id)
+    try:
+        async def _boom(*args, **kwargs):
+            raise RuntimeError("panel loop closed")
+
+        monkeypatch.setattr(agentws.panelws, "job_cancelled", _boom)
+
+        with caplog.at_level(logging.WARNING, logger="comfyfed_server.agentws"):
+            result = asyncio.run(agentws.cancel_and_notify(job_id, reason="panel failure"))
+
+        assert result is True
+        assert any("panelws.job_cancelled" in rec.message for rec in caplog.records)
+
+        ws.receive_json()  # receipt
+        ws.receive_json()  # job_cancelled
+
+        with db.get_session() as session:
+            assert session.query(db.Receipt).filter(db.Receipt.job_id == job_id).count() == 1
+    finally:
+        ws.close()
+
+
+def test_panel_queue_clear_continues_past_one_jobs_notify_failure(client, monkeypatch):
+    """Final-review M2: `POST /comfy/api/queue {"clear": true}` cancels every
+    matching job in a loop -- one job's `cancel_and_notify` blowing up must
+    not 500 the request or leave later jobs untouched."""
+    csrf = _login(client)
+    worker_id, sk = _register_worker(client, csrf, "w1")
+    job_a = _submit_panel(client)
+    job_b = _submit_panel(client)
+
+    ws = _connect(client, worker_id, sk)
+    try:
+        ws.send_json({"type": "heartbeat", "state": "idle", "progress": 0.0, "job_id": None, "dynamic": {}})
+        agentws.dispatch_once(worker_id)
+        first = ws.receive_json()
+        assert first["type"] == "job"
+        running_job = first["job_id"]
+        queued_job = job_b if running_job == job_a else job_a
+
+        real_cancel_and_notify = agentws.cancel_and_notify
+
+        async def _flaky(job_id, *, reason):
+            if job_id == running_job:
+                raise RuntimeError("boom")
+            return await real_cancel_and_notify(job_id, reason=reason)
+
+        import comfyfed_server.comfyapi as comfyapi_module
+
+        monkeypatch.setattr(comfyapi_module.agentws, "cancel_and_notify", _flaky)
+
+        res = client.post("/comfy/api/queue", json={"clear": True})
+        assert res.status_code == 200
+
+        with db.get_session() as session:
+            # running_job's cancel_and_notify blew up entirely, but the loop
+            # in post_queue must not abort on that -- the OTHER job in the
+            # same sweep is still cancelled.
+            assert session.get(db.Job, queued_job).status == "cancelled"
+    finally:
+        ws.close()
 
 
 # --- Task 6: agent protocol 2 ----------------------------------------------

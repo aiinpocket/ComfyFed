@@ -43,6 +43,7 @@ federation rather than a single GPU:
 from __future__ import annotations
 
 import json
+import logging
 import mimetypes
 import os
 from collections import OrderedDict
@@ -53,6 +54,8 @@ from fastapi import APIRouter, Depends, File, Form, Request, UploadFile, WebSock
 from fastapi.responses import FileResponse, JSONResponse, Response
 
 from . import agentws, assess, auth, db, jobs, model_guide, panelws, storage, workers
+
+logger = logging.getLogger(__name__)
 
 # Node classes whose id keys a history entry's `outputs`. The ComfyUI frontend
 # looks up the images it should display under the id of the node that saved
@@ -933,17 +936,36 @@ def create_router(
                 job_ids = []
 
         for job_id in job_ids:
-            await agentws.cancel_and_notify(job_id, reason="removed from panel queue")
+            try:
+                await agentws.cancel_and_notify(job_id, reason="removed from panel queue")
+            except Exception:
+                # One job's cancel/notify blowing up must not 500 the whole
+                # sweep or skip the rest of `job_ids` -- a partially-applied
+                # `{"clear": true}` (or a `delete` list with several ids)
+                # would otherwise leave later jobs queued/running with no
+                # indication to the panel of what actually happened.
+                logger.warning("comfyapi: cancel_and_notify failed for job %s", job_id, exc_info=True)
 
         return JSONResponse(content={})
 
     @r.get("/history")
     def get_history(max_items: Optional[int] = None) -> Response:
+        """Scoped to `origin == "panel"`, matching `POST /history`'s write
+        scope: the panel's history is the panel's own, and a console job
+        that this endpoint could never let the panel hide (`panel_hidden`
+        is set only by panel-origin history mutations) must never appear
+        here in the first place. The console's all-seeing audit surface is
+        `/api/jobs`, which ignores `panel_hidden` and `origin` both.
+        """
         with db.get_session() as session:
             numbers = _numbers_by_job_id(session)
             query = (
                 session.query(db.Job)
-                .filter(db.Job.status.in_(_HISTORY_STATUSES), db.Job.panel_hidden == False)  # noqa: E712
+                .filter(
+                    db.Job.status.in_(_HISTORY_STATUSES),
+                    db.Job.panel_hidden == False,  # noqa: E712
+                    db.Job.origin == "panel",
+                )
                 .order_by(db.Job.finished_at.asc(), db.Job.created_at.asc())
             )
             rows = query.all()
@@ -956,7 +978,12 @@ def create_router(
     def get_history_prompt_id(prompt_id: str) -> Response:
         with db.get_session() as session:
             job = session.get(db.Job, prompt_id)
-            if job is None or job.status not in _HISTORY_STATUSES or job.panel_hidden:
+            if (
+                job is None
+                or job.status not in _HISTORY_STATUSES
+                or job.panel_hidden
+                or job.origin != "panel"
+            ):
                 # Upstream returns {} for an unknown prompt id, never a 404.
                 return JSONResponse(content={})
             numbers = _numbers_by_job_id(session)
