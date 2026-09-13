@@ -607,6 +607,17 @@ export async function hasActiveJobs(db: D1Database): Promise<boolean> {
   return row !== null;
 }
 
+/** Ports panelws.py's `queue_status`'s count: queued + assigned + running,
+ * i.e. upstream's `get_tasks_remaining()` (queued jobs PLUS ones already
+ * picked up but not finished). Backs the panel WS's `status.exec_info.
+ * queue_remaining` badge. */
+export async function countQueueRemaining(db: D1Database): Promise<number> {
+  const row = await db
+    .prepare("SELECT COUNT(*) AS n FROM jobs WHERE status IN ('queued', 'assigned', 'running')")
+    .first<{ n: number }>();
+  return row?.n ?? 0;
+}
+
 // ---------------------------------------------------------------------------
 // Receipts
 

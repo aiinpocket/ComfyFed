@@ -1,17 +1,29 @@
 /**
- * Hub Durable Object -- agent WebSocket channel + dispatch alarm.
- * Parity source: `server/comfyfed_server/agentws.py`, read in full; every
- * function below is named after (and documents its delta from) the Python
- * function it ports. A singleton instance (`idFromName("hub")`) backs the
- * whole deployment -- see progress.md's pre-flight ruling ("ONE Durable
- * Object for agent+panel WS+alarm").
+ * Hub Durable Object -- agent WebSocket channel, panel WebSocket, event bus
+ * + dispatch alarm. Parity sources: `server/comfyfed_server/agentws.py`
+ * (agent side, Task 6) and `panelws.py` + comfyapi.py's `create_ws_router`
+ * (panel side, Task 7), both read in full; every function below is named
+ * after (and documents its delta from) the Python function it ports. A
+ * singleton instance (`idFromName("hub")`) backs the whole deployment -- see
+ * progress.md's pre-flight ruling ("ONE Durable Object for agent+panel
+ * WS+alarm").
  *
- * Part 1 (this task) covers the agent side end-to-end: handshake, hello,
+ * Part 1 (Task 6) covers the agent side end-to-end: handshake, hello,
  * heartbeat, inventory, job push, job_done/job_failed with receipt
- * mint+push+ack, blip re-adoption, and the 5s dispatch alarm. It also opens
- * the `/internal/*` surface Task 7 (panel WS) and Tasks 8/9 (HTTP routes)
- * consume: `/internal/cancel` (real), `/internal/event` (202 stub -- Task 7
- * completes it), `/internal/dynamic` (real, backs `queries.getDynamic`).
+ * mint+push+ack, blip re-adoption, and the 5s dispatch alarm.
+ *
+ * Part 2 (Task 7, this pass) adds the panel WebSocket (`/comfy/api/ws` +
+ * `/comfy/ws`, session-cookie-gated) and completes the panel event relay:
+ * every panelws.py broadcast function (`job_progress`/`job_running`/
+ * `job_done`/`job_failed`/`job_requeued`/`job_cancelled`/`job_status_
+ * refresh`) is now wired as a direct in-DO method call from the exact
+ * agent-handler call site agentws.py calls it from -- agent and panel
+ * sockets share this one DO, so there is no HTTP hop between them.
+ * `/internal/event` (real now, was a 202 stub) is the SEPARATE seam for
+ * panel pushes that originate OUTSIDE this DO (Task 8/9's HTTP routes);
+ * `/internal/dynamic` (real, backs `queries.getDynamic`) is unrelated to
+ * either and was already wired in Task 6. Both `/internal/*` routes are the
+ * `/internal/*` surface Task 6 opened for this task and Tasks 8/9 to consume.
  *
  * WebSocket hibernation vs. in-memory state -- the load-bearing design
  * choice for this file:
@@ -46,6 +58,9 @@ import * as dispatch from "../core/dispatch";
 import { toSqliteTimestamp, resolvePlatformSeed } from "../db/queries";
 import { buildReceiptPayload, signReceipt, verifyHex } from "../lib/signing";
 import { bytesToHex } from "../lib/hex";
+import { readSessionCookie } from "../lib/cookies";
+import { getOrCreateSessionSecret } from "../db/queries";
+import { jobOutputs, FALLBACK_OUTPUT_KEY, type JobOutputsInput } from "../core/outputs";
 
 // ---------------------------------------------------------------------------
 // Constants (parity: agentws.py module-level constants)
@@ -79,9 +94,38 @@ const DEDUP_CAP = 512;
 const OBJECT_INFO_DIR = "object_info";
 
 // ---------------------------------------------------------------------------
+// Panel WebSocket -- parity source: panelws.py + comfyapi.py's
+// `create_ws_router` (the `/comfy/api/ws` / `/comfy/ws` handshake).
+
+/** Same cookie name `lib/guard.ts`'s `requireAdmin`/`requireCsrf` middleware
+ * checks -- duplicated (rather than imported) because this DO verifies the
+ * cookie itself, off the raw upgrade `Request`, with no Hono `Context` to
+ * hand `readSession` its usual middleware entrypoint. */
+const SESSION_COOKIE_NAME = "cf_session";
+
+/** The node id federation job events report -- ComfyFed jobs are opaque
+ * units dispatched to a single worker, not executed node-by-node like
+ * upstream ComfyUI, so there is no real per-node id to report while a job is
+ * running. Ports panelws.py's `_RUNNING_NODE_LABEL`. */
+const RUNNING_NODE_LABEL = "comfyfed";
+
+/** Sent once, right after the initial `status` message, on every panel
+ * connection. All false is the truthful answer for every one of these on
+ * ComfyFed -- ports panelws.py's `FEATURE_FLAGS` verbatim (see that
+ * module's docstring for why each one is false). */
+const FEATURE_FLAGS = {
+  assets: false,
+  node_replacements: false,
+  show_signin_button: false,
+  "extension.manager.supports_v4": false,
+  "extension.manager.supports_csrf_post": false,
+} as const;
+
+// ---------------------------------------------------------------------------
 // Durable per-connection identity (WebSocket.serializeAttachment)
 
-interface Attachment {
+interface AgentAttachment {
+  kind: "agent";
   phase: "handshake" | "ready";
   /** Only set during the handshake phase -- the nonce this connection
    * challenged the agent with. */
@@ -91,6 +135,23 @@ interface Attachment {
   protocol: number;
   state: "idle" | "busy" | "dispatched";
 }
+
+/** A connected panel (ComfyUI-frontend) client -- ports panelws.py's
+ * `_PanelConnection` (minus its `loop` field, which has no equivalent in a
+ * single-threaded DO; see panelws.py's `post_event` docstring for what that
+ * field was for on the Python side). No handshake phase: authentication
+ * happens once, off the raw upgrade request's cookies, before the socket is
+ * ever accepted (see `handlePanelWsUpgrade`). */
+interface PanelAttachment {
+  kind: "panel";
+  sid: string;
+}
+
+/** Every hibernatable socket this DO hosts carries one of these two shapes,
+ * tagged by `kind` -- see the file docstring ("ONE Durable Object for
+ * agent+panel WS+alarm") for why both connection kinds share a single
+ * `ctx.getWebSockets()` set instead of two separate registries. */
+type HubAttachment = AgentAttachment | PanelAttachment;
 
 // ---------------------------------------------------------------------------
 // Ephemeral per-connection state (in-memory, see file docstring)
@@ -134,6 +195,21 @@ function newEphemeral(): Ephemeral {
 
 function randomNonceHex(): string {
   return bytesToHex(crypto.getRandomValues(new Uint8Array(16)));
+}
+
+/** Extracts one cookie's value from a raw `Cookie` request header --
+ * duplicated from `lib/guard.ts`'s private `extractCookie` rather than
+ * imported, since that module's public surface (`readSession`) takes a Hono
+ * `Context`, which this DO's `fetch(request: Request)` doesn't have. */
+function extractCookie(cookieHeader: string | null, name: string): string | null {
+  if (!cookieHeader) return null;
+  for (const part of cookieHeader.split(";")) {
+    const eq = part.indexOf("=");
+    if (eq < 0) continue;
+    const key = part.slice(0, eq).trim();
+    if (key === name) return part.slice(eq + 1).trim();
+  }
+  return null;
 }
 
 /** Validate `hello.protocol`, defaulting to 1 -- ports agentws.py's
@@ -202,6 +278,9 @@ export class Hub extends DurableObject<Env> {
     if (url.pathname === "/api/agent/ws") {
       return this.handleAgentWsUpgrade(request);
     }
+    if (url.pathname === "/comfy/api/ws" || url.pathname === "/comfy/ws") {
+      return this.handlePanelWsUpgrade(request);
+    }
     if (url.pathname === "/internal/cancel" && request.method === "POST") {
       return this.handleInternalCancel(request);
     }
@@ -232,7 +311,14 @@ export class Hub extends DurableObject<Env> {
     this.ctx.acceptWebSocket(server);
 
     const nonce = randomNonceHex();
-    const attachment: Attachment = { phase: "handshake", nonce, workerId: null, protocol: 1, state: "idle" };
+    const attachment: AgentAttachment = {
+      kind: "agent",
+      phase: "handshake",
+      nonce,
+      workerId: null,
+      protocol: 1,
+      state: "idle",
+    };
     server.serializeAttachment(attachment);
 
     try {
@@ -246,12 +332,66 @@ export class Hub extends DurableObject<Env> {
     // a socket that never completes the handshake is closed unauthorized.
     const timer = setTimeout(() => {
       this.handshakeTimers.delete(server);
-      const current = server.deserializeAttachment() as Attachment | null;
+      const current = server.deserializeAttachment() as AgentAttachment | null;
       if (current && current.phase === "handshake") {
         this.closeUnauthorized(server);
       }
     }, AUTH_TIMEOUT_MS);
     this.handshakeTimers.set(server, timer);
+
+    return new Response(null, { status: 101, webSocket: client });
+  }
+
+  /** Ports comfyapi.py's `create_ws_router`'s `panel_ws` handler.
+   *
+   * Deliberate divergence from the Python source's "accept unconditionally,
+   * then close 4401 if the session cookie doesn't check out": Python's own
+   * docstring explains that dance is forced by FastAPI/Starlette internals
+   * (an `HTTPException` raised mid-handshake doesn't reliably translate into
+   * a client-visible close code across versions), which doesn't apply here
+   * -- a Workers `fetch` handler can simply answer the upgrade request with
+   * a plain 401 `Response` instead of a 101, so the cookie is checked
+   * *before* ever creating a `WebSocketPair`. Same outcome (unauthenticated
+   * clients never get a live panel socket), a plainer client-visible signal
+   * (HTTP 401, not a WS open-then-immediately-4401-close). */
+  private async handlePanelWsUpgrade(request: Request): Promise<Response> {
+    if (request.headers.get("Upgrade") !== "websocket") {
+      return new Response("expected websocket", { status: 426 });
+    }
+
+    const cookieValue = extractCookie(request.headers.get("Cookie"), SESSION_COOKIE_NAME);
+    if (!cookieValue) {
+      return new Response("unauthorized", { status: 401 });
+    }
+    const secret = await getOrCreateSessionSecret(this.env.DB);
+    const payload = await readSessionCookie(secret, cookieValue);
+    if (!payload || !payload.authenticated) {
+      return new Response("unauthorized", { status: 401 });
+    }
+
+    const pair = new WebSocketPair();
+    const client = pair[0];
+    const server = pair[1];
+    this.ctx.acceptWebSocket(server);
+
+    const sid = randomNonceHex();
+    const attachment: PanelAttachment = { kind: "panel", sid };
+    server.serializeAttachment(attachment);
+
+    try {
+      server.send(
+        JSON.stringify({ type: "status", data: { status: await this.queueStatus(), sid } })
+      );
+      // Right after the initial status: the pinned frontend gates a handful
+      // of UI affordances on these, and answering unprompted (rather than
+      // waiting for a request) matches upstream's own connect behavior --
+      // see `FEATURE_FLAGS`'s comment for why every one is false here.
+      server.send(JSON.stringify({ type: "feature_flags", data: FEATURE_FLAGS }));
+    } catch {
+      // A send failure this early means the socket is already gone; nothing
+      // else to clean up (no timers, no ephemeral map entry for panel
+      // sockets).
+    }
 
     return new Response(null, { status: 101, webSocket: client });
   }
@@ -297,25 +437,38 @@ export class Hub extends DurableObject<Env> {
     if (owner) {
       const ws = this.findWsForWorker(owner);
       if (ws) {
-        const att = ws.deserializeAttachment() as Attachment;
+        const att = ws.deserializeAttachment() as AgentAttachment;
         await this.sendJobCancelled(ws, att, this.ephemeralFor(ws), jobId);
       }
     }
 
-    // Panel notification (panelws.job_cancelled parity) is Task 7's job via
-    // the panel WS relay this same DO will host -- `/internal/event` is the
-    // stub that lands then.
+    // Ports agentws.py's `cancel_and_notify`: the panel gets told regardless
+    // of whether anyone owned the job yet -- unlike the agent push above
+    // (which only makes sense if someone owned it), the panel's queue badge
+    // needs refreshing either way.
+    await this.panelJobCancelled(jobId);
 
     await this.scheduleAlarmIfNeeded();
 
     return Response.json({ cancelled: true, worker_id: owner });
   }
 
+  /** Generic panel event-bus entrypoint for callers OUTSIDE this DO (Tasks
+   * 8/9's HTTP routes) that need to push a panel event without a job
+   * lifecycle transition of their own to hang it off -- everything
+   * panelws.py's agentws.py callers need is wired as a direct in-DO method
+   * call instead (see this file's docstring: agent socket handling and the
+   * panel WS both live in the same DO, so there is no HTTP hop between
+   * them). Body shape: `{"type": string, "data"?: unknown}`, broadcast
+   * verbatim -- this endpoint does not interpret or validate event
+   * semantics, only relays the envelope Task 8/9 already built. */
   private async handleInternalEvent(request: Request): Promise<Response> {
-    // Panel event-bus stub: Task 7 completes this (real relay to connected
-    // panel WS clients). Draining the body keeps a caller that already sends
-    // one from erroring on an unconsumed stream.
-    await request.arrayBuffer().catch(() => undefined);
+    const body = await request
+      .json<{ type?: unknown; data?: unknown }>()
+      .catch(() => ({}) as { type?: unknown; data?: unknown });
+    if (typeof body.type === "string") {
+      await this.postPanelEvent({ type: body.type, data: body.data });
+    }
     return new Response(null, { status: 202 });
   }
 
@@ -329,9 +482,19 @@ export class Hub extends DurableObject<Env> {
   // -- Hibernatable WebSocket handlers --------------------------------------
 
   async webSocketMessage(ws: WebSocket, message: string | ArrayBuffer): Promise<void> {
-    const attachment = ws.deserializeAttachment() as Attachment | null;
-    if (!attachment) return;
+    const hubAttachment = ws.deserializeAttachment() as HubAttachment | null;
+    if (!hubAttachment) return;
 
+    if (hubAttachment.kind === "panel") {
+      // Panel clients only ever listen; any inbound message -- including
+      // the `feature_flags` frame the frontend announces its own
+      // capabilities with on open -- is simply discarded, mirroring
+      // comfyapi.py's `panel_ws` loop (`await websocket.receive_text()`,
+      // result never inspected).
+      return;
+    }
+
+    const attachment = hubAttachment;
     if (attachment.phase === "handshake") {
       await this.handleHandshakeMessage(ws, attachment, message);
       return;
@@ -397,7 +560,7 @@ export class Hub extends DurableObject<Env> {
    * itself was already sent in `handleAgentWsUpgrade`). */
   private async handleHandshakeMessage(
     ws: WebSocket,
-    attachment: Attachment,
+    attachment: AgentAttachment,
     raw: string | ArrayBuffer
   ): Promise<void> {
     this.clearHandshakeTimer(ws);
@@ -445,8 +608,13 @@ export class Hub extends DurableObject<Env> {
     // it explicitly so exactly one connection ever answers to this worker id.
     for (const other of this.ctx.getWebSockets()) {
       if (other === ws) continue;
-      const otherAttachment = other.deserializeAttachment() as Attachment | null;
-      if (otherAttachment && otherAttachment.phase === "ready" && otherAttachment.workerId === worker.id) {
+      const otherAttachment = other.deserializeAttachment() as HubAttachment | null;
+      if (
+        otherAttachment &&
+        otherAttachment.kind === "agent" &&
+        otherAttachment.phase === "ready" &&
+        otherAttachment.workerId === worker.id
+      ) {
         this.ephemeral.delete(other);
         try {
           other.close(1000, "superseded by a newer connection");
@@ -456,7 +624,7 @@ export class Hub extends DurableObject<Env> {
       }
     }
 
-    const ready: Attachment = { phase: "ready", workerId: worker.id, protocol: 1, state: "idle" };
+    const ready: AgentAttachment = { kind: "agent", phase: "ready", workerId: worker.id, protocol: 1, state: "idle" };
     ws.serializeAttachment(ready);
     this.ephemeral.set(ws, newEphemeral());
 
@@ -494,7 +662,7 @@ export class Hub extends DurableObject<Env> {
   // -- hello -------------------------------------------------------------
 
   /** Ports agentws.py's `_handle_hello`. */
-  private async handleHello(ws: WebSocket, attachment: Attachment, msg: Record<string, unknown>): Promise<void> {
+  private async handleHello(ws: WebSocket, attachment: AgentAttachment, msg: Record<string, unknown>): Promise<void> {
     const protocol = parseProtocol(msg.protocol);
     const workerId = attachment.workerId!;
     const worker = await queries.getWorkerById(this.env.DB, workerId);
@@ -517,7 +685,7 @@ export class Hub extends DurableObject<Env> {
       lastSeen: toSqliteTimestamp(new Date()),
     });
 
-    ws.serializeAttachment({ ...attachment, protocol } satisfies Attachment);
+    ws.serializeAttachment({ ...attachment, protocol } satisfies AgentAttachment);
 
     if (protocol < CURRENT_PROTOCOL) {
       try {
@@ -533,7 +701,7 @@ export class Hub extends DurableObject<Env> {
   /** Ports agentws.py's `_handle_heartbeat`. */
   private async handleHeartbeat(
     ws: WebSocket,
-    attachment: Attachment,
+    attachment: AgentAttachment,
     ephemeral: Ephemeral,
     msg: Record<string, unknown>
   ): Promise<void> {
@@ -567,7 +735,7 @@ export class Hub extends DurableObject<Env> {
         const progress = msg.progress;
         if (typeof progress === "number" && Number.isFinite(progress)) {
           await queries.updateJobProgress(db, jobId, progress);
-          // Panel progress relay (panelws.job_progress parity) -- Task 7.
+          await this.panelJobProgress(jobId, progress);
         }
       } else {
         jobNotOwned = true;
@@ -587,7 +755,7 @@ export class Hub extends DurableObject<Env> {
     if (state === "busy" && jobId) {
       await this.applyOwnedTransition(db, jobId, workerId, ["assigned"], ephemeral, async () => {
         await queries.updateJobRunning(db, jobId, toSqliteTimestamp(now));
-        // Panel running relay (panelws.job_running parity) -- Task 7.
+        await this.panelJobRunning(jobId);
       });
     }
 
@@ -612,7 +780,7 @@ export class Hub extends DurableObject<Env> {
   // -- inventory -------------------------------------------------------------
 
   /** Ports agentws.py's `_handle_inventory` / `_normalize_models`. */
-  private async handleInventory(attachment: Attachment, msg: Record<string, unknown>): Promise<void> {
+  private async handleInventory(attachment: AgentAttachment, msg: Record<string, unknown>): Promise<void> {
     const workerId = attachment.workerId!;
     const worker = await queries.getWorkerById(this.env.DB, workerId);
     if (!worker) return;
@@ -625,7 +793,7 @@ export class Hub extends DurableObject<Env> {
    * `dispatch.try_readopt`). */
   private async handleJobDone(
     ws: WebSocket,
-    attachment: Attachment,
+    attachment: AgentAttachment,
     ephemeral: Ephemeral,
     msg: Record<string, unknown>
   ): Promise<void> {
@@ -650,7 +818,12 @@ export class Hub extends DurableObject<Env> {
     }
 
     if (done) {
-      // Panel job_done relay (panelws.job_done parity) -- Task 7.
+      // Separate lookup rather than reusing the row `updateJobDone` already
+      // touched -- mirrors agentws.py's `_notify_panel_job_done`: `jobOutputs`
+      // needs `resultFiles`/`workflowJson` off the freshly-committed row.
+      const freshJob = await queries.getJobById(db, jobId!);
+      if (freshJob) await this.panelJobDone(freshJob);
+
       const execSeconds = isValidExecSeconds(msg.exec_seconds) ? msg.exec_seconds : null;
       await this.createAndPushReceipt(ws, attachment, jobId!, execSeconds, now);
     }
@@ -660,7 +833,7 @@ export class Hub extends DurableObject<Env> {
    * `_create_and_push_failure_receipt`. */
   private async handleJobFailed(
     ws: WebSocket,
-    attachment: Attachment,
+    attachment: AgentAttachment,
     ephemeral: Ephemeral,
     msg: Record<string, unknown>
   ): Promise<void> {
@@ -675,7 +848,7 @@ export class Hub extends DurableObject<Env> {
     });
 
     if (applied) {
-      // Panel job_failed relay (panelws.job_failed parity) -- Task 7.
+      await this.panelJobFailed(jobId!, error);
       const execSeconds = isValidExecSeconds(msg.exec_seconds) ? msg.exec_seconds : null;
       await this.createAndPushFailureReceipt(ws, attachment, jobId!, execSeconds, now);
     } else if (jobId && (await this.jobNotOwnedBy(jobId, workerId))) {
@@ -748,7 +921,7 @@ export class Hub extends DurableObject<Env> {
   /** Ports agentws.py's `_send_job_cancelled`. */
   private async sendJobCancelled(
     ws: WebSocket,
-    attachment: Attachment,
+    attachment: AgentAttachment,
     ephemeral: Ephemeral,
     jobId: string
   ): Promise<void> {
@@ -793,7 +966,7 @@ export class Hub extends DurableObject<Env> {
   /** Ports agentws.py's `_create_and_push_receipt`. */
   private async createAndPushReceipt(
     ws: WebSocket,
-    attachment: Attachment,
+    attachment: AgentAttachment,
     jobId: string,
     execSeconds: number | null,
     now: Date
@@ -842,7 +1015,7 @@ export class Hub extends DurableObject<Env> {
   /** Ports agentws.py's `_create_and_push_failure_receipt`. */
   private async createAndPushFailureReceipt(
     ws: WebSocket,
-    attachment: Attachment,
+    attachment: AgentAttachment,
     jobId: string,
     execSeconds: number | null,
     now: Date
@@ -938,7 +1111,7 @@ export class Hub extends DurableObject<Env> {
   }
 
   /** Ports agentws.py's `_handle_receipt_ack`. */
-  private async handleReceiptAck(attachment: Attachment, msg: Record<string, unknown>): Promise<void> {
+  private async handleReceiptAck(attachment: AgentAttachment, msg: Record<string, unknown>): Promise<void> {
     const receiptId = msg.receipt_id;
     const workerSig = msg.worker_sig;
     if (typeof receiptId !== "string" || typeof workerSig !== "string") return;
@@ -972,18 +1145,33 @@ export class Hub extends DurableObject<Env> {
     const db = this.env.DB;
     const now = new Date();
 
+    let requeued: string[] = [];
     try {
-      // Requeued jobs' panel relay (panelws.job_requeued / job_status_refresh
-      // parity) is Task 7's job; the requeue itself (DB-only) runs today.
-      await dispatch.requeueStale(db, now);
+      requeued = await dispatch.requeueStale(db, now);
     } catch (err) {
       console.error("hub: requeueStale failed", err);
     }
 
+    // A requeue is invisible from the panel's side otherwise: the frontend
+    // still believes the job is executing, and the done/failed event that
+    // would have cleared it is never coming for that attempt. Clear the
+    // executing marker per job, then refresh the queue badge once -- ports
+    // agentws.py's `dispatch_tick`'s post-`requeue_stale` panel relay.
+    if (requeued.length > 0) {
+      try {
+        for (const jobId of requeued) {
+          await this.panelJobRequeued(jobId);
+        }
+        await this.panelJobStatusRefresh();
+      } catch (err) {
+        console.error("hub: failed to relay requeued jobs to the panel", err);
+      }
+    }
+
     const idleWorkerIds: string[] = [];
     for (const ws of this.ctx.getWebSockets()) {
-      const att = ws.deserializeAttachment() as Attachment | null;
-      if (att && att.phase === "ready" && att.state === "idle" && att.workerId) {
+      const att = ws.deserializeAttachment() as HubAttachment | null;
+      if (att && att.kind === "agent" && att.phase === "ready" && att.state === "idle" && att.workerId) {
         idleWorkerIds.push(att.workerId);
       }
     }
@@ -1007,10 +1195,10 @@ export class Hub extends DurableObject<Env> {
             input_assets: job.inputAssets,
           })
         );
-        const att = ws.deserializeAttachment() as Attachment;
+        const att = ws.deserializeAttachment() as AgentAttachment;
         // Presume busy until the next heartbeat says otherwise, so the next
         // tick doesn't double-push before the agent reports in.
-        ws.serializeAttachment({ ...att, state: "dispatched" } satisfies Attachment);
+        ws.serializeAttachment({ ...att, state: "dispatched" } satisfies AgentAttachment);
       } catch (err) {
         console.error(`hub: failed to push job to worker ${workerId}`, err);
       }
@@ -1020,8 +1208,17 @@ export class Hub extends DurableObject<Env> {
   async alarm(): Promise<void> {
     await this.tick();
 
-    const anyConnected = this.ctx.getWebSockets().length > 0;
-    const active = anyConnected || (await queries.hasActiveJobs(this.env.DB));
+    // Agent connections only -- ports agentws.py's dispatch loop re-arm
+    // condition (`agentws._connections`, a registry that never held panel
+    // sockets; panelws.py keeps its own, entirely separate `_connections`
+    // dict). A panel client alone with zero agents connected has no work
+    // this alarm could possibly dispatch, so it must not be what keeps the
+    // 5s tick alive forever.
+    const anyAgentConnected = [...this.ctx.getWebSockets()].some((ws) => {
+      const att = ws.deserializeAttachment() as HubAttachment | null;
+      return att?.kind === "agent";
+    });
+    const active = anyAgentConnected || (await queries.hasActiveJobs(this.env.DB));
     if (active) {
       await this.ctx.storage.setAlarm(Date.now() + TICK_INTERVAL_MS);
     }
@@ -1044,8 +1241,8 @@ export class Hub extends DurableObject<Env> {
 
   private findWsForWorker(workerId: string): WebSocket | null {
     for (const ws of this.ctx.getWebSockets()) {
-      const att = ws.deserializeAttachment() as Attachment | null;
-      if (att && att.phase === "ready" && att.workerId === workerId) return ws;
+      const att = ws.deserializeAttachment() as HubAttachment | null;
+      if (att && att.kind === "agent" && att.phase === "ready" && att.workerId === workerId) return ws;
     }
     return null;
   }
@@ -1061,5 +1258,112 @@ export class Hub extends DurableObject<Env> {
       this.ephemeral.set(ws, e);
     }
     return e;
+  }
+
+  // -- Panel event bus -----------------------------------------------------
+  // Ports panelws.py's broadcast functions. Every caller here is a
+  // direct in-DO method call from the agent-socket handlers above (see
+  // this file's docstring: agent + panel WS share one DO, no HTTP hop
+  // needed) -- `handleInternalEvent`'s `/internal/event` is the SEPARATE
+  // seam for callers outside the DO (Task 8/9's HTTP routes).
+
+  /** Broadcasts a `{type, data}` envelope to every connected panel client.
+   * Ports panelws.py's `post_event` (minus the cross-event-loop dance,
+   * which has no equivalent in a single-threaded DO -- every caller here
+   * already runs on this DO's own turn). Never throws: a dead/erroring
+   * panel socket is logged and skipped, exactly like Python's `except
+   * Exception` + drop-from-`_connections`; the difference is there is no
+   * registry entry to drop here -- `ctx.getWebSockets()` reflects socket
+   * lifecycle on its own. */
+  private async postPanelEvent(evt: { type: string; data?: unknown }): Promise<void> {
+    const payload = JSON.stringify(evt);
+    for (const ws of this.ctx.getWebSockets()) {
+      const att = ws.deserializeAttachment() as HubAttachment | null;
+      if (!att || att.kind !== "panel") continue;
+      try {
+        ws.send(payload);
+      } catch (err) {
+        console.warn(`hub: failed to deliver panel event to sid ${att.sid}`, err);
+      }
+    }
+  }
+
+  /** Ports panelws.py's `queue_status`. */
+  private async queueStatus(): Promise<{ exec_info: { queue_remaining: number } }> {
+    const remaining = await queries.countQueueRemaining(this.env.DB);
+    return { exec_info: { queue_remaining: remaining } };
+  }
+
+  /** Ports panelws.py's `job_progress`. */
+  private async panelJobProgress(jobId: string, progress: number): Promise<void> {
+    await this.postPanelEvent({
+      type: "progress",
+      data: { value: Math.trunc(progress * 100), max: 100, prompt_id: jobId },
+    });
+  }
+
+  /** Ports panelws.py's `job_running`. */
+  private async panelJobRunning(jobId: string): Promise<void> {
+    await this.postPanelEvent({
+      type: "executing",
+      data: { node: RUNNING_NODE_LABEL, prompt_id: jobId, display_node: RUNNING_NODE_LABEL },
+    });
+  }
+
+  /** Ports panelws.py's `job_status_refresh`. */
+  private async panelJobStatusRefresh(): Promise<void> {
+    await this.postPanelEvent({ type: "status", data: { status: await this.queueStatus() } });
+  }
+
+  /** Ports panelws.py's `job_requeued`. */
+  private async panelJobRequeued(jobId: string): Promise<void> {
+    await this.postPanelEvent({ type: "executing", data: { node: null, prompt_id: jobId } });
+  }
+
+  /** Ports panelws.py's `job_cancelled`. */
+  private async panelJobCancelled(jobId: string): Promise<void> {
+    await this.postPanelEvent({ type: "executing", data: { node: null, prompt_id: jobId } });
+    await this.panelJobStatusRefresh();
+  }
+
+  /** Ports panelws.py's `job_done`: one `executed` event PER output node
+   * (the Phase 1.8b fix -- see `job_outputs`'s docstring on why upstream's
+   * `executed` frame carries exactly one node's UI dict, never the whole
+   * map), then the completion `executing` signal, then a refreshed
+   * `status`. `job_outputs(job) or {FALLBACK_OUTPUT_KEY: {}}` in Python
+   * becomes an explicit empty-check here since `jobOutputs` is async. */
+  private async panelJobDone(job: JobOutputsInput): Promise<void> {
+    let outputs = await jobOutputs(job, this.env.STORE);
+    if (Object.keys(outputs).length === 0) {
+      outputs = { [FALLBACK_OUTPUT_KEY]: {} };
+    }
+
+    for (const [nodeId, payload] of Object.entries(outputs)) {
+      await this.postPanelEvent({
+        type: "executed",
+        data: { prompt_id: job.id, output: payload, node: nodeId, display_node: nodeId },
+      });
+    }
+    await this.postPanelEvent({ type: "executing", data: { node: null, prompt_id: job.id } });
+    await this.panelJobStatusRefresh();
+  }
+
+  /** Ports panelws.py's `job_failed`. */
+  private async panelJobFailed(jobId: string, error: string): Promise<void> {
+    await this.postPanelEvent({
+      type: "execution_error",
+      data: {
+        prompt_id: jobId,
+        node_id: null,
+        node_type: null,
+        exception_message: error,
+        exception_type: "",
+        traceback: [],
+        current_inputs: {},
+        current_outputs: {},
+        executed: [],
+      },
+    });
+    await this.panelJobStatusRefresh();
   }
 }

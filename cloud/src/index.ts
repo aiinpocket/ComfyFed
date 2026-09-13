@@ -59,6 +59,23 @@ app.get("/api/agent/ws", (c) => {
   return stub.fetch(c.req.raw);
 });
 
+// Panel WebSocket: same singleton Hub DO (see do/hub.ts's docstring -- "ONE
+// Durable Object for agent+panel WS+alarm"). Served at both paths for the
+// same reason comfyapi.py's `create_ws_router` does: the pinned frontend
+// builds its socket URL as `api_base + "/ws"`, not through the `/api`-
+// prefixing helper every other call goes through, so a panel served at
+// `/comfy/` connects to `/comfy/ws`; `/comfy/api/ws` is kept as the
+// explicit, documented address. Session-cookie auth happens inside the DO's
+// `handlePanelWsUpgrade`, off the raw request -- nothing about it belongs here.
+app.get("/comfy/api/ws", (c) => {
+  const stub = c.env.HUB.get(c.env.HUB.idFromName("hub"));
+  return stub.fetch(c.req.raw);
+});
+app.get("/comfy/ws", (c) => {
+  const stub = c.env.HUB.get(c.env.HUB.idFromName("hub"));
+  return stub.fetch(c.req.raw);
+});
+
 app.route("/", authRoutes);
 app.route("/", settingsRoutes);
 app.route("/", workersRoutes);
