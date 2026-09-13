@@ -932,9 +932,12 @@ async def _create_and_push_failure_receipt(
         if job is None:
             return
 
-        if _is_valid_exec_seconds(exec_seconds):
+        if _is_valid_exec_seconds(exec_seconds) and job.started_at is not None:
+            # A job that never started has no run to have measured -- an
+            # exec_seconds claim for it is meaningless, so it falls through to
+            # the wall branch below (which measures 0.0 for started_at=None).
             gpu_seconds = exec_seconds
-            if job.started_at is not None and job.finished_at is not None:
+            if job.finished_at is not None:
                 gpu_seconds = min(gpu_seconds, (job.finished_at - job.started_at).total_seconds())
             basis = "exec"
         else:
