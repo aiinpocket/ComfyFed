@@ -8,7 +8,7 @@ from comfyfed_agent import comfy, whitelist
 COMFY_URL = "http://fake-comfy:8188"
 
 
-def _make_app(outputs=None):
+def _make_app(outputs=None, status_str="success"):
     app = FastAPI()
     # `history_misses` makes /history return "not finished yet" that many
     # times, so a test can exercise the in-progress polling path;
@@ -66,7 +66,7 @@ def _make_app(outputs=None):
             return {}
         return {
             prompt_id: {
-                "status": {"status_str": "success"},
+                "status": {"status_str": status_str},
                 "outputs": outputs
                 if outputs is not None
                 else {
@@ -156,8 +156,27 @@ def test_run_workflow_collects_files_keyed_text_outputs():
 
 
 def test_run_workflow_raises_on_prompt_error(client):
-    with pytest.raises(comfy.ComfyError):
+    with pytest.raises(comfy.ComfyError) as exc_info:
         comfy.run_workflow(COMFY_URL, {"1": {"class_type": "BadNode"}}, client=client)
+    # Never submitted, so nothing ran: no exec_seconds to report.
+    assert exc_info.value.exec_seconds is None
+
+
+def test_run_workflow_raises_with_exec_seconds_on_execution_error():
+    """A ComfyUI-reported execution failure (status_str == "error") happens
+    AFTER the prompt was submitted and (usually) started running -- unlike a
+    /prompt submission rejection, this is measurable GPU time and the
+    platform needs to know about it (Phase 1.9 Task 5: non-billable failed
+    receipts still record how much actually ran)."""
+    error_client = TestClient(_make_app(status_str="error"))
+    error_client.app.state.mock["queue_running"] = [[0, "p1", {}]]
+
+    with pytest.raises(comfy.ComfyError) as exc_info:
+        comfy.run_workflow(
+            COMFY_URL, {"1": {"class_type": "KSampler", "inputs": {}}}, client=error_client
+        )
+    assert exc_info.value.exec_seconds is not None
+    assert exc_info.value.exec_seconds >= 0
 
 
 def test_whitelist_allowed_classes_installed_policy(client):

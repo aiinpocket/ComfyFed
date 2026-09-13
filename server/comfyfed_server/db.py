@@ -113,6 +113,22 @@ class Receipt(Base):
     platform_sig: Mapped[str] = mapped_column(String)
     worker_sig: Mapped[Optional[str]] = mapped_column(String, nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime, default=_utcnow)
+    # What kind of job outcome this receipt records ("completed" | "failed" |
+    # "cancelled") -- see agentws._create_and_push_receipt /
+    # _create_and_push_failure_receipt / _mint_cancelled_receipt. Every
+    # existing row predates this column and was a normal completion, hence
+    # the "completed" backfill in migration #7.
+    kind: Mapped[str] = mapped_column(String, default="completed", server_default="completed")
+    # Whether this receipt counts toward billed GPU time. Failed and
+    # cancelled runs still record their gpu_seconds (for capacity/health
+    # reporting) but must never be billed for work the platform didn't
+    # actually get a usable result for.
+    billable: Mapped[bool] = mapped_column(Boolean, default=True, server_default="1")
+    # How `gpu_seconds` was derived: "exec" (the agent's own measured GPU
+    # execution time) or "wall" (a wall-clock fallback -- assigned/running
+    # span, or started_at-to-cancel span). Mirrors the exec/wall distinction
+    # `_create_and_push_receipt` already logs for completed jobs.
+    basis: Mapped[str] = mapped_column(String, default="exec", server_default="exec")
 
 
 class LoginAttempt(Base):

@@ -1167,3 +1167,233 @@ def test_repeat_forged_job_id_warns_once_then_debug_across_message_kinds(client,
             ws_b.close()
     finally:
         ws_a.close()
+
+
+# --- Task 5: non-billable receipts for failed and cancelled runs -----------
+
+
+def _run_to_running(client, csrf, worker_id, sk, job_id):
+    """Connect `worker_id`, get `job_id` dispatched to it, and mark it
+    running -- the shared setup every failed/cancelled-receipt test needs.
+    Returns the open websocket (caller must close it)."""
+    ws = _connect(client, worker_id, sk)
+    ws.send_json({"type": "heartbeat", "state": "idle", "progress": 0.0, "job_id": None, "dynamic": {}})
+    agentws.dispatch_once(worker_id)
+    assert ws.receive_json()["type"] == "job"
+    ws.send_json({"type": "heartbeat", "state": "busy", "progress": 0.0, "job_id": job_id, "dynamic": {}})
+    agentws.dispatch_once(worker_id)
+    with db.get_session() as session:
+        assert session.get(db.Job, job_id).status == "running"
+    return ws
+
+
+def test_job_failed_mints_non_billable_receipt_with_exec_basis(client):
+    csrf = _login(client)
+    worker_id, sk = _register_worker(client, csrf, "w1")
+    job_id = _submit(client, csrf)
+
+    ws = _run_to_running(client, csrf, worker_id, sk, job_id)
+    try:
+        ws.send_json(
+            {"type": "job_failed", "job_id": job_id, "error": "boom", "exec_seconds": 2.5}
+        )
+        agentws.dispatch_once(worker_id)
+
+        receipt_msg = ws.receive_json()
+        assert receipt_msg["type"] == "receipt"
+        assert receipt_msg["kind"] == "failed"
+        assert receipt_msg["billable"] is False
+        assert receipt_msg["basis"] == "exec"
+        # The signed payload byte-format is UNCHANGED: existing worker
+        # verifiers must keep validating it regardless of the new kind/
+        # billable/basis fields riding alongside it.
+        assert receipt_msg["payload"] == f"{job_id}|{worker_id}|2.5"
+
+        with db.get_session() as session:
+            receipt = session.get(db.Receipt, receipt_msg["receipt_id"])
+            assert receipt.kind == "failed"
+            assert receipt.billable is False
+            assert receipt.basis == "exec"
+            assert receipt.gpu_seconds == 2.5
+            assert receipt.job_id == job_id
+            assert receipt.worker_id == worker_id
+    finally:
+        ws.close()
+
+
+def test_job_failed_without_exec_seconds_falls_back_to_wall_basis(client):
+    csrf = _login(client)
+    worker_id, sk = _register_worker(client, csrf, "w1")
+    job_id = _submit(client, csrf)
+
+    ws = _run_to_running(client, csrf, worker_id, sk, job_id)
+    try:
+        ws.send_json({"type": "job_failed", "job_id": job_id, "error": "boom"})
+        agentws.dispatch_once(worker_id)
+
+        receipt_msg = ws.receive_json()
+        assert receipt_msg["kind"] == "failed"
+        assert receipt_msg["billable"] is False
+        assert receipt_msg["basis"] == "wall"
+
+        with db.get_session() as session:
+            receipt = session.get(db.Receipt, receipt_msg["receipt_id"])
+            assert receipt.basis == "wall"
+            assert receipt.gpu_seconds >= 0
+    finally:
+        ws.close()
+
+
+def test_job_failed_receipt_can_still_be_counter_signed(client):
+    """The failed-receipt frame is a real receipt, not a notification -- the
+    worker's normal `receipt_ack` flow must work on it exactly like a
+    completed one."""
+    csrf = _login(client)
+    worker_id, sk = _register_worker(client, csrf, "w1")
+    job_id = _submit(client, csrf)
+
+    ws = _run_to_running(client, csrf, worker_id, sk, job_id)
+    try:
+        ws.send_json({"type": "job_failed", "job_id": job_id, "error": "boom"})
+        agentws.dispatch_once(worker_id)
+        receipt_msg = ws.receive_json()
+
+        worker_sig = sk.sign(receipt_msg["payload"].encode()).signature.hex()
+        ws.send_json(
+            {"type": "receipt_ack", "receipt_id": receipt_msg["receipt_id"], "worker_sig": worker_sig}
+        )
+        agentws.dispatch_once(worker_id)
+
+        with db.get_session() as session:
+            receipt = session.get(db.Receipt, receipt_msg["receipt_id"])
+            assert receipt.worker_sig == worker_sig
+    finally:
+        ws.close()
+
+
+def test_console_cancel_of_running_job_mints_cancelled_receipt(client):
+    csrf = _login(client)
+    worker_id, sk = _register_worker(client, csrf, "w1")
+    job_id = _submit(client, csrf)
+
+    ws = _run_to_running(client, csrf, worker_id, sk, job_id)
+    try:
+        res = client.post(f"/api/jobs/{job_id}/cancel", headers={"X-CSRF": csrf})
+        assert res.status_code == 200
+
+        cancelled_msg = ws.receive_json()
+        assert cancelled_msg == {"type": "job_cancelled", "job_id": job_id}
+        receipt_msg = ws.receive_json()
+        assert receipt_msg["type"] == "receipt"
+        assert receipt_msg["kind"] == "cancelled"
+        assert receipt_msg["billable"] is False
+        assert receipt_msg["basis"] == "wall"
+
+        with db.get_session() as session:
+            receipts = session.query(db.Receipt).filter(db.Receipt.job_id == job_id).all()
+            assert len(receipts) == 1  # exactly once
+            assert receipts[0].kind == "cancelled"
+            assert receipts[0].gpu_seconds >= 0
+    finally:
+        ws.close()
+
+
+def test_panel_interrupt_of_running_job_mints_cancelled_receipt(client):
+    csrf = _login(client)
+    worker_id, sk = _register_worker(client, csrf, "w1")
+    job_id = _submit_panel(client)
+
+    ws = _run_to_running(client, csrf, worker_id, sk, job_id)
+    try:
+        res = client.post("/comfy/api/interrupt")
+        assert res.status_code == 200
+
+        ws.receive_json()  # job_cancelled
+        receipt_msg = ws.receive_json()
+        assert receipt_msg["kind"] == "cancelled"
+        assert receipt_msg["billable"] is False
+
+        with db.get_session() as session:
+            assert session.query(db.Receipt).filter(db.Receipt.job_id == job_id).count() == 1
+    finally:
+        ws.close()
+
+
+def test_panel_queue_delete_of_running_job_mints_cancelled_receipt(client):
+    csrf = _login(client)
+    worker_id, sk = _register_worker(client, csrf, "w1")
+    job_id = _submit_panel(client)
+
+    ws = _run_to_running(client, csrf, worker_id, sk, job_id)
+    try:
+        res = client.post("/comfy/api/queue", json={"delete": [job_id]})
+        assert res.status_code == 200
+
+        ws.receive_json()  # job_cancelled
+        receipt_msg = ws.receive_json()
+        assert receipt_msg["kind"] == "cancelled"
+
+        with db.get_session() as session:
+            assert session.query(db.Receipt).filter(db.Receipt.job_id == job_id).count() == 1
+    finally:
+        ws.close()
+
+
+def test_cancel_of_queued_job_mints_no_receipt(client):
+    """Nothing ran, so nothing is owed a receipt at all -- billable or not."""
+    csrf = _login(client)
+    job_id = _submit(client, csrf)
+
+    res = client.post(f"/api/jobs/{job_id}/cancel", headers={"X-CSRF": csrf})
+    assert res.status_code == 200
+
+    with db.get_session() as session:
+        assert session.query(db.Receipt).filter(db.Receipt.job_id == job_id).count() == 0
+
+
+def test_cancel_of_assigned_but_not_yet_running_job_mints_no_receipt(client):
+    """`started_at` is only set by the busy heartbeat (mark_running); a job
+    merely handed to a worker but not yet started has burned no GPU time."""
+    csrf = _login(client)
+    worker_id, sk = _register_worker(client, csrf, "w1")
+    job_id = _submit(client, csrf)
+
+    ws = _connect(client, worker_id, sk)
+    try:
+        ws.send_json({"type": "heartbeat", "state": "idle", "progress": 0.0, "job_id": None, "dynamic": {}})
+        agentws.dispatch_once(worker_id)
+        assert ws.receive_json()["type"] == "job"
+
+        with db.get_session() as session:
+            assert session.get(db.Job, job_id).status == "assigned"
+
+        res = client.post(f"/api/jobs/{job_id}/cancel", headers={"X-CSRF": csrf})
+        assert res.status_code == 200
+
+        with db.get_session() as session:
+            assert session.query(db.Receipt).filter(db.Receipt.job_id == job_id).count() == 0
+    finally:
+        ws.close()
+
+
+def test_cancel_of_running_job_with_offline_worker_still_writes_receipt(client):
+    """The owning worker may be offline at cancel time (an admin cancelling
+    a job whose agent has already dropped/crashed). The receipt must still
+    be written -- worker_sig NULL until an ack ever arrives -- rather than
+    the mint being skipped just because there is nobody to push it to."""
+    csrf = _login(client)
+    worker_id, sk = _register_worker(client, csrf, "w1")
+    job_id = _submit(client, csrf)
+
+    ws = _run_to_running(client, csrf, worker_id, sk, job_id)
+    ws.close()  # simulate the worker dropping off before the cancel lands
+
+    res = client.post(f"/api/jobs/{job_id}/cancel", headers={"X-CSRF": csrf})
+    assert res.status_code == 200
+
+    with db.get_session() as session:
+        receipts = session.query(db.Receipt).filter(db.Receipt.job_id == job_id).all()
+        assert len(receipts) == 1
+        assert receipts[0].kind == "cancelled"
+        assert receipts[0].billable is False
+        assert receipts[0].worker_sig is None

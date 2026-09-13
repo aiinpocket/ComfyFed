@@ -1,6 +1,7 @@
 import hashlib
 import io
 import json
+import sqlite3
 from datetime import datetime, timedelta, timezone
 from urllib.parse import quote
 
@@ -8,6 +9,8 @@ import httpx
 import pytest
 import secrets
 import time
+from alembic import command
+from alembic.config import Config
 from nacl.signing import SigningKey, VerifyKey
 
 from comfyfed_server import agentws, app as app_module
@@ -406,6 +409,140 @@ def test_contributions_report_filters_by_date_range(client):
     assert len(rows_all) == 1
     assert rows_all[0]["jobs"] == 2
     assert rows_all[0]["gpu_seconds"] == 30.0
+
+
+# --- Task 5: non-billable receipts in the contributions report -------------
+
+
+def test_contributions_report_splits_billable_from_unbilled(client):
+    """Headline `jobs`/`gpu_seconds` stay billable-only (unchanged semantics);
+    non-billable (failed/cancelled) receipts show up only in
+    `unbilled_gpu_seconds` and the per-receipt listing."""
+    csrf = _login(client)
+    worker_id, sk = _register_worker_with_key(client, csrf, "w1")
+
+    with db.get_session() as session:
+        session.add_all(
+            [
+                db.Receipt(
+                    job_id="job-done",
+                    worker_id=worker_id,
+                    gpu_seconds=10.0,
+                    platform_sig="ab" * 32,
+                    kind="completed",
+                    billable=True,
+                    basis="exec",
+                ),
+                db.Receipt(
+                    job_id="job-failed",
+                    worker_id=worker_id,
+                    gpu_seconds=4.0,
+                    platform_sig="cd" * 32,
+                    kind="failed",
+                    billable=False,
+                    basis="exec",
+                ),
+                db.Receipt(
+                    job_id="job-cancelled",
+                    worker_id=worker_id,
+                    gpu_seconds=6.0,
+                    platform_sig="ef" * 32,
+                    kind="cancelled",
+                    billable=False,
+                    basis="wall",
+                ),
+            ]
+        )
+        session.commit()
+
+    res = client.get("/api/reports/contributions", headers={"X-CSRF": csrf})
+    assert res.status_code == 200
+    rows = res.json()
+    assert len(rows) == 1
+    row = rows[0]
+
+    # Headline numbers: billable (completed) receipts only.
+    assert row["jobs"] == 1
+    assert row["gpu_seconds"] == 10.0
+    # New: total non-billable GPU time for this worker.
+    assert row["unbilled_gpu_seconds"] == 10.0
+
+    receipts_by_job = {r["job_id"]: r for r in row["receipts"]}
+    assert receipts_by_job["job-done"] == {
+        "job_id": "job-done", "kind": "completed", "billable": True, "basis": "exec",
+        "gpu_seconds": 10.0, "acked": False,
+    }
+    assert receipts_by_job["job-failed"]["kind"] == "failed"
+    assert receipts_by_job["job-failed"]["billable"] is False
+    assert receipts_by_job["job-cancelled"]["kind"] == "cancelled"
+    assert receipts_by_job["job-cancelled"]["basis"] == "wall"
+
+
+def test_contributions_report_marks_acked_receipts(client):
+    csrf = _login(client)
+    worker_id, sk = _register_worker_with_key(client, csrf, "w1")
+
+    with db.get_session() as session:
+        session.add(
+            db.Receipt(
+                job_id="job-acked",
+                worker_id=worker_id,
+                gpu_seconds=5.0,
+                platform_sig="ab" * 32,
+                worker_sig="cd" * 32,
+            )
+        )
+        session.commit()
+
+    res = client.get("/api/reports/contributions", headers={"X-CSRF": csrf})
+    row = res.json()[0]
+    assert row["receipts"][0]["acked"] is True
+
+
+def test_alembic_migration_7_adds_and_backfills_kind_billable_basis(tmp_path):
+    """A DB already at the previous head (migration #6, job origin/panel_hidden)
+    must upgrade to head cleanly, backfilling every pre-existing receipt as
+    kind=completed/billable=1/basis=exec -- exactly what every receipt was
+    before this task existed."""
+    db_path = str(tmp_path / "t.db")
+    cfg = Config()
+    cfg.set_main_option("script_location", db._alembic_dir())
+    cfg.set_main_option("sqlalchemy.url", f"sqlite+pysqlite:///{db_path}")
+
+    command.upgrade(cfg, "e5f6a7b8c9d0")  # pre-existing DB, one migration behind
+
+    conn = sqlite3.connect(db_path)
+    try:
+        conn.execute(
+            "INSERT INTO receipts (id, job_id, worker_id, gpu_seconds, platform_sig, created_at) "
+            "VALUES ('r1', 'j1', 'w1', 5.0, 'sig', '2026-01-01 00:00:00')"
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+    command.upgrade(cfg, "head")
+
+    conn = sqlite3.connect(db_path)
+    try:
+        cols = {row[1]: row for row in conn.execute("PRAGMA table_info(receipts)").fetchall()}
+        row = conn.execute(
+            "SELECT kind, billable, basis FROM receipts WHERE id = 'r1'"
+        ).fetchone()
+    finally:
+        conn.close()
+
+    assert {"kind", "billable", "basis"} <= set(cols)
+    assert row == ("completed", 1, "exec")
+
+    # Downgrade must cleanly drop all three columns again.
+    command.downgrade(cfg, "e5f6a7b8c9d0")
+    conn = sqlite3.connect(db_path)
+    try:
+        cols_after = {row[1] for row in conn.execute("PRAGMA table_info(receipts)").fetchall()}
+    finally:
+        conn.close()
+    assert not ({"kind", "billable", "basis"} & cols_after)
 
 
 def test_contributions_rejects_an_unparseable_date(client):

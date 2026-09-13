@@ -27,7 +27,11 @@ Agent -> server message contract (all JSON):
          `gpu_seconds` is `min(exec_seconds, wall_clock)`, falling back to
          the wall clock (`finished_at - started_at`) when this is missing or
          invalid -- see `_create_and_push_receipt`.
-  {"type": "job_failed", "job_id": str, "error": str}
+  {"type": "job_failed", "job_id": str, "error": str, "exec_seconds": float|null}
+      -- `exec_seconds` mirrors job_done's: the agent's measured GPU
+         execution time, present only when the prompt actually started
+         (omitted/null otherwise). Mints a non-billable `kind=failed`
+         receipt -- see `_create_and_push_failure_receipt`.
   {"type": "receipt_ack", "receipt_id": str, "worker_sig": hex}
 
 Server -> agent also includes `{"type": "want_object_info"}` (see above); the
@@ -303,6 +307,10 @@ async def _handle_message(worker_id: str, conn: _Connection, message: dict) -> N
                 job_id, worker_id, error, resolve_warn_level=lambda jid: _resolve_warn_level(conn, jid)
             ):
                 await panelws.job_failed(job_id, error)
+                exec_seconds = message.get("exec_seconds")
+                if not _is_valid_exec_seconds(exec_seconds):
+                    exec_seconds = None
+                await _create_and_push_failure_receipt(worker_id, conn, job_id, exec_seconds)
             elif job_id and _job_not_owned_by(job_id, worker_id):
                 await _send_job_cancelled(conn, job_id)
         elif msg_type == "receipt_ack":
@@ -414,12 +422,19 @@ async def cancel_and_notify(job_id: str, *, reason: str) -> bool:
     with db.get_session() as session:
         job = session.get(db.Job, job_id)
         cancellable = job is not None and not dispatch.is_terminal(job.status)
+        # Snapshot before cancel_job flips status/clears worker_id: a
+        # cancelled receipt is only ever minted for a job that was actually
+        # RUNNING (started_at set) -- a queued or merely-assigned cancel
+        # never burned GPU time, so it stays receipt-free.
+        was_running = cancellable and job.status == "running" and job.started_at is not None
     if not cancellable:
         return False
 
     owner = dispatch.cancel_job(job_id, reason=reason)
     if owner:
         await push_job_cancelled(owner, job_id)
+    if was_running and owner:
+        await _mint_cancelled_receipt(owner, job_id)
     await panelws.job_cancelled(job_id)
     return True
 
@@ -627,6 +642,80 @@ def _handle_inventory(worker_id: str, message: dict) -> None:
         session.commit()
 
 
+def _sign_and_store_receipt(
+    session, job_id: str, worker_id: str, gpu_seconds: float, *, kind: str, billable: bool, basis: str
+):
+    """Sign `f"{job_id}|{worker_id}|{gpu_seconds:.1f}"` (the wire payload
+    format worker verifiers pin -- UNCHANGED by this task) and store a
+    Receipt row for it. `kind`/`billable`/`basis` ride only in the row and
+    the outbound WS frame's extra fields (see `_push_receipt_frame`); old
+    agents that only ever look at `payload`/`platform_sig` are unaffected.
+
+    Returns `(receipt_id, payload, platform_sig)` for the caller to push.
+    """
+    payload = f"{job_id}|{worker_id}|{gpu_seconds:.1f}"
+    platform_sig = _signing_key.sign(payload.encode()).signature.hex()
+
+    receipt = db.Receipt(
+        job_id=job_id,
+        worker_id=worker_id,
+        gpu_seconds=gpu_seconds,
+        platform_sig=platform_sig,
+        kind=kind,
+        billable=billable,
+        basis=basis,
+    )
+    session.add(receipt)
+    session.commit()
+    return receipt.id, payload, platform_sig
+
+
+async def _push_receipt_frame(
+    worker_id: str,
+    receipt_id: str,
+    payload: str,
+    platform_sig: str,
+    *,
+    kind: str,
+    billable: bool,
+    basis: str,
+    conn: Optional["_Connection"] = None,
+) -> None:
+    """Push a `receipt` frame to `worker_id`'s live connection, if any.
+
+    `conn` is passed when the caller already has the connection that just
+    sent the message being answered (job_done/job_failed); otherwise (a
+    cancel triggered from an HTTP request, where the owning worker may well
+    be offline right now) the live connection registry is consulted instead.
+    A worker with no live connection at mint time is not an error: the
+    receipt row is already committed by the caller, `worker_sig` stays NULL,
+    and the worker's next `receipt_ack` -- whenever it reconnects -- can
+    never arrive for a frame it was never sent, so nothing here needs to
+    replay it; the report simply shows it as unacked in the meantime.
+    """
+    target = conn or _connections.get(worker_id)
+    if target is None:
+        logger.info(
+            "agentws: worker %s not connected, deferring receipt %s push (kind=%s)",
+            worker_id, receipt_id, kind,
+        )
+        return
+    try:
+        await target.ws.send_json(
+            {
+                "type": "receipt",
+                "receipt_id": receipt_id,
+                "payload": payload,
+                "platform_sig": platform_sig,
+                "kind": kind,
+                "billable": billable,
+                "basis": basis,
+            }
+        )
+    except Exception:
+        logger.exception("agentws: failed to push receipt %s to worker %s", receipt_id, worker_id)
+
+
 async def _create_and_push_receipt(
     worker_id: str, conn: "_Connection", job_id: Optional[str], exec_seconds: Optional[float] = None
 ) -> None:
@@ -660,49 +749,128 @@ async def _create_and_push_receipt(
         if job.started_at is not None and job.finished_at is not None:
             wall_seconds = (job.finished_at - job.started_at).total_seconds()
 
-        if (
-            exec_seconds is None
-            or not isinstance(exec_seconds, (int, float))
-            or isinstance(exec_seconds, bool)
-            or not math.isfinite(exec_seconds)
-            or exec_seconds < 0
-        ):
+        if _is_valid_exec_seconds(exec_seconds):
+            gpu_seconds = min(exec_seconds, wall_seconds)
+            basis = "exec"
+        else:
             gpu_seconds = wall_seconds
+            basis = "wall"
             logger.info(
                 "agentws: job %s has no valid exec_seconds from worker %s, "
                 "billing the wall-clock span instead",
                 job_id,
                 worker_id,
             )
-        else:
-            gpu_seconds = min(exec_seconds, wall_seconds)
 
         gpu_seconds = max(0.0, gpu_seconds)
 
-        payload = f"{job_id}|{worker_id}|{gpu_seconds:.1f}"
-        platform_sig = _signing_key.sign(payload.encode()).signature.hex()
-
-        receipt = db.Receipt(
-            job_id=job_id,
-            worker_id=worker_id,
-            gpu_seconds=gpu_seconds,
-            platform_sig=platform_sig,
+        receipt_id, payload, platform_sig = _sign_and_store_receipt(
+            session, job_id, worker_id, gpu_seconds, kind="completed", billable=True, basis=basis
         )
-        session.add(receipt)
-        session.commit()
-        receipt_id = receipt.id
 
-    try:
-        await conn.ws.send_json(
-            {
-                "type": "receipt",
-                "receipt_id": receipt_id,
-                "payload": payload,
-                "platform_sig": platform_sig,
-            }
+    await _push_receipt_frame(
+        worker_id, receipt_id, payload, platform_sig,
+        kind="completed", billable=True, basis=basis, conn=conn,
+    )
+
+
+def _is_valid_exec_seconds(exec_seconds) -> bool:
+    """Whether `exec_seconds` is a real, non-negative, finite number.
+
+    Shared by the completed and failed receipt paths -- both fall back to a
+    wall-clock basis under the exact same invalidity conditions (missing,
+    wrong type, `NaN`/`Infinity`, or negative).
+    """
+    return (
+        exec_seconds is not None
+        and isinstance(exec_seconds, (int, float))
+        and not isinstance(exec_seconds, bool)
+        and math.isfinite(exec_seconds)
+        and exec_seconds >= 0
+    )
+
+
+async def _create_and_push_failure_receipt(
+    worker_id: str, conn: "_Connection", job_id: Optional[str], exec_seconds: Optional[float] = None
+) -> None:
+    """Mint a non-billable `kind=failed` receipt for a job the worker just
+    reported `job_failed` for, and push it for counter-signature exactly
+    like a completed receipt.
+
+    `gpu_seconds` is `exec_seconds` when the agent measured the prompt
+    actually starting (basis="exec"), else the wall-clock span from
+    `started_at` (set by `mark_running`) to now -- `mark_failed` has already
+    stamped `finished_at` by the time this runs, so that's the span used
+    (basis="wall"). A job that never started (failed while still merely
+    `assigned`) has no `started_at` to measure from at all; that is
+    genuinely zero measured GPU time, not a missing measurement.
+    """
+    if not job_id or _signing_key is None:
+        return
+
+    with db.get_session() as session:
+        job = session.get(db.Job, job_id)
+        if job is None:
+            return
+
+        if _is_valid_exec_seconds(exec_seconds):
+            gpu_seconds = exec_seconds
+            basis = "exec"
+        else:
+            wall_seconds = 0.0
+            if job.started_at is not None:
+                end = job.finished_at or _utcnow()
+                wall_seconds = (end - job.started_at).total_seconds()
+            gpu_seconds = wall_seconds
+            basis = "wall"
+
+        gpu_seconds = max(0.0, gpu_seconds)
+
+        receipt_id, payload, platform_sig = _sign_and_store_receipt(
+            session, job_id, worker_id, gpu_seconds, kind="failed", billable=False, basis=basis
         )
-    except Exception:
-        logger.exception("agentws: failed to push receipt %s to worker %s", receipt_id, worker_id)
+
+    await _push_receipt_frame(
+        worker_id, receipt_id, payload, platform_sig,
+        kind="failed", billable=False, basis=basis, conn=conn,
+    )
+
+
+async def _mint_cancelled_receipt(worker_id: str, job_id: str) -> None:
+    """Mint a non-billable `kind=cancelled` receipt for a job that was
+    cancelled while genuinely running (`started_at` set).
+
+    The single hook every cancel entry point (the admin cancel API, and the
+    ComfyUI-compat `/interrupt` and `/queue` delete/clear handlers) shares,
+    by virtue of all three funnelling through `cancel_and_notify` -- so the
+    mint happens exactly once regardless of which one fired. Unlike the
+    job_done/job_failed mints, there is no live-message `conn` to reuse
+    here: an admin can cancel a job whose worker is offline right now, so
+    `_push_receipt_frame` looks the connection up itself and defers
+    gracefully when there isn't one (see its docstring) -- the row is still
+    written, just unacked until the worker reconnects and this receipt_id
+    happens to be re-delivered some other way, or is simply reported as
+    unacked (Phase 1.9 Task 5 scope: no replay-on-reconnect for it).
+    """
+    if _signing_key is None:
+        return
+
+    with db.get_session() as session:
+        job = session.get(db.Job, job_id)
+        if job is None or job.started_at is None:
+            return
+
+        end = job.finished_at or _utcnow()
+        gpu_seconds = max(0.0, (end - job.started_at).total_seconds())
+
+        receipt_id, payload, platform_sig = _sign_and_store_receipt(
+            session, job_id, worker_id, gpu_seconds, kind="cancelled", billable=False, basis="wall"
+        )
+
+    await _push_receipt_frame(
+        worker_id, receipt_id, payload, platform_sig,
+        kind="cancelled", billable=False, basis="wall",
+    )
 
 
 def _handle_receipt_ack(worker_id: str, message: dict) -> None:

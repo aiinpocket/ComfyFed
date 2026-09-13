@@ -68,10 +68,36 @@ def create_router() -> APIRouter:
         for rec in receipts:
             entry = aggregated.setdefault(
                 rec.worker_id,
-                {"worker_id": rec.worker_id, "name": names.get(rec.worker_id, ""), "jobs": 0, "gpu_seconds": 0.0},
+                {
+                    "worker_id": rec.worker_id,
+                    "name": names.get(rec.worker_id, ""),
+                    "jobs": 0,
+                    "gpu_seconds": 0.0,
+                    "unbilled_gpu_seconds": 0.0,
+                    "receipts": [],
+                },
             )
-            entry["jobs"] += 1
-            entry["gpu_seconds"] += rec.gpu_seconds
+            # Headline `jobs`/`gpu_seconds` stay billable-only -- unchanged
+            # semantics from before non-billable receipts existed (every
+            # receipt was billable then, so this reproduces the old totals
+            # exactly for data that predates this column). Failed/cancelled
+            # receipts still show up in `unbilled_gpu_seconds` and the
+            # per-receipt listing below, just never in the headline numbers.
+            if rec.billable:
+                entry["jobs"] += 1
+                entry["gpu_seconds"] += rec.gpu_seconds
+            else:
+                entry["unbilled_gpu_seconds"] += rec.gpu_seconds
+            entry["receipts"].append(
+                {
+                    "job_id": rec.job_id,
+                    "kind": rec.kind,
+                    "billable": rec.billable,
+                    "basis": rec.basis,
+                    "gpu_seconds": rec.gpu_seconds,
+                    "acked": rec.worker_sig is not None,
+                }
+            )
 
         return list(aggregated.values())
 

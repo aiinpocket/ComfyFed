@@ -154,8 +154,12 @@ class PlatformConnection:
             }
         )
 
-    async def send_job_failed(self, job_id: str, error: str) -> None:
-        await self._send({"type": "job_failed", "job_id": job_id, "error": error})
+    async def send_job_failed(
+        self, job_id: str, error: str, exec_seconds: Optional[float] = None
+    ) -> None:
+        await self._send(
+            {"type": "job_failed", "job_id": job_id, "error": error, "exec_seconds": exec_seconds}
+        )
 
     async def send_receipt_ack(self, receipt_id: str, worker_sig: str) -> None:
         await self._send({"type": "receipt_ack", "receipt_id": receipt_id, "worker_sig": worker_sig})
@@ -478,6 +482,11 @@ class AgentLoop:
         output_files: list[dict] = []
         success = False
         cancelled = False
+        # Set only once `run_workflow` actually returns (success path); a
+        # failure raised from inside it (e.g. a ComfyUI execution error) is
+        # not reflected here -- see the `except Exception` branch below,
+        # which reads `exc.exec_seconds` for that case instead.
+        exec_seconds: Optional[float] = None
         handle = self._jobs.get(job_id)
         if handle is None:
             handle = _JobHandle(job_id=job_id, conn=conn)
@@ -574,7 +583,10 @@ class AgentLoop:
                     )
                 else:
                     logger.exception("runner: job %s failed", job_id)
-                    await conn.send_job_failed(job_id, str(exc))
+                    failure_exec_seconds = (
+                        exec_seconds if exec_seconds is not None else getattr(exc, "exec_seconds", None)
+                    )
+                    await self._report_failure(conn, job_id, str(exc), failure_exec_seconds)
             finally:
                 handle.running = False
                 if cancelled:
@@ -603,6 +615,19 @@ class AgentLoop:
                         self._current_job_id = None
                         self._current_job_task = None
                 await self.broadcast_heartbeat("idle", progress=0.0, job_id=None)
+
+    async def _report_failure(
+        self, conn: PlatformConnection, job_id: str, error: str, exec_seconds: Optional[float] = None
+    ) -> None:
+        """Report `job_failed`, including `exec_seconds` when the prompt
+        actually started (same measurement as the success path -- see
+        `comfy.run_workflow` and `comfy.ComfyError.exec_seconds`), omitted
+        (`None`) otherwise. The platform mints a non-billable receipt from
+        this either way; a transport failure here is left to the normal
+        connection-drop/retry loop rather than held and retried like a
+        completion -- a failed job has no artifacts to lose.
+        """
+        await conn.send_job_failed(job_id, error, exec_seconds)
 
     async def _report_completion(
         self, conn: PlatformConnection, handle: _JobHandle, files: list, exec_seconds
