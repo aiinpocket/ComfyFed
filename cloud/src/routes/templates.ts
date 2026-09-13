@@ -1,0 +1,378 @@
+/**
+ * `/comfy/templates/*` -- ComfyFed's own workflow-template library plus the
+ * official ComfyUI template library, merged and served to the embedded
+ * frontend's built-in template browser. Parity source:
+ * `server/comfyfed_server/templates.py`, read in full -- see that module's
+ * docstring for the frontend contract (`index.json` shape, `moduleName`
+ * must be `"default"`, `fileURL('/templates/<name>...')` resolution, the
+ * `hasDownloadMetadata` check that decides whether a browser-side Download
+ * button renders) this file ports byte-for-byte.
+ *
+ * ComfyFed has no local filesystem in a Worker, so the two "packaged"
+ * sources `templates.py` reads off disk become:
+ *
+ * 1. `env.ASSETS.fetch("/comfyfed_templates/<name>")` -- Task 11 places the
+ *    real packaged files (the ten `comfyfed-*` workflows/thumbnails plus
+ *    `index.json`/`index_logo.json`/`assets/<name>`) under
+ *    `cloud/assets/comfyfed_templates/`, served through the `ASSETS`
+ *    binding (see `wrangler.jsonc`'s `assets.directory`).
+ * 2. A same-shaped R2 fallback under the `comfyfed_templates/` prefix on the
+ *    `STORE` bucket, tried when the ASSETS binding has nothing at that path
+ *    (e.g. this task's own tests, or any deployment running before Task 11
+ *    lands the real assets). This lets `comfyfed_templates/<name>` be
+ *    seeded directly into R2 as an operator override or a test fixture with
+ *    zero code changes -- `fetchPackagedRaw` below tries ASSETS first, R2
+ *    second, and callers never see which one answered.
+ *
+ * The official ComfyUI library (fetched by `cloud/scripts/seed-official.mjs`,
+ * this task's port of `official_templates.py`) lives on R2 under the
+ * `official_templates/` prefix -- the SAME prefix `core/model_guide.ts`'s
+ * `harvest()` already reads (Task 9's documented "guess", confirmed and kept
+ * here rather than renamed, per this task's ledger note).
+ *
+ * Merge rule (ComfyFed-first, exactly `_merged_index`/the two index branches
+ * in `templates.py`):
+ * - `index.json` -- ComfyFed's packaged categories, followed by the
+ *   official library's categories if `official_templates/index.json`
+ *   exists and parses as a list. Ours alone if the official side has
+ *   nothing.
+ * - `index.<locale>.json` -- merged the same way, but ONLY if the official
+ *   dir has that exact localized index (no ours-alone fallback here); the
+ *   "ours" half is always the base `index.json`, never a localized packaged
+ *   file (`templates.py` never reads one either). Missing official copy is
+ *   a 404, matching the frontend's own index.json fallback logic.
+ * - `index_logo.json` -- official side only; no packaged copy is ever
+ *   served here, so this 404s until an official fetch has run.
+ * - Any other `<name>.json` -- packaged first (raw passthrough, byte-
+ *   identical, per `test_own_template_workflow_still_served_byte_identical`
+ *   parity), then official with `stripDownloadMetadata` applied. A
+ *   non-dict/unparseable official JSON is served as raw bytes (never
+ *   404s), matching `_cached_stripped_workflow` returning `None` and
+ *   `template_file` falling through to `FileResponse`.
+ * - Non-JSON files (thumbnails/media) -- packaged first, then official,
+ *   raw passthrough either way, content-type from `MEDIA_TYPES` (stated
+ *   outright, like Python, rather than guessed from a host content-type).
+ *
+ * Index-merge caching: a per-isolate cache keyed on the R2 *etag* of the
+ * relevant `official_templates/<index file>` object (an R2 `head`, not a
+ * full `get`) -- a changed/absent official index naturally invalidates the
+ * cache; the packaged side is treated as static (no cache key contribution)
+ * since `env.ASSETS.fetch`/the R2 fallback are cheap, small, static-asset
+ * reads with nothing to invalidate against in a Worker's lifetime.
+ *
+ * Staging seed parity (`seed_staging` in `templates.py`): on the first
+ * `/comfy/templates/*` request an isolate serves, the packaged *input*
+ * assets the templates reference (`amyntas_ref.png`,
+ * `comfyfed_sample_clip.mp4` -- `templates_data/assets/` on the Python
+ * side) are copied into R2 `staging/<name>` if not already present, so a
+ * template's LoadImage/LoadVideo node resolves on the very first run.
+ * Memoized per isolate (a module-level flag, `stagingSeeded`) and per-file
+ * idempotent (an existing `staging/<name>` object is left alone, exactly
+ * like Python's "admin may have replaced it deliberately" rationale) --
+ * `clearTemplatesCacheForTests` resets both caches for test isolation.
+ */
+
+import { Hono } from "hono";
+import type { Env } from "../env";
+import { requireAdmin } from "../lib/guard";
+import { stagingKey } from "../lib/store";
+import { OFFICIAL_TEMPLATES_PREFIX } from "../core/model_guide";
+
+// Content types stated outright, exactly mirroring `templates.py`'s
+// `_MEDIA_TYPES` comment: the frontend hard-checks `templates/index.json`'s
+// content-type and silently shows an empty browser on anything else, so
+// this cannot be left to a host's guess.
+const MEDIA_TYPES: Record<string, string> = {
+  ".json": "application/json",
+  ".webp": "image/webp",
+  ".png": "image/png",
+  ".jpg": "image/jpeg",
+  ".jpeg": "image/jpeg",
+  ".mp4": "video/mp4",
+  ".webm": "video/webm",
+  ".gif": "image/gif",
+  ".mp3": "audio/mpeg",
+};
+
+/** Packaged (ComfyFed's own) template files -- ASSETS binding path prefix
+ * AND the R2 fallback prefix (kept identical on purpose: same relative
+ * layout, two possible sources). */
+const COMFYFED_PREFIX = "comfyfed_templates/";
+
+/** Official ComfyUI template library, seeded by `scripts/seed-official.mjs`
+ * into R2. Re-exported from `core/model_guide.ts` (Task 9's `harvest()`
+ * already reads this prefix) so both files read the exact same constant --
+ * see this module's docstring. */
+export const OFFICIAL_PREFIX = OFFICIAL_TEMPLATES_PREFIX;
+
+/** Library bookkeeping under the official prefix, never a template. */
+const NON_TEMPLATE_NAMES = new Set(["manifest.json"]);
+
+/** The packaged input assets `seed_staging` copies into R2 `staging/` --
+ * ports `templates.py`'s `asset_names()` (there, a directory listing of
+ * `templates_data/assets/`; here, a fixed list since a Worker cannot list
+ * the ASSETS binding's contents). Keep in sync with whatever Task 11 places
+ * under `assets/comfyfed_templates/assets/`. */
+const SEED_ASSET_NAMES = ["amyntas_ref.png", "comfyfed_sample_clip.mp4"];
+
+function extOf(filename: string): string {
+  const i = filename.lastIndexOf(".");
+  return i === -1 ? "" : filename.slice(i).toLowerCase();
+}
+
+/** Ports `template_file`'s filename guard: no subpaths, no drive letters
+ * (Windows `os.path.join` would otherwise resolve `C:x.json` as
+ * drive-relative and escape both roots -- R2 keys and the ASSETS binding
+ * don't have that Windows-specific footgun, but rejecting `:` costs
+ * nothing and keeps the two implementations' accepted-filename sets
+ * identical). */
+function isSafeFilename(filename: string): boolean {
+  return (
+    !!filename &&
+    filename !== "." &&
+    filename !== ".." &&
+    !filename.includes("/") &&
+    !filename.includes("\\") &&
+    !filename.includes(":")
+  );
+}
+
+const DOWNLOAD_KEYS = new Set(["url", "hash", "hash_type"]);
+
+/** Drop `url`/`hash`/`hash_type` from every model entry the frontend could
+ * turn into a Download button, keeping `name` + `directory`. Byte-for-byte
+ * port of `templates.py`'s `_strip_download_metadata`: fully recursive
+ * (reaches `nodes[].properties.models`, a top-level `models` list, AND
+ * `definitions.subgraphs[].nodes[].properties.models` via the same generic
+ * walk, not per-location enumeration), touches only dict entries that carry
+ * a `name` key, and passes non-dict entries (plain-string model names)
+ * through unchanged. Exported for `templates.spec.ts`'s parity fixtures. */
+export function stripDownloadMetadata(value: unknown): unknown {
+  if (Array.isArray(value)) {
+    return value.map(stripDownloadMetadata);
+  }
+  if (typeof value !== "object" || value === null) {
+    return value;
+  }
+
+  const result: Record<string, unknown> = {};
+  for (const [key, val] of Object.entries(value as Record<string, unknown>)) {
+    if (key === "models" && Array.isArray(val)) {
+      result[key] = val.map((entry) => {
+        if (typeof entry === "object" && entry !== null && !Array.isArray(entry) && "name" in entry) {
+          const out: Record<string, unknown> = {};
+          for (const [k, v] of Object.entries(entry as Record<string, unknown>)) {
+            if (!DOWNLOAD_KEYS.has(k)) out[k] = v;
+          }
+          return out;
+        }
+        return entry;
+      });
+    } else {
+      result[key] = stripDownloadMetadata(val);
+    }
+  }
+  return result;
+}
+
+// ---------------------------------------------------------------------------
+// Packaged-file loading: ASSETS binding first, R2 `comfyfed_templates/`
+// fallback second. Returns raw bytes -- content-type is always decided by
+// `MEDIA_TYPES`/the caller, never trusted from either source, matching
+// Python's explicit-mapping stance.
+
+async function fetchPackagedRaw(env: Env, filename: string): Promise<ArrayBuffer | null> {
+  try {
+    const req = new Request(`https://assets.internal/${COMFYFED_PREFIX}${filename}`);
+    const res = await env.ASSETS.fetch(req);
+    if (res.ok) {
+      return await res.arrayBuffer();
+    }
+  } catch (err) {
+    // ASSETS binding unavailable (e.g. no assets built yet) -- fall through
+    // to the R2 fallback rather than failing the request.
+    console.warn("templates: ASSETS.fetch failed for", filename, err);
+  }
+
+  const obj = await env.STORE.get(`${COMFYFED_PREFIX}${filename}`);
+  return obj ? await obj.arrayBuffer() : null;
+}
+
+async function loadPackagedJson(env: Env, filename: string): Promise<unknown> {
+  const raw = await fetchPackagedRaw(env, filename);
+  if (raw === null) return null;
+  try {
+    return JSON.parse(new TextDecoder("utf-8").decode(raw));
+  } catch {
+    return null;
+  }
+}
+
+async function loadOfficialJson(store: R2Bucket, filename: string): Promise<unknown> {
+  const obj = await store.get(`${OFFICIAL_PREFIX}${filename}`);
+  if (!obj) return null;
+  try {
+    return JSON.parse(await obj.text());
+  } catch {
+    return null;
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Index merge, cached per-isolate on the official index object's R2 etag.
+
+interface MergedCacheEntry {
+  etag: string | null;
+  value: unknown[] | null;
+}
+
+const mergedIndexCache = new Map<string, MergedCacheEntry>();
+let stagingSeeded = false;
+
+/** Test-only escape hatch: resets both the index-merge cache and the
+ * staging-seed memoization flag, mirroring the other route files'
+ * `clear*ForTests` exports (see `comfyapi.ts`'s
+ * `clearObjectInfoCacheForTests`). */
+export function clearTemplatesCacheForTests(): void {
+  mergedIndexCache.clear();
+  stagingSeeded = false;
+}
+
+/** `index.json`: ComfyFed's packaged categories, then the official
+ * library's, if present and parseable -- ports `_merged_index`. */
+async function mergedIndex(env: Env): Promise<unknown[] | null> {
+  const key = `${OFFICIAL_PREFIX}index.json`;
+  const head = await env.STORE.head(key);
+  const etag = head?.etag ?? null;
+
+  const cached = mergedIndexCache.get("index.json");
+  if (cached && cached.etag === etag) return cached.value;
+
+  const ours = await loadPackagedJson(env, "index.json");
+  const oursList = Array.isArray(ours) ? ours : [];
+  const official = etag !== null ? await loadOfficialJson(env.STORE, "index.json") : null;
+
+  let value: unknown[] | null;
+  if (Array.isArray(official)) {
+    value = [...oursList, ...official];
+  } else {
+    value = Array.isArray(ours) ? ours : null;
+  }
+
+  mergedIndexCache.set("index.json", { etag, value });
+  return value;
+}
+
+/** `index.<locale>.json`: merged the same way, but the official side MUST
+ * exist and parse as a list -- no ours-alone fallback -- ports the second
+ * `template_file` index branch. The "ours" half is always the base
+ * `index.json`, never a localized packaged file. */
+async function localizedMergedIndex(env: Env, filename: string): Promise<unknown[] | null> {
+  const key = `${OFFICIAL_PREFIX}${filename}`;
+  const head = await env.STORE.head(key);
+  const etag = head?.etag ?? null;
+
+  const cacheKey = `locale:${filename}`;
+  const cached = mergedIndexCache.get(cacheKey);
+  if (cached && cached.etag === etag) return cached.value;
+
+  let value: unknown[] | null = null;
+  if (etag !== null) {
+    const official = await loadOfficialJson(env.STORE, filename);
+    if (Array.isArray(official)) {
+      const ours = await loadPackagedJson(env, "index.json");
+      value = [...(Array.isArray(ours) ? ours : []), ...official];
+    }
+  }
+
+  mergedIndexCache.set(cacheKey, { etag, value });
+  return value;
+}
+
+// ---------------------------------------------------------------------------
+// Staging seed -- ports `seed_staging`, sourced from the packaged assets
+// (ASSETS binding first, R2 `comfyfed_templates/assets/<name>` fallback,
+// same two-source lookup as everything else packaged in this file).
+
+async function seedStagingOnce(env: Env): Promise<void> {
+  if (stagingSeeded) return;
+  stagingSeeded = true; // memoize the ATTEMPT, not success -- one try per isolate
+
+  for (const name of SEED_ASSET_NAMES) {
+    try {
+      const key = stagingKey(name);
+      const existing = await env.STORE.head(key);
+      if (existing) continue; // an admin may have replaced it deliberately
+
+      const body = await fetchPackagedRaw(env, `assets/${name}`);
+      if (body === null) continue;
+      await env.STORE.put(key, body);
+    } catch (err) {
+      console.warn("templates: could not seed staging asset", name, err);
+    }
+  }
+}
+
+// ---------------------------------------------------------------------------
+
+const app = new Hono<{ Bindings: Env }>();
+
+app.use("/comfy/templates/*", requireAdmin);
+
+app.get("/comfy/templates/:filename", async (c) => {
+  const filename = c.req.param("filename");
+  if (!isSafeFilename(filename) || NON_TEMPLATE_NAMES.has(filename)) {
+    return c.body(null, 404);
+  }
+
+  await seedStagingOnce(c.env);
+
+  if (filename === "index_logo.json") {
+    const logo = await loadOfficialJson(c.env.STORE, filename);
+    if (logo === null) return c.body(null, 404);
+    return c.json(logo as Record<string, unknown>);
+  }
+
+  if (filename === "index.json") {
+    const merged = await mergedIndex(c.env);
+    if (merged === null) return c.body(null, 404);
+    return c.json(merged as unknown[]);
+  }
+
+  if (filename.startsWith("index.") && filename.endsWith(".json")) {
+    const merged = await localizedMergedIndex(c.env, filename);
+    if (merged === null) return c.body(null, 404);
+    return c.json(merged as unknown[]);
+  }
+
+  const mediaType = MEDIA_TYPES[extOf(filename)] ?? "application/octet-stream";
+
+  const packaged = await fetchPackagedRaw(c.env, filename);
+  if (packaged !== null) {
+    return new Response(packaged, { headers: { "content-type": mediaType } });
+  }
+
+  const officialObj = await c.env.STORE.get(`${OFFICIAL_PREFIX}${filename}`);
+  if (!officialObj) return c.body(null, 404);
+
+  if (extOf(filename) === ".json") {
+    const text = await officialObj.text();
+    let parsed: unknown;
+    try {
+      parsed = JSON.parse(text);
+    } catch {
+      parsed = undefined;
+    }
+    if (typeof parsed === "object" && parsed !== null && !Array.isArray(parsed)) {
+      return c.json(stripDownloadMetadata(parsed) as Record<string, unknown>);
+    }
+    // Not a JSON object (unparseable/array/etc.) -- serve raw, same as
+    // `_cached_stripped_workflow` returning None and `template_file`
+    // falling through to `FileResponse`.
+    return c.body(text, 200, { "content-type": mediaType });
+  }
+
+  return new Response(await officialObj.arrayBuffer(), { headers: { "content-type": mediaType } });
+});
+
+export default app;

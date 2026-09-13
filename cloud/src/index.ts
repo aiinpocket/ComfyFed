@@ -5,6 +5,7 @@ import settingsRoutes from "./routes/settings";
 import workersRoutes from "./routes/workers";
 import jobsRoutes from "./routes/jobs";
 import comfyapiRoutes from "./routes/comfyapi";
+import templatesRoutes from "./routes/templates";
 
 export { Hub } from "./do/hub";
 export type { Env };
@@ -83,5 +84,6 @@ app.route("/", settingsRoutes);
 app.route("/", workersRoutes);
 app.route("/", jobsRoutes);
 app.route("/", comfyapiRoutes);
+app.route("/", templatesRoutes);
 
 export default app;

@@ -168,7 +168,11 @@ export const SOURCES: Record<string, ModelSource> = {
 // `OFFICIAL_TEMPLATES_PREFIX` below -- the walk/cache logic needs no other
 // change.
 
-const OFFICIAL_TEMPLATES_PREFIX = "official_templates/";
+// Exported so `routes/templates.ts` (Task 10, which owns the R2 key layout
+// this was a documented guess about) reads/writes the SAME prefix instead
+// of duplicating the literal -- Task 10's ledger note confirms this prefix
+// stays as-is.
+export const OFFICIAL_TEMPLATES_PREFIX = "official_templates/";
 const MANIFEST_NAME = "manifest.json";
 const NON_TEMPLATE_PREFIXES = ["index"];
 
