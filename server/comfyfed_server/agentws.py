@@ -10,15 +10,32 @@ Agent -> server message contract (all JSON):
   {"type": "hello", "hardware": {...}, "backend": str, "torch_version": str,
    "node_classes": [str]}
   {"type": "heartbeat", "state": "idle"|"busy", "progress": float,
-   "job_id": str|null, "dynamic": {...}, "object_info_hash": str|null}
+   "job_id": str|null, "dynamic": {...}, "object_info_hash": str|null,
+   "stage": "fetching_models"|absent, "fetch_pct": float|absent,
+   "fetch_model": str|absent}
       -- `object_info_hash` is the agent's current sha256 of its local
          ComfyUI's canonical `/object_info` (see comfyfed_agent.comfy). When
          it doesn't match `Worker.object_info_hash`, or the platform's stored
          snapshot file is missing, the server replies over this same socket
          with `{"type": "want_object_info"}` to trigger a resend.
-  {"type": "inventory", "models": [{"name": str, "size": float}]}
+      -- `stage`/`fetch_pct`/`fetch_model` (Phase 2.1 Task 5 agents) are
+         present while the agent is downloading a missing model before
+         running the job it was pushed (see the `job` push's `fetch_models`
+         below). Stored transiently in `_fetch_progress`, NOT persisted on
+         the Job row, and relayed to the panel as extra fields on the normal
+         `progress` event (`panelws.job_progress`) -- see that function.
+  {"type": "inventory", "models": [{"name": str, "size": float,
+   "size_bytes": int|absent, "sha256": str|absent}]}
       -- `size` is the model file size in GIGABYTES (not bytes); the server
          compares it against VRAM and free-disk figures that are also in GB.
+         `sha256` (Phase 2.1 Task 1 agents) is present once the agent has
+         hashed the file; `size_bytes` (same agents) is the file's EXACT
+         `os.stat().st_size`, additive alongside `size`. Both are fed into
+         `model_manifest.record_hash` for every entry that carries a
+         `sha256` -- see `_record_model_hashes`, which falls back to
+         reconstructing size_bytes from the rounded `size` when an entry
+         has a `sha256` but no `size_bytes` (an agent that hashes but
+         predates the exact field).
   {"type": "job_done", "job_id": str, "result_files": [str],
    "exec_seconds": float|null}
       -- `exec_seconds` is the agent's measurement of actual GPU execution
@@ -33,6 +50,18 @@ Agent -> server message contract (all JSON):
          (omitted/null otherwise). Mints a non-billable `kind=failed`
          receipt -- see `_create_and_push_failure_receipt`.
   {"type": "receipt_ack", "receipt_id": str, "worker_sig": hex}
+
+Server -> agent job push (`{"type": "job", "job_id", "workflow_json",
+"input_assets", "fetch_models"}`, sent from `dispatch_tick`) gains
+`fetch_models` -- the manifest entries (`model_manifest.entries()` shape:
+name/directory/url/backup_url/sha256/size_bytes/sig) for this job's missing
+models -- ONLY when the pushed worker's verdict for this job was
+`eligible_after_fetch`; omitted entirely otherwise (a directly-eligible push
+carries no such key, same wire shape as before Task 4). Never sent to a
+protocol < 3 connection -- `assess._eligible_after_fetch` already gates that
+verdict kind on `protocol >= 3`, so this is enforced twice: once by the
+verdict a worker had to earn to be dispatched at all, and defensively again
+right before the push (see `_fetch_models_for_push`).
 
 Server -> agent also includes `{"type": "want_object_info"}` (see above); the
 full object_info payload itself travels out-of-band over a signed HTTP POST
@@ -64,7 +93,7 @@ from fastapi import APIRouter, WebSocket, WebSocketDisconnect
 from nacl.exceptions import BadSignatureError
 from nacl.signing import SigningKey, VerifyKey
 
-from . import db, dispatch, metrics, panelws, security, workers
+from . import assess, db, dispatch, metrics, model_manifest, panelws, security, workers
 
 logger = logging.getLogger(__name__)
 
@@ -90,6 +119,29 @@ _signing_key: Optional[SigningKey] = None
 # Set by create_router(data_dir); used to check for a worker's stored
 # object_info file when a heartbeat reports drift (see _handle_heartbeat).
 _data_dir: Optional[str] = None
+
+# job_id -> {"stage": "fetching_models", "fetch_pct": float, "fetch_model": str}
+# for a job currently in the pre-run model-download phase (Phase 2.1 Task 5's
+# agent side). Deliberately NOT a Job column: this is live, second-by-second,
+# transient, in-memory, per-process state -- there is nothing here worth
+# surviving a server restart (a fresh heartbeat repopulates it within one
+# tick), unlike a hash conflict (see `db.ModelHash.conflict`), which IS
+# persisted precisely because it must survive one. `jobs._job_dict` reads it
+# via
+# `get_fetch_progress` to add the stage fields to the console's job payload
+# "when present" (see task-4-brief.md); cleared on every transition that
+# ends or restarts a job's lifecycle so a stale stage never lingers after the
+# fetch (or the job) is actually over.
+_fetch_progress: dict[str, dict] = {}
+
+
+def get_fetch_progress(job_id: str) -> Optional[dict]:
+    """Current fetch-stage progress for `job_id`, or None outside that phase."""
+    return _fetch_progress.get(job_id)
+
+
+def _clear_fetch_progress(job_id: str) -> None:
+    _fetch_progress.pop(job_id, None)
 
 
 def _utcnow() -> datetime:
@@ -322,6 +374,7 @@ async def _handle_message(worker_id: str, conn: _Connection, message: dict) -> N
             if dispatch.mark_failed(
                 job_id, worker_id, error, resolve_warn_level=lambda jid: _resolve_warn_level(conn, jid)
             ):
+                _clear_fetch_progress(job_id)
                 await panelws.job_failed(job_id, error)
                 exec_seconds = message.get("exec_seconds")
                 if not _is_valid_exec_seconds(exec_seconds):
@@ -460,6 +513,7 @@ async def cancel_and_notify(job_id: str, *, reason: str) -> bool:
         return False
 
     owner = dispatch.cancel_job(job_id, reason=reason)
+    _clear_fetch_progress(job_id)
 
     if was_running and owner:
         try:
@@ -517,6 +571,7 @@ async def _handle_job_done(worker_id: str, conn: "_Connection", message: dict) -
             await _send_job_cancelled(conn, job_id)
 
     if done:
+        _clear_fetch_progress(job_id)
         await _notify_panel_job_done(job_id)
         exec_seconds = message.get("exec_seconds")
         if not _is_valid_exec_seconds(exec_seconds):
@@ -564,6 +619,12 @@ async def _handle_hello(worker_id: str, conn: "_Connection", message: dict) -> N
         worker.torch_version = message.get("torch_version") or ""
         worker.node_classes = json.dumps(message.get("node_classes") or [])
         worker.protocol = protocol
+        # Agent-side opt-in for manifest-based model auto-fetch (Phase 2.1
+        # Task 1's hello `auto_fetch` field; gate consumed by
+        # `assess.verdict`'s eligible_after_fetch check). Missing/non-bool
+        # degrades to False -- an old or malformed hello must never be read
+        # as consent to download.
+        worker.auto_fetch = message.get("auto_fetch") is True
         worker.status = "online"
         worker.last_seen = _utcnow()
         session.commit()
@@ -610,10 +671,39 @@ async def _handle_heartbeat(worker_id: str, conn: _Connection, message: dict) ->
             job = session.get(db.Job, job_id)
             if job is not None and job.worker_id == worker_id:
                 progress = message.get("progress")
-                if isinstance(progress, (int, float)):
+                progress_reported = isinstance(progress, (int, float))
+                if progress_reported:
                     job.progress = float(progress)
                     session.commit()
-                    await panelws.job_progress(job_id, job.progress)
+
+                # Phase 2.1 Task 4/5: an agent downloading a missing model
+                # before it can run the job reports stage="fetching_models"
+                # alongside its usual progress. Stored transiently (see
+                # `_fetch_progress`'s docstring) rather than as a Job column,
+                # and cleared the moment a heartbeat stops reporting it. The
+                # agent guarantees EVERY heartbeat naming the job during the
+                # fetch phase carries the stage (initial busy beat, progress
+                # reports, and the periodic 30s beat alike -- see runner's
+                # `_JobHandle.fetch_status`), so a stage-less beat reliably
+                # means the download phase is over (or a pre-2.1 agent that
+                # never fetches). That same stage-less beat is also what
+                # lets mark_running below start the run/billing clock.
+                if message.get("stage") == "fetching_models":
+                    fetch_pct = message.get("fetch_pct")
+                    fetch_model = message.get("fetch_model")
+                    _fetch_progress[job_id] = {
+                        "stage": "fetching_models",
+                        "fetch_pct": float(fetch_pct)
+                        if isinstance(fetch_pct, (int, float)) and not isinstance(fetch_pct, bool)
+                        else None,
+                        "fetch_model": fetch_model if isinstance(fetch_model, str) else None,
+                    }
+                else:
+                    _clear_fetch_progress(job_id)
+
+                fetch_fields = _fetch_progress.get(job_id, {})
+                if progress_reported or fetch_fields:
+                    await panelws.job_progress(job_id, job.progress, **fetch_fields)
             else:
                 job_not_owned = True
 
@@ -636,7 +726,19 @@ async def _handle_heartbeat(worker_id: str, conn: _Connection, message: dict) ->
     # Repeats for the same (connection, job id) are rate-limited to DEBUG via
     # resolve_warn_level/_resolve_warn_level, so a stale agent heartbeating
     # every ~30s for the rest of the run doesn't spam WARNING lines for it.
-    if state == "busy" and job_id:
+    #
+    # M1 fix: while the agent is still in the fetch_models pre-phase
+    # (stage="fetching_models"), the job has NOT started running yet -- it's
+    # downloading a prerequisite model, not billable execution. Leaving
+    # started_at unset here (job stays "assigned") means a fetch failure's
+    # failed receipt correctly shows exec_seconds/gpu_seconds == 0.0 (wall
+    # basis with started_at is None -> no false "protocol violation" ERROR,
+    # since that branch is guarded on started_at is not None) and a cancel
+    # mid-fetch mints NO cancelled receipt at all (parity with cancelling a
+    # still-queued job: download time is never billed). started_at gets set
+    # by the first busy heartbeat WITHOUT stage="fetching_models" -- i.e. the
+    # moment the agent actually starts running the job against ComfyUI.
+    if state == "busy" and job_id and message.get("stage") != "fetching_models":
         if dispatch.mark_running(
             job_id, worker_id, resolve_warn_level=lambda jid: _resolve_warn_level(conn, jid)
         ):
@@ -698,12 +800,51 @@ def _normalize_models(models) -> list:
 
 
 def _handle_inventory(worker_id: str, message: dict) -> None:
+    models = _normalize_models(message.get("models") or [])
+
     with db.get_session() as session:
         worker = session.get(db.Worker, worker_id)
         if worker is None:
             return
-        worker.model_inventory = json.dumps(_normalize_models(message.get("models") or []))
+        worker.model_inventory = json.dumps(models)
         session.commit()
+
+    _record_model_hashes(worker_id, models)
+
+
+def _record_model_hashes(worker_id: str, models: list) -> None:
+    """Learn a sha256 for every inventory entry that carries one (Phase 2.1
+    Task 1 agents; older agents send none). Cheap skip for entries without
+    it -- see `model_manifest.record_hash` for the consensus/conflict rule.
+
+    `size_bytes` is preferred when the entry carries it (an exact
+    `os.stat().st_size` from `hardware.scan_models` -- see its docstring):
+    the signed fetch-manifest trust payload must pin the real byte length,
+    not an approximation. Entries from an agent that hashes but predates
+    the exact `size_bytes` field fall back to reconstructing it from the
+    rounded-to-3-decimal-places GB `size` -- lossy (~1 MB resolution), kept
+    only so those agents' reports aren't dropped outright.
+    """
+    for entry in models:
+        sha256 = entry.get("sha256")
+        if not isinstance(sha256, str) or not sha256:
+            continue
+        name = entry.get("name")
+        if not isinstance(name, str) or not name:
+            continue
+
+        size_bytes = entry.get("size_bytes")
+        if isinstance(size_bytes, int) and not isinstance(size_bytes, bool) and size_bytes > 0:
+            exact_size_bytes = size_bytes
+        else:
+            size = entry.get("size")
+            if not isinstance(size, (int, float)) or isinstance(size, bool):
+                continue
+            # Fallback for agents that hash but don't yet report exact
+            # size_bytes: reconstruct from the rounded GB figure.
+            exact_size_bytes = round(size * (1024 ** 3))
+
+        model_manifest.record_hash(worker_id, name, exact_size_bytes, sha256)
 
 
 def _sign_and_store_receipt(
@@ -1033,6 +1174,60 @@ def _handle_receipt_ack(worker_id: str, message: dict) -> None:
         session.commit()
 
 
+def _fetch_models_for_push(
+    job: db.Job,
+    worker: db.Worker,
+    fetchable_models: dict[str, int],
+    manifest_by_name: dict[str, dict],
+) -> list[dict]:
+    """The `fetch_models` manifest entries to embed in this job's push to
+    `worker`, or `[]` when nothing needs fetching.
+
+    `fetchable_models` (name -> size_bytes) is what `assess.verdict` takes;
+    `manifest_by_name` (name -> full manifest entry, same names) is what
+    actually gets embedded in the push once a name is confirmed missing.
+    Both are compiled once per `dispatch_tick`, not per push.
+
+    Recomputes `assess.verdict` for this exact (job, worker) pair rather than
+    threading the winning candidate's missing-model list through
+    `dispatch.assign_jobs`'s return value -- a deliberate choice (see
+    `assign_jobs`'s docstring): that function keeps its original
+    `(worker_id, job)` tuple shape, which a lot of existing tests already
+    unpack, and re-running `verdict` once per push is cheap (the same gates
+    `assign_jobs` just ran a moment ago for this exact candidate). `[]` is
+    passed for `all_workers` -- `verdict` doesn't actually use that parameter
+    (kept only for other assessment call sites, see its docstring).
+    """
+    if not fetchable_models:
+        return []
+
+    try:
+        requirements_override = json.loads(job.requirements or "{}")
+    except (TypeError, ValueError):
+        requirements_override = {}
+
+    needs = assess.needs_from_job(job)
+    v = assess.verdict(worker, needs, requirements_override, [], fetchable_models)
+    if v.kind != "eligible_after_fetch":
+        return []
+
+    # Defensive: `eligible_after_fetch` already requires protocol >= 3 (see
+    # assess._eligible_after_fetch) -- an agent that predates fetch_models
+    # entirely must never receive this key. This should be unreachable; if
+    # it ever fires, that gate has regressed, so it's logged loudly rather
+    # than silently sent.
+    protocol = getattr(worker, "protocol", None)
+    if not isinstance(protocol, int) or isinstance(protocol, bool) or protocol < 3:
+        logger.error(
+            "agentws: refusing to push fetch_models to worker %s (protocol=%r) for job %s "
+            "-- eligible_after_fetch verdict should be unreachable below protocol 3",
+            worker.id, protocol, job.id,
+        )
+        return []
+
+    return [manifest_by_name[name] for name in v.missing_models if name in manifest_by_name]
+
+
 async def dispatch_tick() -> None:
     """One iteration of the background loop: requeue stale jobs, then collect
     every idle connection's worker id and hand the whole batch to
@@ -1054,14 +1249,32 @@ async def dispatch_tick() -> None:
     if requeued:
         try:
             for job_id in requeued:
+                _clear_fetch_progress(job_id)
                 await panelws.job_requeued(job_id)
             await panelws.job_status_refresh()
         except Exception:
             logger.exception("agentws: failed to relay requeued jobs to the panel")
 
+    # Compiled ONCE per sweep, not per candidate/job: `fetchable_models`
+    # (name -> size_bytes) feeds `assess.verdict` inside `assign_jobs`'s
+    # ranking AND the per-push recompute below; `manifest_by_name` (name ->
+    # full signed entry) is what actually gets embedded in a `fetch_models`
+    # push once a name is confirmed missing. `_data_dir` unset (no router
+    # registered -- practically only in ad-hoc tests) degrades to "nothing
+    # fetchable", identical to Task 3's default.
+    fetchable_models: dict[str, int] = {}
+    manifest_by_name: dict[str, dict] = {}
+    if _data_dir is not None:
+        try:
+            manifest_entries = model_manifest.entries(_data_dir)
+            fetchable_models = {e["name"]: e["size_bytes"] for e in manifest_entries}
+            manifest_by_name = {e["name"]: e for e in manifest_entries}
+        except Exception:
+            logger.exception("agentws: failed to build fetch manifest for dispatch tick")
+
     idle_worker_ids = [worker_id for worker_id, conn in _connections.items() if conn.state == "idle"]
     try:
-        assignments = dispatch.assign_jobs(idle_worker_ids)
+        assignments = dispatch.assign_jobs(idle_worker_ids, fetchable_models)
     except Exception:
         logger.exception("agentws: assign_jobs failed")
         assignments = []
@@ -1071,14 +1284,22 @@ async def dispatch_tick() -> None:
         if conn is None:
             continue
         try:
-            await conn.ws.send_json(
-                {
-                    "type": "job",
-                    "job_id": job.id,
-                    "workflow_json": job.workflow_json,
-                    "input_assets": json.loads(job.input_assets or "[]"),
-                }
-            )
+            frame = {
+                "type": "job",
+                "job_id": job.id,
+                "workflow_json": job.workflow_json,
+                "input_assets": json.loads(job.input_assets or "[]"),
+            }
+            if fetchable_models:
+                with db.get_session() as session:
+                    worker = session.get(db.Worker, worker_id)
+                if worker is not None:
+                    fetch_models = _fetch_models_for_push(
+                        job, worker, fetchable_models, manifest_by_name
+                    )
+                    if fetch_models:
+                        frame["fetch_models"] = fetch_models
+            await conn.ws.send_json(frame)
             # Presume busy until the next heartbeat says otherwise, so we
             # don't double-push before the agent has a chance to report in.
             conn.state = "dispatched"

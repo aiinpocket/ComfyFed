@@ -10,7 +10,7 @@ from typing import Optional
 from fastapi import APIRouter, Depends, File, Form, HTTPException, Request, UploadFile
 from fastapi.responses import FileResponse, JSONResponse
 
-from . import agentws, assess, auth, db, dispatch, storage
+from . import agentws, assess, auth, db, dispatch, model_guide, model_manifest, storage
 from .workers import verify_agent
 
 _JOB_INPUTS_DIRNAME = "job_inputs"
@@ -37,6 +37,45 @@ class MissingAssetsError(Exception):
 def job_inputs_dir(data_dir: str, job_id: str) -> str:
     """Directory holding a job's staged input assets."""
     return os.path.join(data_dir, _JOB_INPUTS_DIRNAME, job_id)
+
+
+def _online_enabled_workers(session) -> list:
+    """Workers eligible to be asked to auto-fetch: online and not disabled.
+
+    Same definition `comfyapi._online_enabled_workers` uses -- kept as its own
+    small query here rather than imported cross-module to avoid a
+    jobs<->comfyapi import cycle (comfyapi already imports this module).
+    """
+    return (
+        session.query(db.Worker)
+        .filter(db.Worker.disabled == False)  # noqa: E712
+        .filter(db.Worker.status != "offline")
+        .all()
+    )
+
+
+def unfetchable_missing_models(needs: assess.JobNeeds, data_dir: str) -> set[str]:
+    """The console submit predicate: fleet-wide missing models that are ALSO
+    not fetchable by anyone (see `assess.partition_fleet_fetchable`).
+
+    Shared by `POST /api/jobs` (the 400 gate below) and nothing else yet --
+    a standalone function rather than inlined in the route so a future
+    caller (or a test) can ask "would this submit be rejected" without
+    going through HTTP.
+    """
+    with db.get_session() as session:
+        all_workers = session.query(db.Worker).all()
+        online_workers = _online_enabled_workers(session)
+
+    missing_models, _missing_nodes = assess.fleet_wide_gaps(needs, all_workers)
+    if not missing_models:
+        return set()
+
+    fetchable_map = {e["name"]: e["size_bytes"] for e in model_manifest.entries(data_dir)}
+    _fetchable, unfetchable = assess.partition_fleet_fetchable(
+        missing_models, fetchable_map, online_workers
+    )
+    return unfetchable
 
 
 def create_job(
@@ -92,7 +131,7 @@ def create_job(
 
 
 def _job_dict(job: db.Job) -> dict:
-    return {
+    d = {
         "id": job.id,
         "status": job.status,
         "origin": job.origin,
@@ -104,6 +143,17 @@ def _job_dict(job: db.Job) -> dict:
         "input_assets": json.loads(job.input_assets or "[]"),
         "est_vram_gb": job.est_vram_gb,
     }
+    # Phase 2.1: transient model-auto-fetch progress (stage/fetch_pct/
+    # fetch_model), NOT a Job column -- see agentws._fetch_progress's
+    # docstring. Added only while the job is actually in that phase, so an
+    # ordinary job's dict shape is unchanged. A field the agent didn't send
+    # a valid value for (fetch_pct/fetch_model can be None -- see
+    # _handle_heartbeat) is OMITTED rather than sent as an explicit null,
+    # matching panelws.job_progress's omit-if-None style for the same data.
+    fetch_progress = agentws.get_fetch_progress(job.id)
+    if fetch_progress:
+        d.update({k: v for k, v in fetch_progress.items() if v is not None})
+    return d
 
 
 def _receipt_dict(receipt: db.Receipt) -> dict:
@@ -163,6 +213,16 @@ def create_router(data_dir: str) -> APIRouter:
             except ValueError:
                 raise _error(400, "jobs.bad_asset_name", f"Invalid asset filename: {upload.filename!r}")
             uploaded_names.append(filename)
+
+        needs = assess.extract(workflow)
+        unfetchable = unfetchable_missing_models(needs, data_dir)
+        if unfetchable:
+            names = sorted(unfetchable)
+            raise _error(
+                400,
+                "jobs.missing_models",
+                model_guide.guidance_message(names, data_dir),
+            )
 
         try:
             job_id = create_job(
@@ -232,20 +292,26 @@ def create_router(data_dir: str) -> APIRouter:
 
             all_workers = session.query(db.Worker).filter(db.Worker.disabled == False).all()  # noqa: E712
 
-            results = []
-            for worker in all_workers:
-                v = assess.verdict(worker, needs, requirements_override, all_workers)
-                results.append(
-                    {
-                        "worker_id": worker.id,
-                        "name": worker.name,
-                        "verdict": v.kind,
-                        "reasons": v.reasons,
-                        "warnings": v.warnings,
-                        "missing_models": v.missing_models,
-                    }
-                )
-            return {"workers": results}
+        # Phase 2.1: same signed manifest dispatch/submission use, so the
+        # assessment display's eligible_after_fetch column matches what would
+        # actually happen at dispatch time -- built once, outside the session
+        # above (model_manifest.entries opens its own).
+        fetchable_models = {e["name"]: e["size_bytes"] for e in model_manifest.entries(data_dir)}
+
+        results = []
+        for worker in all_workers:
+            v = assess.verdict(worker, needs, requirements_override, all_workers, fetchable_models)
+            results.append(
+                {
+                    "worker_id": worker.id,
+                    "name": worker.name,
+                    "verdict": v.kind,
+                    "reasons": v.reasons,
+                    "warnings": v.warnings,
+                    "missing_models": v.missing_models,
+                }
+            )
+        return {"workers": results}
 
     @r.get("/api/agent/jobs/{job_id}/inputs/{filename}")
     def get_job_input(job_id: str, filename: str, worker: db.Worker = Depends(verify_agent)):

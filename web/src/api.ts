@@ -177,6 +177,14 @@ export interface Job {
   result_files: string[];
   input_assets: string[];
   est_vram_gb: number | null;
+  /**
+   * Present only while a worker is fetching a missing model for this job
+   * (Phase 2.1 model auto-fetch). Absent the rest of the time, in which case
+   * rendering falls back to the plain progress bar.
+   */
+  stage?: 'fetching_models' | string;
+  fetch_pct?: number;
+  fetch_model?: string;
 }
 
 /** Dual-signed job receipt summary, embedded in `GET /api/jobs/{id}` once one exists. */

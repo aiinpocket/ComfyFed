@@ -137,6 +137,44 @@ function stubFetch(jobsSequence: Job[][]) {
   return fetchMock;
 }
 
+const FETCHING_JOB: Job = {
+  id: 'job-fetching-0004',
+  status: 'running',
+  origin: 'console',
+  progress: 0,
+  worker_id: 'w1',
+  created_at: '2026-09-13T00:00:00Z',
+  error: null,
+  result_files: [],
+  input_assets: [],
+  est_vram_gb: null,
+  stage: 'fetching_models',
+  fetch_pct: 42,
+  fetch_model: 'sd_xl_base_1.0.safetensors',
+};
+
+describe('Jobs page: model auto-fetch progress', () => {
+  afterEach(() => {
+    cleanup();
+    vi.unstubAllGlobals();
+  });
+
+  it('shows a downloading-models chip with percentage while stage is fetching_models', async () => {
+    stubFetch([[FETCHING_JOB]]);
+    renderJobs();
+
+    expect(await screen.findByText(/Downloading model.*42%/)).toBeInTheDocument();
+  });
+
+  it('does not show the fetch chip once stage is absent (normal progress rendering)', async () => {
+    stubFetch([[RUNNING_JOB]]);
+    renderJobs();
+
+    await screen.findByText('Running');
+    expect(screen.queryByText(/Downloading model/)).not.toBeInTheDocument();
+  });
+});
+
 describe('Jobs page: cancellation', () => {
   afterEach(() => {
     cleanup();

@@ -58,6 +58,7 @@ import { sha256Hex } from "../lib/hex";
 import { bytesToBase64Url } from "../lib/base64";
 import { verifyAgentRequest, type VerifyAgentResult } from "../lib/verify_agent";
 import { requireAdmin, requireCsrf, errorJson } from "../lib/guard";
+import * as modelManifest from "../core/model_manifest";
 
 const PLATFORM_URL_KEY = "platform_url";
 
@@ -280,6 +281,30 @@ app.get("/api/agent/version", async (c) => {
     sha256: await setting(AGENT_WHEEL_SHA256_KEY, null),
     platform_sig: await setting(AGENT_WHEEL_SIG_KEY, null),
   });
+});
+
+// --- /api/agent/manifest / /api/models/manifest (Phase 2.1 Task 7) -----------
+//
+// Both return `{entries: [...]}` from `model_manifest.entries()` -- the agent
+// route (signed-agent auth) is also called internally by dispatch/auto-fetch
+// code (`do/hub.ts`'s dispatch tick), not just over HTTP. A hash conflict is
+// excluded via a plain SQL predicate (`queries.getAllModelHashes`'s
+// `conflict = 0`), so this route (and every other caller) sees exactly the
+// same exclusion the Hub DO sees, with no in-memory state to be missing.
+
+app.get("/api/agent/manifest", async (c) => {
+  const outcome = await verifyAgent(c, new Uint8Array());
+  if (!outcome.ok) return errorJson(c, outcome.status, outcome.code, outcome.message);
+
+  const seed = await resolvePlatformSeed(c.env.DB, c.env.PLATFORM_ED25519_SEED);
+  const entries = await modelManifest.entries(c.env.DB, c.env.STORE, seed);
+  return c.json({ entries });
+});
+
+app.get("/api/models/manifest", requireAdmin, async (c) => {
+  const seed = await resolvePlatformSeed(c.env.DB, c.env.PLATFORM_ED25519_SEED);
+  const entries = await modelManifest.entries(c.env.DB, c.env.STORE, seed);
+  return c.json({ entries });
 });
 
 // --- POST /api/workers/{id}/disable --------------------------------------------

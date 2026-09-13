@@ -179,6 +179,14 @@
         "payload": "1.10.0|deadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeef",
         "signature_hex": "54403c897b5f695f9f2517a1eeb600e7abdddb3d873167abbfe9a232a9f1e671b4c2cd8f95dce06bd2dfb762016cbea15192f4a1a47532d192793bf6c972e80c"
       },
+      "manifest_entry_sample": {
+        "name": "clip_l.safetensors",
+        "directory": "text_encoders",
+        "sha256_hex": "46ca76798c1fdfd019e9f9fdeab094546f9efb720da7621565ecc1e23961e956",
+        "size_bytes": 246973974,
+        "payload": "clip_l.safetensors|text_encoders|46ca76798c1fdfd019e9f9fdeab094546f9efb720da7621565ecc1e23961e956|246973974",
+        "signature_hex": "50f8e1c190596fbb303088f9fdc99c8527efcee0baae476749f5ee8452acac79a4d93ddde183bff29d9e6a1062c8c77bf46b3a5df0e21df1c8d80534ddf51408"
+      },
       "signed_request_sample": {
         "method": "POST",
         "path": "/api/agent/jobs/job-abc123/artifacts/raw/tok-xyz",
@@ -379,6 +387,14 @@
         "payload": "1.10.0|deadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeef",
         "signature_hex": "3f3523ad0005c957c7e557c711623b1228ffaaae61a291b8d96cad2efef5dd9c17a7754f80281adf6afce7ce39041a9279377a7019abfd186304d8157feaa907"
       },
+      "manifest_entry_sample": {
+        "name": "clip_l.safetensors",
+        "directory": "text_encoders",
+        "sha256_hex": "46ca76798c1fdfd019e9f9fdeab094546f9efb720da7621565ecc1e23961e956",
+        "size_bytes": 246973974,
+        "payload": "clip_l.safetensors|text_encoders|46ca76798c1fdfd019e9f9fdeab094546f9efb720da7621565ecc1e23961e956|246973974",
+        "signature_hex": "a3a2fdfb6cc192c9d31414839ed39eb0e4ab52d0725a99a2dc097ac1cca51102ffdcbfdd31b244e211e8dee51509191b02bc9ddb3b9eb6f491b3065e1db68702"
+      },
       "signed_request_sample": {
         "method": "POST",
         "path": "/api/agent/jobs/job-abc123/artifacts/raw/tok-xyz",
@@ -578,6 +594,14 @@
         "sha256_hex": "deadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeef",
         "payload": "1.10.0|deadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeef",
         "signature_hex": "3b4028edeef9308639c01547b22ef243986e4a3e28d52a421b055a1632a2867df8f8fc1d1b292d5983a8b10bceacc3d5aef3e00ebd4c76e744371f70a6d1f900"
+      },
+      "manifest_entry_sample": {
+        "name": "clip_l.safetensors",
+        "directory": "text_encoders",
+        "sha256_hex": "46ca76798c1fdfd019e9f9fdeab094546f9efb720da7621565ecc1e23961e956",
+        "size_bytes": 246973974,
+        "payload": "clip_l.safetensors|text_encoders|46ca76798c1fdfd019e9f9fdeab094546f9efb720da7621565ecc1e23961e956|246973974",
+        "signature_hex": "a642d73c0434376fa5b7d64ac86f4e1f732f5da2cf42c89f3b72c129c0da2300322b6883c1a43b0ef24b7f4853c8c41a79ddee6278d53271c59e3dd58f649406"
       },
       "signed_request_sample": {
         "method": "POST",

@@ -7,6 +7,20 @@ import os
 from dataclasses import asdict, dataclass, field
 
 
+def _coerce_positive_float(value, default: float) -> float:
+    """`max_fetch_gb` from agent.json, defensively: a string like "30" is
+    accepted, anything non-numeric or <= 0 falls back to the default instead
+    of blowing up later inside fetcher's budget check as an opaque
+    job_failed (final-review m4)."""
+    try:
+        result = float(value)
+    except (TypeError, ValueError):
+        return default
+    if result != result or result <= 0:  # NaN or non-positive
+        return default
+    return result
+
+
 @dataclass
 class PlatformEntry:
     platform_url: str
@@ -30,6 +44,14 @@ class AgentConfig:
     # never guesses where ComfyUI's own input/output folders live.
     comfy_output_dir: str | None = None
     comfy_input_dir: str | None = None
+    # Phase 2.1 model auto-distribution groundwork (protocol 3). `hash_models`
+    # gates scan_models' lazy sha256 hashing entirely; `auto_fetch_models` is
+    # only advertised in `hello` here -- the platform-driven fetch itself is
+    # Tasks 2-4. `max_fetch_gb` bounds how much this worker is willing to pull
+    # down automatically once that lands.
+    hash_models: bool = True
+    auto_fetch_models: bool = False
+    max_fetch_gb: float = 30
 
     @classmethod
     def load(cls, path: str) -> "AgentConfig":
@@ -50,6 +72,11 @@ class AgentConfig:
             auto_update=data.get("auto_update", cls.auto_update),
             comfy_output_dir=data.get("comfy_output_dir"),
             comfy_input_dir=data.get("comfy_input_dir"),
+            hash_models=data.get("hash_models", cls.hash_models),
+            auto_fetch_models=data.get("auto_fetch_models", cls.auto_fetch_models),
+            max_fetch_gb=_coerce_positive_float(
+                data.get("max_fetch_gb"), cls.max_fetch_gb
+            ),
         )
 
     def save(self, path: str) -> None:
@@ -67,6 +94,9 @@ class AgentConfig:
             "auto_update": self.auto_update,
             "comfy_output_dir": self.comfy_output_dir,
             "comfy_input_dir": self.comfy_input_dir,
+            "hash_models": self.hash_models,
+            "auto_fetch_models": self.auto_fetch_models,
+            "max_fetch_gb": self.max_fetch_gb,
         }
 
         tmp_path = f"{path}.tmp-{os.getpid()}"

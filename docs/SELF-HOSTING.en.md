@@ -146,6 +146,34 @@ To have the agent clean those up too, set in `agent.json`:
 
 With these set, the agent deletes a job's files ONLY once that job succeeded AND its artifact hashes were confirmed by the platform (reconstructing each output's path from the filename/subfolder ComfyUI's history reported, and refusing to touch anything outside the configured directories). Leave them unset and the agent skips this step entirely — it never guesses where ComfyUI's folders are. A failed job's ComfyUI-side outputs are always left in place so you can inspect what happened.
 
+### Auto-fetch models (optional)
+
+The platform can dispatch a job together with the models it needs that this worker is missing, and the agent downloads them itself before running the job instead of the job simply being ruled `ineligible`. **Off by default** — opt in via `agent.json`:
+
+```json
+{
+  "auto_fetch_models": true,
+  "max_fetch_gb": 30,
+  "hash_models": true
+}
+```
+
+- `auto_fetch_models` (default `false`): while off, this worker is never dispatched a job carrying `fetch_models` — identical to pre-2.1 behavior.
+- `max_fetch_gb` (default `30`): the most this worker will download for a single job, in GB. Over budget or insufficient free disk both refuse the whole batch up front — never a half-downloaded failure.
+- `hash_models` (default `true`): turning this off stops the agent from scanning/hashing local models at all, which also means the server can never learn this worker's models well enough to offer them to others — and, as a side effect, this worker can no longer auto-fetch models either.
+
+**Trust model**: the platform Ed25519-signs the fetch manifest; the agent verifies that signature before downloading anything, then verifies each file's sha256 after it lands. Both checks must pass before the file is moved into place under `models_dir`'s matching subfolder — a bad signature or hash mismatch rejects the whole batch, leaving no partial files behind. Downloads always land under `models_dir`; the agent sanitizes every path so a manifest entry can never write outside it.
+
+Download progress shows on the job's card in the console (`stage: "fetching_models"` plus a percentage and the current filename). Once a download completes, the model isn't recorded as "this worker has it" until the next periodic local scan (up to 10 minutes later) reports its hash to the server.
+
+**A hash conflict is permanent and needs manual recovery**: if two workers report different sha256 values for the same name/size (usually a corrupted or swapped file on one of them), the server logs a `model_manifest: sha256 conflict for ...` WARNING and marks that `model_hashes` row as conflicted (`conflict = 1`), permanently excluding it from the fetch manifest from then on — it does **not** self-heal on restart or on a later, correct report. Once you've confirmed which copy is right, an admin has to fix it directly in the database:
+
+```sql
+UPDATE model_hashes SET conflict = 0 WHERE name = '...' AND size_bytes = ...;
+```
+
+There's no admin-UI conflict-resolution button this phase — this manual query is the only recovery path.
+
 ### Job assessment
 
 When a job arrives, the server automatically extracts the node classes, model files, and (when known) VRAM needs from the workflow, and rules on each candidate worker:

@@ -1,4 +1,5 @@
 import asyncio
+import hashlib
 import json
 import logging
 import math
@@ -10,7 +11,7 @@ from nacl.signing import SigningKey
 from starlette.websockets import WebSocketDisconnect
 
 from comfyfed_server import agentws, app as app_module
-from comfyfed_server import bootstrap, db, dispatch
+from comfyfed_server import bootstrap, db, dispatch, model_manifest
 
 
 @pytest.fixture()
@@ -21,7 +22,12 @@ def client(tmp_path):
     c = TestClient(app)
     c.admin_password = result.admin_password
     c.data_dir = data_dir
-    return c
+    yield c
+    # Module-level, in-memory, per-process (see agentws._fetch_progress) --
+    # reset between tests. Hash-conflict state is persisted on the
+    # model_hashes row itself now (migration c9d0e1f2a3b4) and each test
+    # gets a fresh tmp_path database, so there's nothing to reset for that.
+    agentws._fetch_progress.clear()
 
 
 def _login(client):
@@ -169,6 +175,153 @@ def test_enqueued_job_pushed_to_idle_worker_and_job_done_marks_complete(client):
             assert json.loads(job.result_files) == ["out.png"]
 
 
+def test_job_push_omits_fetch_models_for_a_directly_eligible_worker(client):
+    """The ordinary push shape (no model gap at all) must carry no
+    `fetch_models` key -- Task 4 is purely additive."""
+    csrf = _login(client)
+    worker_id, sk = _register_worker(client, csrf, "w1")
+    job_id = _submit(client, csrf)
+
+    with client.websocket_connect("/api/agent/ws") as ws:
+        challenge = ws.receive_json()
+        sig = sk.sign(challenge["nonce"].encode()).signature.hex()
+        ws.send_json({"type": "auth", "worker_id": worker_id, "sig": sig})
+        assert ws.receive_json()["type"] == "ready"
+
+        ws.send_json({"type": "heartbeat", "state": "idle", "progress": 0.0, "job_id": None, "dynamic": {}})
+        agentws.dispatch_once(worker_id)
+
+        job_msg = ws.receive_json()
+        assert job_msg["type"] == "job"
+        assert job_msg["job_id"] == job_id
+        assert "fetch_models" not in job_msg
+
+
+def _bytes(gb: float) -> int:
+    return round(gb * (1024 ** 3))
+
+
+def _sha(label: str) -> str:
+    return hashlib.sha256(label.encode()).hexdigest()
+
+
+def test_job_push_includes_fetch_models_for_an_eligible_after_fetch_worker(client):
+    """The winning eligible_after_fetch worker's push carries `fetch_models`:
+    the full manifest entries for exactly its missing models."""
+    csrf = _login(client)
+    model_manifest.record_hash(
+        "some-worker", "diffusion_models/flux1-dev.safetensors", _bytes(22.17), _sha("flux")
+    )
+    worker_id, sk = _register_worker(client, csrf, "w1")
+    # The console submit predicate (jobs.py) needs an ONLINE, opted-in worker
+    # to accept a fetchable-missing model at submission time -- set that up
+    # before submitting, then re-declare it for real over the WS hello below
+    # (which is what actually matters for dispatch ranking).
+    with db.get_session() as session:
+        worker = session.get(db.Worker, worker_id)
+        worker.status = "online"
+        worker.protocol = 3
+        worker.auto_fetch = True
+        worker.dynamic = json.dumps({"free_disk_gb": 100.0})
+        session.commit()
+
+    workflow = {"1": {"class_type": "UNETLoader", "inputs": {"unet_name": "flux1-dev.safetensors"}}}
+    job_id = _submit(client, csrf, workflow=workflow)
+
+    with client.websocket_connect("/api/agent/ws") as ws:
+        challenge = ws.receive_json()
+        sig = sk.sign(challenge["nonce"].encode()).signature.hex()
+        ws.send_json({"type": "auth", "worker_id": worker_id, "sig": sig})
+        assert ws.receive_json()["type"] == "ready"
+
+        ws.send_json(
+            {
+                "type": "hello",
+                "hardware": {},
+                "backend": "cuda",
+                "torch_version": "",
+                "node_classes": [],
+                "protocol": 3,
+                "auto_fetch": True,
+            }
+        )
+        ws.send_json(
+            {
+                "type": "heartbeat",
+                "state": "idle",
+                "progress": 0.0,
+                "job_id": None,
+                "dynamic": {"free_disk_gb": 100.0},
+            }
+        )
+        agentws.dispatch_once(worker_id)
+
+        job_msg = ws.receive_json()
+        assert job_msg["type"] == "job"
+        assert job_msg["job_id"] == job_id
+        assert "fetch_models" in job_msg
+        entries = job_msg["fetch_models"]
+        assert len(entries) == 1
+        assert entries[0]["name"] == "flux1-dev.safetensors"
+        assert entries[0]["size_bytes"] == _bytes(22.17)
+        assert entries[0]["sha256"] == _sha("flux")
+
+    with db.get_session() as session:
+        assert session.get(db.Job, job_id).status == "assigned"
+
+
+def test_job_push_never_sent_to_a_protocol_2_worker_even_when_manifest_covers_it(client):
+    """Defensive gate: a protocol<3 agent can never be dispatched an
+    eligible_after_fetch job at all (assess._eligible_after_fetch already
+    excludes it), so the job simply stays queued rather than being pushed
+    without fetch_models."""
+    csrf = _login(client)
+    model_manifest.record_hash(
+        "some-worker", "diffusion_models/flux1-dev.safetensors", _bytes(22.17), _sha("flux")
+    )
+    worker_id, sk = _register_worker(client, csrf, "w1")
+
+    workflow = {"1": {"class_type": "UNETLoader", "inputs": {"unet_name": "flux1-dev.safetensors"}}}
+
+    with client.websocket_connect("/api/agent/ws") as ws:
+        challenge = ws.receive_json()
+        sig = sk.sign(challenge["nonce"].encode()).signature.hex()
+        ws.send_json({"type": "auth", "worker_id": worker_id, "sig": sig})
+        assert ws.receive_json()["type"] == "ready"
+
+        _send_hello_v2(ws)  # protocol 2
+        with db.get_session() as session:
+            worker = session.get(db.Worker, worker_id)
+            worker.auto_fetch = True
+            worker.dynamic = json.dumps({"free_disk_gb": 100.0})
+            session.commit()
+
+        # Registering this worker (w1) makes the model missing-everywhere but
+        # the manifest entry above still requires an ONLINE, protocol>=3,
+        # opted-in worker to be considered fetchable at submission time --
+        # a bare-registered second worker at protocol 3 supplies that so the
+        # console predicate accepts the submission (Task 4's own concern is
+        # dispatch, not submission, for this test).
+        other_id = _register_worker(client, csrf, "w2")[0]
+        with db.get_session() as session:
+            other = session.get(db.Worker, other_id)
+            other.status = "online"
+            other.protocol = 3
+            other.auto_fetch = True
+            other.dynamic = json.dumps({"free_disk_gb": 100.0})
+            session.commit()
+
+        job_id = _submit(client, csrf, workflow=workflow)
+
+        ws.send_json({"type": "heartbeat", "state": "idle", "progress": 0.0, "job_id": None, "dynamic": {"free_disk_gb": 100.0}})
+        agentws.dispatch_once(worker_id)
+
+    # w1 (protocol 2) must never win this job even though it's otherwise the
+    # only idle connection dispatch_tick sees -- it stays queued.
+    with db.get_session() as session:
+        assert session.get(db.Job, job_id).status == "queued"
+
+
 def test_job_failed_marks_job_failed(client):
     csrf = _login(client)
     worker_id, sk = _register_worker(client, csrf, "w1")
@@ -259,6 +412,150 @@ def test_busy_heartbeat_marks_the_assigned_job_running(client):
         with db.get_session() as session:
             receipt = session.get(db.Receipt, receipt_msg["receipt_id"])
             assert receipt.gpu_seconds > 0
+
+
+def test_fetch_stage_heartbeat_does_not_start_the_job_running(client):
+    """M1: a busy heartbeat carrying stage="fetching_models" is the agent
+    downloading a prerequisite model, not billable execution -- it must NOT
+    flip the job to "running" or stamp started_at. Only the first busy
+    heartbeat WITHOUT that stage (the actual run starting) does."""
+    csrf = _login(client)
+    worker_id, sk = _register_worker(client, csrf, "w1")
+    job_id = _submit(client, csrf)
+
+    with client.websocket_connect("/api/agent/ws") as ws:
+        challenge = ws.receive_json()
+        sig = sk.sign(challenge["nonce"].encode()).signature.hex()
+        ws.send_json({"type": "auth", "worker_id": worker_id, "sig": sig})
+        assert ws.receive_json()["type"] == "ready"
+
+        ws.send_json({"type": "heartbeat", "state": "idle", "progress": 0.0, "job_id": None, "dynamic": {}})
+        agentws.dispatch_once(worker_id)
+        assert ws.receive_json()["type"] == "job"
+
+        ws.send_json(
+            {
+                "type": "heartbeat",
+                "state": "busy",
+                "progress": 0.0,
+                "job_id": job_id,
+                "dynamic": {},
+                "stage": "fetching_models",
+                "fetch_pct": 42.0,
+                "fetch_model": "model.safetensors",
+            }
+        )
+        agentws.dispatch_once(worker_id)
+
+        with db.get_session() as session:
+            job = session.get(db.Job, job_id)
+            assert job.status == "assigned"
+            assert job.started_at is None
+
+        # The download finishes and the run actually starts: a busy
+        # heartbeat with no stage field now sets started_at.
+        ws.send_json({"type": "heartbeat", "state": "busy", "progress": 0.0, "job_id": job_id, "dynamic": {}})
+        agentws.dispatch_once(worker_id)
+
+        with db.get_session() as session:
+            job = session.get(db.Job, job_id)
+            assert job.status == "running"
+            assert job.started_at is not None
+
+
+def test_fetch_fail_receipt_is_zero_gpu_seconds_with_no_protocol_violation_log(client, caplog):
+    """M1: a fetch-phase failure must bill gpu_seconds 0.0 (nothing ran) and
+    must NOT trip the "protocol violation: ... despite having started" ERROR
+    -- that branch is (correctly) guarded on started_at is not None, and
+    started_at was never set for a job that failed during the fetch phase."""
+    csrf = _login(client)
+    worker_id, sk = _register_worker(client, csrf, "w1")
+    job_id = _submit(client, csrf)
+
+    ws = _connect(client, worker_id, sk)
+    try:
+        _send_hello_v2(ws)  # protocol 2 -- the branch this guards against
+        ws.send_json({"type": "heartbeat", "state": "idle", "progress": 0.0, "job_id": None, "dynamic": {}})
+        agentws.dispatch_once(worker_id)
+        assert ws.receive_json()["type"] == "job"
+
+        ws.send_json(
+            {
+                "type": "heartbeat",
+                "state": "busy",
+                "progress": 0.0,
+                "job_id": job_id,
+                "dynamic": {},
+                "stage": "fetching_models",
+                "fetch_pct": 10.0,
+                "fetch_model": "model.safetensors",
+            }
+        )
+        agentws.dispatch_once(worker_id)
+
+        with db.get_session() as session:
+            assert session.get(db.Job, job_id).started_at is None
+
+        with caplog.at_level(logging.ERROR, logger="comfyfed_server.agentws"):
+            ws.send_json(
+                {"type": "job_failed", "job_id": job_id, "error": "模型下載失敗 / model fetch failed"}
+            )
+            agentws.dispatch_once(worker_id)
+            receipt_msg = ws.receive_json()
+
+        errors = [r for r in caplog.records if r.levelno >= logging.ERROR]
+        assert not errors, f"unexpected ERROR log(s) on fetch-phase failure: {errors}"
+
+        assert receipt_msg["type"] == "receipt"
+        assert receipt_msg["kind"] == "failed"
+        assert receipt_msg["basis"] == "wall"
+
+        with db.get_session() as session:
+            receipt = session.get(db.Receipt, receipt_msg["receipt_id"])
+            assert receipt.gpu_seconds == 0.0
+    finally:
+        ws.close()
+
+
+def test_cancel_mid_fetch_mints_no_receipt(client):
+    """M1: cancelling a job while it is still in the fetch phase (started_at
+    unset) must mint NO cancelled receipt at all -- parity with cancelling a
+    still-queued/merely-assigned job. Download time is never billed."""
+    csrf = _login(client)
+    worker_id, sk = _register_worker(client, csrf, "w1")
+    job_id = _submit(client, csrf)
+
+    ws = _connect(client, worker_id, sk)
+    try:
+        _send_hello_v2(ws)
+        ws.send_json({"type": "heartbeat", "state": "idle", "progress": 0.0, "job_id": None, "dynamic": {}})
+        agentws.dispatch_once(worker_id)
+        assert ws.receive_json()["type"] == "job"
+
+        ws.send_json(
+            {
+                "type": "heartbeat",
+                "state": "busy",
+                "progress": 0.0,
+                "job_id": job_id,
+                "dynamic": {},
+                "stage": "fetching_models",
+                "fetch_pct": 5.0,
+                "fetch_model": "model.safetensors",
+            }
+        )
+        agentws.dispatch_once(worker_id)
+
+        with db.get_session() as session:
+            assert session.get(db.Job, job_id).started_at is None
+
+        res = client.post(f"/api/jobs/{job_id}/cancel", headers={"X-CSRF": csrf})
+        assert res.status_code == 200
+
+        with db.get_session() as session:
+            assert session.query(db.Receipt).filter(db.Receipt.job_id == job_id).count() == 0
+    finally:
+        ws.close()
 
 
 def _backdate_started_at(job_id, hours):
@@ -599,6 +896,125 @@ def test_byte_scale_inventory_is_converted_to_gigabytes(client):
     job_id = _submit(client, csrf, workflow=workflow)
     detail = client.get(f"/api/jobs/{job_id}", headers={"X-CSRF": csrf}).json()
     assert 6.0 <= detail["est_vram_gb"] <= 8.0
+
+
+def test_inventory_entries_with_exact_size_bytes_are_learned_verbatim(client):
+    """A Task 1+ agent that also reports the file's exact `size_bytes`
+    (`hardware.scan_models`) must have THAT value stored, not a
+    reconstruction from the rounded `size` GB figure -- the signed manifest
+    payload has to pin the real byte length."""
+    csrf = _login(client)
+    worker_id, sk = _register_worker(client, csrf, "w1")
+    sha = hashlib.sha256(b"clip").hexdigest()
+    exact_size_bytes = round(0.23 * (1024 ** 3)) + 7  # deliberately off the rounded GB figure
+
+    with client.websocket_connect("/api/agent/ws") as ws:
+        challenge = ws.receive_json()
+        sig = sk.sign(challenge["nonce"].encode()).signature.hex()
+        ws.send_json({"type": "auth", "worker_id": worker_id, "sig": sig})
+        assert ws.receive_json()["type"] == "ready"
+
+        ws.send_json(
+            {
+                "type": "inventory",
+                "models": [
+                    {
+                        "name": "text_encoders/clip_l.safetensors",
+                        "size": 0.23,
+                        "size_bytes": exact_size_bytes,
+                        "sha256": sha,
+                    },
+                    {"name": "vae/no_hash_yet.safetensors", "size": 0.31},
+                ],
+            }
+        )
+        agentws.dispatch_once(worker_id)
+
+    with db.get_session() as session:
+        row = session.get(db.ModelHash, ("text_encoders/clip_l.safetensors", exact_size_bytes))
+        assert row is not None
+        assert row.sha256 == sha
+        assert row.first_worker_id == worker_id
+        # No row at the rounded-GB reconstruction -- the exact value won.
+        assert session.get(db.ModelHash, ("text_encoders/clip_l.safetensors", round(0.23 * 1024 ** 3))) is None
+        # The hash-less entry must not have produced any row at all.
+        assert session.query(db.ModelHash).count() == 1
+
+
+def test_inventory_entries_without_size_bytes_fall_back_to_rounded_gb(client):
+    """An agent that hashes but predates the exact `size_bytes` field (only
+    sends `sha256` + the rounded `size` GB) still gets learned, via the
+    documented fallback reconstruction."""
+    csrf = _login(client)
+    worker_id, sk = _register_worker(client, csrf, "w1")
+    sha = hashlib.sha256(b"clip").hexdigest()
+
+    with client.websocket_connect("/api/agent/ws") as ws:
+        challenge = ws.receive_json()
+        sig = sk.sign(challenge["nonce"].encode()).signature.hex()
+        ws.send_json({"type": "auth", "worker_id": worker_id, "sig": sig})
+        assert ws.receive_json()["type"] == "ready"
+
+        ws.send_json(
+            {
+                "type": "inventory",
+                "models": [
+                    {"name": "text_encoders/clip_l.safetensors", "size": 0.23, "sha256": sha},
+                    {"name": "vae/no_hash_yet.safetensors", "size": 0.31},
+                ],
+            }
+        )
+        agentws.dispatch_once(worker_id)
+
+    size_bytes = round(0.23 * (1024 ** 3))
+    with db.get_session() as session:
+        row = session.get(db.ModelHash, ("text_encoders/clip_l.safetensors", size_bytes))
+        assert row is not None
+        assert row.sha256 == sha
+        assert row.first_worker_id == worker_id
+        # The hash-less entry must not have produced any row at all.
+        assert session.query(db.ModelHash).count() == 1
+
+
+def test_inventory_hash_conflict_between_two_workers_poisons_the_name(client, caplog):
+    csrf = _login(client)
+    worker_a, sk_a = _register_worker(client, csrf, "wa")
+    worker_b, sk_b = _register_worker(client, csrf, "wb")
+    sha_a = hashlib.sha256(b"a").hexdigest()
+    sha_b = hashlib.sha256(b"b").hexdigest()
+
+    with client.websocket_connect("/api/agent/ws") as ws:
+        challenge = ws.receive_json()
+        ws.send_json(
+            {"type": "auth", "worker_id": worker_a, "sig": sk_a.sign(challenge["nonce"].encode()).signature.hex()}
+        )
+        assert ws.receive_json()["type"] == "ready"
+        ws.send_json(
+            {"type": "inventory", "models": [{"name": "clip_l.safetensors", "size": 0.23, "sha256": sha_a}]}
+        )
+        agentws.dispatch_once(worker_a)
+
+    with caplog.at_level(logging.WARNING, logger="comfyfed_server.model_manifest"):
+        with client.websocket_connect("/api/agent/ws") as ws:
+            challenge = ws.receive_json()
+            ws.send_json(
+                {"type": "auth", "worker_id": worker_b, "sig": sk_b.sign(challenge["nonce"].encode()).signature.hex()}
+            )
+            assert ws.receive_json()["type"] == "ready"
+            ws.send_json(
+                {"type": "inventory", "models": [{"name": "clip_l.safetensors", "size": 0.23, "sha256": sha_b}]}
+            )
+            agentws.dispatch_once(worker_b)
+
+    assert any(
+        r.levelno == logging.WARNING and worker_a in r.message and worker_b in r.message
+        for r in caplog.records
+    )
+    size_bytes = round(0.23 * (1024 ** 3))
+    with db.get_session() as session:
+        row = session.get(db.ModelHash, ("clip_l.safetensors", size_bytes))
+        assert row is not None
+        assert row.conflict is True
 
 
 def test_repeated_busy_heartbeat_is_a_silent_no_op(client, caplog):
@@ -1668,6 +2084,87 @@ def test_hello_without_protocol_defaults_to_1_and_sends_deprecation_frame(client
         ws.close()
 
 
+def test_hello_stores_reported_auto_fetch_true(client):
+    """Phase 2.1 Task 3: hello's auto_fetch opt-in flag lands on the worker
+    row so assess.verdict's eligible_after_fetch gate can read it."""
+    csrf = _login(client)
+    worker_id, sk = _register_worker(client, csrf, "w1")
+
+    ws = _connect(client, worker_id, sk)
+    try:
+        ws.send_json(
+            {
+                "type": "hello",
+                "hardware": {"cpu": "x"},
+                "backend": "cuda",
+                "torch_version": "2.0",
+                "node_classes": [],
+                "protocol": 3,
+                "auto_fetch": True,
+            }
+        )
+        agentws.dispatch_once(worker_id)
+
+        with db.get_session() as session:
+            worker = session.get(db.Worker, worker_id)
+            assert worker.auto_fetch is True
+    finally:
+        ws.close()
+
+
+def test_hello_stores_reported_auto_fetch_false(client):
+    csrf = _login(client)
+    worker_id, sk = _register_worker(client, csrf, "w1")
+
+    ws = _connect(client, worker_id, sk)
+    try:
+        ws.send_json(
+            {
+                "type": "hello",
+                "hardware": {"cpu": "x"},
+                "backend": "cuda",
+                "torch_version": "2.0",
+                "node_classes": [],
+                "protocol": 3,
+                "auto_fetch": False,
+            }
+        )
+        agentws.dispatch_once(worker_id)
+
+        with db.get_session() as session:
+            worker = session.get(db.Worker, worker_id)
+            assert worker.auto_fetch is False
+    finally:
+        ws.close()
+
+
+def test_hello_without_auto_fetch_field_defaults_to_false(client):
+    """An old (pre-Task-1) agent's hello has no `auto_fetch` key at all --
+    must never be read as consent to auto-download models."""
+    csrf = _login(client)
+    worker_id, sk = _register_worker(client, csrf, "w1")
+
+    ws = _connect(client, worker_id, sk)
+    try:
+        ws.send_json(
+            {
+                "type": "hello",
+                "hardware": {"cpu": "x"},
+                "backend": "cuda",
+                "torch_version": "2.0",
+                "node_classes": [],
+                "protocol": 2,
+            }
+        )
+        agentws.dispatch_once(worker_id)
+
+        with db.get_session() as session:
+            worker = session.get(db.Worker, worker_id)
+            assert worker.auto_fetch is False
+    finally:
+        ws.close()
+
+
 def test_hello_with_protocol_2_sends_no_deprecation_frame(client):
     csrf = _login(client)
     worker_id, sk = _register_worker(client, csrf, "w1")
@@ -1777,5 +2274,52 @@ def test_job_done_missing_exec_seconds_for_protocol_2_logs_error(client, caplog)
         with db.get_session() as session:
             receipt = session.query(db.Receipt).filter(db.Receipt.job_id == job_id).one()
             assert receipt.basis == "wall"
+    finally:
+        ws.close()
+
+
+def test_stageless_heartbeat_clears_fetch_chip_and_starts_the_run(client):
+    """final-review m1, settled at the root on the AGENT side: every
+    heartbeat the agent sends while the fetch phase is active carries
+    stage="fetching_models" (initial busy beat, progress reports, AND the
+    periodic 30s beat -- see runner._JobHandle.fetch_status), so the server
+    may keep the simple contract asserted here: a stage-less busy beat
+    means the download is over -- it clears the transient chip and is the
+    run-started (started_at) transition, atomically from the panel's view."""
+    csrf = _login(client)
+    worker_id, sk = _register_worker(client, csrf, "w1")
+    job_id = _submit(client, csrf)
+
+    ws = _connect(client, worker_id, sk)
+    try:
+        _send_hello_v2(ws)
+        ws.send_json({"type": "heartbeat", "state": "idle", "progress": 0.0, "job_id": None, "dynamic": {}})
+        agentws.dispatch_once(worker_id)
+        assert ws.receive_json()["type"] == "job"
+
+        ws.send_json(
+            {
+                "type": "heartbeat",
+                "state": "busy",
+                "progress": 0.0,
+                "job_id": job_id,
+                "dynamic": {},
+                "stage": "fetching_models",
+                "fetch_pct": 33.0,
+                "fetch_model": "m.safetensors",
+            }
+        )
+        agentws.dispatch_once(worker_id)
+        assert agentws._fetch_progress[job_id]["fetch_pct"] == 33.0
+
+        # The first stage-less busy heartbeat: download over, run starts.
+        # Chip cleared and started_at set by the same beat -- the agent
+        # guarantees no stage-less beat can slip out mid-download, so this
+        # transition is unambiguous.
+        ws.send_json({"type": "heartbeat", "state": "busy", "progress": 0.0, "job_id": job_id, "dynamic": {}})
+        agentws.dispatch_once(worker_id)
+        with db.get_session() as session:
+            assert session.get(db.Job, job_id).status == "running"
+        assert job_id not in agentws._fetch_progress
     finally:
         ws.close()

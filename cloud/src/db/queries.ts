@@ -216,6 +216,10 @@ export interface Worker {
   modelInventory: ModelInventoryEntry[];
   objectInfoHash: string;
   protocol: number;
+  /** Agent-side opt-in for manifest-based model auto-fetch (hello.auto_fetch
+   * -- see `agentws._handle_hello` / `do/hub.ts`'s `handleHello`). Off by
+   * default: workers keep sovereignty over unattended downloads. */
+  autoFetch: boolean;
 }
 
 interface WorkerRow {
@@ -234,6 +238,7 @@ interface WorkerRow {
   model_inventory: string;
   object_info_hash: string;
   protocol: number;
+  auto_fetch: number;
 }
 
 function rowToWorker(row: WorkerRow): Worker {
@@ -253,6 +258,7 @@ function rowToWorker(row: WorkerRow): Worker {
     modelInventory: safeParse(row.model_inventory, []),
     objectInfoHash: row.object_info_hash,
     protocol: row.protocol,
+    autoFetch: row.auto_fetch !== 0,
   };
 }
 
@@ -330,13 +336,17 @@ export async function updateWorkerHello(
     nodeClasses: unknown[];
     protocol: number;
     lastSeen: string;
+    /** Missing/non-bool degrades to false at the caller (see `do/hub.ts`'s
+     * `handleHello`) -- an old or malformed hello must never be read as
+     * consent to download. */
+    autoFetch: boolean;
   }
 ): Promise<void> {
   await db
     .prepare(
       `UPDATE workers
        SET hardware = ?, backend = ?, torch_version = ?, node_classes = ?, protocol = ?,
-           status = 'online', last_seen = ?
+           auto_fetch = ?, status = 'online', last_seen = ?
        WHERE id = ?`
     )
     .bind(
@@ -345,6 +355,7 @@ export async function updateWorkerHello(
       fields.torchVersion,
       JSON.stringify(fields.nodeClasses),
       fields.protocol,
+      fields.autoFetch ? 1 : 0,
       fields.lastSeen,
       workerId
     )
@@ -405,6 +416,35 @@ export async function getDynamic(
     if (!res.ok) return null;
     const data = await res.json<{ dynamic: Record<string, unknown> | null }>();
     return data.dynamic ?? null;
+  } catch {
+    return null;
+  }
+}
+
+export interface FetchProgress {
+  stage: string;
+  fetch_pct: number | null;
+  fetch_model: string | null;
+}
+
+/** Typed seam for the Hub DO's transient model-auto-fetch progress map --
+ * mirrors `getDynamic`'s shape (a GET to the singleton Hub DO's
+ * `/internal/*` surface). Ports `agentws.get_fetch_progress`'s read side;
+ * see `do/hub.ts`'s `fetchProgress` field for why this is in-memory,
+ * per-DO-instance state rather than a D1/Job column. Returns null outside
+ * the fetch phase or on any DO-call failure. */
+export async function getFetchProgress(
+  hub: DurableObjectNamespace,
+  jobId: string
+): Promise<FetchProgress | null> {
+  try {
+    const stub = hub.get(hub.idFromName("hub"));
+    const res = await stub.fetch(
+      `http://hub.internal/internal/fetch_progress?job_id=${encodeURIComponent(jobId)}`
+    );
+    if (!res.ok) return null;
+    const data = await res.json<{ progress: FetchProgress | null }>();
+    return data.progress ?? null;
   } catch {
     return null;
   }
@@ -1081,4 +1121,100 @@ export async function claimUploadToken(db: D1Database, token: string): Promise<b
  * both without needing a second column check (final-review.md m3). */
 export async function pruneUploadTokens(db: D1Database, nowSeconds: number): Promise<void> {
   await db.prepare("DELETE FROM upload_tokens WHERE expires_at < ?").bind(nowSeconds).run();
+}
+
+// ---------------------------------------------------------------------------
+// Model hashes (Phase 2.1 Task 7) -- the (name, size_bytes) -> sha256
+// consensus table `core/model_manifest.ts`'s `recordHash`/`entries` read and
+// write. See migrations/0004_model_hashes.sql + 0005_model_hash_conflict.sql;
+// parity source: `server/comfyfed_server/db.py`'s `ModelHash` model.
+
+export interface ModelHashRow {
+  name: string;
+  sizeBytes: number;
+  sha256: string;
+  firstWorkerId: string;
+  createdAt: string;
+  /** Set when a later report for this (name, size_bytes) disagreed with the
+   * first-seen sha256 above (see `recordHash`). Persisted (fix round 1,
+   * migration 0005) rather than tracked in an in-memory, per-DO-instance
+   * set -- `getAllModelHashes` (and therefore `model_manifest.entries()`)
+   * excludes any row with this set, correct across a DO eviction or a
+   * request handled by a plain route with no DO state at all. */
+  conflict: boolean;
+}
+
+interface ModelHashDbRow {
+  name: string;
+  size_bytes: number;
+  sha256: string;
+  first_worker_id: string;
+  created_at: string;
+  conflict: number;
+}
+
+function rowToModelHash(row: ModelHashDbRow): ModelHashRow {
+  return {
+    name: row.name,
+    sizeBytes: row.size_bytes,
+    sha256: row.sha256,
+    firstWorkerId: row.first_worker_id,
+    createdAt: row.created_at,
+    conflict: row.conflict !== 0,
+  };
+}
+
+/** The learned hash row for one (name, size_bytes) key, or null if nobody
+ * has reported it yet -- mirrors `model_manifest.record_hash`'s
+ * `session.get(db.ModelHash, (name, size_bytes))` lookup. */
+export async function getModelHash(db: D1Database, name: string, sizeBytes: number): Promise<ModelHashRow | null> {
+  const row = await db
+    .prepare("SELECT * FROM model_hashes WHERE name = ? AND size_bytes = ?")
+    .bind(name, sizeBytes)
+    .first<ModelHashDbRow>();
+  return row ? rowToModelHash(row) : null;
+}
+
+/** INSERT OR IGNORE semantics for a first-seen (name, size_bytes) report --
+ * returns whether THIS call actually inserted the row (false means a row for
+ * that key already existed, i.e. a race lost to a concurrent first report --
+ * the caller re-reads to compare hashes, exactly like `record_hash`'s
+ * `session.get` + insert-or-compare dance). */
+export async function insertModelHashIfAbsent(
+  db: D1Database,
+  name: string,
+  sizeBytes: number,
+  sha256: string,
+  firstWorkerId: string,
+  createdAt: string
+): Promise<boolean> {
+  const result = await db
+    .prepare(
+      `INSERT INTO model_hashes (name, size_bytes, sha256, first_worker_id, created_at)
+       VALUES (?, ?, ?, ?, ?)
+       ON CONFLICT(name, size_bytes) DO NOTHING`
+    )
+    .bind(name, sizeBytes, sha256, firstWorkerId, createdAt)
+    .run();
+  return (result.meta.changes ?? 0) === 1;
+}
+
+/** Marks an existing (name, size_bytes) row as conflicted -- the row's
+ * sha256/first_worker_id are left untouched (the first-seen hash is kept);
+ * only `conflict` flips to true. Mirrors `model_manifest.record_hash`'s
+ * `existing.conflict = True` write on the Python side. */
+export async function markModelHashConflict(db: D1Database, name: string, sizeBytes: number): Promise<void> {
+  await db
+    .prepare("UPDATE model_hashes SET conflict = 1 WHERE name = ? AND size_bytes = ?")
+    .bind(name, sizeBytes)
+    .run();
+}
+
+/** Every NON-conflicted learned hash row -- mirrors `model_manifest.
+ * entries()`'s `session.query(db.ModelHash).filter(conflict == False).all()`.
+ * A plain SQL predicate, not an in-memory set: correct for any caller
+ * (a Durable Object instance or a stateless route) with no coordination. */
+export async function getAllModelHashes(db: D1Database): Promise<ModelHashRow[]> {
+  const { results } = await db.prepare("SELECT * FROM model_hashes WHERE conflict = 0").all<ModelHashDbRow>();
+  return results.map(rowToModelHash);
 }

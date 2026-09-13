@@ -12,6 +12,8 @@
  *  4. signed-request canonical message (workers.py `_canonical_message`):
  *       f"{METHOD}\n{path}[?{query}]\n{ts}\n{nonce}\n" + body
  *       -- the body is embedded RAW (not hashed) -- byte-for-byte.
+ *  5. fetch-manifest entry (model_manifest.py `entries()`):
+ *       f"{name}|{directory}|{sha256}|{size_bytes}"
  */
 
 import { python1f } from "./format";
@@ -29,6 +31,30 @@ export function buildRegistrationPayload(workerId: string, pubkeyHex: string): s
 
 export function buildReleasePayload(version: string, sha256Hex: string): string {
   return `${version}|${sha256Hex}`;
+}
+
+/** `f"{name}|{directory}|{sha256}|{size_bytes}"` -- ports `model_manifest.
+ * entries()`'s per-entry signed payload verbatim (`|` field delimiter; see
+ * that function's docstring for why a `|` inside `name`/`directory` is
+ * refused by the caller before this is ever built). */
+export function buildManifestEntryPayload(
+  name: string,
+  directory: string,
+  sha256: string,
+  sizeBytes: number
+): string {
+  return `${name}|${directory}|${sha256}|${sizeBytes}`;
+}
+
+export async function signManifestEntry(
+  seedHex: string,
+  name: string,
+  directory: string,
+  sha256: string,
+  sizeBytes: number
+): Promise<string> {
+  const payload = buildManifestEntryPayload(name, directory, sha256, sizeBytes);
+  return signHex(seedHex, encoder.encode(payload));
 }
 
 /**

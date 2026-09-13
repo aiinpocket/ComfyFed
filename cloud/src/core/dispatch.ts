@@ -15,7 +15,7 @@
 import * as queries from "../db/queries";
 import type { Job } from "../db/queries";
 import { toSqliteTimestamp } from "../db/queries";
-import { freeVramGb, needsFromJob, verdict } from "./assess";
+import { freeVramGb, needsFromJob, verdict, type FetchableModels } from "./assess";
 
 const STALE_SECONDS = 90;
 
@@ -56,16 +56,32 @@ function compareTuples(a: readonly (number | string)[], b: readonly (number | st
 
 /** Rank idle workers per queued job and atomically claim the best pair, one
  * job at a time, oldest job first. Ports `dispatch.assign_jobs` -- see its
- * docstring for the full ranking rationale (clean-beats-warned, then the
- * Phase 1.9 light-job preference for zero-model jobs, then heavy-job
- * biggest-free-VRAM, with worker name / id as deterministic tie-breaks).
+ * docstring for the full ranking rationale, in two tiers:
+ *
+ * 1. Directly eligible (`verdict.kind === "eligible"`) candidates: clean
+ *    beats warned, then the Phase 1.9 light-job preference for zero-model
+ *    jobs (weak backend, then smallest free VRAM), else heavy-job biggest-
+ *    free-VRAM, with worker name/id as deterministic tie-breaks.
+ * 2. Only when tier 1 has NO candidates at all: `eligible_after_fetch`
+ *    candidates, ranked by (hasWarnings, totalFetchBytes ASC, same job-class
+ *    VRAM key, name/id) -- a worker that already has everything always wins
+ *    over one that would have to download something first.
+ *
+ * `fetchableModels` is passed straight through to `assess.verdict` -- see
+ * that function's docstring; undefined/null (the default) means "nothing
+ * fetchable", so a caller that doesn't compile it gets tier 1 only,
+ * unchanged.
  *
  * Each worker is claimed for at most one job per call. The claim itself is
  * atomic via `queries.claimJob`'s `WHERE status = 'queued'` re-check, so a
  * job claimed by a concurrent tick a moment ago is skipped rather than
  * double-assigned.
  */
-export async function assignJobs(db: D1Database, idleWorkerIds: string[]): Promise<Assignment[]> {
+export async function assignJobs(
+  db: D1Database,
+  idleWorkerIds: string[],
+  fetchableModels?: FetchableModels | null
+): Promise<Assignment[]> {
   if (idleWorkerIds.length === 0) return [];
 
   const idleWorkers = await queries.getWorkersByIds(db, idleWorkerIds);
@@ -84,41 +100,53 @@ export async function assignJobs(db: D1Database, idleWorkerIds: string[]): Promi
     const needs = needsFromJob(job);
     const isLight = needs.models.size === 0 && !needs.estVramGb;
 
-    let best: { workerId: string; keys: (number | string)[] } | null = null;
+    const candidates: { workerId: string; keys: (number | string)[] }[] = [];
+    const fetchCandidates: { workerId: string; keys: (number | string)[] }[] = [];
+
     for (const candidateId of availableWorkerIds) {
       const worker = workersById.get(candidateId);
       if (!worker) continue;
-      const v = verdict(worker, needs, job.requirements, allWorkers);
-      if (v.kind !== "eligible") continue;
+      const v = verdict(worker, needs, job.requirements, allWorkers, fetchableModels);
+      if (v.kind !== "eligible" && v.kind !== "eligible_after_fetch") continue;
 
       const hasWarnings = v.warnings.length > 0 ? 1 : 0;
-      const keys: (number | string)[] = isLight
+      const jobClassKey: (number | string)[] = isLight
         ? [
-            hasWarnings,
             // Zero-model work needs no GPU at all: a weak-backend
             // (mps/cpu) worker beats a real GPU, then SMALLEST free VRAM
             // first, so the biggest cards stay free for jobs that need
             // them.
             worker.backend !== "mps" && worker.backend !== "cpu" ? 1 : 0,
             freeVramGb(worker),
-            worker.name,
-            candidateId,
           ]
         : [
-            // Heavy job: clean beats warned, then largest free VRAM first
-            // (negated so ascending sort puts it first), then name/id.
-            hasWarnings,
+            // Heavy job: largest free VRAM first (negated so ascending sort
+            // puts it first).
             -freeVramGb(worker),
-            worker.name,
-            candidateId,
           ];
 
-      if (best === null || compareTuples(keys, best.keys) < 0) {
-        best = { workerId: candidateId, keys };
+      if (v.kind === "eligible") {
+        candidates.push({ workerId: candidateId, keys: [hasWarnings, ...jobClassKey, worker.name, candidateId] });
+      } else {
+        // eligible_after_fetch: only ever consulted when NO worker is
+        // directly eligible -- ranked clean-before-warned same as tier 1,
+        // then SMALLEST total download size first, then the same job-class
+        // VRAM key, then name.
+        const totalFetchBytes = v.missingModels.reduce((sum, name) => sum + (fetchableModels?.[name] ?? 0), 0);
+        fetchCandidates.push({
+          workerId: candidateId,
+          keys: [hasWarnings, totalFetchBytes, ...jobClassKey, worker.name, candidateId],
+        });
       }
     }
 
-    if (best === null) continue;
+    // Tier 2 (fetch-then-run) is only ever considered when tier 1 (already
+    // has everything) is completely empty.
+    const activeCandidates = candidates.length > 0 ? candidates : fetchCandidates;
+    if (activeCandidates.length === 0) continue;
+
+    activeCandidates.sort((a, b) => compareTuples(a.keys, b.keys));
+    const best = activeCandidates[0]!;
 
     const claimed = await queries.claimJob(db, job.id, best.workerId);
     if (!claimed) continue;

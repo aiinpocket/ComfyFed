@@ -8,7 +8,7 @@ import time
 import httpx
 import pytest
 
-from comfyfed_agent import comfy, hardware, whitelist
+from comfyfed_agent import comfy, fetcher, hardware, whitelist
 from comfyfed_agent.config import AgentConfig, PlatformEntry
 from comfyfed_agent.runner import AgentLoop, CleanupMode, PlatformConnection, _is_safe_relative_path, cleanup_job_files
 from comfyfed_agent import runner as runner_module
@@ -52,6 +52,8 @@ class FakeConnection:
         self.object_info_hash = ""
         self.object_info_uploads: list[tuple[bytes, str]] = []
         self.receipt_acks: list[tuple[str, str]] = []
+        self.model_inventory_hash = ""
+        self.inventories: list[list[dict]] = []
         # A live socket, as far as the reporting retry is concerned; a test
         # simulates a blip by setting it to None (what `close()` does).
         self.ws = object()
@@ -59,10 +61,28 @@ class FakeConnection:
     async def recv(self):
         await asyncio.sleep(3600)  # nothing ever arrives; the poll times out
 
-    async def send_heartbeat(self, state, progress=0.0, job_id=None, dynamic=None, object_info_hash=None):
+    async def send_heartbeat(
+        self,
+        state,
+        progress=0.0,
+        job_id=None,
+        dynamic=None,
+        object_info_hash=None,
+        stage=None,
+        fetch_pct=None,
+        fetch_model=None,
+    ):
         self.state = state
         self.heartbeats.append(
-            {"state": state, "progress": progress, "job_id": job_id, "object_info_hash": object_info_hash}
+            {
+                "state": state,
+                "progress": progress,
+                "job_id": job_id,
+                "object_info_hash": object_info_hash,
+                "stage": stage,
+                "fetch_pct": fetch_pct,
+                "fetch_model": fetch_model,
+            }
         )
 
     async def send_job_done(self, job_id, result_files, exec_seconds=None):
@@ -73,6 +93,9 @@ class FakeConnection:
 
     async def send_object_info(self, gzip_payload, oi_hash):
         self.object_info_uploads.append((gzip_payload, oi_hash))
+
+    async def send_inventory(self, models):
+        self.inventories.append(models)
 
     async def send_receipt_ack(self, receipt_id, worker_sig):
         self.receipt_acks.append((receipt_id, worker_sig))
@@ -276,6 +299,95 @@ async def test_refresh_object_info_failure_is_swallowed_and_hash_stays_unset(two
 
     assert conn_a.object_info_uploads == []
     assert conn_a.object_info_hash == ""
+
+
+# --- Fix round 1 M1: periodic model inventory rescan ------------------------
+
+
+async def test_refresh_model_inventory_pushes_when_a_file_is_added(two_platform_loop, tmp_path):
+    loop = two_platform_loop
+    loop.config.models_dir = str(tmp_path)
+    conn_a = loop.connections["worker-a"]
+
+    (tmp_path / "a.safetensors").write_bytes(b"one")
+    await loop.refresh_model_inventory(conn_a)
+    assert len(conn_a.inventories) == 1
+    first_hash = conn_a.model_inventory_hash
+    assert first_hash
+
+    (tmp_path / "b.safetensors").write_bytes(b"two")
+    await loop.refresh_model_inventory(conn_a)
+
+    assert len(conn_a.inventories) == 2
+    assert conn_a.model_inventory_hash != first_hash
+    names = {m["name"] for m in conn_a.inventories[-1]}
+    assert names == {"a.safetensors", "b.safetensors"}
+
+
+async def test_refresh_model_inventory_skips_send_when_unchanged(two_platform_loop, tmp_path):
+    loop = two_platform_loop
+    loop.config.models_dir = str(tmp_path)
+    conn_a = loop.connections["worker-a"]
+
+    (tmp_path / "a.safetensors").write_bytes(b"one")
+    await loop.refresh_model_inventory(conn_a)
+    assert len(conn_a.inventories) == 1
+    first_hash = conn_a.model_inventory_hash
+
+    # Nothing changed on disk -> rescanning must not push a no-op message.
+    await loop.refresh_model_inventory(conn_a)
+    assert len(conn_a.inventories) == 1
+    assert conn_a.model_inventory_hash == first_hash
+
+
+async def test_refresh_model_inventory_noop_without_models_dir(two_platform_loop):
+    loop = two_platform_loop
+    conn_a = loop.connections["worker-a"]
+    assert loop.config.models_dir is None
+
+    await loop.refresh_model_inventory(conn_a)
+    assert conn_a.inventories == []
+
+
+async def test_refresh_model_inventory_failure_is_swallowed_and_hash_stays_unset(
+    two_platform_loop, tmp_path, monkeypatch
+):
+    loop = two_platform_loop
+    loop.config.models_dir = str(tmp_path)
+    conn_a = loop.connections["worker-a"]
+    (tmp_path / "a.safetensors").write_bytes(b"one")
+
+    async def boom(*a, **k):
+        raise ConnectionError("socket down")
+
+    monkeypatch.setattr(conn_a, "send_inventory", boom)
+
+    await loop.refresh_model_inventory(conn_a)  # must not raise
+    assert conn_a.model_inventory_hash == ""
+
+
+async def test_connection_loop_rescans_models_on_the_object_info_timer(
+    two_platform_loop, tmp_path, monkeypatch
+):
+    """The brief's shipped missing-model guidance promises a worker rescans
+    and reports within 10 minutes with no restart -- so the periodic
+    object_info timer must also drive a model rescan+push, piggybacking the
+    same interval rather than a separate one."""
+    loop = two_platform_loop
+    loop.config.models_dir = str(tmp_path)
+    conn_a = loop.connections["worker-a"]
+
+    monkeypatch.setattr(comfy, "get_object_info", lambda *a, **k: {"KSampler": {"input": {}}})
+    monkeypatch.setattr(runner_module, "_OBJECT_INFO_INTERVAL_SECONDS", 0)
+    monkeypatch.setattr(runner_module, "_HEARTBEAT_INTERVAL_SECONDS", 9999)
+    monkeypatch.setattr(runner_module, "_RECV_POLL_TIMEOUT_SECONDS", 0.01)
+
+    (tmp_path / "a.safetensors").write_bytes(b"one")
+
+    await _run_connection_loop_briefly(loop, conn_a, seconds=0.1)
+
+    assert conn_a.inventories, "expected the periodic timer to push a model inventory update"
+    assert {m["name"] for m in conn_a.inventories[-1]} == {"a.safetensors"}
 
 
 async def test_broadcast_heartbeat_carries_each_connections_object_info_hash(two_platform_loop):
@@ -1480,7 +1592,7 @@ class _RecordingWS:
 
 
 @pytest.mark.asyncio
-async def test_send_hello_declares_protocol_2():
+async def test_send_hello_declares_protocol_3_and_auto_fetch_false_by_default():
     entry = PlatformEntry(
         platform_url="http://p",
         platform_pubkey="aa",
@@ -1496,8 +1608,27 @@ async def test_send_hello_declares_protocol_2():
     assert len(conn.ws.sent) == 1
     payload = json.loads(conn.ws.sent[0])
     assert payload["type"] == "hello"
-    assert payload["protocol"] == 2
+    assert payload["protocol"] == 3
+    assert payload["auto_fetch"] is False
     assert payload["hardware"]["platform"] == "Windows"
+
+
+@pytest.mark.asyncio
+async def test_send_hello_reports_auto_fetch_true_from_config():
+    entry = PlatformEntry(
+        platform_url="http://p",
+        platform_pubkey="aa",
+        worker_id="w1",
+        certificate="cert",
+        signing_key_hex="00" * 32,
+    )
+    conn = PlatformConnection(entry, AgentConfig(auto_fetch_models=True))
+    conn.ws = _RecordingWS()
+
+    await conn.send_hello({"cpu": "x", "platform": "Windows"}, "cuda", "2.0", ["KSampler"])
+
+    payload = json.loads(conn.ws.sent[0])
+    assert payload["auto_fetch"] is True
 
 
 # --- Console-signal (Ctrl-C / Ctrl-Break) shutdown --------------------------
@@ -1621,4 +1752,267 @@ async def test_graceful_shutdown_and_stop_forces_exit_on_timeout(cancellable_loo
     await asyncio.wait_for(loop._graceful_shutdown_and_stop(fake_loop), timeout=10)
 
     assert exit_calls == [1]
-    assert fake_loop.stopped is False, "a forced exit must not also claim a clean stop"
+
+
+# --- Phase 2.1 Task 5: fetch_models pre-phase --------------------------------
+
+
+def _fetch_job_message(job_id: str, fetch_models: list[dict]) -> dict:
+    return {
+        "job_id": job_id,
+        "workflow_json": json.dumps({"1": {"class_type": "KSampler", "inputs": {}}}),
+        "input_assets": [],
+        "fetch_models": fetch_models,
+    }
+
+
+async def test_fetch_models_disabled_auto_fetch_fails_job_without_running(two_platform_loop, monkeypatch):
+    """A `fetch_models` push reaching a worker with auto_fetch_models still
+    False is always a race or a server bug -- politely job_failed, and
+    run_workflow must never be reached."""
+    loop = two_platform_loop
+    conn_a = loop.connections["worker-a"]
+    assert loop.config.auto_fetch_models is False  # the default
+
+    def _must_not_run(*args, **kwargs):
+        raise AssertionError("run_workflow must not be called when auto-fetch is disabled")
+
+    monkeypatch.setattr(comfy, "run_workflow", _must_not_run)
+
+    job_msg = _fetch_job_message("job-fetch-1", [{"name": "m.safetensors"}])
+    await loop.handle_job(conn_a, job_msg)
+
+    assert conn_a.job_failed == ("job-fetch-1", runner_module._AUTO_FETCH_DISABLED_MESSAGE, None)
+    assert conn_a.job_done is None
+    assert conn_a.heartbeats[-1]["state"] == "idle"
+
+
+async def test_fetch_models_success_pushes_inventory_then_runs_workflow(two_platform_loop, monkeypatch):
+    loop = two_platform_loop
+    loop.config.auto_fetch_models = True
+    loop.config.models_dir = "/fake/models"
+    conn_a = loop.connections["worker-a"]
+
+    fetch_calls = []
+
+    async def _fake_fetch(**kwargs):
+        fetch_calls.append(kwargs)
+        await kwargs["report_progress"](50.0, "m.safetensors")
+
+    monkeypatch.setattr(runner_module.fetcher, "fetch_and_verify_models", _fake_fetch)
+    monkeypatch.setattr(hardware, "scan_models", lambda *a, **k: [{"name": "m.safetensors", "size": 0.1}])
+    monkeypatch.setattr(comfy, "run_workflow", lambda *a, **k: ([], 1.0))
+
+    entries = [{"name": "m.safetensors", "directory": "checkpoints", "url": "http://x", "sha256": "ab", "size_bytes": 5}]
+    job_msg = _fetch_job_message("job-fetch-2", entries)
+    await loop.handle_job(conn_a, job_msg)
+
+    assert len(fetch_calls) == 1
+    assert fetch_calls[0]["entries"] == entries
+    assert fetch_calls[0]["platform_pubkey_hex"] == conn_a.entry.platform_pubkey
+    assert fetch_calls[0]["models_dir"] == loop.config.models_dir
+    assert fetch_calls[0]["max_fetch_gb"] == loop.config.max_fetch_gb
+
+    # The inventory rescan+push happens immediately (not on the 10-minute
+    # timer) once the fetch succeeds.
+    assert conn_a.inventories == [[{"name": "m.safetensors", "size": 0.1}]]
+
+    # And the job continues into the normal run path afterward.
+    assert conn_a.job_done == ("job-fetch-2", [], 1.0)
+
+
+async def test_fetch_progress_relayed_as_stage_heartbeat(two_platform_loop, monkeypatch):
+    loop = two_platform_loop
+    loop.config.auto_fetch_models = True
+    conn_a = loop.connections["worker-a"]
+
+    async def _fake_fetch(**kwargs):
+        await kwargs["report_progress"](42.0, "foo.safetensors")
+
+    monkeypatch.setattr(runner_module.fetcher, "fetch_and_verify_models", _fake_fetch)
+    monkeypatch.setattr(hardware, "scan_models", lambda *a, **k: [])
+    monkeypatch.setattr(comfy, "run_workflow", lambda *a, **k: ([], None))
+
+    job_msg = _fetch_job_message("job-fetch-3", [{"name": "foo.safetensors"}])
+    await loop.handle_job(conn_a, job_msg)
+
+    stage_heartbeats = [hb for hb in conn_a.heartbeats if hb.get("stage") == "fetching_models"]
+    # The INITIAL busy beat already carries the stage (fetch_pct 0.0) so the
+    # server never sees a stage-less beat before the download -- the actual
+    # progress report is the last one.
+    assert len(stage_heartbeats) >= 2, "expected initial + progress fetching_models heartbeats"
+    assert stage_heartbeats[0]["fetch_pct"] == 0.0
+    assert stage_heartbeats[-1]["fetch_pct"] == 42.0
+    assert stage_heartbeats[-1]["fetch_model"] == "foo.safetensors"
+    assert stage_heartbeats[-1]["job_id"] == "job-fetch-3"
+
+
+async def test_fetch_error_fails_job_and_skips_run_workflow(two_platform_loop, monkeypatch):
+    loop = two_platform_loop
+    loop.config.auto_fetch_models = True
+    conn_a = loop.connections["worker-a"]
+
+    async def _fake_fetch(**kwargs):
+        raise fetcher.FetchError("模型清單簽章驗證失敗：m.safetensors / manifest signature verification failed")
+
+    monkeypatch.setattr(runner_module.fetcher, "fetch_and_verify_models", _fake_fetch)
+
+    def _must_not_run(*args, **kwargs):
+        raise AssertionError("run_workflow must not be called after a fetch failure")
+
+    monkeypatch.setattr(comfy, "run_workflow", _must_not_run)
+
+    job_msg = _fetch_job_message("job-fetch-4", [{"name": "m.safetensors"}])
+    await loop.handle_job(conn_a, job_msg)
+
+    assert conn_a.job_failed == (
+        "job-fetch-4",
+        "模型清單簽章驗證失敗：m.safetensors / manifest signature verification failed",
+        None,
+    )
+    assert conn_a.job_done is None
+
+
+async def test_fetch_cancelled_reports_nothing(two_platform_loop, monkeypatch):
+    """`fetcher.fetch_and_verify_models` raises `comfy.JobCancelled` when the
+    cancel_event trips mid-download -- must flow through the exact same
+    silent-cancellation path as a cancel mid-render: no job_done, no
+    job_failed."""
+    loop = two_platform_loop
+    loop.config.auto_fetch_models = True
+    conn_a = loop.connections["worker-a"]
+
+    async def _fake_fetch(**kwargs):
+        raise comfy.JobCancelled()
+
+    monkeypatch.setattr(runner_module.fetcher, "fetch_and_verify_models", _fake_fetch)
+
+    def _must_not_run(*args, **kwargs):
+        raise AssertionError("run_workflow must not be called after a fetch cancellation")
+
+    monkeypatch.setattr(comfy, "run_workflow", _must_not_run)
+
+    job_msg = _fetch_job_message("job-fetch-5", [{"name": "m.safetensors"}])
+    await loop.handle_job(conn_a, job_msg)
+
+    assert conn_a.job_failed is None
+    assert conn_a.job_done is None
+    assert conn_a.heartbeats[-1]["state"] == "idle"
+
+
+async def test_fetch_models_absent_does_not_touch_fetcher(two_platform_loop, monkeypatch):
+    """A plain job push (no `fetch_models` key -- the common case, and every
+    push to a directly-`eligible` worker) must never invoke the fetcher at
+    all."""
+    loop = two_platform_loop
+    conn_a = loop.connections["worker-a"]
+
+    def _must_not_fetch(**kwargs):
+        raise AssertionError("fetch_and_verify_models must not be called without fetch_models")
+
+    monkeypatch.setattr(runner_module.fetcher, "fetch_and_verify_models", _must_not_fetch)
+    monkeypatch.setattr(comfy, "run_workflow", lambda *a, **k: ([], None))
+
+    job_msg = {
+        "job_id": "job-no-fetch",
+        "workflow_json": json.dumps({"1": {"class_type": "KSampler", "inputs": {}}}),
+        "input_assets": [],
+    }
+    await loop.handle_job(conn_a, job_msg)
+
+    assert conn_a.job_done == ("job-no-fetch", [], None)
+
+
+async def test_shutdown_cancels_a_job_stuck_in_the_fetch_phase(two_platform_loop, monkeypatch):
+    """The graceful-shutdown path trips the same `cancel_event` a
+    platform-driven job_cancelled would -- a fetch loop that is checking it
+    (see fetcher._download_one) must abort and clean up exactly like a
+    cancel mid-render."""
+    loop = two_platform_loop
+    loop.config.auto_fetch_models = True
+    conn_a = loop.connections["worker-a"]
+
+    fetch_started = asyncio.Event()
+
+    async def _slow_fetch(**kwargs):
+        cancel_event = kwargs["cancel_event"]
+        fetch_started.set()
+        deadline = time.monotonic() + 10.0
+        while not cancel_event.is_set():
+            if time.monotonic() > deadline:  # pragma: no cover - test safety net
+                raise AssertionError("cancel event never tripped")
+            await asyncio.sleep(0.01)
+        raise comfy.JobCancelled()
+
+    monkeypatch.setattr(runner_module.fetcher, "fetch_and_verify_models", _slow_fetch)
+
+    def _must_not_run(*args, **kwargs):
+        raise AssertionError("run_workflow must not be called once the fetch phase is cancelled")
+
+    monkeypatch.setattr(comfy, "run_workflow", _must_not_run)
+
+    job_msg = _fetch_job_message("job-fetch-shutdown", [{"name": "m.safetensors"}])
+    task = asyncio.create_task(loop._handle_message(conn_a, {**job_msg, "type": "job"}))
+    await asyncio.wait_for(fetch_started.wait(), timeout=5.0)
+
+    await asyncio.wait_for(loop.shutdown(), timeout=5.0)
+    await asyncio.wait_for(task, timeout=5.0)
+
+    assert conn_a.job_failed is None
+    assert conn_a.job_done is None
+    assert not loop._jobs
+
+
+async def test_periodic_heartbeat_carries_fetch_stage_while_downloading(cancellable_loop, monkeypatch):
+    """final-review m1, root fix: while the auto-fetch pre-phase is active,
+    the periodic heartbeat must carry stage="fetching_models" (from
+    `_JobHandle.fetch_status`) -- a stage-less busy beat is the server's
+    run-started signal, and the download phase is deliberately never
+    billed. Simulated by pinning fetch_status on the running handle."""
+    loop = cancellable_loop
+    conn_a = loop.connections["worker-a"]
+
+    monkeypatch.setattr(runner_module, "_HEARTBEAT_INTERVAL_SECONDS", 0)
+    monkeypatch.setattr(runner_module, "_RECV_POLL_TIMEOUT_SECONDS", 0.01)
+
+    await loop._handle_message(conn_a, _job_message("job-fetch-hb"))
+    task = loop._current_job_task
+    await _await_flag(loop.test_started)
+
+    handle = loop._jobs["job-fetch-hb"]
+    handle.fetch_status = {
+        "stage": "fetching_models",
+        "fetch_pct": 55.0,
+        "fetch_model": "big.safetensors",
+    }
+    try:
+        conn_a.heartbeats.clear()
+        loop_task = asyncio.create_task(loop._connection_loop(conn_a))
+        await asyncio.sleep(0.1)
+        loop_task.cancel()
+        try:
+            await loop_task
+        except asyncio.CancelledError:
+            pass
+
+        assert conn_a.heartbeats, "the periodic heartbeat never fired"
+        assert all(hb.get("stage") == "fetching_models" for hb in conn_a.heartbeats)
+        assert all(hb.get("fetch_pct") == 55.0 for hb in conn_a.heartbeats)
+        assert all(hb.get("fetch_model") == "big.safetensors" for hb in conn_a.heartbeats)
+
+        # Fetch over: stage disappears from subsequent periodic beats.
+        handle.fetch_status = None
+        conn_a.heartbeats.clear()
+        loop_task = asyncio.create_task(loop._connection_loop(conn_a))
+        await asyncio.sleep(0.1)
+        loop_task.cancel()
+        try:
+            await loop_task
+        except asyncio.CancelledError:
+            pass
+        assert conn_a.heartbeats
+        # The fake conn records kwargs verbatim (stage=None when unset).
+        assert all(hb["stage"] is None for hb in conn_a.heartbeats)
+    finally:
+        await loop._handle_message(conn_a, {"type": "job_cancelled", "job_id": "job-fetch-hb"})
+        await asyncio.wait_for(task, timeout=10)

@@ -537,6 +537,93 @@ def test_agent_heartbeat_progress_relayed_through_real_agentws_handler(client):
             }
 
 
+def test_agent_heartbeat_fetch_stage_relayed_as_extra_progress_fields(client):
+    """Phase 2.1 Task 4: a heartbeat carrying stage="fetching_models" (plus
+    fetch_pct/fetch_model) relays to the panel as the SAME `progress` event
+    shape, with those three as extra fields -- not a new event type."""
+    from nacl.signing import SigningKey
+
+    from comfyfed_server import agentws
+
+    csrf = _login(client)
+    job_id = _post_prompt(client)
+
+    sk = SigningKey.generate()
+    pubkey_hex = bytes(sk.verify_key).hex()
+    r = client.post("/api/workers/tokens", json={"name": "w1"}, headers={"X-CSRF": csrf})
+    token = r.json()["bundle"]["register_token"]
+    reg = client.post(
+        "/api/agent/register", json={"token": token, "name": "w1", "pubkey": pubkey_hex}
+    )
+    worker_id = reg.json()["worker_id"]
+    _pick_job_for(worker_id)
+
+    try:
+        with client.websocket_connect("/comfy/api/ws") as panel_ws:
+            panel_ws.receive_json()  # initial status
+            panel_ws.receive_json()  # feature_flags
+
+            with client.websocket_connect("/api/agent/ws") as agent_ws:
+                challenge = agent_ws.receive_json()
+                sig = sk.sign(challenge["nonce"].encode()).signature.hex()
+                agent_ws.send_json({"type": "auth", "worker_id": worker_id, "sig": sig})
+                assert agent_ws.receive_json()["type"] == "ready"
+
+                agent_ws.send_json(
+                    {
+                        "type": "heartbeat",
+                        "state": "busy",
+                        "progress": 0.0,
+                        "job_id": job_id,
+                        "dynamic": {},
+                        "stage": "fetching_models",
+                        "fetch_pct": 37.5,
+                        "fetch_model": "flux1-dev.safetensors",
+                    }
+                )
+                agentws.dispatch_once(worker_id)
+
+                progress = panel_ws.receive_json()
+                assert progress == {
+                    "type": "progress",
+                    "data": {
+                        "value": 0,
+                        "max": 100,
+                        "prompt_id": job_id,
+                        "stage": "fetching_models",
+                        "fetch_pct": 37.5,
+                        "fetch_model": "flux1-dev.safetensors",
+                    },
+                }
+                # M1 (Phase 2.1 final review): a fetch-stage heartbeat does
+                # NOT transition assigned->running -- the download phase is
+                # never billed, so started_at stays unset and no "executing"
+                # event is posted yet. The first STAGE-LESS heartbeat below
+                # is the run-started transition: it clears the fetch chip
+                # (relay emits a clean progress event) and then mark_running
+                # posts the "executing" event.
+                agent_ws.send_json(
+                    {
+                        "type": "heartbeat",
+                        "state": "busy",
+                        "progress": 0.1,
+                        "job_id": job_id,
+                        "dynamic": {},
+                    }
+                )
+                agentws.dispatch_once(worker_id)
+                normal_progress = panel_ws.receive_json()
+                assert normal_progress == {
+                    "type": "progress",
+                    "data": {"value": 10, "max": 100, "prompt_id": job_id},
+                }
+                executing = panel_ws.receive_json()
+                assert executing["type"] == "executing"
+                assert agentws.get_fetch_progress(job_id) is None
+    finally:
+        agentws._fetch_progress.pop(job_id, None)
+
+
 # --- same-loop delivery (the production topology) ------------------------------
 #
 # Everything above holds its panel socket through `TestClient`, which runs the

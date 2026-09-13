@@ -55,6 +55,9 @@ import { DurableObject } from "cloudflare:workers";
 import type { Env } from "../env";
 import * as queries from "../db/queries";
 import * as dispatch from "../core/dispatch";
+import * as assess from "../core/assess";
+import type { FetchableModels } from "../core/assess";
+import * as modelManifest from "../core/model_manifest";
 import { toSqliteTimestamp, resolvePlatformSeed } from "../db/queries";
 import { buildReceiptPayload, signReceipt, verifyHex } from "../lib/signing";
 import { bytesToHex } from "../lib/hex";
@@ -72,6 +75,13 @@ const CLOSE_UNAUTHORIZED = 4401;
 /** Minimum `hello.protocol` that guarantees exec_seconds and understands
  * `job_cancelled` pushes -- see agentws.py's `_CURRENT_PROTOCOL`. */
 const CURRENT_PROTOCOL = 2;
+
+/** Minimum `hello.protocol` that can receive `fetch_models` at all (predates
+ * lazy hashing / lazy inventory sha256) -- see assess.py's
+ * `_MIN_AUTO_FETCH_PROTOCOL`. Duplicated here (rather than exported from
+ * `core/assess.ts`, which keeps it private) purely for the defensive
+ * re-check right before a push -- see `fetchModelsForPush`. */
+const MIN_AUTO_FETCH_PROTOCOL = 3;
 
 const DEPRECATION_MESSAGE =
   "agent 版本過舊：無法接收取消通知，計費將以整體耗時（wall-clock）為準。" +
@@ -271,6 +281,22 @@ export class Hub extends DurableObject<Env> {
    * deliberately not persisted across hibernation eviction. */
   private readonly ephemeral = new Map<WebSocket, Ephemeral>();
 
+  /** job_id -> transient model-auto-fetch progress, for exactly as long as a
+   * job is in the pre-run download phase -- ports agentws.py's
+   * `_fetch_progress`. Deliberately NOT DO storage/a D1 column: this is
+   * live, second-by-second state that a fresh heartbeat repopulates within
+   * one tick, so losing it on eviction is harmless (same "nothing here is
+   * worth surviving a restart" reasoning as `ephemeral`). A model-hash
+   * CONFLICT, by contrast, is persisted on the `model_hashes` row itself
+   * (migration 0005_model_hash_conflict.sql) rather than tracked here --
+   * see `core/model_manifest.ts`'s docstring. Read by `routes/jobs.ts`'s
+   * `jobDict` via `/internal/fetch_progress` (mirrors `queries.getDynamic`'s
+   * seam). */
+  private readonly fetchProgress = new Map<
+    string,
+    { stage: string; fetchPct: number | null; fetchModel: string | null }
+  >();
+
   // -- fetch: HTTP entrypoints (WS upgrade + /internal/*) ------------------
 
   async fetch(request: Request): Promise<Response> {
@@ -289,6 +315,9 @@ export class Hub extends DurableObject<Env> {
     }
     if (url.pathname === "/internal/dynamic" && request.method === "GET") {
       return this.handleInternalDynamic(url);
+    }
+    if (url.pathname === "/internal/fetch_progress" && request.method === "GET") {
+      return this.handleInternalFetchProgress(url);
     }
     if (url.pathname === "/internal/wake" && request.method === "POST") {
       await this.scheduleAlarmIfNeeded();
@@ -423,6 +452,7 @@ export class Hub extends DurableObject<Env> {
     }
 
     const owner = await dispatch.cancelJob(db, jobId, reason, now);
+    this.fetchProgress.delete(jobId);
 
     if (wasRunning && owner) {
       try {
@@ -481,6 +511,17 @@ export class Hub extends DurableObject<Env> {
     const ws = workerId ? this.findWsForWorker(workerId) : null;
     const dynamic = ws ? (this.ephemeral.get(ws)?.dynamic ?? null) : null;
     return Response.json({ dynamic });
+  }
+
+  /** Backs `queries.getFetchProgress` -- see `fetchProgress`'s field
+   * docstring. */
+  private async handleInternalFetchProgress(url: URL): Promise<Response> {
+    const jobId = url.searchParams.get("job_id") ?? "";
+    const entry = jobId ? (this.fetchProgress.get(jobId) ?? null) : null;
+    const progress = entry
+      ? { stage: entry.stage, fetch_pct: entry.fetchPct, fetch_model: entry.fetchModel }
+      : null;
+    return Response.json({ progress });
   }
 
   // -- Hibernatable WebSocket handlers --------------------------------------
@@ -679,6 +720,11 @@ export class Hub extends DurableObject<Env> {
     const backend = typeof msg.backend === "string" ? msg.backend : "";
     const torchVersion = typeof msg.torch_version === "string" ? msg.torch_version : "";
     const nodeClasses = Array.isArray(msg.node_classes) ? (msg.node_classes as unknown[]) : [];
+    // Agent-side opt-in for manifest-based model auto-fetch (Phase 2.1's
+    // `hello.auto_fetch`; gate consumed by `assess.verdict`'s
+    // eligible_after_fetch check). Missing/non-bool degrades to false -- an
+    // old or malformed hello must never be read as consent to download.
+    const autoFetch = msg.auto_fetch === true;
 
     await queries.updateWorkerHello(this.env.DB, workerId, {
       hardware,
@@ -686,6 +732,7 @@ export class Hub extends DurableObject<Env> {
       torchVersion,
       nodeClasses,
       protocol,
+      autoFetch,
       lastSeen: toSqliteTimestamp(new Date()),
     });
 
@@ -737,9 +784,35 @@ export class Hub extends DurableObject<Env> {
       const job = await queries.getJobById(db, jobId);
       if (job && job.workerId === workerId) {
         const progress = msg.progress;
-        if (typeof progress === "number" && Number.isFinite(progress)) {
-          await queries.updateJobProgress(db, jobId, progress);
-          await this.panelJobProgress(jobId, progress);
+        const progressReported = typeof progress === "number" && Number.isFinite(progress);
+        let currentProgress = job.progress;
+        if (progressReported) {
+          currentProgress = progress as number;
+          await queries.updateJobProgress(db, jobId, currentProgress);
+        }
+
+        // Phase 2.1: an agent downloading a missing model before it can run
+        // the job it was pushed reports stage="fetching_models" alongside
+        // its usual progress -- ports agentws.py's `_handle_heartbeat`
+        // fetch-stage block. Stored transiently (see `fetchProgress`'s
+        // docstring) and cleared the moment a heartbeat stops reporting it
+        // (the download finished, or this is an older agent that never
+        // sends it at all).
+        if (msg.stage === "fetching_models") {
+          const fetchPct = msg.fetch_pct;
+          const fetchModel = msg.fetch_model;
+          this.fetchProgress.set(jobId, {
+            stage: "fetching_models",
+            fetchPct: typeof fetchPct === "number" && Number.isFinite(fetchPct) ? fetchPct : null,
+            fetchModel: typeof fetchModel === "string" ? fetchModel : null,
+          });
+        } else {
+          this.fetchProgress.delete(jobId);
+        }
+
+        const fetchFields = this.fetchProgress.get(jobId);
+        if (progressReported || fetchFields) {
+          await this.panelJobProgress(jobId, currentProgress, fetchFields);
         }
       } else {
         jobNotOwned = true;
@@ -756,7 +829,18 @@ export class Hub extends DurableObject<Env> {
     // actually started -- "assigned" becomes "running" here. Called
     // unconditionally (matching agentws.py) so the WARNING/DEBUG split for a
     // foreign job_id still fires/rate-limits on every heartbeat.
-    if (state === "busy" && jobId) {
+    //
+    // M1 fix (mirrors agentws.py's `_handle_heartbeat`): while
+    // stage === "fetching_models" the job hasn't started running yet -- it's
+    // downloading a prerequisite model, not billable execution. Skipping the
+    // running transition here leaves startedAt unset, so a fetch failure's
+    // failed receipt reports gpu_seconds 0.0 (no false protocol-violation
+    // alarm) and a cancel mid-fetch mints no cancelled receipt at all
+    // (download time is never billed, same as cancelling a still-queued
+    // job). startedAt is set by the first busy heartbeat that is NOT in the
+    // fetch stage, i.e. when the agent actually starts running against
+    // ComfyUI.
+    if (state === "busy" && jobId && msg.stage !== "fetching_models") {
       await this.applyOwnedTransition(db, jobId, workerId, ["assigned"], ephemeral, async () => {
         await queries.updateJobRunning(db, jobId, toSqliteTimestamp(now));
         await this.panelJobRunning(jobId);
@@ -788,7 +872,43 @@ export class Hub extends DurableObject<Env> {
     const workerId = attachment.workerId!;
     const worker = await queries.getWorkerById(this.env.DB, workerId);
     if (!worker) return;
-    await queries.updateWorkerModelInventory(this.env.DB, workerId, normalizeModels(msg.models));
+    const models = normalizeModels(msg.models);
+    await queries.updateWorkerModelInventory(this.env.DB, workerId, models);
+    await this.recordModelHashes(workerId, models);
+  }
+
+  /** Learn a sha256 for every inventory entry that carries one -- ports
+   * agentws.py's `_record_model_hashes`. `size_bytes` is preferred when the
+   * entry carries it (an exact `os.stat().st_size`); entries from an agent
+   * that hashes but predates the exact `size_bytes` field fall back to
+   * reconstructing it from the rounded-to-3-decimal-places GB `size` --
+   * lossy (~1 MB resolution), kept only so those agents' reports aren't
+   * dropped outright. A conflict (`recordHash`'s `conflict: true`) is
+   * already persisted on the `model_hashes` row by the time this returns --
+   * nothing further to track here (fix round 1: replaced the old in-memory
+   * `poisonedModelNames` DO field). */
+  private async recordModelHashes(workerId: string, models: unknown[]): Promise<void> {
+    for (const entry of models) {
+      if (typeof entry !== "object" || entry === null || Array.isArray(entry)) continue;
+      const e = entry as Record<string, unknown>;
+
+      const sha256 = e.sha256;
+      if (typeof sha256 !== "string" || !sha256) continue;
+      const name = e.name;
+      if (typeof name !== "string" || !name) continue;
+
+      let exactSizeBytes: number;
+      const sizeBytes = e.size_bytes;
+      if (typeof sizeBytes === "number" && Number.isInteger(sizeBytes) && sizeBytes > 0) {
+        exactSizeBytes = sizeBytes;
+      } else {
+        const size = e.size;
+        if (typeof size !== "number" || !Number.isFinite(size)) continue;
+        exactSizeBytes = Math.round(size * 1024 ** 3);
+      }
+
+      await modelManifest.recordHash(this.env.DB, workerId, name, exactSizeBytes, sha256);
+    }
   }
 
   // -- job_done / job_failed --------------------------------------------------
@@ -822,6 +942,7 @@ export class Hub extends DurableObject<Env> {
     }
 
     if (done) {
+      this.fetchProgress.delete(jobId!);
       // Separate lookup rather than reusing the row `updateJobDone` already
       // touched -- mirrors agentws.py's `_notify_panel_job_done`: `jobOutputs`
       // needs `resultFiles`/`workflowJson` off the freshly-committed row.
@@ -852,6 +973,7 @@ export class Hub extends DurableObject<Env> {
     });
 
     if (applied) {
+      this.fetchProgress.delete(jobId!);
       await this.panelJobFailed(jobId!, error);
       const execSeconds = isValidExecSeconds(msg.exec_seconds) ? msg.exec_seconds : null;
       await this.createAndPushFailureReceipt(ws, attachment, jobId!, execSeconds, now);
@@ -1164,6 +1286,7 @@ export class Hub extends DurableObject<Env> {
     if (requeued.length > 0) {
       try {
         for (const jobId of requeued) {
+          this.fetchProgress.delete(jobId);
           await this.panelJobRequeued(jobId);
         }
         await this.panelJobStatusRefresh();
@@ -1180,9 +1303,37 @@ export class Hub extends DurableObject<Env> {
       }
     }
 
+    // Compiled ONCE per sweep, not per candidate/job -- ports agentws.py's
+    // `dispatch_tick`: `fetchableModels` (name -> size_bytes) feeds
+    // `assess.verdict` inside `assignJobs`'s ranking AND the per-push
+    // recompute below; `manifestByName` (name -> full signed entry) is what
+    // actually gets embedded in a `fetch_models` push once a name is
+    // confirmed missing. Skipped entirely unless there is BOTH an idle
+    // worker to dispatch to AND a queued job for it to be dispatched against
+    // this tick (the common case): `assignJobs` is a no-op without both, so
+    // building the manifest (a source/harvest R2 scan plus a D1 read) would
+    // be pure waste -- a cloud-only efficiency note, not a behavior change.
+    let fetchableModels: FetchableModels = {};
+    let manifestByName = new Map<string, modelManifest.ManifestEntry>();
+    const hasQueuedWork = idleWorkerIds.length > 0 && (await queries.getQueuedJobsOrderedByCreatedAt(db)).length > 0;
+    if (hasQueuedWork) {
+      try {
+        const seed = await resolvePlatformSeed(db, this.env.PLATFORM_ED25519_SEED);
+        const manifestEntries = await modelManifest.entries(db, this.env.STORE, seed);
+        for (const e of manifestEntries) {
+          fetchableModels[e.name] = e.size_bytes;
+          manifestByName.set(e.name, e);
+        }
+      } catch (err) {
+        console.error("hub: failed to build fetch manifest for dispatch tick", err);
+        fetchableModels = {};
+        manifestByName = new Map();
+      }
+    }
+
     let assignments: dispatch.Assignment[] = [];
     try {
-      assignments = await dispatch.assignJobs(db, idleWorkerIds);
+      assignments = await dispatch.assignJobs(db, idleWorkerIds, fetchableModels);
     } catch (err) {
       console.error("hub: assignJobs failed", err);
     }
@@ -1191,14 +1342,20 @@ export class Hub extends DurableObject<Env> {
       const ws = this.findWsForWorker(workerId);
       if (!ws) continue;
       try {
-        ws.send(
-          JSON.stringify({
-            type: "job",
-            job_id: job.id,
-            workflow_json: job.workflowJson,
-            input_assets: job.inputAssets,
-          })
-        );
+        const frame: Record<string, unknown> = {
+          type: "job",
+          job_id: job.id,
+          workflow_json: job.workflowJson,
+          input_assets: job.inputAssets,
+        };
+        if (Object.keys(fetchableModels).length > 0) {
+          const worker = await queries.getWorkerById(db, workerId);
+          if (worker) {
+            const fetchModels = await this.fetchModelsForPush(job, worker, fetchableModels, manifestByName);
+            if (fetchModels.length > 0) frame.fetch_models = fetchModels;
+          }
+        }
+        ws.send(JSON.stringify(frame));
         const att = ws.deserializeAttachment() as AgentAttachment;
         // Presume busy until the next heartbeat says otherwise, so the next
         // tick doesn't double-push before the agent reports in.
@@ -1207,6 +1364,41 @@ export class Hub extends DurableObject<Env> {
         console.error(`hub: failed to push job to worker ${workerId}`, err);
       }
     }
+  }
+
+  /** The `fetch_models` manifest entries to embed in this job's push to
+   * `worker`, or `[]` when nothing needs fetching -- ports agentws.py's
+   * `_fetch_models_for_push`. Recomputes `assess.verdict` for this exact
+   * (job, worker) pair rather than threading the winning candidate's
+   * missing-model list through `assignJobs`'s return value -- see that
+   * Python docstring for why. */
+  private async fetchModelsForPush(
+    job: queries.Job,
+    worker: queries.Worker,
+    fetchableModels: FetchableModels,
+    manifestByName: Map<string, modelManifest.ManifestEntry>
+  ): Promise<modelManifest.ManifestEntry[]> {
+    if (Object.keys(fetchableModels).length === 0) return [];
+
+    const allWorkers = await queries.getAllWorkers(this.env.DB);
+    const needs = assess.needsFromJob(job);
+    const v = assess.verdict(worker, needs, job.requirements, allWorkers, fetchableModels);
+    if (v.kind !== "eligible_after_fetch") return [];
+
+    // Defensive: `eligible_after_fetch` already requires protocol >= 3 (see
+    // assess.ts's `workerFetchCapacityOk`) -- an agent that predates
+    // fetch_models entirely must never receive this key. This should be
+    // unreachable; if it ever fires, that gate has regressed, so it's
+    // logged loudly rather than silently sent.
+    if (typeof worker.protocol !== "number" || worker.protocol < MIN_AUTO_FETCH_PROTOCOL) {
+      console.error(
+        `hub: refusing to push fetch_models to worker ${worker.id} (protocol=${worker.protocol}) for job ` +
+          `${job.id} -- eligible_after_fetch verdict should be unreachable below protocol ${MIN_AUTO_FETCH_PROTOCOL}`
+      );
+      return [];
+    }
+
+    return v.missingModels.map((name) => manifestByName.get(name)).filter((e): e is modelManifest.ManifestEntry => !!e);
   }
 
   async alarm(): Promise<void> {
@@ -1298,12 +1490,23 @@ export class Hub extends DurableObject<Env> {
     return { exec_info: { queue_remaining: remaining } };
   }
 
-  /** Ports panelws.py's `job_progress`. */
-  private async panelJobProgress(jobId: string, progress: number): Promise<void> {
-    await this.postPanelEvent({
-      type: "progress",
-      data: { value: Math.trunc(progress * 100), max: 100, prompt_id: jobId },
-    });
+  /** Ports panelws.py's `job_progress`. `fetchFields` (Phase 2.1) carries
+   * the model auto-fetch phase's extra fields -- included in `data` only
+   * when given/non-null, so the wire shape for a plain execution-progress
+   * update stays byte-identical to before this parameter existed. The stock
+   * ComfyUI frontend ignores unknown fields on a `progress` event. */
+  private async panelJobProgress(
+    jobId: string,
+    progress: number,
+    fetchFields?: { stage: string; fetchPct: number | null; fetchModel: string | null }
+  ): Promise<void> {
+    const data: Record<string, unknown> = { value: Math.trunc(progress * 100), max: 100, prompt_id: jobId };
+    if (fetchFields) {
+      data.stage = fetchFields.stage;
+      if (fetchFields.fetchPct !== null) data.fetch_pct = fetchFields.fetchPct;
+      if (fetchFields.fetchModel !== null) data.fetch_model = fetchFields.fetchModel;
+    }
+    await this.postPanelEvent({ type: "progress", data });
   }
 
   /** Ports panelws.py's `job_running`. */

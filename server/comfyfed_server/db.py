@@ -57,6 +57,32 @@ class Worker(Base):
     # `job_cancelled` pushes -- still served, but gets a one-time deprecation
     # frame and is never sent job_cancelled. 2 = current comfyfed-agent.
     protocol: Mapped[int] = mapped_column(Integer, default=1, server_default="1")
+    # Opt-in: whether this worker should auto-fetch missing models from the
+    # signed manifest (Phase 2.1 Task 3). Every existing worker predates the
+    # feature and defaults to off.
+    auto_fetch: Mapped[bool] = mapped_column(Boolean, default=False, server_default="0")
+
+
+class ModelHash(Base):
+    """Learned (name, size_bytes) -> sha256 consensus from agent inventory
+    reports (Phase 2.1 Task 2). `name` is the inventory-relative path (see
+    `assess.matches_model_name`), not the bare model_guide name. See
+    `comfyfed_server.model_manifest`.
+    """
+
+    __tablename__ = "model_hashes"
+
+    name: Mapped[str] = mapped_column(String, primary_key=True)
+    size_bytes: Mapped[int] = mapped_column(Integer, primary_key=True)
+    sha256: Mapped[str] = mapped_column(String)
+    first_worker_id: Mapped[str] = mapped_column(String)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=_utcnow)
+    # Set when a later report for this (name, size_bytes) disagreed with the
+    # first-seen sha256 above (see model_manifest.record_hash). Persistent
+    # replacement for the old in-memory, per-process poisoned-name set --
+    # `model_manifest.entries()` excludes any row with this set, and it
+    # survives a restart/second-replica since it lives on the row itself.
+    conflict: Mapped[bool] = mapped_column(Boolean, default=False, server_default="0")
 
 
 class RegisterToken(Base):

@@ -4,9 +4,9 @@ import { env, createExecutionContext, waitOnExecutionContext, runDurableObjectAl
 import { call, db, SETUP_TOKEN } from "./helpers/http";
 import { connectAgent, connectPanel, collectMessages, expectNoMessage, hub, nextMessage } from "./helpers/ws";
 import { signRequest } from "../src/lib/signing";
-import { signHex } from "../src/lib/ed25519";
+import { signHex, verifyHex, derivePublicKeyHexFromSeed } from "../src/lib/ed25519";
 import { bytesToHex } from "../src/lib/hex";
-import { getJobById, getReceiptsForJob } from "../src/db/queries";
+import { getJobById, getReceiptsForJob, resolvePlatformSeed } from "../src/db/queries";
 import golden from "./fixtures/golden.json";
 
 // ---------------------------------------------------------------------------
@@ -523,6 +523,224 @@ describe("cloud end-to-end", () => {
         gpu_seconds: receiptRow2.gpuSeconds,
         acked: false,
       });
+
+      agent.close();
+      panel.close();
+    },
+    20000
+  );
+
+  // ===========================================================================
+  // Phase 2.1 Task 7: model auto-fetch mini-arc.
+  //
+  // A single fake worker: report inventory WITH a known model (name +
+  // sha256) once so the server LEARNS its hash, then report a SECOND
+  // inventory WITHOUT that model -- the server now sees it missing from the
+  // fleet but still knows a signed hash for it, which is exactly what makes
+  // `model_manifest.entries()` publish a manifest entry for it. Submitting a
+  // job that needs the model then dispatches with `fetch_models` attached
+  // (the worker is opted into auto_fetch, protocol 3, with ample free disk),
+  // and the fake agent reports a `fetching_models` progress stage before
+  // completing the job normally.
+  it(
+    "model auto-fetch: learn a hash from a departed model, dispatch with fetch_models, report fetch progress, complete",
+    async () => {
+      const setupRes = await call("/api/setup", { json: { token: SETUP_TOKEN, password: ADMIN_PASSWORD } });
+      expect(setupRes.status).toBe(200);
+      const loginRes = await call("/api/auth/login", { json: { password: ADMIN_PASSWORD } });
+      const cookie = loginRes.setCookie;
+      const csrf = loginRes.body.csrf;
+
+      const panel = await connectPanel(cookie!);
+      await collectMessages(panel, 2); // initial status + feature_flags
+
+      // -----------------------------------------------------------------
+      // 1. Register a worker and complete its handshake.
+      const tokenRes = await call("/api/workers/tokens", {
+        json: { name: "gpu-fetch" },
+        cookie,
+        headers: { "X-CSRF": csrf },
+      });
+      const kp = golden.keypairs[1]!; // a different fixture keypair than the main test's
+      const registerRes = await call("/api/agent/register", {
+        json: { token: tokenRes.body.bundle.register_token, pubkey: kp.pubkey_hex },
+      });
+      const workerId = registerRes.body.worker_id as string;
+      const seedHex = kp.seed_hex;
+      const agent = await connectAgent(workerId, seedHex);
+
+      // -----------------------------------------------------------------
+      // 2. hello v3: opted into auto_fetch, protocol 3 (the minimum that can
+      // ever receive fetch_models -- see assess.ts's `MIN_AUTO_FETCH_PROTOCOL`).
+      const helloNone = expectNoMessage(agent, 300);
+      agent.send(
+        JSON.stringify({
+          type: "hello",
+          protocol: 3,
+          auto_fetch: true,
+          backend: "cuda",
+          torch_version: "2.4.0",
+          hardware: { vram_gb: 24 },
+          node_classes: ["CLIPLoader"],
+        })
+      );
+      await helloNone;
+
+      // Ample free disk (well over 1.2x the ~0.23 GB curated clip_l.safetensors)
+      // so the disk-margin gate clears.
+      const heartbeatIdleNone = expectNoMessage(agent, 200);
+      agent.send(JSON.stringify({ type: "heartbeat", state: "idle", dynamic: { free_disk_gb: 50 } }));
+      await heartbeatIdleNone;
+
+      // -----------------------------------------------------------------
+      // 3. Report inventory WITH clip_l.safetensors + sha256 -- the server
+      // learns the hash (model_manifest.recordHash), even though this exact
+      // report will be superseded a moment later.
+      const modelName = "clip_l.safetensors";
+      const sizeGb = 0.23; // matches model_guide.SOURCES' curated size exactly
+      const sizeBytes = Math.round(sizeGb * 1024 ** 3);
+      const sha256 = bytesToHex(
+        new Uint8Array(await crypto.subtle.digest("SHA-256", new TextEncoder().encode("e2e-fetch-arc-clip_l")))
+      );
+      const inventoryWithModelNone = expectNoMessage(agent, 200);
+      agent.send(
+        JSON.stringify({
+          type: "inventory",
+          models: [{ name: modelName, size: sizeGb, size_bytes: sizeBytes, sha256 }],
+        })
+      );
+      await inventoryWithModelNone;
+
+      const hashRow = await db()
+        .prepare("SELECT sha256 FROM model_hashes WHERE name = ? AND size_bytes = ?")
+        .bind(modelName, sizeBytes)
+        .first<{ sha256: string }>();
+      expect(hashRow?.sha256).toBe(sha256);
+
+      // -----------------------------------------------------------------
+      // 4. A SECOND inventory report WITHOUT the model -- the fleet now sees
+      // it missing everywhere, but the learned hash row from step 3 is still
+      // in `model_hashes`, so it's a fetch-manifest candidate.
+      const inventoryEmptyNone = expectNoMessage(agent, 200);
+      agent.send(JSON.stringify({ type: "inventory", models: [] }));
+      await inventoryEmptyNone;
+
+      const inventoryRow = await db().prepare("SELECT model_inventory FROM workers WHERE id = ?").bind(workerId).first<any>();
+      expect(JSON.parse(inventoryRow.model_inventory)).toEqual([]);
+
+      // -----------------------------------------------------------------
+      // 5. Submit a job needing clip_l.safetensors via the console. Missing
+      // fleet-wide, but fetchable (manifest entry + this online opted-in
+      // worker clears the disk margin) -- the submission-relaxation gate
+      // (jobs.ts's `unfetchableMissingModels`) lets it through instead of
+      // 400ing.
+      const workflow = { "1": { class_type: "CLIPLoader", inputs: { clip_name: modelName } } };
+      const submitForm = new FormData();
+      submitForm.set("workflow_json", JSON.stringify(workflow));
+      const submitRes = await raw("/api/jobs", { method: "POST", body: submitForm, cookie, headers: { "X-CSRF": csrf } });
+      expect(submitRes.status).toBe(200);
+      const jobId = submitRes.body.job_id as string;
+      expect(typeof jobId).toBe("string");
+
+      const jobRow = await db().prepare("SELECT required_models FROM jobs WHERE id = ?").bind(jobId).first<any>();
+      expect(JSON.parse(jobRow.required_models)).toEqual([modelName]);
+
+      // -----------------------------------------------------------------
+      // 6. Alarm tick: dispatches with `fetch_models` attached, since this
+      // worker's verdict for the job is eligible_after_fetch.
+      const jobPushPromise = nextMessage(agent);
+      const ran = await runDurableObjectAlarm(hub());
+      expect(ran).toBe(true);
+      const pushed = await jobPushPromise;
+      expect(pushed.type).toBe("job");
+      expect(pushed.job_id).toBe(jobId);
+      expect(Array.isArray(pushed.fetch_models)).toBe(true);
+      const fetchEntry = pushed.fetch_models.find((e: any) => e.name === modelName);
+      expect(fetchEntry).toBeDefined();
+      expect(fetchEntry.sha256).toBe(sha256);
+      expect(fetchEntry.size_bytes).toBe(sizeBytes);
+      expect(fetchEntry.directory).toBe("text_encoders");
+
+      // The entry's signature verifies against the platform's public key --
+      // proves this cloud port's manifest entry is byte-parity signed the
+      // same way `model_manifest.py`'s `entries()` signs one.
+      const platformSeed = await resolvePlatformSeed(db(), (env as any).PLATFORM_ED25519_SEED);
+      const platformPubkeyHex = await derivePublicKeyHexFromSeed(platformSeed);
+      const payload = `${fetchEntry.name}|${fetchEntry.directory}|${fetchEntry.sha256}|${fetchEntry.size_bytes}`;
+      const sigOk = await verifyHex(platformPubkeyHex, new TextEncoder().encode(payload), fetchEntry.sig);
+      expect(sigOk).toBe(true);
+
+      const assignedJob = await getJobById(db(), jobId);
+      expect(assignedJob!.status).toBe("assigned");
+      expect(assignedJob!.workerId).toBe(workerId);
+
+      // -----------------------------------------------------------------
+      // 7. Fake agent reports the fetching_models progress stage; the panel
+      // sees it relayed on the `progress` event.
+      const fetchProgressPromise = nextMessage(panel);
+      agent.send(
+        JSON.stringify({
+          type: "heartbeat",
+          state: "busy",
+          job_id: jobId,
+          stage: "fetching_models",
+          fetch_pct: 0.42,
+          fetch_model: modelName,
+        })
+      );
+      const fetchProgressEvent = await fetchProgressPromise;
+      expect(fetchProgressEvent).toEqual({
+        type: "progress",
+        data: { value: 0, max: 100, prompt_id: jobId, stage: "fetching_models", fetch_pct: 0.42, fetch_model: modelName },
+      });
+
+      // M1 fix: fetch wall time is not billable execution, so the
+      // fetching_models stage must NOT start the job's clock -- it stays
+      // "assigned" (no startedAt) for the whole download phase.
+      await new Promise((r) => setTimeout(r, 100));
+      const stillAssignedJob = await getJobById(db(), jobId);
+      expect(stillAssignedJob!.status).toBe("assigned");
+      expect(stillAssignedJob!.startedAt).toBeNull();
+
+      // GET /api/jobs/{id} surfaces the transient fetch-progress fields.
+      const jobDetailDuringFetch = await call(`/api/jobs/${jobId}`, { method: "GET", cookie });
+      expect(jobDetailDuringFetch.body.stage).toBe("fetching_models");
+      expect(jobDetailDuringFetch.body.fetch_pct).toBe(0.42);
+      expect(jobDetailDuringFetch.body.fetch_model).toBe(modelName);
+
+      // -----------------------------------------------------------------
+      // 8. A plain busy heartbeat (fetch finished, now actually running)
+      // clears the transient fetch-progress fields AND is the heartbeat that
+      // finally starts the job's clock.
+      agent.send(JSON.stringify({ type: "heartbeat", state: "busy", job_id: jobId, progress: 0.1 }));
+      for (let i = 0; i < 40; i++) {
+        const detail = await call(`/api/jobs/${jobId}`, { method: "GET", cookie });
+        if (detail.body.stage === undefined) break;
+        await new Promise((r) => setTimeout(r, 25));
+      }
+      const jobDetailAfterFetch = await call(`/api/jobs/${jobId}`, { method: "GET", cookie });
+      expect(jobDetailAfterFetch.body.stage).toBeUndefined();
+      expect(jobDetailAfterFetch.body.fetch_pct).toBeUndefined();
+      expect(jobDetailAfterFetch.body.fetch_model).toBeUndefined();
+
+      let runningJob = await getJobById(db(), jobId);
+      for (let i = 0; i < 40 && runningJob!.status !== "running"; i++) {
+        await new Promise((r) => setTimeout(r, 25));
+        runningJob = await getJobById(db(), jobId);
+      }
+      expect(runningJob!.status).toBe("running");
+      expect(runningJob!.startedAt).not.toBeNull();
+
+      // -----------------------------------------------------------------
+      // 9. job_done completes normally.
+      const doneReceiptPromise = nextMessage(agent);
+      agent.send(JSON.stringify({ type: "job_done", job_id: jobId, result_files: [], exec_seconds: 0.5 }));
+      const doneReceipt = await doneReceiptPromise;
+      expect(doneReceipt.type).toBe("receipt");
+      expect(doneReceipt.kind).toBe("completed");
+
+      const doneJob = await getJobById(db(), jobId);
+      expect(doneJob!.status).toBe("done");
 
       agent.close();
       panel.close();

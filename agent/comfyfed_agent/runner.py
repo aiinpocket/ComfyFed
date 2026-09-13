@@ -20,7 +20,7 @@ import httpx
 import websockets
 from nacl.signing import SigningKey
 
-from . import comfy, hardware, signing, whitelist
+from . import comfy, fetcher, hardware, signing, whitelist
 from .config import AgentConfig, PlatformEntry
 
 logger = logging.getLogger(__name__)
@@ -45,6 +45,18 @@ _REPORT_RETRY_MAX_SECONDS = 30.0
 # stop waiting and let the interpreter tear the loop down instead of hanging
 # forever on a wedged cleanup.
 _SIGNAL_SHUTDOWN_TIMEOUT_SECONDS = 10.0
+
+# Phase 2.1 Task 5: a `job` push carries `fetch_models` only when the
+# platform's dispatch decided this worker is `eligible_after_fetch`, which
+# itself requires the worker's `hello.auto_fetch` to have been true (see
+# `assess._eligible_after_fetch`). So a `fetch_models` push reaching a worker
+# with `auto_fetch_models` now false is always a race (the operator flipped
+# the config and restarted between hello and this push) or a server bug --
+# never a normal flow. Reported as a polite job_failed rather than crashing:
+# nothing was downloaded, nothing to clean up.
+_AUTO_FETCH_DISABLED_MESSAGE = (
+    "此 worker 未開啟自動下載 / this worker does not have auto-fetch enabled"
+)
 
 
 class PlatformUnavailable(Exception):
@@ -71,6 +83,11 @@ class PlatformConnection:
         # platform (or "" before the first successful upload). Carried on
         # every heartbeat so the platform can detect drift independently.
         self.object_info_hash: str = ""
+        # Digest of the last model inventory this connection actually sent
+        # (or "" before the first send). Lets refresh_model_inventory tell a
+        # genuine change from a no-op rescan without resending the whole
+        # (possibly large) model list just to compare it.
+        self.model_inventory_hash: str = ""
 
     def _ws_url(self) -> str:
         parsed = urlsplit(self.entry.platform_url)
@@ -115,10 +132,16 @@ class PlatformConnection:
                 "backend": backend,
                 "torch_version": torch_version,
                 "node_classes": sorted(node_classes),
-                # Protocol 2: this agent guarantees `exec_seconds` on
+                # Protocol 3: adds `auto_fetch` (below) and lazy sha256
+                # hashes on inventory entries (see hardware.scan_models) --
+                # groundwork for Phase 2.1 model auto-distribution. Still
+                # guarantees everything protocol 2 did: `exec_seconds` on
                 # job_done/job_failed whenever the run actually started, and
-                # understands `job_cancelled` pushes. See agentws.py.
-                "protocol": 2,
+                # understands `job_cancelled` pushes. See agentws.py. A
+                # server that doesn't know protocol 3 yet just ignores the
+                # unknown fields.
+                "protocol": 3,
+                "auto_fetch": self.config.auto_fetch_models,
             }
         )
 
@@ -132,18 +155,33 @@ class PlatformConnection:
         job_id: Optional[str] = None,
         dynamic: Optional[dict] = None,
         object_info_hash: Optional[str] = None,
+        stage: Optional[str] = None,
+        fetch_pct: Optional[float] = None,
+        fetch_model: Optional[str] = None,
     ) -> None:
         self.state = state
-        await self._send(
-            {
-                "type": "heartbeat",
-                "state": state,
-                "progress": progress,
-                "job_id": job_id,
-                "dynamic": dynamic or {},
-                "object_info_hash": object_info_hash,
-            }
-        )
+        message = {
+            "type": "heartbeat",
+            "state": state,
+            "progress": progress,
+            "job_id": job_id,
+            "dynamic": dynamic or {},
+            "object_info_hash": object_info_hash,
+        }
+        # Phase 2.1 Task 5: present only while this worker is downloading a
+        # missing model before running the job it was pushed (see
+        # fetcher.fetch_and_verify_models) -- omitted entirely otherwise, so
+        # an ordinary heartbeat's wire shape is unchanged (matching
+        # agentws.py's `"stage": "fetching_models"|absent` contract, as
+        # opposed to job_id/dynamic/object_info_hash which are always
+        # present, just possibly null/empty).
+        if stage is not None:
+            message["stage"] = stage
+        if fetch_pct is not None:
+            message["fetch_pct"] = fetch_pct
+        if fetch_model is not None:
+            message["fetch_model"] = fetch_model
+        await self._send(message)
 
     async def send_object_info(self, gzip_payload: bytes, oi_hash: str) -> None:
         """Signed POST of a gzipped, canonical `/object_info` snapshot."""
@@ -179,6 +217,19 @@ class PlatformConnection:
 
     def sign_receipt_payload(self, payload: str) -> str:
         return self._sign(payload.encode())
+
+
+def _model_inventory_digest(models: list[dict]) -> str:
+    """Stable digest of a model inventory, for change detection.
+
+    Sorted by name (scan_models' own order is os.walk's, which is not
+    guaranteed stable across calls) and dumped with sorted keys so two scans
+    that found the exact same files/sizes/hashes always hash identically --
+    the whole point being to skip resending an `inventory` message when
+    nothing actually changed.
+    """
+    canonical = json.dumps(sorted(models, key=lambda m: m["name"]), sort_keys=True)
+    return hashlib.sha256(canonical.encode()).hexdigest()
 
 
 def _is_safe_relative_path(path: str) -> bool:
@@ -403,6 +454,15 @@ class _JobHandle:
     # loop already handled -- on a shared worker that second call could land
     # on somebody else's render.
     interrupted_prompt_id: Optional[str] = None
+    # While the auto-fetch pre-phase is downloading models, the latest
+    # {"stage": "fetching_models", "fetch_pct": .., "fetch_model": ..} --
+    # None otherwise. EVERY heartbeat that names this job while it is set
+    # must carry these fields (the initial busy beat and the periodic 30s
+    # beat included): the server treats a stage-less busy heartbeat as "the
+    # run has started" (it sets started_at / clears the panel's 下載模型中
+    # chip), so a bare beat slipping out mid-download would start the
+    # billing clock during a phase that is deliberately never billed.
+    fetch_status: Optional[dict] = None
 
     def set_prompt_id(self, prompt_id: str) -> None:
         # Called from `run_workflow`'s worker thread; a plain attribute
@@ -445,6 +505,9 @@ class AgentLoop:
         progress: float = 0.0,
         job_id: Optional[str] = None,
         dynamic: Optional[dict] = None,
+        stage: Optional[str] = None,
+        fetch_pct: Optional[float] = None,
+        fetch_model: Optional[str] = None,
     ) -> None:
         for worker_id, conn in self.connections.items():
             try:
@@ -454,6 +517,9 @@ class AgentLoop:
                     job_id=job_id,
                     dynamic=dynamic,
                     object_info_hash=getattr(conn, "object_info_hash", None) or None,
+                    stage=stage,
+                    fetch_pct=fetch_pct,
+                    fetch_model=fetch_model,
                 )
             except Exception:
                 logger.exception("runner: failed to broadcast heartbeat to %s", worker_id)
@@ -486,6 +552,43 @@ class AgentLoop:
             return
 
         conn.object_info_hash = oi_hash
+
+    async def refresh_model_inventory(self, conn: PlatformConnection) -> None:
+        """Rescan the local model inventory and push it only if it changed.
+
+        Piggybacks the same `_OBJECT_INFO_INTERVAL_SECONDS` timer as
+        `refresh_object_info` (see `_connection_loop`) rather than a second
+        interval of its own: this is also what makes the lazy-hash
+        convergence in `hardware.scan_models` real. A single hello-time scan
+        would schedule at most one background hash and then never look
+        again, so a models folder with several un-hashed files would sit
+        forever with only the first one ever gaining a `sha256`. Re-scanning
+        periodically lets each pass pick up the next still-unhashed file.
+
+        A digest comparison (`_model_inventory_digest`) keeps a rescan that
+        found nothing new from pushing a chatty no-op `inventory` message
+        every 10 minutes -- only an actual change (a new/removed/resized
+        file, or a hash finishing in the background) triggers a send.
+        """
+        if not self.config.models_dir:
+            return
+
+        models = await asyncio.to_thread(
+            hardware.scan_models, self.config.models_dir, self.config.hash_models
+        )
+        digest = _model_inventory_digest(models)
+        if digest == conn.model_inventory_hash:
+            return
+
+        try:
+            await conn.send_inventory(models)
+        except Exception:
+            logger.exception(
+                "runner: failed to push updated model inventory to %s", conn.entry.platform_url
+            )
+            return
+
+        conn.model_inventory_hash = digest
 
     async def handle_job(self, conn: PlatformConnection, job_msg: dict) -> None:
         """Run one job dispatched over `conn`, broadcasting busy state to every platform.
@@ -520,7 +623,76 @@ class AgentLoop:
                 # The platform may have cancelled while this job waited for
                 # the lock, or between dispatch and here.
                 raise_if_cancelled()
-                await self.broadcast_heartbeat("busy", progress=0.0, job_id=job_id)
+
+                fetch_models = list(job_msg.get("fetch_models") or [])
+                if fetch_models and self.config.auto_fetch_models:
+                    # The very first busy heartbeat must already carry the
+                    # fetch stage: a stage-less busy beat is the server's
+                    # signal that the RUN started (started_at / billing
+                    # clock), and the download phase is never billed.
+                    handle.fetch_status = {
+                        "stage": "fetching_models",
+                        "fetch_pct": 0.0,
+                        "fetch_model": None,
+                    }
+                    await self.broadcast_heartbeat(
+                        "busy",
+                        progress=0.0,
+                        job_id=job_id,
+                        stage="fetching_models",
+                        fetch_pct=0.0,
+                    )
+                else:
+                    await self.broadcast_heartbeat("busy", progress=0.0, job_id=job_id)
+
+                if fetch_models:
+                    if not self.config.auto_fetch_models:
+                        # Never a normal flow -- see _AUTO_FETCH_DISABLED_MESSAGE.
+                        # Raising here (rather than reporting directly) lets the
+                        # existing `except Exception` branch below do the
+                        # reporting, exactly like every other fetch failure.
+                        raise fetcher.FetchError(_AUTO_FETCH_DISABLED_MESSAGE)
+
+                    async def report_fetch_progress(pct: float, model_name: Optional[str]) -> None:
+                        # Runs directly on this coroutine (unlike run_workflow's
+                        # on_progress, fetching is native async, no worker
+                        # thread involved) -- so this is just a normal await,
+                        # no run_coroutine_threadsafe needed.
+                        handle.fetch_status = {
+                            "stage": "fetching_models",
+                            "fetch_pct": pct,
+                            "fetch_model": model_name,
+                        }
+                        await self.broadcast_heartbeat(
+                            "busy",
+                            progress=0.0,
+                            job_id=job_id,
+                            stage="fetching_models",
+                            fetch_pct=pct,
+                            fetch_model=model_name,
+                        )
+
+                    await fetcher.fetch_and_verify_models(
+                        entries=fetch_models,
+                        platform_pubkey_hex=conn.entry.platform_pubkey,
+                        models_dir=self.config.models_dir,
+                        max_fetch_gb=self.config.max_fetch_gb,
+                        cancel_event=handle.cancel_event,
+                        report_progress=report_fetch_progress,
+                    )
+
+                    # Fetch phase over: from here on heartbeats go back to
+                    # the plain busy shape, and the first such stage-less
+                    # beat is what tells the server the run is starting.
+                    handle.fetch_status = None
+
+                    # The manifest models just landed on disk -- push the
+                    # updated inventory now rather than waiting for the
+                    # periodic 10-minute rescan (see refresh_model_inventory),
+                    # so the server learns immediately that this worker no
+                    # longer has a gap for this job (or the next one).
+                    await self.refresh_model_inventory(conn)
+                    await self.broadcast_heartbeat("busy", progress=0.0, job_id=job_id)
 
                 workflow = comfy.namespace_outputs(json.loads(job_msg["workflow_json"]), job_id)
                 # allowed_classes does a blocking HTTP call to ComfyUI's
@@ -607,6 +779,9 @@ class AgentLoop:
                     await self._report_failure(conn, job_id, str(exc), failure_exec_seconds)
             finally:
                 handle.running = False
+                # A fetch that failed/was cancelled must not leave the stage
+                # pinned on later heartbeats for this (already ended) job.
+                handle.fetch_status = None
                 if cancelled:
                     # Last look at the prompt id: a cancel that raced the
                     # `/prompt` POST had nothing to stop when it arrived.
@@ -1016,6 +1191,17 @@ class AgentLoop:
                 return handle.job_id
         return None
 
+    def _fetch_status_for(self, conn: PlatformConnection) -> Optional[dict]:
+        """The running job's live fetch-phase status for `conn`'s platform,
+        or None. The periodic heartbeat must carry it for the same reason
+        the initial busy beat does (see `_JobHandle.fetch_status`): a bare
+        busy heartbeat slipping out mid-download would make the server
+        start the billing clock during the never-billed fetch phase."""
+        for handle in self._jobs.values():
+            if handle.running and handle.conn is conn:
+                return handle.fetch_status
+        return None
+
     async def _handle_job_cancelled(self, conn: PlatformConnection, message: dict) -> None:
         """Platform says this job is no longer ours: stop ComfyUI and wind down.
 
@@ -1273,6 +1459,7 @@ class AgentLoop:
             now = time.monotonic()
             if now - last_heartbeat >= _HEARTBEAT_INTERVAL_SECONDS:
                 dynamic = hardware.collect_dynamic(self.config.models_dir)
+                fetch_status = self._fetch_status_for(conn) or {}
                 await conn.send_heartbeat(
                     conn.state,
                     # Carrying the job id is what lets the server notice a
@@ -1281,11 +1468,18 @@ class AgentLoop:
                     job_id=self._job_id_for(conn),
                     dynamic=dynamic,
                     object_info_hash=conn.object_info_hash or None,
+                    # While the auto-fetch pre-phase is active, the periodic
+                    # beat carries the stage too -- a stage-less busy beat
+                    # is the server's run-started signal (started_at).
+                    stage=fetch_status.get("stage"),
+                    fetch_pct=fetch_status.get("fetch_pct"),
+                    fetch_model=fetch_status.get("fetch_model"),
                 )
                 last_heartbeat = now
 
             if now - last_object_info >= _OBJECT_INFO_INTERVAL_SECONDS:
                 await self.refresh_object_info(conn)
+                await self.refresh_model_inventory(conn)
                 last_object_info = now
 
     async def _run_platform(self, conn: PlatformConnection) -> None:
@@ -1306,8 +1500,13 @@ class AgentLoop:
                 )
                 await conn.send_hello(hw, backend, torch_version, allowed)
 
-                models = hardware.scan_models(self.config.models_dir) if self.config.models_dir else []
+                models = (
+                    hardware.scan_models(self.config.models_dir, hash_models=self.config.hash_models)
+                    if self.config.models_dir
+                    else []
+                )
                 await conn.send_inventory(models)
+                conn.model_inventory_hash = _model_inventory_digest(models)
 
                 await self.refresh_object_info(conn)
 

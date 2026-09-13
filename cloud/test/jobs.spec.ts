@@ -260,6 +260,18 @@ async function signedCall(
 }
 
 async function createAssignedJob(worker: RegisteredWorker, workflow: Record<string, unknown> = SIMPLE_WORKFLOW): Promise<string> {
+  // Phase 2.1 Task 7: POST /api/jobs now rejects a submission whose models
+  // are missing fleet-wide AND unfetchable (no signed manifest entry, or no
+  // online opted-in worker) -- see jobs.ts's `unfetchableMissingModels`.
+  // `worker` was just registered with an empty inventory, so it must claim
+  // to already have SIMPLE_WORKFLOW's `sd15.safetensors` (this helper's
+  // whole point is testing artifact upload, not model assessment) or the
+  // submit below would 400 instead of returning a job id.
+  await db()
+    .prepare("UPDATE workers SET model_inventory = ? WHERE id = ?")
+    .bind(JSON.stringify([{ name: "sd15.safetensors", size: 2.0 }]), worker.workerId)
+    .run();
+
   const { cookie, csrf } = await adminSession();
   const submit = await submitJob(cookie, csrf, workflow);
   const jobId = submit.body.job_id;
