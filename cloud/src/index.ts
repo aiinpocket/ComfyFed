@@ -50,6 +50,15 @@ app.use("*", async (c, next) => {
 
 app.get("/api/ping", (c) => c.json({ ok: true, mode: "cloud" }));
 
+// Agent WebSocket: forwarded straight to the singleton Hub Durable Object
+// (see do/hub.ts) -- one instance for the whole deployment, per
+// progress.md's pre-flight ruling. The DO's own `fetch` handles the
+// Upgrade negotiation; nothing about the handshake/protocol belongs here.
+app.get("/api/agent/ws", (c) => {
+  const stub = c.env.HUB.get(c.env.HUB.idFromName("hub"));
+  return stub.fetch(c.req.raw);
+});
+
 app.route("/", authRoutes);
 app.route("/", settingsRoutes);
 app.route("/", workersRoutes);

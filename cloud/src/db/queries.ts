@@ -302,6 +302,62 @@ export async function updateWorkerObjectInfoHash(db: D1Database, workerId: strin
   await db.prepare("UPDATE workers SET object_info_hash = ? WHERE id = ?").bind(hash, workerId).run();
 }
 
+/** Applies a `hello` message's fields -- mirrors `agentws._handle_hello`'s
+ * writes (`hardware`, `backend`, `torch_version`, `node_classes`,
+ * `protocol`), plus `status = "online"` and `last_seen`, both of which
+ * `_handle_hello` also sets unconditionally on a valid hello. */
+export async function updateWorkerHello(
+  db: D1Database,
+  workerId: string,
+  fields: {
+    hardware: Record<string, unknown>;
+    backend: string;
+    torchVersion: string;
+    nodeClasses: unknown[];
+    protocol: number;
+    lastSeen: string;
+  }
+): Promise<void> {
+  await db
+    .prepare(
+      `UPDATE workers
+       SET hardware = ?, backend = ?, torch_version = ?, node_classes = ?, protocol = ?,
+           status = 'online', last_seen = ?
+       WHERE id = ?`
+    )
+    .bind(
+      JSON.stringify(fields.hardware),
+      fields.backend,
+      fields.torchVersion,
+      JSON.stringify(fields.nodeClasses),
+      fields.protocol,
+      fields.lastSeen,
+      workerId
+    )
+    .run();
+}
+
+/** Applies a `heartbeat` message's worker-row writes -- mirrors
+ * `agentws._handle_heartbeat`'s `worker.last_seen`/`worker.status`/
+ * `worker.dynamic` writes. `status` is precomputed by the caller (idle ->
+ * "online", busy -> "busy", anything else -> the worker's own current
+ * status, left untouched -- matching Python's `if/elif` with no `else`). */
+export async function updateWorkerHeartbeat(
+  db: D1Database,
+  workerId: string,
+  fields: { status: string; dynamic: Record<string, unknown>; lastSeen: string }
+): Promise<void> {
+  await db
+    .prepare("UPDATE workers SET status = ?, dynamic = ?, last_seen = ? WHERE id = ?")
+    .bind(fields.status, JSON.stringify(fields.dynamic), fields.lastSeen, workerId)
+    .run();
+}
+
+/** Mirrors `agentws._handle_inventory`'s `worker.model_inventory` write. */
+export async function updateWorkerModelInventory(db: D1Database, workerId: string, models: unknown[]): Promise<void> {
+  await db.prepare("UPDATE workers SET model_inventory = ? WHERE id = ?").bind(JSON.stringify(models), workerId).run();
+}
+
 /** Returns true if a row was updated -- mirrors `disable_worker`'s 404 when
  * the worker doesn't exist. */
 export async function setWorkerDisabled(db: D1Database, workerId: string, disabled: boolean): Promise<boolean> {
@@ -312,15 +368,32 @@ export async function setWorkerDisabled(db: D1Database, workerId: string, disabl
   return (result.meta.changes ?? 0) > 0;
 }
 
-/** Typed seam for the Hub DO's live per-worker state (queue depth, current
- * job, connection status, etc.) -- Task 6 wires this up for real. Until
- * then `GET /api/workers` (see routes/workers.ts) falls back to the
- * persisted `workers.dynamic` column, exactly like `workers.py` does today
- * (there is no live layer in the Python source either -- `dynamic` is
- * itself just a JSON column written by whatever last touched the worker
- * over its agent WebSocket). Always returns null for now. */
-export async function getDynamic(_workerId: string): Promise<Record<string, unknown> | null> {
-  return null;
+/** Typed seam for the Hub DO's live per-worker state, wired for real as of
+ * Task 6: asks the singleton Hub Durable Object (`idFromName("hub")`) for
+ * whatever it has cached in memory for `workerId`'s live connection (its
+ * most recent heartbeat `dynamic` payload) via `GET /internal/dynamic`.
+ * Returns `null` when the worker isn't currently connected (including right
+ * after a hibernation eviction, before its ephemeral state is rebuilt) or on
+ * any DO-call failure -- callers (`GET /api/workers`) already fall back to
+ * the persisted `workers.dynamic` column in that case, exactly like
+ * `workers.py` does today (there is no live layer in the Python source
+ * either -- `dynamic` there is itself just a JSON column written by
+ * whatever last touched the worker over its agent WebSocket); this only
+ * shaves the read-after-write lag a busy heartbeat cadence would otherwise
+ * have against D1. */
+export async function getDynamic(
+  hub: DurableObjectNamespace,
+  workerId: string
+): Promise<Record<string, unknown> | null> {
+  try {
+    const stub = hub.get(hub.idFromName("hub"));
+    const res = await stub.fetch(`http://hub.internal/internal/dynamic?worker_id=${encodeURIComponent(workerId)}`);
+    if (!res.ok) return null;
+    const data = await res.json<{ dynamic: Record<string, unknown> | null }>();
+    return data.dynamic ?? null;
+  } catch {
+    return null;
+  }
 }
 
 // ---------------------------------------------------------------------------
@@ -515,6 +588,25 @@ export async function updateJobFailed(
     .run();
 }
 
+/** Updates a running job's progress fraction -- mirrors agentws.py's
+ * `_handle_heartbeat` writing `job.progress` straight onto the row when a
+ * heartbeat carries one for a job this worker still owns. */
+export async function updateJobProgress(db: D1Database, jobId: string, progress: number): Promise<void> {
+  await db.prepare("UPDATE jobs SET progress = ? WHERE id = ?").bind(progress, jobId).run();
+}
+
+/** Whether any job is currently queued, assigned, or running -- the Hub
+ * DO's alarm re-arm condition (see do/hub.ts): the 5s dispatch tick keeps
+ * ticking while there is either a live agent connection OR work that isn't
+ * finished yet, so a stale/assigned job doesn't sit unrequeued forever even
+ * with zero agents connected. */
+export async function hasActiveJobs(db: D1Database): Promise<boolean> {
+  const row = await db
+    .prepare("SELECT 1 AS one FROM jobs WHERE status IN ('queued', 'assigned', 'running') LIMIT 1")
+    .first<{ one: number }>();
+  return row !== null;
+}
+
 // ---------------------------------------------------------------------------
 // Receipts
 
@@ -565,6 +657,43 @@ export async function getReceiptsForJob(db: D1Database, jobId: string): Promise<
     .bind(jobId)
     .all<ReceiptRow>();
   return results.map(rowToReceipt);
+}
+
+export async function getReceiptById(db: D1Database, id: string): Promise<Receipt | null> {
+  const row = await db.prepare("SELECT * FROM receipts WHERE id = ?").bind(id).first<ReceiptRow>();
+  return row ? rowToReceipt(row) : null;
+}
+
+export interface NewReceipt {
+  id: string;
+  jobId: string;
+  workerId: string;
+  gpuSeconds: number;
+  platformSig: string;
+  createdAt: string;
+  kind: string;
+  billable: boolean;
+  basis: string;
+}
+
+/** Inserts a freshly platform-signed receipt row -- mirrors
+ * `agentws._sign_and_store_receipt`'s `db.Receipt(...)` insert. `worker_sig`
+ * starts NULL; `updateReceiptWorkerSig` fills it in once the worker
+ * counter-signs via `receipt_ack`. */
+export async function insertReceipt(db: D1Database, r: NewReceipt): Promise<void> {
+  await db
+    .prepare(
+      `INSERT INTO receipts (id, job_id, worker_id, gpu_seconds, platform_sig, created_at, kind, billable, basis)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`
+    )
+    .bind(r.id, r.jobId, r.workerId, r.gpuSeconds, r.platformSig, r.createdAt, r.kind, r.billable ? 1 : 0, r.basis)
+    .run();
+}
+
+/** Stores a worker's counter-signature on a receipt -- mirrors
+ * `agentws._handle_receipt_ack`'s `receipt.worker_sig = worker_sig` write. */
+export async function updateReceiptWorkerSig(db: D1Database, id: string, workerSig: string): Promise<void> {
+  await db.prepare("UPDATE receipts SET worker_sig = ? WHERE id = ?").bind(workerSig, id).run();
 }
 
 // ---------------------------------------------------------------------------

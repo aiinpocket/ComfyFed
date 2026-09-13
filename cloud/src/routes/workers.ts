@@ -260,7 +260,7 @@ app.get("/api/workers", requireAdmin, async (c) => {
       last_seen: w.lastSeen ? sqliteTimestampToIsoformat(w.lastSeen) : null,
       disabled: w.disabled,
       hardware: w.hardware,
-      dynamic: (await getDynamic(w.id)) ?? w.dynamic,
+      dynamic: (await getDynamic(c.env.HUB, w.id)) ?? w.dynamic,
       backend: w.backend,
       torch_version: w.torchVersion,
       model_count: w.modelInventory.length,
