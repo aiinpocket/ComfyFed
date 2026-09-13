@@ -680,9 +680,14 @@ async def _handle_heartbeat(worker_id: str, conn: _Connection, message: dict) ->
                 # before it can run the job reports stage="fetching_models"
                 # alongside its usual progress. Stored transiently (see
                 # `_fetch_progress`'s docstring) rather than as a Job column,
-                # and cleared the moment a heartbeat stops reporting it (the
-                # download finished, or this is an older agent that never
-                # sends it at all).
+                # and cleared the moment a heartbeat stops reporting it. The
+                # agent guarantees EVERY heartbeat naming the job during the
+                # fetch phase carries the stage (initial busy beat, progress
+                # reports, and the periodic 30s beat alike -- see runner's
+                # `_JobHandle.fetch_status`), so a stage-less beat reliably
+                # means the download phase is over (or a pre-2.1 agent that
+                # never fetches). That same stage-less beat is also what
+                # lets mark_running below start the run/billing clock.
                 if message.get("stage") == "fetching_models":
                     fetch_pct = message.get("fetch_pct")
                     fetch_model = message.get("fetch_model")
@@ -721,7 +726,19 @@ async def _handle_heartbeat(worker_id: str, conn: _Connection, message: dict) ->
     # Repeats for the same (connection, job id) are rate-limited to DEBUG via
     # resolve_warn_level/_resolve_warn_level, so a stale agent heartbeating
     # every ~30s for the rest of the run doesn't spam WARNING lines for it.
-    if state == "busy" and job_id:
+    #
+    # M1 fix: while the agent is still in the fetch_models pre-phase
+    # (stage="fetching_models"), the job has NOT started running yet -- it's
+    # downloading a prerequisite model, not billable execution. Leaving
+    # started_at unset here (job stays "assigned") means a fetch failure's
+    # failed receipt correctly shows exec_seconds/gpu_seconds == 0.0 (wall
+    # basis with started_at is None -> no false "protocol violation" ERROR,
+    # since that branch is guarded on started_at is not None) and a cancel
+    # mid-fetch mints NO cancelled receipt at all (parity with cancelling a
+    # still-queued job: download time is never billed). started_at gets set
+    # by the first busy heartbeat WITHOUT stage="fetching_models" -- i.e. the
+    # moment the agent actually starts running the job against ComfyUI.
+    if state == "busy" and job_id and message.get("stage") != "fetching_models":
         if dispatch.mark_running(
             job_id, worker_id, resolve_warn_level=lambda jid: _resolve_warn_level(conn, jid)
         ):

@@ -454,6 +454,15 @@ class _JobHandle:
     # loop already handled -- on a shared worker that second call could land
     # on somebody else's render.
     interrupted_prompt_id: Optional[str] = None
+    # While the auto-fetch pre-phase is downloading models, the latest
+    # {"stage": "fetching_models", "fetch_pct": .., "fetch_model": ..} --
+    # None otherwise. EVERY heartbeat that names this job while it is set
+    # must carry these fields (the initial busy beat and the periodic 30s
+    # beat included): the server treats a stage-less busy heartbeat as "the
+    # run has started" (it sets started_at / clears the panel's 下載模型中
+    # chip), so a bare beat slipping out mid-download would start the
+    # billing clock during a phase that is deliberately never billed.
+    fetch_status: Optional[dict] = None
 
     def set_prompt_id(self, prompt_id: str) -> None:
         # Called from `run_workflow`'s worker thread; a plain attribute
@@ -614,9 +623,28 @@ class AgentLoop:
                 # The platform may have cancelled while this job waited for
                 # the lock, or between dispatch and here.
                 raise_if_cancelled()
-                await self.broadcast_heartbeat("busy", progress=0.0, job_id=job_id)
 
                 fetch_models = list(job_msg.get("fetch_models") or [])
+                if fetch_models and self.config.auto_fetch_models:
+                    # The very first busy heartbeat must already carry the
+                    # fetch stage: a stage-less busy beat is the server's
+                    # signal that the RUN started (started_at / billing
+                    # clock), and the download phase is never billed.
+                    handle.fetch_status = {
+                        "stage": "fetching_models",
+                        "fetch_pct": 0.0,
+                        "fetch_model": None,
+                    }
+                    await self.broadcast_heartbeat(
+                        "busy",
+                        progress=0.0,
+                        job_id=job_id,
+                        stage="fetching_models",
+                        fetch_pct=0.0,
+                    )
+                else:
+                    await self.broadcast_heartbeat("busy", progress=0.0, job_id=job_id)
+
                 if fetch_models:
                     if not self.config.auto_fetch_models:
                         # Never a normal flow -- see _AUTO_FETCH_DISABLED_MESSAGE.
@@ -630,6 +658,11 @@ class AgentLoop:
                         # on_progress, fetching is native async, no worker
                         # thread involved) -- so this is just a normal await,
                         # no run_coroutine_threadsafe needed.
+                        handle.fetch_status = {
+                            "stage": "fetching_models",
+                            "fetch_pct": pct,
+                            "fetch_model": model_name,
+                        }
                         await self.broadcast_heartbeat(
                             "busy",
                             progress=0.0,
@@ -648,12 +681,18 @@ class AgentLoop:
                         report_progress=report_fetch_progress,
                     )
 
+                    # Fetch phase over: from here on heartbeats go back to
+                    # the plain busy shape, and the first such stage-less
+                    # beat is what tells the server the run is starting.
+                    handle.fetch_status = None
+
                     # The manifest models just landed on disk -- push the
                     # updated inventory now rather than waiting for the
                     # periodic 10-minute rescan (see refresh_model_inventory),
                     # so the server learns immediately that this worker no
                     # longer has a gap for this job (or the next one).
                     await self.refresh_model_inventory(conn)
+                    await self.broadcast_heartbeat("busy", progress=0.0, job_id=job_id)
 
                 workflow = comfy.namespace_outputs(json.loads(job_msg["workflow_json"]), job_id)
                 # allowed_classes does a blocking HTTP call to ComfyUI's
@@ -740,6 +779,9 @@ class AgentLoop:
                     await self._report_failure(conn, job_id, str(exc), failure_exec_seconds)
             finally:
                 handle.running = False
+                # A fetch that failed/was cancelled must not leave the stage
+                # pinned on later heartbeats for this (already ended) job.
+                handle.fetch_status = None
                 if cancelled:
                     # Last look at the prompt id: a cancel that raced the
                     # `/prompt` POST had nothing to stop when it arrived.
@@ -1149,6 +1191,17 @@ class AgentLoop:
                 return handle.job_id
         return None
 
+    def _fetch_status_for(self, conn: PlatformConnection) -> Optional[dict]:
+        """The running job's live fetch-phase status for `conn`'s platform,
+        or None. The periodic heartbeat must carry it for the same reason
+        the initial busy beat does (see `_JobHandle.fetch_status`): a bare
+        busy heartbeat slipping out mid-download would make the server
+        start the billing clock during the never-billed fetch phase."""
+        for handle in self._jobs.values():
+            if handle.running and handle.conn is conn:
+                return handle.fetch_status
+        return None
+
     async def _handle_job_cancelled(self, conn: PlatformConnection, message: dict) -> None:
         """Platform says this job is no longer ours: stop ComfyUI and wind down.
 
@@ -1406,6 +1459,7 @@ class AgentLoop:
             now = time.monotonic()
             if now - last_heartbeat >= _HEARTBEAT_INTERVAL_SECONDS:
                 dynamic = hardware.collect_dynamic(self.config.models_dir)
+                fetch_status = self._fetch_status_for(conn) or {}
                 await conn.send_heartbeat(
                     conn.state,
                     # Carrying the job id is what lets the server notice a
@@ -1414,6 +1468,12 @@ class AgentLoop:
                     job_id=self._job_id_for(conn),
                     dynamic=dynamic,
                     object_info_hash=conn.object_info_hash or None,
+                    # While the auto-fetch pre-phase is active, the periodic
+                    # beat carries the stage too -- a stage-less busy beat
+                    # is the server's run-started signal (started_at).
+                    stage=fetch_status.get("stage"),
+                    fetch_pct=fetch_status.get("fetch_pct"),
+                    fetch_model=fetch_status.get("fetch_model"),
                 )
                 last_heartbeat = now
 

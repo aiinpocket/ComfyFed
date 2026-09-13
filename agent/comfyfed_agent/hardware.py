@@ -273,6 +273,13 @@ def scan_models(models_dir: str, hash_models: bool = True) -> list[dict]:
             full_path = os.path.join(root, filename)
             if full_path == cache_path or filename.startswith(_HASH_SIDECAR_NAME):
                 continue  # our own sidecar (and its .tmp-* siblings), not a model
+            if filename.endswith(".part"):
+                # An in-progress auto-fetch download (fetcher._PART_SUFFIX):
+                # still being written, so inventorying/hashing it would report
+                # a junk model AND persist a junk model_hashes row server-side
+                # (final-review m2). It becomes visible on the rescan after
+                # its atomic rename.
+                continue
             try:
                 stat_result = os.stat(full_path)
             except OSError:

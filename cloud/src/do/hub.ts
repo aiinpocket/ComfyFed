@@ -829,7 +829,18 @@ export class Hub extends DurableObject<Env> {
     // actually started -- "assigned" becomes "running" here. Called
     // unconditionally (matching agentws.py) so the WARNING/DEBUG split for a
     // foreign job_id still fires/rate-limits on every heartbeat.
-    if (state === "busy" && jobId) {
+    //
+    // M1 fix (mirrors agentws.py's `_handle_heartbeat`): while
+    // stage === "fetching_models" the job hasn't started running yet -- it's
+    // downloading a prerequisite model, not billable execution. Skipping the
+    // running transition here leaves startedAt unset, so a fetch failure's
+    // failed receipt reports gpu_seconds 0.0 (no false protocol-violation
+    // alarm) and a cancel mid-fetch mints no cancelled receipt at all
+    // (download time is never billed, same as cancelling a still-queued
+    // job). startedAt is set by the first busy heartbeat that is NOT in the
+    // fetch stage, i.e. when the agent actually starts running against
+    // ComfyUI.
+    if (state === "busy" && jobId && msg.stage !== "fetching_models") {
       await this.applyOwnedTransition(db, jobId, workerId, ["assigned"], ephemeral, async () => {
         await queries.updateJobRunning(db, jobId, toSqliteTimestamp(now));
         await this.panelJobRunning(jobId);

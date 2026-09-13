@@ -294,6 +294,13 @@ async def _download_one(
         try:
             async with client.stream("GET", url, timeout=timeout) as resp:
                 resp.raise_for_status()
+                if resp.is_redirect or 300 <= resp.status_code < 400:
+                    # Belt-and-suspenders: the client is constructed with
+                    # follow_redirects=True, so this should never trigger in
+                    # production, but a 3xx must never be treated as success
+                    # via the size-mismatch branch below (an un-followed
+                    # redirect's body is empty/small, not a hash mismatch).
+                    raise RuntimeError(f"unexpected redirect status {resp.status_code}")
                 with open(part_path, "wb") as f:
                     async for chunk in resp.aiter_bytes(_CHUNK_SIZE):
                         if cancel_event.is_set():
@@ -394,7 +401,9 @@ async def fetch_and_verify_models(
     created_parts = [target_path + _PART_SUFFIX for _entry, target_path in targets]
 
     try:
-        async with client_factory(timeout=httpx.Timeout(_READ_TIMEOUT_SECONDS)) as client:
+        async with client_factory(
+            timeout=httpx.Timeout(_READ_TIMEOUT_SECONDS), follow_redirects=True
+        ) as client:
             for entry, target_path in targets:
                 model_name = entry.get("name")
 

@@ -414,6 +414,150 @@ def test_busy_heartbeat_marks_the_assigned_job_running(client):
             assert receipt.gpu_seconds > 0
 
 
+def test_fetch_stage_heartbeat_does_not_start_the_job_running(client):
+    """M1: a busy heartbeat carrying stage="fetching_models" is the agent
+    downloading a prerequisite model, not billable execution -- it must NOT
+    flip the job to "running" or stamp started_at. Only the first busy
+    heartbeat WITHOUT that stage (the actual run starting) does."""
+    csrf = _login(client)
+    worker_id, sk = _register_worker(client, csrf, "w1")
+    job_id = _submit(client, csrf)
+
+    with client.websocket_connect("/api/agent/ws") as ws:
+        challenge = ws.receive_json()
+        sig = sk.sign(challenge["nonce"].encode()).signature.hex()
+        ws.send_json({"type": "auth", "worker_id": worker_id, "sig": sig})
+        assert ws.receive_json()["type"] == "ready"
+
+        ws.send_json({"type": "heartbeat", "state": "idle", "progress": 0.0, "job_id": None, "dynamic": {}})
+        agentws.dispatch_once(worker_id)
+        assert ws.receive_json()["type"] == "job"
+
+        ws.send_json(
+            {
+                "type": "heartbeat",
+                "state": "busy",
+                "progress": 0.0,
+                "job_id": job_id,
+                "dynamic": {},
+                "stage": "fetching_models",
+                "fetch_pct": 42.0,
+                "fetch_model": "model.safetensors",
+            }
+        )
+        agentws.dispatch_once(worker_id)
+
+        with db.get_session() as session:
+            job = session.get(db.Job, job_id)
+            assert job.status == "assigned"
+            assert job.started_at is None
+
+        # The download finishes and the run actually starts: a busy
+        # heartbeat with no stage field now sets started_at.
+        ws.send_json({"type": "heartbeat", "state": "busy", "progress": 0.0, "job_id": job_id, "dynamic": {}})
+        agentws.dispatch_once(worker_id)
+
+        with db.get_session() as session:
+            job = session.get(db.Job, job_id)
+            assert job.status == "running"
+            assert job.started_at is not None
+
+
+def test_fetch_fail_receipt_is_zero_gpu_seconds_with_no_protocol_violation_log(client, caplog):
+    """M1: a fetch-phase failure must bill gpu_seconds 0.0 (nothing ran) and
+    must NOT trip the "protocol violation: ... despite having started" ERROR
+    -- that branch is (correctly) guarded on started_at is not None, and
+    started_at was never set for a job that failed during the fetch phase."""
+    csrf = _login(client)
+    worker_id, sk = _register_worker(client, csrf, "w1")
+    job_id = _submit(client, csrf)
+
+    ws = _connect(client, worker_id, sk)
+    try:
+        _send_hello_v2(ws)  # protocol 2 -- the branch this guards against
+        ws.send_json({"type": "heartbeat", "state": "idle", "progress": 0.0, "job_id": None, "dynamic": {}})
+        agentws.dispatch_once(worker_id)
+        assert ws.receive_json()["type"] == "job"
+
+        ws.send_json(
+            {
+                "type": "heartbeat",
+                "state": "busy",
+                "progress": 0.0,
+                "job_id": job_id,
+                "dynamic": {},
+                "stage": "fetching_models",
+                "fetch_pct": 10.0,
+                "fetch_model": "model.safetensors",
+            }
+        )
+        agentws.dispatch_once(worker_id)
+
+        with db.get_session() as session:
+            assert session.get(db.Job, job_id).started_at is None
+
+        with caplog.at_level(logging.ERROR, logger="comfyfed_server.agentws"):
+            ws.send_json(
+                {"type": "job_failed", "job_id": job_id, "error": "模型下載失敗 / model fetch failed"}
+            )
+            agentws.dispatch_once(worker_id)
+            receipt_msg = ws.receive_json()
+
+        errors = [r for r in caplog.records if r.levelno >= logging.ERROR]
+        assert not errors, f"unexpected ERROR log(s) on fetch-phase failure: {errors}"
+
+        assert receipt_msg["type"] == "receipt"
+        assert receipt_msg["kind"] == "failed"
+        assert receipt_msg["basis"] == "wall"
+
+        with db.get_session() as session:
+            receipt = session.get(db.Receipt, receipt_msg["receipt_id"])
+            assert receipt.gpu_seconds == 0.0
+    finally:
+        ws.close()
+
+
+def test_cancel_mid_fetch_mints_no_receipt(client):
+    """M1: cancelling a job while it is still in the fetch phase (started_at
+    unset) must mint NO cancelled receipt at all -- parity with cancelling a
+    still-queued/merely-assigned job. Download time is never billed."""
+    csrf = _login(client)
+    worker_id, sk = _register_worker(client, csrf, "w1")
+    job_id = _submit(client, csrf)
+
+    ws = _connect(client, worker_id, sk)
+    try:
+        _send_hello_v2(ws)
+        ws.send_json({"type": "heartbeat", "state": "idle", "progress": 0.0, "job_id": None, "dynamic": {}})
+        agentws.dispatch_once(worker_id)
+        assert ws.receive_json()["type"] == "job"
+
+        ws.send_json(
+            {
+                "type": "heartbeat",
+                "state": "busy",
+                "progress": 0.0,
+                "job_id": job_id,
+                "dynamic": {},
+                "stage": "fetching_models",
+                "fetch_pct": 5.0,
+                "fetch_model": "model.safetensors",
+            }
+        )
+        agentws.dispatch_once(worker_id)
+
+        with db.get_session() as session:
+            assert session.get(db.Job, job_id).started_at is None
+
+        res = client.post(f"/api/jobs/{job_id}/cancel", headers={"X-CSRF": csrf})
+        assert res.status_code == 200
+
+        with db.get_session() as session:
+            assert session.query(db.Receipt).filter(db.Receipt.job_id == job_id).count() == 0
+    finally:
+        ws.close()
+
+
 def _backdate_started_at(job_id, hours):
     """Push a job's `started_at` into the past, so `finished_at - started_at`
     (the wall clock) is large by the time `job_done` is sent -- used to prove
@@ -2130,5 +2274,52 @@ def test_job_done_missing_exec_seconds_for_protocol_2_logs_error(client, caplog)
         with db.get_session() as session:
             receipt = session.query(db.Receipt).filter(db.Receipt.job_id == job_id).one()
             assert receipt.basis == "wall"
+    finally:
+        ws.close()
+
+
+def test_stageless_heartbeat_clears_fetch_chip_and_starts_the_run(client):
+    """final-review m1, settled at the root on the AGENT side: every
+    heartbeat the agent sends while the fetch phase is active carries
+    stage="fetching_models" (initial busy beat, progress reports, AND the
+    periodic 30s beat -- see runner._JobHandle.fetch_status), so the server
+    may keep the simple contract asserted here: a stage-less busy beat
+    means the download is over -- it clears the transient chip and is the
+    run-started (started_at) transition, atomically from the panel's view."""
+    csrf = _login(client)
+    worker_id, sk = _register_worker(client, csrf, "w1")
+    job_id = _submit(client, csrf)
+
+    ws = _connect(client, worker_id, sk)
+    try:
+        _send_hello_v2(ws)
+        ws.send_json({"type": "heartbeat", "state": "idle", "progress": 0.0, "job_id": None, "dynamic": {}})
+        agentws.dispatch_once(worker_id)
+        assert ws.receive_json()["type"] == "job"
+
+        ws.send_json(
+            {
+                "type": "heartbeat",
+                "state": "busy",
+                "progress": 0.0,
+                "job_id": job_id,
+                "dynamic": {},
+                "stage": "fetching_models",
+                "fetch_pct": 33.0,
+                "fetch_model": "m.safetensors",
+            }
+        )
+        agentws.dispatch_once(worker_id)
+        assert agentws._fetch_progress[job_id]["fetch_pct"] == 33.0
+
+        # The first stage-less busy heartbeat: download over, run starts.
+        # Chip cleared and started_at set by the same beat -- the agent
+        # guarantees no stage-less beat can slip out mid-download, so this
+        # transition is unambiguous.
+        ws.send_json({"type": "heartbeat", "state": "busy", "progress": 0.0, "job_id": job_id, "dynamic": {}})
+        agentws.dispatch_once(worker_id)
+        with db.get_session() as session:
+            assert session.get(db.Job, job_id).status == "running"
+        assert job_id not in agentws._fetch_progress
     finally:
         ws.close()

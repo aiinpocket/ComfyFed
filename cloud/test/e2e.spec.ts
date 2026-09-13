@@ -694,17 +694,13 @@ describe("cloud end-to-end", () => {
         data: { value: 0, max: 100, prompt_id: jobId, stage: "fetching_models", fetch_pct: 0.42, fetch_model: modelName },
       });
 
-      // The progress event (awaited above) is sent from inside the same
-      // heartbeat handler BEFORE the state==="busy" mark_running transition
-      // runs (see do/hub.ts's `handleHeartbeat`), so the DB write can still
-      // be in flight the instant the WS message arrives -- poll briefly
-      // rather than asserting immediately.
-      let runningJob = await getJobById(db(), jobId);
-      for (let i = 0; i < 40 && runningJob!.status !== "running"; i++) {
-        await new Promise((r) => setTimeout(r, 25));
-        runningJob = await getJobById(db(), jobId);
-      }
-      expect(runningJob!.status).toBe("running"); // the busy heartbeat still marks it running
+      // M1 fix: fetch wall time is not billable execution, so the
+      // fetching_models stage must NOT start the job's clock -- it stays
+      // "assigned" (no startedAt) for the whole download phase.
+      await new Promise((r) => setTimeout(r, 100));
+      const stillAssignedJob = await getJobById(db(), jobId);
+      expect(stillAssignedJob!.status).toBe("assigned");
+      expect(stillAssignedJob!.startedAt).toBeNull();
 
       // GET /api/jobs/{id} surfaces the transient fetch-progress fields.
       const jobDetailDuringFetch = await call(`/api/jobs/${jobId}`, { method: "GET", cookie });
@@ -714,7 +710,8 @@ describe("cloud end-to-end", () => {
 
       // -----------------------------------------------------------------
       // 8. A plain busy heartbeat (fetch finished, now actually running)
-      // clears the transient fetch-progress fields.
+      // clears the transient fetch-progress fields AND is the heartbeat that
+      // finally starts the job's clock.
       agent.send(JSON.stringify({ type: "heartbeat", state: "busy", job_id: jobId, progress: 0.1 }));
       for (let i = 0; i < 40; i++) {
         const detail = await call(`/api/jobs/${jobId}`, { method: "GET", cookie });
@@ -725,6 +722,14 @@ describe("cloud end-to-end", () => {
       expect(jobDetailAfterFetch.body.stage).toBeUndefined();
       expect(jobDetailAfterFetch.body.fetch_pct).toBeUndefined();
       expect(jobDetailAfterFetch.body.fetch_model).toBeUndefined();
+
+      let runningJob = await getJobById(db(), jobId);
+      for (let i = 0; i < 40 && runningJob!.status !== "running"; i++) {
+        await new Promise((r) => setTimeout(r, 25));
+        runningJob = await getJobById(db(), jobId);
+      }
+      expect(runningJob!.status).toBe("running");
+      expect(runningJob!.startedAt).not.toBeNull();
 
       // -----------------------------------------------------------------
       // 9. job_done completes normally.

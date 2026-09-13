@@ -61,6 +61,14 @@ class _FakeStreamCtx:
     async def __aexit__(self, *args):
         return False
 
+    @property
+    def is_redirect(self):
+        return 300 <= self._spec.status_code < 400
+
+    @property
+    def status_code(self):
+        return self._spec.status_code
+
     def raise_for_status(self):
         if self._spec.status_code >= 400:
             request = httpx.Request("GET", "http://models.example/f.bin")
@@ -265,6 +273,92 @@ async def test_successful_download_lands_file_and_clears_part(tmp_path, monkeypa
     assert final_path.read_bytes() == content
     assert not (tmp_path / "checkpoints" / "model.safetensors.part").exists()
     assert recorded == [entry["url"]]
+
+
+# --- redirects (C1) -----------------------------------------------------------
+
+
+async def test_redirect_302_then_200_lands_body_via_follow_redirects(tmp_path):
+    """The real official URLs (HuggingFace `/resolve/main/...`, GitHub release
+    assets) are 302s. The client must be constructed with
+    `follow_redirects=True` so httpx itself chases the redirect chain and the
+    real body lands, instead of streaming an empty redirect response into
+    `.part` and dying on the size-mismatch branch."""
+    signing_key, pubkey_hex = _keypair()
+    content = b"redirected-weights"
+    entry = _signed_entry(
+        signing_key,
+        name="model.safetensors",
+        directory="checkpoints",
+        content=content,
+        url="http://models.example/redirect",
+    )
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/redirect":
+            return httpx.Response(302, headers={"Location": "http://models.example/final"})
+        return httpx.Response(200, content=content)
+
+    transport = httpx.MockTransport(handler)
+    captured_kwargs = {}
+
+    def client_factory(**kwargs):
+        captured_kwargs.update(kwargs)
+        return httpx.AsyncClient(transport=transport, **kwargs)
+
+    await fetcher.fetch_and_verify_models(
+        entries=[entry],
+        platform_pubkey_hex=pubkey_hex,
+        models_dir=str(tmp_path),
+        max_fetch_gb=100,
+        cancel_event=asyncio.Event(),
+        report_progress=_noop_progress,
+        client_factory=client_factory,
+    )
+
+    assert captured_kwargs.get("follow_redirects") is True
+    final_path = tmp_path / "checkpoints" / "model.safetensors"
+    assert final_path.read_bytes() == content
+    assert not (tmp_path / "checkpoints" / "model.safetensors.part").exists()
+
+
+async def test_redirect_to_invalid_target_fails_cleanly_per_url(tmp_path):
+    """A 302 that redirects to a dead target (404) must still fail cleanly --
+    named in the error, part file removed -- not hang or silently "succeed"
+    with a zero-byte file."""
+    signing_key, pubkey_hex = _keypair()
+    entry = _signed_entry(
+        signing_key,
+        name="model.safetensors",
+        directory="checkpoints",
+        content=b"weights",
+        url="http://models.example/redirect",
+    )
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/redirect":
+            return httpx.Response(302, headers={"Location": "http://models.example/missing"})
+        return httpx.Response(404)
+
+    transport = httpx.MockTransport(handler)
+
+    def client_factory(**kwargs):
+        return httpx.AsyncClient(transport=transport, **kwargs)
+
+    with pytest.raises(fetcher.FetchError) as exc_info:
+        await fetcher.fetch_and_verify_models(
+            entries=[entry],
+            platform_pubkey_hex=pubkey_hex,
+            models_dir=str(tmp_path),
+            max_fetch_gb=100,
+            cancel_event=asyncio.Event(),
+            report_progress=_noop_progress,
+            client_factory=client_factory,
+        )
+
+    assert entry["url"] in str(exc_info.value)
+    assert not (tmp_path / "checkpoints" / "model.safetensors.part").exists()
+    assert not (tmp_path / "checkpoints" / "model.safetensors").exists()
 
 
 # --- hash mismatch -----------------------------------------------------------

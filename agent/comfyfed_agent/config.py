@@ -7,6 +7,20 @@ import os
 from dataclasses import asdict, dataclass, field
 
 
+def _coerce_positive_float(value, default: float) -> float:
+    """`max_fetch_gb` from agent.json, defensively: a string like "30" is
+    accepted, anything non-numeric or <= 0 falls back to the default instead
+    of blowing up later inside fetcher's budget check as an opaque
+    job_failed (final-review m4)."""
+    try:
+        result = float(value)
+    except (TypeError, ValueError):
+        return default
+    if result != result or result <= 0:  # NaN or non-positive
+        return default
+    return result
+
+
 @dataclass
 class PlatformEntry:
     platform_url: str
@@ -60,7 +74,9 @@ class AgentConfig:
             comfy_input_dir=data.get("comfy_input_dir"),
             hash_models=data.get("hash_models", cls.hash_models),
             auto_fetch_models=data.get("auto_fetch_models", cls.auto_fetch_models),
-            max_fetch_gb=data.get("max_fetch_gb", cls.max_fetch_gb),
+            max_fetch_gb=_coerce_positive_float(
+                data.get("max_fetch_gb"), cls.max_fetch_gb
+            ),
         )
 
     def save(self, path: str) -> None:

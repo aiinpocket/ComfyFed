@@ -341,3 +341,30 @@ def test_config_save_is_not_group_or_world_readable(tmp_path):
         # chmod on Windows only toggles the read-only bit; the write must
         # still succeed and leave the owner able to read it.
         assert mode & stat.S_IRUSR
+
+
+def test_scan_models_skips_part_files(tmp_path):
+    """final-review m2: an in-progress auto-fetch download (`*.part`,
+    fetcher._PART_SUFFIX) must never enter the inventory or become a hash
+    candidate -- it is still being written, and reporting it would persist a
+    junk model_hashes row server-side."""
+    models = tmp_path / "models"
+    (models / "checkpoints").mkdir(parents=True)
+    (models / "checkpoints" / "real.safetensors").write_bytes(b"x" * 10)
+    (models / "checkpoints" / "half.safetensors.part").write_bytes(b"y" * 10)
+
+    entries = hardware.scan_models(str(models), hash_models=True)
+    names = [e["name"] for e in entries]
+    assert names == ["checkpoints/real.safetensors"]
+
+
+def test_config_max_fetch_gb_coercion(tmp_path):
+    """final-review m4: a string value coerces, garbage/non-positive falls
+    back to the default instead of exploding later in fetcher's budget
+    check."""
+    import json as _json
+
+    path = tmp_path / "agent.json"
+    for raw, expected in [("30", 30.0), (12.5, 12.5), ("junk", 30.0), (-5, 30.0), (None, 30.0)]:
+        path.write_text(_json.dumps({"max_fetch_gb": raw}), encoding="utf-8")
+        assert AgentConfig.load(str(path)).max_fetch_gb == expected

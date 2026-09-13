@@ -1837,10 +1837,14 @@ async def test_fetch_progress_relayed_as_stage_heartbeat(two_platform_loop, monk
     await loop.handle_job(conn_a, job_msg)
 
     stage_heartbeats = [hb for hb in conn_a.heartbeats if hb.get("stage") == "fetching_models"]
-    assert stage_heartbeats, "expected at least one fetching_models heartbeat"
-    assert stage_heartbeats[0]["fetch_pct"] == 42.0
-    assert stage_heartbeats[0]["fetch_model"] == "foo.safetensors"
-    assert stage_heartbeats[0]["job_id"] == "job-fetch-3"
+    # The INITIAL busy beat already carries the stage (fetch_pct 0.0) so the
+    # server never sees a stage-less beat before the download -- the actual
+    # progress report is the last one.
+    assert len(stage_heartbeats) >= 2, "expected initial + progress fetching_models heartbeats"
+    assert stage_heartbeats[0]["fetch_pct"] == 0.0
+    assert stage_heartbeats[-1]["fetch_pct"] == 42.0
+    assert stage_heartbeats[-1]["fetch_model"] == "foo.safetensors"
+    assert stage_heartbeats[-1]["job_id"] == "job-fetch-3"
 
 
 async def test_fetch_error_fails_job_and_skips_run_workflow(two_platform_loop, monkeypatch):
@@ -1957,3 +1961,58 @@ async def test_shutdown_cancels_a_job_stuck_in_the_fetch_phase(two_platform_loop
     assert conn_a.job_failed is None
     assert conn_a.job_done is None
     assert not loop._jobs
+
+
+async def test_periodic_heartbeat_carries_fetch_stage_while_downloading(cancellable_loop, monkeypatch):
+    """final-review m1, root fix: while the auto-fetch pre-phase is active,
+    the periodic heartbeat must carry stage="fetching_models" (from
+    `_JobHandle.fetch_status`) -- a stage-less busy beat is the server's
+    run-started signal, and the download phase is deliberately never
+    billed. Simulated by pinning fetch_status on the running handle."""
+    loop = cancellable_loop
+    conn_a = loop.connections["worker-a"]
+
+    monkeypatch.setattr(runner_module, "_HEARTBEAT_INTERVAL_SECONDS", 0)
+    monkeypatch.setattr(runner_module, "_RECV_POLL_TIMEOUT_SECONDS", 0.01)
+
+    await loop._handle_message(conn_a, _job_message("job-fetch-hb"))
+    task = loop._current_job_task
+    await _await_flag(loop.test_started)
+
+    handle = loop._jobs["job-fetch-hb"]
+    handle.fetch_status = {
+        "stage": "fetching_models",
+        "fetch_pct": 55.0,
+        "fetch_model": "big.safetensors",
+    }
+    try:
+        conn_a.heartbeats.clear()
+        loop_task = asyncio.create_task(loop._connection_loop(conn_a))
+        await asyncio.sleep(0.1)
+        loop_task.cancel()
+        try:
+            await loop_task
+        except asyncio.CancelledError:
+            pass
+
+        assert conn_a.heartbeats, "the periodic heartbeat never fired"
+        assert all(hb.get("stage") == "fetching_models" for hb in conn_a.heartbeats)
+        assert all(hb.get("fetch_pct") == 55.0 for hb in conn_a.heartbeats)
+        assert all(hb.get("fetch_model") == "big.safetensors" for hb in conn_a.heartbeats)
+
+        # Fetch over: stage disappears from subsequent periodic beats.
+        handle.fetch_status = None
+        conn_a.heartbeats.clear()
+        loop_task = asyncio.create_task(loop._connection_loop(conn_a))
+        await asyncio.sleep(0.1)
+        loop_task.cancel()
+        try:
+            await loop_task
+        except asyncio.CancelledError:
+            pass
+        assert conn_a.heartbeats
+        # The fake conn records kwargs verbatim (stage=None when unset).
+        assert all(hb["stage"] is None for hb in conn_a.heartbeats)
+    finally:
+        await loop._handle_message(conn_a, {"type": "job_cancelled", "job_id": "job-fetch-hb"})
+        await asyncio.wait_for(task, timeout=10)

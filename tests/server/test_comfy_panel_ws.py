@@ -595,15 +595,13 @@ def test_agent_heartbeat_fetch_stage_relayed_as_extra_progress_fields(client):
                         "fetch_model": "flux1-dev.safetensors",
                     },
                 }
-                # This first busy heartbeat also transitions assigned->running
-                # (see _handle_heartbeat), which posts its own "executing"
-                # event -- drain it before sending the next heartbeat.
-                executing = panel_ws.receive_json()
-                assert executing["type"] == "executing"
-
-                # A later heartbeat with no stage clears it -- the console's
-                # job dict must not keep showing a stale fetch stage once the
-                # agent has moved past it.
+                # M1 (Phase 2.1 final review): a fetch-stage heartbeat does
+                # NOT transition assigned->running -- the download phase is
+                # never billed, so started_at stays unset and no "executing"
+                # event is posted yet. The first STAGE-LESS heartbeat below
+                # is the run-started transition: it clears the fetch chip
+                # (relay emits a clean progress event) and then mark_running
+                # posts the "executing" event.
                 agent_ws.send_json(
                     {
                         "type": "heartbeat",
@@ -619,6 +617,8 @@ def test_agent_heartbeat_fetch_stage_relayed_as_extra_progress_fields(client):
                     "type": "progress",
                     "data": {"value": 10, "max": 100, "prompt_id": job_id},
                 }
+                executing = panel_ws.receive_json()
+                assert executing["type"] == "executing"
                 assert agentws.get_fetch_progress(job_id) is None
     finally:
         agentws._fetch_progress.pop(job_id, None)
