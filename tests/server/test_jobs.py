@@ -7,7 +7,7 @@ import pytest
 from fastapi.testclient import TestClient
 
 from comfyfed_server import app as app_module
-from comfyfed_server import bootstrap, db, dispatch
+from comfyfed_server import bootstrap, db, dispatch, jobs as jobs_module
 
 
 def _pick_job_for(worker_id):
@@ -83,6 +83,52 @@ def test_submit_job_creates_queued_job(client):
     listed = client.get("/api/jobs", headers={"X-CSRF": csrf}).json()
     job = next(j for j in listed if j["id"] == job_id)
     assert job["status"] == "queued"
+
+
+def test_create_job_stamps_the_given_origin(client):
+    """`create_job` is the single assess-and-persist path shared by the
+    console and the panel -- each caller must be able to stamp its own
+    origin onto the row it creates."""
+    console_id = jobs_module.create_job(
+        json.dumps(SIMPLE_WORKFLOW), SIMPLE_WORKFLOW, origin="console"
+    )
+    panel_id = jobs_module.create_job(
+        json.dumps(SIMPLE_WORKFLOW), SIMPLE_WORKFLOW, origin="panel"
+    )
+
+    with db.get_session() as session:
+        assert session.get(db.Job, console_id).origin == "console"
+        assert session.get(db.Job, panel_id).origin == "panel"
+
+
+def test_console_submit_stamps_console_origin(client):
+    """Console's `POST /api/jobs` funnels through `create_job(origin=...)` --
+    the list and detail responses must both surface it, since the console is
+    the audit surface that has to tell panel- and console-submitted jobs
+    apart."""
+    csrf = _login(client)
+    job_id = _submit(client, csrf).json()["job_id"]
+
+    listed = client.get("/api/jobs", headers={"X-CSRF": csrf}).json()
+    job = next(j for j in listed if j["id"] == job_id)
+    assert job["origin"] == "console"
+
+    detail = client.get(f"/api/jobs/{job_id}", headers={"X-CSRF": csrf}).json()
+    assert detail["origin"] == "console"
+
+
+def test_console_jobs_list_includes_panel_hidden_jobs_too(client):
+    """Console is the audit surface -- it must list every job regardless of
+    `panel_hidden`, unlike the panel's `/comfy/api/history`."""
+    csrf = _login(client)
+    job_id = _submit(client, csrf).json()["job_id"]
+    with db.get_session() as session:
+        job = session.get(db.Job, job_id)
+        job.panel_hidden = True
+        session.commit()
+
+    listed = client.get("/api/jobs", headers={"X-CSRF": csrf}).json()
+    assert any(j["id"] == job_id for j in listed)
 
 
 def test_submit_missing_assets_400(client):

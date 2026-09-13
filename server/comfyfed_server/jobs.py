@@ -45,6 +45,7 @@ def create_job(
     *,
     requirements: Optional[dict] = None,
     available_assets: Optional[set[str]] = None,
+    origin: str = "console",
 ) -> str:
     """Assess a workflow and persist a queued Job row. Returns the job id.
 
@@ -58,6 +59,12 @@ def create_job(
     `MissingAssetsError` before anything is written. Storing the asset bytes
     is the caller's job (they arrive as uploads in one case and from staging
     in the other).
+
+    `origin` records who submitted the job -- `"console"` (the default, for
+    ComfyFed's own `POST /api/jobs`) or `"panel"` (stamped explicitly by
+    `comfyapi.post_prompt`). It is what lets the panel's own controls
+    (`/comfy/api/interrupt`, `/comfy/api/queue`, panel history) act only on
+    jobs the panel itself submitted.
     """
     needs = assess.extract(workflow)
     available = set(available_assets or ())
@@ -77,6 +84,7 @@ def create_job(
             required_models=json.dumps(sorted(needs.models)),
             est_vram_gb=est_vram_gb,
             input_assets=json.dumps(sorted(available)),
+            origin=origin,
         )
         session.add(job)
         session.commit()
@@ -87,6 +95,7 @@ def _job_dict(job: db.Job) -> dict:
     return {
         "id": job.id,
         "status": job.status,
+        "origin": job.origin,
         "progress": job.progress,
         "worker_id": job.worker_id,
         "created_at": job.created_at.isoformat() if job.created_at else None,
@@ -147,6 +156,7 @@ def create_router(data_dir: str) -> APIRouter:
                 workflow,
                 requirements=requirements_dict,
                 available_assets=set(uploaded_names),
+                origin="console",
             )
         except MissingAssetsError as exc:
             raise _error(

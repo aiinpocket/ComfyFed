@@ -88,6 +88,19 @@ class Job(Base):
     est_vram_gb: Mapped[Optional[float]] = mapped_column(Float, nullable=True)
     input_assets: Mapped[str] = mapped_column(String, default="[]", server_default="[]")
     result_hashes: Mapped[str] = mapped_column(String, default="{}", server_default="{}")
+    # Who submitted this job: "panel" (the ComfyUI-compatible surface at
+    # `/comfy/api/*`) or "console" (ComfyFed's own `/api/jobs`). Both funnel
+    # through `jobs.create_job`, which is what lets `/comfy/api/interrupt`,
+    # `/comfy/api/queue`, and the panel's history view act only on jobs the
+    # panel itself submitted, leaving console-submitted jobs alone -- the
+    # console stays the one surface that sees and controls everything.
+    origin: Mapped[str] = mapped_column(String, default="console", server_default="console")
+    # Soft-delete flag for the panel's own history view only (`GET
+    # /comfy/api/history` excludes these); the row is never actually
+    # deleted, because receipts reference jobs by id. Console's `/api/jobs`
+    # ignores this entirely -- it is the audit surface and must always show
+    # everything.
+    panel_hidden: Mapped[bool] = mapped_column(Boolean, default=False, server_default="0")
 
 
 class Receipt(Base):

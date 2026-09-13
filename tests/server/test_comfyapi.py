@@ -16,7 +16,7 @@ import pytest
 from fastapi.testclient import TestClient
 
 from comfyfed_server import app as app_module
-from comfyfed_server import bootstrap, comfyapi, db, dispatch, storage, workers
+from comfyfed_server import bootstrap, comfyapi, db, dispatch, jobs, storage, workers
 
 
 def _pick_job_for(worker_id):
@@ -122,6 +122,7 @@ def _finish_job(client, csrf, job_id, *, result_files, artifact_bytes=b"png-byte
         ("post", "/comfy/api/prompt"),
         ("post", "/comfy/api/interrupt"),
         ("post", "/comfy/api/queue"),
+        ("post", "/comfy/api/history"),
     ],
 )
 def test_all_routes_require_admin_session(client, method, path):
@@ -490,6 +491,32 @@ def test_interrupt_does_not_touch_only_queued_jobs(client):
         assert session.get(db.Job, job_id).status == "queued"
 
 
+def test_interrupt_skips_a_console_origin_job_even_if_older_and_running(client):
+    """`/interrupt` is the panel's own "stop what I'm looking at" button --
+    it must never reach into a console-submitted job just because it happens
+    to be the oldest running one."""
+    csrf = _login(client)
+    console_job_id = jobs.create_job(
+        json.dumps(SIMPLE_PROMPT), SIMPLE_PROMPT, origin="console"
+    )
+    panel_job_id = _post_prompt(client).json()["prompt_id"]
+
+    worker_id = _register_worker(client, csrf, "runner")
+    with db.get_session() as session:
+        for job_id in (console_job_id, panel_job_id):
+            job = session.get(db.Job, job_id)
+            job.status = "running"
+            job.worker_id = worker_id
+        session.commit()
+
+    r = client.post("/comfy/api/interrupt")
+    assert r.status_code == 200
+
+    with db.get_session() as session:
+        assert session.get(db.Job, console_job_id).status == "running"
+        assert session.get(db.Job, panel_job_id).status == "cancelled"
+
+
 def test_queue_delete_cancels_listed_jobs_only(client):
     csrf = _login(client)
     job_a = _post_prompt(client).json()["prompt_id"]
@@ -542,6 +569,39 @@ def test_queue_clear_cancels_every_non_terminal_job(client):
         assert session.get(db.Job, running_id).status == "cancelled"
         # A job that already finished is left alone.
         assert session.get(db.Job, done_id).status == "done"
+
+
+def test_queue_clear_leaves_console_origin_jobs_queued(client):
+    """`{"clear": true}` is the panel's "empty my queue" button -- it must
+    never cancel a job the console submitted, even though both funnel
+    through the same `jobs` table."""
+    _login(client)
+    console_job_id = jobs.create_job(
+        json.dumps(SIMPLE_PROMPT), SIMPLE_PROMPT, origin="console"
+    )
+    panel_job_id = _post_prompt(client).json()["prompt_id"]
+
+    r = client.post("/comfy/api/queue", json={"clear": True})
+    assert r.status_code == 200
+
+    with db.get_session() as session:
+        assert session.get(db.Job, console_job_id).status == "queued"
+        assert session.get(db.Job, panel_job_id).status == "cancelled"
+
+
+def test_queue_delete_ignores_a_named_console_origin_job(client):
+    """Even explicitly named, a console job must survive `{"delete": [...]}`
+    from the panel -- origin scoping, not just default queue semantics."""
+    _login(client)
+    console_job_id = jobs.create_job(
+        json.dumps(SIMPLE_PROMPT), SIMPLE_PROMPT, origin="console"
+    )
+
+    r = client.post("/comfy/api/queue", json={"delete": [console_job_id]})
+    assert r.status_code == 200
+
+    with db.get_session() as session:
+        assert session.get(db.Job, console_job_id).status == "queued"
 
 
 def test_queue_delete_with_empty_body_is_a_noop(client):
@@ -713,6 +773,94 @@ def test_history_text_artifact_content_capped_at_100kb(client):
 
     outputs = client.get("/comfy/api/history").json()[prompt_id]["outputs"]
     assert len(outputs["2"]["text"][0]) == 100_000
+
+
+# --- history delete (panel_hidden) ------------------------------------
+
+
+def test_history_delete_hides_named_terminal_panel_job(client):
+    """The live frontend's `deleteItem('history', id)` posts `{"delete":
+    [id]}` to `/history` (verified against the shipped dist) -- ComfyFed
+    must never actually delete the row (receipts reference it), only hide it
+    from the panel's own history view."""
+    csrf = _login(client)
+    prompt_id = _post_prompt(client).json()["prompt_id"]
+    _finish_job(client, csrf, prompt_id, result_files=["out.png"])
+
+    r = client.post("/comfy/api/history", json={"delete": [prompt_id]})
+    assert r.status_code == 200
+    assert r.json() == {}
+
+    assert client.get("/comfy/api/history").json() == {}
+
+    with db.get_session() as session:
+        job = session.get(db.Job, prompt_id)
+        assert job is not None
+        assert job.status == "done"
+        assert job.panel_hidden is True
+
+
+def test_history_delete_ignores_a_non_terminal_job(client):
+    _login(client)
+    prompt_id = _post_prompt(client).json()["prompt_id"]
+
+    r = client.post("/comfy/api/history", json={"delete": [prompt_id]})
+    assert r.status_code == 200
+
+    with db.get_session() as session:
+        assert session.get(db.Job, prompt_id).panel_hidden is False
+
+
+def test_history_delete_ignores_a_console_origin_job(client):
+    csrf = _login(client)
+    console_job_id = jobs.create_job(
+        json.dumps(SIMPLE_PROMPT), SIMPLE_PROMPT, origin="console"
+    )
+    with db.get_session() as session:
+        job = session.get(db.Job, console_job_id)
+        job.status = "done"
+        session.commit()
+
+    r = client.post("/comfy/api/history", json={"delete": [console_job_id]})
+    assert r.status_code == 200
+
+    with db.get_session() as session:
+        assert session.get(db.Job, console_job_id).panel_hidden is False
+
+
+def test_history_clear_hides_all_terminal_panel_jobs(client):
+    csrf = _login(client)
+    done_id = _post_prompt(client).json()["prompt_id"]
+    _finish_job(client, csrf, done_id, result_files=["out.png"])
+
+    failed_id = _post_prompt(client).json()["prompt_id"]
+    worker_id = _register_worker(client, csrf, "runner2")
+    picked = _pick_job_for(worker_id)
+    assert picked is not None and picked.id == failed_id
+    dispatch.mark_failed(failed_id, worker_id, "boom")
+
+    still_queued_id = _post_prompt(client).json()["prompt_id"]
+
+    r = client.post("/comfy/api/history", json={"clear": True})
+    assert r.status_code == 200
+
+    assert client.get("/comfy/api/history").json() == {}
+
+    with db.get_session() as session:
+        assert session.get(db.Job, done_id).panel_hidden is True
+        assert session.get(db.Job, failed_id).panel_hidden is True
+        # Never terminal, so clear does not touch it.
+        assert session.get(db.Job, still_queued_id).panel_hidden is False
+
+
+def test_history_get_by_prompt_id_omits_a_panel_hidden_job(client):
+    csrf = _login(client)
+    prompt_id = _post_prompt(client).json()["prompt_id"]
+    _finish_job(client, csrf, prompt_id, result_files=["out.png"])
+
+    client.post("/comfy/api/history", json={"delete": [prompt_id]})
+
+    assert client.get(f"/comfy/api/history/{prompt_id}").json() == {}
 
 
 def test_history_text_file_without_save_text_node_uses_fallback_key(client):

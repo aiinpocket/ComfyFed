@@ -50,6 +50,19 @@ def _submit(client, csrf, workflow=None):
     return r.json()["job_id"]
 
 
+def _submit_panel(client, workflow=None):
+    """Submit a job as the panel would, via `/comfy/api/prompt`.
+
+    `origin="panel"` is what `/comfy/api/interrupt` and `/comfy/api/queue`
+    require to act on a job (see comfyapi.py) -- a job submitted through
+    the console's `_submit` above is invisible to both.
+    """
+    workflow = workflow if workflow is not None else {"1": {"class_type": "KSampler", "inputs": {"seed": 1}}}
+    r = client.post("/comfy/api/prompt", json={"prompt": workflow, "client_id": "panel-test"})
+    assert r.status_code == 200
+    return r.json()["prompt_id"]
+
+
 def test_handshake_with_bad_signature_closes_4401(client):
     with client.websocket_connect("/api/agent/ws") as ws:
         challenge = ws.receive_json()
@@ -844,7 +857,7 @@ def test_admin_cancel_of_an_unowned_queued_job_sends_nothing_to_any_agent(client
 def test_comfy_interrupt_pushes_job_cancelled_to_the_running_worker(client):
     csrf = _login(client)
     worker_id, sk = _register_worker(client, csrf, "w1")
-    job_id = _submit(client, csrf)
+    job_id = _submit_panel(client)
 
     ws = _connect(client, worker_id, sk)
     try:
@@ -870,7 +883,7 @@ def test_comfy_interrupt_pushes_job_cancelled_to_the_running_worker(client):
 def test_comfy_queue_delete_pushes_job_cancelled_to_the_assigned_worker(client):
     csrf = _login(client)
     worker_id, sk = _register_worker(client, csrf, "w1")
-    job_id = _submit(client, csrf)
+    job_id = _submit_panel(client)
 
     ws = _connect(client, worker_id, sk)
     try:
