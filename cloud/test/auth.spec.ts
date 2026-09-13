@@ -1,6 +1,8 @@
 import { afterEach, describe, expect, it } from "vitest";
 import { call, db, SETUP_TOKEN } from "./helpers/http";
 import { toSqliteTimestamp } from "../src/db/queries";
+import authApp from "../src/routes/auth";
+import { env, createExecutionContext, waitOnExecutionContext } from "cloudflare:test";
 
 // vitest-pool-workers isolates D1 storage per test FILE, not per `it()` (see
 // dispatch.spec.ts's comment / task-1-report.md) -- every test in this file
@@ -62,6 +64,30 @@ describe("POST /api/setup", () => {
     expect(r.status).toBe(400);
     expect(r.body.error.code).toBe("setup.already_done");
   });
+
+  it("refuses setup outright when SETUP_TOKEN is not configured on the environment", async () => {
+    // Review N1: wrangler.jsonc ships no SETUP_TOKEN default -- a freshly
+    // deployed Worker with no operator-chosen token must refuse /api/setup
+    // unconditionally, not fall back to some shipped value. Exercises the
+    // auth sub-app directly against an env clone with SETUP_TOKEN stripped,
+    // since the shared test-pool env always carries the real test token.
+    const envWithoutToken = { ...(env as any), SETUP_TOKEN: undefined };
+    const request = new Request("http://example.com/api/setup", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ token: SETUP_TOKEN, password: ADMIN_PASSWORD }),
+    });
+    const ctx = createExecutionContext();
+    const response = await authApp.fetch(request, envWithoutToken, ctx);
+    await waitOnExecutionContext(ctx);
+
+    expect(response.status).toBe(400);
+    const body = await response.json<{ error: { code: string } }>();
+    expect(body.error.code).toBe("setup.bad_token");
+
+    const status = await call("/api/setup/status", { method: "GET" });
+    expect(status.body).toEqual({ needed: true });
+  });
 });
 
 describe("POST /api/auth/login", () => {
@@ -98,6 +124,20 @@ describe("GET /api/auth/me", () => {
     const login = await call("/api/auth/login", { json: { password: ADMIN_PASSWORD } });
     const r = await call("/api/auth/me", { method: "GET", cookie: login.setCookie });
     expect(r.body.authenticated).toBe(true);
+  });
+
+  it("does not write a session_secret settings row for an anonymous request (no cookie)", async () => {
+    // Regression for review m1: readSession() used to look up (and lazily
+    // create) the session secret before checking whether a cookie was even
+    // present, so every anonymous request -- including this one -- wrote a
+    // settings row. auth.py's read_session_payload checks `if not
+    // session_cookie: return None` first; readSession() must do the same.
+    const before = await db().prepare("SELECT COUNT(*) AS n FROM settings").first<{ n: number }>();
+    await call("/api/auth/me", { method: "GET" });
+    const after = await db().prepare("SELECT COUNT(*) AS n FROM settings").first<{ n: number }>();
+    expect(after!.n).toBe(before!.n);
+    const secretRow = await db().prepare("SELECT value FROM settings WHERE key = 'session_secret'").first();
+    expect(secretRow).toBeNull();
   });
 });
 

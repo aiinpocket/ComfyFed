@@ -5,12 +5,14 @@
   "compatibility_date": "2026-08-22",
   "compatibility_flags": ["nodejs_compat"],
   "vars": {
-    "MODE": "cloud",
-    // First-run /api/setup gate (Task 4). This plaintext dev value is fine
-    // for local `wrangler dev` / vitest only -- a real deployment must
-    // override it with `wrangler secret put SETUP_TOKEN` (secrets shadow
-    // `vars` of the same name) rather than committing the real token here.
-    "SETUP_TOKEN": "dev-setup-token-changeme"
+    "MODE": "cloud"
+    // SETUP_TOKEN (Task 4's /api/setup gate) is intentionally NOT set here.
+    // Absent means setup is impossible -- that's the safe default for a
+    // freshly-deployed Worker before the operator has chosen a token. Set it
+    // for real via `wrangler secret put SETUP_TOKEN` (never commit the real
+    // value to this file). vitest.config.ts injects a test-only value via
+    // `miniflare.bindings` so the test suite can exercise the success path
+    // without touching this file.
   },
   "d1_databases": [
     {

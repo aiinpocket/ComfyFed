@@ -30,6 +30,14 @@ export function errorJson(c: Context, status: number, code: string, message: str
 export async function readSession(c: Context<{ Bindings: Env }>): Promise<SessionPayload | null> {
   const cookieHeader = c.req.header("Cookie");
   const cookieValue = extractCookie(cookieHeader, SESSION_COOKIE_NAME);
+  // Parity with auth.py's `read_session_payload`: `if not session_cookie:
+  // return None` happens BEFORE it ever touches the DB for the signing
+  // secret. Getting this order backwards means every anonymous request
+  // (no cookie at all) would provision a `session_secret` settings row --
+  // an unwanted write on a read path, and a footgun for a future D1
+  // replica/read-only binding. Only look up (and lazily create) the secret
+  // once we actually have a cookie value to verify.
+  if (!cookieValue) return null;
   const secret = await getOrCreateSessionSecret(c.env.DB);
   return readSessionCookie(secret, cookieValue);
 }

@@ -8,9 +8,11 @@ export interface Env {
   STORE: R2Bucket;
   ASSETS: Fetcher;
   MODE: string;
-  /** First-run setup gate (see routes/auth.ts `/api/setup`). A `vars` entry
-   * in wrangler.jsonc for local dev/tests; production deployments should
-   * override it with `wrangler secret put SETUP_TOKEN` instead of leaving
-   * the plaintext var in source control. */
-  SETUP_TOKEN: string;
+  /** First-run setup gate (see routes/auth.ts `/api/setup`). Deliberately
+   * absent from wrangler.jsonc's `vars` -- a freshly-deployed Worker with no
+   * operator-chosen token must refuse `/api/setup` outright, not fall back
+   * to a shipped default. Set for real via `wrangler secret put
+   * SETUP_TOKEN`; the test suite injects a value via vitest.config.ts's
+   * `miniflare.bindings` instead. */
+  SETUP_TOKEN: string | undefined;
 }

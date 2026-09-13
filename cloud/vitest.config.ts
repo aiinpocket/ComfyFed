@@ -27,6 +27,11 @@ export default defineConfig({
   plugins: [
     cloudflareTest({
       wrangler: { configPath: "./wrangler.jsonc" },
+      // Test-only SETUP_TOKEN: wrangler.jsonc deliberately ships none (see
+      // its comment) so a real deployment refuses /api/setup until the
+      // operator sets one via `wrangler secret put`. `miniflare.bindings`
+      // merges over the wrangler-derived vars for the test Worker only.
+      miniflare: { bindings: { SETUP_TOKEN: "test-setup-token" } },
     }),
   ],
 });
