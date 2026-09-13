@@ -367,6 +367,161 @@ async def test_upload_artifact_raises_after_two_failed_attempts(two_platform_loo
         await loop._upload_artifact(entry, "job-x", "out.png", content)
 
 
+# --- Presign upload protocol (Task 8) --------------------------------------
+
+
+class _FakeJsonResponse:
+    def __init__(self, status_code, json_body=None):
+        self.status_code = status_code
+        self._json_body = json_body if json_body is not None else {}
+
+    def json(self):
+        return self._json_body
+
+
+def _fake_presign_client_factory(responses_by_method):
+    """A richer `httpx.AsyncClient` stand-in supporting `post`/`put`, each
+    popping its next canned response off `responses_by_method[method]` --
+    needed once `_upload_artifact` can take the presign branch, which calls
+    `client.post` (presign, confirm) and `client.put` (the raw/S3 PUT)
+    instead of only the legacy path's `build_request`/`send`.
+    """
+
+    class _FakeAsyncClient:
+        def __init__(self, *args, **kwargs):
+            pass
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *args):
+            return False
+
+        async def post(self, path, content=None, headers=None, json=None):
+            return responses_by_method["post"].pop(0)
+
+        async def put(self, url, content=None):
+            return responses_by_method["put"].pop(0)
+
+    return _FakeAsyncClient
+
+
+async def test_upload_artifact_falls_back_to_legacy_when_presign_404s(two_platform_loop, monkeypatch):
+    """A platform that doesn't know the presign route (older ComfyFed)
+    answers 404, and the upload must silently fall back to the exact legacy
+    multipart flow -- verified by reusing the plain `_fake_async_client_factory`
+    for the second (legacy) call. Two separate client classes stand in for
+    the two calls `_upload_artifact` makes: the presign attempt and, once it
+    returns None, the fallback -- verified by counting how many `AsyncClient`
+    instantiations occur.
+    """
+    loop = two_platform_loop
+    entry = loop.connections["worker-a"].entry
+    content = b"pixel-bytes"
+    correct_hash = hashlib.sha256(content).hexdigest()
+
+    calls = {"post": [_FakeJsonResponse(404)]}
+    presign_factory = _fake_presign_client_factory(calls)
+    legacy_factory = _fake_async_client_factory([_FakeArtifactResponse(200, correct_hash)])
+
+    factories = [presign_factory, legacy_factory]
+
+    def next_client(*args, **kwargs):
+        return factories.pop(0)(*args, **kwargs)
+
+    monkeypatch.setattr(runner_module.httpx, "AsyncClient", next_client)
+
+    await loop._upload_artifact(entry, "job-x", "out.png", content)  # must not raise
+
+
+async def test_upload_artifact_presign_direct_mode_puts_raw_bytes(two_platform_loop, monkeypatch):
+    loop = two_platform_loop
+    entry = loop.connections["worker-a"].entry
+    content = b"streamed-artifact-bytes"
+
+    calls = {
+        "post": [_FakeJsonResponse(200, {"mode": "direct", "url": "/api/agent/jobs/job-x/artifacts/raw/tok123"})],
+        "put": [_FakeJsonResponse(200)],
+    }
+    monkeypatch.setattr(runner_module.httpx, "AsyncClient", _fake_presign_client_factory(calls))
+
+    await loop._upload_artifact(entry, "job-x", "out.bin", content)  # must not raise
+    assert calls["post"] == []
+    assert calls["put"] == []
+
+
+async def test_upload_artifact_presign_direct_mode_raises_on_rejection(two_platform_loop, monkeypatch):
+    loop = two_platform_loop
+    entry = loop.connections["worker-a"].entry
+    content = b"streamed-artifact-bytes"
+
+    calls = {
+        "post": [_FakeJsonResponse(200, {"mode": "direct", "url": "/api/agent/jobs/job-x/artifacts/raw/tok123"})],
+        "put": [_FakeJsonResponse(409)],
+    }
+    monkeypatch.setattr(runner_module.httpx, "AsyncClient", _fake_presign_client_factory(calls))
+
+    with pytest.raises(RuntimeError, match="artifact upload failed"):
+        await loop._upload_artifact(entry, "job-x", "out.bin", content)
+
+
+async def test_upload_artifact_presign_s3_mode_puts_then_confirms(two_platform_loop, monkeypatch):
+    loop = two_platform_loop
+    entry = loop.connections["worker-a"].entry
+    content = b"s3-mode-bytes"
+
+    calls = {
+        "post": [
+            _FakeJsonResponse(200, {"mode": "s3", "url": "https://example.r2.cloudflarestorage.com/bucket/key?sig=x"}),
+            _FakeJsonResponse(200, {"ok": True}),
+        ],
+        "put": [_FakeJsonResponse(200)],
+    }
+    monkeypatch.setattr(runner_module.httpx, "AsyncClient", _fake_presign_client_factory(calls))
+
+    await loop._upload_artifact(entry, "job-x", "out.bin", content)  # must not raise
+    assert calls["post"] == []
+    assert calls["put"] == []
+
+
+async def test_upload_artifact_presign_s3_mode_raises_when_storage_put_fails(two_platform_loop, monkeypatch):
+    loop = two_platform_loop
+    entry = loop.connections["worker-a"].entry
+    content = b"s3-mode-bytes"
+
+    calls = {
+        "post": [_FakeJsonResponse(200, {"mode": "s3", "url": "https://example.r2.cloudflarestorage.com/bucket/key?sig=x"})],
+        "put": [_FakeJsonResponse(403)],
+    }
+    monkeypatch.setattr(runner_module.httpx, "AsyncClient", _fake_presign_client_factory(calls))
+
+    with pytest.raises(RuntimeError, match="storage PUT returned 403"):
+        await loop._upload_artifact(entry, "job-x", "out.bin", content)
+
+
+async def test_try_presign_returns_none_on_transport_error(two_platform_loop, monkeypatch):
+    loop = two_platform_loop
+    entry = loop.connections["worker-a"].entry
+
+    class _RaisingClient:
+        def __init__(self, *a, **k):
+            pass
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *a):
+            return False
+
+        async def post(self, *a, **k):
+            raise httpx.ConnectError("boom")
+
+    monkeypatch.setattr(runner_module.httpx, "AsyncClient", _RaisingClient)
+
+    result = await loop._try_presign(entry, "job-x", "out.png", "a" * 64, 3)
+    assert result is None
+
+
 async def test_handle_job_reports_job_failed_when_artifact_upload_never_verifies(two_platform_loop, monkeypatch):
     loop = two_platform_loop
     conn_a = loop.connections["worker-a"]

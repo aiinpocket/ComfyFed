@@ -743,14 +743,27 @@ class AgentLoop:
     async def _upload_artifact(self, entry: PlatformEntry, job_id: str, filename: str, content: bytes) -> None:
         """Upload one job artifact and verify the platform received it uncorrupted.
 
-        Sends the locally computed sha256 as `X-Artifact-SHA256`; the
-        platform recomputes its own hash over the bytes it received and
-        echoes it back in `{"sha256": ...}`. Only a response whose hash
-        matches ours counts as success -- a mismatch (corruption or a swap in
-        transit) or any non-2xx (including the platform's own 400
-        `artifact.hash_mismatch`) is retried once with a fresh upload. If
-        that also fails, raises so `handle_job` reports the job failed
-        instead of silently losing or corrupting the result.
+        Phase 2's presigned upload protocol is tried first: a small signed
+        JSON `POST .../artifacts/presign` asks the platform how it wants the
+        bytes delivered. A platform that doesn't know this route yet (404/405
+        -- any ComfyFed server older than this protocol, or a transport
+        error reaching it at all) falls back to the original multipart
+        upload unchanged, so this method works unmodified against both an
+        old and a new platform. A platform that DOES answer with a mode
+        picks one of two cloud-only paths:
+
+          - `"direct"`: PUT the raw bytes to the one-time-token URL the
+            presign response names, unsigned (the token itself is the
+            auth) -- verified below by `_upload_via_presign_direct`.
+          - `"s3"`: PUT the raw bytes straight to the given aws4-presigned
+            R2 URL, then a signed `POST .../artifacts/confirm` tells the
+            platform the upload landed -- `_upload_via_presign_s3`.
+
+        Whichever path is taken, the platform recomputes/records its own
+        hash over the bytes it received (or, in "s3" mode, HEADs the object
+        and trusts this agent's own claim -- see the platform's `confirm`
+        docstring for why that's an acceptable, narrower trust boundary).
+        Only a response whose hash matches local ours counts as success.
 
         Which exception it raises matters: `RuntimeError` when the platform
         ANSWERED and the upload still did not verify (a real rejection --
@@ -758,8 +771,150 @@ class AgentLoop:
         answer at all (a transport problem -- the job is fine, the socket
         isn't). `_report_completion` holds and retries only the latter.
         """
-        path = f"/api/agent/jobs/{job_id}/artifacts"
         local_sha256 = hashlib.sha256(content).hexdigest()
+
+        presign = await self._try_presign(entry, job_id, filename, local_sha256, len(content))
+        if presign is not None:
+            mode = presign.get("mode")
+            if mode == "direct":
+                await self._upload_via_presign_direct(entry, presign, content, filename)
+                return
+            if mode == "s3":
+                await self._upload_via_presign_s3(entry, job_id, presign, content, filename, local_sha256)
+                return
+            logger.warning("runner: presign for %r returned an unknown mode %r; using legacy upload", filename, mode)
+
+        await self._upload_artifact_legacy(entry, job_id, filename, content, local_sha256)
+
+    async def _try_presign(
+        self, entry: PlatformEntry, job_id: str, filename: str, sha256_hex: str, size: int
+    ) -> Optional[dict]:
+        """Ask the platform how it wants this artifact's bytes delivered.
+
+        Returns the parsed `{"mode": ..., ...}` response on success, or
+        `None` whenever the legacy multipart path should be used instead:
+        the platform doesn't have this route (404/405 -- an older
+        ComfyFed), it answered with anything else that isn't a clean 200,
+        or the request couldn't even be sent (a `_FakeAsyncClient`-style
+        test double with no `post`, a real transport error, ...). Every one
+        of those collapses to the same safe fallback rather than raising --
+        a broken/old presign endpoint must never turn into a lost job.
+        """
+        path = f"/api/agent/jobs/{job_id}/artifacts/presign"
+        body = json.dumps({"filename": filename, "sha256": sha256_hex, "size": size}).encode()
+        try:
+            async with httpx.AsyncClient(base_url=entry.platform_url) as client:
+                headers = signing.signed_headers(entry, "POST", path, body)
+                headers["Content-Type"] = "application/json"
+                resp = await client.post(path, content=body, headers=headers)
+        except Exception:
+            logger.debug("runner: presign request for %r failed to send; using legacy upload", filename, exc_info=True)
+            return None
+
+        if resp.status_code in (404, 405):
+            return None
+        if resp.status_code != 200:
+            logger.warning(
+                "runner: presign for %r returned status=%s; using legacy upload", filename, resp.status_code
+            )
+            return None
+        try:
+            data = resp.json()
+        except Exception:
+            logger.warning("runner: presign for %r returned non-JSON; using legacy upload", filename)
+            return None
+        return data if isinstance(data, dict) else None
+
+    async def _upload_via_presign_direct(
+        self, entry: PlatformEntry, presign: dict, content: bytes, filename: str
+    ) -> None:
+        """PUT raw bytes to the one-time-token URL from a `"direct"` presign
+        response. The token in the URL is the sole auth -- no signed
+        headers. Retried once (same shape as the legacy path's retry), since
+        a token is single-use: a genuine transport failure on attempt one
+        (never reached the platform) is safe to retry, but the token itself
+        does NOT get re-issued here -- a caller that failed after the
+        platform actually received and rejected the bytes must re-presign
+        from scratch (a fresh token), which is why a non-2xx answer raises
+        immediately rather than retrying against the same, now possibly
+        consumed, token.
+        """
+        url = presign.get("url")
+        if not isinstance(url, str) or not url:
+            raise RuntimeError("artifact upload failed: presign response missing url")
+
+        for attempt in range(2):
+            try:
+                async with httpx.AsyncClient(base_url=entry.platform_url) as client:
+                    resp = await client.put(url, content=content)
+            except Exception:
+                logger.exception(
+                    "runner: presigned direct upload for %r raised (attempt=%d)", filename, attempt + 1
+                )
+                continue
+
+            if resp.status_code == 200:
+                return
+            # The platform answered -- the token is one-time, so retrying the
+            # SAME url would just 409. Only a transport-level failure
+            # (caught above) is worth a second attempt.
+            logger.warning(
+                "runner: presigned direct upload for %r not confirmed (status=%s)", filename, resp.status_code
+            )
+            raise RuntimeError("artifact upload failed")
+
+        raise PlatformUnavailable(f"artifact upload for {filename!r} could not reach the platform")
+
+    async def _upload_via_presign_s3(
+        self,
+        entry: PlatformEntry,
+        job_id: str,
+        presign: dict,
+        content: bytes,
+        filename: str,
+        local_sha256: str,
+    ) -> None:
+        """PUT raw bytes straight to the presigned S3 (R2) URL, then tell the
+        platform via a signed confirm call. The PUT itself carries no
+        platform auth at all (the URL's own signature is the auth, verified
+        by R2 -- not by ComfyFed), so a failure there is always a transport
+        problem worth retrying; the confirm call is what actually finishes
+        the hand-off and is retried like every other signed platform call.
+        """
+        url = presign.get("url")
+        if not isinstance(url, str) or not url:
+            raise RuntimeError("artifact upload failed: presign response missing url")
+
+        try:
+            async with httpx.AsyncClient() as client:
+                resp = await client.put(url, content=content)
+        except Exception as exc:
+            raise PlatformUnavailable(f"artifact upload for {filename!r} could not reach storage") from exc
+        if resp.status_code not in (200, 201, 204):
+            raise RuntimeError(f"artifact upload failed: storage PUT returned {resp.status_code}")
+
+        confirm_path = f"/api/agent/jobs/{job_id}/artifacts/confirm"
+        confirm_body = json.dumps({"filename": filename, "sha256": local_sha256}).encode()
+        try:
+            async with httpx.AsyncClient(base_url=entry.platform_url) as client:
+                headers = signing.signed_headers(entry, "POST", confirm_path, confirm_body)
+                headers["Content-Type"] = "application/json"
+                resp = await client.post(confirm_path, content=confirm_body, headers=headers)
+        except Exception as exc:
+            raise PlatformUnavailable(f"artifact confirm for {filename!r} could not reach the platform") from exc
+
+        if resp.status_code == 200:
+            return
+        raise RuntimeError(f"artifact confirm failed: platform returned {resp.status_code}")
+
+    async def _upload_artifact_legacy(
+        self, entry: PlatformEntry, job_id: str, filename: str, content: bytes, local_sha256: str
+    ) -> None:
+        """The original (pre-Phase-2) multipart upload, kept byte-for-byte
+        for platforms that don't understand the presign protocol -- see
+        `_upload_artifact`'s docstring for the fallback contract.
+        """
+        path = f"/api/agent/jobs/{job_id}/artifacts"
         answered = False
 
         for attempt in range(2):
