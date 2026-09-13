@@ -7,3 +7,6 @@ dist/
 .superpowers/
 *.egg-info/
 build/
+.wrangler/
+cloud/.dev.vars
+cloud/assets/

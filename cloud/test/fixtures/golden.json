@@ -1,0 +1,688 @@
+{
+  "_generated_by": "scripts/golden_vectors.py",
+  "_note": "Signature-byte parity vectors for cloud/ (Cloudflare Workers port). Regenerate with .venv/Scripts/python.exe scripts/golden_vectors.py whenever a canonical-string format changes, and re-commit.",
+  "keypairs": [
+    {
+      "seed_hex": "2d4ea31c7101e4e8e3b0243b78d4387d0de1327a0f4dc3135a6aa091fee28acb",
+      "pubkey_hex": "c873131dcb095bdf45e70300c4ff43a486f0c6fa2b3728eda1f9f2a885475c54",
+      "receipt_cases": [
+        {
+          "job_id": "job-00",
+          "worker_id": "worker-00",
+          "gpu_seconds": 0.0,
+          "gpu_seconds_1f": "0.0",
+          "payload": "job-00|worker-00|0.0",
+          "signature_hex": "27404e2de096e9ff17be6f18f6cb8fac134e6c47d846518b1c1e6344f11734f15a7941d37c9532dcc68a1f5c9947bd38e4ac5bf87e9bb4df622f8c125ea7990a"
+        },
+        {
+          "job_id": "job-01",
+          "worker_id": "worker-01",
+          "gpu_seconds": 1.0,
+          "gpu_seconds_1f": "1.0",
+          "payload": "job-01|worker-01|1.0",
+          "signature_hex": "53a695f2b28c3986136e44b964c6c4969b5d24c449175c41e9f67037e939152a3272d1b992fe032939fcaa3fb8b0a4c2d99e4bea98949e16b3dd2e21106ba903"
+        },
+        {
+          "job_id": "job-02",
+          "worker_id": "worker-02",
+          "gpu_seconds": -1.0,
+          "gpu_seconds_1f": "-1.0",
+          "payload": "job-02|worker-02|-1.0",
+          "signature_hex": "9254e396bda60c90e003a76aa6e087c6fc24d68169e9ad1f07faacff844a66ee1bbb9793dde2cc30b5219d27b4b3e7349477db1b4e980599fb6a2b31c525bb08"
+        },
+        {
+          "job_id": "job-03",
+          "worker_id": "worker-03",
+          "gpu_seconds": 0.05,
+          "gpu_seconds_1f": "0.1",
+          "payload": "job-03|worker-03|0.1",
+          "signature_hex": "b1def595dd24cc99d01dafed3ae203701f72d687b2c183ff011f85c999e3b54127606e2f2492af340161e8fe7dbe8861088f80076c99067a460d573c0b2d5e00"
+        },
+        {
+          "job_id": "job-04",
+          "worker_id": "worker-04",
+          "gpu_seconds": 0.15,
+          "gpu_seconds_1f": "0.1",
+          "payload": "job-04|worker-04|0.1",
+          "signature_hex": "4825706766e8efcf7f87976e4189d291760414349adba36a642c6297014e7b419c33456ae5084c899a1966c1fecdfc52ba6db3b925a2600c7cb5a3e5d9154404"
+        },
+        {
+          "job_id": "job-05",
+          "worker_id": "worker-05",
+          "gpu_seconds": 0.25,
+          "gpu_seconds_1f": "0.2",
+          "payload": "job-05|worker-05|0.2",
+          "signature_hex": "58df2491a8f23840187c99a2056cb3f09ba8768ebce33758f22dc5c7dd4c5b26f5c002dc0f63c34883803c090380adab8f7c3e502715a9041dcd8abe5af4230e"
+        },
+        {
+          "job_id": "job-06",
+          "worker_id": "worker-06",
+          "gpu_seconds": 2.5,
+          "gpu_seconds_1f": "2.5",
+          "payload": "job-06|worker-06|2.5",
+          "signature_hex": "beaaeee826242d7038b395a2a9ab5cf2e8083a0ce4284b26c536d6438754cbcdc7d3efa5f3b69106dd6cf2619fa4aff813664e32c82b138001e769cf948f620d"
+        },
+        {
+          "job_id": "job-07",
+          "worker_id": "worker-07",
+          "gpu_seconds": 9.999,
+          "gpu_seconds_1f": "10.0",
+          "payload": "job-07|worker-07|10.0",
+          "signature_hex": "6f301a29c23ffd4cbe66b91ee4fbe3f7d12f92ed352df33ff8d612717ccd25b34ad8c52a620bf4bb229ef157af4f41a927e82704da4fbd2eccc4761f4e1ffb05"
+        },
+        {
+          "job_id": "job-08",
+          "worker_id": "worker-08",
+          "gpu_seconds": 0.04999,
+          "gpu_seconds_1f": "0.0",
+          "payload": "job-08|worker-08|0.0",
+          "signature_hex": "c8a99f91376949d29cc059ffc930562a8127cb715c6984f21c50df6815b67e189a86a5b5fe9677a67d0629b94ef858d244a548b8e8f636105e3c8caed8c4ac06"
+        },
+        {
+          "job_id": "job-09",
+          "worker_id": "worker-09",
+          "gpu_seconds": 1.25,
+          "gpu_seconds_1f": "1.2",
+          "payload": "job-09|worker-09|1.2",
+          "signature_hex": "599811a390154f3f0da4bbbc9d89ac6d2441970a670cfb16e4903ebcc10881059b35334e88e59366055332af0f436d71d614197fef92f91e84977d20fc86a307"
+        },
+        {
+          "job_id": "job-10",
+          "worker_id": "worker-10",
+          "gpu_seconds": 1.35,
+          "gpu_seconds_1f": "1.4",
+          "payload": "job-10|worker-10|1.4",
+          "signature_hex": "e622cf3bf1de483c1f67f2dc5eec8221891dac539517ab599d630008fa3c500affd54de9d9f6206bcba06608d11d5070afb2ff58558cc2ffb96354d6c82c4c08"
+        },
+        {
+          "job_id": "job-11",
+          "worker_id": "worker-11",
+          "gpu_seconds": 0.5,
+          "gpu_seconds_1f": "0.5",
+          "payload": "job-11|worker-11|0.5",
+          "signature_hex": "612a80ae3517ca1ce1263a1c31d8a204877ddcbba4e3bce7391812fe0d27448a7e891c50b9d86a3174f23203cb59c56f2cedd6c38d50d624af9290c362dcb10a"
+        },
+        {
+          "job_id": "job-12",
+          "worker_id": "worker-12",
+          "gpu_seconds": 1.5,
+          "gpu_seconds_1f": "1.5",
+          "payload": "job-12|worker-12|1.5",
+          "signature_hex": "bea72f5651438f68f186bf0cbdf8047be20c47226d1aa246391dd92afb0ce27bfb342ff76f373360276c87a324983f1663d93f503513a90d9e59cfb961e05c06"
+        },
+        {
+          "job_id": "job-13",
+          "worker_id": "worker-13",
+          "gpu_seconds": 2.05,
+          "gpu_seconds_1f": "2.0",
+          "payload": "job-13|worker-13|2.0",
+          "signature_hex": "79469919df1fc3cffa1a75bef3912da1bf8a526b15cf38f5f1aafc2169916678e181168b5ade99a266bb95a2e55ebc8b0ffb685f4f36b5628fcfd7f8f8a13705"
+        },
+        {
+          "job_id": "job-14",
+          "worker_id": "worker-14",
+          "gpu_seconds": 3.14159,
+          "gpu_seconds_1f": "3.1",
+          "payload": "job-14|worker-14|3.1",
+          "signature_hex": "dd7ec41ba07a969aea3fd0f1b6696e508258b8b4ad74c0985c30907bfb72cbbc5afd5c70d43bcc9ecda4bcf8affc6e409b906a5026d55df498bf08dcaf91160e"
+        },
+        {
+          "job_id": "job-15",
+          "worker_id": "worker-15",
+          "gpu_seconds": 100.0,
+          "gpu_seconds_1f": "100.0",
+          "payload": "job-15|worker-15|100.0",
+          "signature_hex": "968f0056b603a01ec58a0ed727f04b158196991afbc274e07df26d93dabc163f58f8053819b2de5314764aea7d1ca9456108e723033270e0da8aa0e4d31a770e"
+        },
+        {
+          "job_id": "job-16",
+          "worker_id": "worker-16",
+          "gpu_seconds": 0.001,
+          "gpu_seconds_1f": "0.0",
+          "payload": "job-16|worker-16|0.0",
+          "signature_hex": "08a8990e39402602a3eb610e7b105d293a7cd7b30f363b8fa232a2bebc0b50c0e85e2f0892181c780053124e489b05c9fec98a6c475535022fb16066c0b80d0d"
+        },
+        {
+          "job_id": "job-17",
+          "worker_id": "worker-17",
+          "gpu_seconds": -0.05,
+          "gpu_seconds_1f": "-0.1",
+          "payload": "job-17|worker-17|-0.1",
+          "signature_hex": "0a0fb47ca6b83fa0b5c2e26ac11d6d07c113e2f5158206b0d3dba1860e1dc846b58cfa2a0dcb279961313934b333f14638669af98de2440aa99fc2142c493607"
+        },
+        {
+          "job_id": "job-18",
+          "worker_id": "worker-18",
+          "gpu_seconds": 123456.789,
+          "gpu_seconds_1f": "123456.8",
+          "payload": "job-18|worker-18|123456.8",
+          "signature_hex": "1d6362dcdd61b003411fb1d169d07d487304a6e0b315b9685218a8887516c105eb67a443200b646f5f6027b5b23acd6f47c0fd022c71911954aed0d223f84a09"
+        },
+        {
+          "job_id": "job-19",
+          "worker_id": "worker-19",
+          "gpu_seconds": 0.045,
+          "gpu_seconds_1f": "0.0",
+          "payload": "job-19|worker-19|0.0",
+          "signature_hex": "93f4414961e64aabac2cf9dd0c3b9e8e84c7bf2bcfceafcc4e7e2fd78792595eada6de215de2b6c0674d13b1964342658b62fe51e6a3f1c0a5f1ff0b3a012308"
+        }
+      ],
+      "registration_sample": {
+        "worker_id": "11111111-2222-3333-4444-555555555555",
+        "pubkey_hex": "c873131dcb095bdf45e70300c4ff43a486f0c6fa2b3728eda1f9f2a885475c54",
+        "payload": "11111111-2222-3333-4444-555555555555|c873131dcb095bdf45e70300c4ff43a486f0c6fa2b3728eda1f9f2a885475c54",
+        "certificate_hex": "5467b97e0177a02bd2ed2f5ce83a7faf8f4aeacfc205bad4ed7199227b3a0df19f2f7ff25b9e52076acba062ec85aa4fc03704342684f847664e404f02f51900"
+      },
+      "release_sample": {
+        "version": "1.10.0",
+        "sha256_hex": "deadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeef",
+        "payload": "1.10.0|deadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeef",
+        "signature_hex": "54403c897b5f695f9f2517a1eeb600e7abdddb3d873167abbfe9a232a9f1e671b4c2cd8f95dce06bd2dfb762016cbea15192f4a1a47532d192793bf6c972e80c"
+      },
+      "signed_request_sample": {
+        "method": "POST",
+        "path": "/api/agent/jobs/job-abc123/artifacts/raw/tok-xyz",
+        "query": "from=agent&retry=1",
+        "ts": "1799999999",
+        "nonce": "a1b2c3d4e5f60718293a4b5c6d7e8f90",
+        "body_utf8_text": "multipart-ish body 中文 \u0000\u0001\u0002 end",
+        "body_hex": "6d756c7469706172742d69736820626f647920e4b8ade696872000010220656e64",
+        "canonical_message_hex": "504f53540a2f6170692f6167656e742f6a6f62732f6a6f622d6162633132332f6172746966616374732f7261772f746f6b2d78797a3f66726f6d3d6167656e742672657472793d310a313739393939393939390a61316232633364346535663630373138323933613462356336643765386639300a6d756c7469706172742d69736820626f647920e4b8ade696872000010220656e64",
+        "signature_hex": "a64cac7a0f4f24179b876d34e7e2e4deaf484c5e3df259aec8205be456410067d43c8f93a4b319820dc4435072ef8c861d98f6f39b38d3be07bb2116c6e84700"
+      },
+      "signed_request_sample_no_query": {
+        "method": "GET",
+        "path": "/api/agent/ping",
+        "query": "",
+        "ts": "1800000000",
+        "nonce": "ffeeddccbbaa99887766554433221100",
+        "body_utf8_text": "",
+        "body_hex": "",
+        "canonical_message_hex": "4745540a2f6170692f6167656e742f70696e670a313830303030303030300a66666565646463636262616139393838373736363535343433333232313130300a",
+        "signature_hex": "e2073d7296ef109605c09a6bb239577b9b16ec78aab9aeda62adb62b55d057802c42e3319935db3c9ae4080d8703b55ab421e6c7ce213b2bc027c8fc60c2190a"
+      }
+    },
+    {
+      "seed_hex": "16285dd099469d53bc43593ca97f9d90eaaac5428346fae228e489a699472453",
+      "pubkey_hex": "1092afce73b22a55a54c944b7603897e7f90b213c14a5f2d5533318e00499669",
+      "receipt_cases": [
+        {
+          "job_id": "job-00",
+          "worker_id": "worker-00",
+          "gpu_seconds": 0.0,
+          "gpu_seconds_1f": "0.0",
+          "payload": "job-00|worker-00|0.0",
+          "signature_hex": "725745c54b0069fd4aedc5d653d7c2c669ab9ae12f804d3dcfb164480d22e3a59bcba5ab5f25f28eeee8b31686572db2ba0ca5db7b90760d2c9bc3b8bd5f2907"
+        },
+        {
+          "job_id": "job-01",
+          "worker_id": "worker-01",
+          "gpu_seconds": 1.0,
+          "gpu_seconds_1f": "1.0",
+          "payload": "job-01|worker-01|1.0",
+          "signature_hex": "7a21fe742f186fee99ed71d3696a59453763136e9c5cb3941093a4b935a5e039ddf1dae83eefd78e9beac09b09d836ce86e9c5eb84780169c052ad92501cfa01"
+        },
+        {
+          "job_id": "job-02",
+          "worker_id": "worker-02",
+          "gpu_seconds": -1.0,
+          "gpu_seconds_1f": "-1.0",
+          "payload": "job-02|worker-02|-1.0",
+          "signature_hex": "a080c327e751666845473c3714e2c876511f31f7d59dc8333cf073145698792130b1642c6f6f532371c8714479de2daf1eb5261e4f24955c7b55936e8aa1540d"
+        },
+        {
+          "job_id": "job-03",
+          "worker_id": "worker-03",
+          "gpu_seconds": 0.05,
+          "gpu_seconds_1f": "0.1",
+          "payload": "job-03|worker-03|0.1",
+          "signature_hex": "b6f64a5cda9426e982870add07649b08f49809ef3cb8abc1112a087b888e49b5020db4a951eab91f99d68a4cee4cb0214b0f9a92fc8cc1519c2b77b583f7ee0c"
+        },
+        {
+          "job_id": "job-04",
+          "worker_id": "worker-04",
+          "gpu_seconds": 0.15,
+          "gpu_seconds_1f": "0.1",
+          "payload": "job-04|worker-04|0.1",
+          "signature_hex": "8f612e3d314bc6493ff0888af477436904ec0e973b02a322b797b3d7ee3d6c6297e726705510e4ca1802469925e5b5cb573daa3a3e9357c2822e31b95fcd6f06"
+        },
+        {
+          "job_id": "job-05",
+          "worker_id": "worker-05",
+          "gpu_seconds": 0.25,
+          "gpu_seconds_1f": "0.2",
+          "payload": "job-05|worker-05|0.2",
+          "signature_hex": "8ee7f0396cbad0ab3a8f402e2ac761762875d3095dfffece03283d11a5ddf94a1cee2560ea80244f66ea9a64467effbb0137f914b31846b6d3574162e193f708"
+        },
+        {
+          "job_id": "job-06",
+          "worker_id": "worker-06",
+          "gpu_seconds": 2.5,
+          "gpu_seconds_1f": "2.5",
+          "payload": "job-06|worker-06|2.5",
+          "signature_hex": "ad62a34be830ee5d6b6c5083df593e9c0a217f37cc751d0f769a5c90a586791590042c4a6a4bb996b84ca40e5ccf033a925efe0291ff52d522d2c94a42d77b0c"
+        },
+        {
+          "job_id": "job-07",
+          "worker_id": "worker-07",
+          "gpu_seconds": 9.999,
+          "gpu_seconds_1f": "10.0",
+          "payload": "job-07|worker-07|10.0",
+          "signature_hex": "822601f3b2c75948d988bad8c271138deb95eb41bf1c3d4cc507b25563f7be0d6ee5135b30868b1015020c876ae194897d432435eb74ef216083056c88551e04"
+        },
+        {
+          "job_id": "job-08",
+          "worker_id": "worker-08",
+          "gpu_seconds": 0.04999,
+          "gpu_seconds_1f": "0.0",
+          "payload": "job-08|worker-08|0.0",
+          "signature_hex": "9cfcf82941b99ab4251268db702d341e21ba34f735033f38c455c11f96d7c936e587f912fb3c3e58652ddcd5f60424ed1c751ebc55d5bfb86d4809b753037006"
+        },
+        {
+          "job_id": "job-09",
+          "worker_id": "worker-09",
+          "gpu_seconds": 1.25,
+          "gpu_seconds_1f": "1.2",
+          "payload": "job-09|worker-09|1.2",
+          "signature_hex": "f00e82b04f3da650678fd46a35655b5de39251647565617b27cebaf4b84be1517bcb34c57a6165f79442ffb68ec68716ea901b76f50b72c96d4dbf30f90f770c"
+        },
+        {
+          "job_id": "job-10",
+          "worker_id": "worker-10",
+          "gpu_seconds": 1.35,
+          "gpu_seconds_1f": "1.4",
+          "payload": "job-10|worker-10|1.4",
+          "signature_hex": "c5a8b3ec08fddad3fba3d51aa13dd6b6b8c03fb1f6ea54a1b7630d68d3854323d227070f57196b09efb42991a4eb064aaa68461a75c9753790fac195808e700f"
+        },
+        {
+          "job_id": "job-11",
+          "worker_id": "worker-11",
+          "gpu_seconds": 0.5,
+          "gpu_seconds_1f": "0.5",
+          "payload": "job-11|worker-11|0.5",
+          "signature_hex": "980f50fa0bfde010110c9160024f249f4e86c3540449772b4058ecdad56d16ce64d043d71156f21f51b88adf574166142783bc599057cdfed1804233e8201a08"
+        },
+        {
+          "job_id": "job-12",
+          "worker_id": "worker-12",
+          "gpu_seconds": 1.5,
+          "gpu_seconds_1f": "1.5",
+          "payload": "job-12|worker-12|1.5",
+          "signature_hex": "7dda0d7c9e790810c117a7e041028eaf574656054c8232da4c26e2845c55ab4aaff64fc27499fa5c42dfc0d0a7232fdf2c5621ee6d0ccf42b82cb88fabc42a0b"
+        },
+        {
+          "job_id": "job-13",
+          "worker_id": "worker-13",
+          "gpu_seconds": 2.05,
+          "gpu_seconds_1f": "2.0",
+          "payload": "job-13|worker-13|2.0",
+          "signature_hex": "55fdeec2ffd69ad0242aeac3ed1eee9292db564d8f39836ba548da277455fcb22c5ba26e574540998984d3f399722e0e27231c788b7c905ebceb13e41773bc08"
+        },
+        {
+          "job_id": "job-14",
+          "worker_id": "worker-14",
+          "gpu_seconds": 3.14159,
+          "gpu_seconds_1f": "3.1",
+          "payload": "job-14|worker-14|3.1",
+          "signature_hex": "dddbab5f7a32fc8531f95b10cba76bf8cfba6da77bdf73059c865d085a32eb138a8dda472ef09ba8146cff413079bf929261ba853fbf5aee76d3eb2536191f07"
+        },
+        {
+          "job_id": "job-15",
+          "worker_id": "worker-15",
+          "gpu_seconds": 100.0,
+          "gpu_seconds_1f": "100.0",
+          "payload": "job-15|worker-15|100.0",
+          "signature_hex": "f8a82b6513cf507c20468ac1a1032b5b4cdc1e1333131fcbcea24f1fb1d1da64e6f3b6bdbc6076ec7899f3d3499ceab8b5e4c3ecef722515acd44a21e6178807"
+        },
+        {
+          "job_id": "job-16",
+          "worker_id": "worker-16",
+          "gpu_seconds": 0.001,
+          "gpu_seconds_1f": "0.0",
+          "payload": "job-16|worker-16|0.0",
+          "signature_hex": "ba3cb1abffc920d50172bc5d85d6fab51d6d941039ef15628ae731de33343bd9527107be9e2940680982ef09bc19934a3d4c6f573bbee62b0fba6a61585e0002"
+        },
+        {
+          "job_id": "job-17",
+          "worker_id": "worker-17",
+          "gpu_seconds": -0.05,
+          "gpu_seconds_1f": "-0.1",
+          "payload": "job-17|worker-17|-0.1",
+          "signature_hex": "be93648ba7ba35a5552b546b8d1d1d4e82b507a75571514cac2f31d1d49960dbf8abf8539efcc36edb04a45b188f14e97a71ce4fbe655514463ff9650474ee03"
+        },
+        {
+          "job_id": "job-18",
+          "worker_id": "worker-18",
+          "gpu_seconds": 123456.789,
+          "gpu_seconds_1f": "123456.8",
+          "payload": "job-18|worker-18|123456.8",
+          "signature_hex": "1e6bdedc3450be8bd448508e9f63e529d091157b461f4acee5180eaba79d404aa51555577315b8aa6a686220698d0cad03794ed4ae5671dd6a166269c6051e06"
+        },
+        {
+          "job_id": "job-19",
+          "worker_id": "worker-19",
+          "gpu_seconds": 0.045,
+          "gpu_seconds_1f": "0.0",
+          "payload": "job-19|worker-19|0.0",
+          "signature_hex": "60b1470655d2cd6d78594da5a60575278373b57afb80024199283292a98436a6e807ae25231f15dfb2e5e5134b53b5735f37f3cf61a1ec57c164026dbab14901"
+        }
+      ],
+      "registration_sample": {
+        "worker_id": "11111111-2222-3333-4444-555555555555",
+        "pubkey_hex": "1092afce73b22a55a54c944b7603897e7f90b213c14a5f2d5533318e00499669",
+        "payload": "11111111-2222-3333-4444-555555555555|1092afce73b22a55a54c944b7603897e7f90b213c14a5f2d5533318e00499669",
+        "certificate_hex": "9cbf152a0a7c7eca027c39056fc0f618eb1c3002eaf1602fe153ea8063d382771c4c17b419ee760a07b3a19e1ad740a30d0baeabed10ed3bd08282b1fe6b5a0e"
+      },
+      "release_sample": {
+        "version": "1.10.0",
+        "sha256_hex": "deadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeef",
+        "payload": "1.10.0|deadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeef",
+        "signature_hex": "3f3523ad0005c957c7e557c711623b1228ffaaae61a291b8d96cad2efef5dd9c17a7754f80281adf6afce7ce39041a9279377a7019abfd186304d8157feaa907"
+      },
+      "signed_request_sample": {
+        "method": "POST",
+        "path": "/api/agent/jobs/job-abc123/artifacts/raw/tok-xyz",
+        "query": "from=agent&retry=1",
+        "ts": "1799999999",
+        "nonce": "a1b2c3d4e5f60718293a4b5c6d7e8f90",
+        "body_utf8_text": "multipart-ish body 中文 \u0000\u0001\u0002 end",
+        "body_hex": "6d756c7469706172742d69736820626f647920e4b8ade696872000010220656e64",
+        "canonical_message_hex": "504f53540a2f6170692f6167656e742f6a6f62732f6a6f622d6162633132332f6172746966616374732f7261772f746f6b2d78797a3f66726f6d3d6167656e742672657472793d310a313739393939393939390a61316232633364346535663630373138323933613462356336643765386639300a6d756c7469706172742d69736820626f647920e4b8ade696872000010220656e64",
+        "signature_hex": "10b18a2e4aa22ac9150bd018bb8633f66f7ccdc031171c1dfb7d5e26b322bc15b4c22ca955ab145f831ddad66fe3597321420d9a82f5444848e3db03505b2e0b"
+      },
+      "signed_request_sample_no_query": {
+        "method": "GET",
+        "path": "/api/agent/ping",
+        "query": "",
+        "ts": "1800000000",
+        "nonce": "ffeeddccbbaa99887766554433221100",
+        "body_utf8_text": "",
+        "body_hex": "",
+        "canonical_message_hex": "4745540a2f6170692f6167656e742f70696e670a313830303030303030300a66666565646463636262616139393838373736363535343433333232313130300a",
+        "signature_hex": "4a46e22c152ccfc3fa3eb224bd928c314c88a0af64b1cd25f543f47593877040908bcc88332941d3726fd80b7a9918fbba6a0c9cd90b2b345a785bcd61eef301"
+      }
+    },
+    {
+      "seed_hex": "3f30b224a0ff6df2f3d4992aac3184fd0ae49d69623e7836e02ad9d78f5993ae",
+      "pubkey_hex": "840f33cafaf5e7ddea99cbf6de99a3b20597b77452b9f4c6790afbdcc28efbc2",
+      "receipt_cases": [
+        {
+          "job_id": "job-00",
+          "worker_id": "worker-00",
+          "gpu_seconds": 0.0,
+          "gpu_seconds_1f": "0.0",
+          "payload": "job-00|worker-00|0.0",
+          "signature_hex": "e628b650262c8e041280ab498d9eb6a8ca8d8d90539ff7717552f786281ba8393810949af6c02831e30d056245c0231e34b44951f57b030da90d07090891a706"
+        },
+        {
+          "job_id": "job-01",
+          "worker_id": "worker-01",
+          "gpu_seconds": 1.0,
+          "gpu_seconds_1f": "1.0",
+          "payload": "job-01|worker-01|1.0",
+          "signature_hex": "34c665aba4bc0c4f6614a1f94ae31a1742a6738755f25f952a277ada1577f83f5d8aa9c0d6f716bc7eee97537bb8c8f9e2357869fcc8336301dcefab16757605"
+        },
+        {
+          "job_id": "job-02",
+          "worker_id": "worker-02",
+          "gpu_seconds": -1.0,
+          "gpu_seconds_1f": "-1.0",
+          "payload": "job-02|worker-02|-1.0",
+          "signature_hex": "c552e7249d3a1864859cd89897eea6193baf28ab4ac38319752279b1126ba6e043f2b1519efabf8b337b15d7cf2fc40c263a70473c3bb24200bf8b60c44f3c05"
+        },
+        {
+          "job_id": "job-03",
+          "worker_id": "worker-03",
+          "gpu_seconds": 0.05,
+          "gpu_seconds_1f": "0.1",
+          "payload": "job-03|worker-03|0.1",
+          "signature_hex": "e08a1ea9016584ce9ccafe527071825c9454f0945ba1cffe6d6b1f632499e45409c9903a67f1b96e1034e8bcde8aacdf159bc03ad07696d10c26f396ed396d08"
+        },
+        {
+          "job_id": "job-04",
+          "worker_id": "worker-04",
+          "gpu_seconds": 0.15,
+          "gpu_seconds_1f": "0.1",
+          "payload": "job-04|worker-04|0.1",
+          "signature_hex": "cbccb0e004ae3fd381feaf14dbbf0d7836fa49676908987ba19c824cc08be42af550f82546b98e788ef172bbfb50bff4bbbcc7f23f408f10fda2fcb570dd590e"
+        },
+        {
+          "job_id": "job-05",
+          "worker_id": "worker-05",
+          "gpu_seconds": 0.25,
+          "gpu_seconds_1f": "0.2",
+          "payload": "job-05|worker-05|0.2",
+          "signature_hex": "5527843435544bfd380ecbb3d2abe26d1500eb63f9f91995f4069043a9f5ea3707ef38591d4f8959ae4bc0b39fbde310659ab7646bf82ba255416b70ffb88c08"
+        },
+        {
+          "job_id": "job-06",
+          "worker_id": "worker-06",
+          "gpu_seconds": 2.5,
+          "gpu_seconds_1f": "2.5",
+          "payload": "job-06|worker-06|2.5",
+          "signature_hex": "c44df87c7da8feedba6456f66548bd3ca2f20a214ec529c3f671ed0d8a59eb76c77d6cc3298196bec129c5200bfcd45642f03c9ad92d9ddebb9508fa3377c80d"
+        },
+        {
+          "job_id": "job-07",
+          "worker_id": "worker-07",
+          "gpu_seconds": 9.999,
+          "gpu_seconds_1f": "10.0",
+          "payload": "job-07|worker-07|10.0",
+          "signature_hex": "5eb8d43695fb25fd817aef1a928dc4821a686509716fa067cc7598013bc3154e5ba13c8a8c572411d88fc307371c37a25ee8a7e334b1c56fdf6ef2aedb1ea80d"
+        },
+        {
+          "job_id": "job-08",
+          "worker_id": "worker-08",
+          "gpu_seconds": 0.04999,
+          "gpu_seconds_1f": "0.0",
+          "payload": "job-08|worker-08|0.0",
+          "signature_hex": "897002d7c260aa0bc91531bd2918adf3490e9eb886ecf891b40b41e36fbd62f53f00e38cb7ef66236c55299b8a2ddd6bb035b3a0208e66132c79edb2f1205e04"
+        },
+        {
+          "job_id": "job-09",
+          "worker_id": "worker-09",
+          "gpu_seconds": 1.25,
+          "gpu_seconds_1f": "1.2",
+          "payload": "job-09|worker-09|1.2",
+          "signature_hex": "39add4b2edfb1b14d7f39ad0b5f383e5a3beaca652eb442b40826ceae19853f7deb2f431fdad8d7ea3bdd7e4ee4c121b2134d702521632082cdd64676b7b2101"
+        },
+        {
+          "job_id": "job-10",
+          "worker_id": "worker-10",
+          "gpu_seconds": 1.35,
+          "gpu_seconds_1f": "1.4",
+          "payload": "job-10|worker-10|1.4",
+          "signature_hex": "d7b6abda2b767d799c50af99ad08b2d1f297ca9c647fbb6003a29bbd8706808aa9032d89f5d7a6ff893977b11c435e506a72593289fc320fa71a38551ddf3c04"
+        },
+        {
+          "job_id": "job-11",
+          "worker_id": "worker-11",
+          "gpu_seconds": 0.5,
+          "gpu_seconds_1f": "0.5",
+          "payload": "job-11|worker-11|0.5",
+          "signature_hex": "188d168d7f84e4a0d0387ae67ac6b4d3778add233c45a7e339698a75d0ed05e45007d2bc538040f02ace1407ab5d3994efd909df29dc6208caf3afa6efc1470e"
+        },
+        {
+          "job_id": "job-12",
+          "worker_id": "worker-12",
+          "gpu_seconds": 1.5,
+          "gpu_seconds_1f": "1.5",
+          "payload": "job-12|worker-12|1.5",
+          "signature_hex": "ae3cdae68c2ee8f0ec06aeaed538e6997eb8396168eb2e4a45612745e67df9572d602d143fe2b2f16845101cfed5bfb3ad5e682430740abfd07dcb02b0c50b00"
+        },
+        {
+          "job_id": "job-13",
+          "worker_id": "worker-13",
+          "gpu_seconds": 2.05,
+          "gpu_seconds_1f": "2.0",
+          "payload": "job-13|worker-13|2.0",
+          "signature_hex": "69afe9e6b28cdc5648956b2c5771916998d0eb0e1c2018da5e6f4fd33b8453adf67ca836e24dedd8f7c9eeec85549495d2ef192e603f2668bde68de6ba77800a"
+        },
+        {
+          "job_id": "job-14",
+          "worker_id": "worker-14",
+          "gpu_seconds": 3.14159,
+          "gpu_seconds_1f": "3.1",
+          "payload": "job-14|worker-14|3.1",
+          "signature_hex": "66c1a88741e9456cb7de943aab5f1380684371747584121d99c83c5342d5950bce10bb34a9ecf99f86e31764ff3b7e24055c7532ce02a90054980659b0762e07"
+        },
+        {
+          "job_id": "job-15",
+          "worker_id": "worker-15",
+          "gpu_seconds": 100.0,
+          "gpu_seconds_1f": "100.0",
+          "payload": "job-15|worker-15|100.0",
+          "signature_hex": "484efdc45d063e192f9d0b3b86b698da3ff3e6dcc07bdea700c80e223058ffea1232ff3ad9559b48c74516acd9219adaa80596e44faa9d1e95e9503e6e755104"
+        },
+        {
+          "job_id": "job-16",
+          "worker_id": "worker-16",
+          "gpu_seconds": 0.001,
+          "gpu_seconds_1f": "0.0",
+          "payload": "job-16|worker-16|0.0",
+          "signature_hex": "7d54983fffce6c9e21fceeb583d4a8f2eb7bf5f3927bfdb3949fcb4f7ea4302ef3e503a4b57573eea933b9e74896cfe0c9dcfc69a02d0e1d13176edc273b300b"
+        },
+        {
+          "job_id": "job-17",
+          "worker_id": "worker-17",
+          "gpu_seconds": -0.05,
+          "gpu_seconds_1f": "-0.1",
+          "payload": "job-17|worker-17|-0.1",
+          "signature_hex": "0db54d43100e69f238089c44b484eb6e6027cecd262fec54e30a1f9346af9a1f4003b4139d4ffd3620356aa6dfd5d9ead70c217fca05804a1c8ab8e7dee6b307"
+        },
+        {
+          "job_id": "job-18",
+          "worker_id": "worker-18",
+          "gpu_seconds": 123456.789,
+          "gpu_seconds_1f": "123456.8",
+          "payload": "job-18|worker-18|123456.8",
+          "signature_hex": "6159a32ca3bd320f358eb1276488f325bb21ec50f4ef6734d3414a519c3a71a147bc11f9b32b235564ac55c5e7169423326c0c0d7a5fa0593a69afd8db15e001"
+        },
+        {
+          "job_id": "job-19",
+          "worker_id": "worker-19",
+          "gpu_seconds": 0.045,
+          "gpu_seconds_1f": "0.0",
+          "payload": "job-19|worker-19|0.0",
+          "signature_hex": "1cf7f3f943ed79d32445337fc0cb4c54c42f7f37b582194e5fe447fbc49a5ae2b7199c1918f7ee5f83b77c2ba896d6ea9b9e0018c43396978eac0cd2370a9b06"
+        }
+      ],
+      "registration_sample": {
+        "worker_id": "11111111-2222-3333-4444-555555555555",
+        "pubkey_hex": "840f33cafaf5e7ddea99cbf6de99a3b20597b77452b9f4c6790afbdcc28efbc2",
+        "payload": "11111111-2222-3333-4444-555555555555|840f33cafaf5e7ddea99cbf6de99a3b20597b77452b9f4c6790afbdcc28efbc2",
+        "certificate_hex": "f1cdab9c33308e83904060885e025850103611d4704c9bb108386abd69735635a74e4a99026c4015e1856bfa60bc4d1dd636b4d375f4cc998c63bf1a54f4e402"
+      },
+      "release_sample": {
+        "version": "1.10.0",
+        "sha256_hex": "deadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeef",
+        "payload": "1.10.0|deadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeef",
+        "signature_hex": "3b4028edeef9308639c01547b22ef243986e4a3e28d52a421b055a1632a2867df8f8fc1d1b292d5983a8b10bceacc3d5aef3e00ebd4c76e744371f70a6d1f900"
+      },
+      "signed_request_sample": {
+        "method": "POST",
+        "path": "/api/agent/jobs/job-abc123/artifacts/raw/tok-xyz",
+        "query": "from=agent&retry=1",
+        "ts": "1799999999",
+        "nonce": "a1b2c3d4e5f60718293a4b5c6d7e8f90",
+        "body_utf8_text": "multipart-ish body 中文 \u0000\u0001\u0002 end",
+        "body_hex": "6d756c7469706172742d69736820626f647920e4b8ade696872000010220656e64",
+        "canonical_message_hex": "504f53540a2f6170692f6167656e742f6a6f62732f6a6f622d6162633132332f6172746966616374732f7261772f746f6b2d78797a3f66726f6d3d6167656e742672657472793d310a313739393939393939390a61316232633364346535663630373138323933613462356336643765386639300a6d756c7469706172742d69736820626f647920e4b8ade696872000010220656e64",
+        "signature_hex": "425e5ef694b84d7328308f4816cc60d1bb700c836a6482a1e39487e832d5c522a8e0d940a5223c504b938778b4f5c6689e5d5c1fa10065dd7aabb04449473c03"
+      },
+      "signed_request_sample_no_query": {
+        "method": "GET",
+        "path": "/api/agent/ping",
+        "query": "",
+        "ts": "1800000000",
+        "nonce": "ffeeddccbbaa99887766554433221100",
+        "body_utf8_text": "",
+        "body_hex": "",
+        "canonical_message_hex": "4745540a2f6170692f6167656e742f70696e670a313830303030303030300a66666565646463636262616139393838373736363535343433333232313130300a",
+        "signature_hex": "5c67dd446963e03c5d499f7ca98c2e3e412457cba8d9f356de4b26c80f96804cc4e3e22913c0dae21fb55377802d0859c4e6d6fea4d33874471fe18b357e940f"
+      }
+    }
+  ],
+  "dotonef_cases": [
+    {
+      "input": 0.0,
+      "expected": "0.0"
+    },
+    {
+      "input": 1.0,
+      "expected": "1.0"
+    },
+    {
+      "input": -1.0,
+      "expected": "-1.0"
+    },
+    {
+      "input": 0.05,
+      "expected": "0.1"
+    },
+    {
+      "input": 0.15,
+      "expected": "0.1"
+    },
+    {
+      "input": 0.25,
+      "expected": "0.2"
+    },
+    {
+      "input": 2.5,
+      "expected": "2.5"
+    },
+    {
+      "input": 9.999,
+      "expected": "10.0"
+    },
+    {
+      "input": 0.04999,
+      "expected": "0.0"
+    },
+    {
+      "input": 1.25,
+      "expected": "1.2"
+    },
+    {
+      "input": 1.35,
+      "expected": "1.4"
+    },
+    {
+      "input": 0.5,
+      "expected": "0.5"
+    },
+    {
+      "input": 1.5,
+      "expected": "1.5"
+    },
+    {
+      "input": 2.05,
+      "expected": "2.0"
+    },
+    {
+      "input": 3.14159,
+      "expected": "3.1"
+    },
+    {
+      "input": 100.0,
+      "expected": "100.0"
+    },
+    {
+      "input": 0.001,
+      "expected": "0.0"
+    },
+    {
+      "input": -0.05,
+      "expected": "-0.1"
+    },
+    {
+      "input": 123456.789,
+      "expected": "123456.8"
+    },
+    {
+      "input": 0.045,
+      "expected": "0.0"
+    }
+  ]
+}
