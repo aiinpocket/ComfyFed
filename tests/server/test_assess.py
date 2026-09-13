@@ -55,6 +55,51 @@ def test_extract_finds_nodes_models_and_assets():
     assert needs.est_vram_gb is None
 
 
+def test_model_nodes_maps_each_model_to_its_referencing_nodes():
+    mapping = assess.model_nodes(REALISTIC_WORKFLOW)
+    assert mapping == {
+        "sd_xl_base.safetensors": [("1", "CheckpointLoaderSimple")],
+        "my_style.safetensors": [("2", "LoraLoader")],
+    }
+
+
+ONE_MODEL_TWO_NODES = {
+    "1": {"class_type": "CheckpointLoaderSimple", "inputs": {"ckpt_name": "shared.safetensors"}},
+    "2": {"class_type": "UNETLoader", "inputs": {"unet_name": "shared.safetensors"}},
+}
+
+
+def test_model_nodes_lists_every_node_referencing_the_same_model():
+    mapping = assess.model_nodes(ONE_MODEL_TWO_NODES)
+    assert mapping == {
+        "shared.safetensors": [
+            ("1", "CheckpointLoaderSimple"),
+            ("2", "UNETLoader"),
+        ]
+    }
+
+
+TWO_MODELS_ONE_NODE = {
+    "1": {
+        "class_type": "DualCLIPLoader",
+        "inputs": {"clip_name1": "clip_l.safetensors", "clip_name2": "t5xxl_fp16.safetensors"},
+    },
+}
+
+
+def test_model_nodes_lists_every_model_referenced_by_the_same_node():
+    mapping = assess.model_nodes(TWO_MODELS_ONE_NODE)
+    assert mapping == {
+        "clip_l.safetensors": [("1", "DualCLIPLoader")],
+        "t5xxl_fp16.safetensors": [("1", "DualCLIPLoader")],
+    }
+
+
+def test_model_nodes_empty_for_empty_workflow():
+    assert assess.model_nodes({}) == {}
+    assert assess.model_nodes(None) == {}
+
+
 def test_estimate_vram_none_when_no_known_size():
     assert assess.estimate_vram({"sd_xl_base.safetensors"}, []) is None
 

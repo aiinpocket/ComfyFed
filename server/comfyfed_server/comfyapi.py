@@ -691,10 +691,34 @@ def create_router(
             # and as the leading half of the dialog's `message + ": " +
             # details`, so a multi-line blob in `message` renders either as a
             # collapsed one-line headline or twice over.
+            #
+            # node_errors mirrors the same missing models onto the actual
+            # offending node(s): the panel's Errors tab reads its scrollable
+            # details box ONLY from node_errors[<id>].errors[].details, never
+            # from this top-level error, so without this an admin sees just
+            # the one-line summary there and has to fall back to the legacy
+            # dialog to read the download guidance at all.
+            node_errors: dict = {}
+            model_node_map = assess.model_nodes(prompt)
+            for name in names:
+                for node_id, class_type in model_node_map.get(name, []):
+                    entry = node_errors.setdefault(
+                        node_id,
+                        {"class_type": class_type, "dependent_outputs": [], "errors": []},
+                    )
+                    entry["errors"].append(
+                        {
+                            "type": "comfyfed.missing_model",
+                            "message": model_guide.guidance_summary([name]),
+                            "details": model_guide.model_guidance_block(name, data_dir),
+                            "extra_info": {},
+                        }
+                    )
             return _comfy_error(
                 "prompt.missing_models",
                 model_guide.guidance_summary(names),
                 guidance,
+                node_errors,
             )
 
         resolved: dict[str, str] = {}

@@ -298,9 +298,92 @@ def test_prompt_rejects_when_no_registered_worker_has_the_model(client):
         "備份載點：https://storage.googleapis.com/comfyfed-models/models/diffusion_models/flux1-dev.safetensors"
         in details
     )
-    assert body["node_errors"] == {}
+    node_errors = body["node_errors"]
+    assert set(node_errors.keys()) == {"1"}
+    node_entry = node_errors["1"]
+    assert node_entry["class_type"] == "UNETLoader"
+    assert node_entry["dependent_outputs"] == []
+    assert len(node_entry["errors"]) == 1
+    err = node_entry["errors"][0]
+    assert err["type"] == "comfyfed.missing_model"
+    assert err["message"] == "缺少模型：flux1-dev.safetensors，無法執行——詳見下方下載指引"
+    assert "\n" not in err["message"]
+    assert err["extra_info"] == {}
+    assert (
+        "官方載點：https://huggingface.co/black-forest-labs/FLUX.1-dev/resolve/main/flux1-dev.safetensors"
+        in err["details"]
+    )
+    assert "備份載點：" in err["details"]
+    # per-node details is ONLY that model's own block -- not the shared
+    # header or any other missing model's block.
+    assert "無法執行：聯邦裡所有已註冊的 worker" not in err["details"]
+
     with db.get_session() as session:
         assert session.query(db.Job).count() == 0
+
+
+TWO_MODELS_ONE_NODE_PROMPT = {
+    "1": {
+        "class_type": "DualCLIPLoader",
+        "inputs": {"clip_name1": "clip_l.safetensors", "clip_name2": "t5xxl_fp16.safetensors"},
+    },
+    "2": {"class_type": "SaveText", "inputs": {}},
+}
+
+ONE_MODEL_TWO_NODES_PROMPT = {
+    "1": {"class_type": "CheckpointLoaderSimple", "inputs": {"ckpt_name": "flux1-dev.safetensors"}},
+    "2": {"class_type": "UNETLoader", "inputs": {"unet_name": "flux1-dev.safetensors"}},
+}
+
+
+def test_prompt_rejection_node_errors_one_model_referenced_by_two_nodes(client):
+    csrf = _login(client)
+    _register_worker(client, csrf, "runner-1")
+
+    r = _post_prompt(client, prompt=ONE_MODEL_TWO_NODES_PROMPT)
+    assert r.status_code == 400
+    node_errors = r.json()["node_errors"]
+
+    assert set(node_errors.keys()) == {"1", "2"}
+    assert node_errors["1"]["class_type"] == "CheckpointLoaderSimple"
+    assert node_errors["2"]["class_type"] == "UNETLoader"
+    for node_id in ("1", "2"):
+        entry = node_errors[node_id]
+        assert entry["dependent_outputs"] == []
+        assert len(entry["errors"]) == 1
+        assert entry["errors"][0]["message"] == (
+            "缺少模型：flux1-dev.safetensors，無法執行——詳見下方下載指引"
+        )
+
+
+def test_prompt_rejection_node_errors_two_models_referenced_by_one_node(client):
+    csrf = _login(client)
+    _register_worker(client, csrf, "runner-1")
+
+    r = _post_prompt(client, prompt=TWO_MODELS_ONE_NODE_PROMPT)
+    assert r.status_code == 400
+    node_errors = r.json()["node_errors"]
+
+    assert set(node_errors.keys()) == {"1"}
+    entry = node_errors["1"]
+    assert entry["class_type"] == "DualCLIPLoader"
+    assert entry["dependent_outputs"] == []
+    assert len(entry["errors"]) == 2
+    messages = {e["message"] for e in entry["errors"]}
+    assert messages == {
+        "缺少模型：clip_l.safetensors，無法執行——詳見下方下載指引",
+        "缺少模型：t5xxl_fp16.safetensors，無法執行——詳見下方下載指引",
+    }
+    details_by_message = {e["message"]: e["details"] for e in entry["errors"]}
+    assert "clip_l.safetensors" in details_by_message[
+        "缺少模型：clip_l.safetensors，無法執行——詳見下方下載指引"
+    ]
+    assert "t5xxl_fp16.safetensors" in details_by_message[
+        "缺少模型：t5xxl_fp16.safetensors，無法執行——詳見下方下載指引"
+    ]
+    for e in entry["errors"]:
+        assert e["type"] == "comfyfed.missing_model"
+        assert e["extra_info"] == {}
 
 
 def test_prompt_still_queues_when_no_workers_registered(client):
