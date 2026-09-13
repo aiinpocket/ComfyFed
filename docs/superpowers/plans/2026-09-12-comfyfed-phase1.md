@@ -1,6 +1,6 @@
 # ComfyFed Phase 1 Implementation Plan
 
-> **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
+> **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [x]`) syntax for tracking.
 
 **Goal:** 端到端可用的最小聯邦：安裝（隨機 admin 密碼、雙語導引）→ 登入 → 發識別碼 → Agent 註冊上線（Ed25519）→ 送 workflow → WS 派工 → Agent 呼叫本機 ComfyUI 執行 → 結果與收據回傳 → React 儀表板可視。
 
@@ -30,7 +30,7 @@
 **Interfaces:**
 - Produces: 可 `pip install -e .[dev]`、`pytest` 綠燈的空專案；套件名 `comfyfed_server`、`comfyfed_agent`
 
-- [ ] **Step 1: 寫 pyproject.toml**
+- [x] **Step 1: 寫 pyproject.toml**
 
 ```toml
 [project]
@@ -54,9 +54,9 @@ asyncio_mode = "auto"
 testpaths = ["tests"]
 ```
 
-- [ ] **Step 2: .gitignore（data/、__pycache__、node_modules、dist、*.db、.venv）＋兩個空套件 `__init__.py`＋README 一段話**
-- [ ] **Step 3: `py -3.12 -m venv .venv && .venv/Scripts/pip install -e .[dev]`，跑 `pytest`（0 tests, exit 0＝collected ok）**
-- [ ] **Step 4: Commit** `chore: scaffold comfyfed monorepo`
+- [x] **Step 2: .gitignore（data/、__pycache__、node_modules、dist、*.db、.venv）＋兩個空套件 `__init__.py`＋README 一段話**
+- [x] **Step 3: `py -3.12 -m venv .venv && .venv/Scripts/pip install -e .[dev]`，跑 `pytest`（0 tests, exit 0＝collected ok）**
+- [x] **Step 4: Commit** `chore: scaffold comfyfed monorepo`
 
 ### Task 2: DB 層（models + init）
 
@@ -73,7 +73,7 @@ testpaths = ["tests"]
   - `Receipt(id: str[PK=uuid], job_id, worker_id, gpu_seconds: float, platform_sig: str, worker_sig: str|None, created_at)`
   - `LoginAttempt(id: int[PK], at: datetime, ok: bool)`
 
-- [ ] **Step 1: 失敗測試**
+- [x] **Step 1: 失敗測試**
 
 ```python
 # tests/server/test_db.py
@@ -90,10 +90,10 @@ def test_worker_defaults(tmp_path):
         assert (w.status, w.disabled) == ("offline", False)
 ```
 
-- [ ] **Step 2: `pytest tests/server/test_db.py -v` → FAIL (no module)**
-- [ ] **Step 3: 實作 db.py＋Alembic**：SQLAlchemy 2 DeclarativeBase；module-level `_engine`；`init_db` 建引擎（`sqlite+pysqlite`、`PRAGMA journal_mode=WAL`）後**程式化執行 `alembic upgrade head`**（`alembic.config.Config` 指到 repo 內 `server/alembic/`；不用 create_all）；`alembic init` 產生環境＋手寫 initial migration（含所有表與預設值）；`get_session` 用 `sessionmaker`＋contextmanager。Worker 表另含 `backend: str=''`（cuda/rocm/mps/cpu）、`torch_version: str=''`、`node_classes: str='[]'`（JSON list）；Job 表含 `requirements: str='{}'`、`required_nodes: str='[]'`
-- [ ] **Step 4: pytest → PASS**
-- [ ] **Step 5: Commit** `feat(server): sqlite schema and session management`
+- [x] **Step 2: `pytest tests/server/test_db.py -v` → FAIL (no module)**
+- [x] **Step 3: 實作 db.py＋Alembic**：SQLAlchemy 2 DeclarativeBase；module-level `_engine`；`init_db` 建引擎（`sqlite+pysqlite`、`PRAGMA journal_mode=WAL`）後**程式化執行 `alembic upgrade head`**（`alembic.config.Config` 指到 repo 內 `server/alembic/`；不用 create_all）；`alembic init` 產生環境＋手寫 initial migration（含所有表與預設值）；`get_session` 用 `sessionmaker`＋contextmanager。Worker 表另含 `backend: str=''`（cuda/rocm/mps/cpu）、`torch_version: str=''`、`node_classes: str='[]'`（JSON list）；Job 表含 `requirements: str='{}'`、`required_nodes: str='[]'`
+- [x] **Step 4: pytest → PASS**
+- [x] **Step 5: Commit** `feat(server): sqlite schema and session management`
 
 ### Task 3: 安裝導引（bootstrap，雙語、隨機密碼、平台金鑰）
 
@@ -109,7 +109,7 @@ def test_worker_defaults(tmp_path):
   - `bootstrap.ensure_installed(data_dir, lang: str|None, url: str|None, interactive: bool) -> InstallResult(admin_password: str|None, first_run: bool)`——首跑：語言→platform_url→產隨機密碼（`secrets.token_urlsafe(12)`）→寫 settings（`admin_password_hash`、`platform_url`、`lang`）；非首跑回 `first_run=False`
   - `i18n.t(key, lang) -> str`：dict 字典，鍵含 `install.choose_lang / install.enter_url / install.admin_password_notice / ...`，zh-TW 與 en 都齊
 
-- [ ] **Step 1: 失敗測試**
+- [x] **Step 1: 失敗測試**
 
 ```python
 def test_first_run_generates_password(tmp_path):
@@ -130,10 +130,10 @@ def test_i18n_both_languages():
     assert i18n.t("install.admin_password_notice", "zh-TW") != i18n.t("install.admin_password_notice", "en")
 ```
 
-- [ ] **Step 2: pytest → FAIL**
-- [ ] **Step 3: 實作三個模組**（interactive=True 時用 input() 走雙語問答；金鑰用 `nacl.signing.SigningKey.generate()`，hex 存檔）
-- [ ] **Step 4: pytest → PASS**
-- [ ] **Step 5: Commit** `feat(server): bilingual install bootstrap with random admin password and platform keys`
+- [x] **Step 2: pytest → FAIL**
+- [x] **Step 3: 實作三個模組**（interactive=True 時用 input() 走雙語問答；金鑰用 `nacl.signing.SigningKey.generate()`，hex 存檔）
+- [x] **Step 4: pytest → PASS**
+- [x] **Step 5: Commit** `feat(server): bilingual install bootstrap with random admin password and platform keys`
 
 ### Task 4: Web 認證（session、登入退避、CSRF、改密碼）
 
@@ -149,9 +149,9 @@ def test_i18n_both_languages():
   - 依賴 `require_admin`（cookie 驗證失敗 401 `{"error":{"code":"auth.required"}}`）
   - 登入退避：連續失敗 n 次後需等 `2^(n-3)` 秒（查 LoginAttempt 最近 10 分鐘），太快回 429 `auth.too_many_attempts`
 
-- [ ] **Step 1: 失敗測試**（TestClient：錯密碼 401；對密碼 200 拿 cookie+csrf；me 200；無 csrf 改密碼 403；有 csrf 改密碼 200 且舊密碼失效；連錯 4 次第 5 次 429）
-- [ ] **Step 2: FAIL → Step 3: 實作 → Step 4: PASS**
-- [ ] **Step 5: Commit** `feat(server): session auth with backoff, csrf, password change`
+- [x] **Step 1: 失敗測試**（TestClient：錯密碼 401；對密碼 200 拿 cookie+csrf；me 200；無 csrf 改密碼 403；有 csrf 改密碼 200 且舊密碼失效；連錯 4 次第 5 次 429）
+- [x] **Step 2: FAIL → Step 3: 實作 → Step 4: PASS**
+- [x] **Step 5: Commit** `feat(server): session auth with backoff, csrf, password change`
 
 ### Task 5: Worker 憑證發放與註冊
 
@@ -168,9 +168,9 @@ def test_i18n_both_languages():
   - `POST /api/workers/{id}/disable`（admin, csrf）
   - token 重複使用 → 409 `register.token_used`
 
-- [ ] **Step 1: 失敗測試**（發 token→register 成功且回 certificate 可用平台 pubkey 驗簽；同 token 二次 register 409；list 出現該 worker）
-- [ ] **Step 2: FAIL → Step 3: 實作 → Step 4: PASS**
-- [ ] **Step 5: Commit** `feat(server): worker token issuance and ed25519 registration`
+- [x] **Step 1: 失敗測試**（發 token→register 成功且回 certificate 可用平台 pubkey 驗簽；同 token 二次 register 409；list 出現該 worker）
+- [x] **Step 2: FAIL → Step 3: 實作 → Step 4: PASS**
+- [x] **Step 5: Commit** `feat(server): worker token issuance and ed25519 registration`
 
 ### Task 6: Agent 端身分與註冊 client
 
@@ -184,9 +184,9 @@ def test_i18n_both_languages():
   - `config.AgentConfig.load(path) / .save()`：JSON `{platforms: [{platform_url, platform_pubkey, worker_id, certificate, signing_key_hex}], comfy_url: "http://127.0.0.1:8188", whitelist_extra: []}`
   - `identity.register(bundle: dict, name: str, cfg_path: str, client: httpx.Client) -> PlatformEntry`：自產 SigningKey→POST register→驗 certificate（用 bundle 的 platform_pubkey）→寫入 config
 
-- [ ] **Step 1: 失敗測試**（in-memory server；register 後 config 檔含 worker_id 與 signing_key；憑證驗簽通過；偽平台簽名→raises `CertificateInvalid`）
-- [ ] **Step 2: FAIL → Step 3: 實作 → Step 4: PASS**
-- [ ] **Step 5: Commit** `feat(agent): identity bundle registration with key pinning`
+- [x] **Step 1: 失敗測試**（in-memory server；register 後 config 檔含 worker_id 與 signing_key；憑證驗簽通過；偽平台簽名→raises `CertificateInvalid`）
+- [x] **Step 2: FAIL → Step 3: 實作 → Step 4: PASS**
+- [x] **Step 5: Commit** `feat(agent): identity bundle registration with key pinning`
 
 ### Task 7: 簽名請求層（agent 簽、server 驗、防重放）
 
@@ -200,9 +200,9 @@ def test_i18n_both_languages():
   - server：`verify_agent` dependency → 回 Worker；驗：worker 存在且未停用、|ts-now|≤120、nonce 未見過（in-memory TTL set）、簽名對其 pubkey 有效；失敗 401 `agent.bad_signature` / 409 `agent.replay`
   - 測試端點 `POST /api/agent/ping` → `{ok: true}`
 
-- [ ] **Step 1: 失敗測試**（正簽 200；改 body 401；重放同 nonce 409；ts 偏 300s 401；disabled worker 403）
-- [ ] **Step 2: FAIL → Step 3: 實作 → Step 4: PASS**
-- [ ] **Step 5: Commit** `feat: ed25519 signed agent requests with replay protection`
+- [x] **Step 1: 失敗測試**（正簽 200；改 body 401；重放同 nonce 409；ts 偏 300s 401；disabled worker 403）
+- [x] **Step 2: FAIL → Step 3: 實作 → Step 4: PASS**
+- [x] **Step 5: Commit** `feat: ed25519 signed agent requests with replay protection`
 
 ### Task 8: Job 佇列與派工核心（含斷線重派）
 
@@ -218,15 +218,15 @@ def test_i18n_both_languages():
     - `assess.extract(workflow: dict) -> JobNeeds(nodes: set, models: set, est_vram_gb: float|None, assets: set)`——assets=LoadImage/LoadImageMask 節點 inputs 的 `image` 字串值（**任務輸入素材，如角色形象參考圖**；與模型分開處理：模型走庫存判定，素材隨任務附檔）：nodes=各 node 的 class_type；models=掃描 inputs 中的模型欄位（欄位名 ∈ {ckpt_name, unet_name, clip_name, clip_name1, clip_name2, vae_name, lora_name, model_name, control_net_name, style_model_name, upscale_model_name}，值為 str 且以 .safetensors/.ckpt/.pt/.sft/.gguf 結尾）；est_vram_gb=max(引用模型大小，查各 worker 回報庫存取最大已知值)×1.15（取最大單一模型而非加總：ComfyUI 順序載入/卸載，峰值由最大模型主導），查無任何大小→None（不做 VRAM 判定）
     - `assess.verdict(worker, needs, requirements_override: dict) -> Verdict(kind: "eligible"|"eligible_after_fetch"|"ineligible", reasons: list[str], missing_models: list[str], warnings: list[str])`：缺節點/backend 不符/**est_vram > vram_gb ＋ ram_gb**/override 不符→ineligible（reasons 用穩定 code 如 `missing_nodes:IPAdapter`、`vram:40.0>8+16`）；**vram_gb < est_vram ≤ vram_gb＋ram_gb → 仍 eligible，附非阻斷 warning `vram_offload:25.49>15.9`**（ComfyUI 把權重卸載到系統 RAM 串流執行，慢但跑得動──2026-09-12 實機驗證：15.9GB 顯卡跑得動 22.17GB 的 flux1-dev；ram_gb 取 hardware.ram_gb，缺則退 dynamic.free_ram_gb，都沒有就不判硬缺口）；僅缺模型且聯邦內其他 worker 庫存有＋free_disk 夠→eligible_after_fetch；全過→eligible
   - Job 表欄位改：`required_nodes: str='[]'`, `required_models: str='[]'`, `est_vram_gb: float|None`, `requirements: str='{}'`（=進階覆寫，預設空）
-  - `dispatch.pick_job_for` 只派 verdict=eligible（Phase 1；eligible_after_fetch 標記於 job 供 UI 顯示「僅缺模型，待模型分發開通」）。**帶 warning 的 eligible 照派**──warning 只說明「會怎麼跑」，不是拒絕理由；Phase 1 不因 warning 調整派工優先序。
+  - `dispatch.pick_job_for` 只派 verdict=eligible（Phase 1；eligible_after_fetch 標記於 job 供 UI 顯示「僅缺模型，待模型分發開通」）。**帶 warning 的 eligible 照派**──warning 只說明「會怎麼跑」，不是拒絕理由；Phase 1 不因 warning 調整派工優先序（superseded — shipped in Phase 1.7: dispatch ranking now puts clean-eligible ahead of vram_offload-warned）。
   - `GET /api/jobs/{id}/assessment`（admin）→ 每個 worker 的三態判定＋原因＋**warnings**（前端翻譯 reason codes；warnings 以黃字/淡色附註呈現，不是錯誤）
   - `dispatch.pick_job_for(worker_id) -> Job|None`：原子性把「最舊且 worker_meets 通過」的 queued job 改 assigned＋綁 worker（跳過不符合的，不阻塞後面的 job）
   - `dispatch.requeue_stale(now) -> list[str]`（回傳被退回的 job id，`len()` 即舊的計數）：worker last_seen 距今 >90s 的 assigned/running job → queued、worker_id=None、progress=0；worker.status='offline'
   - `dispatch.mark_running/mark_done(job_id, result_files)/mark_failed(job_id, error)`
 
-- [ ] **Step 1: 失敗測試**（submit→queued；pick 原子（兩次 pick 不同 job 或第二次 None）；requeue_stale 把 91s 未心跳 worker 的 running job 退回 queued 並可被另一 worker pick——**這是使用者明確要求的斷線重派**）
-- [ ] **Step 2: FAIL → Step 3: 實作 → Step 4: PASS**
-- [ ] **Step 5: Commit** `feat(server): job queue with atomic dispatch and stale-worker requeue`
+- [x] **Step 1: 失敗測試**（submit→queued；pick 原子（兩次 pick 不同 job 或第二次 None）；requeue_stale 把 91s 未心跳 worker 的 running job 退回 queued 並可被另一 worker pick——**這是使用者明確要求的斷線重派**）
+- [x] **Step 2: FAIL → Step 3: 實作 → Step 4: PASS**
+- [x] **Step 5: Commit** `feat(server): job queue with atomic dispatch and stale-worker requeue`
 
 ### Task 9: Agent WS 通道（心跳、派工推送、進度回報）
 
@@ -242,9 +242,9 @@ def test_i18n_both_languages():
   - agent→server：`{"type":"inventory","models":[{"name":"diffusion_models/x.safetensors","size":123}]}`——上線後與每 10 分鐘掃描 ComfyUI models 目錄（相對路徑＋bytes）；server 存 `Worker.model_inventory: str='[]'`（Task 2 Worker 表加此欄）——評估引擎與未來 P2P tracker 的資料源；`{"type":"job_done","job_id","result_files":[names]}`；`{"type":"job_failed","job_id","error"}`
   - server→agent：`{"type":"job","job_id","workflow_json","input_assets":[filenames]}`（僅對 state=idle 者推）
   - server 背景迴圈每 5s：`requeue_stale()`＋為每個 idle 連線 `pick_job_for` 並推送
-- [ ] **Step 1: 失敗測試**（TestClient websocket：未簽名關閉 4401；簽名握手 ready；送 heartbeat 後 DB last_seen 更新且 status=online；enqueue job 後 idle 連線收到 job 訊息；回 job_done 後 job status=done）
-- [ ] **Step 2: FAIL → Step 3: 實作 → Step 4: PASS**
-- [ ] **Step 5: Commit** `feat(server): authenticated agent websocket with heartbeat and push dispatch`
+- [x] **Step 1: 失敗測試**（TestClient websocket：未簽名關閉 4401；簽名握手 ready；送 heartbeat 後 DB last_seen 更新且 status=online；enqueue job 後 idle 連線收到 job 訊息；回 job_done 後 job status=done）
+- [x] **Step 2: FAIL → Step 3: 實作 → Step 4: PASS**
+- [x] **Step 5: Commit** `feat(server): authenticated agent websocket with heartbeat and push dispatch`
 
 ### Task 10: 結果上傳與收據
 
@@ -258,9 +258,9 @@ def test_i18n_both_languages():
   - `POST /api/agent/jobs/{id}/artifacts`（signed, multipart）→ `ArtifactStore.put`；限已 assigned 給該 worker 的 job
   - job_done 處理時：計 `gpu_seconds = finished-started`，建 Receipt＋`platform_sig = sign(f"{job_id}|{worker_id}|{gpu_seconds:.1f}")`；WS 推 `{"type":"receipt","receipt_id","payload","platform_sig"}` 給 agent；agent 回 `{"type":"receipt_ack","receipt_id","worker_sig"}` → 存入 Receipt.worker_sig
   - `GET /api/reports/contributions?from=&to=`（admin）→ 按 worker 彙總 `{worker_id, name, jobs, gpu_seconds}`（時間區間篩選——使用者要求）
-- [ ] **Step 1: 失敗測試**（artifact 上傳落地；receipt 兩簽俱全且平台簽可驗；report 區間過濾正確）
-- [ ] **Step 2: FAIL → Step 3: 實作 → Step 4: PASS**
-- [ ] **Step 5: Commit** `feat(server): artifacts upload and dual-signed receipts with contribution report`
+- [x] **Step 1: 失敗測試**（artifact 上傳落地；receipt 兩簽俱全且平台簽可驗；report 區間過濾正確）
+- [x] **Step 2: FAIL → Step 3: 實作 → Step 4: PASS**
+- [x] **Step 5: Commit** `feat(server): artifacts upload and dual-signed receipts with contribution report`
 
 ### Task 11: Agent 執行器（ComfyUI client、白名單、多平台 busy 廣播）
 
@@ -276,9 +276,9 @@ def test_i18n_both_languages():
   - `comfy.upload_input(comfy_url, filename, content: bytes) -> None`：POST ComfyUI `/upload/image`（multipart，overwrite=true）——把任務附帶的輸入素材（參考圖等）放進本機 ComfyUI input 目錄
   - `runner.AgentLoop(config)`：對每個 platform 開 WS；收 job（訊息含 `input_assets` 清單）→全平台廣播 busy→白名單→**逐一下載 input assets（signed GET `/api/agent/jobs/{id}/inputs/{f}`）→ upload_input 到本機 ComfyUI**→run_workflow（進度回 WS）→上傳 artifacts→job_done→收 receipt→ack→廣播 idle；單一併發（一次一 job）
   - `cli()`：`comfyfed-agent register <bundle.json>`、`comfyfed-agent run`
-- [ ] **Step 1: 失敗測試**（白名單擋未知節點；mock comfy 跑通回檔案；AgentLoop 對兩個 mock 平台：A 派工時 B 收到 busy 心跳）
-- [ ] **Step 2: FAIL → Step 3: 實作 → Step 4: PASS**
-- [ ] **Step 5: Commit** `feat(agent): job runner with node whitelist and multi-platform busy broadcast`
+- [x] **Step 1: 失敗測試**（白名單擋未知節點；mock comfy 跑通回檔案；AgentLoop 對兩個 mock 平台：A 派工時 B 收到 busy 心跳）
+- [x] **Step 2: FAIL → Step 3: 實作 → Step 4: PASS**
+- [x] **Step 5: Commit** `feat(agent): job runner with node whitelist and multi-platform busy broadcast`
 
 ### Task 12: React SPA（雙語、登入、儀表板、任務、worker 管理、設定）
 
@@ -295,10 +295,10 @@ def test_i18n_both_languages():
   - Workers：新增（輸入名稱→顯示 bundle JSON＋下載按鈕）、停用
   - Reports：日期區間選擇→貢獻表
   - Settings：改密碼、platform_url、預設語言
-- [ ] **Step 1: scaffold（`npm create vite@latest web -- --template react-ts`；裝 mantine、react-i18next）＋i18n key 一致性 vitest（先寫測試、跑 FAIL、補齊字典、PASS）**
-- [ ] **Step 2: 實作 api.ts 與六頁（Mantine AppShell；所有文案走 t()）**
-- [ ] **Step 3: `npm run build` 成功；vitest PASS**
-- [ ] **Step 4: Commit** `feat(web): bilingual react console (login, dashboard, jobs, workers, reports, settings)`
+- [x] **Step 1: scaffold（`npm create vite@latest web -- --template react-ts`；裝 mantine、react-i18next）＋i18n key 一致性 vitest（先寫測試、跑 FAIL、補齊字典、PASS）**
+- [x] **Step 2: 實作 api.ts 與六頁（Mantine AppShell；所有文案走 t()）**
+- [x] **Step 3: `npm run build` 成功；vitest PASS**
+- [x] **Step 4: Commit** `feat(web): bilingual react console (login, dashboard, jobs, workers, reports, settings)`
 
 ### Task 13: 整線：static serve、CLI、端到端煙霧測試
 
@@ -310,9 +310,9 @@ def test_i18n_both_languages():
 - Consumes: 全部
 - Produces: 一條命令可跑的平台＋一條命令可跑的 agent
 
-- [ ] **Step 1: e2e 失敗測試**（單製程內：create_app＋mock ComfyUI＋真 AgentLoop（thread）：admin 登入→發 token→agent register→WS 上線→submit job→джob done→artifact 存在→receipt 雙簽→report 有數字）
-- [ ] **Step 2: FAIL → Step 3: 實作 cli 與 mount → Step 4: PASS＋手動 `comfyfed-server install` 走一遍雙語導引截圖留檔**
-- [ ] **Step 5: Commit** `feat: cli entrypoints, spa serving, end-to-end smoke test`
+- [x] **Step 1: e2e 失敗測試**（單製程內：create_app＋mock ComfyUI＋真 AgentLoop（thread）：admin 登入→發 token→agent register→WS 上線→submit job→джob done→artifact 存在→receipt 雙簽→report 有數字）
+- [x] **Step 2: FAIL → Step 3: 實作 cli 與 mount → Step 4: PASS＋手動 `comfyfed-server install` 走一遍雙語導引截圖留檔**
+- [x] **Step 5: Commit** `feat: cli entrypoints, spa serving, end-to-end smoke test`
 
 ### Task 14: Prometheus /metrics 端點
 
@@ -326,9 +326,9 @@ def test_i18n_both_languages():
   - `comfyfed_worker_up{worker}`、`comfyfed_worker_free_vram_gb{worker}`、`comfyfed_worker_free_ram_gb{worker}`、`comfyfed_worker_free_disk_gb{worker}`（心跳時 set）
   - `comfyfed_jobs_queued`（gauge，抓取時查 DB）、`comfyfed_job_wait_seconds`／`comfyfed_job_run_seconds`（histogram，job 開跑/完成時 observe）、`comfyfed_ws_reconnects_total{worker}`（counter）
 
-- [ ] **Step 1: 失敗測試**（TestClient GET /metrics 含 `comfyfed_jobs_queued`；心跳後 worker gauge 出現；job 完成後 histogram count ≥1）
-- [ ] **Step 2: FAIL → Step 3: 實作（prometheus-client registry；custom collector 查 queued 數）→ Step 4: PASS**
-- [ ] **Step 5: Commit** `feat(server): prometheus metrics endpoint`
+- [x] **Step 1: 失敗測試**（TestClient GET /metrics 含 `comfyfed_jobs_queued`；心跳後 worker gauge 出現；job 完成後 histogram count ≥1）
+- [x] **Step 2: FAIL → Step 3: 實作（prometheus-client registry；custom collector 查 queued 數）→ Step 4: PASS**
+- [x] **Step 5: Commit** `feat(server): prometheus metrics endpoint`
 
 ### Task 15: Agent 版本檢查與簽章自動更新
 
@@ -340,18 +340,18 @@ def test_i18n_both_languages():
 - Produces:
   - server：`GET /api/agent/version` → `{latest: "0.1.0", min_supported: "0.1.0", wheel_url: str|None, sha256: str|None, platform_sig: str|None}`（值來自 settings，admin 可在 Settings 頁維護；wheel 檔放 `data/releases/` 由平台 serve）
   - agent：`update.check(entry, current: str) -> UpdateDecision(action: "ok"|"update"|"blocked")`；current < min_supported → blocked（雙語訊息退出）；有新版且 config `auto_update: true`（預設）→ 下載 wheel → 驗 SHA256 → 驗 `platform_sig`（平台公鑰對 sha256 簽名）→ `pip install --no-deps <wheel>` → `os.execv` 自我重啟；驗證失敗→不安裝、警告、照舊版續跑
-- [ ] **Step 1: 失敗測試**（版本比對三態；壞簽章拒裝；mock wheel 流程走到 pip 呼叫（monkeypatch subprocess））
-- [ ] **Step 2: FAIL → Step 3: 實作 → Step 4: PASS**
-- [ ] **Step 5: Commit** `feat(agent): signed self-update with min-supported version gate`
+- [x] **Step 1: 失敗測試**（版本比對三態；壞簽章拒裝；mock wheel 流程走到 pip 呼叫（monkeypatch subprocess））
+- [x] **Step 2: FAIL → Step 3: 實作 → Step 4: PASS**
+- [x] **Step 5: Commit** `feat(agent): signed self-update with min-supported version gate`
 
 ### Task 16: 文件
 
 **Files:**
 - Modify: `README.md`（雙語：安裝平台、開 DDNS/固定 IP 注意事項＋反向代理 TLS 範例（Caddyfile 兩行）、新增 worker 流程、安全模型摘要、白名單說明）
-- [ ] **Step 1: 撰寫 → Step 2: Commit** `docs: bilingual setup guide`
+- [x] **Step 1: 撰寫 → Step 2: Commit** `docs: bilingual setup guide`
 
 ## Self-Review 紀錄
 
-- 規格覆蓋：安裝隨機密碼（T3/T13）、雙語 CLI＋UI（T3/T12/T13）、SQLite＋Alembic 遷移（T2）、DDNS/固定 IP=platform_url 設定＋文件（T3/T12/T16）、簽名協議＋防重放（T5-T7,T9）、斷線重派（T8/T9）、busy 廣播（T11）、收據與區間報表（T10/T12）、node policy＋節點交集派工＋backend 比對（T2/T8/T9/T11）、/metrics（T14）、ArtifactStore 抽象（T10）、agent 簽章自動更新（T15）。Phase 2 項目（模型 manifest、Comfy 面板、P2P、S3 presigned 實作）依規格明確排除。
+- 規格覆蓋：安裝隨機密碼（T3/T13）、雙語 CLI＋UI（T3/T12/T13）、SQLite＋Alembic 遷移（T2）、DDNS/固定 IP=platform_url 設定＋文件（T3/T12/T16）、簽名協議＋防重放（T5-T7,T9）、斷線重派（T8/T9）、busy 廣播（T11）、收據與區間報表（T10/T12）、node policy＋節點交集派工＋backend 比對（T2/T8/T9/T11）、/metrics（T14）、ArtifactStore 抽象（T10）、agent 簽章自動更新（T15）。Phase 2 項目（模型 manifest、Comfy 面板、P2P、S3 presigned 實作）依規格明確排除（superseded — Comfy 面板 shipped in Phase 1.5; 其餘仍 Phase 2/3 未做）。
 - 型別一致性：`verify_agent`、`pick_job_for`、`requeue_stale`、bundle/certificate 欄位在 T5/T6/T7/T9 均沿用同名。
 - 無占位符：各任務含測試碼或明確斷言清單與實作要點。

@@ -1,6 +1,6 @@
 # Phase 1.7: Job Lifecycle & Dispatch Strategy Implementation Plan
 
-> **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
+> **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [x]`) syntax for tracking.
 
 **Goal:** Zombie-run elimination and real cancellation: a worker whose job was requeued learns within one heartbeat and aborts (interrupt + cleanup) instead of finishing uselessly; a worker that merely blipped offline and comes back with the finished result gets it accepted (re-adoption); humans can cancel jobs from the console AND the embedded panel's native controls; dispatch picks the best eligible worker instead of first-come.
 
@@ -36,13 +36,13 @@
 - Artifact upload (`workers.py` or wherever `POST /api/agent/jobs/{id}/artifacts` ownership-gates): accept uploads when `try_readopt` would succeed — concretely, allow when `job.worker_id == worker_id` OR (`status == "queued"` AND `last_worker_id == worker_id`); do NOT flip ownership from the upload path itself (read-only check), the job_done message does the adoption. Find the actual gate with grep and adapt minimally.
 
 Steps (TDD; run the suite after each green):
-- [ ] **Step 1: Failing tests — migration + model.** `last_worker_id` column exists, nullable, default None; alembic upgrade head from a pre-existing DB works (there are existing migration tests to copy the harness from — grep `alembic` in tests/server).
-- [ ] **Step 2: Failing tests — requeue_stale records last_worker_id** for each requeued job, and clears worker_id as today.
-- [ ] **Step 3: Failing tests — cancel_job**: queued→cancelled (returns None), assigned/running→cancelled (returns worker id, error=reason, finished_at set); done/failed/cancelled/unknown → None and unchanged; no receipt row created.
-- [ ] **Step 4: Failing tests — try_readopt**: queued+matching last_worker_id → assigned to that worker, True; queued+different last_worker → False unchanged; assigned-to-other → False; terminal → False.
-- [ ] **Step 5: Failing tests — agentws pushes**: (a) busy heartbeat carrying a job_id owned by another worker → connection receives `job_cancelled` exactly once even across repeated heartbeats (dedup), and the WARNING log still fires; (b) `job_done` for a job requeued from this same worker (status queued, last_worker_id=this) → re-adopted: job ends `done`, receipt created, panel notified, NO job_cancelled sent; (c) `job_done` for a job now running on worker B → rejected, A receives job_cancelled, B's job untouched; (d) artifact upload in the blip window (queued + last_worker_id match) → 200 accepted.
-- [ ] **Step 6: Implement** (migration first, then dispatch, then agentws), matching existing module conventions (docstring style, log-level split WARNING/DEBUG rationale in `_owned_job` — extend it, don't fork it).
-- [ ] **Step 7: Full suite; commit** `feat(server): cancelled status, job_cancelled push, blip re-adoption (migration 5)`.
+- [x] **Step 1: Failing tests — migration + model.** `last_worker_id` column exists, nullable, default None; alembic upgrade head from a pre-existing DB works (there are existing migration tests to copy the harness from — grep `alembic` in tests/server).
+- [x] **Step 2: Failing tests — requeue_stale records last_worker_id** for each requeued job, and clears worker_id as today.
+- [x] **Step 3: Failing tests — cancel_job**: queued→cancelled (returns None), assigned/running→cancelled (returns worker id, error=reason, finished_at set); done/failed/cancelled/unknown → None and unchanged; no receipt row created.
+- [x] **Step 4: Failing tests — try_readopt**: queued+matching last_worker_id → assigned to that worker, True; queued+different last_worker → False unchanged; assigned-to-other → False; terminal → False.
+- [x] **Step 5: Failing tests — agentws pushes**: (a) busy heartbeat carrying a job_id owned by another worker → connection receives `job_cancelled` exactly once even across repeated heartbeats (dedup), and the WARNING log still fires; (b) `job_done` for a job requeued from this same worker (status queued, last_worker_id=this) → re-adopted: job ends `done`, receipt created, panel notified, NO job_cancelled sent; (c) `job_done` for a job now running on worker B → rejected, A receives job_cancelled, B's job untouched; (d) artifact upload in the blip window (queued + last_worker_id match) → 200 accepted.
+- [x] **Step 6: Implement** (migration first, then dispatch, then agentws), matching existing module conventions (docstring style, log-level split WARNING/DEBUG rationale in `_owned_job` — extend it, don't fork it).
+- [x] **Step 7: Full suite; commit** `feat(server): cancelled status, job_cancelled push, blip re-adoption (migration 5)`.
 
 ### Task 2: Cancel entry points — admin API, panel /interrupt + /queue delete, console button
 
@@ -55,11 +55,11 @@ Steps (TDD; run the suite after each green):
 - Consumes: `dispatch.cancel_job` + agentws send from Task 1. Produces: `POST /api/jobs/{id}/cancel` (admin session; 200 `{"status":"cancelled"}`, 404 unknown, 409 if already terminal with the terminal status in the body); comfyapi `POST /interrupt` cancels the currently-executing panel job (the one panelws tracks as executing; 200 always, matching upstream's fire-and-forget contract); comfyapi `POST /queue` with body `{"delete": [prompt_ids]}` cancels those queued/assigned jobs (upstream contract: also `{"clear": true}` empties the queue — support both); each cancellation of an owned assigned/running job pushes `job_cancelled` to the owning agent connection and emits the panel event.
 - Console: jobs table row action 取消 (only for queued/assigned/running), optimistic refresh, `cancelled` rendered as its own status chip (zh-TW 已取消 / en Cancelled).
 
-- [ ] **Step 1: Failing server tests** for the three entry points incl. WS push to owner and panel event; `{"clear": true}` cancels every non-terminal panel-submitted job.
-- [ ] **Step 2: Implement server side.**
-- [ ] **Step 3: Failing vitest** for the cancel button rendering/click wiring (mock fetch), status chip.
-- [ ] **Step 4: Implement console; `npx vitest run` green; also `npm run build` must succeed** (the live install serves `web/dist`).
-- [ ] **Step 5: Full suites; commit** `feat: job cancellation via console and native panel controls`.
+- [x] **Step 1: Failing server tests** for the three entry points incl. WS push to owner and panel event; `{"clear": true}` cancels every non-terminal panel-submitted job.
+- [x] **Step 2: Implement server side.**
+- [x] **Step 3: Failing vitest** for the cancel button rendering/click wiring (mock fetch), status chip.
+- [x] **Step 4: Implement console; `npx vitest run` green; also `npm run build` must succeed** (the live install serves `web/dist`).
+- [x] **Step 5: Full suites; commit** `feat: job cancellation via console and native panel controls`.
 
 ### Task 3: Agent — concurrent job task + cancellation handling
 
@@ -72,8 +72,8 @@ Steps (TDD; run the suite after each green):
 - New message branch: `job_cancelled` → if it names the current job: set a per-job `asyncio.Event` (checked by the run loop) AND call `comfy.interrupt_or_dequeue(prompt_id)` (`POST /interrupt` when this prompt is ComfyUI's `queue_running` head, else `POST /queue {"delete": [prompt_id]}`); the running `handle_job` task then winds down WITHOUT sending job_done/job_failed for the cancelled job, runs `cleanup_job_files` for whatever inputs were staged and outputs already produced (cancel cleanup must not require `success=True` — refactor the flag into an explicit mode), and returns the agent to idle (broadcast idle heartbeat as today). If it names a non-current job: log at DEBUG, ignore.
 - `comfy.run_workflow` gains cooperative cancellation: its polling loop checks the cancel event each iteration and raises a dedicated `JobCancelled` exception that `handle_job` catches (no job_failed message for it).
 
-- [ ] **Step 1: Failing tests**: (a) receive loop stays responsive during a running job (send `job_cancelled` mid-run against a fake slow ComfyUI; assert interrupt called, no job_done/job_failed sent, cleanup ran, agent broadcasts idle); (b) cancel for a *queued-locally* prompt uses /queue delete not /interrupt; (c) cancel for unknown job id is ignored quietly; (d) normal completion path unchanged (job_done still sent, cleanup on success still happens); (e) receipt message arriving mid-run is still processed (proves the loop is truly concurrent).
-- [ ] **Step 2: Implement. Step 3: Full suite; commit** `feat(agent): concurrent job execution with server-driven cancellation`.
+- [x] **Step 1: Failing tests**: (a) receive loop stays responsive during a running job (send `job_cancelled` mid-run against a fake slow ComfyUI; assert interrupt called, no job_done/job_failed sent, cleanup ran, agent broadcasts idle); (b) cancel for a *queued-locally* prompt uses /queue delete not /interrupt; (c) cancel for unknown job id is ignored quietly; (d) normal completion path unchanged (job_done still sent, cleanup on success still happens); (e) receipt message arriving mid-run is still processed (proves the loop is truly concurrent).
+- [x] **Step 2: Implement. Step 3: Full suite; commit** `feat(agent): concurrent job execution with server-driven cancellation`.
 
 ### Task 4: Dispatch ranking — best worker per job
 
@@ -85,8 +85,8 @@ Steps (TDD; run the suite after each green):
 - New: `dispatch.assign_jobs(idle_worker_ids: list[str]) -> list[tuple[str, db.Job]]` — for each queued job oldest-first, evaluate every still-unassigned idle worker's verdict and pick the best: (1) eligible with no warnings beats eligible-with-warnings (vram_offload), (2) tie-break by largest free VRAM (from the worker's dynamic/hardware snapshot — reuse whatever `assess.verdict` reads), (3) stable tie-break by worker name for determinism. Atomic claim per pair exactly as `pick_job_for` does today (keep the rowcount guard). Each worker gets at most one job per tick. `pick_job_for` stays for any other callers (grep; if none besides dispatch_tick, fold it in and delete).
 - `dispatch_tick` calls `assign_jobs` once with all idle connection ids, then pushes each (worker, job) pair on its connection.
 
-- [ ] **Step 1: Failing tests**: two idle workers (one clean-eligible, one vram_offload-warned) + one job → clean one gets it; two clean workers with different free VRAM → larger wins; two jobs oldest-first across two workers → both assigned in one tick; claim race (job already taken) skips gracefully.
-- [ ] **Step 2: Implement. Step 3: Full suite; commit** `feat(server): rank eligible workers when dispatching (clean > warned, then free VRAM)`.
+- [x] **Step 1: Failing tests**: two idle workers (one clean-eligible, one vram_offload-warned) + one job → clean one gets it; two clean workers with different free VRAM → larger wins; two jobs oldest-first across two workers → both assigned in one tick; claim race (job already taken) skips gracefully.
+- [x] **Step 2: Implement. Step 3: Full suite; commit** `feat(server): rank eligible workers when dispatching (clean > warned, then free VRAM)`.
 
 ### Task 5 (controller-executed): Live verification
 
