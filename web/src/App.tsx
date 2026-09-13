@@ -12,9 +12,10 @@ import { Jobs } from './pages/Jobs';
 import { Login } from './pages/Login';
 import { Reports } from './pages/Reports';
 import { Settings } from './pages/Settings';
+import { Setup } from './pages/Setup';
 import { Workers } from './pages/Workers';
 
-type AuthState = 'checking' | 'authenticated' | 'anonymous';
+type AuthState = 'checking' | 'authenticated' | 'anonymous' | 'setup_needed';
 
 export function App() {
   const { t } = useTranslation();
@@ -32,9 +33,32 @@ export function App() {
     }
   }, []);
 
-  useEffect(() => {
-    void refreshSession();
+  // Cloud-only first-run gate (see api.ts's `setupStatus` docstring): the
+  // Python server has no `/api/setup/*` routes at all, so any failure here
+  // (network error, 404) is silently treated as "setup not needed" and we
+  // fall straight through to the normal session check.
+  const bootstrap = useCallback(async () => {
+    try {
+      const status = await api.setupStatus();
+      if (status.needed) {
+        setAuth('setup_needed');
+        return;
+      }
+    } catch {
+      /* Python server, or a transient network error -- proceed as normal. */
+    }
+    await refreshSession();
   }, [refreshSession]);
+
+  useEffect(() => {
+    void bootstrap();
+  }, [bootstrap]);
+
+  const handleSetupComplete = useCallback(() => {
+    // POST /api/setup does not log the caller in -- flow into the normal
+    // login form (see Setup.tsx's `onSetupComplete` docstring).
+    setAuth('anonymous');
+  }, []);
 
   // Any 401 from anywhere in the app drops us back to the login screen.
   useEffect(() => {
@@ -63,6 +87,10 @@ export function App() {
         </Stack>
       </Center>
     );
+  }
+
+  if (auth === 'setup_needed') {
+    return <Setup onSetupComplete={handleSetupComplete} />;
   }
 
   if (auth === 'anonymous') {

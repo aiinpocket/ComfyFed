@@ -1,0 +1,5 @@
+{
+  "id": "comfyfed-asset-fixture",
+  "note": "Test-only fixture for the ASSETS-served packaged-template path (see test/gate.spec.ts and test/templates.spec.ts's \"ASSETS-served packaged path\" describe block). Deliberately named so it never collides with any real ComfyFed template name or with the R2-seeded fixture names the rest of templates.spec.ts uses.",
+  "nodes": []
+}

@@ -119,6 +119,10 @@ function postForm<T>(path: string, form: FormData): Promise<T> {
 
 /* ------------------------------------------------------------------ types */
 
+export interface SetupStatus {
+  needed: boolean;
+}
+
 export interface MeResponse {
   authenticated: boolean;
   lang: string;
@@ -254,6 +258,23 @@ export interface SettingsState {
 /* -------------------------------------------------------------- endpoints */
 
 export const api = {
+  /**
+   * GET /api/setup/status. Cloud-only (see routes/auth.ts's `/api/setup/*`
+   * docstring) -- the Python server has no such route at all, so callers
+   * must treat any error here (network failure, 404) as "setup not
+   * needed" rather than surfacing it.
+   */
+  setupStatus(): Promise<SetupStatus> {
+    return getJson<SetupStatus>('/api/setup/status');
+  },
+
+  /** POST /api/setup. Does not log the caller in -- flow into the normal
+   * login form afterwards (see the route's docstring: a stateless Workers
+   * deployment has no session to hand back here). */
+  setup(token: string, password: string): Promise<{ ok: boolean }> {
+    return postJson('/api/setup', { token, password });
+  },
+
   async login(password: string): Promise<void> {
     const result = await request<{ csrf: string }>(
       'POST',
