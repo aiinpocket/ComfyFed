@@ -4,6 +4,9 @@ import { env, createExecutionContext, waitOnExecutionContext } from "cloudflare:
 export interface CallOptions {
   method?: string;
   json?: unknown;
+  /** Raw body bytes, for routes that read a non-JSON body (signed agent
+   * requests, gzip object_info uploads). Mutually exclusive with `json`. */
+  rawBody?: Uint8Array;
   headers?: Record<string, string>;
   cookie?: string | null;
 }
@@ -22,19 +25,21 @@ export interface CallResult {
  * cycle against the Worker's fetch handler. */
 export async function call(path: string, opts: CallOptions = {}): Promise<CallResult> {
   const headers: Record<string, string> = { ...(opts.headers ?? {}) };
-  let body: string | undefined;
+  let body: string | Uint8Array | undefined;
   if (opts.json !== undefined) {
     headers["Content-Type"] = "application/json";
     body = JSON.stringify(opts.json);
+  } else if (opts.rawBody !== undefined) {
+    body = opts.rawBody;
   }
   if (opts.cookie) {
     headers["Cookie"] = opts.cookie;
   }
 
   const request = new Request(`http://example.com${path}`, {
-    method: opts.method ?? (opts.json !== undefined ? "POST" : "GET"),
+    method: opts.method ?? (body !== undefined ? "POST" : "GET"),
     headers,
-    body,
+    body: body as BodyInit | undefined,
   });
   const ctx = createExecutionContext();
   const response = await worker.fetch(request, env as any, ctx);

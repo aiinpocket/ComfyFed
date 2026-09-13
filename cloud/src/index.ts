@@ -2,6 +2,7 @@ import { Hono } from "hono";
 import type { Env } from "./env";
 import authRoutes from "./routes/auth";
 import settingsRoutes from "./routes/settings";
+import workersRoutes from "./routes/workers";
 
 export { Hub } from "./do/hub";
 export type { Env };
@@ -51,5 +52,6 @@ app.get("/api/ping", (c) => c.json({ ok: true, mode: "cloud" }));
 
 app.route("/", authRoutes);
 app.route("/", settingsRoutes);
+app.route("/", workersRoutes);
 
 export default app;

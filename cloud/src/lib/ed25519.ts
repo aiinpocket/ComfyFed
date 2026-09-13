@@ -23,20 +23,44 @@
  */
 
 import { hexToBytes, bytesToHex } from "./hex";
+import { base64UrlToBytes } from "./base64";
 
 const PKCS8_ED25519_SEED_PREFIX_HEX = "302e020100300506032b657004220420";
 
-export async function importPrivateKeyFromSeedHex(seedHex: string): Promise<CryptoKey> {
+function seedToPkcs8(seedHex: string): Uint8Array {
   const seed = hexToBytes(seedHex);
   if (seed.length !== 32) {
-    throw new Error(`importPrivateKeyFromSeedHex: seed must be 32 bytes, got ${seed.length}`);
+    throw new Error(`seedToPkcs8: seed must be 32 bytes, got ${seed.length}`);
   }
   const prefix = hexToBytes(PKCS8_ED25519_SEED_PREFIX_HEX);
   const pkcs8 = new Uint8Array(prefix.length + seed.length);
   pkcs8.set(prefix, 0);
   pkcs8.set(seed, prefix.length);
+  return pkcs8;
+}
 
-  return crypto.subtle.importKey("pkcs8", pkcs8, { name: "Ed25519" }, false, ["sign"]);
+export async function importPrivateKeyFromSeedHex(seedHex: string): Promise<CryptoKey> {
+  return crypto.subtle.importKey("pkcs8", seedToPkcs8(seedHex), { name: "Ed25519" }, false, ["sign"]);
+}
+
+/** Derive the hex public key that corresponds to a raw 32-byte Ed25519 seed
+ * -- the WebCrypto equivalent of PyNaCl's `SigningKey(seed).verify_key`.
+ * WebCrypto has no direct "public key from private key" API, but exporting
+ * an *extractable* Ed25519 private key as JWK includes the public component
+ * under `x` (base64url, unpadded) alongside the private `d` -- this imports
+ * the seed as extractable-only-for-export (never for signing) purely to
+ * read that field back out. Used by the platform key: workers.py persists
+ * `platform.key` (the seed) and derives `verify_key` from it on every read
+ * (see `security.load_platform_keys`); the cloud equivalent persists the
+ * same seed in `settings.platform_seed` (see `queries.getOrCreatePlatformSeed`)
+ * and needs this to hand out `platform_pubkey` in the register-token bundle. */
+export async function derivePublicKeyHexFromSeed(seedHex: string): Promise<string> {
+  const key = await crypto.subtle.importKey("pkcs8", seedToPkcs8(seedHex), { name: "Ed25519" }, true, ["sign"]);
+  const jwk = (await crypto.subtle.exportKey("jwk", key)) as JsonWebKey;
+  if (typeof jwk.x !== "string") {
+    throw new Error("derivePublicKeyHexFromSeed: exported JWK has no public key component");
+  }
+  return bytesToHex(base64UrlToBytes(jwk.x));
 }
 
 export async function importPublicKeyFromHex(pubkeyHex: string): Promise<CryptoKey> {

@@ -15,7 +15,7 @@ describe("D1 migration 0001_initial", () => {
       .all<{ name: string }>();
     const names = rows.results.map((r) => r.name).filter((n) => !n.startsWith("sqlite_") && !n.startsWith("_cf_") && !n.startsWith("d1_"));
     expect(names.sort()).toEqual(
-      ["jobs", "login_attempts", "receipts", "register_tokens", "settings", "workers"].sort()
+      ["jobs", "login_attempts", "nonces", "receipts", "register_tokens", "settings", "workers"].sort()
     );
   });
 
@@ -68,5 +68,27 @@ describe("D1 migration 0001_initial", () => {
     expect(row?.origin).toBe("console");
     expect(row?.panel_hidden).toBe(0);
     expect(row?.progress).toBe(0);
+  });
+});
+
+// Task 5's replay-protection store (verify_agent's nonce reuse check).
+describe("D1 migration 0002_nonces", () => {
+  it("creates the nonces table with a (worker_id, nonce) primary key", async () => {
+    const db = (env as any).DB as D1Database;
+    const cols = await db.prepare("PRAGMA table_info(nonces)").all<{ name: string; pk: number }>();
+    const byName = new Map(cols.results.map((c) => [c.name, c]));
+    expect(byName.has("worker_id")).toBe(true);
+    expect(byName.has("nonce")).toBe(true);
+    expect(byName.has("expires_at")).toBe(true);
+    expect(byName.get("worker_id")!.pk).toBeGreaterThan(0);
+    expect(byName.get("nonce")!.pk).toBeGreaterThan(0);
+  });
+
+  it("rejects a duplicate (worker_id, nonce) pair", async () => {
+    const db = (env as any).DB as D1Database;
+    await db.prepare("INSERT INTO nonces (worker_id, nonce, expires_at) VALUES ('w1', 'n1', 100)").run();
+    await expect(
+      db.prepare("INSERT INTO nonces (worker_id, nonce, expires_at) VALUES ('w1', 'n1', 200)").run()
+    ).rejects.toThrow();
   });
 });

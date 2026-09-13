@@ -50,6 +50,18 @@ export function toSqliteTimestamp(date: Date): string {
   return `${y}-${mo}-${d} ${h}:${mi}:${s}.${micros}`;
 }
 
+/** Inverse-ish of `toSqliteTimestamp`, formatted the way Python's naive
+ * `datetime.isoformat()` renders the same value (`workers.py`'s `GET
+ * /api/workers`: `w.last_seen.isoformat() if w.last_seen else None`) --
+ * space separator becomes "T", and an all-zero fractional part is dropped
+ * entirely (`datetime.isoformat()` omits microseconds when they are exactly
+ * 0, which never happens in practice for a real heartbeat timestamp but is
+ * matched here for completeness). */
+export function sqliteTimestampToIsoformat(s: string): string {
+  const iso = s.replace(" ", "T");
+  return iso.endsWith(".000000") ? iso.slice(0, -7) : iso;
+}
+
 // ---------------------------------------------------------------------------
 // Settings
 
@@ -99,6 +111,27 @@ export async function rotateSessionSecret(db: D1Database): Promise<string> {
     .join("");
   await setSetting(db, SESSION_SECRET_KEY, secret);
   return secret;
+}
+
+const PLATFORM_SEED_KEY = "platform_seed";
+
+/** Mirrors `security.load_platform_keys`: lazily generates and persists the
+ * platform's Ed25519 signing seed on first use. Python stores it as a
+ * hex-encoded 32-byte seed at `<data_dir>/keys/platform.key`; there is no
+ * writable filesystem in a Worker, so the cloud port persists the same hex
+ * seed as a `settings` row instead -- same lazy-generate-and-persist shape,
+ * D1-backed rather than file-backed. Used to sign registration certificates
+ * (`workers.py`'s `register()`) and to hand out `platform_pubkey` in the
+ * register-token bundle (see `lib/ed25519.ts`'s `derivePublicKeyHexFromSeed`). */
+export async function getOrCreatePlatformSeed(db: D1Database): Promise<string> {
+  const existing = await getSetting(db, PLATFORM_SEED_KEY);
+  if (existing) return existing;
+  const bytes = crypto.getRandomValues(new Uint8Array(32));
+  const seed = Array.from(bytes)
+    .map((b) => b.toString(16).padStart(2, "0"))
+    .join("");
+  await setSetting(db, PLATFORM_SEED_KEY, seed);
+  return seed;
 }
 
 // ---------------------------------------------------------------------------
@@ -200,6 +233,51 @@ export async function getStaleWorkers(db: D1Database, cutoffTimestamp: string): 
 
 export async function markWorkerOffline(db: D1Database, workerId: string): Promise<void> {
   await db.prepare("UPDATE workers SET status = 'offline' WHERE id = ?").bind(workerId).run();
+}
+
+/** Inserts a freshly-registered worker row (Task 5's `POST
+ * /api/agent/register`), relying on the migration's column DEFAULTs for
+ * everything `workers.py`'s `db.Worker(name=..., pubkey=...)` also leaves at
+ * its model default (status='offline', hardware/dynamic='{}', etc). */
+export async function insertWorker(
+  db: D1Database,
+  id: string,
+  name: string,
+  pubkey: string,
+  createdAt: string
+): Promise<void> {
+  await db
+    .prepare("INSERT INTO workers (id, name, pubkey, created_at) VALUES (?, ?, ?, ?)")
+    .bind(id, name, pubkey, createdAt)
+    .run();
+}
+
+/** Mirrors `workers.py`'s `upload_object_info` DB write: only the hash
+ * column changes, the gzipped bytes themselves go to R2 (see
+ * `routes/workers.ts`). */
+export async function updateWorkerObjectInfoHash(db: D1Database, workerId: string, hash: string): Promise<void> {
+  await db.prepare("UPDATE workers SET object_info_hash = ? WHERE id = ?").bind(hash, workerId).run();
+}
+
+/** Returns true if a row was updated -- mirrors `disable_worker`'s 404 when
+ * the worker doesn't exist. */
+export async function setWorkerDisabled(db: D1Database, workerId: string, disabled: boolean): Promise<boolean> {
+  const result = await db
+    .prepare("UPDATE workers SET disabled = ? WHERE id = ?")
+    .bind(disabled ? 1 : 0, workerId)
+    .run();
+  return (result.meta.changes ?? 0) > 0;
+}
+
+/** Typed seam for the Hub DO's live per-worker state (queue depth, current
+ * job, connection status, etc.) -- Task 6 wires this up for real. Until
+ * then `GET /api/workers` (see routes/workers.ts) falls back to the
+ * persisted `workers.dynamic` column, exactly like `workers.py` does today
+ * (there is no live layer in the Python source either -- `dynamic` is
+ * itself just a JSON column written by whatever last touched the worker
+ * over its agent WebSocket). Always returns null for now. */
+export async function getDynamic(_workerId: string): Promise<Record<string, unknown> | null> {
+  return null;
 }
 
 // ---------------------------------------------------------------------------
@@ -487,4 +565,66 @@ export async function getRecentLoginAttempts(
  * caller) keeps this from ever affecting the 10-minute backoff logic. */
 export async function pruneLoginAttempts(db: D1Database, beforeTimestamp: string): Promise<void> {
   await db.prepare("DELETE FROM login_attempts WHERE at < ?").bind(beforeTimestamp).run();
+}
+
+export async function insertRegisterToken(
+  db: D1Database,
+  token: string,
+  workerName: string,
+  createdAt: string
+): Promise<void> {
+  await db
+    .prepare("INSERT INTO register_tokens (token, worker_name, created_at) VALUES (?, ?, ?)")
+    .bind(token, workerName, createdAt)
+    .run();
+}
+
+export async function getRegisterToken(db: D1Database, token: string): Promise<RegisterToken | null> {
+  const row = await db
+    .prepare("SELECT token, worker_name, created_at, used FROM register_tokens WHERE token = ?")
+    .bind(token)
+    .first<{ token: string; worker_name: string; created_at: string; used: number }>();
+  if (!row) return null;
+  return { token: row.token, workerName: row.worker_name, createdAt: row.created_at, used: row.used !== 0 };
+}
+
+/** Atomically claims an unused register token (`used` 0 -> 1). Returns
+ * whether THIS call was the one that claimed it -- mirrors `register()`'s
+ * `UPDATE ... WHERE used == False` rowcount check, which is what makes a
+ * concurrent double-use of the same token resolve to exactly one winner. */
+export async function claimRegisterToken(db: D1Database, token: string): Promise<boolean> {
+  const result = await db
+    .prepare("UPDATE register_tokens SET used = 1 WHERE token = ? AND used = 0")
+    .bind(token)
+    .run();
+  return (result.meta.changes ?? 0) === 1;
+}
+
+// ---------------------------------------------------------------------------
+// Nonces (Task 5) -- D1-backed replay-protection store, see
+// migrations/0002_nonces.sql and lib/verify_agent.ts.
+
+/** Deletes expired nonce rows -- called opportunistically on every signed
+ * request verification, mirroring `workers.py`'s `_prune_nonces`. */
+export async function pruneNonces(db: D1Database, nowSeconds: number): Promise<void> {
+  await db.prepare("DELETE FROM nonces WHERE expires_at <= ?").bind(nowSeconds).run();
+}
+
+/** Inserts a (worker_id, nonce) pair if not already present; returns false
+ * (without writing) if it already exists -- the row surviving means it's
+ * either still within its TTL or hasn't been pruned yet this call, either
+ * way a replay. Doing this as a single conditional INSERT (rather than a
+ * SELECT-then-INSERT) makes the replay check race-free under concurrent
+ * requests carrying the same nonce. */
+export async function tryInsertNonce(
+  db: D1Database,
+  workerId: string,
+  nonce: string,
+  expiresAt: number
+): Promise<boolean> {
+  const result = await db
+    .prepare("INSERT INTO nonces (worker_id, nonce, expires_at) VALUES (?, ?, ?) ON CONFLICT(worker_id, nonce) DO NOTHING")
+    .bind(workerId, nonce, expiresAt)
+    .run();
+  return (result.meta.changes ?? 0) === 1;
 }
