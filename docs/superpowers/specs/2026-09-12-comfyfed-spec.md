@@ -83,7 +83,7 @@ worker 斷線（>90s 無心跳）→ assigned/running 的任務自動回 queued 
 - **Phase 2**：模型 manifest＋平台中繼下載；`/object_info` 能力交集模式（保守選項，**已於 Phase 1.9 提前實作** `auth`/`comfyapi` 的 `object_info_mode: union|intersection`）。
 - **Phase 3**：成員間 P2P 分塊傳輸；貢獻報表進階（分潤試算）；多管理員。
 - **Phase 1.9（backlog zero，2026-09-13）**：job origin 欄位＋範圍限定（面板原生控制只動面板自己送的工作）；面板任務歷史可刪除；node_errors 前端引導文案；隱藏面板內失效的 Comfy-cloud 登入按鈕；失敗／取消任務不計費（收據 0）；agent 通訊協定升級到 v2；派工優先序偏好弱 GPU／Mac 之類的機器優先接零模型需求的工作，把重活留給有模型的機器；範本快取與下載上限；一個間歇性 flake 已根治（非重跑掩蓋）；console 新增任務詳情頁（完整錯誤引導＋artifacts）；專案採用 AGPL-3.0 授權。
-- **未來方向：ComfyFed Cloud（2026-09-12 提出）**——平台端移植 Cloudflare Workers＋D1＋R2 的免自架部署形態：D1=SQLite（schema 近乎原樣）、R2=ArtifactStore 的 S3 介面（presigned 直傳、零出口費）、agent 長連 WS 改由 Durable Objects（hibernation）承接、派工迴圈改 DO alarms、Ed25519 驗簽走 WebCrypto。價值：DDNS/固定IP/NAT/TLS 痛點全消失。定位：**自架 Python 版仍是本體**（內網/離線場景＋資料自主），Cloud 版是第二部署形態；現有架構決策（outbound-only WS、S3 介面、簽章收據）已刻意為此保留可移植性。
+- **ComfyFed Cloud（2026-09-12 提出，Phase 2.0 已上線）**——平台端的 Cloudflare Workers＋D1＋R2 免自架部署形態：D1=SQLite（schema 近乎原樣）、R2=ArtifactStore 的 S3 介面（presigned 直傳、零出口費）、agent 長連 WS 由 Durable Objects（hibernation）承接、派工迴圈為 DO alarms、Ed25519 驗簽走 WebCrypto。`cloud/` 目錄的 TypeScript Workers 實作已完成並部署在 workers.dev 網域上，見 `cloud/README.md`。定位：**自架 Python 版仍是本體**（內網/離線場景＋資料自主），Cloud 版是第二部署形態；現有架構決策（outbound-only WS、S3 介面、簽章收據）已刻意為此保留可移植性。
 
 ## 9.5 架構審查補強（2026-09-12 定案，全部納入 Phase 1）
 

@@ -241,8 +241,24 @@ _MODEL_SECTION_HEADINGS = ("### 模型下載", "### Model downloads")
 
 
 def _readme_text():
-    with open(os.path.join(_repo_root(), "README.md"), encoding="utf-8") as f:
-        return f.read()
+    """Text of the model-download sections' current home.
+
+    The general-audience README.md/README.en.md no longer carry the model
+    table (docs: general-audience bilingual README rewrite) -- it moved to
+    docs/SELF-HOSTING.{zh,en}.md, one language per file. Concatenating both
+    keeps this helper's "one bilingual text" contract intact for the section
+    scan below.
+    """
+    root = _repo_root()
+    paths = (
+        os.path.join(root, "docs", "SELF-HOSTING.zh.md"),
+        os.path.join(root, "docs", "SELF-HOSTING.en.md"),
+    )
+    parts = []
+    for path in paths:
+        with open(path, encoding="utf-8") as f:
+            parts.append(f.read())
+    return "\n".join(parts)
 
 
 def _readme_sections(text, headings):
@@ -1139,18 +1155,19 @@ def test_mp3_thumbnail_is_served_as_audio(client):
 
 
 def test_readme_model_downloads_section_covers_the_whole_inventory():
-    readme_path = os.path.join(os.path.dirname(__file__), "..", "..", "README.md")
-    with open(readme_path, encoding="utf-8") as f:
-        readme = f.read()
+    # Model tables live in docs/SELF-HOSTING.{zh,en}.md, not the
+    # general-audience README.md, since the "docs: general-audience
+    # bilingual README" rewrite. `_readme_text()` concatenates both.
+    readme = _readme_text()
 
     urls = _gcs_urls_in(readme)
-    assert urls, "README has no GCS backup model links"
+    assert urls, "self-hosting guides have no GCS backup model links"
     for url in urls:
         assert url.startswith(GCS_MODEL_BASE), url
         assert url.rsplit("/", 1)[-1] in MODEL_INVENTORY, url
 
-    # Every model in the shared inventory shows up at least once in the README
-    # (bilingual tables both reference the same nine files).
+    # Every model in the shared inventory shows up at least once across the
+    # two self-hosting guides (their tables both reference the same files).
     seen = {url.rsplit("/", 1)[-1] for url in urls}
     assert seen == MODEL_INVENTORY
 

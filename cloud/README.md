@@ -2,6 +2,8 @@
 
 [繁體中文](#繁體中文) | [English](#english)
 
+一般使用者導向的說明：[README.md](../README.md)（中文）｜ [README.en.md](../README.en.md)（English）。自架技術指南：[docs/SELF-HOSTING.zh.md](../docs/SELF-HOSTING.zh.md) ｜ [docs/SELF-HOSTING.en.md](../docs/SELF-HOSTING.en.md)。
+
 ---
 
 ## 繁體中文
