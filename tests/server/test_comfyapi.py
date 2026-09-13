@@ -1373,7 +1373,9 @@ def test_prompt_copies_staged_asset_into_job_inputs(client):
     [
         ("/comfy/api/features", {}),
         ("/comfy/api/users", {"storage": "server", "migrated": False}),
-        ("/comfy/api/extensions", ["/comfy/api/comfyfed-ext/comfyfed.js"]),
+        # Without the /comfy mount prefix: the frontend joins listed URLs
+        # onto its own api base (/comfy); a prefixed path would double up.
+        ("/comfy/api/extensions", ["/api/comfyfed-ext/comfyfed.js"]),
         ("/comfy/api/embeddings", []),
         ("/comfy/api/models", []),
         ("/comfy/api/i18n", {}),
