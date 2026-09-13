@@ -1,4 +1,5 @@
 import asyncio
+import hashlib
 import json
 import logging
 import math
@@ -10,7 +11,7 @@ from nacl.signing import SigningKey
 from starlette.websockets import WebSocketDisconnect
 
 from comfyfed_server import agentws, app as app_module
-from comfyfed_server import bootstrap, db, dispatch
+from comfyfed_server import bootstrap, db, dispatch, model_manifest
 
 
 @pytest.fixture()
@@ -599,6 +600,76 @@ def test_byte_scale_inventory_is_converted_to_gigabytes(client):
     job_id = _submit(client, csrf, workflow=workflow)
     detail = client.get(f"/api/jobs/{job_id}", headers={"X-CSRF": csrf}).json()
     assert 6.0 <= detail["est_vram_gb"] <= 8.0
+
+
+def test_inventory_entries_with_sha256_are_learned_into_model_hashes(client):
+    csrf = _login(client)
+    worker_id, sk = _register_worker(client, csrf, "w1")
+    sha = hashlib.sha256(b"clip").hexdigest()
+
+    with client.websocket_connect("/api/agent/ws") as ws:
+        challenge = ws.receive_json()
+        sig = sk.sign(challenge["nonce"].encode()).signature.hex()
+        ws.send_json({"type": "auth", "worker_id": worker_id, "sig": sig})
+        assert ws.receive_json()["type"] == "ready"
+
+        ws.send_json(
+            {
+                "type": "inventory",
+                "models": [
+                    {"name": "text_encoders/clip_l.safetensors", "size": 0.23, "sha256": sha},
+                    {"name": "vae/no_hash_yet.safetensors", "size": 0.31},
+                ],
+            }
+        )
+        agentws.dispatch_once(worker_id)
+
+    size_bytes = round(0.23 * (1024 ** 3))
+    with db.get_session() as session:
+        row = session.get(db.ModelHash, ("text_encoders/clip_l.safetensors", size_bytes))
+        assert row is not None
+        assert row.sha256 == sha
+        assert row.first_worker_id == worker_id
+        # The hash-less entry must not have produced any row at all.
+        assert session.query(db.ModelHash).count() == 1
+
+
+def test_inventory_hash_conflict_between_two_workers_poisons_the_name(client, caplog):
+    csrf = _login(client)
+    worker_a, sk_a = _register_worker(client, csrf, "wa")
+    worker_b, sk_b = _register_worker(client, csrf, "wb")
+    sha_a = hashlib.sha256(b"a").hexdigest()
+    sha_b = hashlib.sha256(b"b").hexdigest()
+
+    with client.websocket_connect("/api/agent/ws") as ws:
+        challenge = ws.receive_json()
+        ws.send_json(
+            {"type": "auth", "worker_id": worker_a, "sig": sk_a.sign(challenge["nonce"].encode()).signature.hex()}
+        )
+        assert ws.receive_json()["type"] == "ready"
+        ws.send_json(
+            {"type": "inventory", "models": [{"name": "clip_l.safetensors", "size": 0.23, "sha256": sha_a}]}
+        )
+        agentws.dispatch_once(worker_a)
+
+    with caplog.at_level(logging.WARNING, logger="comfyfed_server.model_manifest"):
+        with client.websocket_connect("/api/agent/ws") as ws:
+            challenge = ws.receive_json()
+            ws.send_json(
+                {"type": "auth", "worker_id": worker_b, "sig": sk_b.sign(challenge["nonce"].encode()).signature.hex()}
+            )
+            assert ws.receive_json()["type"] == "ready"
+            ws.send_json(
+                {"type": "inventory", "models": [{"name": "clip_l.safetensors", "size": 0.23, "sha256": sha_b}]}
+            )
+            agentws.dispatch_once(worker_b)
+
+    assert any(
+        r.levelno == logging.WARNING and worker_a in r.message and worker_b in r.message
+        for r in caplog.records
+    )
+    assert "clip_l.safetensors" in model_manifest.poisoned_names()
+    model_manifest._poisoned_names.discard("clip_l.safetensors")
 
 
 def test_repeated_busy_heartbeat_is_a_silent_no_op(client, caplog):

@@ -16,9 +16,12 @@ Agent -> server message contract (all JSON):
          it doesn't match `Worker.object_info_hash`, or the platform's stored
          snapshot file is missing, the server replies over this same socket
          with `{"type": "want_object_info"}` to trigger a resend.
-  {"type": "inventory", "models": [{"name": str, "size": float}]}
+  {"type": "inventory", "models": [{"name": str, "size": float, "sha256": str|absent}]}
       -- `size` is the model file size in GIGABYTES (not bytes); the server
          compares it against VRAM and free-disk figures that are also in GB.
+         `sha256` (Phase 2.1 Task 1 agents) is present once the agent has
+         hashed the file; fed into `model_manifest.record_hash` for every
+         entry that carries one -- see `_record_model_hashes`.
   {"type": "job_done", "job_id": str, "result_files": [str],
    "exec_seconds": float|null}
       -- `exec_seconds` is the agent's measurement of actual GPU execution
@@ -64,7 +67,7 @@ from fastapi import APIRouter, WebSocket, WebSocketDisconnect
 from nacl.exceptions import BadSignatureError
 from nacl.signing import SigningKey, VerifyKey
 
-from . import db, dispatch, metrics, panelws, security, workers
+from . import db, dispatch, metrics, model_manifest, panelws, security, workers
 
 logger = logging.getLogger(__name__)
 
@@ -698,12 +701,34 @@ def _normalize_models(models) -> list:
 
 
 def _handle_inventory(worker_id: str, message: dict) -> None:
+    models = _normalize_models(message.get("models") or [])
+
     with db.get_session() as session:
         worker = session.get(db.Worker, worker_id)
         if worker is None:
             return
-        worker.model_inventory = json.dumps(_normalize_models(message.get("models") or []))
+        worker.model_inventory = json.dumps(models)
         session.commit()
+
+    _record_model_hashes(worker_id, models)
+
+
+def _record_model_hashes(worker_id: str, models: list) -> None:
+    """Learn a sha256 for every inventory entry that carries one (Phase 2.1
+    Task 1 agents; older agents send none). Cheap skip for entries without
+    it -- see `model_manifest.record_hash` for the consensus/conflict rule.
+    """
+    for entry in models:
+        sha256 = entry.get("sha256")
+        if not isinstance(sha256, str) or not sha256:
+            continue
+        name = entry.get("name")
+        size = entry.get("size")
+        if not isinstance(name, str) or not name:
+            continue
+        if not isinstance(size, (int, float)) or isinstance(size, bool):
+            continue
+        model_manifest.record_hash(worker_id, name, float(size), sha256)
 
 
 def _sign_and_store_receipt(
