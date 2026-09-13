@@ -83,7 +83,7 @@ def _curated(
     )
 
 
-# The ten curated models, verified 2026-09-13 -- see
+# The eleven curated models, verified 2026-09-13 -- see
 # docs/superpowers/plans/2026-09-13-phase1_6-official-templates.md, "The
 # curated model source registry", and the Phase 1.8b addendum's model
 # registry table for entry #10 (qwen3vl_4b_bf16.safetensors).
@@ -181,6 +181,18 @@ SOURCES: dict[str, ModelSource] = {
             "text_encoders/qwen3vl_4b_bf16.safetensors"
         ),
         backup_url=f"{_GCS_BACKUP_BASE}/text_encoders/qwen3vl_4b_bf16.safetensors",
+        gated=False,
+    ),
+    # Entry #11, Phase 1.10 -- a GitHub release asset rather than a HuggingFace
+    # `resolve/main/` URL, so this is built manually like the MiniMax-H3
+    # entries above instead of via `_curated`.
+    "RealESRGAN_x4plus.pth": ModelSource(
+        name="RealESRGAN_x4plus.pth",
+        directory="upscale_models",
+        size_gb=0.06,
+        official_page="https://github.com/xinntao/Real-ESRGAN",
+        official_url="https://github.com/xinntao/Real-ESRGAN/releases/download/v0.1.0/RealESRGAN_x4plus.pth",
+        backup_url=f"{_GCS_BACKUP_BASE}/upscale_models/RealESRGAN_x4plus.pth",
         gated=False,
     ),
 }

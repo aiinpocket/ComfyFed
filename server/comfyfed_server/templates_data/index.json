@@ -68,6 +68,39 @@
         "description": "Paste a rough idea and the same local Qwen3-VL model rewrites it into a structured English prompt.",
         "tags": ["qwen3vl", "prompt", "提示詞", "llm", "新手", "comfyfed"],
         "models": ["qwen3vl_4b_bf16.safetensors"]
+      },
+      {
+        "name": "comfyfed-flf2v-video",
+        "title": "首尾幀生影片 / First+last frame to video",
+        "mediaType": "image",
+        "mediaSubtype": "webp",
+        "description": "Give MiniMax H3 a first frame and a last frame plus a one-sentence action description; it generates the motion (and audio) in between.",
+        "tags": ["video", "首尾幀", "新手", "comfyfed"],
+        "models": [
+          "minimax_h3_ref2va_pruned_int8_convrot.safetensors",
+          "qwen3vl_32b_heretic_minimax_h3_nvfp4.safetensors",
+          "minimax_h3_video_vae_fp16.safetensors",
+          "minimax_h3_audio_vae_fp32.safetensors",
+          "minimax_h3_ref2v_turbo_8step_v1.0_768p_comfyui_resized_avg_rank_64_bf16.safetensors"
+        ]
+      },
+      {
+        "name": "comfyfed-video-trim",
+        "title": "影片截段 / Video trim",
+        "mediaType": "image",
+        "mediaSubtype": "webp",
+        "description": "Cut a start-second + length span out of a video clip. Needs zero models -- runs on a brand-new worker.",
+        "tags": ["video", "剪輯", "新手", "零模型"],
+        "models": []
+      },
+      {
+        "name": "comfyfed-image-upscale",
+        "title": "圖片放大 / Image upscale",
+        "mediaType": "image",
+        "mediaSubtype": "webp",
+        "description": "4x super-resolution upscale of a still image via RealESRGAN. Ships with a sample image.",
+        "tags": ["image", "放大", "新手"],
+        "models": ["RealESRGAN_x4plus.pth"]
       }
     ]
   }

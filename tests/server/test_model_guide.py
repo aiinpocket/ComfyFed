@@ -10,9 +10,9 @@ from comfyfed_server import model_guide
 # --- curated registry --------------------------------------------------
 
 
-def test_all_ten_curated_names_resolve(tmp_path):
+def test_all_eleven_curated_names_resolve(tmp_path):
     data_dir = str(tmp_path)
-    assert len(model_guide.SOURCES) == 10
+    assert len(model_guide.SOURCES) == 11
     for name, source in model_guide.SOURCES.items():
         found = model_guide.lookup(name, data_dir)
         assert found is not None
@@ -46,6 +46,23 @@ def test_curated_qwen3vl_4b_fields():
     assert (
         source.backup_url
         == "https://storage.googleapis.com/comfyfed-models/models/text_encoders/qwen3vl_4b_bf16.safetensors"
+    )
+    assert source.gated is False
+
+
+def test_curated_realesrgan_fields():
+    """Phase 1.10 Task 1: entry #11, shared by the image-upscale template."""
+    source = model_guide.SOURCES["RealESRGAN_x4plus.pth"]
+    assert source.directory == "upscale_models"
+    assert source.size_gb == 0.06
+    assert source.official_page == "https://github.com/xinntao/Real-ESRGAN"
+    assert (
+        source.official_url
+        == "https://github.com/xinntao/Real-ESRGAN/releases/download/v0.1.0/RealESRGAN_x4plus.pth"
+    )
+    assert (
+        source.backup_url
+        == "https://storage.googleapis.com/comfyfed-models/models/upscale_models/RealESRGAN_x4plus.pth"
     )
     assert source.gated is False
 
