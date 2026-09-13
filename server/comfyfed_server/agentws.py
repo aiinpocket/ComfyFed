@@ -573,6 +573,12 @@ async def _handle_hello(worker_id: str, conn: "_Connection", message: dict) -> N
         worker.torch_version = message.get("torch_version") or ""
         worker.node_classes = json.dumps(message.get("node_classes") or [])
         worker.protocol = protocol
+        # Agent-side opt-in for manifest-based model auto-fetch (Phase 2.1
+        # Task 1's hello `auto_fetch` field; gate consumed by
+        # `assess.verdict`'s eligible_after_fetch check). Missing/non-bool
+        # degrades to False -- an old or malformed hello must never be read
+        # as consent to download.
+        worker.auto_fetch = message.get("auto_fetch") is True
         worker.status = "online"
         worker.last_seen = _utcnow()
         session.commit()

@@ -5,7 +5,15 @@ import pytest
 from comfyfed_server import assess, db
 
 
-def _worker(id_, node_classes=None, model_inventory=None, hardware=None, dynamic=None):
+def _worker(
+    id_,
+    node_classes=None,
+    model_inventory=None,
+    hardware=None,
+    dynamic=None,
+    protocol=None,
+    auto_fetch=None,
+):
     return db.Worker(
         id=id_,
         name=id_,
@@ -14,7 +22,16 @@ def _worker(id_, node_classes=None, model_inventory=None, hardware=None, dynamic
         model_inventory=json.dumps(model_inventory if model_inventory is not None else []),
         hardware=json.dumps(hardware if hardware is not None else {}),
         dynamic=json.dumps(dynamic if dynamic is not None else {}),
+        protocol=protocol,
+        auto_fetch=auto_fetch,
     )
+
+
+def _fetch_ready_worker(id_, **kwargs):
+    """A worker opted into manifest-based auto-fetch: protocol 3 + auto_fetch."""
+    kwargs.setdefault("protocol", 3)
+    kwargs.setdefault("auto_fetch", True)
+    return _worker(id_, **kwargs)
 
 
 REALISTIC_WORKFLOW = {
@@ -136,17 +153,13 @@ def test_verdict_eligible_when_everything_present():
     assert v.missing_models == []
 
 
-def test_verdict_eligible_after_fetch_when_other_worker_has_missing_model():
-    worker = _worker(
+def test_verdict_eligible_after_fetch_when_manifest_can_supply_missing_model():
+    worker = _fetch_ready_worker(
         "w1",
         node_classes=["CheckpointLoaderSimple"],
         model_inventory=[],
         hardware={"vram_gb": 24},
         dynamic={"free_disk_gb": 100},
-    )
-    other = _worker(
-        "w2",
-        model_inventory=[{"name": "ckpt.safetensors", "size": 4.0}],
     )
     needs = assess.JobNeeds(
         nodes={"CheckpointLoaderSimple"},
@@ -154,10 +167,137 @@ def test_verdict_eligible_after_fetch_when_other_worker_has_missing_model():
         est_vram_gb=None,
         assets=set(),
     )
-    v = assess.verdict(worker, needs, {}, [worker, other])
+    # 4 GiB manifest entry; 100 GB free clears 1.2x margin easily.
+    fetchable = {"ckpt.safetensors": 4 * 1024**3}
+    v = assess.verdict(worker, needs, {}, [worker], fetchable_models=fetchable)
     assert v.kind == "eligible_after_fetch"
     assert v.missing_models == ["ckpt.safetensors"]
     assert any(r.startswith("missing_models:") for r in v.reasons)
+
+
+def test_verdict_ineligible_when_fetchable_models_not_supplied():
+    """The optional parameter defaults to None -- "nothing fetchable" -- so a
+    worker missing a model with no manifest wired in stays ineligible, not
+    eligible_after_fetch. This is the Task-4 no-op default."""
+    worker = _fetch_ready_worker(
+        "w1",
+        node_classes=["CheckpointLoaderSimple"],
+        model_inventory=[],
+        hardware={"vram_gb": 24},
+        dynamic={"free_disk_gb": 100},
+    )
+    needs = assess.JobNeeds(
+        nodes={"CheckpointLoaderSimple"},
+        models={"ckpt.safetensors"},
+        est_vram_gb=None,
+        assets=set(),
+    )
+    v = assess.verdict(worker, needs, {}, [worker])
+    assert v.kind == "ineligible"
+    assert any(r.startswith("missing_models_unavailable:") for r in v.reasons)
+
+
+def test_verdict_ineligible_when_only_some_missing_models_are_in_manifest():
+    worker = _fetch_ready_worker(
+        "w1",
+        model_inventory=[],
+        dynamic={"free_disk_gb": 100},
+    )
+    needs = assess.JobNeeds(
+        nodes=set(), models={"ckpt.safetensors", "lora.safetensors"}, est_vram_gb=None
+    )
+    fetchable = {"ckpt.safetensors": 1 * 1024**3}  # lora.safetensors missing from manifest
+    v = assess.verdict(worker, needs, {}, [worker], fetchable_models=fetchable)
+    assert v.kind == "ineligible"
+    assert any(r.startswith("missing_models_unavailable:") for r in v.reasons)
+
+
+def test_verdict_ineligible_when_protocol_below_3():
+    worker = _worker(
+        "w1",
+        model_inventory=[],
+        dynamic={"free_disk_gb": 100},
+        protocol=2,
+        auto_fetch=True,
+    )
+    needs = assess.JobNeeds(nodes=set(), models={"ckpt.safetensors"}, est_vram_gb=None)
+    fetchable = {"ckpt.safetensors": 1 * 1024**3}
+    v = assess.verdict(worker, needs, {}, [worker], fetchable_models=fetchable)
+    assert v.kind == "ineligible"
+    assert any(r.startswith("missing_models_unavailable:") for r in v.reasons)
+
+
+def test_verdict_ineligible_when_worker_has_not_opted_into_auto_fetch():
+    worker = _worker(
+        "w1",
+        model_inventory=[],
+        dynamic={"free_disk_gb": 100},
+        protocol=3,
+        auto_fetch=False,
+    )
+    needs = assess.JobNeeds(nodes=set(), models={"ckpt.safetensors"}, est_vram_gb=None)
+    fetchable = {"ckpt.safetensors": 1 * 1024**3}
+    v = assess.verdict(worker, needs, {}, [worker], fetchable_models=fetchable)
+    assert v.kind == "ineligible"
+    assert any(r.startswith("missing_models_unavailable:") for r in v.reasons)
+
+
+def test_verdict_ineligible_when_disk_margin_insufficient():
+    """1.2x margin on a 10 GiB manifest entry needs > 12 GB free; 12 GB flat
+    is not enough (strictly greater), 5 GB is nowhere close."""
+    worker = _fetch_ready_worker(
+        "w1", model_inventory=[], dynamic={"free_disk_gb": 12.0}
+    )
+    needs = assess.JobNeeds(nodes=set(), models={"big.safetensors"}, est_vram_gb=None)
+    fetchable = {"big.safetensors": 10 * 1024**3}
+    v = assess.verdict(worker, needs, {}, [worker], fetchable_models=fetchable)
+    assert v.kind == "ineligible"
+    assert any(r.startswith("missing_models_unavailable:") for r in v.reasons)
+
+
+def test_verdict_eligible_after_fetch_when_disk_margin_just_clears():
+    worker = _fetch_ready_worker(
+        "w1", model_inventory=[], dynamic={"free_disk_gb": 12.1}
+    )
+    needs = assess.JobNeeds(nodes=set(), models={"big.safetensors"}, est_vram_gb=None)
+    fetchable = {"big.safetensors": 10 * 1024**3}
+    v = assess.verdict(worker, needs, {}, [worker], fetchable_models=fetchable)
+    assert v.kind == "eligible_after_fetch"
+
+
+def test_verdict_ineligible_when_free_disk_unknown():
+    """Can't prove the >1.2x margin holds without a free_disk_gb figure at
+    all -- unlike the VRAM-offload gate, this one refuses rather than warns:
+    an unproven auto-download is a bigger risk than an unproven offload."""
+    worker = _fetch_ready_worker("w1", model_inventory=[], dynamic={})
+    needs = assess.JobNeeds(nodes=set(), models={"ckpt.safetensors"}, est_vram_gb=None)
+    fetchable = {"ckpt.safetensors": 1 * 1024**3}
+    v = assess.verdict(worker, needs, {}, [worker], fetchable_models=fetchable)
+    assert v.kind == "ineligible"
+    assert any(r.startswith("missing_models_unavailable:") for r in v.reasons)
+
+
+def test_verdict_ineligible_when_manifest_size_sum_exceeds_margin():
+    """Disk headroom is a SUM across every model to fetch, not a max."""
+    worker = _fetch_ready_worker(
+        "w1", model_inventory=[], dynamic={"free_disk_gb": 15.0}
+    )
+    needs = assess.JobNeeds(
+        nodes=set(), models={"big.safetensors", "also_big.safetensors"}, est_vram_gb=None
+    )
+    fetchable = {
+        "big.safetensors": 11 * 1024**3,
+        "also_big.safetensors": 9 * 1024**3,
+    }
+    # Sum is 20 GB; 1.2x margin needs > 24 GB. 15 GB free clears neither.
+    v = assess.verdict(worker, needs, {}, [worker], fetchable_models=fetchable)
+    assert v.kind == "ineligible"
+
+    roomy = _fetch_ready_worker(
+        "w2", model_inventory=[], dynamic={"free_disk_gb": 25.0}
+    )
+    v2 = assess.verdict(roomy, needs, {}, [roomy], fetchable_models=fetchable)
+    assert v2.kind == "eligible_after_fetch"
 
 
 def test_verdict_ineligible_when_missing_node():
@@ -367,30 +507,21 @@ def test_estimate_vram_returns_none_when_nothing_matches():
     assert assess.estimate_vram({"not_here.safetensors"}, [worker]) is None
 
 
-def test_eligible_after_fetch_matches_a_peer_by_category_relative_name():
-    """A peer's models-root-relative inventory must satisfy a missing model."""
-    have_nothing = _worker("w1", node_classes=["KSampler"], dynamic={"free_disk_gb": 500})
-    peer = _worker("w2", model_inventory=FLUX_INVENTORY)
+def test_eligible_after_fetch_missing_model_check_still_uses_category_relative_matching():
+    """The worker's OWN inventory is still checked with `matches_model_name`
+    (models-root-relative) before anything is considered missing at all --
+    the manifest only supplies what the worker truly lacks."""
+    worker = _fetch_ready_worker(
+        "w1", node_classes=["KSampler"], model_inventory=FLUX_INVENTORY,
+        dynamic={"free_disk_gb": 500},
+    )
     needs = assess.JobNeeds(
         nodes={"KSampler"}, models={"flux1-dev.safetensors"}, est_vram_gb=None, assets=set()
     )
-
-    v = assess.verdict(have_nothing, needs, {}, [have_nothing, peer])
-    assert v.kind == "eligible_after_fetch"
-    assert v.missing_models == ["flux1-dev.safetensors"]
-
-
-def test_eligible_after_fetch_uses_the_matched_size_for_the_disk_check():
-    """The 11.9 GB size must be found, so 5 GB of free disk is not enough."""
-    cramped = _worker("w1", node_classes=["KSampler"], dynamic={"free_disk_gb": 5})
-    peer = _worker("w2", model_inventory=FLUX_INVENTORY)
-    needs = assess.JobNeeds(
-        nodes={"KSampler"}, models={"flux1-dev.safetensors"}, est_vram_gb=None, assets=set()
-    )
-
-    v = assess.verdict(cramped, needs, {}, [cramped, peer])
-    assert v.kind == "ineligible"
-    assert any(r.startswith("missing_models_unavailable") for r in v.reasons)
+    # Already present (category-relative match) -- nothing to fetch.
+    v = assess.verdict(worker, needs, {}, [worker], fetchable_models={"flux1-dev.safetensors": 1})
+    assert v.kind == "eligible"
+    assert v.missing_models == []
 
 
 def test_find_model_reports_presence_and_the_largest_known_size():
@@ -411,29 +542,35 @@ def test_fetch_disk_headroom_is_still_a_sum_not_a_max():
 
     Every fetched model lands on disk and stays there simultaneously, so the
     eligible_after_fetch headroom check sums them -- even though the VRAM
-    estimate deliberately takes the largest single model.
+    estimate deliberately takes the largest single model. (Covered in more
+    detail, with the 1.2x margin, by
+    test_verdict_ineligible_when_manifest_size_sum_exceeds_margin above.)
     """
-    peer = _worker(
-        "peer",
-        model_inventory=[
-            {"name": "diffusion_models/big.safetensors", "size": 11.0},
-            {"name": "text_encoders/also_big.safetensors", "size": 9.0},
-        ],
-    )
     needs = assess.JobNeeds(
         nodes=set(),
         models={"big.safetensors", "also_big.safetensors"},
         est_vram_gb=None,
         assets=set(),
     )
+    fetchable = {
+        "big.safetensors": 11 * 1024**3,
+        "also_big.safetensors": 9 * 1024**3,
+    }
 
-    # 15 GB free clears the largest model (11) but not the total (20).
-    cramped = _worker("w1", dynamic={"free_disk_gb": 15.0})
-    assert assess.verdict(cramped, needs, {}, [cramped, peer]).kind == "ineligible"
+    # 24 GB free clears the largest model x1.2 (13.2) but not the margin on
+    # the total (20 x 1.2 = 24, and the gate is strictly-greater).
+    cramped = _fetch_ready_worker("w1", dynamic={"free_disk_gb": 24.0})
+    assert (
+        assess.verdict(cramped, needs, {}, [cramped], fetchable_models=fetchable).kind
+        == "ineligible"
+    )
 
-    # 25 GB clears the sum.
-    roomy = _worker("w2", dynamic={"free_disk_gb": 25.0})
-    assert assess.verdict(roomy, needs, {}, [roomy, peer]).kind == "eligible_after_fetch"
+    # 25 GB clears the margin on the sum.
+    roomy = _fetch_ready_worker("w2", dynamic={"free_disk_gb": 25.0})
+    assert (
+        assess.verdict(roomy, needs, {}, [roomy], fetchable_models=fetchable).kind
+        == "eligible_after_fetch"
+    )
 
 
 # --- VRAM: offload-aware gate (LIVE-3) ----------------------------------------
@@ -526,23 +663,19 @@ def test_min_vram_override_remains_a_hard_refusal():
 
 
 def test_a_warning_survives_an_eligible_after_fetch_verdict():
-    """The job still needs a model from a peer AND will offload -- both facts
-    are true and the submitter should see each in its own place."""
-    worker = _worker(
+    """The job still needs a manifest-fetched model AND will offload -- both
+    facts are true and the submitter should see each in its own place."""
+    worker = _fetch_ready_worker(
         "w",
         node_classes=["KSampler"],
         hardware={"vram_gb": 8.0, "ram_gb": 64.0},
         dynamic={"free_disk_gb": 500.0},
     )
-    peer = _worker(
-        "peer",
-        node_classes=["KSampler"],
-        model_inventory=[{"name": "diffusion_models/flux1-dev.safetensors", "size": 22.17}],
-    )
     needs = assess.JobNeeds(
         nodes={"KSampler"}, models={"flux1-dev.safetensors"}, est_vram_gb=25.5
     )
-    v = assess.verdict(worker, needs, {}, [worker, peer])
+    fetchable = {"flux1-dev.safetensors": int(22.17 * 1024**3)}
+    v = assess.verdict(worker, needs, {}, [worker], fetchable_models=fetchable)
     assert v.kind == "eligible_after_fetch"
     assert v.reasons == ["missing_models:flux1-dev.safetensors"]
     assert v.warnings == ["vram_offload:25.5>8.0"]

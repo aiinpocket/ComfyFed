@@ -1785,6 +1785,87 @@ def test_hello_without_protocol_defaults_to_1_and_sends_deprecation_frame(client
         ws.close()
 
 
+def test_hello_stores_reported_auto_fetch_true(client):
+    """Phase 2.1 Task 3: hello's auto_fetch opt-in flag lands on the worker
+    row so assess.verdict's eligible_after_fetch gate can read it."""
+    csrf = _login(client)
+    worker_id, sk = _register_worker(client, csrf, "w1")
+
+    ws = _connect(client, worker_id, sk)
+    try:
+        ws.send_json(
+            {
+                "type": "hello",
+                "hardware": {"cpu": "x"},
+                "backend": "cuda",
+                "torch_version": "2.0",
+                "node_classes": [],
+                "protocol": 3,
+                "auto_fetch": True,
+            }
+        )
+        agentws.dispatch_once(worker_id)
+
+        with db.get_session() as session:
+            worker = session.get(db.Worker, worker_id)
+            assert worker.auto_fetch is True
+    finally:
+        ws.close()
+
+
+def test_hello_stores_reported_auto_fetch_false(client):
+    csrf = _login(client)
+    worker_id, sk = _register_worker(client, csrf, "w1")
+
+    ws = _connect(client, worker_id, sk)
+    try:
+        ws.send_json(
+            {
+                "type": "hello",
+                "hardware": {"cpu": "x"},
+                "backend": "cuda",
+                "torch_version": "2.0",
+                "node_classes": [],
+                "protocol": 3,
+                "auto_fetch": False,
+            }
+        )
+        agentws.dispatch_once(worker_id)
+
+        with db.get_session() as session:
+            worker = session.get(db.Worker, worker_id)
+            assert worker.auto_fetch is False
+    finally:
+        ws.close()
+
+
+def test_hello_without_auto_fetch_field_defaults_to_false(client):
+    """An old (pre-Task-1) agent's hello has no `auto_fetch` key at all --
+    must never be read as consent to auto-download models."""
+    csrf = _login(client)
+    worker_id, sk = _register_worker(client, csrf, "w1")
+
+    ws = _connect(client, worker_id, sk)
+    try:
+        ws.send_json(
+            {
+                "type": "hello",
+                "hardware": {"cpu": "x"},
+                "backend": "cuda",
+                "torch_version": "2.0",
+                "node_classes": [],
+                "protocol": 2,
+            }
+        )
+        agentws.dispatch_once(worker_id)
+
+        with db.get_session() as session:
+            worker = session.get(db.Worker, worker_id)
+            assert worker.auto_fetch is False
+    finally:
+        ws.close()
+
+
 def test_hello_with_protocol_2_sends_no_deprecation_frame(client):
     csrf = _login(client)
     worker_id, sk = _register_worker(client, csrf, "w1")

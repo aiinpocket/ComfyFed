@@ -44,6 +44,17 @@ _ASSET_FIELD_NAMES = ("image", "audio", "video", "file")
 
 _VRAM_FUDGE_FACTOR = 1.15
 
+# Phase 2.1: eligible_after_fetch (server-signed manifest auto-download).
+# free_disk_gb must exceed the total download size by this factor -- not just
+# clear it -- so a fetch never lands a worker at (near-)zero free disk.
+_FETCH_DISK_MARGIN = 1.2
+
+# hello.protocol below which an agent cannot receive fetch_models at all (it
+# predates lazy hashing / lazy inventory sha256 -- see agentws._handle_hello).
+_MIN_AUTO_FETCH_PROTOCOL = 3
+
+_BYTES_PER_GB = 1024**3
+
 
 @dataclass
 class JobNeeds:
@@ -309,7 +320,13 @@ def estimate_vram(models: set[str], workers: list) -> float | None:
     return largest * _VRAM_FUDGE_FACTOR
 
 
-def verdict(worker, needs: JobNeeds, requirements_override: dict, all_workers: list) -> Verdict:
+def verdict(
+    worker,
+    needs: JobNeeds,
+    requirements_override: dict,
+    all_workers: list,
+    fetchable_models: dict[str, int] | None = None,
+) -> Verdict:
     """Judge whether `worker` can run a job needing `needs`.
 
     `requirements_override` is the job's advanced-override dict (optional
@@ -319,9 +336,29 @@ def verdict(worker, needs: JobNeeds, requirements_override: dict, all_workers: l
     backend ("cuda"/"rocm"/"mps"/"cpu"). Phase 1 derives nothing automatically
     -- a workflow is never inspected for backend hints, so this check only
     fires when the submitter set the override explicitly.
-    `all_workers` is the full federation worker list, used to determine
-    whether a model missing from `worker`'s inventory is fetchable from
-    another worker.
+    `all_workers` is the full federation worker list (kept for callers/other
+    assessment helpers that need it; `verdict` itself no longer searches
+    peer inventories for a missing model -- see `fetchable_models` below).
+
+    `fetchable_models` maps a missing model's name (in the SAME shape as
+    `needs.models` -- a workflow-declared, category-relative name, e.g.
+    `flux1-dev.safetensors` -- not a worker-inventory-relative path) to its
+    exact `size_bytes`, as published by the platform's signed
+    `model_manifest.entries()`. It is None by default -- "nothing is
+    fetchable" -- so a caller that doesn't compile it (every caller as of
+    Phase 2.1 Task 3; Task 4 wires dispatch/comfyapi up) gets the exact same
+    behavior as before this parameter existed: no missing model can ever
+    turn `eligible_after_fetch` real.
+
+    `eligible_after_fetch` requires ALL of: at least one required model
+    missing from `worker`'s own inventory; EVERY missing model present in
+    `fetchable_models`; `worker.protocol >= 3` (hello's opt-in fields did not
+    exist before protocol 3); `worker.auto_fetch` (agent-side opt-in, off by
+    default -- workers keep sovereignty over unattended downloads); and
+    `worker.dynamic["free_disk_gb"] > 1.2 * sum(missing sizes, in GB)`. That
+    margin is a hard gate with no "unknown -> warn" fallback (unlike the VRAM
+    offload gate below) -- an unattended multi-GB download is a bigger risk
+    to leave unproven than an offload is.
     """
     reasons: list[str] = []
     warnings: list[str] = []
@@ -408,37 +445,7 @@ def verdict(worker, needs: JobNeeds, requirements_override: dict, all_workers: l
     if not missing_models:
         return Verdict(kind="eligible", reasons=[], missing_models=[], warnings=warnings)
 
-    # Can every missing model be fetched from some other worker, and does
-    # this worker have enough free disk for the total size of what's missing?
-    #
-    # This one really is a SUM, unlike the VRAM estimate above: every fetched
-    # model lands on disk and stays there at the same time. Don't "correct"
-    # it to a max to match estimate_vram -- they measure different resources.
-    other_workers = [w for w in all_workers if w is not worker]
-    total_missing_size = 0.0
-    all_available_elsewhere = True
-    for model_name in missing_models:
-        found_size = None
-        for other in other_workers:
-            found, size = find_model(model_inventory(other), model_name)
-            if not found:
-                continue
-            # Present but with an unknown size still counts as fetchable; it
-            # just contributes nothing to the disk-headroom total.
-            candidate = size if size is not None else 0.0
-            if found_size is None or candidate > found_size:
-                found_size = candidate
-        if found_size is None:
-            all_available_elsewhere = False
-            break
-        total_missing_size += found_size
-
-    free_disk_gb = dynamic.get("free_disk_gb")
-    disk_ok = True
-    if isinstance(free_disk_gb, (int, float)):
-        disk_ok = free_disk_gb >= total_missing_size
-
-    if all_available_elsewhere and disk_ok:
+    if _eligible_after_fetch(worker, missing_models, fetchable_models, dynamic):
         return Verdict(
             kind="eligible_after_fetch",
             reasons=[f"missing_models:{','.join(missing_models)}"],
@@ -451,3 +458,33 @@ def verdict(worker, needs: JobNeeds, requirements_override: dict, all_workers: l
         reasons=[f"missing_models_unavailable:{','.join(missing_models)}"],
         missing_models=missing_models,
     )
+
+
+def _eligible_after_fetch(
+    worker, missing_models: list[str], fetchable_models: dict[str, int] | None, dynamic: dict
+) -> bool:
+    """All the eligible_after_fetch gates -- see `verdict`'s docstring."""
+    fetchable_models = fetchable_models or {}
+    if not all(name in fetchable_models for name in missing_models):
+        return False
+
+    protocol = getattr(worker, "protocol", None)
+    if not isinstance(protocol, int) or isinstance(protocol, bool):
+        protocol = 1
+    if protocol < _MIN_AUTO_FETCH_PROTOCOL:
+        return False
+
+    if not getattr(worker, "auto_fetch", False):
+        return False
+
+    total_missing_bytes = sum(fetchable_models[name] for name in missing_models)
+    total_missing_gb = total_missing_bytes / _BYTES_PER_GB
+
+    free_disk_gb = dynamic.get("free_disk_gb")
+    if not isinstance(free_disk_gb, (int, float)) or isinstance(free_disk_gb, bool):
+        # Unknown free disk cannot prove the margin holds -- refuse rather
+        # than warn (see the docstring on `verdict` for why this gate, unlike
+        # VRAM offload, has no unknown-warns-instead fallback).
+        return False
+
+    return free_disk_gb > _FETCH_DISK_MARGIN * total_missing_gb
