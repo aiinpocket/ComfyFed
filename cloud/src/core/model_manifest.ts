@@ -30,6 +30,20 @@
  * Hub DO's memory, and was forgotten on DO eviction. Persisting it makes
  * exclusion a plain SQL predicate every caller gets for free, with no
  * coordination and no staleness window.
+ *
+ * Phase 3.2 addendum, ported from `model_manifest.py`: `entries()` no
+ * longer requires a learned consensus row at all for the 11 curated models
+ * in `model_guide.SOURCES` that carry an operator-vouched `sha256`/
+ * `sizeBytes` -- a "zero-holder" curated model (no worker in the fleet has
+ * ever reported it, so no `model_hashes` row can exist) still gets a signed
+ * manifest entry, built straight from those guide values (see
+ * `guideHashEntry`). A learned consensus, once any worker reports one,
+ * always wins over the guide value for that entry; a guide/consensus
+ * mismatch is logged (deduped per (name, guide, consensus) triple via
+ * `MISMATCH_LOGGED`, a module-level Set -- fine for a single worker isolate,
+ * same as the Python process-level set) and the consensus hash is what
+ * ships. A conflicted `model_hashes` row still excludes the name outright,
+ * guide hash or not -- see `entries()`.
  */
 
 import { matchesModelName } from "./assess";
@@ -58,6 +72,12 @@ export interface ManifestEntry {
    * `entries()` shape (`peer` key only set when true, never `false`). */
   peer?: true;
 }
+
+// Guide-vs-consensus mismatch warnings already emitted (dedup; see
+// `entries()`) -- module-level Set, ported from Python's `_MISMATCH_LOGGED`.
+// Fine to keep per-isolate: a repeat mismatch after an isolate recycle just
+// logs once more, no correctness dependency on this surviving a cold start.
+const MISMATCH_LOGGED = new Set<string>();
 
 export interface RecordHashResult {
   /** True when this report conflicted with an already-learned hash for the
@@ -148,6 +168,43 @@ function splitInventoryName(inventoryName: string): [directory: string, name: st
   return [normalized.slice(0, slash), normalized.slice(slash + 1)];
 }
 
+/** Phase 3.2 zero-holder entry: sign a manifest entry straight from
+ * `source`'s operator-vouched `sha256`/`sizeBytes` when NO `model_hashes`
+ * row exists for it yet (nobody in the fleet holds the file, so no learned
+ * consensus is even possible) -- ports `model_manifest._guide_hash_entry`.
+ * Caller (`entries()`) only reaches here after confirming no row --
+ * conflicted or otherwise -- matches this name; a learned consensus, once
+ * any worker reports one, always takes over from this path (see
+ * `entries()`'s consensus-precedence branch).
+ *
+ * `peer` is deliberately never set on this entry: by construction there is
+ * no `model_hashes` row, so there is nothing for `rowHasSeeder` to have
+ * matched -- an entry from this path always means zero holders right now. */
+async function guideHashEntry(seedHex: string, source: modelGuide.ModelSource): Promise<ManifestEntry | null> {
+  if (source.sha256 === undefined || source.sizeBytes === undefined) return null;
+
+  if (source.name.includes("|") || source.directory.includes("|")) {
+    console.warn(
+      `model_manifest: skipping guide-hash manifest candidate with a '|' in name or directory ` +
+        `(payload delimiter): name=${JSON.stringify(source.name)} directory=${JSON.stringify(source.directory)}`
+    );
+    return null;
+  }
+
+  const payload = buildManifestEntryPayload(source.name, source.directory, source.sha256, source.sizeBytes);
+  const sig = await signHex(seedHex, new TextEncoder().encode(payload));
+
+  return {
+    name: source.name,
+    directory: source.directory,
+    url: source.officialUrl,
+    backup_url: source.backupUrl,
+    sha256: source.sha256,
+    size_bytes: source.sizeBytes,
+    sig,
+  };
+}
+
 /** Build a peer-only manifest entry for `row` (a non-conflicted
  * `model_hashes` row with no known download source), or null when it has no
  * online seeder right now -- ports `model_manifest._peer_only_entry`. `url`/
@@ -211,6 +268,11 @@ export async function entries(db: D1Database, store: R2Bucket, seedHex: string):
   const names = new Set([...Object.keys(modelGuide.SOURCES), ...Object.keys(harvested)]);
 
   const hashRows = await queries.getAllModelHashes(db);
+  // Phase 3.2: a conflicted row must still block the guide-hash fallback
+  // below -- "two reporters disagree" is not resolved by the operator's
+  // curated hash, so a name with one stays excluded exactly like before this
+  // phase.
+  const conflictedRows = await queries.getConflictedModelHashes(db);
 
   // M3 final-review fix: one worker query + one inventory parse per worker
   // for this whole call, instead of once per hash row below.
@@ -223,7 +285,31 @@ export async function entries(db: D1Database, store: R2Bucket, seedHex: string):
     if (source === null || !source.officialUrl) continue;
 
     const row = findHashRow(hashRows, name);
-    if (row === null) continue;
+    if (row === null) {
+      // Phase 3.2: no learned consensus for this (curated or harvested)
+      // source. A conflicted row still excludes it outright -- consensus
+      // precedence never lets a curated guide hash paper over a genuine
+      // reporter disagreement.
+      if (findHashRow(conflictedRows, name) !== null) continue;
+      const guideEntry = await guideHashEntry(seedHex, source);
+      if (guideEntry !== null) result.push(guideEntry);
+      continue;
+    }
+
+    if (source.sha256 !== undefined && source.sha256 !== row.sha256) {
+      const dedupKey = `${source.name} ${source.sha256} ${row.sha256}`;
+      // Dedup per (name, pair): entries() can be read repeatedly (every
+      // manifest fetch), and a standing mismatch would otherwise flood the
+      // log.
+      if (!MISMATCH_LOGGED.has(dedupKey)) {
+        MISMATCH_LOGGED.add(dedupKey);
+        console.warn(
+          `model_manifest: guide sha256 for ${source.name} differs from the learned consensus ` +
+            `(guide=${source.sha256} consensus=${row.sha256}) -- consensus wins, the manifest entry uses the ` +
+            `learned hash`
+        );
+      }
+    }
 
     // Defensive: `|` is the field delimiter in the signed payload below --
     // see model_manifest.py's docstring for why a harvested entry's

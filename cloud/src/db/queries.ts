@@ -1462,6 +1462,18 @@ export async function getAllModelHashes(db: D1Database): Promise<ModelHashRow[]>
   return results.map(rowToModelHash);
 }
 
+/** Every CONFLICTED learned hash row -- Phase 3.2 addendum, mirrors
+ * `model_manifest.entries()`'s `session.query(db.ModelHash).filter(conflict
+ * == True).all()`. A conflicted row must still exclude its name from the
+ * guide-hash fallback (see `core/model_manifest.ts`'s `entries()`): a
+ * reporter-vs-reporter disagreement is never papered over by the operator's
+ * curated hash, even for a name that would otherwise be zero-holder
+ * fetchable. */
+export async function getConflictedModelHashes(db: D1Database): Promise<ModelHashRow[]> {
+  const { results } = await db.prepare("SELECT * FROM model_hashes WHERE conflict = 1").all<ModelHashDbRow>();
+  return results.map(rowToModelHash);
+}
+
 // ---------------------------------------------------------------------------
 // P2P grants (Phase 3.1 addendum, Task 8) -- D1-backed equivalent of
 // `server/comfyfed_server/peer.py`'s in-memory `_grants` dict + `_grant_lock`.

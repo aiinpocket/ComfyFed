@@ -1,5 +1,6 @@
 import { describe, expect, it } from "vitest";
 import { modelNodes, verdict, partitionFleetFetchable, fleetWideGaps, type JobNeeds } from "../src/core/assess";
+import * as modelGuide from "../src/core/model_guide";
 import type { Worker } from "../src/db/queries";
 
 // Ports the `model_nodes` cases from tests/server/test_assess.py -- `extract`/
@@ -169,6 +170,34 @@ describe("verdict eligible_after_fetch", () => {
     const v = verdict(worker, jobNeeds, {}, [worker], { "ckpt.safetensors": 1 * GB });
     expect(v.kind).toBe("eligible_after_fetch");
     expect(v.warnings.some((w) => w.startsWith("vram_offload:"))).toBe(true);
+  });
+
+  it("Phase 3.2: eligible_after_fetch for a zero-holder curated model", () => {
+    // An empty-inventory worker with autoFetch opted in becomes
+    // eligible_after_fetch for a curated model that NOT A SINGLE fleet
+    // worker holds, as long as the manifest entry it was handed (built from
+    // model_guide.SOURCES' operator-vouched sha256/sizeBytes -- see
+    // model_manifest.ts's guideHashEntry) is present in fetchableModels.
+    // This is the same eligibleAfterFetch gate as always; Phase 3.2 only
+    // changes that fetchableModels can now contain a curated model's entry
+    // even when zero workers have ever reported it -- confirmed here using
+    // the REAL curated sizeBytes from model_guide.SOURCES rather than an
+    // arbitrary test fixture size.
+    const source = modelGuide.SOURCES["RealESRGAN_x4plus.pth"]!;
+    expect(source.sha256).toBeDefined();
+    expect(source.sizeBytes).toBeDefined();
+
+    const worker = fetchReadyWorker("w1", {
+      nodeClasses: ["UpscaleModelLoader"],
+      modelInventory: [], // zero holders anywhere, including this worker
+      dynamic: { free_disk_gb: 100.0 },
+    });
+    const jobNeeds = needs(["RealESRGAN_x4plus.pth"], ["UpscaleModelLoader"]);
+    const fetchable = { "RealESRGAN_x4plus.pth": source.sizeBytes! };
+
+    const v = verdict(worker, jobNeeds, {}, [worker], fetchable);
+    expect(v.kind).toBe("eligible_after_fetch");
+    expect(v.missingModels).toEqual(["RealESRGAN_x4plus.pth"]);
   });
 });
 

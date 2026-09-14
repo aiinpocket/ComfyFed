@@ -1,4 +1,4 @@
-import { afterEach, describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 import { env } from "cloudflare:test";
 import { call, db, SETUP_TOKEN } from "./helpers/http";
 import * as modelManifest from "../src/core/model_manifest";
@@ -133,9 +133,23 @@ describe("recordHash", () => {
 // --- entries(): the signed manifest -----------------------------------------
 
 describe("entries", () => {
-  it("excludes a model with no learned hash", async () => {
+  it("excludes a model with no learned hash and no guide hash (harvest()-sourced entries never carry one)", async () => {
+    await store().put(
+      "official_templates/hashless.json",
+      JSON.stringify({
+        nodes: [
+          {
+            id: 1,
+            properties: {
+              models: [{ name: "hashless_model.safetensors", url: "https://example.invalid/hashless_model.safetensors", directory: "checkpoints" }],
+            },
+          },
+        ],
+      })
+    );
+
     const entries = await modelManifest.entries(db(), store(), await seed());
-    expect(entries.some((e) => e.name === "clip_l.safetensors")).toBe(false);
+    expect(entries.some((e) => e.name === "hashless_model.safetensors")).toBe(false);
   });
 
   it("excludes a learned hash with no matching source", async () => {
@@ -212,6 +226,113 @@ describe("entries", () => {
     const entry = entries.find((e) => e.name === "clip_l.safetensors")!;
     expect(entry.size_bytes).toBe(bytesFor(0.5));
     expect(entry.size_bytes).not.toBe(bytesFor(0.23));
+  });
+});
+
+// --- entries(): Phase 3.2 zero-holder curated entries (guide-hash fallback) -
+
+describe("entries: Phase 3.2 zero-holder curated entries", () => {
+  it("synthesizes a zero-holder entry from the guide hash alone", async () => {
+    const entries = await modelManifest.entries(db(), store(), await seed());
+    const matches = entries.filter((e) => e.name === "clip_l.safetensors");
+    expect(matches).toHaveLength(1);
+    const entry = matches[0]!;
+
+    const source = modelGuide.SOURCES["clip_l.safetensors"]!;
+    expect(entry.directory).toBe("text_encoders");
+    expect(entry.url).toBe(source.officialUrl);
+    expect(entry.backup_url).toBe(source.backupUrl);
+    expect(entry.sha256).toBe(source.sha256);
+    expect(entry.size_bytes).toBe(source.sizeBytes);
+    expect("peer" in entry).toBe(false);
+
+    const pubkeyHex = await derivePublicKeyHexFromSeed(await seed());
+    const payload = `${entry.name}|${entry.directory}|${entry.sha256}|${entry.size_bytes}`;
+    expect(await verifyHex(pubkeyHex, new TextEncoder().encode(payload), entry.sig)).toBe(true);
+  });
+
+  it("all eleven curated models are zero-holder fetchable with no worker ever having reported anything", async () => {
+    const entries = await modelManifest.entries(db(), store(), await seed());
+    const names = new Set(entries.map((e) => e.name));
+    for (const curatedName of Object.keys(modelGuide.SOURCES)) {
+      expect(names.has(curatedName)).toBe(true);
+    }
+  });
+
+  it("a learned consensus wins over the guide hash and the mismatch is logged", async () => {
+    const source = modelGuide.SOURCES["clip_l.safetensors"]!;
+    const consensusSha = await shaHex("actually-reported-bytes");
+    expect(consensusSha).not.toBe(source.sha256);
+
+    const warnSpy = vi.spyOn(console, "warn").mockImplementation(() => {});
+    try {
+      await modelManifest.recordHash(db(), "w1", "text_encoders/clip_l.safetensors", source.sizeBytes!, consensusSha);
+      const entries = await modelManifest.entries(db(), store(), await seed());
+      const entry = entries.find((e) => e.name === "clip_l.safetensors")!;
+
+      expect(entry.sha256).toBe(consensusSha);
+      expect(entry.sha256).not.toBe(source.sha256);
+      expect(
+        warnSpy.mock.calls.some(
+          (call) =>
+            typeof call[0] === "string" &&
+            call[0].includes("clip_l.safetensors") &&
+            call[0].includes(source.sha256!) &&
+            call[0].includes(consensusSha)
+        )
+      ).toBe(true);
+    } finally {
+      warnSpy.mockRestore();
+    }
+  });
+
+  it("a consensus matching the guide hash logs no mismatch", async () => {
+    const source = modelGuide.SOURCES["clip_l.safetensors"]!;
+    const warnSpy = vi.spyOn(console, "warn").mockImplementation(() => {});
+    try {
+      await modelManifest.recordHash(db(), "w1", "text_encoders/clip_l.safetensors", source.sizeBytes!, source.sha256!);
+      const entries = await modelManifest.entries(db(), store(), await seed());
+      const entry = entries.find((e) => e.name === "clip_l.safetensors")!;
+
+      expect(entry.sha256).toBe(source.sha256);
+      expect(
+        warnSpy.mock.calls.some((call) => typeof call[0] === "string" && call[0].includes("differs from the learned consensus"))
+      ).toBe(false);
+    } finally {
+      warnSpy.mockRestore();
+    }
+  });
+
+  it("a conflicted row still excludes the name despite the guide hash", async () => {
+    const source = modelGuide.SOURCES["clip_l.safetensors"]!;
+    await modelManifest.recordHash(db(), "w1", "text_encoders/clip_l.safetensors", source.sizeBytes!, await shaHex("a"));
+    await modelManifest.recordHash(db(), "w2", "text_encoders/clip_l.safetensors", source.sizeBytes!, await shaHex("b"));
+
+    const entries = await modelManifest.entries(db(), store(), await seed());
+    expect(entries.some((e) => e.name === "clip_l.safetensors")).toBe(false);
+  });
+
+  it("a zero-holder guide-hash entry and an unrelated peer-only entry coexist with no double-entry", async () => {
+    // The guide-hash path (no model_hashes row at all for clip_l.safetensors)
+    // never touches `usedRows`, and the peer-only sweep only considers rows
+    // from `hashRows` -- confirms the two code paths don't collide or
+    // duplicate an entry for either name.
+    const sha = await shaHex("private");
+    const sizeBytes = bytesFor(1.0);
+    await modelManifest.recordHash(db(), "w1", "loras/my_style.safetensors", sizeBytes, sha);
+    await seedOnlineSeeder("seeder1", "loras/my_style.safetensors", sizeBytes, sha);
+
+    const entries = await modelManifest.entries(db(), store(), await seed());
+
+    const clipMatches = entries.filter((e) => e.name === "clip_l.safetensors");
+    expect(clipMatches).toHaveLength(1);
+    expect(clipMatches[0]!.url).not.toBeNull();
+    expect("peer" in clipMatches[0]!).toBe(false);
+
+    const peerMatches = entries.filter((e) => e.name === "my_style.safetensors");
+    expect(peerMatches).toHaveLength(1);
+    expect(peerMatches[0]!.url).toBeNull();
+    expect(peerMatches[0]!.peer).toBe(true);
   });
 });
 

@@ -38,6 +38,20 @@ export interface ModelSource {
   officialUrl: string;
   backupUrl: string | null;
   gated: boolean;
+  // Phase 3.2: operator-vouched trust anchor for the 11 curated entries
+  // ONLY -- `model_manifest.entries()` uses these to sign a fetch-manifest
+  // entry straight from the guide even when no worker's reported inventory
+  // has ever established a learned consensus hash for this (name,
+  // size_bytes) yet (the "zero-holder" case: every worker in the fleet is
+  // missing the model, so no `model_hashes` row can exist). A learned
+  // consensus row, once one exists, always wins over these -- see
+  // model_manifest.py's docstring and the Phase 3.2 addendum. `harvest()`-
+  // sourced entries never set these (no trustworthy value to curate for
+  // them), so they keep going through the consensus-only path exactly as
+  // before. Undefined (not just absent) mirrors Python's `sha256: str |
+  // None = None` default for a harvested/manually-built ModelSource.
+  sha256?: string;
+  sizeBytes?: number;
 }
 
 const GCS_BACKUP_BASE = "https://storage.googleapis.com/comfyfed-models/models";
@@ -47,7 +61,16 @@ const HEADER =
   "無法執行：聯邦裡所有已註冊的 worker 都缺少以下模型（含目前離線的）。" +
   "請在 worker 主機下載後放到指定資料夾，worker 會在 10 分鐘內自動掃描並回報，不需重啟。";
 
-function curated(name: string, directory: string, sizeGb: number, officialPage: string, filename: string, gated = false): ModelSource {
+function curated(
+  name: string,
+  directory: string,
+  sizeGb: number,
+  officialPage: string,
+  filename: string,
+  gated = false,
+  sha256?: string,
+  sizeBytes?: number
+): ModelSource {
   return {
     name,
     directory,
@@ -56,6 +79,8 @@ function curated(name: string, directory: string, sizeGb: number, officialPage: 
     officialUrl: `${officialPage}/resolve/main/${filename}`,
     backupUrl: `${GCS_BACKUP_BASE}/${directory}/${name}`,
     gated,
+    sha256,
+    sizeBytes,
   };
 }
 
@@ -70,7 +95,9 @@ export const SOURCES: Record<string, ModelSource> = {
     22.17,
     "https://huggingface.co/black-forest-labs/FLUX.1-dev",
     "flux1-dev.safetensors",
-    true
+    true,
+    "4610115bb0c89560703c892c59ac2742fa821e60ef5871b33493ba544683abd7",
+    23802932552
   ),
   "ae.safetensors": curated(
     "ae.safetensors",
@@ -78,28 +105,39 @@ export const SOURCES: Record<string, ModelSource> = {
     0.31,
     "https://huggingface.co/black-forest-labs/FLUX.1-dev",
     "ae.safetensors",
-    true
+    true,
+    "afc8e28272cd15db3919bacdb6918ce9c1ed22e96cb12c4d5ed0fba823529e38",
+    335304388
   ),
   "clip_l.safetensors": curated(
     "clip_l.safetensors",
     "text_encoders",
     0.23,
     "https://huggingface.co/comfyanonymous/flux_text_encoders",
-    "clip_l.safetensors"
+    "clip_l.safetensors",
+    false,
+    "660c6f5b1abae9dc498ac2d21e1347d2abdb0cf6c0c0c8576cd796491d9a6cdd",
+    246144152
   ),
   "t5xxl_fp16.safetensors": curated(
     "t5xxl_fp16.safetensors",
     "text_encoders",
     9.12,
     "https://huggingface.co/comfyanonymous/flux_text_encoders",
-    "t5xxl_fp16.safetensors"
+    "t5xxl_fp16.safetensors",
+    false,
+    "6e480b09fae049a72d2a8c5fbccb8d3e92febeb233bbe9dfe7256958a9167635",
+    9787841024
   ),
   "qwen3vl_32b_heretic_minimax_h3_nvfp4.safetensors": curated(
     "qwen3vl_32b_heretic_minimax_h3_nvfp4.safetensors",
     "text_encoders",
     14.61,
     "https://huggingface.co/sakamakismile/Qwen3-VL-32B-Heretic-MiniMax-H3-NVFP4",
-    "qwen3vl_32b_heretic_minimax_h3_nvfp4.safetensors"
+    "qwen3vl_32b_heretic_minimax_h3_nvfp4.safetensors",
+    false,
+    "a166c7bbbe66a22065159e478335fee4a633c4a3e3bb34c8e8ac4cc91bf4996f",
+    15683129587
   ),
   "minimax_h3_ref2va_pruned_int8_convrot.safetensors": {
     name: "minimax_h3_ref2va_pruned_int8_convrot.safetensors",
@@ -110,6 +148,8 @@ export const SOURCES: Record<string, ModelSource> = {
       "https://huggingface.co/Comfy-Org/MiniMax-H3/resolve/main/diffusion_models/minimax_h3_ref2va_pruned_int8_convrot.safetensors",
     backupUrl: `${GCS_BACKUP_BASE}/diffusion_models/minimax_h3_ref2va_pruned_int8_convrot.safetensors`,
     gated: false,
+    sha256: "9255f52b6677845ad238f20dfaafa94727053694127ab7f255c048f0f9365779",
+    sizeBytes: 20970379616,
   },
   "minimax_h3_video_vae_fp16.safetensors": {
     name: "minimax_h3_video_vae_fp16.safetensors",
@@ -119,6 +159,8 @@ export const SOURCES: Record<string, ModelSource> = {
     officialUrl: "https://huggingface.co/Comfy-Org/MiniMax-H3/resolve/main/vae/minimax_h3_video_vae_fp16.safetensors",
     backupUrl: `${GCS_BACKUP_BASE}/vae/minimax_h3_video_vae_fp16.safetensors`,
     gated: false,
+    sha256: "7c1f131492e7eddacaac9069a61b81bdd39de5cc96561e677c5eab1cdce5e522",
+    sizeBytes: 5207808496,
   },
   "minimax_h3_audio_vae_fp32.safetensors": {
     name: "minimax_h3_audio_vae_fp32.safetensors",
@@ -128,13 +170,18 @@ export const SOURCES: Record<string, ModelSource> = {
     officialUrl: "https://huggingface.co/Comfy-Org/MiniMax-H3/resolve/main/vae/minimax_h3_audio_vae_fp32.safetensors",
     backupUrl: `${GCS_BACKUP_BASE}/vae/minimax_h3_audio_vae_fp32.safetensors`,
     gated: false,
+    sha256: "8e505d95dd1561d47abd43d4238fd40d9bb1ae9e147ed0a4cba778d76ae4db48",
+    sizeBytes: 605254808,
   },
   "minimax_h3_ref2v_turbo_8step_v1.0_768p_comfyui_resized_avg_rank_64_bf16.safetensors": curated(
     "minimax_h3_ref2v_turbo_8step_v1.0_768p_comfyui_resized_avg_rank_64_bf16.safetensors",
     "loras",
     0.91,
     "https://huggingface.co/drbaph/MiniMax-H3-Turbo-Lora-ComfyUI",
-    "minimax_h3_ref2v_turbo_8step_v1.0_768p_comfyui_resized_avg_rank_64_bf16.safetensors"
+    "minimax_h3_ref2v_turbo_8step_v1.0_768p_comfyui_resized_avg_rank_64_bf16.safetensors",
+    false,
+    "374dfbce47a9f44b19a4d78b44c63bf613ba74110077582603b3d74ad3d47254",
+    978227408
   ),
   "qwen3vl_4b_bf16.safetensors": {
     name: "qwen3vl_4b_bf16.safetensors",
@@ -144,6 +191,8 @@ export const SOURCES: Record<string, ModelSource> = {
     officialUrl: "https://huggingface.co/Comfy-Org/Krea-2/resolve/main/text_encoders/qwen3vl_4b_bf16.safetensors",
     backupUrl: `${GCS_BACKUP_BASE}/text_encoders/qwen3vl_4b_bf16.safetensors`,
     gated: false,
+    sha256: "36f3ff447ef59201722e8f9ce6020c9819fdcfba6aa2608c4e09b1c0ce114e34",
+    sizeBytes: 8875719384,
   },
   "RealESRGAN_x4plus.pth": {
     name: "RealESRGAN_x4plus.pth",
@@ -153,6 +202,8 @@ export const SOURCES: Record<string, ModelSource> = {
     officialUrl: "https://github.com/xinntao/Real-ESRGAN/releases/download/v0.1.0/RealESRGAN_x4plus.pth",
     backupUrl: `${GCS_BACKUP_BASE}/upscale_models/RealESRGAN_x4plus.pth`,
     gated: false,
+    sha256: "4fa0d38905f75ac06eb49a7951b426670021be3018265fd191d2125df9d682f1",
+    sizeBytes: 67040989,
   },
 };
 
