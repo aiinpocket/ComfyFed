@@ -26,7 +26,7 @@ import {
   IconServerOff,
   IconX,
 } from '@tabler/icons-react';
-import { useCallback, useState } from 'react';
+import { useCallback, useState, useEffect } from 'react';
 import { useTranslation } from 'react-i18next';
 
 import { ApiError, api, type TokenBundle, type Worker } from '../api';
@@ -46,6 +46,21 @@ export function Workers() {
   const workers = data ?? [];
 
   const [addOpen, setAddOpen] = useState(false);
+  const [wheelUrl, setWheelUrl] = useState<string | null>(null);
+  useEffect(() => {
+    let cancelled = false;
+    api
+      .agentVersion()
+      .then((v) => {
+        if (!cancelled) setWheelUrl(v.wheel_url);
+      })
+      .catch(() => {
+        /* no published wheel (or older server) -- just hide the button */
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, []);
   const [confirmTarget, setConfirmTarget] = useState<Worker | null>(null);
   const [disabling, setDisabling] = useState(false);
 
@@ -83,9 +98,21 @@ export function Workers() {
         title={t('workers.title')}
         description={t('workers.subtitle')}
         action={
-          <Button leftSection={<IconPlus size={16} />} onClick={() => setAddOpen(true)}>
-            {t('workers.add')}
-          </Button>
+          <Group gap="sm">
+            {wheelUrl && (
+              <Button
+                variant="default"
+                component="a"
+                href={wheelUrl}
+                leftSection={<IconDownload size={16} />}
+              >
+                {t('workers.download_agent')}
+              </Button>
+            )}
+            <Button leftSection={<IconPlus size={16} />} onClick={() => setAddOpen(true)}>
+              {t('workers.add')}
+            </Button>
+          </Group>
         }
       />
 

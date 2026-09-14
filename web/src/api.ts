@@ -160,6 +160,14 @@ export interface WorkerDynamic {
 
 export type WorkerStatus = 'online' | 'busy' | 'offline';
 
+export interface AgentVersion {
+  latest: string;
+  min_supported: string;
+  wheel_url: string | null;
+  sha256: string | null;
+  platform_sig: string | null;
+}
+
 export interface Worker {
   id: string;
   name: string;
@@ -387,6 +395,10 @@ export const api = {
     });
     setCsrf(result.csrf);
     return result;
+  },
+
+  agentVersion(): Promise<AgentVersion> {
+    return getJson<AgentVersion>('/api/agent/version');
   },
 
   listWorkers(): Promise<Worker[]> {

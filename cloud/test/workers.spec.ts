@@ -7,6 +7,7 @@ import { verifyAgentRequest } from "../src/lib/verify_agent";
 import { derivePublicKeyHexFromSeed } from "../src/lib/ed25519";
 import { hexToBytes, bytesToHex } from "../src/lib/hex";
 import workersApp from "../src/routes/workers";
+import worker from "../src/index";
 import golden from "./fixtures/golden.json";
 
 // vitest-pool-workers isolates D1 storage per test FILE (see task-1-report.md
@@ -579,5 +580,82 @@ describe("POST /api/workers/:id/disable", () => {
     });
     expect(r.status).toBe(404);
     expect(r.body.error.code).toBe("workers.not_found");
+  });
+});
+
+describe("agent releases (cloud publish-agent parity)", () => {
+  const WHEEL = new TextEncoder().encode("fake-wheel-bytes-for-test");
+  const FILENAME = "comfyfed-9.9.9-py3-none-any.whl";
+
+  afterEach(async () => {
+    await store().delete("releases/" + FILENAME);
+  });
+
+  async function rawGet(path: string): Promise<Response> {
+    const request = new Request("https://example.com" + path);
+    const ctx = createExecutionContext();
+    const response = await worker.fetch(request, env as any, ctx);
+    await waitOnExecutionContext(ctx);
+    return response;
+  }
+
+  async function publish(): Promise<{ cookie: string | null; csrf: string; body: any; status: number }> {
+    const { cookie, csrf } = await adminSession();
+    const r = await call(`/api/workers/agent-release?filename=${FILENAME}`, {
+      method: "POST",
+      rawBody: WHEEL,
+      cookie,
+      headers: { "X-CSRF": csrf },
+    });
+    return { cookie, csrf, body: r.body, status: r.status };
+  }
+
+  it("publishes a wheel: settings written, version parsed, signature verifies", async () => {
+    const { body, status } = await publish();
+    expect(status).toBe(200);
+    expect(body.agent_latest).toBe("9.9.9");
+    expect(body.agent_min_supported).toBe("9.9.9");
+    expect(body.agent_wheel_url).toBe(`/api/agent/releases/${FILENAME}`);
+
+    const seed = await resolvePlatformSeed(db(), undefined);
+    const pubkey = await derivePublicKeyHexFromSeed(seed);
+    const payload = `9.9.9|${body.agent_wheel_sha256}`;
+    expect(await verifyHex(pubkey, new TextEncoder().encode(payload), body.agent_wheel_sig)).toBe(true);
+
+    const version = await call("/api/agent/version");
+    expect(version.body.latest).toBe("9.9.9");
+    expect(version.body.wheel_url).toBe(`/api/agent/releases/${FILENAME}`);
+    expect(version.body.sha256).toBe(body.agent_wheel_sha256);
+  });
+
+  it("serves the published wheel bytes back unauthenticated", async () => {
+    await publish();
+    const r = await rawGet(`/api/agent/releases/${FILENAME}`);
+    expect(r.status).toBe(200);
+    expect(r.headers.get("Content-Type")).toBe("application/octet-stream");
+    expect(new Uint8Array(await r.arrayBuffer())).toEqual(WHEEL);
+  });
+
+  it("404s an unknown release and traversal-shaped names", async () => {
+    expect((await rawGet("/api/agent/releases/nope.whl")).status).toBe(404);
+    expect((await rawGet("/api/agent/releases/..%2Fsecrets.whl")).status).toBe(404);
+  });
+
+  it("rejects publish without admin/CSRF and with a non-.whl filename", async () => {
+    const anon = await call(`/api/workers/agent-release?filename=${FILENAME}`, {
+      method: "POST",
+      rawBody: WHEEL,
+    });
+    expect([401, 403]).toContain(anon.status);
+
+    const { cookie, csrf } = await adminSession();
+    const bad = await call("/api/workers/agent-release?filename=evil.txt", {
+      method: "POST",
+      rawBody: WHEEL,
+      cookie,
+      headers: { "X-CSRF": csrf },
+    });
+    expect(bad.status).toBe(400);
+    expect(bad.body.error.code).toBe("agent.bad_release_filename");
   });
 });

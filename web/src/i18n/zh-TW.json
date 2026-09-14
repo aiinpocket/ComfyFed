@@ -223,6 +223,7 @@
     "title": "Worker",
     "subtitle": "這個聯邦裡已註冊的 GPU Worker。",
     "add": "新增 Worker",
+    "download_agent": "下載 Agent 安裝包",
     "add_title": "新增 Worker",
     "add_body": "先為要加入的機器取個名字，ComfyFed 會發一份一次性的註冊包給它的 agent。",
     "name_label": "Worker 名稱",

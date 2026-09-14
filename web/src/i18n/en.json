@@ -223,6 +223,7 @@
     "title": "Workers",
     "subtitle": "Registered GPU workers in this federation.",
     "add": "Add worker",
+    "download_agent": "Download agent package",
     "add_title": "Add a worker",
     "add_body": "Name the machine you are about to enrol. ComfyFed issues a one-time registration bundle for its agent.",
     "name_label": "Worker name",

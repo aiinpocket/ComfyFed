@@ -48,11 +48,12 @@ import {
   insertRegisterToken,
   getRegisterToken,
   claimRegisterToken,
+  setSetting,
   toSqliteTimestamp,
   sqliteTimestampToIsoformat,
 } from "../db/queries";
 import { derivePublicKeyHexFromSeed } from "../lib/ed25519";
-import { signRegistration } from "../lib/signing";
+import { signRegistration, signRelease } from "../lib/signing";
 import { boundedGunzip, ObjectInfoTooLarge, InvalidGzip } from "../lib/gzip";
 import { sha256Hex } from "../lib/hex";
 import { bytesToBase64Url } from "../lib/base64";
@@ -285,6 +286,86 @@ app.get("/api/agent/version", async (c) => {
     wheel_url: await setting(AGENT_WHEEL_URL_KEY, null),
     sha256: await setting(AGENT_WHEEL_SHA256_KEY, null),
     platform_sig: await setting(AGENT_WHEEL_SIG_KEY, null),
+  });
+});
+
+// --- agent wheel releases (cloud parity of workers.py publish-agent) ---------
+//
+// `GET /api/agent/releases/{filename}` serves a published wheel from R2
+// (`releases/<basename>`), unauthenticated like the Python route -- a fresh
+// installer downloads the wheel before it has any credentials, and the
+// integrity story is the sha256 + platform signature `/api/agent/version`
+// advertises, not the transport. `POST /api/workers/agent-release`
+// (admin+CSRF) is the cloud stand-in for the `comfyfed-server publish-agent`
+// CLI: raw wheel bytes in the body, `?filename=` (basename, must end .whl),
+// optional `?latest=`/`?min_supported=` overriding the version parsed from
+// the filename (`comfyfed-<version>-py3-none-any.whl`). Stores the wheel,
+// signs `{version}|{sha256}` with the platform key (signRelease, byte-parity
+// with main.py's publish_agent), and writes the five `agent_*` settings that
+// `GET /api/agent/version` serves.
+
+const RELEASES_PREFIX = "releases/";
+
+function wheelVersionFromFilename(filename: string): string | null {
+  const m = /^[A-Za-z0-9_.]+-([0-9][A-Za-z0-9_.!+]*)-/.exec(filename);
+  return m?.[1] ?? null;
+}
+
+app.get("/api/agent/releases/:filename", async (c) => {
+  const raw = c.req.param("filename");
+  // Basename-only, mirroring workers.py's os.path.basename guard; reject
+  // separators and parent refs outright rather than normalizing them.
+  if (!raw || raw.includes("/") || raw.includes("\\") || raw.includes("..")) {
+    return errorJson(c, 404, "agent.release_not_found", "Release file not found.");
+  }
+  const obj = await c.env.STORE.get(RELEASES_PREFIX + raw);
+  if (obj === null) {
+    return errorJson(c, 404, "agent.release_not_found", "Release file not found.");
+  }
+  return new Response(obj.body, {
+    headers: {
+      "Content-Type": "application/octet-stream",
+      "Content-Length": String(obj.size),
+      "Content-Disposition": `attachment; filename="${raw}"`,
+    },
+  });
+});
+
+app.post("/api/workers/agent-release", requireCsrf, async (c) => {
+  const filename = c.req.query("filename") ?? "";
+  if (!/^[A-Za-z0-9][A-Za-z0-9_.+-]*\.whl$/.test(filename)) {
+    return errorJson(c, 400, "agent.bad_release_filename", "filename must be a .whl basename.");
+  }
+  const parsed = wheelVersionFromFilename(filename);
+  const latest = c.req.query("latest") || parsed || null;
+  if (!latest) {
+    return errorJson(c, 400, "agent.bad_release_version", "Cannot parse a version from the filename; pass ?latest=.");
+  }
+  const minSupported = c.req.query("min_supported") || latest;
+
+  const body = new Uint8Array(await c.req.arrayBuffer());
+  if (body.byteLength === 0) {
+    return errorJson(c, 400, "agent.empty_release", "Empty wheel body.");
+  }
+  const sha256 = await sha256Hex(body);
+  await c.env.STORE.put(RELEASES_PREFIX + filename, body);
+
+  const seed = await resolvePlatformSeed(c.env.DB, c.env.PLATFORM_ED25519_SEED);
+  const { signatureHex: sig } = await signRelease(seed, latest, sha256);
+
+  const wheelUrl = `/api/agent/releases/${filename}`;
+  await setSetting(c.env.DB, AGENT_LATEST_KEY, latest);
+  await setSetting(c.env.DB, AGENT_MIN_SUPPORTED_KEY, minSupported);
+  await setSetting(c.env.DB, AGENT_WHEEL_URL_KEY, wheelUrl);
+  await setSetting(c.env.DB, AGENT_WHEEL_SHA256_KEY, sha256);
+  await setSetting(c.env.DB, AGENT_WHEEL_SIG_KEY, sig);
+
+  return c.json({
+    agent_latest: latest,
+    agent_min_supported: minSupported,
+    agent_wheel_url: wheelUrl,
+    agent_wheel_sha256: sha256,
+    agent_wheel_sig: sig,
   });
 });
 
