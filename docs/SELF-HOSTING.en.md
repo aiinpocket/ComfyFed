@@ -344,6 +344,14 @@ comfyfed-server publish-agent dist/comfyfed_agent-0.2.0-py3-none-any.whl \
 
 Once published, an agent asks `/api/agent/version` at startup, compares versions, downloads the wheel, and installs it only if both the sha256 and the platform signature verify. **The signed payload is `{version}|{sha256}`** — binding the version into the signature means an old release's signature cannot be replayed to advertise a newer version, so a downgrade attack does not work.
 
+**Cloud deployment (Cloudflare Workers)**: there is no CLI on the cloud edition — use the admin API instead. After logging in, POST the wheel directly (it is stored under `releases/` in R2; the signature and the five settings are written exactly as the CLI does):
+
+```bash
+curl -X POST "https://<your-platform-url>/api/workers/agent-release?filename=comfyfed-0.1.0-py3-none-any.whl"   -H "X-CSRF: <csrf from login>" -b cookies.txt   --data-binary @dist/comfyfed-0.1.0-py3-none-any.whl
+```
+
+Once published, the console's Workers page shows a "Download agent package" button, and anyone can fetch `/api/agent/releases/<filename>` without logging in — integrity is guarded by the sha256 + platform signature that `/api/agent/version` advertises, same as the self-hosted edition.
+
 ⚠ **The platform signing key may be kept offline** (as the spec recommends). If you would rather not keep `data/keys/platform.key` on the live host, skip `publish-agent`: sign `"{version}|{sha256}"` yourself on an offline machine and set `agent_latest`, `agent_min_supported`, `agent_wheel_url`, `agent_wheel_sha256` and `agent_wheel_sig` by hand. The agent verifies them identically either way.
 
 ### Known limitations

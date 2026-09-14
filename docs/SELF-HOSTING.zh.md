@@ -344,6 +344,14 @@ comfyfed-server publish-agent dist/comfyfed_agent-0.2.0-py3-none-any.whl \
 
 發布完成後，agent 啟動時會去問 `/api/agent/version`，比對版本、下載 wheel、驗 sha256 與簽章，全部通過才安裝並重啟。**簽章內容是 `{版本}|{sha256}`**──把版本綁進簽章裡，就沒辦法拿舊版本的簽章去冒充新版本，避免被降版攻擊。
 
+**雲端版（Cloudflare Workers）發布方式**：雲端沒有 CLI，改用管理員 API——登入後把 wheel 直接 POST 上去（wheel 存進 R2 的 `releases/`，簽章與五個設定的寫法與 CLI 完全相同）：
+
+```bash
+curl -X POST "https://<你的平台網址>/api/workers/agent-release?filename=comfyfed-0.1.0-py3-none-any.whl"   -H "X-CSRF: <登入拿到的 csrf>" -b cookies.txt   --data-binary @dist/comfyfed-0.1.0-py3-none-any.whl
+```
+
+發布後主控台 Workers 頁會出現「下載 Agent 安裝包」按鈕，任何人都能從 `/api/agent/releases/<檔名>` 下載（下載本身不需登入——完整性由 `/api/agent/version` 公告的 sha256＋平台簽章把關，和自架版一致）。
+
 ⚠ **平台簽章金鑰可以離線保管**（規格建議做法）：如果不想把 `data/keys/platform.key` 放在線上主機，可以不跑 `publish-agent`，改成在離線機器上自己對 `"{版本}|{sha256}"` 簽名，再手動把 `agent_latest`／`agent_min_supported`／`agent_wheel_url`／`agent_wheel_sha256`／`agent_wheel_sig` 五個設定寫進資料庫。agent 端的驗證方式完全一樣。
 
 ### 已知限制
