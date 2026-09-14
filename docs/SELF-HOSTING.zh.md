@@ -202,22 +202,26 @@ UPDATE model_hashes SET conflict = 0 WHERE name = '...' AND size_bytes = ...;
 {
   "peer_serve": true,
   "peer_listen_port": 8850,
-  "peer_advertise_host": "your-lan-or-public-ip"
+  "peer_advertise_host": "your-lan-or-public-ip",
+  "peer_bind_host": "0.0.0.0"
 }
 ```
 
-- `peer_serve`（預設 `false`）：關閉時完全不啟動分享用的 HTTP 服務，也不會在握手／心跳裡通告任何 peer 位址。
-- `peer_listen_port`：必填才會真正啟用（只設 `peer_serve: true` 沒給埠號等於沒開）。這個 listener 是 agent 內建的 stdlib HTTP server，不另外裝依賴，只服務 `GET /peer/models/<檔名>` 這一條路徑。
+- `peer_serve`（預設 `false`）：關閉時完全不啟動分享用的 HTTP 服務，也不會在握手（hello）裡通告任何 peer 位址（僅握手時通告一次，不是每次心跳都帶）。
+- `peer_listen_port`：必填才會真正啟用（只設 `peer_serve: true` 沒給埠號等於沒開）。這個 listener 是 agent 內建的 stdlib HTTP server，不另外裝依賴，只服務 `GET /peer/models/<檔名>` 這一條路徑；每個連線有 30 秒的 socket timeout，避免閒置連線一直占著執行緒。
 - `peer_advertise_host`（選填）：不設的話 agent 會自動偵測區網 IP 來通告；如果 worker 在 NAT 後面而其他成員需要透過固定 IP／DDNS 連進來，在這裡指定對外可連到的位址。
+- `peer_bind_host`（選填，預設 `"0.0.0.0"`）：listener 綁定的介面。**如果這台機器有公網 IP**（例如租用的 GPU 機器），預設值會讓分享服務直接暴露在網際網路上——想限制在區網／VPN 內，把這裡改成區網介面 IP（例如 `192.168.1.10`）或 `127.0.0.1`（僅搭配反向代理使用）。
 - **防火牆記得放行 `peer_listen_port` 這個埠**，否則平台配對到你當種子後，拉方仍然連不進來（會落回官方載點鏈，不會卡住工作，但你這份模型等於沒發揮作用）。
 - **分享與「停用接單」彼此獨立**：把 worker 在 Workers 頁停用（不再接新工作）不會影響它繼續分享已有的模型；反過來，`peer_serve: false` 只關閉分享，不影響它正常接工作。兩者可以任意組合。
 
 **安全模型**：分享模型的每一次傳輸都要憑證，沒有任何匿名路徑。
 
 - 拉方（已通過簽章驗證的 agent 請求）向平台要一張 **Ed25519 簽發的傳輸憑證**，**10 分鐘效期**，綁死單一檔案＋單一拉方＋單一種子——不是讓任何 worker 可以長期持有憑證到處跑，過期就得重新申請。
-- 種子端（分享模型的那台 worker）**每一個請求都驗證**這張憑證：平台簽章、有沒有過期、`seeder_id` 是不是自己、檔名是否與本機庫存相符，缺憑證／驗簽失敗／過期／範圍不符一律 **fail-closed 回 403**，不洩漏任何細節。
+- 種子端（分享模型的那台 worker）**每一個請求都驗證**這張憑證：平台簽章、有沒有過期、`seeder_id` 是不是自己、檔名是否與本機庫存相符，缺憑證／驗簽失敗／過期／範圍不符一律 **fail-closed 回 403**，不洩漏任何細節（連「這個檔名存不存在」都不會用 404/403 的差異洩漏出去——沒有憑證一律 403）。
 - worker 之間**不互留常駐信任**——今天你把模型分享給某個成員，不代表對方之後可以不憑證再連進來；每次傳輸都要平台重新核發。
 - 逐塊 hash 只用來提早中止壞塊，**最終整檔 SHA-256 驗證永遠會做**，跟一般模型下載的鐵律一樣，分塊表本身不是信任來源。
+- **傳輸目前走明文 HTTP**：憑證本身只授權「誰能拉哪個檔」，不代表內容有加密——`X-ComfyFed-Grant` 這個標頭跟模型內容的位元組，都是在明文 HTTP 上傳輸的。憑證本身就是唯一的存取憑證（bearer token），10 分鐘內任何看得到這個標頭的人都能冒充拉方把檔案拉走。如果你的成員之間走的是公開網路，建議只在可信任的 LAN 或 VPN（Tailscale、WireGuard 之類）裡開啟這項功能，不要對外網開放 `peer_listen_port`。
+- **通告位址由 worker 自行申報，平台不代驗**：`peer_advertise_host`／自動偵測到的 IP 不會被平台反查或探測，一個惡意 worker 理論上可以申報一個平台或其他成員內網才連得到的位址（例如 `127.0.0.1`、`169.254.169.254`、其他 worker 的內網 IP），誘使其他 agent 對那個位址發出帶 Range 的 GET 請求。回應會因為簽章/格式不符而被丟棄，不會外洩任何資料，但這仍是一個未經地址過濾的請求轉發面——`peer_url` 的信任範圍就等於「這個 worker 本身的註冊信任範圍」，不多也不少。
 
 **頻寬入帳**：種子 worker 完成一張憑證的服務量後會回報給平台，記入收據帳本（`kind: p2p_upload`，不計費、不算 GPU 秒數），Reports 頁的貢獻報表會多一欄「P2P 上傳量」；Workers 頁也會顯示這台 worker 目前是否在分享模型，以及通告出去的位址。
 

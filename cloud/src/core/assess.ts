@@ -467,6 +467,28 @@ export function verdict(
     };
   }
 
+  // L6 final-review fix (ports assess.py's verdict): a protocol<4 worker
+  // blocked specifically because a missing model is peer-only gets a
+  // distinguishable reason from the generic "unavailable" -- see the
+  // Python docstring for why only this one condition (the protocol gate,
+  // which this function has direct evidence for) is distinguished; a
+  // peer-only model whose seeder is currently offline still falls into the
+  // generic branch below, same as a model that never existed.
+  const fetchable = fetchableModels || {};
+  const peerOnlySet = peerOnlyModels || new Set<string>();
+  const blockedByPeerProtocol =
+    missingModels.every((name) => name in fetchable) &&
+    missingModels.some((name) => peerOnlySet.has(name)) &&
+    workerProtocol(worker) < MIN_PEER_FETCH_PROTOCOL;
+  if (blockedByPeerProtocol) {
+    return {
+      kind: "ineligible",
+      reasons: [`missing_models_peer_protocol:${missingModels.join(",")}`],
+      missingModels,
+      warnings: [],
+    };
+  }
+
   return {
     kind: "ineligible",
     reasons: [`missing_models_unavailable:${missingModels.join(",")}`],

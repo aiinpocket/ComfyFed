@@ -7,6 +7,9 @@ import type { TFunction } from 'i18next';
  *   missing_nodes:A,B
  *   missing_models:A,B                (fetchable from a peer — soft)
  *   missing_models_unavailable:A,B    (nowhere in the federation — hard)
+ *   missing_models_peer_protocol:A,B  (peer-only model, worker's protocol
+ *                                      too old to speak the peer-pull
+ *                                      protocol — hard; final-review L6)
  *   vram:25.5>15.9+63.6               (needs > VRAM + system RAM — hard)
  *
  * ...and the shapes emitted as non-blocking `warnings` on an ELIGIBLE
@@ -52,6 +55,13 @@ export function parseReason(raw: string): ParsedReason {
     case 'missing_models_unavailable':
       return {
         key: 'missing_models_unavailable',
+        values: { items: rest.split(',').filter(Boolean).join(LIST_SEPARATOR) },
+        tone: 'error',
+      };
+
+    case 'missing_models_peer_protocol':
+      return {
+        key: 'missing_models_peer_protocol',
         values: { items: rest.split(',').filter(Boolean).join(LIST_SEPARATOR) },
         tone: 'error',
       };

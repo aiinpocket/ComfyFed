@@ -466,6 +466,32 @@ def verdict(
             warnings=warnings,
         )
 
+    # L6 final-review fix: a protocol<4 worker blocked specifically because a
+    # missing model is peer-only (no URL at all, so it can ONLY ever be
+    # fetched over the peer-grant/chunk-pull protocol this worker's protocol
+    # version can't speak) gets a distinguishable reason from the generic
+    # "unavailable" -- otherwise it's indistinguishable in the UI from "this
+    # model doesn't exist in the federation" (spec: 判定透明列在 UI 原因裡，
+    # 不是靜默失敗). This only covers the protocol gate, the one condition
+    # `verdict` actually has direct evidence for; a peer-only model whose
+    # seeder happens to be offline right now is not distinguishable here at
+    # all (the manifest simply omits it, exactly like a model that never
+    # existed -- see model_manifest._peer_only_entry), so it still falls into
+    # the generic branch below.
+    _fetchable = fetchable_models or {}
+    _peer_only = peer_only_models or frozenset()
+    blocked_by_peer_protocol = (
+        all(name in _fetchable for name in missing_models)
+        and any(name in _peer_only for name in missing_models)
+        and _worker_protocol(worker) < _MIN_PEER_FETCH_PROTOCOL
+    )
+    if blocked_by_peer_protocol:
+        return Verdict(
+            kind="ineligible",
+            reasons=[f"missing_models_peer_protocol:{','.join(missing_models)}"],
+            missing_models=missing_models,
+        )
+
     return Verdict(
         kind="ineligible",
         reasons=[f"missing_models_unavailable:{','.join(missing_models)}"],

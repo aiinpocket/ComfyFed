@@ -457,6 +457,7 @@ async def _request_peer_grant(
     name: str,
     size_bytes: int,
     client_factory: Callable[..., httpx.AsyncClient],
+    is_url_sourced: bool = False,
 ) -> Optional[dict]:
     """`POST /api/agent/peer-grant` to the issuing platform. Returns the
     response body (`{"grant": {...+sig}, "peer_url": ..., "chunk_sha256s":
@@ -464,7 +465,15 @@ async def _request_peer_grant(
     (`peer.no_seeder`/`peer.no_model`)/400 (`peer.already_has_model`) refusal,
     an unexpected status, or a network failure all just fall back to the URL
     chain the same way, logged once at info level (never a warning/error:
-    "no peer available" is an expected, routine outcome, not a fault)."""
+    "no peer available" is an expected, routine outcome, not a fault) --
+    EXCEPT (L5 final-review fix) a `peer.no_model` 404 for a URL-sourced
+    entry (`is_url_sourced=True`), which is also the symptom of the guide/
+    inventory directory mismatch `_inventory_name` can hit (model_guide's
+    `directory` and `db.ModelHash.name`'s leniently-matched directory
+    disagreeing -- see `model_manifest._find_hash_row`): that one gets a
+    WARNING naming the possibility, since it otherwise silently degrades to
+    "no peer available" indistinguishably from the routine case, every
+    dispatch, with no signal pointing at the actual cause."""
     body = json.dumps({"name": name, "size_bytes": size_bytes}).encode()
     try:
         headers = signing.signed_headers(platform_entry, "POST", _PEER_GRANT_PATH, body)
@@ -472,10 +481,25 @@ async def _request_peer_grant(
         async with client_factory(base_url=platform_entry.platform_url) as client:
             resp = await client.post(_PEER_GRANT_PATH, content=body, headers=headers)
         if resp.status_code != 200:
-            logger.info(
-                "fetcher: peer grant unavailable for %r (status=%s), falling back to URL chain",
-                name, resp.status_code,
-            )
+            code = None
+            if is_url_sourced and resp.status_code == 404:
+                try:
+                    code = resp.json().get("error", {}).get("code")
+                except Exception:
+                    code = None
+            if code == "peer.no_model":
+                logger.warning(
+                    "fetcher: peer grant unavailable for %r (peer.no_model) -- this can mean the "
+                    "platform's learned model_hashes name disagrees with this entry's model_guide "
+                    "directory (a guide/inventory directory mismatch), not just \"no consensus hash "
+                    "yet\"; falling back to URL chain",
+                    name,
+                )
+            else:
+                logger.info(
+                    "fetcher: peer grant unavailable for %r (status=%s), falling back to URL chain",
+                    name, resp.status_code,
+                )
             return None
         return resp.json()
     except Exception as exc:
@@ -655,12 +679,14 @@ async def _fetch_via_peer(
     size_bytes = entry.get("size_bytes")
     inventory_name = _inventory_name(entry)
     part_path = target_path + _PART_SUFFIX
+    is_url_sourced = entry.get("url") is not None
 
     grant_response = await _request_peer_grant(
         platform_entry=platform_entry,
         name=inventory_name,
         size_bytes=size_bytes,
         client_factory=platform_client_factory,
+        is_url_sourced=is_url_sourced,
     )
     if grant_response is None:
         return False
@@ -711,6 +737,7 @@ async def _fetch_via_peer(
                 name=inventory_name,
                 size_bytes=size_bytes,
                 client_factory=platform_client_factory,
+                is_url_sourced=is_url_sourced,
             )
             if new_grant_response is None:
                 logger.info(

@@ -1242,6 +1242,82 @@ async def test_peer_only_entry_failure_is_fetch_failure(tmp_path):
     assert not (tmp_path / "checkpoints" / "model.bin.part").exists()
 
 
+async def test_peer_no_model_404_for_a_url_sourced_entry_logs_a_warning(tmp_path, caplog):
+    """L5 final-review fix: a `peer.no_model` 404 for a URL-sourced entry can
+    mean the platform's model_hashes name disagrees with this entry's
+    model_guide directory (a guide/inventory directory mismatch) -- silently
+    falling back to the URL chain with no signal used to make this
+    undiagnosable. One WARNING names the possibility."""
+    import logging
+
+    manifest_key, manifest_pubkey_hex = _keypair()
+    content = b"x" * 100
+    entry = _signed_entry(
+        manifest_key, name="model.bin", directory="checkpoints", content=content,
+        url="http://models.example/f.bin",
+    )
+
+    def _no_model(path, content, headers):
+        request = httpx.Request("POST", "http://platform.example" + path)
+        return httpx.Response(404, json={"error": {"code": "peer.no_model"}}, request=request)
+
+    recorded = []
+    url_client_cls = _client_factory([_StreamSpec(chunks=[content])], recorded)
+
+    with caplog.at_level(logging.WARNING, logger="comfyfed_agent.fetcher"):
+        await fetcher.fetch_and_verify_models(
+            entries=[entry],
+            platform_pubkey_hex=manifest_pubkey_hex,
+            models_dir=str(tmp_path),
+            max_fetch_gb=100,
+            cancel_event=asyncio.Event(),
+            report_progress=_noop_progress,
+            client_factory=url_client_cls,
+            platform_entry=_puller_platform_entry(),
+            peer_client_factory=httpx.AsyncClient,
+            platform_client_factory=_platform_client_factory(_no_model),
+        )
+
+    assert recorded == [entry["url"]]  # fell back to the URL chain, as before
+    assert any("directory mismatch" in r.message for r in caplog.records)
+
+
+async def test_peer_no_seeder_404_does_not_log_a_warning(tmp_path, caplog):
+    """A plain `peer.no_seeder` 404 (nobody online has it right now) is the
+    routine case -- must stay at info, not warn."""
+    import logging
+
+    manifest_key, manifest_pubkey_hex = _keypair()
+    content = b"x" * 100
+    entry = _signed_entry(
+        manifest_key, name="model.bin", directory="checkpoints", content=content,
+        url="http://models.example/f.bin",
+    )
+
+    def _no_seeder(path, content, headers):
+        request = httpx.Request("POST", "http://platform.example" + path)
+        return httpx.Response(404, json={"error": {"code": "peer.no_seeder"}}, request=request)
+
+    recorded = []
+    url_client_cls = _client_factory([_StreamSpec(chunks=[content])], recorded)
+
+    with caplog.at_level(logging.WARNING, logger="comfyfed_agent.fetcher"):
+        await fetcher.fetch_and_verify_models(
+            entries=[entry],
+            platform_pubkey_hex=manifest_pubkey_hex,
+            models_dir=str(tmp_path),
+            max_fetch_gb=100,
+            cancel_event=asyncio.Event(),
+            report_progress=_noop_progress,
+            client_factory=url_client_cls,
+            platform_entry=_puller_platform_entry(),
+            peer_client_factory=httpx.AsyncClient,
+            platform_client_factory=_platform_client_factory(_no_seeder),
+        )
+
+    assert caplog.records == []
+
+
 async def test_cancel_mid_peer_pull_cleans_up(tmp_path, monkeypatch):
     """Cancellation mid peer-pull raises JobCancelled and removes the
     `.part` -- the same contract the URL path already guarantees, reused

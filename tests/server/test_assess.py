@@ -319,7 +319,11 @@ def test_verdict_peer_only_model_ineligible_at_protocol_3():
         peer_only_models=frozenset({"peer.safetensors"}),
     )
     assert v.kind == "ineligible"
-    assert any(r.startswith("missing_models_unavailable:") for r in v.reasons)
+    # L6 final-review fix: distinguishable from the generic "nowhere in the
+    # federation" reason -- this worker's protocol is specifically the
+    # blocker, not a genuinely unfetchable model.
+    assert any(r.startswith("missing_models_peer_protocol:") for r in v.reasons)
+    assert not any(r.startswith("missing_models_unavailable:") for r in v.reasons)
 
 
 def test_verdict_peer_only_model_eligible_after_fetch_at_protocol_4():

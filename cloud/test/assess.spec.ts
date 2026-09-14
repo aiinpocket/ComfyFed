@@ -238,6 +238,11 @@ describe("verdict / partitionFleetFetchable: peerOnlyModels protocol>=4 gate", (
       new Set(["peer_only.safetensors"])
     );
     expect(v.kind).toBe("ineligible");
+    // L6 final-review fix: distinguishable from the generic "nowhere in the
+    // federation" reason -- this worker's protocol is specifically the
+    // blocker, not a genuinely unfetchable model.
+    expect(v.reasons.some((r) => r.startsWith("missing_models_peer_protocol:"))).toBe(true);
+    expect(v.reasons.some((r) => r.startsWith("missing_models_unavailable:"))).toBe(false);
   });
 
   it("a protocol-4 worker is eligible_after_fetch for the same peer-only model", () => {

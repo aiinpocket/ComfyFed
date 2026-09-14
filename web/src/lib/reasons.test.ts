@@ -49,11 +49,20 @@ describe('parseReason', () => {
     });
   });
 
+  it('parses missing_models_peer_protocol as a hard refusal (L6 final-review fix)', () => {
+    expect(parseReason('missing_models_peer_protocol:A,B')).toEqual({
+      key: 'missing_models_peer_protocol',
+      values: { items: 'A, B' },
+      tone: 'error',
+    });
+  });
+
   it('has a translation for every reason key it can emit, in both locales', () => {
     const raws = [
       'missing_nodes:A',
       'missing_models:A',
       'missing_models_unavailable:A',
+      'missing_models_peer_protocol:A',
       'vram:46>8+16',
       'vram_offload:25.49>15.9',
       'backend:cuda!=cpu',
