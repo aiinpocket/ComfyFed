@@ -473,6 +473,13 @@ export interface Job {
   resultHashes: Record<string, unknown>;
   origin: string;
   panelHidden: boolean;
+  /** Phase 3.0: the submitting session's uid (`SessionUser.uid`), stamped by
+   * both `POST /api/jobs` (console) and `POST /comfy/api/prompt` (panel) --
+   * mirrors `db.Job.user_id`. `null` for a pre-Phase-3.0 job that predates
+   * the column (migration 0006 backfills it to the migrated admin user where
+   * possible, but a brand-new install with no such setting leaves it null),
+   * or for a row a test inserts directly without setting it. */
+  userId: string | null;
 }
 
 interface JobRow {
@@ -495,6 +502,7 @@ interface JobRow {
   result_hashes: string;
   origin: string;
   panel_hidden: number;
+  user_id: string | null;
 }
 
 function rowToJob(row: JobRow): Job {
@@ -518,6 +526,7 @@ function rowToJob(row: JobRow): Job {
     resultHashes: safeParse(row.result_hashes, {}),
     origin: row.origin,
     panelHidden: row.panel_hidden !== 0,
+    userId: row.user_id,
   };
 }
 
@@ -536,6 +545,11 @@ export interface NewJob {
   inputAssets: string[];
   origin: string;
   createdAt: string;
+  /** Phase 3.0: the submitting session's uid -- omitted (or `null`) for an
+   * agent/system-originated insert with no session behind it (none exist
+   * today; kept optional so a future non-session caller doesn't need a fake
+   * value). */
+  userId?: string | null;
 }
 
 /** Inserts a freshly-assessed queued job row -- mirrors `jobs.create_job`'s
@@ -546,8 +560,8 @@ export async function insertJob(db: D1Database, job: NewJob): Promise<void> {
   await db
     .prepare(
       `INSERT INTO jobs (id, workflow_json, requirements, required_nodes, required_models, est_vram_gb,
-                          input_assets, origin, created_at)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`
+                          input_assets, origin, created_at, user_id)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
     )
     .bind(
       job.id,
@@ -558,24 +572,50 @@ export async function insertJob(db: D1Database, job: NewJob): Promise<void> {
       job.estVramGb,
       JSON.stringify(job.inputAssets),
       job.origin,
-      job.createdAt
+      job.createdAt,
+      job.userId ?? null
     )
     .run();
 }
 
-/** All jobs, oldest first, optionally filtered to a set of statuses --
- * mirrors `jobs.list_jobs`'s `?status=a,b,c` query-param filter. */
-export async function listJobs(db: D1Database, statuses?: string[]): Promise<Job[]> {
+/** All jobs, oldest first, optionally filtered to a set of statuses and/or
+ * (Phase 3.0) a single owning user -- mirrors `jobs.list_jobs`'s
+ * `?status=a,b,c` query-param filter plus its non-admin `user_id == uid`
+ * scope. `opts.userId` omitted means unscoped (every job, any owner) --
+ * callers needing "this user's jobs" always pass it explicitly rather than
+ * relying on a default. */
+export async function listJobs(db: D1Database, statuses?: string[], opts: { userId?: string } = {}): Promise<Job[]> {
+  const clauses: string[] = [];
+  const binds: unknown[] = [];
   if (statuses && statuses.length > 0) {
-    const placeholders = statuses.map(() => "?").join(",");
-    const { results } = await db
-      .prepare(`SELECT * FROM jobs WHERE status IN (${placeholders}) ORDER BY created_at ASC`)
-      .bind(...statuses)
-      .all<JobRow>();
-    return results.map(rowToJob);
+    clauses.push(`status IN (${statuses.map(() => "?").join(",")})`);
+    binds.push(...statuses);
   }
-  const { results } = await db.prepare("SELECT * FROM jobs ORDER BY created_at ASC").all<JobRow>();
+  if (opts.userId !== undefined) {
+    clauses.push("user_id = ?");
+    binds.push(opts.userId);
+  }
+  const where = clauses.length > 0 ? `WHERE ${clauses.join(" AND ")}` : "";
+  const { results } = await db
+    .prepare(`SELECT * FROM jobs ${where} ORDER BY created_at ASC`)
+    .bind(...binds)
+    .all<JobRow>();
   return results.map(rowToJob);
+}
+
+/** `{id -> username}` for a set of user ids -- backs `GET /api/jobs`'s admin
+ * view (mirrors jobs.py's `list_jobs` in-memory join: one query over the
+ * distinct `user_id`s a job page references, rather than an N+1 lookup per
+ * row). Empty input short-circuits without a query (an empty `IN ()` is
+ * invalid SQL). */
+export async function getUsernamesByIds(db: D1Database, ids: string[]): Promise<Map<string, string>> {
+  if (ids.length === 0) return new Map();
+  const placeholders = ids.map(() => "?").join(",");
+  const { results } = await db
+    .prepare(`SELECT id, username FROM users WHERE id IN (${placeholders})`)
+    .bind(...ids)
+    .all<{ id: string; username: string }>();
+  return new Map(results.map((r) => [r.id, r.username]));
 }
 
 /** Requeues a failed job for retry -- mirrors `jobs.retry_job`'s row reset
@@ -747,11 +787,14 @@ export async function getOnlineEnabledWorkers(db: D1Database): Promise<Worker[]>
  * `panel`) excluding panel-hidden rows -- mirrors comfyapi.py's `GET
  * /comfy/api/queue` (origin-agnostic caller passes no `origin`) and `GET
  * /comfy/api/history` (`origin: "panel"`, `panelHiddenExcluded: true`)
- * queries. */
+ * queries. `opts.userId` (Phase 3.0) additionally scopes to one owning user
+ * -- every panel-native route call site passes it (the panel is a per-user
+ * workspace for every role, admin included; see comfyapi.py's module
+ * docstring), while `origin`-agnostic console-side callers omit it. */
 export async function getJobsByStatusAndOrigin(
   db: D1Database,
   statuses: string[],
-  opts: { origin?: string; excludePanelHidden?: boolean; orderBy?: "created_at" | "finished_at" } = {}
+  opts: { origin?: string; excludePanelHidden?: boolean; orderBy?: "created_at" | "finished_at"; userId?: string } = {}
 ): Promise<Job[]> {
   const placeholders = statuses.map(() => "?").join(",");
   const clauses = [`status IN (${placeholders})`];
@@ -762,6 +805,10 @@ export async function getJobsByStatusAndOrigin(
   }
   if (opts.excludePanelHidden) {
     clauses.push("panel_hidden = 0");
+  }
+  if (opts.userId !== undefined) {
+    clauses.push("user_id = ?");
+    binds.push(opts.userId);
   }
   const order =
     opts.orderBy === "finished_at" ? "ORDER BY finished_at ASC, created_at ASC" : "ORDER BY created_at ASC, id ASC";
@@ -783,12 +830,22 @@ export async function getAllJobsOrderedByCreatedAt(db: D1Database): Promise<Job[
 
 /** Sets `panel_hidden = 1` on every terminal (`done`/`failed`), `origin =
  * 'panel'` job matching `ids` (or every such job when `ids` is undefined) --
- * mirrors comfyapi.py's `POST /comfy/api/history` hide mutation. Returns the
- * number of rows touched (unused by the caller today, kept for parity with
- * every other bulk-write helper's return shape in this file). */
-export async function hidePanelHistoryJobs(db: D1Database, ids?: string[]): Promise<number> {
+ * mirrors comfyapi.py's `POST /comfy/api/history` hide mutation. `opts.userId`
+ * (Phase 3.0) additionally scopes the mutation to one owning user, matching
+ * that route's per-user panel scope -- every call site passes it. Returns
+ * the number of rows touched (unused by the caller today, kept for parity
+ * with every other bulk-write helper's return shape in this file). */
+export async function hidePanelHistoryJobs(
+  db: D1Database,
+  ids?: string[],
+  opts: { userId?: string } = {}
+): Promise<number> {
   const clauses = ["status IN ('done', 'failed')", "origin = 'panel'"];
   const binds: unknown[] = [];
+  if (opts.userId !== undefined) {
+    clauses.push("user_id = ?");
+    binds.push(opts.userId);
+  }
   if (ids !== undefined) {
     if (ids.length === 0) return 0;
     clauses.push(`id IN (${ids.map(() => "?").join(",")})`);

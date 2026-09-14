@@ -6,9 +6,16 @@
  * (panel-shaped `/prompt` errors, `/object_info` as a fleet union/
  * intersection, flat asset staging, `prompt_id` == ComfyFed job id).
  *
- * EVERY route below requires only an authenticated admin session
- * (`requireAdmin`), no CSRF check -- mirrors `create_router`'s single
- * router-level `Depends(auth.require_admin)` dependency. Nothing in
+ * EVERY route below requires only an authenticated, non-disabled session
+ * (`requireUser`), no CSRF check -- mirrors `create_router`'s single
+ * router-level `Depends(auth.require_user)` dependency. Phase 3.0 Task 4
+ * widened the panel from admin-only to any logged-in user: what stays
+ * per-role is not gate ACCESS but per-route SCOPE -- every panel-native
+ * read/control below (`/queue`, `/history`, `/interrupt`, `/queue`
+ * delete/clear, `/history` hide, `/view`) is additionally filtered to
+ * `origin === "panel" AND user_id === <the session's own uid>`, including
+ * for an admin session (full fleet visibility lives in the console's
+ * `/api/jobs`, not here -- see comfyapi.py's module docstring). Nothing in
  * comfyapi.py adds `require_csrf` anywhere, `POST /prompt` included: the
  * stock ComfyUI frontend has no way to send our `X-CSRF` header, and the
  * session cookie is `SameSite`-scoped, which is what keeps this from being
@@ -51,7 +58,7 @@ import {
   stagingKey,
 } from "../lib/store";
 import { boundedGunzip } from "../lib/gzip";
-import { requireAdmin, errorJson } from "../lib/guard";
+import { requireUser, errorJson, SESSION_VAR } from "../lib/guard";
 import { COMFYFED_EXT_JS } from "../core/comfyfed_ext";
 
 const RUNNING_STATUSES = ["assigned", "running"];
@@ -382,7 +389,7 @@ async function saveComfySettings(db: D1Database, values: Record<string, unknown>
 
 const app = new Hono<{ Bindings: Env }>();
 
-app.use("/comfy/api/*", requireAdmin);
+app.use("/comfy/api/*", requireUser);
 
 // --- GET /comfy/api/object_info -------------------------------------------
 
@@ -416,6 +423,7 @@ app.get("/comfy/api/workflow_templates", (c) => c.json({}));
 // --- POST /comfy/api/prompt ------------------------------------------------
 
 app.post("/comfy/api/prompt", async (c) => {
+  const user = c.get(SESSION_VAR).user;
   let body: unknown;
   try {
     body = await c.req.json();
@@ -513,6 +521,7 @@ app.post("/comfy/api/prompt", async (c) => {
     inputAssets: [...needs.assets].sort(),
     origin: "panel",
     createdAt: toSqliteTimestamp(new Date()),
+    userId: user.uid,
   });
 
   for (const [name, obj] of resolved) {
@@ -551,8 +560,12 @@ app.post("/comfy/api/upload/image", async (c) => {
 // --- GET /comfy/api/queue ----------------------------------------------------
 
 app.get("/comfy/api/queue", async (c) => {
+  const user = c.get(SESSION_VAR).user;
   const numbers = await numbersByJobId(c.env.DB);
-  const rows = await queries.getJobsByStatusAndOrigin(c.env.DB, [...RUNNING_STATUSES, ...PENDING_STATUSES]);
+  const rows = await queries.getJobsByStatusAndOrigin(c.env.DB, [...RUNNING_STATUSES, ...PENDING_STATUSES], {
+    origin: "panel",
+    userId: user.uid,
+  });
   const running = rows.filter((j) => RUNNING_STATUSES.includes(j.status)).map((j) => queueEntry(numbers.get(j.id) ?? 0, j));
   const pending = rows.filter((j) => PENDING_STATUSES.includes(j.status)).map((j) => queueEntry(numbers.get(j.id) ?? 0, j));
   return c.json({ queue_running: running, queue_pending: pending });
@@ -561,7 +574,11 @@ app.get("/comfy/api/queue", async (c) => {
 // --- POST /comfy/api/interrupt -----------------------------------------------
 
 app.post("/comfy/api/interrupt", async (c) => {
-  const running = await queries.getJobsByStatusAndOrigin(c.env.DB, RUNNING_STATUSES, { origin: "panel" });
+  const user = c.get(SESSION_VAR).user;
+  const running = await queries.getJobsByStatusAndOrigin(c.env.DB, RUNNING_STATUSES, {
+    origin: "panel",
+    userId: user.uid,
+  });
   const job = running[0];
   if (job) {
     // Fire-and-forget, matching Python's /interrupt (comfyapi.py) which
@@ -581,6 +598,7 @@ app.post("/comfy/api/interrupt", async (c) => {
 // --- POST /comfy/api/queue (delete/clear) ------------------------------------
 
 app.post("/comfy/api/queue", async (c) => {
+  const user = c.get(SESSION_VAR).user;
   let body: unknown;
   try {
     body = await c.req.json();
@@ -591,6 +609,7 @@ app.post("/comfy/api/queue", async (c) => {
 
   const candidates = await queries.getJobsByStatusAndOrigin(c.env.DB, [...PENDING_STATUSES, ...RUNNING_STATUSES], {
     origin: "panel",
+    userId: user.uid,
   });
 
   let jobIds: string[];
@@ -616,12 +635,14 @@ app.post("/comfy/api/queue", async (c) => {
 // --- GET /comfy/api/history ---------------------------------------------------
 
 app.get("/comfy/api/history", async (c) => {
+  const user = c.get(SESSION_VAR).user;
   const maxItemsParam = c.req.query("max_items");
   const numbers = await numbersByJobId(c.env.DB);
   let rows = await queries.getJobsByStatusAndOrigin(c.env.DB, HISTORY_STATUSES, {
     origin: "panel",
     excludePanelHidden: true,
     orderBy: "finished_at",
+    userId: user.uid,
   });
 
   if (maxItemsParam !== undefined) {
@@ -641,9 +662,16 @@ app.get("/comfy/api/history", async (c) => {
 // --- GET /comfy/api/history/{prompt_id} --------------------------------------
 
 app.get("/comfy/api/history/:promptId", async (c) => {
+  const user = c.get(SESSION_VAR).user;
   const promptId = c.req.param("promptId");
   const job = await queries.getJobById(c.env.DB, promptId);
-  if (!job || !HISTORY_STATUSES.includes(job.status) || job.panelHidden || job.origin !== "panel") {
+  if (
+    !job ||
+    !HISTORY_STATUSES.includes(job.status) ||
+    job.panelHidden ||
+    job.origin !== "panel" ||
+    job.userId !== user.uid
+  ) {
     // Upstream returns {} for an unknown prompt id, never a 404.
     return c.json({});
   }
@@ -654,6 +682,7 @@ app.get("/comfy/api/history/:promptId", async (c) => {
 // --- POST /comfy/api/history (hide) ------------------------------------------
 
 app.post("/comfy/api/history", async (c) => {
+  const user = c.get(SESSION_VAR).user;
   let body: unknown;
   try {
     body = await c.req.json();
@@ -663,14 +692,14 @@ app.post("/comfy/api/history", async (c) => {
   const bodyObj = typeof body === "object" && body !== null && !Array.isArray(body) ? (body as Record<string, unknown>) : {};
 
   if (bodyObj.clear) {
-    await queries.hidePanelHistoryJobs(c.env.DB);
+    await queries.hidePanelHistoryJobs(c.env.DB, undefined, { userId: user.uid });
     return c.json({});
   }
 
   const requested = Array.isArray(bodyObj.delete) ? bodyObj.delete.filter((v): v is string => typeof v === "string") : [];
   if (requested.length === 0) return c.json({});
 
-  await queries.hidePanelHistoryJobs(c.env.DB, requested);
+  await queries.hidePanelHistoryJobs(c.env.DB, requested, { userId: user.uid });
   return c.json({});
 });
 
@@ -701,6 +730,7 @@ function guessMediaType(filename: string): string {
 }
 
 app.get("/comfy/api/view", async (c) => {
+  const user = c.get(SESSION_VAR).user;
   const filenameRaw = c.req.query("filename") ?? "";
   const type = c.req.query("type") ?? "output";
   const subfolder = c.req.query("subfolder") ?? "";
@@ -729,10 +759,16 @@ app.get("/comfy/api/view", async (c) => {
       return c.body(null, 400);
     }
     const job = await queries.getJobById(c.env.DB, jobId);
-    if (!job || !resultFilesOf(job).includes(safeName)) return c.body(null, 404);
+    if (!job || !resultFilesOf(job).includes(safeName) || job.origin !== "panel" || job.userId !== user.uid) {
+      return c.body(null, 404);
+    }
   } else {
-    // Legacy fallback: scan done jobs newest-first for the filename.
-    const done = await queries.listJobs(c.env.DB, ["done"]);
+    // Legacy fallback for links minted before outputs carried a subfolder:
+    // scan this user's OWN done panel jobs newest-first for the filename --
+    // same scope as every other panel-native route, so this fallback can't
+    // be used to read another user's (or the console's) artifact just by
+    // omitting `subfolder`.
+    const done = await queries.getJobsByStatusAndOrigin(c.env.DB, ["done"], { origin: "panel", userId: user.uid });
     // n2 (final review): two-key sort matching comfyapi.py's `ORDER BY
     // finished_at DESC, created_at DESC` -- `updateJobDone` always sets
     // `finished_at`, so today ties never reach the tiebreaker, but comparing

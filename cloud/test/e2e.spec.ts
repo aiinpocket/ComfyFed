@@ -676,9 +676,17 @@ describe("cloud end-to-end", () => {
       expect(assignedJob!.workerId).toBe(workerId);
 
       // -----------------------------------------------------------------
-      // 7. Fake agent reports the fetching_models progress stage; the panel
-      // sees it relayed on the `progress` event.
-      const fetchProgressPromise = nextMessage(panel);
+      // 7. Fake agent reports the fetching_models progress stage. Phase 3.0
+      // Task 10: the panel WS is a per-user PANEL workspace now -- a
+      // job-scoped frame only reaches a panel socket when the job's own
+      // `origin === "panel"` (see do/hub.ts's `panelVisibleTo`), which this
+      // one isn't (submitted via the console in step 5). So the panel must
+      // NOT see this relayed, unlike pre-Task-10 -- proven with
+      // `expectNoMessage` rather than the old `nextMessage` wait. The
+      // progress itself is still verified below via the console's own `GET
+      // /api/jobs/{id}` transient-field surface, which every role's own
+      // console session can read regardless of panel scoping.
+      const fetchProgressAbsence = expectNoMessage(panel, 300);
       agent.send(
         JSON.stringify({
           type: "heartbeat",
@@ -689,11 +697,7 @@ describe("cloud end-to-end", () => {
           fetch_model: modelName,
         })
       );
-      const fetchProgressEvent = await fetchProgressPromise;
-      expect(fetchProgressEvent).toEqual({
-        type: "progress",
-        data: { value: 0, max: 100, prompt_id: jobId, stage: "fetching_models", fetch_pct: 0.42, fetch_model: modelName },
-      });
+      await fetchProgressAbsence;
 
       // M1 fix: fetch wall time is not billable execution, so the
       // fetching_models stage must NOT start the job's clock -- it stays

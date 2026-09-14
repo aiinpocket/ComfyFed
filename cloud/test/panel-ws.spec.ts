@@ -2,7 +2,7 @@ import { afterEach, describe, expect, it } from "vitest";
 import { env, runDurableObjectAlarm, runInDurableObject } from "cloudflare:test";
 import { call, db, SETUP_TOKEN } from "./helpers/http";
 import { toSqliteTimestamp, getJobById } from "../src/db/queries";
-import { connectAgent, connectPanel, collectMessages, hub, nextMessage, openPanelWs } from "./helpers/ws";
+import { connectAgent, connectPanel, collectMessages, expectNoMessage, hub, nextMessage, openPanelWs } from "./helpers/ws";
 import golden from "./fixtures/golden.json";
 
 // Ports the panel-facing half of tests/server/test_panel_ws.py against the
@@ -44,12 +44,38 @@ const KEYPAIRS = golden.keypairs;
 const ADMIN_PASSWORD = "correct-horse-battery-staple";
 
 /** Setup + login, returning a `cf_session=...` cookie pair usable on the
- * panel WS upgrade's `Cookie` header. */
-async function loginCookie(): Promise<string> {
+ * panel WS upgrade's `Cookie` header, plus the admin's own uid -- Phase 3.0
+ * Task 10 scopes every panel-native frame to `origin === "panel" AND
+ * user_id === <the connecting session's own uid>` (see `panelVisibleTo` in
+ * do/hub.ts), so a directly-inserted test job must be stamped with THIS
+ * uid (via `makeJob`'s `userId` option) to be visible on a socket opened
+ * with this cookie. */
+async function loginCookie(): Promise<{ cookie: string; uid: string; csrf: string }> {
   await call("/api/setup", { json: { token: SETUP_TOKEN, password: ADMIN_PASSWORD } });
   const r = await call("/api/auth/login", { json: { username: "admin", password: ADMIN_PASSWORD } });
   if (!r.setCookie) throw new Error("login did not set a cookie");
-  return r.setCookie;
+  const row = await d1().prepare("SELECT id FROM users WHERE username = 'admin'").first<{ id: string }>();
+  if (!row) throw new Error("admin user row not found after setup");
+  return { cookie: r.setCookie, uid: row.id, csrf: r.body.csrf };
+}
+
+/** Creates a non-admin `role: "user"` account and logs in as it, returning
+ * its own cookie/uid -- Phase 3.0 Task 10's WS frame-filtering isolation
+ * tests need a SECOND authenticated panel connection, distinct from
+ * `loginCookie()`'s admin, to prove a job-scoped frame reaches only the
+ * socket for its own owning user. Requires `loginCookie()` (or another
+ * `/api/setup` call) to have already provisioned the admin account this
+ * borrows CSRF from. */
+async function secondUserCookie(admin: { cookie: string; csrf: string }, username: string): Promise<{ cookie: string; uid: string }> {
+  const password = "a-long-enough-password1";
+  const created = await call("/api/users", {
+    json: { username, role: "user", password },
+    cookie: admin.cookie,
+    headers: { "X-CSRF": admin.csrf },
+  });
+  const login = await call("/api/auth/login", { json: { username, password } });
+  if (!login.setCookie) throw new Error("second user login did not set a cookie");
+  return { cookie: login.setCookie, uid: created.body.id };
 }
 
 async function makeWorker(opts: { pubkeyHex: string; id?: string }): Promise<string> {
@@ -66,12 +92,21 @@ async function makeJob(opts: {
   workerId?: string | null;
   startedAt?: Date | null;
   workflowJson?: string;
+  /** Phase 3.0 Task 10: `origin`/`userId` so a job-scoped panel frame's
+   * `panelVisibleTo` check finds a match -- default to `"panel"`/`null`
+   * (an ownerless legacy-shaped row), NOT visible to any authenticated
+   * connection; every test in this file that expects a job's events to
+   * reach its panel socket passes `userId: <that socket's own uid>`
+   * explicitly (mirroring how a real panel-submitted job is always stamped
+   * with its submitter's uid). */
+  origin?: string;
+  userId?: string | null;
 }): Promise<string> {
   const id = uniqueId("job");
   await d1()
     .prepare(
-      `INSERT INTO jobs (id, workflow_json, status, worker_id, created_at, started_at, input_assets)
-       VALUES (?, ?, ?, ?, ?, ?, '[]')`
+      `INSERT INTO jobs (id, workflow_json, status, worker_id, created_at, started_at, input_assets, origin, user_id)
+       VALUES (?, ?, ?, ?, ?, ?, '[]', ?, ?)`
     )
     .bind(
       id,
@@ -79,7 +114,9 @@ async function makeJob(opts: {
       opts.status,
       opts.workerId ?? null,
       toSqliteTimestamp(new Date()),
-      opts.startedAt ? toSqliteTimestamp(opts.startedAt) : null
+      opts.startedAt ? toSqliteTimestamp(opts.startedAt) : null,
+      opts.origin ?? "panel",
+      opts.userId ?? null
     )
     .run();
   return id;
@@ -94,7 +131,7 @@ function store(): R2Bucket {
 
 describe("panel connect", () => {
   it("sends the initial status frame then an all-false feature_flags frame", async () => {
-    const cookie = await loginCookie();
+    const { cookie } = await loginCookie();
     const ws = await connectPanel(cookie);
     const [status, flags] = await collectMessages(ws, 2);
 
@@ -122,7 +159,7 @@ describe("panel connect", () => {
     await makeJob({ status: "running" });
     await makeJob({ status: "done" }); // not counted
 
-    const cookie = await loginCookie();
+    const { cookie } = await loginCookie();
     const ws = await connectPanel(cookie);
     const [status] = await collectMessages(ws, 1);
     expect(status.data.status).toEqual({ exec_info: { queue_remaining: 2 } });
@@ -130,7 +167,7 @@ describe("panel connect", () => {
   });
 
   it("serves the same handshake at both /comfy/api/ws and /comfy/ws", async () => {
-    const cookie = await loginCookie();
+    const { cookie } = await loginCookie();
     const ws = await connectPanel(cookie, "/comfy/ws");
     const [status] = await collectMessages(ws, 1);
     expect(status.type).toBe("status");
@@ -165,9 +202,9 @@ describe("progress relay", () => {
   it("relays heartbeat progress to the panel as a progress event", async () => {
     const kp = KEYPAIRS[0]!;
     const workerId = await makeWorker({ pubkeyHex: kp.pubkey_hex });
-    const jobId = await makeJob({ status: "running", workerId, startedAt: new Date() });
+    const { cookie, uid } = await loginCookie();
+    const jobId = await makeJob({ status: "running", workerId, startedAt: new Date(), userId: uid });
 
-    const cookie = await loginCookie();
     const panel = await connectPanel(cookie);
     await collectMessages(panel, 2); // status, feature_flags
 
@@ -186,9 +223,9 @@ describe("progress relay", () => {
   it("relays a busy heartbeat's ownership transition as an executing event", async () => {
     const kp = KEYPAIRS[0]!;
     const workerId = await makeWorker({ pubkeyHex: kp.pubkey_hex });
-    const jobId = await makeJob({ status: "assigned", workerId });
+    const { cookie, uid } = await loginCookie();
+    const jobId = await makeJob({ status: "assigned", workerId, userId: uid });
 
-    const cookie = await loginCookie();
     const panel = await connectPanel(cookie);
     await collectMessages(panel, 2);
 
@@ -220,15 +257,16 @@ describe("job_done relay", () => {
       "7": { class_type: "SaveText" },
       "9": { class_type: "PreviewAny" },
     };
+    const { cookie, uid } = await loginCookie();
     const jobId = await makeJob({
       status: "running",
       workerId,
       startedAt: new Date(Date.now() - 1000),
       workflowJson: JSON.stringify(workflow),
+      userId: uid,
     });
     await store().put(`artifacts/${jobId}/note.txt`, "hello from the worker");
 
-    const cookie = await loginCookie();
     const panel = await connectPanel(cookie);
     await collectMessages(panel, 2); // status, feature_flags
 
@@ -298,9 +336,9 @@ describe("job_done relay", () => {
   it("falls back to a single FALLBACK_OUTPUT_KEY executed event for a job with no result files", async () => {
     const kp = KEYPAIRS[0]!;
     const workerId = await makeWorker({ pubkeyHex: kp.pubkey_hex });
-    const jobId = await makeJob({ status: "running", workerId, startedAt: new Date() });
+    const { cookie, uid } = await loginCookie();
+    const jobId = await makeJob({ status: "running", workerId, startedAt: new Date(), userId: uid });
 
-    const cookie = await loginCookie();
     const panel = await connectPanel(cookie);
     await collectMessages(panel, 2);
 
@@ -327,9 +365,9 @@ describe("cancel relay", () => {
   it("relays a cancellation as executing:null + a refreshed status", async () => {
     const kp = KEYPAIRS[0]!;
     const workerId = await makeWorker({ pubkeyHex: kp.pubkey_hex });
-    const jobId = await makeJob({ status: "running", workerId, startedAt: new Date() });
+    const { cookie, uid } = await loginCookie();
+    const jobId = await makeJob({ status: "running", workerId, startedAt: new Date(), userId: uid });
 
-    const cookie = await loginCookie();
     const panel = await connectPanel(cookie);
     await collectMessages(panel, 2); // status, feature_flags
 
@@ -359,9 +397,9 @@ describe("cancel relay", () => {
     // cancel_and_notify parity: the panel is told regardless of ownership --
     // a queued, never-assigned job has no worker to push a job_cancelled
     // to, but the panel's queue badge still needs to drop.
-    const jobId = await makeJob({ status: "queued" });
+    const { cookie, uid } = await loginCookie();
+    const jobId = await makeJob({ status: "queued", userId: uid });
 
-    const cookie = await loginCookie();
     const panel = await connectPanel(cookie);
     await collectMessages(panel, 2);
 
@@ -388,7 +426,7 @@ describe("cancel relay", () => {
 
 describe("/internal/event", () => {
   it("broadcasts a {type, data} body verbatim to connected panel clients", async () => {
-    const cookie = await loginCookie();
+    const { cookie } = await loginCookie();
     const panel = await connectPanel(cookie);
     await collectMessages(panel, 2);
 
@@ -429,7 +467,7 @@ describe("/internal/event", () => {
 
 describe("alarm re-arm (agent-kind filter)", () => {
   it("does NOT re-arm when only a panel client is connected (zero agents, zero active jobs)", async () => {
-    const cookie = await loginCookie();
+    const { cookie } = await loginCookie();
     const panel = await connectPanel(cookie);
     await collectMessages(panel, 2); // status, feature_flags
 
@@ -461,5 +499,187 @@ describe("alarm re-arm (agent-kind filter)", () => {
     expect(alarmAfter).not.toBeNull();
 
     agent.close();
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Phase 3.0 Task 10: panel WS frame filtering -- `do/hub.ts`'s
+// `panelVisibleTo` must scope every job-specific frame (`progress`/
+// `executing`/`executed`/`execution_error`) to ONLY the socket for that
+// job's own panel origin and user. Every case here binds a SECOND panel
+// socket (a non-admin user, via `secondUserCookie`) alongside the admin's,
+// and proves the frame reaches the owner's socket while `expectNoMessage`
+// proves it does NOT reach the other one -- absence, not just presence, is
+// the point of this whole describe block.
+
+describe("panel WS: frame filtering is per-owner (Phase 3.0 Task 10)", () => {
+  it("progress: reaches the owning user's socket, never the other user's", async () => {
+    const kp = KEYPAIRS[0]!;
+    const workerId = await makeWorker({ pubkeyHex: kp.pubkey_hex });
+    const admin = await loginCookie();
+    const other = await secondUserCookie(admin, "alice");
+    const jobId = await makeJob({ status: "running", workerId, startedAt: new Date(), userId: admin.uid });
+
+    const ownerPanel = await connectPanel(admin.cookie);
+    await collectMessages(ownerPanel, 2); // status, feature_flags
+    const otherPanel = await connectPanel(other.cookie);
+    await collectMessages(otherPanel, 2);
+
+    const agent = await connectAgent(workerId, kp.seed_hex);
+    agent.send(JSON.stringify({ type: "hello", protocol: 2 }));
+
+    const ownerAbsence = expectNoMessage(otherPanel, 300);
+    const progressPromise = nextMessage(ownerPanel);
+    agent.send(JSON.stringify({ type: "heartbeat", state: "idle", job_id: jobId, progress: 0.42 }));
+    const progress = await progressPromise;
+    expect(progress).toEqual({ type: "progress", data: { value: 42, max: 100, prompt_id: jobId } });
+    await ownerAbsence;
+
+    agent.close();
+    ownerPanel.close();
+    otherPanel.close();
+  });
+
+  it("job_done: the 'executed' fan-out reaches only the owner's socket", async () => {
+    const kp = KEYPAIRS[0]!;
+    const workerId = await makeWorker({ pubkeyHex: kp.pubkey_hex });
+    const admin = await loginCookie();
+    const other = await secondUserCookie(admin, "alice");
+    const jobId = await makeJob({ status: "running", workerId, startedAt: new Date(), userId: admin.uid });
+
+    const ownerPanel = await connectPanel(admin.cookie);
+    await collectMessages(ownerPanel, 2);
+    const otherPanel = await connectPanel(other.cookie);
+    await collectMessages(otherPanel, 2);
+
+    const agent = await connectAgent(workerId, kp.seed_hex);
+    agent.send(JSON.stringify({ type: "hello", protocol: 2 }));
+
+    // `job_done` fans out into 3 owner frames (executed, executing:null,
+    // status) but only the LAST -- the aggregate status refresh, which
+    // carries no job identity -- reaches `otherPanel` too (see
+    // `panelJobStatusRefresh`); the job-scoped `executed`/`executing` frames
+    // must not.
+    const ownerEventsPromise = collectMessages(ownerPanel, 3);
+    const otherEventsPromise = collectMessages(otherPanel, 1);
+    agent.send(JSON.stringify({ type: "job_done", job_id: jobId, result_files: [], exec_seconds: 1 }));
+    const [executed] = await ownerEventsPromise;
+    expect(executed.type).toBe("executed");
+    expect(executed.data.prompt_id).toBe(jobId);
+
+    const [otherOnly] = await otherEventsPromise;
+    expect(otherOnly.type).toBe("status");
+
+    agent.close();
+    ownerPanel.close();
+    otherPanel.close();
+  });
+
+  it("cancel: 'executing:null' reaches only the owner's socket (aggregate status refresh still broadcasts to both)", async () => {
+    const kp = KEYPAIRS[0]!;
+    const workerId = await makeWorker({ pubkeyHex: kp.pubkey_hex });
+    const admin = await loginCookie();
+    const other = await secondUserCookie(admin, "alice");
+    const jobId = await makeJob({ status: "running", workerId, startedAt: new Date(), userId: admin.uid });
+
+    const ownerPanel = await connectPanel(admin.cookie);
+    await collectMessages(ownerPanel, 2);
+    const otherPanel = await connectPanel(other.cookie);
+    await collectMessages(otherPanel, 2);
+
+    // The job-scoped `executing:null` frame must not reach `otherPanel`, but
+    // the AGGREGATE `status` refresh right after it (no job identity, see
+    // `panelJobStatusRefresh`) still broadcasts to every connected socket --
+    // so `otherPanel` gets exactly one frame (status), never two.
+    const ownerEventsPromise = collectMessages(ownerPanel, 2); // executing:null, status
+    const otherEventsPromise = collectMessages(otherPanel, 1); // status only
+    const otherNoSecond = new Promise<void>((resolve, reject) => {
+      let count = 0;
+      const onMessage = () => {
+        count += 1;
+        if (count > 1) reject(new Error("otherPanel received more than one frame"));
+      };
+      otherPanel.addEventListener("message", onMessage);
+      setTimeout(() => {
+        otherPanel.removeEventListener("message", onMessage);
+        resolve();
+      }, 500);
+    });
+
+    const response = await hub().fetch(
+      new Request("http://do/internal/cancel", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ job_id: jobId, reason: "admin cancel" }),
+      })
+    );
+    expect((await response.json<{ cancelled: boolean }>()).cancelled).toBe(true);
+
+    const [executingNull, status] = await ownerEventsPromise;
+    expect(executingNull).toEqual({ type: "executing", data: { node: null, prompt_id: jobId } });
+    expect(status.type).toBe("status");
+
+    const [otherStatus] = await otherEventsPromise;
+    expect(otherStatus.type).toBe("status");
+    await otherNoSecond;
+
+    ownerPanel.close();
+    otherPanel.close();
+  });
+
+  it("execution_error (job_failed): reaches only the owning user's socket", async () => {
+    const kp = KEYPAIRS[0]!;
+    const workerId = await makeWorker({ pubkeyHex: kp.pubkey_hex });
+    const admin = await loginCookie();
+    const other = await secondUserCookie(admin, "alice");
+    const jobId = await makeJob({ status: "running", workerId, startedAt: new Date(), userId: admin.uid });
+
+    const ownerPanel = await connectPanel(admin.cookie);
+    await collectMessages(ownerPanel, 2);
+    const otherPanel = await connectPanel(other.cookie);
+    await collectMessages(otherPanel, 2);
+
+    const agent = await connectAgent(workerId, kp.seed_hex);
+    agent.send(JSON.stringify({ type: "hello", protocol: 2 }));
+
+    // Same aggregate-vs-job-scoped split as the job_done case above: the
+    // job-scoped `execution_error` reaches only the owner; the trailing
+    // status refresh reaches both.
+    const ownerEventsPromise = collectMessages(ownerPanel, 2); // execution_error, status
+    const otherEventsPromise = collectMessages(otherPanel, 1); // status only
+    agent.send(JSON.stringify({ type: "job_failed", job_id: jobId, error: "boom", exec_seconds: 0.5 }));
+    const [executionError] = await ownerEventsPromise;
+    expect(executionError.type).toBe("execution_error");
+    expect(executionError.data.prompt_id).toBe(jobId);
+    expect(executionError.data.exception_message).toBe("boom");
+
+    const [otherOnly] = await otherEventsPromise;
+    expect(otherOnly.type).toBe("status");
+
+    agent.close();
+    ownerPanel.close();
+    otherPanel.close();
+  });
+
+  it("a job with no user_id (pre-Phase-3.0 shaped row) is invisible to any authenticated panel socket", async () => {
+    // Fails CLOSED, not open: panelVisibleTo requires origin === "panel" AND
+    // user_id === connUid, so a null user_id never matches any real uid.
+    const kp = KEYPAIRS[0]!;
+    const workerId = await makeWorker({ pubkeyHex: kp.pubkey_hex });
+    const admin = await loginCookie();
+    const jobId = await makeJob({ status: "running", workerId, startedAt: new Date(), userId: null });
+
+    const panel = await connectPanel(admin.cookie);
+    await collectMessages(panel, 2);
+
+    const agent = await connectAgent(workerId, kp.seed_hex);
+    agent.send(JSON.stringify({ type: "hello", protocol: 2 }));
+
+    const absence = expectNoMessage(panel, 300);
+    agent.send(JSON.stringify({ type: "heartbeat", state: "idle", job_id: jobId, progress: 0.5 }));
+    await absence;
+
+    agent.close();
+    panel.close();
   });
 });

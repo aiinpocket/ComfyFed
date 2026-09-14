@@ -152,10 +152,22 @@ interface AgentAttachment {
  * single-threaded DO; see panelws.py's `post_event` docstring for what that
  * field was for on the Python side). No handshake phase: authentication
  * happens once, off the raw upgrade request's cookies, before the socket is
- * ever accepted (see `handlePanelWsUpgrade`). */
+ * ever accepted (see `handlePanelWsUpgrade`).
+ *
+ * `uid` (Phase 3.0 Task 4/10 parity): the session uid this socket
+ * authenticated as, stored in `serializeAttachment` (not a separate
+ * in-memory map) so it survives hibernation, matching the convention every
+ * other durable per-connection field on `AgentAttachment` already follows.
+ * `postPanelEvent` reads it back to scope job-specific frames to this
+ * connection's own jobs -- see `panelVisibleTo`. Always set by
+ * `handlePanelWsUpgrade` (the socket is never accepted without a resolved
+ * session user), unlike Python's `_PanelConnection.uid`, which a same-loop
+ * test helper could leave `None`; there is no such unauthenticated-register
+ * path here. */
 interface PanelAttachment {
   kind: "panel";
   sid: string;
+  uid: string;
 }
 
 /** Every hibernatable socket this DO hosts carries one of these two shapes,
@@ -267,6 +279,24 @@ function normalizeModels(models: unknown): unknown[] {
     }
   }
   return out;
+}
+
+/** `(origin, userId)` of the job a panel-scoped event is about -- ports
+ * panelws.py's bare `tuple[str, Optional[str]]` `owner` shape (kept as a
+ * named interface here rather than a tuple for readability at call sites). */
+interface PanelOwner {
+  origin: string;
+  userId: string | null;
+}
+
+/** Whether a job-scoped frame for `owner` should reach a panel connection
+ * whose session uid is `connUid` -- ports panelws.py's `_visible_to`. The
+ * panel is a per-user workspace (Phase 3.0 Task 4), so a job-specific frame
+ * (`progress`/`executing`/`executed`/`execution_error`) must only ever reach
+ * the socket for the job's OWN panel origin and user, including an admin
+ * socket. */
+function panelVisibleTo(connUid: string, owner: PanelOwner): boolean {
+  return owner.origin === "panel" && owner.userId === connUid;
 }
 
 // ---------------------------------------------------------------------------
@@ -410,7 +440,7 @@ export class Hub extends DurableObject<Env> {
     this.ctx.acceptWebSocket(server);
 
     const sid = randomNonceHex();
-    const attachment: PanelAttachment = { kind: "panel", sid };
+    const attachment: PanelAttachment = { kind: "panel", sid, uid: user.uid };
     server.serializeAttachment(attachment);
 
     try {
@@ -1465,19 +1495,43 @@ export class Hub extends DurableObject<Env> {
   // needed) -- `handleInternalEvent`'s `/internal/event` is the SEPARATE
   // seam for callers outside the DO (Task 8/9's HTTP routes).
 
-  /** Broadcasts a `{type, data}` envelope to every connected panel client.
-   * Ports panelws.py's `post_event` (minus the cross-event-loop dance,
-   * which has no equivalent in a single-threaded DO -- every caller here
-   * already runs on this DO's own turn). Never throws: a dead/erroring
-   * panel socket is logged and skipped, exactly like Python's `except
-   * Exception` + drop-from-`_connections`; the difference is there is no
-   * registry entry to drop here -- `ctx.getWebSockets()` reflects socket
-   * lifecycle on its own. */
-  private async postPanelEvent(evt: { type: string; data?: unknown }): Promise<void> {
+  /** `(origin, userId)` for `jobId`, or `null` if it doesn't (or no longer)
+   * exist -- ports panelws.py's `_job_owner`. Callers below only ever have a
+   * bare `jobId`, not a live row (the one exception, `panelJobDone`, already
+   * has the freshly-committed row in hand and skips this lookup entirely). */
+  private async jobOwner(jobId: string): Promise<PanelOwner | null> {
+    const job = await queries.getJobById(this.env.DB, jobId);
+    return job ? { origin: job.origin, userId: job.userId } : null;
+  }
+
+  /** Broadcasts a `{type, data}` envelope to connected panel clients. Ports
+   * panelws.py's `post_event` (minus the cross-event-loop dance, which has
+   * no equivalent in a single-threaded DO -- every caller here already runs
+   * on this DO's own turn). Never throws: a dead/erroring panel socket is
+   * logged and skipped, exactly like Python's `except Exception` +
+   * drop-from-`_connections`; the difference is there is no registry entry
+   * to drop here -- `ctx.getWebSockets()` reflects socket lifecycle on its
+   * own.
+   *
+   * `owner` (Phase 3.0 Task 4/10 parity): `(origin, userId)` for the job this
+   * event is about, from `jobOwner`/a live row -- scopes delivery to ONLY the
+   * socket whose `uid` matches (see `panelVisibleTo`), including an admin's
+   * own panel socket (the spec's ruling: an admin's panel is as personal as
+   * anyone else's; full fleet visibility lives in the console). Omitted
+   * (`undefined`) means an unscoped broadcast -- used for the queue-badge
+   * `status` refreshes, which carry no single job's identity to scope
+   * against -- delivered to every connected panel socket, exactly as before
+   * this parameter existed. A `jobOwner` lookup that resolves to `null` (the
+   * job no longer exists) is passed through as `undefined` by every caller
+   * below, matching Python's fail-open-to-unscoped-broadcast rule: there is
+   * nothing left to scope against, and swallowing a real event is worse than
+   * a one-off leak. */
+  private async postPanelEvent(evt: { type: string; data?: unknown }, owner?: PanelOwner): Promise<void> {
     const payload = JSON.stringify(evt);
     for (const ws of this.ctx.getWebSockets()) {
       const att = ws.deserializeAttachment() as HubAttachment | null;
       if (!att || att.kind !== "panel") continue;
+      if (owner !== undefined && !panelVisibleTo(att.uid, owner)) continue;
       try {
         ws.send(payload);
       } catch (err) {
@@ -1508,15 +1562,18 @@ export class Hub extends DurableObject<Env> {
       if (fetchFields.fetchPct !== null) data.fetch_pct = fetchFields.fetchPct;
       if (fetchFields.fetchModel !== null) data.fetch_model = fetchFields.fetchModel;
     }
-    await this.postPanelEvent({ type: "progress", data });
+    await this.postPanelEvent({ type: "progress", data }, (await this.jobOwner(jobId)) ?? undefined);
   }
 
   /** Ports panelws.py's `job_running`. */
   private async panelJobRunning(jobId: string): Promise<void> {
-    await this.postPanelEvent({
-      type: "executing",
-      data: { node: RUNNING_NODE_LABEL, prompt_id: jobId, display_node: RUNNING_NODE_LABEL },
-    });
+    await this.postPanelEvent(
+      {
+        type: "executing",
+        data: { node: RUNNING_NODE_LABEL, prompt_id: jobId, display_node: RUNNING_NODE_LABEL },
+      },
+      (await this.jobOwner(jobId)) ?? undefined
+    );
   }
 
   /** Ports panelws.py's `job_status_refresh`. */
@@ -1526,12 +1583,18 @@ export class Hub extends DurableObject<Env> {
 
   /** Ports panelws.py's `job_requeued`. */
   private async panelJobRequeued(jobId: string): Promise<void> {
-    await this.postPanelEvent({ type: "executing", data: { node: null, prompt_id: jobId } });
+    await this.postPanelEvent(
+      { type: "executing", data: { node: null, prompt_id: jobId } },
+      (await this.jobOwner(jobId)) ?? undefined
+    );
   }
 
   /** Ports panelws.py's `job_cancelled`. */
   private async panelJobCancelled(jobId: string): Promise<void> {
-    await this.postPanelEvent({ type: "executing", data: { node: null, prompt_id: jobId } });
+    await this.postPanelEvent(
+      { type: "executing", data: { node: null, prompt_id: jobId } },
+      (await this.jobOwner(jobId)) ?? undefined
+    );
     await this.panelJobStatusRefresh();
   }
 
@@ -1540,39 +1603,50 @@ export class Hub extends DurableObject<Env> {
    * `executed` frame carries exactly one node's UI dict, never the whole
    * map), then the completion `executing` signal, then a refreshed
    * `status`. `job_outputs(job) or {FALLBACK_OUTPUT_KEY: {}}` in Python
-   * becomes an explicit empty-check here since `jobOutputs` is async. */
-  private async panelJobDone(job: JobOutputsInput): Promise<void> {
+   * becomes an explicit empty-check here since `jobOutputs` is async.
+   *
+   * `job` already carries `origin`/`userId` (the caller's freshly-committed
+   * `Job` row) -- unlike the jobId-only panel* methods above, no extra
+   * `jobOwner` lookup is needed to scope this event's delivery. */
+  private async panelJobDone(job: JobOutputsInput & PanelOwner): Promise<void> {
     let outputs = await jobOutputs(job, this.env.STORE);
     if (Object.keys(outputs).length === 0) {
       outputs = { [FALLBACK_OUTPUT_KEY]: {} };
     }
 
+    const owner: PanelOwner = { origin: job.origin, userId: job.userId };
     for (const [nodeId, payload] of Object.entries(outputs)) {
-      await this.postPanelEvent({
-        type: "executed",
-        data: { prompt_id: job.id, output: payload, node: nodeId, display_node: nodeId },
-      });
+      await this.postPanelEvent(
+        {
+          type: "executed",
+          data: { prompt_id: job.id, output: payload, node: nodeId, display_node: nodeId },
+        },
+        owner
+      );
     }
-    await this.postPanelEvent({ type: "executing", data: { node: null, prompt_id: job.id } });
+    await this.postPanelEvent({ type: "executing", data: { node: null, prompt_id: job.id } }, owner);
     await this.panelJobStatusRefresh();
   }
 
   /** Ports panelws.py's `job_failed`. */
   private async panelJobFailed(jobId: string, error: string): Promise<void> {
-    await this.postPanelEvent({
-      type: "execution_error",
-      data: {
-        prompt_id: jobId,
-        node_id: null,
-        node_type: null,
-        exception_message: error,
-        exception_type: "",
-        traceback: [],
-        current_inputs: {},
-        current_outputs: {},
-        executed: [],
+    await this.postPanelEvent(
+      {
+        type: "execution_error",
+        data: {
+          prompt_id: jobId,
+          node_id: null,
+          node_type: null,
+          exception_message: error,
+          exception_type: "",
+          traceback: [],
+          current_inputs: {},
+          current_outputs: {},
+          executed: [],
+        },
       },
-    });
+      (await this.jobOwner(jobId)) ?? undefined
+    );
     await this.panelJobStatusRefresh();
   }
 }
