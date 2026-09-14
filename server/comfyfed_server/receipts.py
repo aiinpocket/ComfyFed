@@ -152,12 +152,21 @@ def create_router() -> APIRouter:
         unbilled split as `contributions`. A receipt whose job is missing or
         whose job has no `user_id` (pre-Phase-3.0 data) aggregates into a
         single `user_id: None` row rather than being dropped.
+
+        L4 final-review fix: `kind == "p2p_upload"` rows are excluded
+        entirely -- they're worker-side bandwidth (job_id is always NULL for
+        them, see `peer.peer_served`), not consumer usage, and outer-joining
+        them through a nonexistent job otherwise materializes a phantom
+        `{username: null, jobs: 0, gpu_seconds: 0}` row in any range with
+        P2P activity. `/contributions` (above) still aggregates them into
+        `p2p_upload_bytes`; only this usage view drops them.
         """
         with db.get_session() as session:
             query = (
                 session.query(db.Receipt, db.Job.user_id, db.User.username)
                 .outerjoin(db.Job, db.Job.id == db.Receipt.job_id)
                 .outerjoin(db.User, db.User.id == db.Job.user_id)
+                .filter(db.Receipt.kind != "p2p_upload")
             )
             if start is not None:
                 query = query.filter(db.Receipt.created_at >= start)

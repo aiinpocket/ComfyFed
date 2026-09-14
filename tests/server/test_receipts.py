@@ -667,11 +667,12 @@ def test_contributions_report_unbilled_gpu_seconds_unaffected_by_p2p_upload(clie
     assert row["p2p_upload_bytes"] == 2_000_000
 
 
-def test_usage_report_p2p_upload_receipt_does_not_distort_usage(client):
-    """A p2p_upload receipt has job_id=None -> in /usage it folds into the
-    `user_id: None` legacy row via the outer join, same as any job-less
-    receipt. Its billable=False keeps it out of `jobs`, and its
-    gpu_seconds=0.0 must not move the row's totals."""
+def test_usage_report_excludes_p2p_upload_receipts_entirely(client):
+    """L4 final-review fix: a p2p_upload receipt has job_id=None, so the
+    outer join used to fold it into a phantom `user_id: None` row. It must
+    now be excluded from `/usage` entirely -- worker-side bandwidth is not
+    consumer usage -- leaving no null-user row at all when every other
+    receipt has a real owner."""
     admin_csrf = _login(client)
     worker_id, _sk = _register_worker_with_key(client, admin_csrf, "w1")
     alice = _create_user(client, admin_csrf, "alice", password="alice-pw-123")
@@ -705,10 +706,37 @@ def test_usage_report_p2p_upload_receipt_does_not_distort_usage(client):
     assert by_user[alice["id"]] == {
         "user_id": alice["id"], "username": "alice", "jobs": 1, "gpu_seconds": 10.0, "unbilled_gpu_seconds": 0.0,
     }
-    # The p2p_upload receipt folds into the null-user legacy row, untouched.
-    assert by_user[None] == {
-        "user_id": None, "username": None, "jobs": 0, "gpu_seconds": 0.0, "unbilled_gpu_seconds": 0.0,
-    }
+    # No phantom null-user row: the p2p_upload receipt is excluded outright.
+    assert None not in by_user
+    assert len(rows) == 1
+
+
+def test_contributions_report_still_includes_p2p_upload_bytes(client):
+    """Pin the OTHER half of L4: `/contributions` must keep aggregating
+    p2p_upload receipts (into `p2p_upload_bytes`) even though `/usage` now
+    excludes them -- the fix is scoped to the usage view only."""
+    admin_csrf = _login(client)
+    worker_id, _sk = _register_worker_with_key(client, admin_csrf, "w1")
+
+    with db.get_session() as session:
+        session.add(
+            db.Receipt(
+                job_id=None,
+                worker_id=worker_id,
+                gpu_seconds=0.0,
+                platform_sig="cd" * 32,
+                kind="p2p_upload",
+                billable=False,
+                basis="exec",
+                bytes=999,
+            )
+        )
+        session.commit()
+
+    res = client.get("/api/reports/contributions", headers={"X-CSRF": admin_csrf})
+    assert res.status_code == 200
+    row = next(r for r in res.json() if r["worker_id"] == worker_id)
+    assert row["p2p_upload_bytes"] == 999
 
 
 def test_contributions_rejects_an_unparseable_date(client):

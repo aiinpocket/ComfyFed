@@ -1061,11 +1061,16 @@ export async function getUsageRowsInRange(
   end: string | null,
   onlyUserId?: string
 ): Promise<UsageJoinRow[]> {
+  // L4 final-review fix: exclude kind='p2p_upload' rows -- they're
+  // worker-side bandwidth (job_id is always NULL for them), not consumer
+  // usage, and would otherwise materialize a phantom {username: null,
+  // gpuSeconds: 0} row in any range with P2P activity. `/contributions`
+  // still aggregates them separately into p2pUploadBytes.
   let sql = `SELECT j.user_id AS user_id, u.username AS username, r.gpu_seconds AS gpu_seconds, r.billable AS billable
              FROM receipts r
              LEFT JOIN jobs j ON j.id = r.job_id
              LEFT JOIN users u ON u.id = j.user_id
-             WHERE 1=1`;
+             WHERE r.kind != 'p2p_upload'`;
   const binds: string[] = [];
   if (start !== null) {
     sql += " AND r.created_at >= ?";
