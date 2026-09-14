@@ -6,15 +6,21 @@ and progress throttling.
 from __future__ import annotations
 
 import asyncio
+import base64
 import hashlib
+import json
 import os
+import re
+import time
 
 import httpx
 import pytest
 from nacl.signing import SigningKey
 
-from comfyfed_agent import fetcher
+from comfyfed_agent import fetcher, peerserve
 from comfyfed_agent.comfy import JobCancelled
+from comfyfed_agent.config import PlatformEntry
+from tests.agent.test_peerserve import _make_grant, _platform, _sign_grant
 
 
 def _keypair():
@@ -686,3 +692,373 @@ async def test_progress_is_throttled_by_default(tmp_path):
     # to a small handful of reports, always ending on the 100% completion.
     assert 0 < len(calls) < 30
     assert calls[-1] == (100.0, None)
+
+
+# --- Phase 3.1 P2P addendum: peer source path --------------------------------
+
+
+def _puller_platform_entry(worker_id="puller-1"):
+    """A puller agent's own pinned-platform entry -- what fetcher signs its
+    `/api/agent/peer-grant` REQUEST with. Unrelated to the seeder identity
+    `tests.agent.test_peerserve._platform` builds (that one signs the GRANT
+    itself, verified seeder-side by `peerserve`, which this module never
+    touches -- fetcher only forwards whatever the platform handed it)."""
+    signing_key = SigningKey.generate()
+    return PlatformEntry(
+        platform_url="http://platform.example",
+        platform_pubkey="0" * 64,  # unused: fetcher never verifies the grant itself
+        worker_id=worker_id,
+        certificate="cert",
+        signing_key_hex=signing_key.encode().hex(),
+    )
+
+
+class _FakePlatformClient:
+    """Fakes the `httpx.AsyncClient` fetcher uses for `POST
+    /api/agent/peer-grant` -- `handler(path, content, headers)` returns the
+    canned `httpx.Response`."""
+
+    def __init__(self, handler, **_kwargs):
+        self._handler = handler
+
+    async def __aenter__(self):
+        return self
+
+    async def __aexit__(self, *args):
+        return False
+
+    async def post(self, path, content=None, headers=None):
+        return self._handler(path, content, headers)
+
+
+def _platform_client_factory(handler):
+    def _factory(**kwargs):
+        return _FakePlatformClient(handler)
+
+    return _factory
+
+
+class _ExplodingURLClient:
+    """The URL-chain `client_factory` for a test expecting the peer source
+    to fully satisfy every entry -- construction is fine (the outer `async
+    with client_factory(...)` always runs it once), but `.stream()` must
+    never be called."""
+
+    def __init__(self, *a, **k):
+        pass
+
+    async def __aenter__(self):
+        return self
+
+    async def __aexit__(self, *a):
+        return False
+
+    def stream(self, *a, **k):
+        raise AssertionError("peer source should have satisfied the entry; URL chain must not run")
+
+
+def _grant_issuer(*, name, size_bytes, seeder_id, signing_key, peer_url, chunk_sha256s):
+    """A fake `/api/agent/peer-grant` handler that mints a freshly-signed,
+    freshly-numbered (`g-1`, `g-2`, ...) grant on every call -- `.calls`
+    counts invocations, useful for asserting a single grant vs. a re-grant."""
+
+    state = {"calls": 0}
+
+    def handle(path, content, headers):
+        state["calls"] += 1
+        grant = _make_grant(
+            name=name, size_bytes=size_bytes, seeder_id=seeder_id, puller_id="puller-1",
+            grant_id=f"g-{state['calls']}",
+        )
+        sig = _sign_grant(signing_key, grant)
+        return httpx.Response(
+            200,
+            json={"grant": {**grant, "sig": sig}, "peer_url": peer_url, "chunk_sha256s": chunk_sha256s},
+        )
+
+    handle.calls = lambda: state["calls"]
+    return handle
+
+
+def _chunk_sha256s(content: bytes, chunk_size: int) -> list[str]:
+    return [
+        hashlib.sha256(content[i : i + chunk_size]).hexdigest() for i in range(0, len(content), chunk_size)
+    ]
+
+
+async def test_peer_happy_path_multi_chunk_pull(tmp_path, monkeypatch):
+    """Peer source satisfies the entry entirely: multiple chunks (small
+    monkeypatched chunk size), verified individually, land + whole-file
+    verify + atomic replace -- the URL chain is never touched."""
+    monkeypatch.setattr(fetcher, "_PEER_CHUNK_SIZE", 1000)
+
+    content = os.urandom(5000)
+    seed_dir = tmp_path / "seed"
+    (seed_dir / "checkpoints").mkdir(parents=True)
+    (seed_dir / "checkpoints" / "model.bin").write_bytes(content)
+
+    seeder_signing_key, seeder_entry = _platform(worker_id="seeder-1")
+    srv = peerserve.PeerHTTPServer(
+        models_dir=str(seed_dir), port=0, platforms=[seeder_entry], bind_host="127.0.0.1"
+    )
+    srv.start()
+    try:
+        manifest_key, manifest_pubkey_hex = _keypair()
+        entry = _signed_entry(
+            manifest_key, name="model.bin", directory="checkpoints", content=content,
+            url="http://models.example/should-not-be-fetched",
+        )
+
+        issuer = _grant_issuer(
+            name="checkpoints/model.bin", size_bytes=len(content), seeder_id=seeder_entry.worker_id,
+            signing_key=seeder_signing_key, peer_url=f"http://127.0.0.1:{srv.port}",
+            chunk_sha256s=_chunk_sha256s(content, 1000),
+        )
+
+        dest = tmp_path / "dest"
+        await fetcher.fetch_and_verify_models(
+            entries=[entry],
+            platform_pubkey_hex=manifest_pubkey_hex,
+            models_dir=str(dest),
+            max_fetch_gb=100,
+            cancel_event=asyncio.Event(),
+            report_progress=_noop_progress,
+            client_factory=_ExplodingURLClient,
+            platform_entry=_puller_platform_entry(),
+            peer_client_factory=httpx.AsyncClient,
+            platform_client_factory=_platform_client_factory(issuer),
+        )
+
+        final_path = dest / "checkpoints" / "model.bin"
+        assert final_path.read_bytes() == content
+        assert not (dest / "checkpoints" / "model.bin.part").exists()
+        assert issuer.calls() == 1
+    finally:
+        srv.stop()
+
+
+async def test_peer_chunk_mismatch_falls_back_to_url(tmp_path, monkeypatch):
+    """A per-chunk hash mismatch abandons the peer source entirely (`.part`
+    cleared, no retry against the peer) and falls to the URL chain, which
+    completes normally."""
+    monkeypatch.setattr(fetcher, "_PEER_CHUNK_SIZE", 1000)
+
+    content = os.urandom(3000)
+    seed_dir = tmp_path / "seed"
+    (seed_dir / "checkpoints").mkdir(parents=True)
+    (seed_dir / "checkpoints" / "model.bin").write_bytes(content)
+
+    seeder_signing_key, seeder_entry = _platform(worker_id="seeder-1")
+    srv = peerserve.PeerHTTPServer(
+        models_dir=str(seed_dir), port=0, platforms=[seeder_entry], bind_host="127.0.0.1"
+    )
+    srv.start()
+    try:
+        manifest_key, manifest_pubkey_hex = _keypair()
+        entry = _signed_entry(
+            manifest_key, name="model.bin", directory="checkpoints", content=content,
+            url="http://models.example/f.bin",
+        )
+
+        bad_chunks = _chunk_sha256s(content, 1000)
+        bad_chunks[1] = "0" * 64  # corrupt the second chunk's expected hash
+
+        issuer = _grant_issuer(
+            name="checkpoints/model.bin", size_bytes=len(content), seeder_id=seeder_entry.worker_id,
+            signing_key=seeder_signing_key, peer_url=f"http://127.0.0.1:{srv.port}",
+            chunk_sha256s=bad_chunks,
+        )
+
+        recorded = []
+        url_client_cls = _client_factory([_StreamSpec(chunks=[content])], recorded)
+
+        dest = tmp_path / "dest"
+        await fetcher.fetch_and_verify_models(
+            entries=[entry],
+            platform_pubkey_hex=manifest_pubkey_hex,
+            models_dir=str(dest),
+            max_fetch_gb=100,
+            cancel_event=asyncio.Event(),
+            report_progress=_noop_progress,
+            client_factory=url_client_cls,
+            platform_entry=_puller_platform_entry(),
+            peer_client_factory=httpx.AsyncClient,
+            platform_client_factory=_platform_client_factory(issuer),
+        )
+
+        final_path = dest / "checkpoints" / "model.bin"
+        assert final_path.read_bytes() == content
+        assert not (dest / "checkpoints" / "model.bin.part").exists()
+        assert recorded == [entry["url"]]
+        assert issuer.calls() == 1  # peer tried exactly once, no retry loop after a mismatch
+    finally:
+        srv.stop()
+
+
+async def test_peer_resume_after_disconnect_regrants_and_skips_verified_chunks(tmp_path, monkeypatch):
+    """A mid-transfer disconnect (simulated as a 403 on the in-flight chunk,
+    matching a seeder-side grant-expiry response) triggers a fresh grant;
+    the resume logic re-verifies `.part` against `chunk_sha256s` and
+    continues from the first missing chunk -- the already-verified chunk is
+    never re-requested."""
+    monkeypatch.setattr(fetcher, "_PEER_CHUNK_SIZE", 1000)
+
+    content = os.urandom(3000)
+    chunk_sha256s = _chunk_sha256s(content, 1000)
+    inventory_name = "checkpoints/model.bin"
+
+    requests: list[tuple[str, str]] = []
+    # The chunk starting at byte 1000, but ONLY under the first grant, fails
+    # with 403 -- simulating a disconnect/expiry mid-pull; a fresh grant
+    # (g-2) succeeds for that same range.
+    failing = {("g-1", 1000)}
+
+    class _FakePeerServer:
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *a):
+            return False
+
+        async def get(self, url, headers=None):
+            grant_obj = json.loads(base64.b64decode(headers[fetcher._PEER_GRANT_HEADER]))
+            grant_id = grant_obj["grant_id"]
+            m = re.match(r"bytes=(\d+)-(\d+)", headers["Range"])
+            start, end = int(m.group(1)), int(m.group(2))
+            requests.append((grant_id, headers["Range"]))
+            if (grant_id, start) in failing:
+                return httpx.Response(403, content=b"")
+            return httpx.Response(206, content=content[start : end + 1])
+
+    def _peer_client_factory(**kwargs):
+        return _FakePeerServer()
+
+    seeder_signing_key, seeder_entry = _platform(worker_id="seeder-1")
+    issuer = _grant_issuer(
+        name=inventory_name, size_bytes=len(content), seeder_id=seeder_entry.worker_id,
+        signing_key=seeder_signing_key, peer_url="http://fake-peer.example",
+        chunk_sha256s=chunk_sha256s,
+    )
+
+    manifest_key, manifest_pubkey_hex = _keypair()
+    entry = _signed_entry(
+        manifest_key, name="model.bin", directory="checkpoints", content=content,
+        url="http://models.example/should-not-be-fetched",
+    )
+
+    dest = tmp_path / "dest"
+    await fetcher.fetch_and_verify_models(
+        entries=[entry],
+        platform_pubkey_hex=manifest_pubkey_hex,
+        models_dir=str(dest),
+        max_fetch_gb=100,
+        cancel_event=asyncio.Event(),
+        report_progress=_noop_progress,
+        client_factory=_ExplodingURLClient,
+        platform_entry=_puller_platform_entry(),
+        peer_client_factory=_peer_client_factory,
+        platform_client_factory=_platform_client_factory(issuer),
+    )
+
+    final_path = dest / "checkpoints" / "model.bin"
+    assert final_path.read_bytes() == content
+    assert issuer.calls() == 2  # one re-grant after the simulated disconnect
+
+    # Chunk 0 (bytes=0-999) was verified under g-1 and must NEVER be
+    # re-requested once g-2 takes over.
+    chunk0_requests = [r for r in requests if r[1] == "bytes=0-999"]
+    assert chunk0_requests == [("g-1", "bytes=0-999")]
+
+    # The failed range was retried, successfully, under the fresh grant.
+    assert ("g-1", "bytes=1000-1999") in requests
+    assert ("g-2", "bytes=1000-1999") in requests
+
+
+async def test_peer_only_entry_failure_is_fetch_failure(tmp_path):
+    """A `url: None, peer: True` entry skips the URL chain entirely -- a
+    failed peer grant for it is a plain fetch failure, not a silent
+    fall-through."""
+    manifest_key, manifest_pubkey_hex = _keypair()
+    content = b"x" * 100
+    entry = _signed_entry(
+        manifest_key, name="model.bin", directory="checkpoints", content=content, url=None
+    )
+    entry["peer"] = True
+
+    def _no_seeder(path, content, headers):
+        request = httpx.Request("POST", "http://platform.example" + path)
+        return httpx.Response(404, json={"detail": {"code": "peer.no_seeder"}}, request=request)
+
+    with pytest.raises(fetcher.FetchError) as exc_info:
+        await fetcher.fetch_and_verify_models(
+            entries=[entry],
+            platform_pubkey_hex=manifest_pubkey_hex,
+            models_dir=str(tmp_path),
+            max_fetch_gb=100,
+            cancel_event=asyncio.Event(),
+            report_progress=_noop_progress,
+            client_factory=_ExplodingURLClient,
+            platform_entry=_puller_platform_entry(),
+            peer_client_factory=httpx.AsyncClient,
+            platform_client_factory=_platform_client_factory(_no_seeder),
+        )
+
+    assert "model.bin" in str(exc_info.value)
+    assert not (tmp_path / "checkpoints" / "model.bin").exists()
+    assert not (tmp_path / "checkpoints" / "model.bin.part").exists()
+
+
+async def test_cancel_mid_peer_pull_cleans_up(tmp_path, monkeypatch):
+    """Cancellation mid peer-pull raises JobCancelled and removes the
+    `.part` -- the same contract the URL path already guarantees, reused
+    unchanged."""
+    monkeypatch.setattr(fetcher, "_PEER_CHUNK_SIZE", 1000)
+    monkeypatch.setattr(fetcher, "_PROGRESS_MIN_INTERVAL_SECONDS", 0.0)
+    monkeypatch.setattr(fetcher, "_PROGRESS_MIN_PCT_STEP", 0.0)
+
+    content = os.urandom(5000)
+    seed_dir = tmp_path / "seed"
+    (seed_dir / "checkpoints").mkdir(parents=True)
+    (seed_dir / "checkpoints" / "model.bin").write_bytes(content)
+
+    seeder_signing_key, seeder_entry = _platform(worker_id="seeder-1")
+    srv = peerserve.PeerHTTPServer(
+        models_dir=str(seed_dir), port=0, platforms=[seeder_entry], bind_host="127.0.0.1"
+    )
+    srv.start()
+    try:
+        manifest_key, manifest_pubkey_hex = _keypair()
+        entry = _signed_entry(
+            manifest_key, name="model.bin", directory="checkpoints", content=content,
+            url="http://models.example/should-not-be-fetched",
+        )
+        issuer = _grant_issuer(
+            name="checkpoints/model.bin", size_bytes=len(content), seeder_id=seeder_entry.worker_id,
+            signing_key=seeder_signing_key, peer_url=f"http://127.0.0.1:{srv.port}",
+            chunk_sha256s=_chunk_sha256s(content, 1000),
+        )
+
+        cancel_event = asyncio.Event()
+
+        async def _progress(pct, name):
+            cancel_event.set()
+
+        dest = tmp_path / "dest"
+        with pytest.raises(JobCancelled):
+            await fetcher.fetch_and_verify_models(
+                entries=[entry],
+                platform_pubkey_hex=manifest_pubkey_hex,
+                models_dir=str(dest),
+                max_fetch_gb=100,
+                cancel_event=cancel_event,
+                report_progress=_progress,
+                client_factory=_ExplodingURLClient,
+                platform_entry=_puller_platform_entry(),
+                peer_client_factory=httpx.AsyncClient,
+                platform_client_factory=_platform_client_factory(issuer),
+            )
+
+        assert not (dest / "checkpoints" / "model.bin.part").exists()
+        assert not (dest / "checkpoints" / "model.bin").exists()
+    finally:
+        srv.stop()

@@ -34,7 +34,9 @@ branch exactly like a cancel mid-render: silently, no `job_failed` sent.
 
 from __future__ import annotations
 
+import base64
 import hashlib
+import json
 import logging
 import ntpath
 import os
@@ -42,12 +44,15 @@ import re
 import shutil
 import time
 from typing import Awaitable, Callable, Optional
+from urllib.parse import quote
 
 import httpx
 from nacl.exceptions import BadSignatureError
 from nacl.signing import VerifyKey
 
+from . import hardware, signing
 from .comfy import JobCancelled
+from .config import PlatformEntry
 
 logger = logging.getLogger(__name__)
 
@@ -55,6 +60,38 @@ _CONNECT_TIMEOUT_SECONDS = 30.0
 _READ_TIMEOUT_SECONDS = 120.0
 _CHUNK_SIZE = 1024 * 1024  # 1 MiB, matching hardware._HASH_READ_CHUNK
 _PART_SUFFIX = ".part"
+
+# Phase 3.1 P2P addendum (拉方/puller side). Peer chunk boundary MUST match
+# hardware.CHUNK_SIZE (64 MiB, Global Constraints) -- reused directly rather
+# than duplicated, since it also governs how `chunk_sha256s` offsets are
+# computed on the seeder/reporting side.
+_PEER_CHUNK_SIZE = hardware.CHUNK_SIZE
+_PEER_GRANT_PATH = "/api/agent/peer-grant"
+# Must byte-for-byte match comfyfed_agent.peerserve._ROUTE_PREFIX / the
+# seeder's route -- duplicated (not imported) the same way peerserve itself
+# duplicates comfyfed_server.peer's field ordering, per that module's own
+# precedent for these cross-process wire-shape constants.
+_PEER_ROUTE_PREFIX = "/peer/models/"
+_PEER_GRANT_HEADER = "X-ComfyFed-Grant"
+_PEER_CONNECT_TIMEOUT_SECONDS = 30.0
+_PEER_READ_TIMEOUT_SECONDS = 120.0
+
+
+class _PeerGrantExpired(Exception):
+    """The grant expired (403 from the seeder, or the locally-tracked
+    `expires_at` already elapsed) -- caller re-requests a grant and resumes."""
+
+
+class _PeerChunkMismatch(Exception):
+    """One pulled chunk failed its `chunk_sha256s` check -- the peer source
+    is abandoned entirely for this entry (whole `.part` cleared) in favor of
+    the URL chain."""
+
+
+class _PeerFailure(Exception):
+    """Any other unrecoverable peer-source problem (malformed grant
+    response, network error, unexpected HTTP status, short read) -- falls
+    back to the URL chain the same as `_PeerChunkMismatch`."""
 
 # Progress is reported at most this often OR on at least this big a jump in
 # overall percent -- whichever comes first -- so a fast local download (many
@@ -250,6 +287,58 @@ def _safe_unlink(path: str) -> None:
         pass
 
 
+def _finalize_download(
+    *,
+    part_path: str,
+    target_path: str,
+    expected_sha256,
+    expected_size,
+    source_label: str,
+    written_size: Optional[int] = None,
+    precomputed_sha256: Optional[str] = None,
+) -> Optional[str]:
+    """Final whole-file size + SHA-256 verify, then atomic `os.replace` onto
+    `target_path` -- shared by BOTH the URL path (`_download_one`, which
+    already has a streaming digest/byte-count in hand -- passed as
+    `written_size`/`precomputed_sha256` to avoid a second read) and the peer
+    path (which re-reads `part_path` from disk here, since its chunks are
+    verified individually, not against a running whole-file digest).
+
+    Returns `None` on success (file is now at `target_path`), or an error
+    message with `part_path` already removed on failure. Never raises for an
+    OSError while stat'ing/reading -- folded into the returned message like
+    every other download failure.
+    """
+    try:
+        size = written_size if written_size is not None else os.path.getsize(part_path)
+    except OSError as exc:
+        _safe_unlink(part_path)
+        return f"{source_label} -> could not stat downloaded file: {exc}"
+
+    if isinstance(expected_size, int) and size != expected_size:
+        _safe_unlink(part_path)
+        return f"{source_label} -> size mismatch (got {size} bytes, expected {expected_size})"
+
+    if expected_sha256:
+        digest_hex = precomputed_sha256
+        if digest_hex is None:
+            digest = hashlib.sha256()
+            try:
+                with open(part_path, "rb") as f:
+                    for chunk in iter(lambda: f.read(_CHUNK_SIZE), b""):
+                        digest.update(chunk)
+            except OSError as exc:
+                _safe_unlink(part_path)
+                return f"{source_label} -> could not read downloaded file: {exc}"
+            digest_hex = digest.hexdigest()
+        if digest_hex != expected_sha256:
+            _safe_unlink(part_path)
+            return f"{source_label} -> sha256 mismatch"
+
+    os.replace(part_path, target_path)
+    return None
+
+
 async def _download_one(
     *,
     entry: dict,
@@ -318,24 +407,297 @@ async def _download_one(
             _safe_unlink(part_path)
             continue
 
-        if isinstance(expected_size, int) and written != expected_size:
-            last_error = f"{url} -> size mismatch (got {written} bytes, expected {expected_size})"
-            logger.warning("fetcher: %s", last_error)
-            _safe_unlink(part_path)
-            continue
-        if expected_sha256 and digest.hexdigest() != expected_sha256:
-            last_error = f"{url} -> sha256 mismatch"
-            logger.warning("fetcher: sha256 mismatch downloading %r from %s", name, url)
-            _safe_unlink(part_path)
+        error = _finalize_download(
+            part_path=part_path,
+            target_path=target_path,
+            expected_sha256=expected_sha256,
+            expected_size=expected_size,
+            source_label=url,
+            written_size=written,
+            precomputed_sha256=digest.hexdigest(),
+        )
+        if error is not None:
+            last_error = error
+            logger.warning("fetcher: %s", error)
             continue
 
-        os.replace(part_path, target_path)
         return
 
     raise FetchError(
         f"模型 {name} 下載失敗（已嘗試：{', '.join(urls_tried)}）：{last_error} / "
         f"failed to download model {name} (tried: {', '.join(urls_tried)}): {last_error}"
     )
+
+
+# --- Phase 3.1 P2P addendum (拉方/puller side) --------------------------------
+
+
+def _inventory_name(entry: dict) -> str:
+    """The `dir/file`-shaped inventory name `hardware.scan_models` (and
+    therefore `db.ModelHash`/peer-grant/peerserve) uses for this entry --
+    NOT the bare `name` field a fetch-manifest entry carries (see
+    `model_manifest.entries`'s separate `name`/`directory` fields). Built
+    from the SAME already-sanitized values `_resolve_target_path` validated
+    for this entry earlier in `fetch_and_verify_models`."""
+    name = entry.get("name")
+    directory = (entry.get("directory") or "").replace("\\", "/").strip("/")
+    return f"{directory}/{name}" if directory else name
+
+
+async def _request_peer_grant(
+    *,
+    platform_entry: PlatformEntry,
+    name: str,
+    size_bytes: int,
+    client_factory: Callable[..., httpx.AsyncClient],
+) -> Optional[dict]:
+    """`POST /api/agent/peer-grant` to the issuing platform. Returns the
+    response body (`{"grant": {...+sig}, "peer_url": ..., "chunk_sha256s":
+    ...}`) on a 200, or `None` on ANY other outcome -- a typed 404
+    (`peer.no_seeder`/`peer.no_model`)/400 (`peer.already_has_model`) refusal,
+    an unexpected status, or a network failure all just fall back to the URL
+    chain the same way, logged once at info level (never a warning/error:
+    "no peer available" is an expected, routine outcome, not a fault)."""
+    body = json.dumps({"name": name, "size_bytes": size_bytes}).encode()
+    try:
+        headers = signing.signed_headers(platform_entry, "POST", _PEER_GRANT_PATH, body)
+        headers["Content-Type"] = "application/json"
+        async with client_factory(base_url=platform_entry.platform_url) as client:
+            resp = await client.post(_PEER_GRANT_PATH, content=body, headers=headers)
+        if resp.status_code != 200:
+            logger.info(
+                "fetcher: peer grant unavailable for %r (status=%s), falling back to URL chain",
+                name, resp.status_code,
+            )
+            return None
+        return resp.json()
+    except Exception as exc:
+        logger.info(
+            "fetcher: peer grant request failed for %r (%s), falling back to URL chain", name, exc
+        )
+        return None
+
+
+def _verify_local_chunks(part_path: str, chunk_sha256s: Optional[list], size_bytes: int) -> int:
+    """Resume support: re-hash an existing `.part` chunk-by-chunk against
+    `chunk_sha256s` (in `_PEER_CHUNK_SIZE` pieces), keep the longest verified
+    PREFIX, and truncate the file to exactly that many bytes (dropping any
+    trailing partial/invalid chunk). Returns the resulting byte offset to
+    resume pulling from.
+
+    No `chunk_sha256s` on the grant -> there is no way to verify anything
+    already on disk, so the whole `.part` is discarded (offset 0) rather
+    than trusted blind, per the brief's resume contract.
+    """
+    if not os.path.exists(part_path):
+        return 0
+    if not chunk_sha256s:
+        _safe_unlink(part_path)
+        return 0
+
+    verified_bytes = 0
+    try:
+        with open(part_path, "rb") as f:
+            for i, expected in enumerate(chunk_sha256s):
+                chunk_start = i * _PEER_CHUNK_SIZE
+                if chunk_start >= size_bytes:
+                    break
+                chunk_end = min(chunk_start + _PEER_CHUNK_SIZE, size_bytes)
+                chunk_len = chunk_end - chunk_start
+                data = f.read(chunk_len)
+                if len(data) != chunk_len or hashlib.sha256(data).hexdigest() != expected:
+                    break
+                verified_bytes = chunk_end
+    except OSError:
+        _safe_unlink(part_path)
+        return 0
+
+    try:
+        with open(part_path, "r+b") as f:
+            f.truncate(verified_bytes)
+    except OSError:
+        _safe_unlink(part_path)
+        return 0
+    return verified_bytes
+
+
+async def _pull_chunks_from_offset(
+    *,
+    entry: dict,
+    inventory_name: str,
+    target_path: str,
+    grant_response: dict,
+    start_offset: int,
+    cancel_event,
+    on_bytes: Callable[[int], Awaitable[None]],
+    client_factory: Callable[..., httpx.AsyncClient],
+) -> None:
+    """Pull `target_path`'s `.part` from `start_offset` through end-of-file
+    via sequential `_PEER_CHUNK_SIZE` Range GETs against the seeder,
+    appending each verified chunk. Raises `comfy.JobCancelled`,
+    `_PeerGrantExpired`, `_PeerChunkMismatch`, or `_PeerFailure` -- never
+    returns partway through, always either finishes (returns normally, every
+    byte through `size_bytes` on disk) or raises."""
+    size_bytes = entry.get("size_bytes")
+    part_path = target_path + _PART_SUFFIX
+    chunk_sha256s = grant_response.get("chunk_sha256s")
+    peer_url = grant_response.get("peer_url")
+    grant = grant_response.get("grant")
+    if not isinstance(peer_url, str) or not peer_url or not isinstance(grant, dict) or "sig" not in grant:
+        raise _PeerFailure("malformed peer grant response")
+
+    url = peer_url.rstrip("/") + _PEER_ROUTE_PREFIX + quote(inventory_name, safe="")
+    header_value = base64.b64encode(json.dumps(grant).encode()).decode()
+
+    timeout = httpx.Timeout(
+        connect=_PEER_CONNECT_TIMEOUT_SECONDS,
+        read=_PEER_READ_TIMEOUT_SECONDS,
+        write=_PEER_READ_TIMEOUT_SECONDS,
+        pool=_PEER_CONNECT_TIMEOUT_SECONDS,
+    )
+
+    offset = start_offset
+    async with client_factory(timeout=timeout) as client:
+        while offset < size_bytes:
+            if cancel_event.is_set():
+                raise JobCancelled()
+            if grant.get("expires_at", 0) <= time.time():
+                raise _PeerGrantExpired()
+
+            chunk_end = min(offset + _PEER_CHUNK_SIZE, size_bytes) - 1
+            try:
+                resp = await client.get(
+                    url,
+                    headers={_PEER_GRANT_HEADER: header_value, "Range": f"bytes={offset}-{chunk_end}"},
+                )
+            except Exception as exc:
+                raise _PeerFailure(f"request error: {exc}") from exc
+
+            if resp.status_code == 403:
+                raise _PeerGrantExpired()
+            if resp.status_code not in (200, 206):
+                raise _PeerFailure(f"unexpected status {resp.status_code}")
+
+            data = resp.content
+            expected_len = chunk_end - offset + 1
+            if len(data) != expected_len:
+                raise _PeerFailure(
+                    f"short chunk read (got {len(data)} bytes, expected {expected_len})"
+                )
+
+            if chunk_sha256s:
+                chunk_index = offset // _PEER_CHUNK_SIZE
+                if chunk_index < len(chunk_sha256s) and hashlib.sha256(data).hexdigest() != chunk_sha256s[chunk_index]:
+                    raise _PeerChunkMismatch()
+
+            with open(part_path, "ab") as f:
+                f.write(data)
+            offset = chunk_end + 1
+            await on_bytes(expected_len)
+
+
+async def _fetch_via_peer(
+    *,
+    entry: dict,
+    target_path: str,
+    platform_entry: PlatformEntry,
+    cancel_event,
+    on_bytes: Callable[[int], Awaitable[None]],
+    peer_client_factory: Callable[..., httpx.AsyncClient],
+    platform_client_factory: Callable[..., httpx.AsyncClient],
+) -> bool:
+    """Try the peer source for one manifest entry, end to end: grant, chunked
+    pull (with resume + re-grant-on-expiry), final whole-file verify +
+    atomic replace (via `_finalize_download`, the SAME helper `_download_one`
+    uses).
+
+    Returns `True` iff `target_path` now holds the fully verified file.
+    `False` means "give up on peer for this entry, try the URL chain instead"
+    -- every case reaching `False` has already logged once and cleaned up
+    any `.part` bytes it can no longer vouch for. Raises `comfy.JobCancelled`
+    on cancellation (unchanged existing behavior, handled by the caller).
+    """
+    if cancel_event.is_set():
+        raise JobCancelled()
+
+    name = entry.get("name")
+    size_bytes = entry.get("size_bytes")
+    inventory_name = _inventory_name(entry)
+    part_path = target_path + _PART_SUFFIX
+
+    grant_response = await _request_peer_grant(
+        platform_entry=platform_entry,
+        name=inventory_name,
+        size_bytes=size_bytes,
+        client_factory=platform_client_factory,
+    )
+    if grant_response is None:
+        return False
+
+    chunk_sha256s = grant_response.get("chunk_sha256s")
+    offset = _verify_local_chunks(part_path, chunk_sha256s, size_bytes)
+    if offset:
+        await on_bytes(offset)
+
+    while True:
+        try:
+            await _pull_chunks_from_offset(
+                entry=entry,
+                inventory_name=inventory_name,
+                target_path=target_path,
+                grant_response=grant_response,
+                start_offset=offset,
+                cancel_event=cancel_event,
+                on_bytes=on_bytes,
+                client_factory=peer_client_factory,
+            )
+            break
+        except _PeerGrantExpired:
+            logger.info("fetcher: peer grant expired mid-transfer for %r, re-granting", name)
+            new_grant_response = await _request_peer_grant(
+                platform_entry=platform_entry,
+                name=inventory_name,
+                size_bytes=size_bytes,
+                client_factory=platform_client_factory,
+            )
+            if new_grant_response is None:
+                logger.info(
+                    "fetcher: could not obtain a fresh peer grant for %r, falling back to URL chain",
+                    name,
+                )
+                _safe_unlink(part_path)
+                return False
+            grant_response = new_grant_response
+            chunk_sha256s = grant_response.get("chunk_sha256s")
+            # Recompute from disk: any bytes already pulled under the
+            # expired grant were already reported via on_bytes as they
+            # landed, so this must NOT be re-reported here.
+            offset = _verify_local_chunks(part_path, chunk_sha256s, size_bytes)
+            continue
+        except _PeerChunkMismatch:
+            logger.info(
+                "fetcher: peer chunk hash mismatch for %r, falling back to URL chain", name
+            )
+            _safe_unlink(part_path)
+            return False
+        except _PeerFailure as exc:
+            logger.info(
+                "fetcher: peer pull failed for %r (%s), falling back to URL chain", name, exc
+            )
+            _safe_unlink(part_path)
+            return False
+
+    error = _finalize_download(
+        part_path=part_path,
+        target_path=target_path,
+        expected_sha256=entry.get("sha256"),
+        expected_size=size_bytes,
+        source_label=f"peer:{grant_response.get('peer_url')}",
+    )
+    if error is not None:
+        logger.info("fetcher: peer whole-file verify failed for %r (%s), falling back to URL chain", name, error)
+        return False
+    return True
 
 
 async def fetch_and_verify_models(
@@ -347,6 +709,9 @@ async def fetch_and_verify_models(
     cancel_event,
     report_progress: Callable[[float, Optional[str]], Awaitable[None]],
     client_factory: Callable[..., httpx.AsyncClient] = httpx.AsyncClient,
+    platform_entry: Optional[PlatformEntry] = None,
+    peer_client_factory: Callable[..., httpx.AsyncClient] = httpx.AsyncClient,
+    platform_client_factory: Callable[..., httpx.AsyncClient] = httpx.AsyncClient,
 ) -> None:
     """Verify, budget-check, and download every `fetch_models` entry.
 
@@ -354,6 +719,17 @@ async def fetch_and_verify_models(
     (0-100, weighted by `size_bytes` across every entry, not per-file) and
     the name of the entry currently in flight, throttled to at most every
     `_PROGRESS_MIN_INTERVAL_SECONDS` or `_PROGRESS_MIN_PCT_STEP`.
+
+    Phase 3.1 P2P addendum: when `platform_entry` (the PlatformEntry of the
+    platform that dispatched this job -- `conn.entry` in `runner.handle_job`)
+    is given, EVERY entry tries the peer source FIRST via that platform's
+    `/api/agent/peer-grant`, before its URL chain -- see `_fetch_via_peer`.
+    `platform_entry=None` (the default, and every pre-3.1 caller) skips the
+    peer attempt entirely and behaves exactly as before. An entry shaped
+    `{"url": None, "peer": True}` (peer-only, Task 6) skips the URL chain
+    entirely: a failed/unavailable peer source for one of those is a fetch
+    failure via the same `FetchError` path as any other download failure,
+    not a silent fall-through to a URL chain that doesn't exist for it.
 
     Raises `FetchError` (a signature, budget, disk, path, or download
     failure -- `str()` is the ready-to-report zh-TW-first message) or
@@ -406,9 +782,30 @@ async def fetch_and_verify_models(
         ) as client:
             for entry, target_path in targets:
                 model_name = entry.get("name")
+                is_peer_only = entry.get("url") is None and entry.get("peer") is True
 
                 async def _on_bytes(n: int, _name=model_name) -> None:
                     await on_bytes(_name, n)
+
+                peer_ok = False
+                if platform_entry is not None:
+                    peer_ok = await _fetch_via_peer(
+                        entry=entry,
+                        target_path=target_path,
+                        platform_entry=platform_entry,
+                        cancel_event=cancel_event,
+                        on_bytes=_on_bytes,
+                        peer_client_factory=peer_client_factory,
+                        platform_client_factory=platform_client_factory,
+                    )
+                if peer_ok:
+                    continue
+
+                if is_peer_only:
+                    raise FetchError(
+                        f"模型 {model_name} 沒有可用的下載網址（點對點來源失敗）/ "
+                        f"model {model_name} has no download url (peer source failed)"
+                    )
 
                 await _download_one(
                     entry=entry,

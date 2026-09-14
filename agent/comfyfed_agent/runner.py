@@ -693,6 +693,11 @@ class AgentLoop:
                         max_fetch_gb=self.config.max_fetch_gb,
                         cancel_event=handle.cancel_event,
                         report_progress=report_fetch_progress,
+                        # Phase 3.1 P2P addendum: the ISSUING platform (the
+                        # one that dispatched this job over `conn`) is who
+                        # mints a peer grant -- fetcher tries that source
+                        # first, per entry, before falling to the URL chain.
+                        platform_entry=conn.entry,
                     )
 
                     # Fetch phase over: from here on heartbeats go back to
