@@ -1000,7 +1000,15 @@ export class Hub extends DurableObject<Env> {
 
       let chunkSha256s: string[] | null = null;
       const rawChunks = e.chunk_sha256s;
-      if (Array.isArray(rawChunks) && rawChunks.length > 0 && rawChunks.every((c) => typeof c === "string" && c)) {
+      // Bound to what the file size can hold (untrusted input; whole-file
+      // hash stays the authority) -- mirrors agentws._record_model_hashes.
+      const maxChunks = Math.max(1, Math.ceil(exactSizeBytes / (64 * 1024 * 1024)));
+      if (
+        Array.isArray(rawChunks) &&
+        rawChunks.length > 0 &&
+        rawChunks.length <= maxChunks &&
+        rawChunks.every((c) => typeof c === "string" && c.length === 64)
+      ) {
         chunkSha256s = rawChunks as string[];
       }
 

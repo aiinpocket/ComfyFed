@@ -884,10 +884,16 @@ def _record_model_hashes(worker_id: str, models: list) -> None:
             exact_size_bytes = round(size * (1024 ** 3))
 
         chunk_sha256s = entry.get("chunk_sha256s")
+        # Bound the list to what the file size can actually hold: an agent
+        # report is untrusted input, and an unbounded array would bloat the
+        # model_hashes row (memory/JSON growth, not a trust bypass -- the
+        # whole-file hash stays the authority).
+        max_chunks = max(1, -(-exact_size_bytes // (64 * 1024 * 1024)))
         if not (
             isinstance(chunk_sha256s, list)
             and chunk_sha256s
-            and all(isinstance(c, str) and c for c in chunk_sha256s)
+            and len(chunk_sha256s) <= max_chunks
+            and all(isinstance(c, str) and len(c) == 64 for c in chunk_sha256s)
         ):
             chunk_sha256s = None
 
