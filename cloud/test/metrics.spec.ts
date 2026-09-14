@@ -81,6 +81,21 @@ describe("GET /metrics", () => {
     expect(typeof r.body).toBe("string");
   });
 
+  it("401s for a plain user-role session when metrics_public is false (final review finding #2)", async () => {
+    await db().prepare("INSERT INTO settings (key, value) VALUES ('metrics_public', 'false')").run();
+    const admin = await adminSession();
+    const password = "a-long-enough-password1";
+    await call("/api/users", {
+      json: { username: "alice", role: "user", password },
+      cookie: admin.cookie,
+      headers: { "X-CSRF": admin.csrf },
+    });
+    const login = await call("/api/auth/login", { json: { username: "alice", password } });
+    const r = await call("/metrics", { method: "GET", cookie: login.setCookie });
+    expect(r.status).toBe(401);
+    expect(r.body.error.code).toBe("auth.required");
+  });
+
   it("serves Prometheus 0.0.4 text content-type", async () => {
     const request = new Request("http://example.com/metrics");
     const ctx = createExecutionContext();

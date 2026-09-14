@@ -212,8 +212,12 @@ const app = new Hono<{ Bindings: Env }>();
 
 app.get("/metrics", async (c) => {
   if (!(await isPublic(c.env.DB))) {
+    // Final review finding #2: admin-only, matching server's
+    // `metrics.py` (`user is None or user.role != "admin"`) -- a plain
+    // `user`-role session must not see the fleet-wide worker/queue/VRAM
+    // gauges just because it is logged in.
     const user = await resolveSessionUser(c);
-    if (!user) {
+    if (!user || user.role !== "admin") {
       return errorJson(c, 401, "auth.required", MESSAGES.authRequired);
     }
   }
