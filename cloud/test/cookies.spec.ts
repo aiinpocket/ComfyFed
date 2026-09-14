@@ -11,10 +11,12 @@ const SECRET = "test-secret-do-not-use-in-prod";
 describe("session cookies", () => {
   it("signs and reads back the payload", async () => {
     const csrf = generateCsrfToken();
-    const cookie = await signSessionCookie(SECRET, { authenticated: true, csrf });
+    const cookie = await signSessionCookie(SECRET, { uid: "u1", role: "admin", epoch: 0, csrf });
     const payload = await readSessionCookie(SECRET, cookie);
     expect(payload).not.toBeNull();
-    expect(payload!.authenticated).toBe(true);
+    expect(payload!.uid).toBe("u1");
+    expect(payload!.role).toBe("admin");
+    expect(payload!.epoch).toBe(0);
     expect(payload!.csrf).toBe(csrf);
   });
 
@@ -30,7 +32,7 @@ describe("session cookies", () => {
   });
 
   it("rejects a cookie signed with a different secret (secret-rotation semantics)", async () => {
-    const cookie = await signSessionCookie(SECRET, { authenticated: true, csrf: "x" });
+    const cookie = await signSessionCookie(SECRET, { uid: "u1", role: "admin", epoch: 0, csrf: "x" });
     const payload = await readSessionCookie("a-different-secret", cookie);
     expect(payload).toBeNull();
   });
@@ -43,7 +45,7 @@ describe("session cookies", () => {
     // the same bytes ~1/16 of the time. Flipping the second-to-last
     // character instead sits in a fully-populated group and always changes
     // the decoded bytes.
-    const cookie = await signSessionCookie(SECRET, { authenticated: true, csrf: "x" });
+    const cookie = await signSessionCookie(SECRET, { uid: "u1", role: "admin", epoch: 0, csrf: "x" });
     const dot = cookie.indexOf(".");
     const sig = cookie.slice(dot + 1);
     const pos = sig.length - 2;
@@ -55,7 +57,7 @@ describe("session cookies", () => {
   });
 
   it("rejects a tampered payload even if the signature segment is untouched", async () => {
-    const cookie = await signSessionCookie(SECRET, { authenticated: true, csrf: "x" });
+    const cookie = await signSessionCookie(SECRET, { uid: "u1", role: "admin", epoch: 0, csrf: "x" });
     const dot = cookie.indexOf(".");
     const payloadB64 = cookie.slice(0, dot);
     const pos = payloadB64.length - 2;
@@ -67,7 +69,7 @@ describe("session cookies", () => {
 
   it("accepts a cookie right up to the max-age boundary and rejects just past it", async () => {
     const issuedAt = 1_000_000;
-    const cookie = await signSessionCookie(SECRET, { authenticated: true, csrf: "x" }, issuedAt);
+    const cookie = await signSessionCookie(SECRET, { uid: "u1", role: "admin", epoch: 0, csrf: "x" }, issuedAt);
 
     const stillValid = await readSessionCookie(
       SECRET,
@@ -88,7 +90,7 @@ describe("session cookies", () => {
 
   it("rejects a cookie whose iat is in the future (clock-skew abuse)", async () => {
     const issuedAt = 2_000_000;
-    const cookie = await signSessionCookie(SECRET, { authenticated: true, csrf: "x" }, issuedAt);
+    const cookie = await signSessionCookie(SECRET, { uid: "u1", role: "admin", epoch: 0, csrf: "x" }, issuedAt);
     const readEarlier = await readSessionCookie(
       SECRET,
       cookie,

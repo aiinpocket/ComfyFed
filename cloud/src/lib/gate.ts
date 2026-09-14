@@ -34,7 +34,7 @@
 
 import type { MiddlewareHandler } from "hono";
 import type { Env } from "../env";
-import { readSession } from "./guard";
+import { resolveSessionUser } from "./guard";
 
 const COMFY_PREFIX = "/comfy";
 const COMFY_API_PREFIX = "/comfy/api";
@@ -66,8 +66,8 @@ export function isGateExempt(path: string): boolean {
 export const comfySessionGate: MiddlewareHandler<{ Bindings: Env }> = async (c, next) => {
   const path = new URL(c.req.url).pathname;
   if (inComfy(path) && !isGateExempt(path)) {
-    const payload = await readSession(c);
-    if (!payload || !payload.authenticated) {
+    const user = await resolveSessionUser(c);
+    if (!user) {
       return c.redirect("/", 302);
     }
   }

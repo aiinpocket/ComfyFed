@@ -957,20 +957,31 @@ export interface LoginAttempt {
   ok: boolean;
 }
 
-export async function insertLoginAttempt(db: D1Database, at: string, ok: boolean): Promise<void> {
-  await db.prepare("INSERT INTO login_attempts (at, ok) VALUES (?, ?)").bind(at, ok ? 1 : 0).run();
+/** `username` is nullable at the type level only for pre-Phase-3.0 rows
+ * already in the table (see 0006_users.sql's `ALTER TABLE ... ADD COLUMN`);
+ * every row inserted by the current login route always carries the
+ * normalized (lowercased) username that was attempted, matching auth.py's
+ * per-username `LoginAttempt` insert. */
+export async function insertLoginAttempt(db: D1Database, at: string, ok: boolean, username: string): Promise<void> {
+  await db
+    .prepare("INSERT INTO login_attempts (at, ok, username) VALUES (?, ?, ?)")
+    .bind(at, ok ? 1 : 0, username)
+    .run();
 }
 
-/** Rows at/after `cutoffTimestamp`, newest first -- exactly the shape
- * `core/auth.ts`'s `consecutiveFailures` expects (parity with auth.py's
- * `_consecutive_failures` query). */
-export async function getRecentLoginAttempts(
+/** Rows at/after `cutoffTimestamp` for one `username`, newest first --
+ * exactly the shape `core/auth.ts`'s `consecutiveFailures` expects. Phase
+ * 3.0: backoff is per-username (parity with auth.py's `_consecutive_failures`,
+ * which filters `LoginAttempt.username == username`), so failed logins
+ * against one account never lock out a different one. */
+export async function getRecentLoginAttemptsForUsername(
   db: D1Database,
-  cutoffTimestamp: string
+  cutoffTimestamp: string,
+  username: string
 ): Promise<{ at: string; ok: boolean }[]> {
   const { results } = await db
-    .prepare("SELECT at, ok FROM login_attempts WHERE at >= ? ORDER BY at DESC")
-    .bind(cutoffTimestamp)
+    .prepare("SELECT at, ok FROM login_attempts WHERE at >= ? AND username = ? ORDER BY at DESC")
+    .bind(cutoffTimestamp, username)
     .all<{ at: string; ok: number }>();
   return results.map((r) => ({ at: r.at, ok: r.ok !== 0 }));
 }
@@ -1217,4 +1228,167 @@ export async function markModelHashConflict(db: D1Database, name: string, sizeBy
 export async function getAllModelHashes(db: D1Database): Promise<ModelHashRow[]> {
   const { results } = await db.prepare("SELECT * FROM model_hashes WHERE conflict = 0").all<ModelHashDbRow>();
   return results.map(rowToModelHash);
+}
+
+// ---------------------------------------------------------------------------
+// Users (Phase 3.0 multi-user) -- parity source: server/comfyfed_server/
+// auth.py's `db.User` reads/writes and users.py's admin CRUD. See
+// migrations/0006_users.sql for the table shape.
+
+export interface User {
+  id: string;
+  username: string;
+  passwordHash: string;
+  role: string;
+  disabled: boolean;
+  sessionEpoch: number;
+  createdAt: string;
+}
+
+interface UserRow {
+  id: string;
+  username: string;
+  password_hash: string;
+  role: string;
+  disabled: number;
+  session_epoch: number;
+  created_at: string;
+}
+
+function rowToUser(row: UserRow): User {
+  return {
+    id: row.id,
+    username: row.username,
+    passwordHash: row.password_hash,
+    role: row.role,
+    disabled: row.disabled !== 0,
+    sessionEpoch: row.session_epoch,
+    createdAt: row.created_at,
+  };
+}
+
+/** Whether the `users` table has ever had a row -- backs `/api/setup/status`
+ * and `/api/setup`'s "already done" check now that credentials live here
+ * instead of the `admin_password_hash` setting. */
+export async function hasAnyUser(db: D1Database): Promise<boolean> {
+  const row = await db.prepare("SELECT 1 AS one FROM users LIMIT 1").first<{ one: number }>();
+  return row !== null;
+}
+
+export async function getUserById(db: D1Database, id: string): Promise<User | null> {
+  const row = await db.prepare("SELECT * FROM users WHERE id = ?").bind(id).first<UserRow>();
+  return row ? rowToUser(row) : null;
+}
+
+/** `username` must already be normalized (trimmed + lowercased) by the
+ * caller -- mirrors auth.py's `login()`/users.py's `_normalize_username`,
+ * which both do that normalization before ever touching the DB. */
+export async function getUserByUsername(db: D1Database, username: string): Promise<User | null> {
+  const row = await db.prepare("SELECT * FROM users WHERE username = ?").bind(username).first<UserRow>();
+  return row ? rowToUser(row) : null;
+}
+
+export interface NewUser {
+  id: string;
+  username: string;
+  passwordHash: string;
+  role: string;
+  createdAt: string;
+}
+
+/** Inserts a freshly-created user row -- mirrors users.py's `create_user`'s
+ * `db.User(...)` insert. Relies on the migration's column DEFAULTs for
+ * `disabled` (0) and `session_epoch` (0), same as Python's model defaults. */
+export async function insertUser(db: D1Database, user: NewUser): Promise<void> {
+  await db
+    .prepare(
+      `INSERT INTO users (id, username, password_hash, role, disabled, session_epoch, created_at)
+       VALUES (?, ?, ?, ?, 0, 0, ?)`
+    )
+    .bind(user.id, user.username, user.passwordHash, user.role, user.createdAt)
+    .run();
+}
+
+export interface UserWithJobCount extends User {
+  jobs: number;
+}
+
+/** Every user, oldest-created first, each with its job count -- mirrors
+ * users.py's `list_users`: one grouped query over `jobs.user_id` (`GROUP BY
+ * user_id`) joined in memory against the user rows, rather than an N+1 count
+ * per user. */
+export async function listUsersWithJobCounts(db: D1Database): Promise<UserWithJobCount[]> {
+  const { results: userRows } = await db.prepare("SELECT * FROM users ORDER BY created_at ASC").all<UserRow>();
+  const { results: countRows } = await db
+    .prepare("SELECT user_id, COUNT(*) AS n FROM jobs WHERE user_id IS NOT NULL GROUP BY user_id")
+    .all<{ user_id: string; n: number }>();
+  const counts = new Map(countRows.map((r) => [r.user_id, r.n]));
+  return userRows.map((row) => ({ ...rowToUser(row), jobs: counts.get(row.id) ?? 0 }));
+}
+
+/** Job count for a single user -- mirrors the count returned alongside a
+ * single-row response (users.py's `create_user`/`patch_user`, which each
+ * return `_user_list_row(target, job_count)`). A freshly-created user always
+ * has 0; `patch_user`'s target may already own jobs. */
+export async function countJobsForUser(db: D1Database, userId: string): Promise<number> {
+  const row = await db
+    .prepare("SELECT COUNT(*) AS n FROM jobs WHERE user_id = ?")
+    .bind(userId)
+    .first<{ n: number }>();
+  return row?.n ?? 0;
+}
+
+/** Active (non-disabled) admins, optionally excluding one id -- mirrors
+ * users.py's `_active_admin_count`, used by `patch_user`'s last-admin guard. */
+export async function countActiveAdmins(db: D1Database, excludeId?: string): Promise<number> {
+  let sql = "SELECT COUNT(*) AS n FROM users WHERE role = 'admin' AND disabled = 0";
+  const binds: string[] = [];
+  if (excludeId !== undefined) {
+    sql += " AND id != ?";
+    binds.push(excludeId);
+  }
+  const row = await db.prepare(sql).bind(...binds).first<{ n: number }>();
+  return row?.n ?? 0;
+}
+
+/** Sets a new password hash and bumps `session_epoch` in one write --
+ * mirrors change-password's/reset-password's paired writes in auth.py/
+ * users.py (every existing session for this account, including in the
+ * change-password case the caller's own pre-update cookie, stops validating;
+ * change-password's route re-issues a fresh cookie right after this call so
+ * the caller stays logged in). */
+export async function updateUserPasswordAndBumpEpoch(db: D1Database, id: string, passwordHash: string): Promise<void> {
+  await db
+    .prepare("UPDATE users SET password_hash = ?, session_epoch = session_epoch + 1 WHERE id = ?")
+    .bind(passwordHash, id)
+    .run();
+}
+
+export async function bumpUserSessionEpoch(db: D1Database, id: string): Promise<void> {
+  await db.prepare("UPDATE users SET session_epoch = session_epoch + 1 WHERE id = ?").bind(id).run();
+}
+
+/** Applies a `PATCH /api/users/{id}` update -- mirrors users.py's
+ * `patch_user` field-by-field `if ... is not None` writes. Epoch-bumping on
+ * disable is the caller's job (patch_user route), not this helper's, since
+ * it only applies when disabling flips false->true, a decision the route
+ * already has to make for the last-admin guard anyway. */
+export async function updateUserRoleAndDisabled(
+  db: D1Database,
+  id: string,
+  fields: { role?: string; disabled?: boolean }
+): Promise<void> {
+  const sets: string[] = [];
+  const binds: unknown[] = [];
+  if (fields.role !== undefined) {
+    sets.push("role = ?");
+    binds.push(fields.role);
+  }
+  if (fields.disabled !== undefined) {
+    sets.push("disabled = ?");
+    binds.push(fields.disabled ? 1 : 0);
+  }
+  if (sets.length === 0) return;
+  binds.push(id);
+  await db.prepare(`UPDATE users SET ${sets.join(", ")} WHERE id = ?`).bind(...binds).run();
 }

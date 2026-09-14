@@ -68,12 +68,35 @@ export const MESSAGES = {
   invalidPassword: "Invalid password.",
   tooManyAttempts: "Too many attempts, please wait.",
   csrfInvalid: "CSRF token missing or invalid.",
+  // Mirrors auth.py's `require_admin`: "403 for a logged-in non-admin."
+  adminRequired: "Admin role required.",
   passwordTooShort: "New password must be at least 8 characters.",
   oldPasswordIncorrect: "Old password is incorrect.",
   badPlatformUrl: "Platform URL must start with http:// or https://.",
   badLang: "Language must be one of: zh-TW, en.",
   badObjectInfoMode: "object_info_mode 必須是 union 或 intersection 其中之一。",
 } as const;
+
+// -- Users API messages (Phase 3.0), copied verbatim from users.py ---------
+
+export const USER_MESSAGES = {
+  invalidUsername: "Username must be 3-32 chars: a-z, 0-9, _.-",
+  invalidRole: (roles: readonly string[]) => `Role must be one of ${pyTuple(roles)}`,
+  usernameTaken: "That username is already in use.",
+  lastAdmin: "Cannot disable or demote the only active admin.",
+  notFound: "User not found.",
+} as const;
+
+/** Renders a JS array the way Python's `f"{roles_tuple}"` renders a tuple
+ * (`('admin', 'user')`), since users.py's `_validate_role` error message
+ * interpolates `_ROLES` -- a Python tuple -- directly with `f"...{_ROLES}"`. */
+function pyTuple(items: readonly string[]): string {
+  return `(${items.map((i) => `'${i}'`).join(", ")})`;
+}
+
+export const USERNAME_RE = /^[a-z0-9_.-]{3,32}$/;
+export const ROLES = ["admin", "user"] as const;
+export type Role = (typeof ROLES)[number];
 
 // -- Setup (cloud-only, no Python parity source) ---------------------------
 

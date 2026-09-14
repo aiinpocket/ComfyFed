@@ -18,7 +18,7 @@ const ADMIN_PASSWORD = "correct-horse-battery-staple";
 
 async function loginSession(): Promise<{ cookie: string | null; csrf: string }> {
   await call("/api/setup", { json: { token: SETUP_TOKEN, password: ADMIN_PASSWORD } });
-  const login = await call("/api/auth/login", { json: { password: ADMIN_PASSWORD } });
+  const login = await call("/api/auth/login", { json: { username: "admin", password: ADMIN_PASSWORD } });
   return { cookie: login.setCookie, csrf: login.body.csrf };
 }
 
@@ -44,6 +44,7 @@ async function putPackagedRaw(filename: string, value: ArrayBuffer | Uint8Array)
 
 afterEach(async () => {
   await db().prepare("DELETE FROM settings").run();
+  await db().prepare("DELETE FROM users").run();
   clearTemplatesCacheForTests();
   for (const prefix of ["staging/", "official_templates/", "comfyfed_templates/"]) {
     const listed = await store().list({ prefix });

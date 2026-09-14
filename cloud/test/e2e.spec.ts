@@ -30,6 +30,7 @@ import golden from "./fixtures/golden.json";
 
 afterEach(async () => {
   await db().prepare("DELETE FROM settings").run();
+  await db().prepare("DELETE FROM users").run();
   await db().prepare("DELETE FROM workers").run();
   await db().prepare("DELETE FROM register_tokens").run();
   await db().prepare("DELETE FROM nonces").run();
@@ -124,7 +125,7 @@ describe("cloud end-to-end", () => {
       // 1. Setup + login (SETUP_TOKEN), issuing a cookie+csrf session.
       const setupRes = await call("/api/setup", { json: { token: SETUP_TOKEN, password: ADMIN_PASSWORD } });
       expect(setupRes.status).toBe(200);
-      const loginRes = await call("/api/auth/login", { json: { password: ADMIN_PASSWORD } });
+      const loginRes = await call("/api/auth/login", { json: { username: "admin", password: ADMIN_PASSWORD } });
       expect(loginRes.status).toBe(200);
       const cookie = loginRes.setCookie;
       const csrf = loginRes.body.csrf;
@@ -547,7 +548,7 @@ describe("cloud end-to-end", () => {
     async () => {
       const setupRes = await call("/api/setup", { json: { token: SETUP_TOKEN, password: ADMIN_PASSWORD } });
       expect(setupRes.status).toBe(200);
-      const loginRes = await call("/api/auth/login", { json: { password: ADMIN_PASSWORD } });
+      const loginRes = await call("/api/auth/login", { json: { username: "admin", password: ADMIN_PASSWORD } });
       const cookie = loginRes.setCookie;
       const csrf = loginRes.body.csrf;
 

@@ -63,6 +63,7 @@ import { buildReceiptPayload, signReceipt, verifyHex } from "../lib/signing";
 import { bytesToHex } from "../lib/hex";
 import { readSessionCookie } from "../lib/cookies";
 import { getOrCreateSessionSecret } from "../db/queries";
+import { sessionUserFromPayload } from "../lib/guard";
 import { jobOutputs, FALLBACK_OUTPUT_KEY, type JobOutputsInput } from "../core/outputs";
 
 // ---------------------------------------------------------------------------
@@ -398,7 +399,8 @@ export class Hub extends DurableObject<Env> {
     }
     const secret = await getOrCreateSessionSecret(this.env.DB);
     const payload = await readSessionCookie(secret, cookieValue);
-    if (!payload || !payload.authenticated) {
+    const user = await sessionUserFromPayload(this.env.DB, payload);
+    if (!user) {
       return new Response("unauthorized", { status: 401 });
     }
 

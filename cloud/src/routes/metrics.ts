@@ -50,7 +50,7 @@
 import { Hono } from "hono";
 import type { Env } from "../env";
 import { getAllWorkers, getAllJobsOrderedByCreatedAt, getSetting, sqliteTimestampToEpochMs } from "../db/queries";
-import { readSession, errorJson } from "../lib/guard";
+import { resolveSessionUser, errorJson } from "../lib/guard";
 import { MESSAGES } from "../core/auth";
 
 const METRICS_PUBLIC_KEY = "metrics_public";
@@ -212,8 +212,8 @@ const app = new Hono<{ Bindings: Env }>();
 
 app.get("/metrics", async (c) => {
   if (!(await isPublic(c.env.DB))) {
-    const payload = await readSession(c);
-    if (!payload || !payload.authenticated) {
+    const user = await resolveSessionUser(c);
+    if (!user) {
       return errorJson(c, 401, "auth.required", MESSAGES.authRequired);
     }
   }

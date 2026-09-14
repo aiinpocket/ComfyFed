@@ -8,6 +8,7 @@ import golden from "./fixtures/golden.json";
 
 afterEach(async () => {
   await db().prepare("DELETE FROM settings").run();
+  await db().prepare("DELETE FROM users").run();
   await db().prepare("DELETE FROM workers").run();
   await db().prepare("DELETE FROM register_tokens").run();
   await db().prepare("DELETE FROM nonces").run();
@@ -29,7 +30,7 @@ const ADMIN_PASSWORD = "correct-horse-battery-staple";
 
 async function adminSession(): Promise<{ cookie: string | null; csrf: string }> {
   await call("/api/setup", { json: { token: SETUP_TOKEN, password: ADMIN_PASSWORD } });
-  const login = await call("/api/auth/login", { json: { password: ADMIN_PASSWORD } });
+  const login = await call("/api/auth/login", { json: { username: "admin", password: ADMIN_PASSWORD } });
   return { cookie: login.setCookie, csrf: login.body.csrf };
 }
 

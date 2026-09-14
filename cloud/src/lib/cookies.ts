@@ -4,16 +4,25 @@
  * `URLSafeTimedSerializer` token format -- but the SEMANTICS mirror
  * server/comfyfed_server/auth.py exactly:
  *
- *  - payload shape `{ authenticated: boolean, csrf: string }`
+ *  - Phase 3.0: payload shape `{ uid, role, epoch, csrf }` (was `{
+ *    authenticated, csrf }` pre-multiuser). A payload with no `uid` --
+ *    including every pre-Phase-3.0 cookie -- is deliberately NOT mapped onto
+ *    any account; `lib/guard.ts`'s session-to-`SessionUser` resolution
+ *    treats it as unauthenticated, same as auth.py's `_session_user_from_
+ *    payload` docstring: everyone re-authenticates once after this upgrade.
  *  - 7-day max-age, timestamp-checked on read (itsdangerous embeds the issue
  *    time in its token for `max_age` checks on `.loads()`; we embed it
  *    ourselves as `iat` in the JSON payload since a bare HMAC carries no
  *    timestamp of its own)
- *  - "rotate by secret change": auth.py invalidates every outstanding
- *    session by overwriting the stored HMAC signing secret (`session_secret`
- *    setting) rather than tracking a token blocklist. Because our signature
- *    is `HMAC(secret, payload)`, swapping the secret used to verify has the
- *    identical effect here for free -- no extra revocation bookkeeping.
+ *  - Per-user revocation via `epoch`, not secret rotation: pre-Phase-3.0,
+ *    auth.py invalidated EVERY outstanding session by overwriting the
+ *    stored HMAC signing secret (`session_secret` setting) on password
+ *    change -- logging out the whole deployment for one person's password
+ *    change. Phase 3.0 instead pins each cookie to the `session_epoch` its
+ *    user had at issue time; a change-password/disable/reset-password bumps
+ *    that user's `session_epoch`, which invalidates only THAT user's other
+ *    cookies (`lib/guard.ts` checks `payload.epoch === user.sessionEpoch`).
+ *    The global signing secret is no longer rotated by any of these flows.
  *
  * Tamper-detection note (see tests/server/test_auth.py's
  * `test_read_session_payload_rejects_absent_and_tampered_cookies` docstring):
@@ -30,8 +39,16 @@ import { bytesToBase64Url, base64UrlToBytes } from "./base64";
 
 export const COOKIE_MAX_AGE_SECONDS = 7 * 24 * 3600; // 7 days
 
+/** Phase 3.0 cookie payload shape. `uid`/`role`/`epoch` are typed as
+ * required here for the current signing path (`issueSessionCookie` always
+ * writes all four), but a payload DECODED off an old or malformed cookie may
+ * lack `uid` entirely -- callers must treat a missing `uid` as unauthenticated
+ * (see `lib/guard.ts`'s `sessionUserFromPayload`) rather than assuming this
+ * interface's required-ness is runtime-enforced. */
 export interface SessionPayload {
-  authenticated: boolean;
+  uid: string;
+  role: string;
+  epoch: number;
   csrf: string;
   [key: string]: unknown;
 }

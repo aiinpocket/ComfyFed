@@ -30,6 +30,7 @@ afterEach(async () => {
   await d1().prepare("DELETE FROM receipts").run();
   await d1().prepare("DELETE FROM nonces").run();
   await d1().prepare("DELETE FROM settings").run();
+  await d1().prepare("DELETE FROM users").run();
   await d1().prepare("DELETE FROM login_attempts").run();
 });
 
@@ -46,7 +47,7 @@ const ADMIN_PASSWORD = "correct-horse-battery-staple";
  * panel WS upgrade's `Cookie` header. */
 async function loginCookie(): Promise<string> {
   await call("/api/setup", { json: { token: SETUP_TOKEN, password: ADMIN_PASSWORD } });
-  const r = await call("/api/auth/login", { json: { password: ADMIN_PASSWORD } });
+  const r = await call("/api/auth/login", { json: { username: "admin", password: ADMIN_PASSWORD } });
   if (!r.setCookie) throw new Error("login did not set a cookie");
   return r.setCookie;
 }
