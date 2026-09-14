@@ -50,6 +50,7 @@ import * as queries from "../db/queries";
 import type { Job } from "../db/queries";
 import { toSqliteTimestamp, sqliteTimestampToEpochMs, resolvePlatformSeed } from "../db/queries";
 import { extract, estimateVram, modelNodes, fleetWideGaps, partitionFleetFetchable, type FetchableModels } from "../core/assess";
+import { peerOnlyNames } from "../core/model_manifest";
 import { jobOutputs } from "../core/outputs";
 import * as modelGuide from "../core/model_guide";
 import * as modelManifest from "../core/model_manifest";
@@ -182,12 +183,12 @@ async function numbersByJobId(db: D1Database): Promise<Map<string, number>> {
  * `model_manifest.entries()` read -- shared by every submission-relaxation
  * call site in this file (and `routes/jobs.ts`'s own copy) so a single
  * request/tick never re-reads the manifest more than once. */
-async function fetchableModelsMap(env: Env): Promise<FetchableModels> {
+async function fetchableModelsMap(env: Env): Promise<{ map: FetchableModels; peerOnlyModels: ReadonlySet<string> }> {
   const seed = await resolvePlatformSeed(env.DB, env.PLATFORM_ED25519_SEED);
   const entries = await modelManifest.entries(env.DB, env.STORE, seed);
   const map: FetchableModels = {};
   for (const e of entries) map[e.name] = e.size_bytes;
-  return map;
+  return { map, peerOnlyModels: peerOnlyNames(entries) };
 }
 
 // ---------------------------------------------------------------------------
@@ -482,8 +483,8 @@ app.post("/comfy/api/prompt", async (c) => {
   let blocking = missingModelsSet;
   if (missingModelsSet.size > 0) {
     const onlineWorkers = await queries.getOnlineEnabledWorkers(c.env.DB);
-    const fetchableMap = await fetchableModelsMap(c.env);
-    const [, unfetchable] = partitionFleetFetchable(missingModelsSet, fetchableMap, onlineWorkers);
+    const { map: fetchableMap, peerOnlyModels } = await fetchableModelsMap(c.env);
+    const [, unfetchable] = partitionFleetFetchable(missingModelsSet, fetchableMap, onlineWorkers, peerOnlyModels);
     blocking = unfetchable;
   }
 

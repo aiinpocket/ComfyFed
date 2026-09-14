@@ -70,7 +70,8 @@ function compareTuples(a: readonly (number | string)[], b: readonly (number | st
  * `fetchableModels` is passed straight through to `assess.verdict` -- see
  * that function's docstring; undefined/null (the default) means "nothing
  * fetchable", so a caller that doesn't compile it gets tier 1 only,
- * unchanged.
+ * unchanged. `peerOnlyModels` (Phase 3.1 P2P) is likewise passed straight
+ * through -- see `assess.verdict`'s docstring.
  *
  * Each worker is claimed for at most one job per call. The claim itself is
  * atomic via `queries.claimJob`'s `WHERE status = 'queued'` re-check, so a
@@ -80,7 +81,8 @@ function compareTuples(a: readonly (number | string)[], b: readonly (number | st
 export async function assignJobs(
   db: D1Database,
   idleWorkerIds: string[],
-  fetchableModels?: FetchableModels | null
+  fetchableModels?: FetchableModels | null,
+  peerOnlyModels?: ReadonlySet<string> | null
 ): Promise<Assignment[]> {
   if (idleWorkerIds.length === 0) return [];
 
@@ -106,7 +108,7 @@ export async function assignJobs(
     for (const candidateId of availableWorkerIds) {
       const worker = workersById.get(candidateId);
       if (!worker) continue;
-      const v = verdict(worker, needs, job.requirements, allWorkers, fetchableModels);
+      const v = verdict(worker, needs, job.requirements, allWorkers, fetchableModels, peerOnlyModels);
       if (v.kind !== "eligible" && v.kind !== "eligible_after_fetch") continue;
 
       const hasWarnings = v.warnings.length > 0 ? 1 : 0;

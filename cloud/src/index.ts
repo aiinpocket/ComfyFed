@@ -9,6 +9,7 @@ import templatesRoutes from "./routes/templates";
 import reportsRoutes from "./routes/reports";
 import metricsRoutes from "./routes/metrics";
 import usersRoutes from "./routes/users";
+import peerRoutes from "./routes/peer";
 import { comfySessionGate, serveComfyAsset } from "./lib/gate";
 
 export { Hub } from "./do/hub";
@@ -128,6 +129,7 @@ app.route("/", templatesRoutes);
 app.route("/", reportsRoutes);
 app.route("/", metricsRoutes);
 app.route("/", usersRoutes);
+app.route("/", peerRoutes);
 
 // Anything under `/comfy/*` not claimed by a route above (the panel's own
 // `index.html`, its JS/CSS/font/image bundle) has already passed

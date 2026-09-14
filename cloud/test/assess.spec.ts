@@ -71,6 +71,7 @@ function makeWorker(id: string, overrides: Partial<Worker> = {}): Worker {
     objectInfoHash: "",
     protocol: 1,
     autoFetch: false,
+    peerUrl: null,
     ...overrides,
   };
 }
@@ -218,6 +219,83 @@ describe("partitionFleetFetchable", () => {
 
 // ---------------------------------------------------------------------------
 // fleetWideGaps
+
+// ---------------------------------------------------------------------------
+// Phase 3.1 P2P: peerOnlyModels requires protocol>=4 (a protocol-3 worker
+// can auto-fetch a URL-sourced model fine, but has no way to speak the
+// peer-grant/chunk-pull protocol for a peer-only one). Ports the highest-
+// value cases from tests/server/test_assess.py's peer-only section.
+
+describe("verdict / partitionFleetFetchable: peerOnlyModels protocol>=4 gate", () => {
+  it("a protocol-3 worker is ineligible for a peer-only missing model", () => {
+    const worker = fetchReadyWorker("w1", { protocol: 3, dynamic: { free_disk_gb: 100 } }); // protocol 3, not 4
+    const v = verdict(
+      worker,
+      needs(["peer_only.safetensors"]),
+      {},
+      [worker],
+      { "peer_only.safetensors": 1 * GB },
+      new Set(["peer_only.safetensors"])
+    );
+    expect(v.kind).toBe("ineligible");
+  });
+
+  it("a protocol-4 worker is eligible_after_fetch for the same peer-only model", () => {
+    const worker = fetchReadyWorker("w1", { protocol: 4, dynamic: { free_disk_gb: 100 } });
+    const v = verdict(
+      worker,
+      needs(["peer_only.safetensors"]),
+      {},
+      [worker],
+      { "peer_only.safetensors": 1 * GB },
+      new Set(["peer_only.safetensors"])
+    );
+    expect(v.kind).toBe("eligible_after_fetch");
+  });
+
+  it("a URL-sourced model outside peerOnlyModels stays protocol>=3 sufficient", () => {
+    const worker = fetchReadyWorker("w1", { protocol: 3, dynamic: { free_disk_gb: 100 } });
+    const v = verdict(
+      worker,
+      needs(["url_sourced.safetensors"]),
+      {},
+      [worker],
+      { "url_sourced.safetensors": 1 * GB },
+      new Set(["some_other_peer_only.safetensors"])
+    );
+    expect(v.kind).toBe("eligible_after_fetch");
+  });
+
+  it("undefined peerOnlyModels is identical to the pre-3.1 behavior (protocol>=3 sufficient)", () => {
+    const worker = fetchReadyWorker("w1", { protocol: 3, dynamic: { free_disk_gb: 100 } });
+    const v = verdict(worker, needs(["ckpt.safetensors"]), {}, [worker], { "ckpt.safetensors": 1 * GB });
+    expect(v.kind).toBe("eligible_after_fetch");
+  });
+
+  it("partitionFleetFetchable: no protocol>=4 worker online -> the peer-only-covered subset is unfetchable", () => {
+    const worker = fetchReadyWorker("w1", { protocol: 3, dynamic: { free_disk_gb: 100 } });
+    const [fetchable, unfetchable] = partitionFleetFetchable(
+      new Set(["peer_only.safetensors"]),
+      { "peer_only.safetensors": 1 * GB },
+      [worker],
+      new Set(["peer_only.safetensors"])
+    );
+    expect(fetchable.size).toBe(0);
+    expect(unfetchable).toEqual(new Set(["peer_only.safetensors"]));
+  });
+
+  it("partitionFleetFetchable: a protocol>=4 online worker makes the peer-only-covered subset fetchable", () => {
+    const worker = fetchReadyWorker("w1", { protocol: 4, dynamic: { free_disk_gb: 100 } });
+    const [fetchable, unfetchable] = partitionFleetFetchable(
+      new Set(["peer_only.safetensors"]),
+      { "peer_only.safetensors": 1 * GB },
+      [worker],
+      new Set(["peer_only.safetensors"])
+    );
+    expect(fetchable).toEqual(new Set(["peer_only.safetensors"]));
+    expect(unfetchable.size).toBe(0);
+  });
+});
 
 describe("fleetWideGaps", () => {
   it("returns empty sets with zero workers (queue-and-wait, not a dead end)", () => {

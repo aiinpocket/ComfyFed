@@ -229,6 +229,20 @@ export type FetchableModels = Record<string, number>;
  * (it predates lazy hashing / lazy inventory sha256). */
 const MIN_AUTO_FETCH_PROTOCOL = 3;
 
+/** Phase 3.1 P2P: hello.protocol below which an agent cannot pull from a
+ * peer seeder at all (no chunk-table fields, no peer-grant support) -- see
+ * `eligibleAfterFetch`/`partitionFleetFetchable`'s `peerOnlyModels` param. */
+const MIN_PEER_FETCH_PROTOCOL = 4;
+
+/** `worker.protocol`, normalized the same way every fetch-eligibility gate
+ * here needs it: missing/non-integer degrades to 1 (the oldest,
+ * least-capable value), never throws -- ports assess.py's `_worker_protocol`.
+ * Single helper so `workerFetchCapacityOk` and the peer-protocol check below
+ * can't drift on this normalization. */
+function workerProtocol(worker: Worker): number {
+  return typeof worker.protocol === "number" && Number.isInteger(worker.protocol) ? worker.protocol : 1;
+}
+
 /** free_disk_gb must exceed the total download size by this factor -- not
  * just clear it -- so a fetch never lands a worker at (near-)zero free disk. */
 const FETCH_DISK_MARGIN = 1.2;
@@ -240,8 +254,7 @@ const BYTES_PER_GB = 1024 ** 3;
  * `partitionFleetFetchable`'s fleet-wide submission-time gate. Ports
  * `assess._worker_fetch_capacity_ok`. */
 function workerFetchCapacityOk(worker: Worker, dynamic: Record<string, unknown>, totalMissingGb: number): boolean {
-  const protocol = typeof worker.protocol === "number" && Number.isInteger(worker.protocol) ? worker.protocol : 1;
-  if (protocol < MIN_AUTO_FETCH_PROTOCOL) return false;
+  if (workerProtocol(worker) < MIN_AUTO_FETCH_PROTOCOL) return false;
   if (!worker.autoFetch) return false;
 
   const freeDiskGb = asNumber(dynamic["free_disk_gb"]);
@@ -253,15 +266,30 @@ function workerFetchCapacityOk(worker: Worker, dynamic: Record<string, unknown>,
   return freeDiskGb > FETCH_DISK_MARGIN * totalMissingGb;
 }
 
-/** All the eligible_after_fetch gates -- ports `assess._eligible_after_fetch`. */
+/** All the eligible_after_fetch gates -- ports `assess._eligible_after_fetch`.
+ *
+ * `peerOnlyModels` (Phase 3.1 P2P; a subset of `fetchableModels`'s keys,
+ * `model_manifest.peerOnlyNames`'s shape) names missing models whose ONLY
+ * manifest source is a peer seeder, no URL at all. When any missing model
+ * this worker needs falls in that set, the worker must ALSO be protocol>=4
+ * (peer-pull capable) -- a protocol-3 worker can auto-fetch a URL-sourced
+ * model fine, but has no way to speak the peer-grant/chunk-pull protocol for
+ * a peer-only one. Undefined/empty (every pre-3.1 caller) means "nothing is
+ * peer-only", identical to the pre-Task-6 behavior. */
 function eligibleAfterFetch(
   worker: Worker,
   missingModels: string[],
   fetchableModels: FetchableModels | null | undefined,
-  dynamic: Record<string, unknown>
+  dynamic: Record<string, unknown>,
+  peerOnlyModels?: ReadonlySet<string> | null
 ): boolean {
   const map = fetchableModels ?? {};
   if (!missingModels.every((name) => Object.prototype.hasOwnProperty.call(map, name))) return false;
+
+  const peerOnly = peerOnlyModels ?? new Set<string>();
+  if (missingModels.some((name) => peerOnly.has(name)) && workerProtocol(worker) < MIN_PEER_FETCH_PROTOCOL) {
+    return false;
+  }
 
   const totalMissingGb = missingModels.reduce((sum, name) => sum + map[name]!, 0) / BYTES_PER_GB;
   return workerFetchCapacityOk(worker, dynamic, totalMissingGb);
@@ -271,11 +299,18 @@ function eligibleAfterFetch(
  * `[fetchable, unfetchable]` for the submission-relaxation matrix -- ports
  * `assess.partition_fleet_fetchable`. See that Python docstring for why this
  * is a single COMBINED gate over the whole manifest-covered subset, not a
- * per-model one. */
+ * per-model one.
+ *
+ * `peerOnlyModels` (Phase 3.1 P2P, `model_manifest.peerOnlyNames`'s shape):
+ * when the manifest-covered subset includes any name with no URL source at
+ * all, a candidate worker must ALSO be protocol>=4 -- same rule
+ * `eligibleAfterFetch` applies per-candidate, evaluated once here against
+ * the combined subset. */
 export function partitionFleetFetchable(
   missingModels: ReadonlySet<string>,
   fetchableModels: FetchableModels | null | undefined,
-  onlineEnabledWorkers: Worker[]
+  onlineEnabledWorkers: Worker[],
+  peerOnlyModels?: ReadonlySet<string> | null
 ): [fetchable: Set<string>, unfetchable: Set<string>] {
   const map = fetchableModels ?? {};
   const manifestCovered = new Set([...missingModels].filter((name) => Object.prototype.hasOwnProperty.call(map, name)));
@@ -283,8 +318,15 @@ export function partitionFleetFetchable(
 
   if (manifestCovered.size === 0) return [new Set(), new Set(missingModels)];
 
+  const peerOnly = peerOnlyModels ?? new Set<string>();
+  const requiresPeerProtocol = [...manifestCovered].some((name) => peerOnly.has(name));
+
   const totalMissingGb = [...manifestCovered].reduce((sum, name) => sum + map[name]!, 0) / BYTES_PER_GB;
-  const canFetch = onlineEnabledWorkers.some((worker) => workerFetchCapacityOk(worker, worker.dynamic, totalMissingGb));
+  const canFetch = onlineEnabledWorkers.some(
+    (worker) =>
+      workerFetchCapacityOk(worker, worker.dynamic, totalMissingGb) &&
+      (!requiresPeerProtocol || workerProtocol(worker) >= MIN_PEER_FETCH_PROTOCOL)
+  );
   if (canFetch) return [manifestCovered, notInManifest];
 
   return [new Set(), new Set(missingModels)];
@@ -324,13 +366,18 @@ export function fleetWideGaps(
  * `fetchableModels` is the signed manifest's name -> size_bytes map
  * (`model_manifest.entries()`'s shape). Undefined/null (the default) means
  * "nothing is fetchable" -- a caller that doesn't compile it gets the exact
- * same behavior as before this parameter existed. */
+ * same behavior as before this parameter existed.
+ *
+ * `peerOnlyModels` (Phase 3.1 P2P, `model_manifest.peerOnlyNames`'s shape):
+ * see `eligibleAfterFetch`'s docstring. Undefined/null means "nothing is
+ * peer-only", identical to the pre-3.1 behavior. */
 export function verdict(
   worker: Worker,
   needs: JobNeeds,
   requirementsOverride: Record<string, unknown>,
   allWorkers: Worker[],
-  fetchableModels?: FetchableModels | null
+  fetchableModels?: FetchableModels | null,
+  peerOnlyModels?: ReadonlySet<string> | null
 ): Verdict {
   const reasons: string[] = [];
   const warnings: string[] = [];
@@ -411,7 +458,7 @@ export function verdict(
     return { kind: "eligible", reasons: [], missingModels: [], warnings };
   }
 
-  if (eligibleAfterFetch(worker, missingModels, fetchableModels, dynamic)) {
+  if (eligibleAfterFetch(worker, missingModels, fetchableModels, dynamic, peerOnlyModels)) {
     return {
       kind: "eligible_after_fetch",
       reasons: [`missing_models:${missingModels.join(",")}`],

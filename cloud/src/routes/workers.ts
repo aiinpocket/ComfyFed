@@ -265,6 +265,11 @@ app.get("/api/workers", requireAdmin, async (c) => {
       backend: w.backend,
       torch_version: w.torchVersion,
       model_count: w.modelInventory.length,
+      // Phase 3.1 P2P: set from the agent's `hello.peer_url` when peer_serve
+      // is enabled and advertise_host is configured (see do/hub.ts's
+      // handleHello / parsePeerUrl). Admin-only page, so exposing it here is
+      // fine.
+      peer_url: w.peerUrl,
     }))
   );
   return c.json(rows);

@@ -220,6 +220,13 @@ export interface Worker {
    * -- see `agentws._handle_hello` / `do/hub.ts`'s `handleHello`). Off by
    * default: workers keep sovereignty over unattended downloads. */
   autoFetch: boolean;
+  /** Phase 3.1 P2P: the agent's advertised peer-serving endpoint (e.g.
+   * "http://192.168.1.5:8850"), set from `hello.peer_url` when the agent has
+   * `peer_serve` enabled and a usable advertise host -- validated the same
+   * way `agentws._parse_peer_url` does (http(s) scheme + host). Hello-only,
+   * not refreshed on heartbeat; cleared on the stale/offline transition
+   * (`markWorkerOffline`) -- see `db.Worker.peer_url`'s Python docstring. */
+  peerUrl: string | null;
 }
 
 interface WorkerRow {
@@ -239,6 +246,7 @@ interface WorkerRow {
   object_info_hash: string;
   protocol: number;
   auto_fetch: number;
+  peer_url: string | null;
 }
 
 function rowToWorker(row: WorkerRow): Worker {
@@ -259,6 +267,7 @@ function rowToWorker(row: WorkerRow): Worker {
     objectInfoHash: row.object_info_hash,
     protocol: row.protocol,
     autoFetch: row.auto_fetch !== 0,
+    peerUrl: row.peer_url,
   };
 }
 
@@ -294,8 +303,15 @@ export async function getStaleWorkers(db: D1Database, cutoffTimestamp: string): 
   return results.map(rowToWorker);
 }
 
+/** Marks a worker offline -- ports `dispatch.requeue_stale`'s per-worker
+ * write. Phase 3.1: also clears `peer_url` in the same UPDATE -- a seeder
+ * endpoint only means anything while the worker is actually reachable, and
+ * `hub.ts`'s `handleHello` (mirroring agentws._handle_hello) is the only
+ * place it gets set again, on the agent's next hello. Mirrors
+ * `dispatch.requeue_stale`'s `worker.status = "offline"; worker.peer_url =
+ * None` pair (same session, same commit). */
 export async function markWorkerOffline(db: D1Database, workerId: string): Promise<void> {
-  await db.prepare("UPDATE workers SET status = 'offline' WHERE id = ?").bind(workerId).run();
+  await db.prepare("UPDATE workers SET status = 'offline', peer_url = NULL WHERE id = ?").bind(workerId).run();
 }
 
 /** Inserts a freshly-registered worker row (Task 5's `POST
@@ -360,6 +376,16 @@ export async function updateWorkerHello(
       workerId
     )
     .run();
+}
+
+/** Phase 3.1 P2P: writes the hello-reported `peer_url` -- mirrors
+ * `agentws._handle_hello`'s `worker.peer_url = peer_url` write, folded into
+ * `updateWorkerHello` at the call site (`do/hub.ts`'s `handleHello`) rather
+ * than added as a field on that function's `fields` object, since it needs
+ * its own null-clearing semantics (fully replaced from each hello, never
+ * merged) that the other hello fields don't need to distinguish. */
+export async function updateWorkerPeerUrl(db: D1Database, workerId: string, peerUrl: string | null): Promise<void> {
+  await db.prepare("UPDATE workers SET peer_url = ? WHERE id = ?").bind(peerUrl, workerId).run();
 }
 
 /** Applies a `heartbeat` message's worker-row writes -- mirrors
@@ -783,6 +809,27 @@ export async function getOnlineEnabledWorkers(db: D1Database): Promise<Worker[]>
   return results.map(rowToWorker);
 }
 
+/** Phase 3.1 P2P: online (`status != 'offline'`), not-disabled workers at or
+ * above `minProtocol` that are advertising a `peer_url` -- the SQL half of
+ * `core/peer.ts`'s `onlineSeeders` predicate (the remaining
+ * inventory/consensus-hash check happens in JS since it must inspect each
+ * worker's JSON `model_inventory`). `excludeWorkerId`, when given, omits
+ * that worker (the requester itself, in grant issuance). */
+export async function getOnlinePeerCapableWorkers(
+  db: D1Database,
+  minProtocol: number,
+  excludeWorkerId?: string
+): Promise<Worker[]> {
+  let sql = "SELECT * FROM workers WHERE disabled = 0 AND status != 'offline' AND protocol >= ? AND peer_url IS NOT NULL";
+  const binds: unknown[] = [minProtocol];
+  if (excludeWorkerId !== undefined) {
+    sql += " AND id != ?";
+    binds.push(excludeWorkerId);
+  }
+  const { results } = await db.prepare(sql).bind(...binds).all<WorkerRow>();
+  return results.map(rowToWorker);
+}
+
 /** Jobs matching `statuses`, restricted to a given `origin` and (for
  * `panel`) excluding panel-hidden rows -- mirrors comfyapi.py's `GET
  * /comfy/api/queue` (origin-agnostic caller passes no `origin`) and `GET
@@ -886,7 +933,10 @@ export async function countQueueRemaining(db: D1Database): Promise<number> {
 
 export interface Receipt {
   id: string;
-  jobId: string;
+  /** NULL only for kind === "p2p_upload" (Phase 3.1) -- every other kind
+   * always carries a real job id. Global Constraints: only p2p_upload may
+   * have a NULL job_id. */
+  jobId: string | null;
   workerId: string;
   gpuSeconds: number;
   platformSig: string;
@@ -895,11 +945,14 @@ export interface Receipt {
   kind: string;
   billable: boolean;
   basis: string;
+  /** Phase 3.1: actual bytes served for a p2p_upload receipt; null for
+   * every other kind. */
+  bytes: number | null;
 }
 
 interface ReceiptRow {
   id: string;
-  job_id: string;
+  job_id: string | null;
   worker_id: string;
   gpu_seconds: number;
   platform_sig: string;
@@ -908,6 +961,7 @@ interface ReceiptRow {
   kind: string;
   billable: number;
   basis: string;
+  bytes: number | null;
 }
 
 export function rowToReceipt(row: ReceiptRow): Receipt {
@@ -922,6 +976,7 @@ export function rowToReceipt(row: ReceiptRow): Receipt {
     kind: row.kind,
     billable: row.billable !== 0,
     basis: row.basis,
+    bytes: row.bytes,
   };
 }
 
@@ -1033,7 +1088,8 @@ export async function getUsageRowsInRange(
 
 export interface NewReceipt {
   id: string;
-  jobId: string;
+  /** NULL only for kind === "p2p_upload" (Phase 3.1). */
+  jobId: string | null;
   workerId: string;
   gpuSeconds: number;
   platformSig: string;
@@ -1041,6 +1097,9 @@ export interface NewReceipt {
   kind: string;
   billable: boolean;
   basis: string;
+  /** Phase 3.1: bytes served, only for kind === "p2p_upload"; omitted (or
+   * null) for every other kind. */
+  bytes?: number | null;
 }
 
 /** Inserts a freshly platform-signed receipt row -- mirrors
@@ -1050,10 +1109,21 @@ export interface NewReceipt {
 export async function insertReceipt(db: D1Database, r: NewReceipt): Promise<void> {
   await db
     .prepare(
-      `INSERT INTO receipts (id, job_id, worker_id, gpu_seconds, platform_sig, created_at, kind, billable, basis)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`
+      `INSERT INTO receipts (id, job_id, worker_id, gpu_seconds, platform_sig, created_at, kind, billable, basis, bytes)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
     )
-    .bind(r.id, r.jobId, r.workerId, r.gpuSeconds, r.platformSig, r.createdAt, r.kind, r.billable ? 1 : 0, r.basis)
+    .bind(
+      r.id,
+      r.jobId,
+      r.workerId,
+      r.gpuSeconds,
+      r.platformSig,
+      r.createdAt,
+      r.kind,
+      r.billable ? 1 : 0,
+      r.basis,
+      r.bytes ?? null
+    )
     .run();
 }
 
@@ -1275,6 +1345,10 @@ export interface ModelHashRow {
    * excludes any row with this set, correct across a DO eviction or a
    * request handled by a plain route with no DO state at all. */
   conflict: boolean;
+  /** Phase 3.1: the per-64-MiB-chunk sha256 list (JSON-parsed), or null when
+   * no reporter has supplied one yet. Set once, never overwritten -- see
+   * `core/model_manifest.ts`'s `recordHash` docstring. */
+  chunkSha256s: string[] | null;
 }
 
 interface ModelHashDbRow {
@@ -1284,6 +1358,7 @@ interface ModelHashDbRow {
   first_worker_id: string;
   created_at: string;
   conflict: number;
+  chunk_sha256s: string | null;
 }
 
 function rowToModelHash(row: ModelHashDbRow): ModelHashRow {
@@ -1294,6 +1369,7 @@ function rowToModelHash(row: ModelHashDbRow): ModelHashRow {
     firstWorkerId: row.first_worker_id,
     createdAt: row.created_at,
     conflict: row.conflict !== 0,
+    chunkSha256s: safeParse<string[] | null>(row.chunk_sha256s, null),
   };
 }
 
@@ -1319,15 +1395,39 @@ export async function insertModelHashIfAbsent(
   sizeBytes: number,
   sha256: string,
   firstWorkerId: string,
-  createdAt: string
+  createdAt: string,
+  chunkSha256sJson: string | null = null
 ): Promise<boolean> {
   const result = await db
     .prepare(
-      `INSERT INTO model_hashes (name, size_bytes, sha256, first_worker_id, created_at)
-       VALUES (?, ?, ?, ?, ?)
+      `INSERT INTO model_hashes (name, size_bytes, sha256, first_worker_id, created_at, chunk_sha256s)
+       VALUES (?, ?, ?, ?, ?, ?)
        ON CONFLICT(name, size_bytes) DO NOTHING`
     )
-    .bind(name, sizeBytes, sha256, firstWorkerId, createdAt)
+    .bind(name, sizeBytes, sha256, firstWorkerId, createdAt, chunkSha256sJson)
+    .run();
+  return (result.meta.changes ?? 0) === 1;
+}
+
+/** Phase 3.1: sets `chunk_sha256s` for an existing (name, size_bytes) row
+ * ONLY if it doesn't already have one -- mirrors `model_manifest.record_hash`'s
+ * "stored the first time consensus is established and no chunk list is on
+ * the row yet, never overwritten by a later, different one" rule. Returns
+ * whether THIS call actually set it (false means the row already had a
+ * chunk list, or the row doesn't exist -- the caller distinguishes those the
+ * same way `record_hash` does: by having already resolved the row via
+ * `getModelHash` before calling this). */
+export async function setModelHashChunksIfAbsent(
+  db: D1Database,
+  name: string,
+  sizeBytes: number,
+  chunkSha256sJson: string
+): Promise<boolean> {
+  const result = await db
+    .prepare(
+      "UPDATE model_hashes SET chunk_sha256s = ? WHERE name = ? AND size_bytes = ? AND chunk_sha256s IS NULL"
+    )
+    .bind(chunkSha256sJson, name, sizeBytes)
     .run();
   return (result.meta.changes ?? 0) === 1;
 }
@@ -1350,6 +1450,116 @@ export async function markModelHashConflict(db: D1Database, name: string, sizeBy
 export async function getAllModelHashes(db: D1Database): Promise<ModelHashRow[]> {
   const { results } = await db.prepare("SELECT * FROM model_hashes WHERE conflict = 0").all<ModelHashDbRow>();
   return results.map(rowToModelHash);
+}
+
+// ---------------------------------------------------------------------------
+// P2P grants (Phase 3.1 addendum, Task 8) -- D1-backed equivalent of
+// `server/comfyfed_server/peer.py`'s in-memory `_grants` dict + `_grant_lock`.
+// A Worker isolate's in-memory state is not reliable/shared across requests
+// (unlike a long-lived Python process), so the grant book lives in D1 here;
+// atomic claim uses `UPDATE ... WHERE booked = 0` checked against
+// `meta.changes`, the D1-correct equivalent of peer.py's lock-guarded
+// check-then-set (see `core/peer.ts`). See migrations/0007_p2p.sql.
+
+export interface P2pGrantRow {
+  grantId: string;
+  name: string;
+  sizeBytes: number;
+  sha256: string;
+  seederId: string;
+  pullerId: string;
+  expiresAt: number;
+  booked: boolean;
+  createdAt: number;
+}
+
+interface P2pGrantDbRow {
+  grant_id: string;
+  name: string;
+  size_bytes: number;
+  sha256: string;
+  seeder_id: string;
+  puller_id: string;
+  expires_at: number;
+  booked: number;
+  created_at: number;
+}
+
+function rowToP2pGrant(row: P2pGrantDbRow): P2pGrantRow {
+  return {
+    grantId: row.grant_id,
+    name: row.name,
+    sizeBytes: row.size_bytes,
+    sha256: row.sha256,
+    seederId: row.seeder_id,
+    pullerId: row.puller_id,
+    expiresAt: row.expires_at,
+    booked: row.booked !== 0,
+    createdAt: row.created_at,
+  };
+}
+
+export interface NewP2pGrant {
+  grantId: string;
+  name: string;
+  sizeBytes: number;
+  sha256: string;
+  seederId: string;
+  pullerId: string;
+  expiresAt: number;
+  createdAt: number;
+}
+
+export async function insertP2pGrant(db: D1Database, g: NewP2pGrant): Promise<void> {
+  await db
+    .prepare(
+      `INSERT INTO p2p_grants (grant_id, name, size_bytes, sha256, seeder_id, puller_id, expires_at, booked, created_at)
+       VALUES (?, ?, ?, ?, ?, ?, ?, 0, ?)`
+    )
+    .bind(g.grantId, g.name, g.sizeBytes, g.sha256, g.seederId, g.pullerId, g.expiresAt, g.createdAt)
+    .run();
+}
+
+export async function getP2pGrant(db: D1Database, grantId: string): Promise<P2pGrantRow | null> {
+  const row = await db.prepare("SELECT * FROM p2p_grants WHERE grant_id = ?").bind(grantId).first<P2pGrantDbRow>();
+  return row ? rowToP2pGrant(row) : null;
+}
+
+/** Atomic claim -- mirrors peer.py's `_grant_lock`-guarded check-not-booked-
+ * then-mark-booked step. Returns whether THIS call was the one that claimed
+ * it (`meta.changes === 1`); two concurrent calls for the same grant_id can
+ * never both succeed, exactly like the Python lock. */
+export async function claimP2pGrantBooked(db: D1Database, grantId: string): Promise<boolean> {
+  const result = await db
+    .prepare("UPDATE p2p_grants SET booked = 1 WHERE grant_id = ? AND booked = 0")
+    .bind(grantId)
+    .run();
+  return (result.meta.changes ?? 0) === 1;
+}
+
+/** Un-marks a grant as booked -- mirrors peer.py's rollback when the DB
+ * insert after a successful claim fails, so a legitimate retry can still
+ * succeed instead of permanently wedging on a grant nothing ever actually
+ * booked. */
+export async function unmarkP2pGrantBooked(db: D1Database, grantId: string): Promise<void> {
+  await db.prepare("UPDATE p2p_grants SET booked = 0 WHERE grant_id = ?").bind(grantId).run();
+}
+
+/** Unexpired, unbooked grants currently seeded by `seederId` -- the "fewest
+ * active grants" tiebreak for picking among multiple seeders (peer.py's
+ * `_active_grant_count`). */
+export async function countActiveP2pGrantsForSeeder(db: D1Database, seederId: string, nowSeconds: number): Promise<number> {
+  const row = await db
+    .prepare("SELECT COUNT(*) AS n FROM p2p_grants WHERE seeder_id = ? AND expires_at > ? AND booked = 0")
+    .bind(seederId, nowSeconds)
+    .first<{ n: number }>();
+  return row?.n ?? 0;
+}
+
+/** Deletes expired grant rows -- mirrors peer.py's `_prune_expired`, called
+ * opportunistically on issuance/booking. */
+export async function pruneExpiredP2pGrants(db: D1Database, nowSeconds: number): Promise<void> {
+  await db.prepare("DELETE FROM p2p_grants WHERE expires_at <= ?").bind(nowSeconds).run();
 }
 
 // ---------------------------------------------------------------------------

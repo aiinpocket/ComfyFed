@@ -505,6 +505,20 @@ describe("GET /api/workers", () => {
     const r = await call("/api/workers", { method: "GET", cookie });
     expect(r.body[0].last_seen).toBeNull();
   });
+
+  it("reports peer_url when the worker advertises one, and null otherwise (Phase 3.1 P2P)", async () => {
+    const seeding = await registerWorker("seeding-box");
+    await db().prepare("UPDATE workers SET peer_url = ? WHERE id = ?").bind("http://192.168.1.5:8850", seeding.workerId).run();
+    await registerWorker("quiet-box");
+
+    const { cookie } = await adminSession();
+    const r = await call("/api/workers", { method: "GET", cookie });
+    expect(r.status).toBe(200);
+    const seedingRow = r.body.find((w: any) => w.id === seeding.workerId);
+    const quietRow = r.body.find((w: any) => w.name === "quiet-box");
+    expect(seedingRow.peer_url).toBe("http://192.168.1.5:8850");
+    expect(quietRow.peer_url).toBeNull();
+  });
 });
 
 // ---------------------------------------------------------------------------

@@ -515,6 +515,7 @@ describe("cloud end-to-end", () => {
         basis: "exec",
         gpu_seconds: receiptRow1.gpuSeconds,
         acked: true,
+        bytes: null,
       });
       const cancelledEntry = workerReport.receipts.find((r: any) => r.kind === "cancelled");
       expect(cancelledEntry).toEqual({
@@ -524,6 +525,7 @@ describe("cloud end-to-end", () => {
         basis: "wall",
         gpu_seconds: receiptRow2.gpuSeconds,
         acked: false,
+        bytes: null,
       });
 
       agent.close();

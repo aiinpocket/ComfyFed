@@ -262,6 +262,31 @@ function secondsBetween(a: string, b: string): number {
   return (parseSqliteTimestamp(b).getTime() - parseSqliteTimestamp(a).getTime()) / 1000;
 }
 
+/** Validate hello's optional `peer_url` (Phase 3.1 P2P seeder advertisement):
+ * must be a string that parses as an http:// or https:// URL with a host.
+ * Anything else (missing, wrong type, wrong scheme, no host, a bare path) is
+ * ignored -- logged, not stored -- so a malformed or hostile value can never
+ * end up handed out as a seeder endpoint. Ports agentws.py's `_parse_peer_url`. */
+function parsePeerUrl(value: unknown, workerId: string): string | null {
+  if (value === null || value === undefined) return null;
+  if (typeof value !== "string") {
+    console.warn(`hub: worker ${workerId} hello.peer_url not a string, ignoring`);
+    return null;
+  }
+  let parsed: URL;
+  try {
+    parsed = new URL(value);
+  } catch {
+    console.warn(`hub: worker ${workerId} hello.peer_url ${JSON.stringify(value)} is not a valid http(s) URL, ignoring`);
+    return null;
+  }
+  if ((parsed.protocol !== "http:" && parsed.protocol !== "https:") || !parsed.hostname) {
+    console.warn(`hub: worker ${workerId} hello.peer_url ${JSON.stringify(value)} is not a valid http(s) URL, ignoring`);
+    return null;
+  }
+  return value;
+}
+
 /** Ports agentws.py's `_MAX_PLAUSIBLE_MODEL_GB` / `_normalize_models`. */
 const MAX_PLAUSIBLE_MODEL_GB = 10_000;
 
@@ -785,6 +810,11 @@ export class Hub extends DurableObject<Env> {
     // eligible_after_fetch check). Missing/non-bool degrades to false -- an
     // old or malformed hello must never be read as consent to download.
     const autoFetch = msg.auto_fetch === true;
+    // Phase 3.1 P2P seeder advertisement (protocol 4). Fully replaced from
+    // this hello, same as every other field above -- an agent that
+    // reconnects with peer_serve now off (or an old/malformed value) must
+    // not keep a previous session's endpoint alive.
+    const peerUrl = parsePeerUrl(msg.peer_url, workerId);
 
     await queries.updateWorkerHello(this.env.DB, workerId, {
       hardware,
@@ -795,6 +825,7 @@ export class Hub extends DurableObject<Env> {
       autoFetch,
       lastSeen: toSqliteTimestamp(new Date()),
     });
+    await queries.updateWorkerPeerUrl(this.env.DB, workerId, peerUrl);
 
     ws.serializeAttachment({ ...attachment, protocol } satisfies AgentAttachment);
 
@@ -967,7 +998,13 @@ export class Hub extends DurableObject<Env> {
         exactSizeBytes = Math.round(size * 1024 ** 3);
       }
 
-      await modelManifest.recordHash(this.env.DB, workerId, name, exactSizeBytes, sha256);
+      let chunkSha256s: string[] | null = null;
+      const rawChunks = e.chunk_sha256s;
+      if (Array.isArray(rawChunks) && rawChunks.length > 0 && rawChunks.every((c) => typeof c === "string" && c)) {
+        chunkSha256s = rawChunks as string[];
+      }
+
+      await modelManifest.recordHash(this.env.DB, workerId, name, exactSizeBytes, sha256, chunkSha256s);
     }
   }
 
@@ -1313,6 +1350,16 @@ export class Hub extends DurableObject<Env> {
     const worker = await queries.getWorkerById(db, workerId);
     if (!worker) return;
 
+    // Phase 3.1: a p2p_upload receipt (job_id NULL) is never pushed over
+    // this WebSocket -- it's minted synchronously by `routes/peer.ts`'s
+    // `POST /api/agent/peer-served` and never acked here at all. Guard
+    // defensively rather than pass null where `buildReceiptPayload` expects
+    // a job id.
+    if (receipt.jobId === null) {
+      console.warn(`hub: receipt_ack for job-less receipt ${receiptId} (kind=${receipt.kind}) from worker ${workerId}`);
+      return;
+    }
+
     const payload = buildReceiptPayload(receipt.jobId, receipt.workerId, receipt.gpuSeconds);
     const ok = await verifyHex(worker.pubkey, new TextEncoder().encode(payload), workerSig);
     if (!ok) {
@@ -1375,6 +1422,7 @@ export class Hub extends DurableObject<Env> {
     // be pure waste -- a cloud-only efficiency note, not a behavior change.
     let fetchableModels: FetchableModels = {};
     let manifestByName = new Map<string, modelManifest.ManifestEntry>();
+    let peerOnlyModels: ReadonlySet<string> = new Set();
     const hasQueuedWork = idleWorkerIds.length > 0 && (await queries.getQueuedJobsOrderedByCreatedAt(db)).length > 0;
     if (hasQueuedWork) {
       try {
@@ -1384,16 +1432,18 @@ export class Hub extends DurableObject<Env> {
           fetchableModels[e.name] = e.size_bytes;
           manifestByName.set(e.name, e);
         }
+        peerOnlyModels = modelManifest.peerOnlyNames(manifestEntries);
       } catch (err) {
         console.error("hub: failed to build fetch manifest for dispatch tick", err);
         fetchableModels = {};
         manifestByName = new Map();
+        peerOnlyModels = new Set();
       }
     }
 
     let assignments: dispatch.Assignment[] = [];
     try {
-      assignments = await dispatch.assignJobs(db, idleWorkerIds, fetchableModels);
+      assignments = await dispatch.assignJobs(db, idleWorkerIds, fetchableModels, peerOnlyModels);
     } catch (err) {
       console.error("hub: assignJobs failed", err);
     }
@@ -1411,7 +1461,7 @@ export class Hub extends DurableObject<Env> {
         if (Object.keys(fetchableModels).length > 0) {
           const worker = await queries.getWorkerById(db, workerId);
           if (worker) {
-            const fetchModels = await this.fetchModelsForPush(job, worker, fetchableModels, manifestByName);
+            const fetchModels = await this.fetchModelsForPush(job, worker, fetchableModels, manifestByName, peerOnlyModels);
             if (fetchModels.length > 0) frame.fetch_models = fetchModels;
           }
         }
@@ -1436,13 +1486,14 @@ export class Hub extends DurableObject<Env> {
     job: queries.Job,
     worker: queries.Worker,
     fetchableModels: FetchableModels,
-    manifestByName: Map<string, modelManifest.ManifestEntry>
+    manifestByName: Map<string, modelManifest.ManifestEntry>,
+    peerOnlyModels?: ReadonlySet<string> | null
   ): Promise<modelManifest.ManifestEntry[]> {
     if (Object.keys(fetchableModels).length === 0) return [];
 
     const allWorkers = await queries.getAllWorkers(this.env.DB);
     const needs = assess.needsFromJob(job);
-    const v = assess.verdict(worker, needs, job.requirements, allWorkers, fetchableModels);
+    const v = assess.verdict(worker, needs, job.requirements, allWorkers, fetchableModels, peerOnlyModels);
     if (v.kind !== "eligible_after_fetch") return [];
 
     // Defensive: `eligible_after_fetch` already requires protocol >= 3 (see

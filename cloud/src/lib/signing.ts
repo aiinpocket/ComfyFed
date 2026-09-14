@@ -14,6 +14,13 @@
  *       -- the body is embedded RAW (not hashed) -- byte-for-byte.
  *  5. fetch-manifest entry (model_manifest.py `entries()`):
  *       f"{name}|{directory}|{sha256}|{size_bytes}"
+ *  6. P2P grant (peer.py `sign_grant`/`verify_grant`, Phase 3.1 Task 3/8):
+ *       f"{grant_id}|{name}|{size_bytes}|{sha256}|{seeder_id}|{puller_id}|{expires_at}"
+ *  7. P2P upload receipt (peer.py `peer_served`'s dedicated signing string,
+ *     deliberately NOT the receipt payload above -- job_id is always NULL
+ *     for a p2p_upload receipt, and stringifying that would sign the
+ *     literal text "None"/"null"):
+ *       f"p2p_upload|{grant_id}|{worker_id}|{bytes_served}"
  */
 
 import { python1f } from "./format";
@@ -138,6 +145,44 @@ export async function verifySignedRequest(
 ): Promise<boolean> {
   const message = buildCanonicalRequestMessage(method, path, query, ts, nonce, body);
   return verifyHex(pubkeyHex, message, signatureHex);
+}
+
+/** Ordered exactly as peer.py's `_GRANT_FIELDS` / the Global Constraints
+ * payload -- `grant_id|name|size_bytes|sha256|seeder_id|puller_id|expires_at`.
+ * Exported so `core/peer.ts` can also use it for the `|`-delimiter guard
+ * (each field's string form must not contain `|`) without duplicating the
+ * field order. */
+export const GRANT_FIELDS = [
+  "grant_id",
+  "name",
+  "size_bytes",
+  "sha256",
+  "seeder_id",
+  "puller_id",
+  "expires_at",
+] as const;
+
+export interface GrantFields {
+  grant_id: string;
+  name: string;
+  size_bytes: number;
+  sha256: string;
+  seeder_id: string;
+  puller_id: string;
+  expires_at: number;
+}
+
+/** `f"{grant_id}|{name}|{size_bytes}|{sha256}|{seeder_id}|{puller_id}|{expires_at}"`
+ * -- ports peer.py's `_grant_payload` verbatim (field order = `GRANT_FIELDS`). */
+export function buildGrantPayload(grant: GrantFields): string {
+  return GRANT_FIELDS.map((field) => String(grant[field])).join("|");
+}
+
+/** `f"p2p_upload|{grant_id}|{worker_id}|{bytes_served}"` -- ports peer.py's
+ * `peer_served` dedicated signing string (see this file's module docstring,
+ * item 7, for why it is NOT `buildReceiptPayload`). */
+export function buildP2pUploadReceiptPayload(grantId: string, workerId: string, bytesServed: number): string {
+  return `p2p_upload|${grantId}|${workerId}|${bytesServed}`;
 }
 
 export { signHex, verifyHex } from "./ed25519";
