@@ -772,3 +772,77 @@ def test_payout_report_requires_admin(client):
 
     res = client.get("/api/reports/payout", params={"pool": "10"}, headers={"X-CSRF": alice_csrf})
     assert res.status_code == 403
+
+
+def test_usage_and_payout_reports_respect_from_to_date_range(client):
+    """Receipts seeded on two different dates: `from`/`to` on /usage,
+    /my-usage, and /payout must all filter the same way /contributions
+    already does (see test_contributions_report_filters_by_date_range)."""
+    admin_csrf = _login(client)
+    worker_id, _sk = _register_worker_with_key(client, admin_csrf, "w1")
+    alice = _create_user(client, admin_csrf, "alice", password="alice-pw-123")
+
+    with db.get_session() as session:
+        session.add_all(
+            [
+                db.Job(id="job-old", workflow_json="{}", user_id=alice["id"]),
+                db.Job(id="job-recent", workflow_json="{}", user_id=alice["id"]),
+            ]
+        )
+        session.add_all(
+            [
+                db.Receipt(
+                    job_id="job-old", worker_id=worker_id, gpu_seconds=10.0,
+                    platform_sig="ab" * 32, created_at=datetime(2020, 1, 1),
+                ),
+                db.Receipt(
+                    job_id="job-recent", worker_id=worker_id, gpu_seconds=20.0,
+                    platform_sig="cd" * 32, created_at=datetime(2026, 6, 1),
+                ),
+            ]
+        )
+        session.commit()
+
+    range_params = {"from": "2026-01-01", "to": "2026-12-31"}
+
+    # /usage: only the in-range receipt counts.
+    res = client.get("/api/reports/usage", params=range_params, headers={"X-CSRF": admin_csrf})
+    assert res.status_code == 200
+    rows = res.json()
+    assert len(rows) == 1
+    assert rows[0]["user_id"] == alice["id"]
+    assert rows[0]["jobs"] == 1
+    assert rows[0]["gpu_seconds"] == 20.0
+
+    res_all = client.get("/api/reports/usage", headers={"X-CSRF": admin_csrf})
+    assert res_all.status_code == 200
+    rows_all = res_all.json()
+    assert len(rows_all) == 1
+    assert rows_all[0]["jobs"] == 2
+    assert rows_all[0]["gpu_seconds"] == 30.0
+
+    # /my-usage: same filtering, scoped to alice.
+    r = client.post("/api/auth/login", json={"username": "alice", "password": "alice-pw-123"})
+    assert r.status_code == 200
+    alice_csrf = r.json()["csrf"]
+
+    res_my = client.get("/api/reports/my-usage", params=range_params, headers={"X-CSRF": alice_csrf})
+    assert res_my.status_code == 200
+    assert res_my.json()["jobs"] == 1
+    assert res_my.json()["gpu_seconds"] == 20.0
+
+    # /payout: only the in-range receipt's gpu_seconds feed the pool split.
+    # Re-login as admin -- the client's single cookie jar is currently
+    # alice's session from the /my-usage check above.
+    admin_csrf = _login(client)
+    res_payout = client.get(
+        "/api/reports/payout",
+        params={**range_params, "pool": "100"},
+        headers={"X-CSRF": admin_csrf},
+    )
+    assert res_payout.status_code == 200
+    body = res_payout.json()
+    assert body["total_gpu_seconds"] == 20.0
+    assert body["workers"] == [
+        {"worker_id": worker_id, "name": "w1", "gpu_seconds": 20.0, "ratio": 1.0, "amount": 100.0}
+    ]
