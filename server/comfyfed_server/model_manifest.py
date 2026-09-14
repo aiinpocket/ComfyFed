@@ -66,6 +66,9 @@ from . import assess, auth, db, model_guide, peer, security, workers
 
 logger = logging.getLogger(__name__)
 
+# Guide-vs-consensus mismatch warnings already emitted (dedup; see entries()).
+_MISMATCH_LOGGED: set[tuple[str, str, str]] = set()
+
 
 def _utcnow() -> datetime:
     return datetime.now(timezone.utc).replace(tzinfo=None)
@@ -397,7 +400,14 @@ def entries(data_dir: str) -> list[dict]:
                         result.append(guide_entry)
                 continue
 
-            if source.sha256 and source.sha256 != row.sha256:
+            if (
+                source.sha256
+                and source.sha256 != row.sha256
+                and (source.name, source.sha256, row.sha256) not in _MISMATCH_LOGGED
+            ):
+                # Dedup per (name, pair): entries() runs every dispatch tick
+                # (~5s), and a standing mismatch would otherwise flood the log.
+                _MISMATCH_LOGGED.add((source.name, source.sha256, row.sha256))
                 logger.warning(
                     "model_manifest: guide sha256 for %s differs from the "
                     "learned consensus (guide=%s consensus=%s) -- consensus "
