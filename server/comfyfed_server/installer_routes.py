@@ -63,9 +63,7 @@ def _read_template(filename: str) -> str:
     path = resources.files(__package__).joinpath(_INSTALLERS_DIRNAME).joinpath(filename)
     text = path.read_text(encoding="utf-8")
     if filename.endswith(".sh"):
-        text = text.replace("
-", "
-")
+        text = text.replace("\r\n", "\n")
     return text
 
 
