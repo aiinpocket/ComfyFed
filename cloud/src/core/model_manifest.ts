@@ -79,6 +79,29 @@ export interface ManifestEntry {
 // logs once more, no correctness dependency on this surviving a cold start.
 const MISMATCH_LOGGED = new Set<string>();
 
+/** Test-only escape hatch (Phase 3.2 F6 fix), ports model_manifest.py's
+ * `_clear_mismatch_log_for_tests`: reset the module-level guide-vs-consensus
+ * mismatch dedup set so a test asserting a warning was logged isn't broken
+ * by test ORDER -- only the first execution of a given (name, guide,
+ * consensus) triple in this module instance actually logs otherwise. NOT
+ * for production use. */
+export function clearMismatchLogForTests(): void {
+  MISMATCH_LOGGED.clear();
+}
+
+/** The curated guide sha256 for inventory-relative `name`, when it matches
+ * one of the 11 `model_guide.SOURCES` entries that carries a vouched hash --
+ * else null. Used only to annotate a `recordHash` conflict warning (Phase
+ * 3.2 F4 fix) with a diagnostic clue; never to resolve/prefer a value -- a
+ * `model_hashes` conflict stays purely reporter-vs-reporter, and the guide
+ * never writes to this table. Ports model_manifest.py's `_guide_sha256_for`. */
+function guideSha256For(name: string): string | null {
+  for (const source of Object.values(modelGuide.SOURCES)) {
+    if (source.sha256 && matchesModelName(name, source.name)) return source.sha256;
+  }
+  return null;
+}
+
 export interface RecordHashResult {
   /** True when this report conflicted with an already-learned hash for the
    * same (name, size_bytes) -- the row has already been marked
@@ -137,10 +160,24 @@ export async function recordHash(
     return { conflict: false };
   }
 
+  // Phase 3.2 F4 fix: when either side of the conflict happens to equal the
+  // curated guide's vouched hash for this name, say so -- that's exactly
+  // the clue an operator needs to diagnose "this is a stale registry entry,
+  // not two genuinely different worker builds" at a glance.
+  const guideSha256 = guideSha256For(name);
+  let guideClue = "";
+  if (guideSha256 !== null) {
+    if (guideSha256 === sha256) {
+      guideClue = ` (NOTE: worker ${workerId}'s reported hash matches the curated guide value -- the OTHER report looks stale)`;
+    } else if (guideSha256 === existing.sha256) {
+      guideClue = ` (NOTE: the existing hash matches the curated guide value -- worker ${workerId}'s NEW report looks stale)`;
+    }
+  }
+
   console.warn(
     `model_manifest: sha256 conflict for ${name} (size_bytes=${sizeBytes}): ` +
       `worker ${workerId} reported ${sha256}, worker ${existing.firstWorkerId} previously reported ` +
-      `${existing.sha256} -- keeping the first-seen hash and excluding this name from the fetch manifest`
+      `${existing.sha256} -- keeping the first-seen hash and excluding this name from the fetch manifest${guideClue}`
   );
   await queries.markModelHashConflict(db, name, sizeBytes);
   return { conflict: true };

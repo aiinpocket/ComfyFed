@@ -70,6 +70,21 @@ logger = logging.getLogger(__name__)
 _MISMATCH_LOGGED: set[tuple[str, str, str]] = set()
 
 
+def _clear_mismatch_log_for_tests() -> None:
+    """Test-only escape hatch (Phase 3.2 F6 fix): reset the per-process
+    guide-vs-consensus mismatch dedup set so a test asserting a WARNING was
+    logged isn't silently broken by test ORDER -- without this, only the
+    first execution of a given (name, guide, consensus) triple in the whole
+    process actually logs, so a second test (or a pytest-repeat run) hitting
+    the same triple would see nothing and fail. NOT used in production: the
+    dedup there is deliberately permanent for the process lifetime (see this
+    module's docstring) -- an operator who re-breaks a registry entry the
+    same way twice gets no second warning until a restart, which is an
+    accepted (documented) tradeoff, not something tests should paper over by
+    calling this outside test setup."""
+    _MISMATCH_LOGGED.clear()
+
+
 def _utcnow() -> datetime:
     return datetime.now(timezone.utc).replace(tzinfo=None)
 
@@ -151,20 +166,55 @@ def record_hash(
                     )
             return
 
+        # Phase 3.2 F4 fix: when either side of the conflict happens to
+        # equal the curated guide's vouched hash for this name, say so --
+        # that's exactly the clue an operator needs to diagnose "this is a
+        # stale registry entry, not two genuinely different worker builds"
+        # at a glance, instead of having to go cross-reference model_guide.py
+        # by hand.
+        guide_sha256 = _guide_sha256_for(name)
+        guide_clue = ""
+        if guide_sha256 is not None:
+            if guide_sha256 == sha256:
+                guide_clue = (
+                    f" (NOTE: worker {worker_id}'s reported hash matches the "
+                    "curated guide value -- the OTHER report looks stale)"
+                )
+            elif guide_sha256 == existing.sha256:
+                guide_clue = (
+                    f" (NOTE: the existing hash matches the curated guide "
+                    f"value -- worker {worker_id}'s NEW report looks stale)"
+                )
+
         logger.warning(
             "model_manifest: sha256 conflict for %s (size_bytes=%s): "
             "worker %s reported %s, worker %s previously reported %s -- "
             "keeping the first-seen hash and excluding this name from the "
-            "fetch manifest",
+            "fetch manifest%s",
             name,
             size_bytes,
             worker_id,
             sha256,
             existing.first_worker_id,
             existing.sha256,
+            guide_clue,
         )
         existing.conflict = True
         session.commit()
+
+
+def _guide_sha256_for(name: str) -> Optional[str]:
+    """The curated guide sha256 for inventory-relative `name`, when it
+    matches one of the 11 `model_guide.SOURCES` entries that carries a
+    vouched hash -- else None. Used only to annotate a `record_hash`
+    conflict WARNING (Phase 3.2 F4 fix) with a diagnostic clue; never to
+    resolve/prefer a value -- a `model_hashes` conflict stays purely
+    reporter-vs-reporter, and the guide never writes to this table (see this
+    module's docstring)."""
+    for source in model_guide.SOURCES.values():
+        if source.sha256 and assess.matches_model_name(name, source.name):
+            return source.sha256
+    return None
 
 
 def _find_hash_row(rows: list, source_key: str):

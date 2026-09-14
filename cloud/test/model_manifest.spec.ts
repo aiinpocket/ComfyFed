@@ -27,6 +27,12 @@ afterEach(async () => {
   await db().prepare("DELETE FROM register_tokens").run();
   await db().prepare("DELETE FROM nonces").run();
   modelGuide.clearHarvestCacheForTests();
+  // Phase 3.2 F6 fix: MISMATCH_LOGGED is a module-level dedup Set, so a test
+  // asserting a mismatch warning was logged (e.g. "a learned consensus wins
+  // over the guide hash and the mismatch is logged" below) would otherwise
+  // only pass the FIRST time this module hits a given (name, guide,
+  // consensus) triple -- a real fragility under test re-ordering/repeats.
+  modelManifest.clearMismatchLogForTests();
 });
 
 async function seed(): Promise<string> {
@@ -118,6 +124,62 @@ describe("recordHash", () => {
       .first<{ sha256: string; conflict: number }>();
     expect(row?.sha256).toBe(shaA); // first-seen hash kept
     expect(row?.conflict).toBe(1);
+  });
+
+  it("Phase 3.2 F4: a conflict warning notes when the NEW report matches the curated guide value", async () => {
+    const source = modelGuide.SOURCES["clip_l.safetensors"]!;
+    const otherSha = await shaHex("some-other-build");
+    const warnSpy = vi.spyOn(console, "warn").mockImplementation(() => {});
+    try {
+      await modelManifest.recordHash(db(), "worker-first", "text_encoders/clip_l.safetensors", source.sizeBytes!, otherSha);
+      await modelManifest.recordHash(
+        db(),
+        "worker-second",
+        "text_encoders/clip_l.safetensors",
+        source.sizeBytes!,
+        source.sha256!
+      );
+      expect(
+        warnSpy.mock.calls.some(
+          (call) =>
+            typeof call[0] === "string" &&
+            call[0].includes("sha256 conflict") &&
+            call[0].includes("clip_l.safetensors") &&
+            call[0].includes("worker-second's reported hash matches the curated guide value") &&
+            call[0].includes("OTHER report looks stale")
+        )
+      ).toBe(true);
+    } finally {
+      warnSpy.mockRestore();
+    }
+  });
+
+  it("Phase 3.2 F4: a conflict warning notes when the EXISTING (first-seen) hash matches the curated guide value", async () => {
+    const source = modelGuide.SOURCES["clip_l.safetensors"]!;
+    const otherSha = await shaHex("some-other-build");
+    const warnSpy = vi.spyOn(console, "warn").mockImplementation(() => {});
+    try {
+      await modelManifest.recordHash(
+        db(),
+        "worker-first",
+        "text_encoders/clip_l.safetensors",
+        source.sizeBytes!,
+        source.sha256!
+      );
+      await modelManifest.recordHash(db(), "worker-second", "text_encoders/clip_l.safetensors", source.sizeBytes!, otherSha);
+      expect(
+        warnSpy.mock.calls.some(
+          (call) =>
+            typeof call[0] === "string" &&
+            call[0].includes("sha256 conflict") &&
+            call[0].includes("clip_l.safetensors") &&
+            call[0].includes("existing hash matches the curated guide value") &&
+            call[0].includes("worker-second's NEW report looks stale")
+        )
+      ).toBe(true);
+    } finally {
+      warnSpy.mockRestore();
+    }
   });
 
   it("different exact sizes are independent keys -- no conflict", async () => {

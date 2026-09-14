@@ -25,6 +25,17 @@ def data_dir(tmp_path):
     yield d
 
 
+@pytest.fixture(autouse=True)
+def _reset_guide_mismatch_dedup():
+    """Phase 3.2 F6 fix: `_MISMATCH_LOGGED` is a process-global dedup set, so
+    without this, only the FIRST test in the whole process to hit a given
+    (name, guide, consensus) triple would see the WARNING it asserts on --
+    a real fragility under pytest-repeat or simply a second test reaching
+    the same triple first. Reset before every test in this module."""
+    model_manifest._clear_mismatch_log_for_tests()
+    yield
+
+
 def _sha(label: str) -> str:
     return hashlib.sha256(label.encode()).hexdigest()
 
@@ -77,6 +88,58 @@ def test_record_hash_conflict_does_not_overwrite_the_hash_but_marks_the_row_conf
         and "worker-second" in r.message
         for r in caplog.records
     )
+
+
+def test_record_hash_conflict_notes_when_the_new_report_matches_the_guide_value(data_dir, caplog):
+    """Phase 3.2 F4 fix: when the NEW (conflicting) report happens to match
+    the curated guide's vouched hash, the WARNING says so -- the clue an
+    operator needs to see that the OTHER (first-seen) report is the stale
+    one, not two genuinely different builds."""
+    source = model_guide.SOURCES["clip_l.safetensors"]
+    other_sha = _sha("some-other-build")
+    model_manifest.record_hash("worker-first", "text_encoders/clip_l.safetensors", source.size_bytes, other_sha)
+    with caplog.at_level(logging.WARNING, logger="comfyfed_server.model_manifest"):
+        model_manifest.record_hash(
+            "worker-second", "text_encoders/clip_l.safetensors", source.size_bytes, source.sha256
+        )
+
+    assert any(
+        r.levelno == logging.WARNING
+        and "sha256 conflict" in r.message
+        and "clip_l.safetensors" in r.message
+        and "worker-second's reported hash matches the curated guide value" in r.message
+        and "OTHER report looks stale" in r.message
+        for r in caplog.records
+    )
+
+
+def test_record_hash_conflict_notes_when_the_existing_report_matches_the_guide_value(data_dir, caplog):
+    source = model_guide.SOURCES["clip_l.safetensors"]
+    other_sha = _sha("some-other-build")
+    model_manifest.record_hash("worker-first", "text_encoders/clip_l.safetensors", source.size_bytes, source.sha256)
+    with caplog.at_level(logging.WARNING, logger="comfyfed_server.model_manifest"):
+        model_manifest.record_hash("worker-second", "text_encoders/clip_l.safetensors", source.size_bytes, other_sha)
+
+    assert any(
+        r.levelno == logging.WARNING
+        and "sha256 conflict" in r.message
+        and "clip_l.safetensors" in r.message
+        and "existing hash matches the curated guide value" in r.message
+        and "worker-second's NEW report looks stale" in r.message
+        for r in caplog.records
+    )
+
+
+def test_record_hash_conflict_between_two_non_guide_hashes_has_no_guide_clue(data_dir, caplog):
+    """Neither side matches the curated guide value -- no NOTE clause at
+    all, matching pre-F4 behavior exactly."""
+    with caplog.at_level(logging.WARNING, logger="comfyfed_server.model_manifest"):
+        model_manifest.record_hash("worker-first", "clip_l.safetensors", _bytes(0.23), _sha("a"))
+        model_manifest.record_hash("worker-second", "clip_l.safetensors", _bytes(0.23), _sha("b"))
+
+    conflict_records = [r for r in caplog.records if "sha256 conflict" in r.message]
+    assert len(conflict_records) == 1
+    assert "NOTE" not in conflict_records[0].message
 
 
 def test_record_hash_different_sizes_are_independent_keys(data_dir):

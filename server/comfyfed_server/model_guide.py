@@ -103,6 +103,16 @@ def _curated(
 # docs/superpowers/plans/2026-09-13-phase1_6-official-templates.md, "The
 # curated model source registry", and the Phase 1.8b addendum's model
 # registry table for entry #10 (qwen3vl_4b_bf16.safetensors).
+#
+# `sha256`/`size_bytes` provenance (Phase 3.2, F3): fixed 2026-09-14 from
+# this federation's own LIVE `model_hashes` consensus -- i.e. the values
+# every worker that then held each file had already agreed on via inventory
+# reports, not independently sourced/typed by hand. To re-derive or rotate
+# one: read the current consensus row for (name, size_bytes) out of
+# `model_hashes` on a healthy fleet (see `model_manifest.py`'s docstring for
+# how that consensus is formed) and copy it in here -- never invent a value,
+# and never trust a single worker's report without checking it against the
+# fleet.
 SOURCES: dict[str, ModelSource] = {
     "flux1-dev.safetensors": _curated(
         "flux1-dev.safetensors",

@@ -88,6 +88,11 @@ function curated(
 // `SOURCES` (see that module's comment for the verification date/plan
 // references). DO NOT reorder/rename/reword any field: byte parity with the
 // Python registry is the whole point (see test/model_guide.spec.ts).
+//
+// `sha256`/`sizeBytes` provenance (Phase 3.2, F3): fixed 2026-09-14 from this
+// federation's own LIVE `model_hashes` consensus -- see model_guide.py's
+// matching comment for how to re-derive/rotate one. Byte-identical to the
+// Python values by construction (test/model_guide.spec.ts checks this).
 export const SOURCES: Record<string, ModelSource> = {
   "flux1-dev.safetensors": curated(
     "flux1-dev.safetensors",
