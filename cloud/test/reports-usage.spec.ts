@@ -349,6 +349,15 @@ describe("GET /api/reports/payout", () => {
     expect(r.body.error.code).toBe("reports.bad_pool");
   });
 
+  it("400s reports.bad_pool on a non-finite pool (NaN/Infinity)", async () => {
+    const admin = await adminSession();
+    for (const bad of ["NaN", "nan", "Infinity", "inf", "-inf"]) {
+      const r = await call(`/api/reports/payout?pool=${bad}`, { method: "GET", cookie: admin.cookie });
+      expect(r.status).toBe(400);
+      expect(r.body.error.code).toBe("reports.bad_pool");
+    }
+  });
+
   it("400s reports.bad_pool on a negative pool", async () => {
     const admin = await adminSession();
     const r = await call("/api/reports/payout?pool=-5", { method: "GET", cookie: admin.cookie });

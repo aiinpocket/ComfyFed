@@ -157,7 +157,7 @@ function parsePoolParam(raw: string | undefined): number {
   }
   const trimmed = raw.trim();
   const value = Number(trimmed);
-  if (trimmed === "" || Number.isNaN(value)) {
+  if (trimmed === "" || !Number.isFinite(value)) {
     throw new BadPoolError(`Not a valid number: ${pyStrRepr(raw)}`);
   }
   if (value < 0) {

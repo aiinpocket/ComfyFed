@@ -759,6 +759,13 @@ def test_payout_report_rejects_missing_or_bad_or_negative_pool(client):
 
     r = client.get("/api/reports/payout", params={"pool": "-5"}, headers={"X-CSRF": admin_csrf})
     assert r.status_code == 400
+
+    # Non-finite floats parse but are not a usable pool: NaN would poison every
+    # amount, Infinity every ratio product. Both sides (server + cloud) reject.
+    for bad in ("nan", "NaN", "inf", "Infinity", "-inf"):
+        r = client.get("/api/reports/payout", params={"pool": bad}, headers={"X-CSRF": admin_csrf})
+        assert r.status_code == 400, bad
+        assert r.json()["error"]["code"] == "reports.bad_pool"
     assert r.json()["error"]["code"] == "reports.bad_pool"
 
 

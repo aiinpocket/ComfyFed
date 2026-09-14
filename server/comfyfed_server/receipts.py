@@ -7,6 +7,7 @@ receipt_ack exchange). This module just reports on the resulting rows.
 
 from __future__ import annotations
 
+import math
 from datetime import datetime, timezone
 from typing import Optional
 
@@ -29,6 +30,8 @@ def _parse_pool(value: Optional[str]) -> float:
     try:
         pool = float(value)
     except (TypeError, ValueError):
+        raise _error(400, "reports.bad_pool", f"Not a valid number: {value!r}")
+    if not math.isfinite(pool):
         raise _error(400, "reports.bad_pool", f"Not a valid number: {value!r}")
     if pool < 0:
         raise _error(400, "reports.bad_pool", "pool must be non-negative")
