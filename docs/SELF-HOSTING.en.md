@@ -164,7 +164,7 @@ comfyfed stop     # ask the agent to shut down gracefully (same as Ctrl-C in its
 
 (`comfyfed` is on PATH after the one-line installer runs; the manual-install flow uses the same binary under the name `comfyfed-agent` — they're the same commands.)
 
-Idle-detection settings live in `agent.json`: `pause_when_active` (default `true`) toggles activity detection on/off, and `idle_minutes` (default `5`) is how many minutes of no input count as "the user is active" (within that window → paused). After editing `agent.json` by hand, restart the agent (or at least `comfyfed stop` then `comfyfed pause`/`run`) for the change to take effect.
+Idle-detection settings live in `agent.json`: `pause_when_active` (default `true`) toggles activity detection on/off, and `idle_minutes` (default `5`) is how many consecutive minutes without any keyboard/mouse input count as idle — while the last input is more recent than that, the agent treats the user as active and pauses intake, resuming once the machine has been idle that long. After editing `agent.json` by hand, restart the agent for the change to take effect.
 
 **When activity can't be detected, the worker is always treated as idle and keeps accepting jobs**: headless machines (no display/keyboard/mouse) and Wayland desktops without XWayland give the agent no signal to read, so detection failure never makes a worker unschedulable — it just behaves as if pause-when-active is off.
 

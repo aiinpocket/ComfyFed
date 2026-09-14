@@ -164,7 +164,7 @@ comfyfed stop     # 請 agent 優雅結束（等同在它的終端機按 Ctrl-C�
 
 （一行安裝指令裝好之後 `comfyfed` 就在 PATH 上；手動安裝時同一支指令叫 `comfyfed-agent`，兩者相通。）
 
-閒置偵測的參數寫在 `agent.json`：`pause_when_active`（預設 `true`）控制要不要偵測使用者活動，`idle_minutes`（預設 `5`）是判定「使用者正在用」所需的無操作秒數門檻（於此門檻內視為活動中→暫停）。手動改完 `agent.json` 需要重啟 agent（或至少 `comfyfed stop` 再 `comfyfed pause`／`run`）才會生效。
+閒置偵測的參數寫在 `agent.json`：`pause_when_active`（預設 `true`）控制要不要偵測使用者活動；`idle_minutes`（預設 `5`）是「連續幾分鐘沒有任何鍵盤滑鼠輸入才算閒置」——距離最後一次輸入不滿這個分鐘數就視為使用者活動中、暫停接單，滿了才恢復接單。手動改完 `agent.json` 需要重啟 agent 才會生效。
 
 **偵測不到使用者活動時視為閒置，一律接單**：headless 機器（沒有實體螢幕/鍵盤滑鼠）或 Wayland 桌面若沒有裝 XWayland，agent 偵測不到活動訊號，這種情況一律當作「沒有人在用」，不會因為偵測失敗就把 worker 晾在一邊接不到工作。
 
