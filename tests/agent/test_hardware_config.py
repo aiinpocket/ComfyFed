@@ -591,3 +591,47 @@ def test_config_max_fetch_gb_coercion(tmp_path):
     for raw, expected in [("30", 30.0), (12.5, 12.5), ("junk", 30.0), (-5, 30.0), (None, 30.0)]:
         path.write_text(_json.dumps({"max_fetch_gb": raw}), encoding="utf-8")
         assert AgentConfig.load(str(path)).max_fetch_gb == expected
+
+
+def test_config_peer_serve_defaults(tmp_path):
+    path = tmp_path / "agent.json"
+    AgentConfig().save(str(path))
+
+    loaded = AgentConfig.load(str(path))
+    assert loaded.peer_serve is False
+    assert loaded.peer_listen_port is None
+    assert loaded.peer_advertise_host is None
+
+
+def test_config_peer_serve_round_trip(tmp_path):
+    path = tmp_path / "agent.json"
+    config = AgentConfig(peer_serve=True, peer_listen_port=8850, peer_advertise_host="203.0.113.5")
+    config.save(str(path))
+
+    loaded = AgentConfig.load(str(path))
+    assert loaded.peer_serve is True
+    assert loaded.peer_listen_port == 8850
+    assert loaded.peer_advertise_host == "203.0.113.5"
+
+
+def test_config_peer_serve_coercion(tmp_path):
+    """Defensive coercion, matching max_fetch_gb's posture: a hand-edited
+    agent.json shouldn't be able to crash config loading, only fall back to
+    the safe default."""
+    import json as _json
+
+    path = tmp_path / "agent.json"
+    bool_cases = [("true", True), ("false", False), (True, True), (False, False), ("yes", True), ("no", False), ("junk", False), (None, False)]
+    for raw, expected in bool_cases:
+        path.write_text(_json.dumps({"peer_serve": raw}), encoding="utf-8")
+        assert AgentConfig.load(str(path)).peer_serve is expected
+
+    port_cases = [("8850", 8850), (8850, 8850), (0, None), (-1, None), ("junk", None), (None, None)]
+    for raw, expected in port_cases:
+        path.write_text(_json.dumps({"peer_listen_port": raw}), encoding="utf-8")
+        assert AgentConfig.load(str(path)).peer_listen_port == expected
+
+    host_cases = [("203.0.113.5", "203.0.113.5"), ("", None), (123, None), (None, None)]
+    for raw, expected in host_cases:
+        path.write_text(_json.dumps({"peer_advertise_host": raw}), encoding="utf-8")
+        assert AgentConfig.load(str(path)).peer_advertise_host == expected

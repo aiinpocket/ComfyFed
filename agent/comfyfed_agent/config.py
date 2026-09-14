@@ -21,6 +21,47 @@ def _coerce_positive_float(value, default: float) -> float:
     return result
 
 
+def _coerce_bool(value, default: bool) -> bool:
+    """`peer_serve` from agent.json, defensively: a real bool passes through,
+    a common string spelling ("true"/"false"/"1"/"0"/"yes"/"no") is accepted
+    for hand-edited configs, and anything else (missing, wrong type, unknown
+    string) falls back to `default` rather than raising -- same posture as
+    `_coerce_positive_float`."""
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, str):
+        lowered = value.strip().lower()
+        if lowered in ("true", "1", "yes", "on"):
+            return True
+        if lowered in ("false", "0", "no", "off"):
+            return False
+    return default
+
+
+def _coerce_optional_positive_int(value, default: int | None) -> int | None:
+    """`peer_listen_port` from agent.json, defensively: a string like "8850"
+    is accepted; missing/non-numeric/non-positive falls back to `default`
+    (usually `None`, meaning "peer serving has no port to bind")."""
+    if value is None:
+        return default
+    try:
+        result = int(value)
+    except (TypeError, ValueError):
+        return default
+    if result <= 0:
+        return default
+    return result
+
+
+def _coerce_optional_str(value, default: str | None) -> str | None:
+    """`peer_advertise_host` from agent.json: a non-empty string passes
+    through, anything else (missing, empty, wrong type) falls back to
+    `default` (`None`, meaning "auto-detect the LAN IP")."""
+    if isinstance(value, str) and value:
+        return value
+    return default
+
+
 @dataclass
 class PlatformEntry:
     platform_url: str
@@ -52,6 +93,16 @@ class AgentConfig:
     hash_models: bool = True
     auto_fetch_models: bool = False
     max_fetch_gb: float = 30
+    # Phase 3.1 P2P addendum (種子端): this worker serves model bytes to other
+    # agents holding a platform-issued Grant (agent/comfyfed_agent/peerserve.py).
+    # Peer serving is enabled iff BOTH `peer_serve` is true AND
+    # `peer_listen_port` is set -- a bare `peer_serve: true` with no port has
+    # nothing to bind and is treated as off (see peerserve.is_enabled).
+    # `peer_advertise_host` overrides the auto-detected LAN IP advertised in
+    # `hello.peer_url` (useful behind NAT/port-forwarding or a fixed hostname).
+    peer_serve: bool = False
+    peer_listen_port: int | None = None
+    peer_advertise_host: str | None = None
 
     @classmethod
     def load(cls, path: str) -> "AgentConfig":
@@ -77,6 +128,13 @@ class AgentConfig:
             max_fetch_gb=_coerce_positive_float(
                 data.get("max_fetch_gb"), cls.max_fetch_gb
             ),
+            peer_serve=_coerce_bool(data.get("peer_serve"), cls.peer_serve),
+            peer_listen_port=_coerce_optional_positive_int(
+                data.get("peer_listen_port"), cls.peer_listen_port
+            ),
+            peer_advertise_host=_coerce_optional_str(
+                data.get("peer_advertise_host"), cls.peer_advertise_host
+            ),
         )
 
     def save(self, path: str) -> None:
@@ -97,6 +155,9 @@ class AgentConfig:
             "hash_models": self.hash_models,
             "auto_fetch_models": self.auto_fetch_models,
             "max_fetch_gb": self.max_fetch_gb,
+            "peer_serve": self.peer_serve,
+            "peer_listen_port": self.peer_listen_port,
+            "peer_advertise_host": self.peer_advertise_host,
         }
 
         tmp_path = f"{path}.tmp-{os.getpid()}"

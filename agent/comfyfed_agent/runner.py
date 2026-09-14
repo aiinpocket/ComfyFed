@@ -20,7 +20,7 @@ import httpx
 import websockets
 from nacl.signing import SigningKey
 
-from . import comfy, fetcher, hardware, signing, whitelist
+from . import comfy, fetcher, hardware, peerserve, signing, whitelist
 from .config import AgentConfig, PlatformEntry
 
 logger = logging.getLogger(__name__)
@@ -124,26 +124,34 @@ class PlatformConnection:
     async def recv(self) -> dict:
         return json.loads(await self.ws.recv())
 
-    async def send_hello(self, hardware_info: dict, backend: str, torch_version: str, node_classes) -> None:
-        await self._send(
-            {
-                "type": "hello",
-                "hardware": hardware_info,
-                "backend": backend,
-                "torch_version": torch_version,
-                "node_classes": sorted(node_classes),
-                # Protocol 3: adds `auto_fetch` (below) and lazy sha256
-                # hashes on inventory entries (see hardware.scan_models) --
-                # groundwork for Phase 2.1 model auto-distribution. Still
-                # guarantees everything protocol 2 did: `exec_seconds` on
-                # job_done/job_failed whenever the run actually started, and
-                # understands `job_cancelled` pushes. See agentws.py. A
-                # server that doesn't know protocol 3 yet just ignores the
-                # unknown fields.
-                "protocol": 3,
-                "auto_fetch": self.config.auto_fetch_models,
-            }
-        )
+    async def send_hello(
+        self,
+        hardware_info: dict,
+        backend: str,
+        torch_version: str,
+        node_classes,
+        peer_url: Optional[str] = None,
+    ) -> None:
+        message = {
+            "type": "hello",
+            "hardware": hardware_info,
+            "backend": backend,
+            "torch_version": torch_version,
+            "node_classes": sorted(node_classes),
+            # Protocol 4 (Phase 3.1 P2P addendum): adds the optional
+            # `peer_url` field below, advertised only when this worker's
+            # peer HTTP server is enabled (see peerserve.is_enabled). Still
+            # guarantees everything protocol 3 did: `auto_fetch` and lazy
+            # sha256/chunk hashes on inventory entries (hardware.scan_models),
+            # `exec_seconds` on job_done/job_failed, and job_cancelled
+            # pushes. A server that doesn't know protocol 4 yet just ignores
+            # the unknown fields (see agentws.py).
+            "protocol": 4,
+            "auto_fetch": self.config.auto_fetch_models,
+        }
+        if peer_url:
+            message["peer_url"] = peer_url
+        await self._send(message)
 
     async def send_inventory(self, models: list[dict]) -> None:
         await self._send({"type": "inventory", "models": models})
@@ -498,6 +506,12 @@ class AgentLoop:
         # recognised as "already shutting down" and forces an immediate exit
         # instead of layering a second wind-down on top of the first.
         self._shutdown_in_progress = False
+        # Phase 3.1 P2P addendum (種子端): started in `run()` when
+        # `peerserve.is_enabled(config)`, stopped in `shutdown()`. One
+        # listener for the whole process, shared across every platform
+        # connection (see peerserve.PeerHTTPServer's docstring).
+        self._peer_server: Optional["peerserve.PeerHTTPServer"] = None
+        self._peer_advertised_url: Optional[str] = None
 
     async def broadcast_heartbeat(
         self,
@@ -1328,6 +1342,47 @@ class AgentLoop:
         self._stop_tasks.clear()
         self._jobs.clear()
 
+        if self._peer_server is not None:
+            try:
+                self._peer_server.stop()
+            except Exception:
+                logger.exception("runner: failed to stop peer HTTP server cleanly")
+            self._peer_server = None
+            self._peer_advertised_url = None
+
+    def _start_peer_server(self) -> None:
+        """Start the peer HTTP server when `peer_serve`/`peer_listen_port`
+        are configured, so `_run_platform` has an advertisable `peer_url`
+        for every connection's `hello`. Best-effort: a bind failure (port in
+        use, no permission) disables peer serving for this run rather than
+        crashing agent startup -- the agent still works fine as a puller-only
+        or non-P2P worker.
+        """
+        if not peerserve.is_enabled(self.config):
+            return
+        if not self.config.models_dir:
+            logger.warning(
+                "runner: peer_serve is enabled but models_dir is not configured; "
+                "skipping the peer HTTP server for this run"
+            )
+            return
+        try:
+            self._peer_server = peerserve.PeerHTTPServer(
+                models_dir=self.config.models_dir,
+                port=self.config.peer_listen_port,
+                platforms=list(self.config.platforms),
+            )
+            self._peer_server.start()
+            self._peer_advertised_url = peerserve.advertised_url(self.config)
+            logger.info(
+                "runner: peer HTTP server listening on port %s, advertising %s",
+                self.config.peer_listen_port, self._peer_advertised_url,
+            )
+        except Exception:
+            logger.exception("runner: failed to start the peer HTTP server; P2P serving disabled for this run")
+            self._peer_server = None
+            self._peer_advertised_url = None
+
     def _install_signal_handlers(self, loop: asyncio.AbstractEventLoop) -> None:
         """Install SIGINT/SIGTERM (and SIGBREAK on Windows) handlers.
 
@@ -1498,7 +1553,7 @@ class AgentLoop:
                     self.config.comfy_url,
                     self.config.whitelist_extra,
                 )
-                await conn.send_hello(hw, backend, torch_version, allowed)
+                await conn.send_hello(hw, backend, torch_version, allowed, peer_url=self._peer_advertised_url)
 
                 models = (
                     hardware.scan_models(self.config.models_dir, hash_models=self.config.hash_models)
@@ -1538,6 +1593,7 @@ class AgentLoop:
             return
         loop = asyncio.get_running_loop()
         self._install_signal_handlers(loop)
+        self._start_peer_server()
         try:
             await asyncio.gather(*(self._run_platform(conn) for conn in self.connections.values()))
         finally:

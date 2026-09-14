@@ -1592,7 +1592,7 @@ class _RecordingWS:
 
 
 @pytest.mark.asyncio
-async def test_send_hello_declares_protocol_3_and_auto_fetch_false_by_default():
+async def test_send_hello_declares_protocol_4_and_auto_fetch_false_by_default():
     entry = PlatformEntry(
         platform_url="http://p",
         platform_pubkey="aa",
@@ -1608,9 +1608,31 @@ async def test_send_hello_declares_protocol_3_and_auto_fetch_false_by_default():
     assert len(conn.ws.sent) == 1
     payload = json.loads(conn.ws.sent[0])
     assert payload["type"] == "hello"
-    assert payload["protocol"] == 3
+    assert payload["protocol"] == 4
     assert payload["auto_fetch"] is False
     assert payload["hardware"]["platform"] == "Windows"
+    assert "peer_url" not in payload
+
+
+@pytest.mark.asyncio
+async def test_send_hello_includes_peer_url_when_given():
+    entry = PlatformEntry(
+        platform_url="http://p",
+        platform_pubkey="aa",
+        worker_id="w1",
+        certificate="cert",
+        signing_key_hex="00" * 32,
+    )
+    conn = PlatformConnection(entry, AgentConfig())
+    conn.ws = _RecordingWS()
+
+    await conn.send_hello(
+        {"cpu": "x", "platform": "Windows"}, "cuda", "2.0", ["KSampler"],
+        peer_url="http://192.168.1.5:8850",
+    )
+
+    payload = json.loads(conn.ws.sent[0])
+    assert payload["peer_url"] == "http://192.168.1.5:8850"
 
 
 @pytest.mark.asyncio
