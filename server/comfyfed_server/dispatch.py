@@ -100,14 +100,20 @@ def assign_jobs(
         return []
 
     with db.get_session() as session:
+        # `deleted == False` on both queries: a soft-deleted worker is never
+        # eligible for dispatch and never counts as a peer seeder, even if a
+        # live connection is still being torn down when this tick runs (see
+        # `db.Worker.deleted` / `agentws.kick_worker`).
         workers = {
             w.id: w
-            for w in session.query(db.Worker).filter(db.Worker.id.in_(idle_worker_ids)).all()
+            for w in session.query(db.Worker)
+            .filter(db.Worker.id.in_(idle_worker_ids), db.Worker.deleted == False)  # noqa: E712
+            .all()
         }
         if not workers:
             return []
 
-        all_workers = session.query(db.Worker).all()
+        all_workers = session.query(db.Worker).filter(db.Worker.deleted == False).all()  # noqa: E712
 
         queued_jobs = (
             session.query(db.Job)

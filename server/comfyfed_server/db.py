@@ -70,6 +70,14 @@ class Worker(Base):
     status: Mapped[str] = mapped_column(String, default="offline", server_default="offline")
     last_seen: Mapped[Optional[datetime]] = mapped_column(DateTime, nullable=True)
     disabled: Mapped[bool] = mapped_column(Boolean, default=False, server_default="0")
+    # SOFT delete. Receipts and jobs reference workers for the billing ledger,
+    # so an admin "delete" must never remove the row: it flips this flag (and
+    # `disabled`, so every existing disabled-gated path keeps holding even if
+    # a future caller forgets `deleted`). A deleted worker disappears from the
+    # console listing, dispatch eligibility and metrics, and can no longer
+    # complete the agent WS handshake -- but `GET /api/reports/*` still
+    # resolves its historical receipts by id, unchanged.
+    deleted: Mapped[bool] = mapped_column(Boolean, default=False, server_default="0")
     created_at: Mapped[datetime] = mapped_column(DateTime, default=_utcnow)
     hardware: Mapped[str] = mapped_column(String, default="{}", server_default="{}")
     dynamic: Mapped[str] = mapped_column(String, default="{}", server_default="{}")

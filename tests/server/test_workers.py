@@ -235,3 +235,92 @@ def test_agent_release_missing_404(client):
 def test_agent_release_sanitizes_path_traversal(client):
     r = client.get("/api/agent/releases/..%2F..%2Fsecrets.txt")
     assert r.status_code in (404, 400)
+
+
+# --------------------------------------------------------------- soft delete
+
+
+def _register(client, csrf, name, pubkey):
+    """Issue a register token for `name` and claim it, returning the worker id."""
+    r = client.post("/api/workers/tokens", json={"name": name}, headers={"X-CSRF": csrf})
+    token = r.json()["bundle"]["register_token"]
+    reg = client.post(
+        "/api/agent/register",
+        json={"token": token, "name": name, "pubkey": pubkey},
+    )
+    assert reg.status_code == 200
+    return reg.json()["worker_id"]
+
+
+def test_delete_worker_requires_login(client):
+    r = client.delete("/api/workers/does-not-exist")
+    assert r.status_code == 401
+
+
+def test_delete_worker_requires_csrf(client):
+    _login(client)
+    r = client.delete("/api/workers/does-not-exist")
+    assert r.status_code == 403
+    assert r.json()["error"]["code"] == "auth.csrf"
+
+
+def test_delete_worker_requires_admin_role(client):
+    """A logged-in non-admin gets 403 even with a valid CSRF token -- the
+    route hangs off `auth.require_csrf`, which is admin-only."""
+    csrf = _login(client)
+    worker_id = _register(client, csrf, "worker-del-role", "78" * 32)
+    created = client.post(
+        "/api/users",
+        json={"username": "plainuser", "role": "user", "password": "s3cret-password"},
+        headers={"X-CSRF": csrf},
+    )
+    assert created.status_code == 200
+
+    client.post("/api/auth/logout", headers={"X-CSRF": csrf})
+    login = client.post(
+        "/api/auth/login", json={"username": "plainuser", "password": "s3cret-password"}
+    )
+    assert login.status_code == 200
+    user_csrf = login.json()["csrf"]
+
+    r = client.delete(f"/api/workers/{worker_id}", headers={"X-CSRF": user_csrf})
+    assert r.status_code == 403
+
+
+def test_delete_worker_soft_deletes_and_hides_from_list(client):
+    csrf = _login(client)
+    worker_id = _register(client, csrf, "worker-del", "9a" * 32)
+
+    r = client.delete(f"/api/workers/{worker_id}", headers={"X-CSRF": csrf})
+    assert r.status_code == 200
+    assert r.json() == {"ok": True}
+
+    listed = client.get("/api/workers").json()
+    assert all(w["id"] != worker_id for w in listed)
+
+    # The row itself survives -- the billing ledger's receipts/jobs still
+    # reference it (see db.Worker.deleted).
+    with db.get_session() as session:
+        row = session.get(db.Worker, worker_id)
+        assert row is not None
+        assert row.deleted is True
+        assert row.disabled is True
+
+
+def test_delete_unknown_worker_404(client):
+    csrf = _login(client)
+    r = client.delete("/api/workers/does-not-exist", headers={"X-CSRF": csrf})
+    assert r.status_code == 404
+    assert r.json()["error"]["code"] == "workers.not_found"
+
+
+def test_delete_worker_twice_404(client):
+    csrf = _login(client)
+    worker_id = _register(client, csrf, "worker-del-twice", "bc" * 32)
+
+    first = client.delete(f"/api/workers/{worker_id}", headers={"X-CSRF": csrf})
+    assert first.status_code == 200
+
+    second = client.delete(f"/api/workers/{worker_id}", headers={"X-CSRF": csrf})
+    assert second.status_code == 404
+    assert second.json()["error"]["code"] == "workers.not_found"

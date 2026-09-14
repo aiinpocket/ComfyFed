@@ -2764,3 +2764,64 @@ def test_stageless_heartbeat_clears_fetch_chip_and_starts_the_run(client):
         assert job_id not in agentws._fetch_progress
     finally:
         ws.close()
+
+
+# ------------------------------------------- admin soft delete (Worker.deleted)
+
+
+def test_handshake_refused_for_a_deleted_worker(client):
+    """A soft-deleted worker can never get a live socket back, however valid
+    its certificate and signature still are -- see `_handshake`."""
+    csrf = _login(client)
+    worker_id, sk = _register_worker(client, csrf, "w-deleted")
+
+    assert client.delete(f"/api/workers/{worker_id}", headers={"X-CSRF": csrf}).status_code == 200
+
+    with client.websocket_connect("/api/agent/ws") as ws:
+        challenge = ws.receive_json()
+        sig = sk.sign(challenge["nonce"].encode()).signature.hex()
+        ws.send_json({"type": "auth", "worker_id": worker_id, "sig": sig})
+
+        with pytest.raises(WebSocketDisconnect) as exc_info:
+            ws.receive_json()
+        assert exc_info.value.code == 4401
+
+
+def test_delete_kicks_a_live_agent_connection(client):
+    """Deleting a CONNECTED worker closes its socket (4403) and unregisters
+    it immediately, rather than leaving it heartbeating against a worker the
+    console no longer shows -- see `agentws.kick_worker`."""
+    csrf = _login(client)
+    worker_id, sk = _register_worker(client, csrf, "w-live-delete")
+
+    with client.websocket_connect("/api/agent/ws") as ws:
+        challenge = ws.receive_json()
+        sig = sk.sign(challenge["nonce"].encode()).signature.hex()
+        ws.send_json({"type": "auth", "worker_id": worker_id, "sig": sig})
+        assert ws.receive_json()["type"] == "ready"
+        assert worker_id in agentws._connections
+
+        assert client.delete(f"/api/workers/{worker_id}", headers={"X-CSRF": csrf}).status_code == 200
+
+        assert worker_id not in agentws._connections
+        with pytest.raises(WebSocketDisconnect) as exc_info:
+            ws.receive_json()
+        assert exc_info.value.code == 4403
+
+
+def test_deleted_worker_is_not_dispatched_to(client):
+    """Even with a stale registry entry, `assign_jobs` filters deleted rows,
+    so a queued job is never handed to a deleted worker."""
+    csrf = _login(client)
+    worker_id, sk = _register_worker(client, csrf, "w-no-dispatch")
+    job_id = _submit(client, csrf)
+
+    with db.get_session() as session:
+        worker = session.get(db.Worker, worker_id)
+        worker.deleted = True
+        session.commit()
+
+    assert dispatch.assign_jobs([worker_id], {}, frozenset()) == []
+
+    with db.get_session() as session:
+        assert session.get(db.Job, job_id).status == "queued"

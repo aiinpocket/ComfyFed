@@ -118,6 +118,10 @@ logger = logging.getLogger(__name__)
 _AUTH_TIMEOUT_SECONDS = 10
 _TICK_INTERVAL_SECONDS = 5
 _CLOSE_UNAUTHORIZED = 4401
+# An admin soft-deleted this worker while it was connected (see
+# `workers.delete_worker` / `kick_worker`). Distinct from 4401 so an agent's
+# log says why it was dropped; the agent treats any 4xxx close the same way.
+_CLOSE_WORKER_DELETED = 4403
 
 # Minimum `hello.protocol` that guarantees exec_seconds on job_done/job_failed
 # (when the run started) and understands `job_cancelled` pushes. Below this,
@@ -331,7 +335,11 @@ async def _handshake(websocket: WebSocket) -> Optional[str]:
 
     with db.get_session() as session:
         worker = session.get(db.Worker, worker_id)
-        if worker is None or worker.disabled:
+        # `deleted` is checked alongside `disabled` (a soft-deleted worker is
+        # always disabled too, but the flag is the authoritative one -- see
+        # `db.Worker.deleted`): a deleted worker must never get a live socket
+        # back, no matter how valid its certificate still is.
+        if worker is None or worker.disabled or worker.deleted:
             await _close_unauthorized(websocket)
             return None
 
@@ -349,6 +357,43 @@ async def _close_unauthorized(websocket: WebSocket) -> None:
         await websocket.close(code=_CLOSE_UNAUTHORIZED)
     except Exception:
         pass
+
+
+async def _close_deleted(conn: "_Connection") -> None:
+    try:
+        await conn.ws.close(code=_CLOSE_WORKER_DELETED)
+    except Exception:
+        logger.exception("agentws: failed to close socket for deleted worker %s", conn.worker_id)
+
+
+def kick_worker(worker_id: str) -> bool:
+    """Close `worker_id`'s live agent socket, if it has one. Returns whether
+    one was found.
+
+    Called from `workers.delete_worker` (a plain sync FastAPI route, so it
+    runs on a threadpool thread with no event loop of its own) right after
+    the row is flagged deleted: the handshake gate only stops the NEXT
+    connection attempt, and an already-connected agent would otherwise keep
+    heartbeating against a worker the console no longer shows.
+
+    The send has to happen on the loop the connection was accepted on --
+    same constraint (and same `run_coroutine_threadsafe` remedy)
+    `push_job_cancelled` and `dispatch_once` document. The registry entry is
+    dropped here rather than waiting for the socket's own `finally` so the
+    worker is invisible to `dispatch_tick` immediately, even if the close
+    frame takes a moment to land.
+    """
+    conn = _connections.pop(worker_id, None)
+    if conn is None:
+        return False
+    try:
+        asyncio.run_coroutine_threadsafe(_close_deleted(conn), conn.loop).result(timeout=5)
+    except Exception:
+        # A dead/closing socket, or a loop that's already gone: the row is
+        # already flagged deleted and the connection is already unregistered,
+        # so there is nothing left to undo -- never fail the delete over it.
+        logger.exception("agentws: failed to kick deleted worker %s", worker_id)
+    return True
 
 
 def _resolve_warn_level(conn: _Connection, job_id: Optional[str]) -> int:

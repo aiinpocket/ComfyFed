@@ -18,7 +18,7 @@ from nacl.signing import VerifyKey
 from pydantic import BaseModel
 from sqlalchemy import update
 
-from . import auth, db, security, storage
+from . import auth, db, metrics, security, storage
 
 _PLATFORM_URL_KEY = "platform_url"
 
@@ -388,7 +388,10 @@ def create_router(data_dir: str) -> APIRouter:
     @r.get("/api/workers")
     def list_workers(_payload: dict = Depends(auth.require_admin)):
         with db.get_session() as session:
-            workers = session.query(db.Worker).all()
+            # Soft-deleted workers are gone as far as every user-visible
+            # surface is concerned (see `db.Worker.deleted`); only the
+            # reports/payout endpoints still resolve them, by id.
+            workers = session.query(db.Worker).filter(db.Worker.deleted == False).all()  # noqa: E712
             return [
                 {
                     "id": w.id,
@@ -451,4 +454,62 @@ def create_router(data_dir: str) -> APIRouter:
 
         return {"ok": True}
 
+    @r.delete("/api/workers/{worker_id}")
+    def delete_worker(
+        worker_id: str,
+        _payload: dict = Depends(auth.require_csrf),
+    ):
+        """Admin soft delete: the worker vanishes from the console, dispatch
+        and metrics, and can never reconnect -- but its row survives so the
+        receipts and jobs pointing at it keep resolving in the billing
+        reports. Same admin+CSRF gate as `disable_worker` above
+        (`require_csrf` already hangs off `require_admin`).
+
+        Already-deleted is 404, identical to unknown: from every caller's
+        point of view the worker no longer exists, and telling the two apart
+        would leak that an id was once real.
+        """
+        with db.get_session() as session:
+            worker = session.get(db.Worker, worker_id)
+            if worker is None or worker.deleted:
+                raise _error(404, "workers.not_found", "Worker not found.")
+            worker_name = worker.name
+            worker.deleted = True
+            # Belt and braces: every pre-existing gate (dispatch, the agent
+            # WS handshake, signed agent requests) already refuses a disabled
+            # worker, so flipping both means nothing can serve a deleted
+            # worker even on a path that predates `deleted`.
+            worker.disabled = True
+            session.commit()
+
+        # Imported lazily: `agentws` imports this module at load time, so a
+        # module-level import here would be circular.
+        from . import agentws
+
+        agentws.kick_worker(worker_id)
+        _forget_worker_metrics(worker_name)
+
+        return {"ok": True}
+
     return r
+
+
+def _forget_worker_metrics(worker_name: str) -> None:
+    """Drop a deleted worker's per-worker gauge samples.
+
+    The gauges are labelled by NAME (see `metrics.Metrics`) and nothing else
+    ever clears a label, so a deleted worker would otherwise keep exporting
+    `comfyfed_worker_up{worker="..."} 0` forever and page whoever alerts on
+    it. `remove` raises KeyError for a label set that was never set (a worker
+    that never heartbeated), which is not an error here. Best-effort in full:
+    metrics must never fail the delete.
+    """
+    try:
+        m = metrics.get_metrics()
+    except RuntimeError:
+        return
+    for gauge in (m.worker_up, m.worker_free_vram_gb, m.worker_free_ram_gb, m.worker_free_disk_gb):
+        try:
+            gauge.remove(worker_name)
+        except (KeyError, ValueError):
+            pass
