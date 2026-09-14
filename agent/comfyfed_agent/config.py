@@ -144,7 +144,10 @@ class AgentConfig:
         if not os.path.exists(path):
             return cls()
 
-        with open(path, "r", encoding="utf-8") as f:
+        # utf-8-sig: tolerate a UTF-8 BOM in hand-edited configs (Windows
+        # editors and PS 5.1 redirects often prepend one; strict utf-8
+        # would crash json.load on the very first byte).
+        with open(path, "r", encoding="utf-8-sig") as f:
             data = json.load(f)
 
         platforms = [PlatformEntry(**p) for p in data.get("platforms", [])]

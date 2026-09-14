@@ -179,3 +179,35 @@ def test_cli_wires_each_subcommand_to_its_handler(monkeypatch, tmp_path, command
     main_module.cli()
 
     assert called == [str(tmp_path / "agent.json")]
+
+
+def test_register_reads_a_bundle_with_a_utf8_bom(tmp_path, monkeypatch, capsys):
+    """PS 5.1 wrote bundle.json with a UTF-8 BOM and register crashed on
+    json.load before ever contacting the platform (live-caught). The reader
+    is utf-8-sig now: the BOM'd bundle must parse and reach identity.register
+    verbatim."""
+    bundle = {"platform_url": "http://x", "platform_pubkey": "pk", "register_token": "t"}
+    bundle_path = tmp_path / "bundle.json"
+    bundle_path.write_bytes(b"\xef\xbb\xbf" + json.dumps(bundle).encode("utf-8"))
+    cfg_path = tmp_path / "agent.json"
+
+    seen = {}
+
+    class _Entry:
+        worker_id = "w1"
+        platform_url = "http://x"
+
+    def fake_register(got_bundle, name, config_path, client):
+        seen["bundle"] = got_bundle
+        return _Entry()
+
+    monkeypatch.setattr(main_module.identity, "register", fake_register)
+    monkeypatch.setattr(
+        main_module.detect, "apply_detection", lambda cfg, client, default: []
+    )
+    monkeypatch.setattr(main_module.detect, "probe_comfy", lambda url, client: True)
+
+    args = argparse.Namespace(bundle=str(bundle_path), name="w1", config=str(cfg_path))
+    main_module._cmd_register(args)
+
+    assert seen["bundle"] == bundle

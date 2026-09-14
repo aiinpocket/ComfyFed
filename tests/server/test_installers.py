@@ -392,3 +392,14 @@ def test_ps1_served_response_has_no_bom_or_mojibake(client_with_url):
     assert not r.text.startswith("﻿")
     assert "﻿" not in r.text
     assert "中文/EN bilingual" in r.text  # exact CJK marker from line 2: mojibake would break it
+
+
+def test_ps1_writes_the_register_bundle_without_a_bom():
+    """PS 5.1's `Set-Content -Encoding UTF8` prepends a BOM, which the
+    agent's strict-JSON reader rejected during a real install. The bundle
+    must be written via WriteAllText with an explicit BOM-less encoding,
+    and no Set-Content may touch bundle.json again."""
+    text = open(_source_path("install.ps1"), encoding="utf-8").read()
+    assert "[System.IO.File]::WriteAllText($bundlePath" in text
+    assert "New-Object System.Text.UTF8Encoding($false)" in text
+    assert "Set-Content -Path $bundlePath" not in text

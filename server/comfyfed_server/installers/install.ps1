@@ -323,7 +323,10 @@ if ($RegisterToken -ne '') {
         platform_pubkey = $platformInfo.platform_pubkey
         register_token = $RegisterToken
     }
-    ($bundle | ConvertTo-Json) | Set-Content -Path $bundlePath -Encoding UTF8
+    # PS 5.1's `Set-Content -Encoding UTF8` writes a BOM, which strict
+    # utf-8 JSON readers reject (live-caught: the agent's register crashed
+    # on "Unexpected UTF-8 BOM") -- write the file BOM-less explicitly.
+    [System.IO.File]::WriteAllText($bundlePath, ($bundle | ConvertTo-Json), (New-Object System.Text.UTF8Encoding($false)))
 
     try {
         & $venvAgent register $bundlePath

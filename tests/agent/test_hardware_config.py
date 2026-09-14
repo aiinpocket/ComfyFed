@@ -638,3 +638,18 @@ def test_config_peer_serve_coercion(tmp_path):
     for raw, expected in host_cases:
         path.write_text(_json.dumps({"peer_advertise_host": raw}), encoding="utf-8")
         assert AgentConfig.load(str(path)).peer_advertise_host == expected
+
+
+def test_config_load_tolerates_a_utf8_bom(tmp_path):
+    """Windows tooling (PS 5.1 `Set-Content -Encoding UTF8`, Notepad) writes
+    JSON with a UTF-8 BOM; strict utf-8 json.load rejects the very first
+    byte (live-caught during a real one-line install). load() must accept
+    both spellings identically."""
+    path = tmp_path / "agent.json"
+    AgentConfig(models_dir=str(tmp_path / "m")).save(str(path))
+    raw = path.read_bytes()
+    assert not raw.startswith(b"\xef\xbb\xbf")  # save itself stays BOM-less
+    path.write_bytes(b"\xef\xbb\xbf" + raw)
+
+    loaded = AgentConfig.load(str(path))
+    assert loaded.models_dir == str(tmp_path / "m")

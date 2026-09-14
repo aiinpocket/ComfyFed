@@ -28,7 +28,10 @@ _STATE_STALE_SECONDS = 20.0
 
 
 def _cmd_register(args: argparse.Namespace) -> None:
-    with open(args.bundle, "r", encoding="utf-8") as f:
+    # utf-8-sig: tolerate a UTF-8 BOM -- Windows tooling (PS 5.1 Set-Content
+    # -Encoding UTF8, Notepad) loves to prepend one, and json.load rejects
+    # it under strict utf-8 (live-caught during a real one-line install).
+    with open(args.bundle, "r", encoding="utf-8-sig") as f:
         bundle = json.load(f)
 
     name = args.name or socket.gethostname()
