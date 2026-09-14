@@ -636,6 +636,38 @@ def test_assign_jobs_fetch_tier_prefers_smallest_total_download(_db):
     assert job.id == job_id
 
 
+def test_assign_jobs_peer_only_model_skips_a_protocol_3_worker(_db):
+    """Phase 3.1 P2P: a missing model whose ONLY manifest source is a peer
+    (`peer_only_models`) is not fetchable by a protocol-3 worker -- it must
+    never be assigned this job, even with nobody else in the pool."""
+    worker_id = _make_fetch_ready_worker("w1", dynamic={"free_disk_gb": 100.0}, protocol=3)
+    job_id = _make_model_job(models=("peer.safetensors",))
+    fetchable = {"peer.safetensors": round(1.0 * 1024**3)}
+
+    assignments = dispatch.assign_jobs(
+        [worker_id], fetchable, peer_only_models=frozenset({"peer.safetensors"})
+    )
+
+    assert assignments == []
+    with db.get_session() as session:
+        assert session.get(db.Job, job_id).status == "queued"
+
+
+def test_assign_jobs_peer_only_model_assigns_a_protocol_4_worker(_db):
+    worker_id = _make_fetch_ready_worker("w1", dynamic={"free_disk_gb": 100.0}, protocol=4)
+    job_id = _make_model_job(models=("peer.safetensors",))
+    fetchable = {"peer.safetensors": round(1.0 * 1024**3)}
+
+    assignments = dispatch.assign_jobs(
+        [worker_id], fetchable, peer_only_models=frozenset({"peer.safetensors"})
+    )
+
+    assert len(assignments) == 1
+    assigned_worker_id, job = assignments[0]
+    assert assigned_worker_id == worker_id
+    assert job.id == job_id
+
+
 def test_assign_jobs_no_fetch_candidate_when_fetchable_models_not_supplied(_db):
     """The Task-3 no-op default: omitting fetchable_models must reproduce the
     exact pre-Task-4 behavior -- no missing-model worker is ever assigned."""

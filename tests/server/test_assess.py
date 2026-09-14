@@ -300,6 +300,125 @@ def test_verdict_ineligible_when_manifest_size_sum_exceeds_margin():
     assert v2.kind == "eligible_after_fetch"
 
 
+# --- Phase 3.1 P2P: peer-only fetch source requires protocol>=4 -----------
+
+
+def test_verdict_peer_only_model_ineligible_at_protocol_3():
+    """A protocol-3 worker can auto-fetch a URL-sourced model just fine, but
+    has no way to speak the peer-grant/chunk-pull protocol -- a missing model
+    whose ONLY manifest source is a peer (`peer_only_models`) must exclude it
+    from `eligible_after_fetch` even though every other gate (auto_fetch,
+    disk) passes."""
+    worker = _fetch_ready_worker(
+        "w1", model_inventory=[], dynamic={"free_disk_gb": 100}
+    )  # protocol=3 via _fetch_ready_worker
+    needs = assess.JobNeeds(nodes=set(), models={"peer.safetensors"}, est_vram_gb=None)
+    fetchable = {"peer.safetensors": 1 * 1024**3}
+    v = assess.verdict(
+        worker, needs, {}, [worker], fetchable_models=fetchable,
+        peer_only_models=frozenset({"peer.safetensors"}),
+    )
+    assert v.kind == "ineligible"
+    assert any(r.startswith("missing_models_unavailable:") for r in v.reasons)
+
+
+def test_verdict_peer_only_model_eligible_after_fetch_at_protocol_4():
+    worker = _fetch_ready_worker(
+        "w1", model_inventory=[], dynamic={"free_disk_gb": 100}, protocol=4
+    )
+    needs = assess.JobNeeds(nodes=set(), models={"peer.safetensors"}, est_vram_gb=None)
+    fetchable = {"peer.safetensors": 1 * 1024**3}
+    v = assess.verdict(
+        worker, needs, {}, [worker], fetchable_models=fetchable,
+        peer_only_models=frozenset({"peer.safetensors"}),
+    )
+    assert v.kind == "eligible_after_fetch"
+    assert v.missing_models == ["peer.safetensors"]
+
+
+def test_verdict_url_only_missing_model_unaffected_by_peer_only_models_param():
+    """`peer_only_models` only raises the bar for names actually IN that set
+    -- a protocol-3 worker stays eligible_after_fetch for a plain URL-sourced
+    missing model even when the parameter is non-empty (for some OTHER
+    name)."""
+    worker = _fetch_ready_worker(
+        "w1", model_inventory=[], dynamic={"free_disk_gb": 100}
+    )
+    needs = assess.JobNeeds(nodes=set(), models={"url_only.safetensors"}, est_vram_gb=None)
+    fetchable = {"url_only.safetensors": 1 * 1024**3}
+    v = assess.verdict(
+        worker, needs, {}, [worker], fetchable_models=fetchable,
+        peer_only_models=frozenset({"some_other_peer_only.safetensors"}),
+    )
+    assert v.kind == "eligible_after_fetch"
+
+
+def test_verdict_mixed_missing_models_peer_only_gate_applies_to_whole_job():
+    """One missing model is URL-fetchable, the other peer-only -- since
+    `eligible_after_fetch` is an all-or-nothing verdict for the whole job (a
+    worker either fetches everything it's missing or it isn't eligible yet),
+    a protocol-3 worker is ineligible for the WHOLE job, not just the
+    peer-only half."""
+    worker = _fetch_ready_worker(
+        "w1", model_inventory=[], dynamic={"free_disk_gb": 100}
+    )
+    needs = assess.JobNeeds(
+        nodes=set(), models={"url_only.safetensors", "peer.safetensors"}, est_vram_gb=None
+    )
+    fetchable = {
+        "url_only.safetensors": 1 * 1024**3,
+        "peer.safetensors": 1 * 1024**3,
+    }
+    v = assess.verdict(
+        worker, needs, {}, [worker], fetchable_models=fetchable,
+        peer_only_models=frozenset({"peer.safetensors"}),
+    )
+    assert v.kind == "ineligible"
+
+
+# --- partition_fleet_fetchable: peer-only requires an online protocol>=4 --
+# --- worker among the candidates, same rule as verdict's per-candidate gate
+
+
+def test_partition_fleet_fetchable_peer_only_model_unfetchable_without_protocol_4_worker():
+    online = [
+        _fetch_ready_worker("w1", model_inventory=[], dynamic={"free_disk_gb": 100})
+    ]  # protocol 3
+    fetchable = {"peer.safetensors": 1 * 1024**3}
+    fetchable_set, unfetchable = assess.partition_fleet_fetchable(
+        {"peer.safetensors"}, fetchable, online, peer_only_models=frozenset({"peer.safetensors"})
+    )
+    assert fetchable_set == set()
+    assert unfetchable == {"peer.safetensors"}
+
+
+def test_partition_fleet_fetchable_peer_only_model_fetchable_with_a_protocol_4_worker():
+    online = [
+        _fetch_ready_worker("w1", model_inventory=[], dynamic={"free_disk_gb": 100}, protocol=4)
+    ]
+    fetchable = {"peer.safetensors": 1 * 1024**3}
+    fetchable_set, unfetchable = assess.partition_fleet_fetchable(
+        {"peer.safetensors"}, fetchable, online, peer_only_models=frozenset({"peer.safetensors"})
+    )
+    assert fetchable_set == {"peer.safetensors"}
+    assert unfetchable == set()
+
+
+def test_partition_fleet_fetchable_peer_only_models_none_matches_pre_task_6_behavior():
+    """Omitting `peer_only_models` (None, the default) reproduces the exact
+    pre-Task-6 behavior -- a protocol-3 worker is enough for any manifest-
+    covered model, since nothing is considered peer-only."""
+    online = [
+        _fetch_ready_worker("w1", model_inventory=[], dynamic={"free_disk_gb": 100})
+    ]
+    fetchable = {"whatever.safetensors": 1 * 1024**3}
+    fetchable_set, unfetchable = assess.partition_fleet_fetchable(
+        {"whatever.safetensors"}, fetchable, online
+    )
+    assert fetchable_set == {"whatever.safetensors"}
+    assert unfetchable == set()
+
+
 def test_verdict_ineligible_when_missing_node():
     worker = _worker(
         "w1",

@@ -1226,6 +1226,7 @@ def _fetch_models_for_push(
     worker: db.Worker,
     fetchable_models: dict[str, int],
     manifest_by_name: dict[str, dict],
+    peer_only_models: frozenset[str] | None = None,
 ) -> list[dict]:
     """The `fetch_models` manifest entries to embed in this job's push to
     `worker`, or `[]` when nothing needs fetching.
@@ -1254,7 +1255,7 @@ def _fetch_models_for_push(
         requirements_override = {}
 
     needs = assess.needs_from_job(job)
-    v = assess.verdict(worker, needs, requirements_override, [], fetchable_models)
+    v = assess.verdict(worker, needs, requirements_override, [], fetchable_models, peer_only_models)
     if v.kind != "eligible_after_fetch":
         return []
 
@@ -1311,17 +1312,19 @@ async def dispatch_tick() -> None:
     # fetchable", identical to Task 3's default.
     fetchable_models: dict[str, int] = {}
     manifest_by_name: dict[str, dict] = {}
+    peer_only_models: frozenset[str] = frozenset()
     if _data_dir is not None:
         try:
             manifest_entries = model_manifest.entries(_data_dir)
             fetchable_models = {e["name"]: e["size_bytes"] for e in manifest_entries}
             manifest_by_name = {e["name"]: e for e in manifest_entries}
+            peer_only_models = model_manifest.peer_only_names(manifest_entries)
         except Exception:
             logger.exception("agentws: failed to build fetch manifest for dispatch tick")
 
     idle_worker_ids = [worker_id for worker_id, conn in _connections.items() if conn.state == "idle"]
     try:
-        assignments = dispatch.assign_jobs(idle_worker_ids, fetchable_models)
+        assignments = dispatch.assign_jobs(idle_worker_ids, fetchable_models, peer_only_models)
     except Exception:
         logger.exception("agentws: assign_jobs failed")
         assignments = []
@@ -1342,7 +1345,7 @@ async def dispatch_tick() -> None:
                     worker = session.get(db.Worker, worker_id)
                 if worker is not None:
                     fetch_models = _fetch_models_for_push(
-                        job, worker, fetchable_models, manifest_by_name
+                        job, worker, fetchable_models, manifest_by_name, peer_only_models
                     )
                     if fetch_models:
                         frame["fetch_models"] = fetch_models

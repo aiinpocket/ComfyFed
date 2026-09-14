@@ -3,6 +3,7 @@ conflict handling) and the platform-signed fetch manifest built from them.
 """
 
 import hashlib
+import json
 import logging
 import secrets
 import time
@@ -14,6 +15,7 @@ from nacl.signing import SigningKey, VerifyKey
 
 from comfyfed_server import app as app_module
 from comfyfed_server import bootstrap, db, model_guide, model_manifest, security
+from comfyfed_agent import fetcher as agent_fetcher
 
 
 @pytest.fixture()
@@ -214,6 +216,186 @@ def test_entries_skips_a_candidate_whose_name_contains_the_payload_delimiter(dat
 
     names = {e["name"] for e in model_manifest.entries(data_dir)}
     assert evil_name not in names
+
+
+# --- Phase 3.1: peer-only manifest entries ---------------------------------
+
+
+def _seeder_worker(
+    data_dir,
+    worker_id,
+    *,
+    model_name="checkpoints/model.safetensors",
+    size_bytes=_bytes(1.0),
+    sha256=None,
+    protocol=4,
+    peer_url="http://10.0.0.5:8850",
+    status="online",
+    disabled=False,
+):
+    """Insert a `db.Worker` row directly (no HTTP registration needed --
+    `peer.online_seeders`, which `entries()` now consults, only ever queries
+    the DB) shaped so it satisfies `peer.online_seeders`'s predicate: online,
+    not disabled, protocol>=4, `peer_url` set, and an inventory entry for
+    `model_name`/`size_bytes` at `sha256` -- mirrors `test_peer.py`'s
+    `_make_online_seeder` fixture, minus the HTTP registration step that
+    fixture needs a `client` for.
+    """
+    sha256 = sha256 or _sha(worker_id)
+    with db.get_session() as session:
+        session.add(
+            db.Worker(
+                id=worker_id,
+                name=worker_id,
+                pubkey="pk",
+                status=status,
+                disabled=disabled,
+                protocol=protocol,
+                peer_url=peer_url,
+                model_inventory=json.dumps(
+                    [{"name": model_name, "size_bytes": size_bytes, "sha256": sha256}]
+                ),
+            )
+        )
+        session.commit()
+    model_manifest.record_hash(worker_id, model_name, size_bytes, sha256)
+    return sha256
+
+
+def test_entries_includes_peer_only_model_with_online_seeder(data_dir):
+    """A model with NO known download source (not in `model_guide.SOURCES`/
+    `harvest()`) but an agreed hash AND an online protocol>=4 seeder becomes
+    a peer-only entry: `url`/`backup_url` None, `peer: True`, `name`/
+    `directory` split from the seeder's inventory-relative path exactly the
+    way the agent's `fetcher._inventory_name` reconstructs it (the inverse
+    operation) -- see `model_manifest._split_inventory_name`.
+    """
+    sha = _seeder_worker(
+        data_dir, "seeder-1", model_name="loras/wuxia/my_style.safetensors", size_bytes=_bytes(0.5)
+    )
+
+    entries = model_manifest.entries(data_dir)
+    matches = [e for e in entries if e["name"] == "wuxia/my_style.safetensors"]
+    assert len(matches) == 1
+    entry = matches[0]
+
+    assert entry["directory"] == "loras"
+    assert entry["url"] is None
+    assert entry["backup_url"] is None
+    assert entry["peer"] is True
+    assert entry["sha256"] == sha
+    assert entry["size_bytes"] == _bytes(0.5)
+
+    _, verify_key = security.load_platform_keys(data_dir)
+    payload = f"{entry['name']}|{entry['directory']}|{entry['sha256']}|{entry['size_bytes']}"
+    verify_key.verify(payload.encode(), bytes.fromhex(entry["sig"]))  # raises on mismatch
+
+
+def test_entries_excludes_peer_only_candidate_with_no_online_seeder(data_dir):
+    """An agreed hash alone is not enough -- without an online seeder
+    (`peer.online_seeders` empty), a model with no download source never
+    becomes a manifest entry at all, exactly like before Task 6."""
+    model_manifest.record_hash(
+        "reporter-only", "loras/no_seeder.safetensors", _bytes(0.2), _sha("x")
+    )
+    names = {e["name"] for e in model_manifest.entries(data_dir)}
+    assert "no_seeder.safetensors" not in names
+
+
+def test_entries_peer_only_entry_disappears_when_the_seeder_goes_offline(data_dir):
+    """`entries()` re-derives seeder status from the live `workers` table on
+    every call (no caching of who's a seeder) -- the same `verdict` flip the
+    task brief calls for, observed directly on the manifest that feeds it."""
+    _seeder_worker(data_dir, "seeder-1", model_name="loras/x.safetensors", size_bytes=_bytes(0.2))
+    names_before = {e["name"] for e in model_manifest.entries(data_dir)}
+    assert "x.safetensors" in names_before
+
+    with db.get_session() as session:
+        worker = session.get(db.Worker, "seeder-1")
+        worker.status = "offline"
+        session.commit()
+
+    names_after = {e["name"] for e in model_manifest.entries(data_dir)}
+    assert "x.safetensors" not in names_after
+
+
+def test_entries_url_sourced_model_gets_peer_flag_when_also_seeded(data_dir):
+    """A curated (URL-sourced) model that ALSO has an online seeder keeps its
+    `url` untouched but gains `peer: True` -- informative only (the agent
+    fetcher always tries a peer source first regardless of this flag, per
+    Task 5), so downstream eligibility code never needs a second path to
+    learn "this one also has a seeder"."""
+    _seeder_worker(
+        data_dir,
+        "seeder-1",
+        model_name="text_encoders/clip_l.safetensors",
+        size_bytes=_bytes(0.23),
+        sha256=_sha("clip"),
+    )
+
+    entry = next(e for e in model_manifest.entries(data_dir) if e["name"] == "clip_l.safetensors")
+    assert entry["url"] == (
+        "https://huggingface.co/comfyanonymous/flux_text_encoders/resolve/main/clip_l.safetensors"
+    )
+    assert entry["peer"] is True
+
+
+def test_entries_url_sourced_model_has_no_peer_flag_without_a_seeder(data_dir):
+    model_manifest.record_hash("w1", "text_encoders/clip_l.safetensors", _bytes(0.23), _sha("clip"))
+    entry = next(e for e in model_manifest.entries(data_dir) if e["name"] == "clip_l.safetensors")
+    assert "peer" not in entry
+
+
+def test_peer_only_names_returns_only_url_less_entries(data_dir):
+    _seeder_worker(data_dir, "seeder-1", model_name="loras/x.safetensors", size_bytes=_bytes(0.2))
+    model_manifest.record_hash("w1", "text_encoders/clip_l.safetensors", _bytes(0.23), _sha("clip"))
+
+    entries = model_manifest.entries(data_dir)
+    peer_only = model_manifest.peer_only_names(entries)
+    assert peer_only == {"x.safetensors"}
+
+
+def test_entries_peer_only_directory_empty_when_inventory_name_has_no_category(data_dir):
+    """An inventory name with no `/` at all (no category folder) still
+    produces a valid entry -- `directory` degrades to `""`, matching
+    `_resolve_target_path`'s "models root" handling for an empty directory
+    on the agent side."""
+    _seeder_worker(data_dir, "seeder-1", model_name="rootfile.safetensors", size_bytes=_bytes(0.1))
+    entry = next(e for e in model_manifest.entries(data_dir) if e["name"] == "rootfile.safetensors")
+    assert entry["directory"] == ""
+
+
+# --- Task 6 cross-test: a real peer-only entry through the agent fetcher ---
+
+
+def test_peer_only_entry_passes_the_agent_fetchers_own_validation(data_dir):
+    """Integration check (Task 5's "known gap" note): a REAL peer-only entry
+    built by the server's `entries()` must satisfy the agent fetcher's own
+    entry-shape/signature checks unmodified -- `_validate_entry_shape` (the
+    sha256/size_bytes sanity gate) and `_verify_entry_signature` (byte-for-
+    byte payload match against the pinned platform key), exactly as a real
+    dispatch's `fetch_models` push would be checked agent-side. Also confirms
+    `fetcher._inventory_name` reconstructs the SAME inventory-relative path
+    `model_manifest._split_inventory_name` split it from -- the two must stay
+    exact inverses of each other for peer-grant requests to name the right
+    file.
+    """
+    _seeder_worker(
+        data_dir, "seeder-1", model_name="loras/wuxia/my_style.safetensors", size_bytes=_bytes(0.5)
+    )
+    entry = next(
+        e for e in model_manifest.entries(data_dir) if e["name"] == "wuxia/my_style.safetensors"
+    )
+    assert entry["peer"] is True and entry["url"] is None
+
+    _, verify_key = security.load_platform_keys(data_dir)
+    platform_pubkey_hex = bytes(verify_key).hex()
+
+    # Raises on failure -- the assertion IS that these don't raise.
+    agent_fetcher._validate_entry_shape(entry)
+    agent_fetcher._verify_entry_signature(entry, platform_pubkey_hex)
+
+    assert agent_fetcher._inventory_name(entry) == "loras/wuxia/my_style.safetensors"
 
 
 # --- routes: auth ----------------------------------------------------------

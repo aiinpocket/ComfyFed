@@ -48,10 +48,11 @@ from __future__ import annotations
 import json
 import logging
 from datetime import datetime, timezone
+from typing import Optional
 
 from fastapi import APIRouter, Depends
 
-from . import assess, auth, db, model_guide, security, workers
+from . import assess, auth, db, model_guide, peer, security, workers
 
 logger = logging.getLogger(__name__)
 
@@ -165,14 +166,98 @@ def _find_hash_row(rows: list, source_key: str):
     return None
 
 
+def _split_inventory_name(inventory_name: str) -> tuple[str, str]:
+    """Split an inventory-relative model path (`"directory/name"`, the shape
+    `hardware.scan_models` reports and `db.ModelHash.name` stores) into
+    `(directory, name)`, the same one-level convention Task 5's agent-side
+    `fetcher._inventory_name` reconstructs from and `peerserve._sanitize_peer_name`
+    caps names at. A path with no `/` at all (no category) yields
+    `("", inventory_name)`.
+    """
+    normalized = inventory_name.replace("\\", "/").lstrip("/")
+    directory, separator, remainder = normalized.partition("/")
+    if not separator:
+        return "", normalized
+    return directory, remainder
+
+
+def _peer_only_entry(session, signing_key, row: db.ModelHash) -> Optional[dict]:
+    """Build a peer-only manifest entry for `row` (a non-conflicted
+    `model_hashes` row with no known download source), or None when it has no
+    online seeder right now.
+
+    This is `entries()`'s embodiment of the task brief's `fetchable(name,
+    size)` predicate for the peer branch: "consensus hash exists AND
+    `peer.online_seeders(...)` is non-empty" -- `online_seeders` is the
+    single seeder predicate (see its docstring), imported and reused here
+    rather than re-derived, exactly as the plan's Global Constraints require.
+    `url`/`backup_url` are None and `peer: True` marks the entry so a
+    consumer (assess.verdict's protocol>=4 gate, the agent fetcher) knows
+    this model has no URL fallback at all.
+    """
+    if not peer.online_seeders(session, row.name, row.size_bytes):
+        return None
+
+    directory, name = _split_inventory_name(row.name)
+
+    # Same defensive `|` guard as the URL-sourced branch below -- an agent-
+    # reported inventory name is untrusted input relative to this process.
+    if "|" in name or "|" in directory:
+        logger.warning(
+            "model_manifest: skipping peer-only manifest candidate with a "
+            "'|' in name or directory (payload delimiter): name=%r directory=%r",
+            name,
+            directory,
+        )
+        return None
+
+    payload = f"{name}|{directory}|{row.sha256}|{row.size_bytes}"
+    sig = signing_key.sign(payload.encode()).signature.hex()
+
+    return {
+        "name": name,
+        "directory": directory,
+        "url": None,
+        "backup_url": None,
+        "sha256": row.sha256,
+        "size_bytes": row.size_bytes,
+        "sig": sig,
+        "peer": True,
+    }
+
+
+def peer_only_names(manifest_entries: list[dict]) -> frozenset[str]:
+    """The subset of `entries()`'s output whose ONLY source is a peer (`url`
+    is None) -- names a candidate fetching worker must be protocol>=4 to
+    pull, per the task brief's eligibility gate. A model that has both a URL
+    and an online seeder (`peer: True` alongside a real `url`) is NOT in this
+    set: protocol>=3 stays sufficient for it, exactly as today, since the
+    agent fetcher falls back to the URL chain when a peer pull fails.
+    """
+    return frozenset(e["name"] for e in manifest_entries if e.get("url") is None)
+
+
 def entries(data_dir: str) -> list[dict]:
     """Build the signed fetch-manifest entry list.
 
-    Only models with BOTH a known download source (curated or harvested,
-    with a non-empty `official_url`) AND an agreed, non-conflicting learned
-    sha256 (`model_hashes.conflict == False`) become entries. Each entry's
-    `sig` is a platform Ed25519 signature (hex) over
-    `f"{name}|{directory}|{sha256}|{size_bytes}"`.
+    Two kinds of entries:
+
+    1. URL-sourced: a known download source (curated or harvested, with a
+       non-empty `official_url`) AND an agreed, non-conflicting learned
+       sha256 (`model_hashes.conflict == False`). If that same (name,
+       size_bytes) also has an online peer seeder right now
+       (`peer.online_seeders`), the entry additionally carries `"peer":
+       True` -- informative only, since the agent fetcher always tries a
+       peer source first regardless of this flag (Task 5) -- so dispatch/
+       assess never need a second code path to learn "this model also has a
+       seeder".
+    2. Peer-only (Phase 3.1): a `model_hashes` row with an agreed hash but NO
+       known download source, that DOES have an online seeder right now --
+       see `_peer_only_entry`. `url`/`backup_url` are None and `peer: True`.
+
+    Every entry's `sig` is a platform Ed25519 signature (hex) over
+    `f"{name}|{directory}|{sha256}|{size_bytes}"` -- unchanged shape for both
+    kinds, the URL fields are simply not part of what's signed.
     """
     signing_key, _ = security.load_platform_keys(data_dir)
 
@@ -186,39 +271,40 @@ def entries(data_dir: str) -> list[dict]:
             session.query(db.ModelHash).filter(db.ModelHash.conflict == False).all()  # noqa: E712
         )
 
-    result: list[dict] = []
-    for name in sorted(names):
-        source = model_guide.lookup(name, data_dir)
-        if source is None or not source.official_url:
-            continue
+        result: list[dict] = []
+        used_rows: set[tuple[str, int]] = set()
+        for name in sorted(names):
+            source = model_guide.lookup(name, data_dir)
+            if source is None or not source.official_url:
+                continue
 
-        row = _find_hash_row(hash_rows, name)
-        if row is None:
-            continue
+            row = _find_hash_row(hash_rows, name)
+            if row is None:
+                continue
 
-        # Defensive: `|` is the field delimiter in the signed payload below.
-        # `source.name`/`source.directory` should never legitimately contain
-        # one (model filenames and category folders don't use it), but a
-        # harvested entry's `name`/`directory` come straight off a workflow
-        # JSON on disk -- untrusted input relative to this process. Letting
-        # one through would let a crafted `directory` value (e.g.
-        # containing an extra `|1234|sha|`) shift which substring the
-        # signature is later parsed as covering, forging a payload the
-        # platform never actually intended to sign for.
-        if "|" in source.name or "|" in source.directory:
-            logger.warning(
-                "model_manifest: skipping manifest candidate with a '|' in "
-                "name or directory (payload delimiter): name=%r directory=%r",
-                source.name,
-                source.directory,
-            )
-            continue
+            # Defensive: `|` is the field delimiter in the signed payload
+            # below. `source.name`/`source.directory` should never
+            # legitimately contain one (model filenames and category folders
+            # don't use it), but a harvested entry's `name`/`directory` come
+            # straight off a workflow JSON on disk -- untrusted input
+            # relative to this process. Letting one through would let a
+            # crafted `directory` value (e.g. containing an extra
+            # `|1234|sha|`) shift which substring the signature is later
+            # parsed as covering, forging a payload the platform never
+            # actually intended to sign for.
+            if "|" in source.name or "|" in source.directory:
+                logger.warning(
+                    "model_manifest: skipping manifest candidate with a '|' in "
+                    "name or directory (payload delimiter): name=%r directory=%r",
+                    source.name,
+                    source.directory,
+                )
+                continue
 
-        payload = f"{source.name}|{source.directory}|{row.sha256}|{row.size_bytes}"
-        sig = signing_key.sign(payload.encode()).signature.hex()
+            payload = f"{source.name}|{source.directory}|{row.sha256}|{row.size_bytes}"
+            sig = signing_key.sign(payload.encode()).signature.hex()
 
-        result.append(
-            {
+            entry = {
                 "name": source.name,
                 "directory": source.directory,
                 "url": source.official_url,
@@ -227,7 +313,21 @@ def entries(data_dir: str) -> list[dict]:
                 "size_bytes": row.size_bytes,
                 "sig": sig,
             }
-        )
+            if peer.online_seeders(session, row.name, row.size_bytes):
+                entry["peer"] = True
+            result.append(entry)
+            used_rows.add((row.name, row.size_bytes))
+
+        # Phase 3.1: every remaining non-conflicted hash row (no known
+        # download source at all) becomes a peer-only entry when it has an
+        # online seeder right now.
+        for row in hash_rows:
+            key = (row.name, row.size_bytes)
+            if key in used_rows:
+                continue
+            peer_entry = _peer_only_entry(session, signing_key, row)
+            if peer_entry is not None:
+                result.append(peer_entry)
 
     return result
 

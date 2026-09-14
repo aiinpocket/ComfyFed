@@ -71,9 +71,11 @@ def unfetchable_missing_models(needs: assess.JobNeeds, data_dir: str) -> set[str
     if not missing_models:
         return set()
 
-    fetchable_map = {e["name"]: e["size_bytes"] for e in model_manifest.entries(data_dir)}
+    manifest_entries = model_manifest.entries(data_dir)
+    fetchable_map = {e["name"]: e["size_bytes"] for e in manifest_entries}
+    peer_only_models = model_manifest.peer_only_names(manifest_entries)
     _fetchable, unfetchable = assess.partition_fleet_fetchable(
-        missing_models, fetchable_map, online_workers
+        missing_models, fetchable_map, online_workers, peer_only_models
     )
     return unfetchable
 
@@ -335,11 +337,15 @@ def create_router(data_dir: str) -> APIRouter:
         # assessment display's eligible_after_fetch column matches what would
         # actually happen at dispatch time -- built once, outside the session
         # above (model_manifest.entries opens its own).
-        fetchable_models = {e["name"]: e["size_bytes"] for e in model_manifest.entries(data_dir)}
+        manifest_entries = model_manifest.entries(data_dir)
+        fetchable_models = {e["name"]: e["size_bytes"] for e in manifest_entries}
+        peer_only_models = model_manifest.peer_only_names(manifest_entries)
 
         results = []
         for worker in all_workers:
-            v = assess.verdict(worker, needs, requirements_override, all_workers, fetchable_models)
+            v = assess.verdict(
+                worker, needs, requirements_override, all_workers, fetchable_models, peer_only_models
+            )
             results.append(
                 {
                     "worker_id": worker.id,

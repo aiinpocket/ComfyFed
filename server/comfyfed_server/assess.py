@@ -53,6 +53,16 @@ _FETCH_DISK_MARGIN = 1.2
 # predates lazy hashing / lazy inventory sha256 -- see agentws._handle_hello).
 _MIN_AUTO_FETCH_PROTOCOL = 3
 
+# hello.protocol below which an agent cannot pull from a peer seeder at all
+# (Phase 3.1 P2P -- mirrors peer._MIN_PEER_PROTOCOL, the same floor the
+# platform requires of a SEEDER; a puller needs the matching capability, not
+# just a newer hello field, to speak the peer-grant/chunk-pull protocol).
+# Only required when a missing model's ONLY manifest source is a peer (see
+# `_eligible_after_fetch`/`partition_fleet_fetchable`'s `peer_only_models`
+# parameter) -- a URL-fetchable model stays reachable by a protocol>=3
+# worker exactly as before this constant existed.
+_MIN_PEER_FETCH_PROTOCOL = 4
+
 _BYTES_PER_GB = 1024**3
 
 
@@ -326,6 +336,7 @@ def verdict(
     requirements_override: dict,
     all_workers: list,
     fetchable_models: dict[str, int] | None = None,
+    peer_only_models: frozenset[str] | None = None,
 ) -> Verdict:
     """Judge whether `worker` can run a job needing `needs`.
 
@@ -358,7 +369,9 @@ def verdict(
     `worker.dynamic["free_disk_gb"] > 1.2 * sum(missing sizes, in GB)`. That
     margin is a hard gate with no "unknown -> warn" fallback (unlike the VRAM
     offload gate below) -- an unattended multi-GB download is a bigger risk
-    to leave unproven than an offload is.
+    to leave unproven than an offload is. When any missing model is
+    peer-only (Phase 3.1 P2P, `peer_only_models` -- see `_eligible_after_fetch`),
+    `worker.protocol >= 4` is additionally required for that model.
     """
     reasons: list[str] = []
     warnings: list[str] = []
@@ -445,7 +458,7 @@ def verdict(
     if not missing_models:
         return Verdict(kind="eligible", reasons=[], missing_models=[], warnings=warnings)
 
-    if _eligible_after_fetch(worker, missing_models, fetchable_models, dynamic):
+    if _eligible_after_fetch(worker, missing_models, fetchable_models, dynamic, peer_only_models):
         return Verdict(
             kind="eligible_after_fetch",
             reasons=[f"missing_models:{','.join(missing_models)}"],
@@ -460,6 +473,19 @@ def verdict(
     )
 
 
+def _worker_protocol(worker) -> int:
+    """`worker.protocol`, normalized the same way every fetch-eligibility
+    gate here needs it: missing/non-int/bool degrades to 1 (the oldest,
+    least-capable value), never raises. Single helper so
+    `_worker_fetch_capacity_ok` and the peer-protocol check below can't drift
+    on this normalization.
+    """
+    protocol = getattr(worker, "protocol", None)
+    if not isinstance(protocol, int) or isinstance(protocol, bool):
+        return 1
+    return protocol
+
+
 def _worker_fetch_capacity_ok(worker, dynamic: dict, total_missing_gb: float) -> bool:
     """Protocol/auto_fetch/disk-margin gate, independent of WHICH models are
     missing -- shared by `_eligible_after_fetch` (per-candidate gate inside
@@ -467,10 +493,7 @@ def _worker_fetch_capacity_ok(worker, dynamic: dict, total_missing_gb: float) ->
     gate). `dynamic` is the caller's already-parsed `worker.dynamic` JSON
     (avoids re-parsing it once per candidate in `verdict`'s hot path).
     """
-    protocol = getattr(worker, "protocol", None)
-    if not isinstance(protocol, int) or isinstance(protocol, bool):
-        protocol = 1
-    if protocol < _MIN_AUTO_FETCH_PROTOCOL:
+    if _worker_protocol(worker) < _MIN_AUTO_FETCH_PROTOCOL:
         return False
 
     if not getattr(worker, "auto_fetch", False):
@@ -487,12 +510,31 @@ def _worker_fetch_capacity_ok(worker, dynamic: dict, total_missing_gb: float) ->
 
 
 def _eligible_after_fetch(
-    worker, missing_models: list[str], fetchable_models: dict[str, int] | None, dynamic: dict
+    worker,
+    missing_models: list[str],
+    fetchable_models: dict[str, int] | None,
+    dynamic: dict,
+    peer_only_models: frozenset[str] | None = None,
 ) -> bool:
-    """All the eligible_after_fetch gates -- see `verdict`'s docstring."""
+    """All the eligible_after_fetch gates -- see `verdict`'s docstring.
+
+    `peer_only_models` (Phase 3.1 P2P; a subset of `fetchable_models`'
+    keys, `model_manifest.peer_only_names`'s shape) names missing models
+    whose ONLY manifest source is a peer seeder, no URL at all. When any
+    missing model this worker needs falls in that set, the worker must ALSO
+    be protocol>=4 (peer-pull capable) -- a protocol-3 worker can auto-fetch
+    a URL-sourced model just fine, but has no way to speak the peer-grant/
+    chunk-pull protocol for a peer-only one. None (every pre-3.1 caller)
+    means "nothing is peer-only", identical to the pre-Task-6 behavior.
+    """
     fetchable_models = fetchable_models or {}
     if not all(name in fetchable_models for name in missing_models):
         return False
+
+    peer_only_models = peer_only_models or frozenset()
+    if any(name in peer_only_models for name in missing_models):
+        if _worker_protocol(worker) < _MIN_PEER_FETCH_PROTOCOL:
+            return False
 
     total_missing_gb = sum(fetchable_models[name] for name in missing_models) / _BYTES_PER_GB
     return _worker_fetch_capacity_ok(worker, dynamic, total_missing_gb)
@@ -502,6 +544,7 @@ def partition_fleet_fetchable(
     missing_models: set[str],
     fetchable_models: dict[str, int] | None,
     online_enabled_workers: list,
+    peer_only_models: frozenset[str] | None = None,
 ) -> tuple[set[str], set[str]]:
     """Split a fleet-wide "missing from every worker" model set into
     `(fetchable, unfetchable)` for the submission-relaxation matrix
@@ -526,6 +569,13 @@ def partition_fleet_fetchable(
 
     Models with no manifest entry are always unfetchable and never affect
     the combined-gate outcome for the ones that DO have an entry.
+
+    `peer_only_models` (Phase 3.1 P2P, `model_manifest.peer_only_names`'s
+    shape): when the manifest-covered subset includes any name with no URL
+    source at all, a candidate worker must ALSO be protocol>=4 (peer-pull
+    capable) -- same rule `_eligible_after_fetch` applies per-candidate, just
+    evaluated once against the combined subset here. None means "nothing is
+    peer-only", the pre-Task-6 behavior.
     """
     fetchable_models = fetchable_models or {}
     manifest_covered = {name for name in missing_models if name in fetchable_models}
@@ -534,9 +584,13 @@ def partition_fleet_fetchable(
     if not manifest_covered:
         return set(), set(missing_models)
 
+    peer_only_models = peer_only_models or frozenset()
+    requires_peer_protocol = bool(manifest_covered & peer_only_models)
+
     total_missing_gb = sum(fetchable_models[name] for name in manifest_covered) / _BYTES_PER_GB
     can_fetch = any(
         _worker_fetch_capacity_ok(worker, _worker_dynamic(worker), total_missing_gb)
+        and (not requires_peer_protocol or _worker_protocol(worker) >= _MIN_PEER_FETCH_PROTOCOL)
         for worker in online_enabled_workers
     )
     if can_fetch:

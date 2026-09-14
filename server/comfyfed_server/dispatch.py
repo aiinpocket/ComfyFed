@@ -44,7 +44,9 @@ def _free_vram_gb(worker: db.Worker) -> float:
 
 
 def assign_jobs(
-    idle_worker_ids: list[str], fetchable_models: Optional[dict[str, int]] = None
+    idle_worker_ids: list[str],
+    fetchable_models: Optional[dict[str, int]] = None,
+    peer_only_models: Optional[frozenset[str]] = None,
 ) -> list[tuple[str, db.Job]]:
     """Rank idle workers per queued job and atomically claim the best pair.
 
@@ -72,7 +74,9 @@ def assign_jobs(
     -> size_bytes from the signed manifest, `model_manifest.entries()`'s
     shape) -- None (the default) means "nothing fetchable", the exact
     pre-Task-4 behavior, so any other caller (tests) that doesn't pass it
-    gets tier 1 only, unchanged.
+    gets tier 1 only, unchanged. `peer_only_models` (Phase 3.1 P2P,
+    `model_manifest.peer_only_names`'s shape) is likewise passed straight
+    through -- see `assess.verdict`'s protocol>=4-for-peer-only gate.
 
     The winning candidate's `fetch_models` push payload (the manifest entries
     for its missing models) is deliberately NOT part of this function's
@@ -132,7 +136,9 @@ def assign_jobs(
             fetch_candidates = []
             for candidate_id in available_worker_ids:
                 worker = workers[candidate_id]
-                v = assess.verdict(worker, needs, requirements_override, all_workers, fetchable_models)
+                v = assess.verdict(
+                    worker, needs, requirements_override, all_workers, fetchable_models, peer_only_models
+                )
                 if v.kind not in ("eligible", "eligible_after_fetch"):
                     continue
                 if is_light:

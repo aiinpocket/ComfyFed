@@ -270,6 +270,135 @@ def test_job_push_includes_fetch_models_for_an_eligible_after_fetch_worker(clien
         assert session.get(db.Job, job_id).status == "assigned"
 
 
+def test_job_push_includes_peer_only_entry_for_a_protocol_4_worker(client):
+    """Phase 3.1 P2P: a model with NO download source but an online seeder
+    becomes a peer-only `fetch_models` entry (`url`/`backup_url` None,
+    `peer: True`) in the push to a protocol>=4 puller -- the dispatch-time
+    re-verdict (`agentws._fetch_models_for_push`) embeds exactly what
+    `model_manifest.entries()` built, peer-only shape included."""
+    csrf = _login(client)
+    seeder_id, _seeder_sk = _register_worker(client, csrf, "seeder")
+    with db.get_session() as session:
+        seeder = session.get(db.Worker, seeder_id)
+        seeder.status = "online"
+        seeder.protocol = 4
+        seeder.peer_url = "http://10.0.0.9:8850"
+        seeder.model_inventory = json.dumps(
+            [{
+                "name": "loras/wuxia/my_style.safetensors",
+                "size_bytes": _bytes(0.5),
+                "sha256": _sha("style"),
+            }]
+        )
+        session.commit()
+    model_manifest.record_hash(
+        seeder_id, "loras/wuxia/my_style.safetensors", _bytes(0.5), _sha("style")
+    )
+
+    puller_id, sk = _register_worker(client, csrf, "puller")
+
+    workflow = {"1": {"class_type": "LoraLoader", "inputs": {"lora_name": "wuxia/my_style.safetensors"}}}
+    job_id = _submit(client, csrf, workflow=workflow)
+
+    with client.websocket_connect("/api/agent/ws") as ws:
+        challenge = ws.receive_json()
+        sig = sk.sign(challenge["nonce"].encode()).signature.hex()
+        ws.send_json({"type": "auth", "worker_id": puller_id, "sig": sig})
+        assert ws.receive_json()["type"] == "ready"
+
+        ws.send_json(
+            {
+                "type": "hello",
+                "hardware": {},
+                "backend": "cuda",
+                "torch_version": "",
+                "node_classes": [],
+                "protocol": 4,
+                "auto_fetch": True,
+            }
+        )
+        ws.send_json(
+            {
+                "type": "heartbeat",
+                "state": "idle",
+                "progress": 0.0,
+                "job_id": None,
+                "dynamic": {"free_disk_gb": 100.0},
+            }
+        )
+        agentws.dispatch_once(puller_id)
+
+        job_msg = ws.receive_json()
+        assert job_msg["job_id"] == job_id
+        assert "fetch_models" in job_msg
+        entries = job_msg["fetch_models"]
+        assert len(entries) == 1
+        entry = entries[0]
+        assert entry["name"] == "wuxia/my_style.safetensors"
+        assert entry["directory"] == "loras"
+        assert entry["url"] is None
+        assert entry["backup_url"] is None
+        assert entry["peer"] is True
+
+    with db.get_session() as session:
+        assert session.get(db.Job, job_id).status == "assigned"
+
+
+def test_job_push_omits_peer_only_model_job_from_a_protocol_3_worker(client):
+    """A protocol-3 worker is not peer-pull capable -- a job needing a
+    peer-only model must never be pushed to it (it stays queued, not
+    assigned, since no other worker is idle/eligible either)."""
+    csrf = _login(client)
+    seeder_id, _seeder_sk = _register_worker(client, csrf, "seeder")
+    with db.get_session() as session:
+        seeder = session.get(db.Worker, seeder_id)
+        seeder.status = "online"
+        seeder.protocol = 4
+        seeder.peer_url = "http://10.0.0.9:8850"
+        seeder.model_inventory = json.dumps(
+            [{"name": "loras/x.safetensors", "size_bytes": _bytes(0.2), "sha256": _sha("x")}]
+        )
+        session.commit()
+    model_manifest.record_hash(seeder_id, "loras/x.safetensors", _bytes(0.2), _sha("x"))
+
+    puller_id, sk = _register_worker(client, csrf, "puller-old")
+
+    workflow = {"1": {"class_type": "LoraLoader", "inputs": {"lora_name": "x.safetensors"}}}
+    job_id = _submit(client, csrf, workflow=workflow)
+
+    with client.websocket_connect("/api/agent/ws") as ws:
+        challenge = ws.receive_json()
+        sig = sk.sign(challenge["nonce"].encode()).signature.hex()
+        ws.send_json({"type": "auth", "worker_id": puller_id, "sig": sig})
+        assert ws.receive_json()["type"] == "ready"
+
+        ws.send_json(
+            {
+                "type": "hello",
+                "hardware": {},
+                "backend": "cuda",
+                "torch_version": "",
+                "node_classes": [],
+                "protocol": 3,
+                "auto_fetch": True,
+            }
+        )
+        ws.send_json(
+            {
+                "type": "heartbeat",
+                "state": "idle",
+                "progress": 0.0,
+                "job_id": None,
+                "dynamic": {"free_disk_gb": 100.0},
+            }
+        )
+        agentws.dispatch_once(puller_id)
+        ws.send_json({"type": "heartbeat", "state": "idle", "progress": 0.0, "job_id": None, "dynamic": {}})
+
+    with db.get_session() as session:
+        assert session.get(db.Job, job_id).status == "queued"
+
+
 def test_job_push_never_sent_to_a_protocol_2_worker_even_when_manifest_covers_it(client):
     """Defensive gate: a protocol<3 agent can never be dispatched an
     eligible_after_fetch job at all (assess._eligible_after_fetch already
