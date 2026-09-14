@@ -786,6 +786,30 @@ def _chunk_sha256s(content: bytes, chunk_size: int) -> list[str]:
     ]
 
 
+def test_verify_local_chunks_no_list_resumes_blindly_from_file_size(tmp_path):
+    part_path = str(tmp_path / "model.bin.part")
+    with open(part_path, "wb") as f:
+        f.write(b"x" * 1500)
+
+    assert fetcher._verify_local_chunks(part_path, None, 3000) == 1500
+    # Untouched -- no truncation happened for the no-chunk-list path.
+    assert os.path.getsize(part_path) == 1500
+
+
+def test_verify_local_chunks_no_list_discards_an_oversized_part(tmp_path):
+    part_path = str(tmp_path / "model.bin.part")
+    with open(part_path, "wb") as f:
+        f.write(b"x" * 4000)  # larger than size_bytes -- can't be a valid prefix
+
+    assert fetcher._verify_local_chunks(part_path, None, 3000) == 0
+    assert not os.path.exists(part_path)
+
+
+def test_verify_local_chunks_no_list_missing_file_returns_zero(tmp_path):
+    part_path = str(tmp_path / "does-not-exist.part")
+    assert fetcher._verify_local_chunks(part_path, None, 3000) == 0
+
+
 async def test_peer_happy_path_multi_chunk_pull(tmp_path, monkeypatch):
     """Peer source satisfies the entry entirely: multiple chunks (small
     monkeypatched chunk size), verified individually, land + whole-file
@@ -1037,6 +1061,83 @@ async def test_peer_resume_after_disconnect_regrants_and_skips_verified_chunks(t
     assert ("g-2", "bytes=1000-1999") in requests
 
 
+async def test_peer_resume_without_chunk_list_keeps_progress_across_a_regrant(tmp_path, monkeypatch):
+    """M8 final-review fix: when no `chunk_sha256s` is available (a hash
+    established by a protocol-3 agent or pre-3.1 sidecar), a re-grant mid-
+    transfer must NOT discard everything already pulled -- it resumes
+    blindly from the current `.part` size instead, so a transfer that
+    outlives one 600s TTL still converges. The mandatory whole-file SHA-256
+    is what actually verifies correctness at the end."""
+    monkeypatch.setattr(fetcher, "_PEER_CHUNK_SIZE", 1000)
+
+    content = os.urandom(3000)
+    inventory_name = "checkpoints/model.bin"
+
+    requests: list[tuple[str, str]] = []
+    # The chunk starting at byte 1000, but ONLY under the first grant, fails
+    # with 403 -- simulating a TTL expiry mid-pull; a fresh grant (g-2, also
+    # with NO chunk list) succeeds for the rest of the file.
+    failing = {("g-1", 1000)}
+
+    class _FakePeerServer:
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *a):
+            return False
+
+        async def get(self, url, headers=None):
+            grant_obj = json.loads(base64.b64decode(headers[fetcher._PEER_GRANT_HEADER]))
+            grant_id = grant_obj["grant_id"]
+            m = re.match(r"bytes=(\d+)-(\d+)", headers["Range"])
+            start, end = int(m.group(1)), int(m.group(2))
+            requests.append((grant_id, headers["Range"]))
+            if (grant_id, start) in failing:
+                return httpx.Response(403, content=b"")
+            return httpx.Response(206, content=content[start : end + 1])
+
+    def _peer_client_factory(**kwargs):
+        return _FakePeerServer()
+
+    seeder_signing_key, seeder_entry = _platform(worker_id="seeder-1")
+    issuer = _grant_issuer(
+        name=inventory_name, size_bytes=len(content), seeder_id=seeder_entry.worker_id,
+        signing_key=seeder_signing_key, peer_url="http://fake-peer.example",
+        chunk_sha256s=None,
+    )
+
+    manifest_key, manifest_pubkey_hex = _keypair()
+    entry = _signed_entry(
+        manifest_key, name="model.bin", directory="checkpoints", content=content,
+        url="http://models.example/should-not-be-fetched",
+    )
+
+    dest = tmp_path / "dest"
+    await fetcher.fetch_and_verify_models(
+        entries=[entry],
+        platform_pubkey_hex=manifest_pubkey_hex,
+        models_dir=str(dest),
+        max_fetch_gb=100,
+        cancel_event=asyncio.Event(),
+        report_progress=_noop_progress,
+        client_factory=_ExplodingURLClient,
+        platform_entry=_puller_platform_entry(),
+        peer_client_factory=_peer_client_factory,
+        platform_client_factory=_platform_client_factory(issuer),
+    )
+
+    final_path = dest / "checkpoints" / "model.bin"
+    assert final_path.read_bytes() == content
+    assert issuer.calls() == 2  # one re-grant after the simulated expiry
+
+    # The already-pulled prefix (bytes 0-999, landed under g-1) must never be
+    # re-requested once g-2 takes over -- proving the resume actually kept
+    # the existing bytes instead of discarding the whole `.part`.
+    chunk0_requests = [r for r in requests if r[1] == "bytes=0-999"]
+    assert chunk0_requests == [("g-1", "bytes=0-999")]
+    assert ("g-2", "bytes=1000-1999") in requests
+
+
 async def test_peer_always_403_falls_back_after_no_progress_cap(tmp_path):
     """A seeder that always 403s (grant expiry that never resolves, even
     across re-grants) must not loop forever: after
@@ -1067,7 +1168,8 @@ async def test_peer_always_403_falls_back_after_no_progress_cap(tmp_path):
     issuer = _grant_issuer(
         name=inventory_name, size_bytes=len(content), seeder_id=seeder_entry.worker_id,
         signing_key=seeder_signing_key, peer_url="http://fake-peer.example",
-        chunk_sha256s=None,  # no per-chunk list -- offset is always 0, so every re-grant is "no progress"
+        chunk_sha256s=None,  # no per-chunk list -- every attempt 403s before any byte lands,
+                             # so `.part` never grows and offset stays 0 (still "no progress")
     )
 
     manifest_key, manifest_pubkey_hex = _keypair()

@@ -492,15 +492,30 @@ def _verify_local_chunks(part_path: str, chunk_sha256s: Optional[list], size_byt
     trailing partial/invalid chunk). Returns the resulting byte offset to
     resume pulling from.
 
-    No `chunk_sha256s` on the grant -> there is no way to verify anything
-    already on disk, so the whole `.part` is discarded (offset 0) rather
-    than trusted blind, per the brief's resume contract.
+    No `chunk_sha256s` on the grant (M8 final-review fix): there is no way
+    to verify anything already on disk chunk-by-chunk, but discarding the
+    whole `.part` anyway means a large peer-only transfer on a link slower
+    than TTL/size never converges -- every re-grant (every 600s) throws away
+    everything pulled so far, forever. Instead, trust the existing bytes
+    BLINDLY and resume appending from the current file size: the mandatory
+    whole-file SHA-256 in `_finalize_download` is still the actual trust
+    root regardless of chunk verification, exactly as it already is for the
+    URL path (which never verifies mid-download either). Only a `.part`
+    somehow LARGER than the expected `size_bytes` is discarded outright --
+    that can't be a valid prefix of the target file no matter what's in it.
     """
     if not os.path.exists(part_path):
         return 0
     if not chunk_sha256s:
-        _safe_unlink(part_path)
-        return 0
+        try:
+            existing_size = os.path.getsize(part_path)
+        except OSError:
+            _safe_unlink(part_path)
+            return 0
+        if existing_size > size_bytes:
+            _safe_unlink(part_path)
+            return 0
+        return existing_size
 
     verified_bytes = 0
     try:
