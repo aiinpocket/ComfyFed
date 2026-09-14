@@ -20,7 +20,7 @@ import httpx
 import websockets
 from nacl.signing import SigningKey
 
-from . import comfy, fetcher, hardware, peerserve, signing, whitelist
+from . import comfy, control, fetcher, hardware, peerserve, signing, whitelist
 from .config import AgentConfig, PlatformEntry
 
 logger = logging.getLogger(__name__)
@@ -533,6 +533,10 @@ class AgentLoop:
     def __init__(self, config: AgentConfig, cfg_path: str, connection_factory=PlatformConnection):
         self.config = config
         self.cfg_path = cfg_path
+        # Where the cross-process control files live (pause flag, stop
+        # request, published state) -- always beside agent.json, so a CLI
+        # invoked with the same `--config` finds exactly this directory.
+        self._config_dir = os.path.dirname(os.path.abspath(cfg_path))
         self.connections: dict[str, PlatformConnection] = {
             entry.worker_id: connection_factory(entry, config) for entry in config.platforms
         }
@@ -586,6 +590,54 @@ class AgentLoop:
                 )
             except Exception:
                 logger.exception("runner: failed to broadcast heartbeat to %s", worker_id)
+
+    def _effective_state(self, state: str) -> str:
+        """Rewrite an availability-bearing heartbeat state for this tick.
+
+        `"busy"` (and any other non-availability state) is returned
+        untouched: a running job keeps its busy beats and its job_id, because
+        pausing never aborts work in flight -- it only stops NEW intake.
+        Otherwise the tick reports `"idle"` or `"paused"` according to
+        `control.availability`. `"paused"` is accepted as an input too: it is
+        what the previous tick left on `conn.state`, and treating it as
+        "would be idle" is what lets a resume flip back to `"idle"`.
+        """
+        if state not in ("idle", "paused"):
+            return state
+        return "idle" if control.availability(self.config, self._config_dir) == "available" else "paused"
+
+    def _poll_stop_request(self) -> None:
+        """Honour a `comfyfed stop` dropped by another process.
+
+        The stop file is consumed (cleared) before the wind-down starts, so a
+        crash mid-shutdown cannot leave a request that instantly kills the
+        next run. Everything after that mirrors `_on_os_signal`: set
+        `_shutdown_in_progress` and schedule exactly the same
+        `_graceful_shutdown_and_stop` task on the running loop. A request
+        arriving while a wind-down is already under way is a no-op -- unlike
+        a second Ctrl-C there is no impatient operator at a console to
+        escalate to `os._exit` for.
+        """
+        if not control.is_stop_requested(self._config_dir):
+            return
+
+        control.clear_stop(self._config_dir)
+        if self._shutdown_in_progress:
+            logger.info(
+                "已在停止流程中，忽略重複的停止要求 / already shutting down, "
+                "ignoring a repeated stop request"
+            )
+            return
+
+        self._shutdown_in_progress = True
+        logger.info(
+            "收到停止要求，進行中的工作會先跑完 / stop requested, "
+            "the running job finishes first"
+        )
+        loop = asyncio.get_running_loop()
+        loop.create_task(
+            self._graceful_shutdown_and_stop(loop), name="comfyfed-stop-request-shutdown"
+        )
 
     async def refresh_object_info(self, conn: PlatformConnection, force: bool = False) -> None:
         """Fetch ComfyUI's full `/object_info` and upload it if it changed.
@@ -1572,12 +1624,16 @@ class AgentLoop:
             if now - last_heartbeat >= _HEARTBEAT_INTERVAL_SECONDS:
                 dynamic = hardware.collect_dynamic(self.config.models_dir)
                 fetch_status = self._fetch_status_for(conn) or {}
+                job_id = self._job_id_for(conn)
+                effective_state = self._effective_state(conn.state)
+                control.write_state(self._config_dir, effective_state, job_id)
+                self._poll_stop_request()
                 await conn.send_heartbeat(
-                    conn.state,
+                    effective_state,
                     # Carrying the job id is what lets the server notice a
                     # worker still grinding on a job it no longer owns; see
                     # `_job_id_for` for why it is scoped to this connection.
-                    job_id=self._job_id_for(conn),
+                    job_id=job_id,
                     dynamic=dynamic,
                     object_info_hash=conn.object_info_hash or None,
                     # While the auto-fetch pre-phase is active, the periodic
@@ -1658,6 +1714,10 @@ class AgentLoop:
             return
         loop = asyncio.get_running_loop()
         self._install_signal_handlers(loop)
+        # A stop.request left behind by a crash (or by the previous run being
+        # killed before it could consume the file) must not kill this fresh
+        # run on its very first heartbeat.
+        control.clear_stop(self._config_dir)
         self._start_peer_server()
         try:
             await asyncio.gather(*(self._run_platform(conn) for conn in self.connections.values()))
@@ -1671,3 +1731,7 @@ class AgentLoop:
             # connection failing outright) that no signal ever touched.
             if not self._shutdown_in_progress:
                 await self.shutdown()
+            # The published state describes a LIVE agent; leaving it behind
+            # would have `comfyfed status` report this process as running
+            # until the 120s staleness window expires.
+            control.clear_state(self._config_dir)
