@@ -191,6 +191,47 @@ describe("hello", () => {
     ws.close();
   });
 
+  // Phase 3.2 F1 fix -- ports agentws.py's _parse_max_fetch_gb test coverage.
+  it("stores a reported max_fetch_gb inside the hardware JSON blob", async () => {
+    const kp = KEYPAIRS[0]!;
+    const workerId = await makeWorker({ pubkeyHex: kp.pubkey_hex });
+    const ws = await connectAgent(workerId, kp.seed_hex);
+    const none = expectNoMessage(ws, 300);
+    ws.send(
+      JSON.stringify({
+        type: "hello",
+        protocol: 4,
+        auto_fetch: true,
+        hardware: { vram_gb: 24 },
+        max_fetch_gb: 5,
+      })
+    );
+    await none;
+
+    const row = await db().prepare("SELECT hardware FROM workers WHERE id = ?").bind(workerId).first<{ hardware: string }>();
+    const hardware = JSON.parse(row!.hardware);
+    expect(hardware.max_fetch_gb).toBe(5);
+    expect(hardware.vram_gb).toBe(24);
+    ws.close();
+  });
+
+  it("omits max_fetch_gb from the hardware blob when hello doesn't report a valid value", async () => {
+    for (const bad of [undefined, -5, "30", 0]) {
+      const kp = KEYPAIRS[0]!;
+      const workerId = await makeWorker({ pubkeyHex: kp.pubkey_hex });
+      const ws = await connectAgent(workerId, kp.seed_hex);
+      const none = expectNoMessage(ws, 200);
+      const msg: Record<string, unknown> = { type: "hello", protocol: 4, auto_fetch: true, hardware: {} };
+      if (bad !== undefined) msg.max_fetch_gb = bad;
+      ws.send(JSON.stringify(msg));
+      await none;
+
+      const row = await db().prepare("SELECT hardware FROM workers WHERE id = ?").bind(workerId).first<{ hardware: string }>();
+      expect(JSON.parse(row!.hardware)).not.toHaveProperty("max_fetch_gb");
+      ws.close();
+    }
+  });
+
   // Phase 3.1 P2P seeder advertisement -- ports agentws.py's _parse_peer_url
   // test coverage.
   it("stores a valid http(s) peer_url", async () => {

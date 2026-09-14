@@ -161,6 +161,34 @@ describe("verdict eligible_after_fetch", () => {
     expect(verdict(roomyWorker, bothMissing, {}, [roomyWorker], fetchable).kind).toBe("eligible_after_fetch");
   });
 
+  it("is ineligible when total missing exceeds the worker's hardware.max_fetch_gb budget", () => {
+    // Phase 3.2 F1 fix: a worker whose hello reported max_fetch_gb=5 must not
+    // be counted eligible_after_fetch for a 31 GiB curated set even though
+    // disk margin easily clears -- it would refuse the download itself
+    // (the agent's own max_fetch_gb check) once dispatched.
+    const worker = fetchReadyWorker("w1", {
+      hardware: { max_fetch_gb: 5 },
+      dynamic: { free_disk_gb: 1000.0 },
+    });
+    const v = verdict(worker, needs(["big.safetensors"]), {}, [worker], { "big.safetensors": 31 * GB });
+    expect(v.kind).toBe("ineligible");
+  });
+
+  it("is eligible_after_fetch when the worker's max_fetch_gb budget covers it", () => {
+    const worker = fetchReadyWorker("w1", {
+      hardware: { max_fetch_gb: 100 },
+      dynamic: { free_disk_gb: 1000.0 },
+    });
+    const v = verdict(worker, needs(["big.safetensors"]), {}, [worker], { "big.safetensors": 31 * GB });
+    expect(v.kind).toBe("eligible_after_fetch");
+  });
+
+  it("defaults a missing hardware.max_fetch_gb to 30, same as the agent's own default", () => {
+    const worker = fetchReadyWorker("w1", { hardware: {}, dynamic: { free_disk_gb: 1000.0 } });
+    const v = verdict(worker, needs(["big.safetensors"]), {}, [worker], { "big.safetensors": 31 * GB });
+    expect(v.kind).toBe("ineligible");
+  });
+
   it("a warning (e.g. vram_offload) survives an eligible_after_fetch verdict", () => {
     const worker = fetchReadyWorker("w1", {
       hardware: { vram_gb: 8, ram_gb: 32 },
@@ -243,6 +271,27 @@ describe("partitionFleetFetchable", () => {
     );
     expect(fetchable.size).toBe(0);
     expect(unfetchable).toEqual(new Set(["a.safetensors"]));
+  });
+
+  it("excludes a 31GB set for a low-budget worker; a high-budget worker restores queueing", () => {
+    // Phase 3.2 F1 fix: the exact headline scenario -- a max_fetch_gb=5
+    // worker is not fetch-capable for a 31 GB curated set (submission-time
+    // 400 still lists it as unfetchable, actionable), but a
+    // max_fetch_gb=100 worker restores queueing.
+    const lowBudget = fetchReadyWorker("w1", { hardware: { max_fetch_gb: 5 }, dynamic: { free_disk_gb: 1000.0 } });
+    const fetchableModels = { "a.safetensors": 31 * GB };
+    const [fetchable1, unfetchable1] = partitionFleetFetchable(new Set(["a.safetensors"]), fetchableModels, [
+      lowBudget,
+    ]);
+    expect(fetchable1.size).toBe(0);
+    expect(unfetchable1).toEqual(new Set(["a.safetensors"]));
+
+    const highBudget = fetchReadyWorker("w2", { hardware: { max_fetch_gb: 100 }, dynamic: { free_disk_gb: 1000.0 } });
+    const [fetchable2, unfetchable2] = partitionFleetFetchable(new Set(["a.safetensors"]), fetchableModels, [
+      highBudget,
+    ]);
+    expect(fetchable2).toEqual(new Set(["a.safetensors"]));
+    expect(unfetchable2.size).toBe(0);
   });
 });
 
