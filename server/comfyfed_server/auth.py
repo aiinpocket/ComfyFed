@@ -384,14 +384,17 @@ def change_password(
         db_user.password_hash = security.hash_password(body.new)
         db_user.session_epoch += 1
         db_session.commit()
-
-        # Final review finding #6: close any open panel WebSocket for this
-        # uid now that its epoch has moved -- the caller's OWN session stays
-        # alive via the fresh cookie issued below, but any other tab's panel
-        # socket (already-open, pre-bump) must not keep streaming.
-        panelws.close_for_uid(db_user.id)
-
+        uid = db_user.id
         csrf = issue_session_cookie(response, db_user)
+
+    # Final review finding #6: close any open panel WebSocket for this uid
+    # now that its epoch has moved -- the caller's OWN session stays alive
+    # via the fresh cookie issued above, but any other tab's panel socket
+    # (already-open, pre-bump) must not keep streaming. Called OUTSIDE the
+    # session block (like users.py's call sites): close_for_uid can block up
+    # to 5s per socket, and holding the SQLite connection through that wait
+    # would stall unrelated requests.
+    panelws.close_for_uid(uid)
 
     return {"ok": True, "csrf": csrf}
 
