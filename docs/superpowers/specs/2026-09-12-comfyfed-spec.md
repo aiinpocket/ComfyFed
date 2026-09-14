@@ -138,3 +138,54 @@ Decisions of record:
 - 圖生提示詞走內建模板＋` /no_think` 尾綴；文字生提示詞必須關閉內建模板、手動 `<|im_start|>` chat 包裹（否則編碼模板立即 EOS、輸出空字串）。chat 標記藏在「別動」節點，新手只碰想法欄。
 - 文字結果雙路呈現：panel 內 `PreviewAny`/`SaveText` 節點即席顯示（server 端 `job_outputs` 把 .txt artifacts 讀出為 `text` payload 映射到對應節點 id），同時以 .txt artifact 回傳 console。
 - 新模型入 curated registry（#10）＋GCS 鏡像。
+
+---
+
+## Phase 3.0 addendum: 多使用者帳號系統（multi-user, multi-admin, per-user billing）(2026-09-14)
+
+User directives: 推進 Phase 3；admin 登入後要可以幫 user 建立帳號；每個 user 只能看到自己的 job 跟產物；只有 admin 可以看到全部人的狀況；每個 user 個別使用了多少帳單資源要可以被計算。（Phase 3 既列項中的「多管理員」「分潤試算」併入本 phase；P2P 分塊傳輸另立 Phase 3.1。）
+
+Decisions of record:
+
+### 資料模型（server Alembic 新遷移＋cloud D1 0006，兩端對等）
+- 新表 `users`：`id`（uuid4 hex PK）、`username`（唯一；儲存前 lowercase 正規化，3–32 字元 `[a-z0-9_.-]`）、`password_hash`、`role`（`'admin'|'user'`）、`disabled`（bool，預設 false）、`session_epoch`（int，預設 0）、`created_at`。
+- 資料遷移：既有 `settings.admin_password_hash` → 建立 `username='admin'`、`role='admin'` 的 user 列（沿用原 hash，**既有 admin 密碼不變**），遷移後刪除該 setting key。全新安裝由 bootstrap／cloud `/api/setup` 直接建 admin user 列。
+- `jobs.user_id`（nullable TEXT）：新 job 一律蓋章提交者；既有 job 遷移時全數指到遷移出的 admin user。
+- `login_attempts` 加 `username` 欄；登入退避改**per-username**計算（同公式、同視窗）。
+
+### Session 與登入
+- Cookie payload 由 `{authenticated, csrf}` 改為 `{uid, role, epoch, csrf}`。舊 payload 缺 `uid` → 一律視為未登入（升級後全員重新登入一次，不做相容映射）。
+- `epoch` 必須等於該 user 當前 `session_epoch` 才有效：改密碼／被停用／重設密碼時 epoch +1 → 該 user 所有既有 session 立即失效（自己改密碼時當場重發新 cookie，本人不掉線）。**全域 session secret 不再因改密碼而輪替**（那會登出所有人）。
+- `POST /api/auth/login` 收 `{username, password}`；查無此人時仍對 dummy hash 做一次驗證（防 timing 枚舉），錯誤訊息不分「無此帳號／密碼錯」。`disabled` 使用者登入直接拒絕（同一種錯誤訊息）。
+- `GET /api/auth/me` 回 `{authenticated, username, role, lang, platform_url}`。
+- `POST /api/auth/change-password`：任何角色皆可自改（CSRF 保護），驗舊密碼。
+
+### 授權模型
+- 依賴鏈：`require_user`（任何已登入、未停用者，回傳 `{uid, role}`）→ `require_admin`（role=='admin'）。
+- Admin-only：使用者管理、workers、settings、註冊識別碼、`/api/reports/contributions`、`/api/reports/usage`、`/api/reports/payout`、`/metrics`、model manifest 管理面。
+- Owner-or-admin：`GET /api/jobs/{id}`、assessment、artifacts 下載、cancel。`GET /api/jobs` 列表：admin 看全部（附 `username`），一般 user 只回自己的。`POST /api/jobs` 蓋章 `user_id`。
+- **面板（/comfy）改為個人工作區（ruling）**：任何已登入 user 皆可用；`/comfy/api/queue`、`/history`、`/interrupt`、`/queue delete/clear`、`POST /history`（隱藏）、`/view`、job_outputs 一律範圍限定在「origin=='panel' 且 user_id==本人」——**admin 在面板內也只看自己的面板工作**（全視野走 console）。Console API 維持角色範圍。
+- 面板 WS 進度轉發同樣只推本人 job 的事件。
+
+### 使用者管理 API（admin-only，CSRF 保護）
+- `GET /api/users`：列表（id、username、role、disabled、created_at、job 數）。
+- `POST /api/users`：`{username, role, password?}`——未給密碼則產生隨機密碼（`secrets.token_urlsafe(12)`），**僅此一次**回傳明文。
+- `POST /api/users/{id}/reset-password`：產新隨機密碼（一次性回傳）＋epoch+1。
+- `PATCH /api/users/{id}`：`{role?, disabled?}`；**最後一名有效 admin 不可停用亦不可降級**（400）。停用即 epoch+1。
+- 不提供 DELETE（jobs/receipts 引用歷史）；停用即除役。
+
+### 帳單／報表
+- `GET /api/reports/usage`（admin，from/to 同 contributions）：receipts JOIN jobs.user_id，按 user 聚合 `{user_id, username, jobs, gpu_seconds, unbilled_gpu_seconds}`；user_id 為 NULL 的歷史列歸入 `username: null` 一列不丟失。
+- `GET /api/reports/my-usage`（任何登入者）：同形狀、僅本人。
+- **分潤試算** `GET /api/reports/payout?pool=<float>&from&to`（admin）：以區間內 billable gpu_seconds 按 worker 聚合，`ratio = worker_seconds / total_seconds`、`amount = pool × ratio`（raw float，前端格式化）；total 為 0 時回空列表＋`total_gpu_seconds: 0`。
+- `GET /api/reports/contributions` 維持不變。
+
+### Web
+- 登入頁加 username 欄；auth state 帶 `{username, role}`。
+- 導覽依角色：一般 user 只見 Dashboard（自己的統計）、Jobs（自己的）、Reports（我的用量）、Settings 縮減為改密碼＋語言；Workers／Users／完整 Settings／貢獻與分潤報表為 admin-only，路由層雙重把關（非僅藏選單）。
+- 新 Users 頁（admin）：列表、建帳號（一次性密碼顯示＋複製）、啟停用、角色切換、重設密碼。
+- Jobs 頁 admin 檢視加「使用者」欄；Reports 頁 admin 分頁：Worker 貢獻／使用者用量／分潤試算（pool 輸入框）。
+- zh-TW＋en 全量翻譯。
+
+### Cloud 對等
+- D1 migration 0006（users＋jobs.user_id＋login_attempts.username＋資料遷移 SQL）；`/api/setup` 建 admin user 列；auth／users／jobs 範圍／comfy 面板範圍／reports 三端點 byte-parity 移植；既有部署跑遷移後舊 cookie 自然失效。
