@@ -21,6 +21,8 @@ import worker from "../src/index";
 afterEach(async () => {
   await db().prepare("DELETE FROM settings").run();
   await db().prepare("DELETE FROM users").run();
+  await db().prepare("DELETE FROM register_tokens").run();
+  await db().prepare("DELETE FROM login_attempts").run();
 });
 
 const ADMIN_PASSWORD = "correct-horse-battery-staple";
