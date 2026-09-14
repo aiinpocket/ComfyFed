@@ -17,7 +17,7 @@ from fastapi import APIRouter, Depends, HTTPException
 from pydantic import BaseModel
 from sqlalchemy import func
 
-from . import auth, db, security
+from . import auth, db, panelws, security
 
 _USERNAME_RE = re.compile(r"^[a-z0-9_.-]{3,32}$")
 _ROLES = ("admin", "user")
@@ -99,6 +99,14 @@ def create_router() -> APIRouter:
         role = _validate_role(body.role)
         password = body.password or secrets.token_urlsafe(12)
 
+        # Final review finding #8: the same 8-char minimum self-service
+        # change-password enforces (auth.py's `change_password`) -- an admin
+        # could otherwise create an account with password `a`. Generated
+        # passwords (`token_urlsafe(12)` -> 16 chars) always comply, so this
+        # only ever rejects an admin-supplied one.
+        if len(password) < 8:
+            raise _error(400, "auth.password_too_short", "New password must be at least 8 characters.")
+
         with db.get_session() as session:
             existing = session.query(db.User).filter(db.User.username == username).one_or_none()
             if existing is not None:
@@ -129,7 +137,13 @@ def create_router() -> APIRouter:
             target.password_hash = security.hash_password(password)
             target.session_epoch += 1
             session.commit()
-            return {"password": password}
+            target_id = target.id
+
+        # Final review finding #6: close any open panel WebSocket for this
+        # user now that their epoch has moved -- outside the `with` block,
+        # after commit, same ordering as auth.change_password.
+        panelws.close_for_uid(target_id)
+        return {"password": password}
 
     @r.patch("/api/users/{user_id}")
     def patch_user(
@@ -158,6 +172,15 @@ def create_router() -> APIRouter:
 
             session.commit()
             job_count = session.query(db.Job).filter(db.Job.user_id == target.id).count()
-            return _user_list_row(target, job_count)
+            result = _user_list_row(target, job_count)
+            target_id = target.id
+
+        if disabling:
+            # Final review finding #6: close any open panel WebSocket for
+            # this user now that they're disabled -- outside the `with`
+            # block, after commit, same ordering as the other epoch-bump
+            # sites.
+            panelws.close_for_uid(target_id)
+        return result
 
     return r

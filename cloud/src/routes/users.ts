@@ -27,7 +27,27 @@ import {
 import { hashPassword } from "../lib/passwords";
 import { bytesToHex } from "../lib/hex";
 import { requireAdmin, requireCsrf, errorJson } from "../lib/guard";
-import { USERNAME_RE, ROLES, USER_MESSAGES, type Role } from "../core/auth";
+import { USERNAME_RE, ROLES, USER_MESSAGES, MESSAGES, type Role } from "../core/auth";
+
+/** Final review finding #6: reach the Hub DO to close any open panel
+ * WebSocket for `uid` right after a session_epoch bump (reset-password,
+ * disable) -- same fire-and-forget internal-HTTP-hop pattern
+ * `routes/jobs.ts`'s `wakeHub`/cancel calls use, since this route runs as a
+ * plain Worker fetch handler with no direct handle on the DO's live
+ * sockets. Never throws: a Hub DO hiccup here must not fail the
+ * reset-password/disable response itself. */
+async function closePanelForUid(env: Env, uid: string): Promise<void> {
+  try {
+    const stub = env.HUB.get(env.HUB.idFromName("hub"));
+    await stub.fetch("http://hub.internal/internal/close_panel_for_uid", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ uid }),
+    });
+  } catch (err) {
+    console.warn("users: failed to close panel socket for uid", uid, err);
+  }
+}
 
 /** Looks up the `:userId` path param, or answers the 404 `not_found` error
  * shape -- mirrors users.py's `_get_user_or_404`. Returns the `Response`
@@ -110,6 +130,15 @@ app.post("/api/users", requireCsrf, async (c) => {
   const role = body.role as Role;
   const password = typeof body.password === "string" && body.password ? body.password : randomPassword();
 
+  // Final review finding #8: the same 8-char minimum self-service
+  // change-password enforces (routes/auth.ts's `change-password`) -- an
+  // admin could otherwise create an account with password `a`. A generated
+  // password (`randomPassword()`) always complies, so this only ever
+  // rejects an admin-supplied one.
+  if (password.length < 8) {
+    return errorJson(c, 400, "auth.password_too_short", MESSAGES.passwordTooShort);
+  }
+
   const existing = await getUserByUsername(c.env.DB, username);
   if (existing !== null) {
     return errorJson(c, 400, "username_taken", USER_MESSAGES.usernameTaken);
@@ -133,6 +162,7 @@ app.post("/api/users/:userId/reset-password", requireCsrf, async (c) => {
 
   const password = randomPassword();
   await updateUserPasswordAndBumpEpoch(c.env.DB, target.id, await hashPassword(password));
+  await closePanelForUid(c.env, target.id);
 
   return c.json({ password });
 });
@@ -164,6 +194,7 @@ app.patch("/api/users/:userId", requireCsrf, async (c) => {
   await updateUserRoleAndDisabled(c.env.DB, target.id, { role, disabled });
   if (disabling) {
     await bumpUserSessionEpoch(c.env.DB, target.id);
+    await closePanelForUid(c.env, target.id);
   }
 
   const jobCount = await countJobsForUser(c.env.DB, target.id);

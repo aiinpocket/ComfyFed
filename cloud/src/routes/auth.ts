@@ -25,7 +25,6 @@ import { setCookie, deleteCookie } from "hono/cookie";
 import type { Env } from "../env";
 import {
   getSetting,
-  setSetting,
   getOrCreateSessionSecret,
   rotateSessionSecret,
   insertLoginAttempt,
@@ -52,6 +51,26 @@ import { errorJson, requireCsrfUser, SESSION_COOKIE_NAME, readSession, sessionUs
 
 const LANG_KEY = "lang";
 const PLATFORM_URL_KEY = "platform_url";
+
+/** Final review finding #6: reach the Hub DO to close any open panel
+ * WebSocket for `uid` right after `change-password` bumps its
+ * session_epoch -- mirrors `routes/users.ts`'s own copy of this helper
+ * (kept as a small per-file copy rather than a cross-route import, matching
+ * that file's/comfyapi.ts's stated convention for `wakeHub`-shaped
+ * helpers). Never throws: a Hub DO hiccup here must not fail the
+ * change-password response itself. */
+async function closePanelForUid(env: Env, uid: string): Promise<void> {
+  try {
+    const stub = env.HUB.get(env.HUB.idFromName("hub"));
+    await stub.fetch("http://hub.internal/internal/close_panel_for_uid", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ uid }),
+    });
+  } catch (err) {
+    console.warn("auth: failed to close panel socket for uid", uid, err);
+  }
+}
 
 // Rows older than this are pruned on every login write -- purely a storage
 // hygiene measure (see queries.ts's pruneLoginAttempts docstring), set well
@@ -167,8 +186,25 @@ app.post("/api/setup", async (c) => {
 
 app.post("/api/auth/login", async (c) => {
   const body = await c.req.json<{ username?: unknown; password?: unknown }>().catch(() => ({}) as any);
-  const username = (typeof body.username === "string" ? body.username : "").trim().toLowerCase();
-  const password = typeof body.password === "string" ? body.password : "";
+
+  // Final review finding #9: the server's `LoginBody` Pydantic model makes
+  // BOTH `username` and `password` required, so a missing/non-string EITHER
+  // field yields FastAPI's `{"error": {"code": "validation_error", ...}}`
+  // 422 envelope (see auth.py's app-wide validation-error handler) -- cloud
+  // used to coerce a missing field to `""` and fall through to a 401
+  // `auth.required`, which was at least symmetric between the two fields
+  // but disagreed with the server's status code entirely. Aligning both
+  // fields to the server's 422/validation_error shape here, rather than
+  // aligning the server down to 401, since the plan's Global Constraints
+  // demand identical error shapes and 422-for-missing-required-field is the
+  // server's existing, load-bearing convention (see e.g. `test_auth.py`'s
+  // `test_validation_error_uses_the_standard_error_envelope`).
+  if (typeof body.username !== "string" || typeof body.password !== "string") {
+    return errorJson(c, 422, "validation_error", "Invalid request body.");
+  }
+
+  const username = body.username.trim().toLowerCase();
+  const password = body.password;
 
   const now = new Date();
   const cutoff = toSqliteTimestamp(new Date(now.getTime() - BACKOFF_WINDOW_MS));
@@ -253,6 +289,7 @@ app.post("/api/auth/change-password", requireCsrfUser, async (c) => {
 
   const newHash = await hashPassword(newPassword);
   await updateUserPasswordAndBumpEpoch(c.env.DB, user.id, newHash);
+  await closePanelForUid(c.env, user.id);
 
   const csrf = await issueSessionCookie(c, c.env.DB, { id: user.id, role: user.role, sessionEpoch: user.sessionEpoch + 1 });
 

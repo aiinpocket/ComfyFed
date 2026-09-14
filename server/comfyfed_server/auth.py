@@ -19,7 +19,7 @@ from fastapi import APIRouter, Cookie, Depends, Header, HTTPException, Response
 from itsdangerous import BadSignature, SignatureExpired, URLSafeTimedSerializer
 from pydantic import BaseModel
 
-from . import db, security
+from . import db, panelws, security
 
 _SESSION_SECRET_KEY = "session_secret"
 _LANG_KEY = "lang"
@@ -384,6 +384,12 @@ def change_password(
         db_user.password_hash = security.hash_password(body.new)
         db_user.session_epoch += 1
         db_session.commit()
+
+        # Final review finding #6: close any open panel WebSocket for this
+        # uid now that its epoch has moved -- the caller's OWN session stays
+        # alive via the fresh cookie issued below, but any other tab's panel
+        # socket (already-open, pre-bump) must not keep streaming.
+        panelws.close_for_uid(db_user.id)
 
         csrf = issue_session_cookie(response, db_user)
 
