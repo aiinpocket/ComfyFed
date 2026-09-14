@@ -412,7 +412,11 @@ def test_job_failed_sends_execution_error(client):
 
 def test_job_cancelled_relay_clears_executing_and_refreshes_status(client):
     _login(client)
-    job_id = "some-job"
+    # A real, resolvable job -- final review finding #5 made an unresolved
+    # job-scoped frame fail CLOSED (dropped) rather than fail open to an
+    # unscoped broadcast, so this relay needs a job row `_job_owner` can
+    # actually find.
+    job_id = _post_prompt(client)
     with client.websocket_connect("/comfy/api/ws") as ws:
         ws.receive_json()  # initial status
         ws.receive_json()  # feature_flags
@@ -499,6 +503,27 @@ def test_broadcast_with_no_connected_clients_is_a_noop(client):
     relay(panelws.job_progress("nonexistent-job", 0.5))
     relay(panelws.job_running("nonexistent-job"))
     relay(panelws.job_failed("nonexistent-job", "boom"))
+
+
+def test_job_scoped_frame_for_an_unresolved_job_fails_closed(client):
+    """Final review finding #5: a job-scoped frame whose row can no longer be
+    resolved (deleted, or -- as here -- never existed) must be DROPPED, not
+    fanned out unscoped to every connected socket. Proven by ordering: relay
+    an unscoped `status` refresh right after the unresolvable job-scoped
+    frame, then assert `status` is the FIRST thing the connected socket
+    receives -- if the job-scoped frame had fallen back to an unscoped
+    broadcast (the old fail-OPEN behavior), `executing` for the bogus job
+    would arrive first instead."""
+    _login(client)
+    with client.websocket_connect("/comfy/api/ws") as ws:
+        ws.receive_json()  # initial status
+        ws.receive_json()  # feature_flags
+
+        relay(panelws.job_running("nonexistent-job"))
+        relay(panelws.job_status_refresh())
+
+        msg = ws.receive_json()
+        assert msg["type"] == "status"
 
 
 # --- Task 4: per-user relay scoping -------------------------------------------
@@ -909,3 +934,60 @@ async def test_dispatch_tick_relays_requeued_jobs_to_the_panel(client):
 
     with db.get_session() as session:
         assert session.get(db.Job, job_id).status == "queued"
+
+
+# --- Task 4/final review finding #6: session_epoch bump closes open panel sockets
+
+def test_change_password_closes_the_callers_open_panel_socket(client):
+    csrf = _login(client)
+    with client.websocket_connect("/comfy/api/ws") as ws:
+        ws.receive_json()  # initial status
+        ws.receive_json()  # feature_flags
+
+        r = client.post(
+            "/api/auth/change-password",
+            json={"old": client.admin_password, "new": "newpassword123"},
+            headers={"X-CSRF": csrf},
+        )
+        assert r.status_code == 200
+
+        with pytest.raises(WebSocketDisconnect):
+            ws.receive_json()
+
+
+def test_reset_password_closes_the_targets_open_panel_socket(client, two_users):
+    admin_csrf = _login(client)
+    with db.get_session() as session:
+        alice_id = session.query(db.User).filter(db.User.username == ALICE[0]).one().id
+
+    _login(client, *ALICE)
+    with client.websocket_connect("/comfy/api/ws") as alice_ws:
+        alice_ws.receive_json()  # initial status
+        alice_ws.receive_json()  # feature_flags
+
+        admin_csrf = _login(client)  # back to admin -- refreshes the csrf token too
+        r = client.post(f"/api/users/{alice_id}/reset-password", headers={"X-CSRF": admin_csrf})
+        assert r.status_code == 200
+
+        with pytest.raises(WebSocketDisconnect):
+            alice_ws.receive_json()
+
+
+def test_disabling_a_user_closes_their_open_panel_socket(client, two_users):
+    admin_csrf = _login(client)
+    with db.get_session() as session:
+        bob_id = session.query(db.User).filter(db.User.username == BOB[0]).one().id
+
+    _login(client, *BOB)
+    with client.websocket_connect("/comfy/api/ws") as bob_ws:
+        bob_ws.receive_json()  # initial status
+        bob_ws.receive_json()  # feature_flags
+
+        admin_csrf = _login(client)  # back to admin -- refreshes the csrf token too
+        r = client.patch(
+            f"/api/users/{bob_id}", json={"disabled": True}, headers={"X-CSRF": admin_csrf}
+        )
+        assert r.status_code == 200
+
+        with pytest.raises(WebSocketDisconnect):
+            bob_ws.receive_json()

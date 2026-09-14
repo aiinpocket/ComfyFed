@@ -354,6 +354,9 @@ export class Hub extends DurableObject<Env> {
       await this.scheduleAlarmIfNeeded();
       return new Response(null, { status: 202 });
     }
+    if (url.pathname === "/internal/close_panel_for_uid" && request.method === "POST") {
+      return this.handleInternalClosePanelForUid(request);
+    }
     return new Response("not found", { status: 404 });
   }
 
@@ -534,6 +537,31 @@ export class Hub extends DurableObject<Env> {
       .catch(() => ({}) as { type?: unknown; data?: unknown });
     if (typeof body.type === "string") {
       await this.postPanelEvent({ type: body.type, data: body.data });
+    }
+    return new Response(null, { status: 202 });
+  }
+
+  /** Final review finding #6: closes every panel WebSocket attached with the
+   * given uid. `users`/`auth` routes bump `session_epoch` on password
+   * change/reset/disable but have no direct handle on this DO's live
+   * sockets (they run as plain Worker fetch handlers, not DO methods), so
+   * they reach the Hub the same way `routes/jobs.ts`'s `wakeHub`/cancel
+   * calls do: an HTTP hop to this internal route. Body shape:
+   * `{"uid": string}`. Mirrors `panelws.close_for_uid` on the server. */
+  private async handleInternalClosePanelForUid(request: Request): Promise<Response> {
+    const body = await request.json<{ uid?: unknown }>().catch(() => ({}) as { uid?: unknown });
+    const uid = typeof body.uid === "string" ? body.uid : "";
+    if (!uid) {
+      return Response.json({ error: "missing uid" }, { status: 400 });
+    }
+    for (const ws of this.ctx.getWebSockets()) {
+      const att = ws.deserializeAttachment() as HubAttachment | null;
+      if (!att || att.kind !== "panel" || att.uid !== uid) continue;
+      try {
+        ws.close(4402, "session epoch bumped");
+      } catch (err) {
+        console.warn(`hub: failed to close panel socket ${att.sid} for uid ${uid}`, err);
+      }
     }
     return new Response(null, { status: 202 });
   }
@@ -1521,11 +1549,15 @@ export class Hub extends DurableObject<Env> {
    * (`undefined`) means an unscoped broadcast -- used for the queue-badge
    * `status` refreshes, which carry no single job's identity to scope
    * against -- delivered to every connected panel socket, exactly as before
-   * this parameter existed. A `jobOwner` lookup that resolves to `null` (the
-   * job no longer exists) is passed through as `undefined` by every caller
-   * below, matching Python's fail-open-to-unscoped-broadcast rule: there is
-   * nothing left to scope against, and swallowing a real event is worse than
-   * a one-off leak. */
+   * this parameter existed.
+   *
+   * Final review finding #5: a job-scoped frame whose `jobOwner` lookup
+   * resolves to `null` (the job no longer exists) is DROPPED by
+   * `postJobScopedPanelEvent` below, not passed through as an unscoped
+   * broadcast -- see that method's docstring. `owner` here is therefore
+   * always either a real resolved owner or `undefined` for a genuinely
+   * unscoped call (the queue-badge `status` refreshes); this method itself
+   * never needs to fail closed. */
   private async postPanelEvent(evt: { type: string; data?: unknown }, owner?: PanelOwner): Promise<void> {
     const payload = JSON.stringify(evt);
     for (const ws of this.ctx.getWebSockets()) {
@@ -1538,6 +1570,27 @@ export class Hub extends DurableObject<Env> {
         console.warn(`hub: failed to deliver panel event to sid ${att.sid}`, err);
       }
     }
+  }
+
+  /** Job-scoped variant of `postPanelEvent`: looks `jobId` up via `jobOwner`
+   * and only sends `evt` when it resolves. Final review finding #5 -- the
+   * old rule fell back to an unscoped broadcast when a job-scoped frame's
+   * row could not be resolved ("swallowing a real event is worse than a
+   * one-off leak"), reasoning that predates the panel being multi-tenant: an
+   * `executed` frame carries the job's full output payload, including
+   * `.txt` artifact TEXT CONTENT, so an unscoped fan-out on a resolution
+   * miss would risk handing one user's job data to every other connected
+   * panel socket. Now the frame is simply DROPPED (fail closed) and logged;
+   * callers that also need an unscoped follow-up (e.g. `job_cancelled`'s
+   * trailing `status` refresh) issue it as a separate `postPanelEvent` call,
+   * unaffected by this method's own drop. */
+  private async postJobScopedPanelEvent(jobId: string, evt: { type: string; data?: unknown }): Promise<void> {
+    const owner = await this.jobOwner(jobId);
+    if (owner === null) {
+      console.warn(`hub: dropping unresolved job-scoped frame for job ${jobId}`);
+      return;
+    }
+    await this.postPanelEvent(evt, owner);
   }
 
   /** Ports panelws.py's `queue_status`. */
@@ -1562,18 +1615,15 @@ export class Hub extends DurableObject<Env> {
       if (fetchFields.fetchPct !== null) data.fetch_pct = fetchFields.fetchPct;
       if (fetchFields.fetchModel !== null) data.fetch_model = fetchFields.fetchModel;
     }
-    await this.postPanelEvent({ type: "progress", data }, (await this.jobOwner(jobId)) ?? undefined);
+    await this.postJobScopedPanelEvent(jobId, { type: "progress", data });
   }
 
   /** Ports panelws.py's `job_running`. */
   private async panelJobRunning(jobId: string): Promise<void> {
-    await this.postPanelEvent(
-      {
-        type: "executing",
-        data: { node: RUNNING_NODE_LABEL, prompt_id: jobId, display_node: RUNNING_NODE_LABEL },
-      },
-      (await this.jobOwner(jobId)) ?? undefined
-    );
+    await this.postJobScopedPanelEvent(jobId, {
+      type: "executing",
+      data: { node: RUNNING_NODE_LABEL, prompt_id: jobId, display_node: RUNNING_NODE_LABEL },
+    });
   }
 
   /** Ports panelws.py's `job_status_refresh`. */
@@ -1583,18 +1633,12 @@ export class Hub extends DurableObject<Env> {
 
   /** Ports panelws.py's `job_requeued`. */
   private async panelJobRequeued(jobId: string): Promise<void> {
-    await this.postPanelEvent(
-      { type: "executing", data: { node: null, prompt_id: jobId } },
-      (await this.jobOwner(jobId)) ?? undefined
-    );
+    await this.postJobScopedPanelEvent(jobId, { type: "executing", data: { node: null, prompt_id: jobId } });
   }
 
   /** Ports panelws.py's `job_cancelled`. */
   private async panelJobCancelled(jobId: string): Promise<void> {
-    await this.postPanelEvent(
-      { type: "executing", data: { node: null, prompt_id: jobId } },
-      (await this.jobOwner(jobId)) ?? undefined
-    );
+    await this.postJobScopedPanelEvent(jobId, { type: "executing", data: { node: null, prompt_id: jobId } });
     await this.panelJobStatusRefresh();
   }
 
@@ -1630,23 +1674,20 @@ export class Hub extends DurableObject<Env> {
 
   /** Ports panelws.py's `job_failed`. */
   private async panelJobFailed(jobId: string, error: string): Promise<void> {
-    await this.postPanelEvent(
-      {
-        type: "execution_error",
-        data: {
-          prompt_id: jobId,
-          node_id: null,
-          node_type: null,
-          exception_message: error,
-          exception_type: "",
-          traceback: [],
-          current_inputs: {},
-          current_outputs: {},
-          executed: [],
-        },
+    await this.postJobScopedPanelEvent(jobId, {
+      type: "execution_error",
+      data: {
+        prompt_id: jobId,
+        node_id: null,
+        node_type: null,
+        exception_message: error,
+        exception_type: "",
+        traceback: [],
+        current_inputs: {},
+        current_outputs: {},
+        executed: [],
       },
-      (await this.jobOwner(jobId)) ?? undefined
-    );
+    });
     await this.panelJobStatusRefresh();
   }
 }

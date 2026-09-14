@@ -682,4 +682,105 @@ describe("panel WS: frame filtering is per-owner (Phase 3.0 Task 10)", () => {
     agent.close();
     panel.close();
   });
+
+  it("a job-scoped frame for a job id that no longer resolves fails CLOSED, not open (final review finding #5)", async () => {
+    // The old rule fell back to an unscoped broadcast when `jobOwner`
+    // couldn't resolve a row for a job-identifying frame ("swallowing a
+    // real event is worse than a one-off leak") -- reasoning that predates
+    // the panel being multi-tenant. Drives the DO's own (otherwise private)
+    // `panelJobRunning` directly with a job id that was never inserted,
+    // mirroring how the Python suite's `relay(panelws.job_running(...))`
+    // exercises the same module-level function without a full HTTP/WS
+    // round trip. Proven by ordering: an unscoped `status` refresh issued
+    // right after must be the ONLY thing the connected socket receives.
+    const admin = await loginCookie();
+    const panel = await connectPanel(admin.cookie);
+    await collectMessages(panel, 2); // status, feature_flags
+
+    const eventsPromise = collectMessages(panel, 1);
+    await runInDurableObject(hub(), async (instance) => {
+      const anyInstance = instance as any;
+      await anyInstance.panelJobRunning("never-inserted-job-id");
+      await anyInstance.panelJobStatusRefresh();
+    });
+
+    const [onlyMessage] = await eventsPromise;
+    expect(onlyMessage.type).toBe("status");
+
+    panel.close();
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Final review finding #6: a session_epoch bump (change-password,
+// reset-password, disable) must close that user's open panel WebSocket(s),
+// not just make their NEXT handshake fail -- the handshake resolves the
+// session once and stores only the uid (serializeAttachment survives
+// hibernation too), with no re-check afterwards.
+
+function expectClose(ws: WebSocket, timeoutMs = 3000): Promise<{ code: number }> {
+  return new Promise((resolve, reject) => {
+    const timer = setTimeout(() => {
+      ws.removeEventListener("close", onClose);
+      reject(new Error("timeout waiting for the socket to close"));
+    }, timeoutMs);
+    const onClose = (evt: CloseEvent) => {
+      clearTimeout(timer);
+      ws.removeEventListener("close", onClose);
+      resolve({ code: evt.code });
+    };
+    ws.addEventListener("close", onClose);
+  });
+}
+
+describe("session_epoch bump closes open panel sockets (final review finding #6)", () => {
+  it("change-password closes the caller's own open panel socket", async () => {
+    const admin = await loginCookie();
+    const panel = await connectPanel(admin.cookie);
+    await collectMessages(panel, 2); // status, feature_flags
+
+    const closed = expectClose(panel);
+    const r = await call("/api/auth/change-password", {
+      json: { old: ADMIN_PASSWORD, new: "brand-new-password-1" },
+      cookie: admin.cookie,
+      headers: { "X-CSRF": admin.csrf },
+    });
+    expect(r.status).toBe(200);
+    await closed;
+  });
+
+  it("reset-password closes the target user's open panel socket", async () => {
+    const admin = await loginCookie();
+    const alice = await secondUserCookie(admin, "alice");
+
+    const alicePanel = await connectPanel(alice.cookie);
+    await collectMessages(alicePanel, 2); // status, feature_flags
+
+    const closed = expectClose(alicePanel);
+    const r = await call(`/api/users/${alice.uid}/reset-password`, {
+      method: "POST",
+      cookie: admin.cookie,
+      headers: { "X-CSRF": admin.csrf },
+    });
+    expect(r.status).toBe(200);
+    await closed;
+  });
+
+  it("disabling a user closes their open panel socket", async () => {
+    const admin = await loginCookie();
+    const bob = await secondUserCookie(admin, "bob");
+
+    const bobPanel = await connectPanel(bob.cookie);
+    await collectMessages(bobPanel, 2); // status, feature_flags
+
+    const closed = expectClose(bobPanel);
+    const r = await call(`/api/users/${bob.uid}`, {
+      method: "PATCH",
+      json: { disabled: true },
+      cookie: admin.cookie,
+      headers: { "X-CSRF": admin.csrf },
+    });
+    expect(r.status).toBe(200);
+    await closed;
+  });
 });

@@ -73,6 +73,45 @@ def unregister(sid: str) -> None:
     _connections.pop(sid, None)
 
 
+# WebSocket close code for a socket force-closed because its session_epoch
+# was bumped out from under it -- distinct from `comfyapi._CLOSE_UNAUTHORIZED`
+# (4401, an unauthenticated handshake) even though both are in the private
+# range, since this one is a live, previously-authenticated connection being
+# cut off, not a handshake ever being rejected.
+_CLOSE_EPOCH_BUMPED = 4402
+
+
+def close_for_uid(uid: str) -> None:
+    """Synchronously close every registered panel WebSocket for `uid`.
+
+    Final review finding #6: an open panel socket used to survive a
+    session_epoch bump indefinitely -- the handshake resolves the session
+    once and stores only the uid, with no re-check afterwards, so a user
+    disabled (or password-reset, or self-changed) while their panel was open
+    kept streaming job frames until the tab was closed on its own. Called
+    from every epoch-bump call site (`auth.change_password`,
+    `users.reset_password`, `users.patch_user`'s disable branch) right after
+    the bump commits.
+
+    Those call sites are synchronous request handlers, not coroutines, so
+    this schedules the close on each matching connection's own captured loop
+    (mirrors `agentws.dispatch_once`'s same sync-caller-into-async pattern)
+    rather than awaiting directly. Never raises: a socket that is already
+    gone, or whose close races the client's own disconnect, is exactly the
+    outcome this function is trying to produce anyway.
+    """
+    for sid, conn in list(_connections.items()):
+        if conn.uid != uid:
+            continue
+        try:
+            asyncio.run_coroutine_threadsafe(
+                conn.ws.close(code=_CLOSE_EPOCH_BUMPED), conn.loop
+            ).result(timeout=_CROSS_LOOP_TIMEOUT_SECONDS)
+        except Exception:
+            logger.exception("panelws: failed to close panel socket %s for uid %s", sid, uid)
+        _connections.pop(sid, None)
+
+
 def clear() -> None:
     """Drop all registered connections (test helper, mirrors comfyapi's cache clear)."""
     _connections.clear()
@@ -177,15 +216,20 @@ async def post_event(
     id (this module then looks the row up itself). Neither given means an
     unscoped broadcast (used for the queue-badge `status` refreshes, which
     carry no single job's identity to scope against) -- delivered to every
-    connection, exactly as before this parameter existed. A `job_id` that no
-    longer resolves to a row (already deleted, or a synthetic id used only by
-    a relay-function unit test) also fails OPEN to an unscoped broadcast:
-    there is nothing left to scope against, and swallowing a real event is a
-    worse failure mode than a one-off leak in what is, in every real
-    deployment, a fleet with exactly one person online at a time to leak to.
+    connection, exactly as before this parameter existed.
+
+    Final review finding #5: a `job_id` that no longer resolves to a row
+    (already deleted, or a synthetic id used only by a relay-function unit
+    test) now fails CLOSED -- the frame is DROPPED, reaching no connection at
+    all -- rather than falling back to an unscoped broadcast. The earlier
+    fail-OPEN reasoning ("swallowing a real event is worse than a one-off
+    leak") predates the panel being multi-tenant: an `executed` frame carries
+    the job's full output payload, including `.txt` artifact TEXT CONTENT
+    (`job_outputs`), so an unscoped fan-out on a resolution miss would risk
+    handing one user's job output to every other connected panel socket.
     A connection registered without a resolved uid (`conn.uid is None` --
-    only the same-loop test helpers still do this) also always sees
-    everything, regardless of scoping.
+    only the same-loop test helpers still do this) still always sees
+    everything once a frame IS scoped to a resolved owner.
 
     Never raises -- swallows and logs everything, including "no panel clients
     connected" (a no-op) and a dead event loop.
@@ -198,6 +242,13 @@ async def post_event(
         owner = (job.origin, job.user_id)
     elif job_id is not None:
         owner = _job_owner(job_id)
+        if owner is None:
+            # Fail CLOSED (final review finding #5): this frame identifies a
+            # specific job, but the row can no longer be resolved -- there is
+            # nothing left to scope against, and an unscoped fan-out here
+            # could leak another user's job data. Drop it instead.
+            logger.warning("panelws: dropping unresolved job-scoped frame for job %s", job_id)
+            return
 
     current = asyncio.get_running_loop()
     for sid, conn in list(_connections.items()):
