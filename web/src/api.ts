@@ -369,8 +369,18 @@ export const api = {
     return getJson<MeResponse>('/api/auth/me');
   },
 
-  changePassword(oldPassword: string, newPassword: string): Promise<{ ok: boolean }> {
-    return postJson('/api/auth/change-password', { old: oldPassword, new: newPassword });
+  /** Final review finding #4: the server re-issues a fresh cookie AND a
+   * fresh CSRF token here (the epoch bump would otherwise invalidate the
+   * caller's own session too) -- the client must adopt it immediately via
+   * `setCsrf`, or every subsequent state-changing request silently fails
+   * `403 auth.csrf` until the next full login. */
+  async changePassword(oldPassword: string, newPassword: string): Promise<{ ok: boolean; csrf: string }> {
+    const result = await postJson<{ ok: boolean; csrf: string }>('/api/auth/change-password', {
+      old: oldPassword,
+      new: newPassword,
+    });
+    setCsrf(result.csrf);
+    return result;
   },
 
   listWorkers(): Promise<Worker[]> {
