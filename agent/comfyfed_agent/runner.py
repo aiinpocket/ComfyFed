@@ -88,6 +88,13 @@ class PlatformConnection:
         # genuine change from a no-op rescan without resending the whole
         # (possibly large) model list just to compare it.
         self.model_inventory_hash: str = ""
+        # M7 final-review fix: name -> sha256 for every model whose
+        # `chunk_sha256s` has actually been sent to the platform on THIS
+        # connection. `_dedup_chunk_lists` consults this to omit
+        # `chunk_sha256s` from an inventory report for a file whose chunk
+        # list the platform already has at the same sha256 -- only the first
+        # report after connect, or a file (re)hashed since, carries it.
+        self.chunks_sent: dict[str, str] = {}
 
     def _ws_url(self) -> str:
         parsed = urlsplit(self.entry.platform_url)
@@ -238,6 +245,40 @@ def _model_inventory_digest(models: list[dict]) -> str:
     """
     canonical = json.dumps(sorted(models, key=lambda m: m["name"]), sort_keys=True)
     return hashlib.sha256(canonical.encode()).hexdigest()
+
+
+def _dedup_chunk_lists(models: list[dict], chunks_sent: dict[str, str]) -> tuple[list[dict], dict[str, str]]:
+    """M7 final-review fix: strip `chunk_sha256s` from an outgoing inventory
+    entry whose (name, sha256) was already sent-with-chunks on this same
+    connection, per `chunks_sent` -- spec: 庫存回報攜帶分塊表僅在整檔雜湊首次回報或
+    變更時傳. Returns `(outgoing_models, updates)`; `updates` is every
+    (name -> sha256) pair that DOES go out with its chunk list this call --
+    the caller applies it to `conn.chunks_sent` only once `send_inventory`
+    actually succeeds (mirroring how `model_inventory_hash` is only updated
+    after a successful send), so a failed send never wrongly marks a chunk
+    list as delivered.
+
+    Every other field is untouched -- the server already tolerates (and
+    first-wins-stores) an inventory entry with no `chunk_sha256s`
+    (`model_manifest.record_hash`'s `chunk_json is None` branch), so omitting
+    it here is purely a payload-size optimization, never a behavior change
+    for the server side.
+    """
+    out: list[dict] = []
+    updates: dict[str, str] = {}
+    for entry in models:
+        chunk_list = entry.get("chunk_sha256s")
+        name = entry.get("name")
+        sha256 = entry.get("sha256")
+        if not chunk_list or not isinstance(name, str) or not isinstance(sha256, str):
+            out.append(entry)
+            continue
+        if chunks_sent.get(name) == sha256:
+            out.append({k: v for k, v in entry.items() if k != "chunk_sha256s"})
+        else:
+            out.append(entry)
+            updates[name] = sha256
+    return out, updates
 
 
 def _is_safe_relative_path(path: str) -> bool:
@@ -594,8 +635,9 @@ class AgentLoop:
         if digest == conn.model_inventory_hash:
             return
 
+        outgoing, chunk_updates = _dedup_chunk_lists(models, conn.chunks_sent)
         try:
-            await conn.send_inventory(models)
+            await conn.send_inventory(outgoing)
         except Exception:
             logger.exception(
                 "runner: failed to push updated model inventory to %s", conn.entry.platform_url
@@ -603,6 +645,7 @@ class AgentLoop:
             return
 
         conn.model_inventory_hash = digest
+        conn.chunks_sent.update(chunk_updates)
 
     async def handle_job(self, conn: PlatformConnection, job_msg: dict) -> None:
         """Run one job dispatched over `conn`, broadcasting busy state to every platform.
@@ -1376,6 +1419,7 @@ class AgentLoop:
                 models_dir=self.config.models_dir,
                 port=self.config.peer_listen_port,
                 platforms=list(self.config.platforms),
+                bind_host=self.config.peer_bind_host,
             )
             self._peer_server.start()
             self._peer_advertised_url = peerserve.advertised_url(self.config)
@@ -1565,8 +1609,16 @@ class AgentLoop:
                     if self.config.models_dir
                     else []
                 )
-                await conn.send_inventory(models)
+                # M7 final-review fix: a fresh connection (including a
+                # reconnect) always sends every currently-hashed file's
+                # chunk_sha256s at least once -- `chunks_sent` resets here so
+                # "first report after connect" is exactly the hello-time
+                # inventory send, matching the spec's wording literally.
+                conn.chunks_sent = {}
+                outgoing, chunk_updates = _dedup_chunk_lists(models, conn.chunks_sent)
+                await conn.send_inventory(outgoing)
                 conn.model_inventory_hash = _model_inventory_digest(models)
+                conn.chunks_sent.update(chunk_updates)
 
                 await self.refresh_object_info(conn)
 

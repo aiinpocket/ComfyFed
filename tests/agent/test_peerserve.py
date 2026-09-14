@@ -140,6 +140,24 @@ def test_grant_signed_by_unpinned_platform_is_403(server):
     assert resp.status_code == 403
 
 
+def test_unauthenticated_request_for_unknown_name_is_403_not_404(server):
+    """M5 final-review fix: an unauthenticated request must not be able to
+    tell "no such model" apart from "auth failed" by distinguishing 404 from
+    403 -- both a present and an absent name get 403 with no grant at all,
+    closing the pre-auth model-inventory oracle."""
+    srv, *_ = server
+
+    resp = httpx.get(_url(srv, name="diffusion_models/this-name-does-not-exist.bin"))
+    assert resp.status_code == 403
+
+
+def test_unauthenticated_request_for_a_known_name_is_also_403(server):
+    srv, *_ = server
+
+    resp = httpx.get(_url(srv))  # the real "diffusion_models/model.bin", no grant header
+    assert resp.status_code == 403
+
+
 # --- path sanitization / inventory-index resolution ---------------------
 
 
@@ -314,3 +332,92 @@ def test_advertised_url_is_none_when_disabled():
 
     cfg = AgentConfig(peer_serve=False, peer_listen_port=None)
     assert peerserve.advertised_url(cfg) is None
+
+
+# --- M4: bounded report retries ---------------------------------------------
+
+
+def test_grant_tracker_record_failed_attempt_counts_up():
+    tracker = peerserve._GrantTracker()
+    assert tracker.record_failed_attempt("g1") == 1
+    assert tracker.record_failed_attempt("g1") == 2
+    assert tracker.record_failed_attempt("g2") == 1
+
+
+def test_report_due_grants_gives_up_after_max_attempts(server, caplog, monkeypatch):
+    """A grant that keeps failing to report (e.g. the platform has pruned it,
+    or any other persistent rejection) must not retry forever --
+    `_MAX_REPORT_ATTEMPTS` failures give up and mark it reported so the
+    reporter loop drops it, logging once at WARNING."""
+    import logging
+
+    srv, signing_key, entry, _content = server
+    # expires_in=-10: already expired, so due_for_report fires immediately
+    # regardless of the idle-seconds default (a monkeypatched module
+    # constant would NOT retroactively change due_for_report's bound default
+    # parameter, since that's captured at function-definition time).
+    grant = _make_grant(
+        name="diffusion_models/model.bin", size_bytes=5000, seeder_id=entry.worker_id, expires_in=-10
+    )
+    srv._tracker.note_grant(grant, entry)
+    srv._tracker.add_bytes(grant["grant_id"], 1234)
+
+    monkeypatch.setattr(srv, "_post_peer_served", lambda *a, **k: False)
+
+    with caplog.at_level(logging.WARNING, logger="comfyfed_agent.peerserve"):
+        for _ in range(peerserve._MAX_REPORT_ATTEMPTS):
+            srv._report_due_grants()
+
+    assert grant["grant_id"] in srv._tracker._reported
+    assert any("giving up reporting bandwidth" in r.message for r in caplog.records)
+
+
+def test_report_due_grants_succeeds_before_hitting_the_cap(server, monkeypatch):
+    srv, signing_key, entry, _content = server
+    grant = _make_grant(
+        name="diffusion_models/model.bin", size_bytes=5000, seeder_id=entry.worker_id, expires_in=-10
+    )
+    srv._tracker.note_grant(grant, entry)
+    srv._tracker.add_bytes(grant["grant_id"], 1234)
+
+    calls = {"n": 0}
+
+    def _fake_post(*a, **k):
+        calls["n"] += 1
+        return calls["n"] >= 2  # fails once, then succeeds
+
+    monkeypatch.setattr(srv, "_post_peer_served", _fake_post)
+
+    srv._report_due_grants()
+    assert grant["grant_id"] not in srv._tracker._reported
+    srv._report_due_grants()
+    assert grant["grant_id"] in srv._tracker._reported
+    assert calls["n"] == 2
+
+
+# --- M6: listener hardening -------------------------------------------------
+
+
+def test_handler_class_has_a_socket_timeout(server):
+    srv, *_ = server
+    handler_cls = srv._httpd.RequestHandlerClass
+    assert getattr(handler_cls, "timeout", None) == 30
+
+
+def test_daemon_threads_enabled(server):
+    srv, *_ = server
+    assert srv._httpd.daemon_threads is True
+
+
+def test_peer_bind_host_config_defaults_to_all_interfaces():
+    from comfyfed_agent.config import AgentConfig
+
+    cfg = AgentConfig(peer_serve=True, peer_listen_port=8850)
+    assert cfg.peer_bind_host == "0.0.0.0"
+
+
+def test_peer_bind_host_config_can_be_overridden():
+    from comfyfed_agent.config import AgentConfig
+
+    cfg = AgentConfig(peer_serve=True, peer_listen_port=8850, peer_bind_host="127.0.0.1")
+    assert cfg.peer_bind_host == "127.0.0.1"

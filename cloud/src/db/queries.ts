@@ -1561,10 +1561,39 @@ export async function countActiveP2pGrantsForSeeder(db: D1Database, seederId: st
   return row?.n ?? 0;
 }
 
-/** Deletes expired grant rows -- mirrors peer.py's `_prune_expired`, called
- * opportunistically on issuance/booking. */
+/** M4 final-review fix: retention window (seconds) past `expires_at` before
+ * a grant row is actually pruned -- mirrors peer.py's
+ * `_GRANT_RETENTION_SECONDS`. A grant whose transfer is still active when
+ * its 600s TTL elapses must still be found by an expiry-triggered
+ * `peer-served` report; pruning at the exact TTL boundary guarantees that
+ * report 404s and retries forever. `countActiveP2pGrantsForSeeder`'s
+ * `expires_at > now` filter already keeps a retained-but-expired grant out
+ * of seeder selection, so this window only affects when the row is deleted. */
+export const GRANT_RETENTION_SECONDS = 3600;
+
+/** L1 final-review fix: hard cap on `p2p_grants` row count -- once exceeded,
+ * the oldest-created rows beyond the cap are deleted alongside the normal
+ * retention-window prune below. */
+export const MAX_P2P_GRANTS = 10000;
+
+/** Deletes grant rows past their retention window, and (L1) any excess rows
+ * beyond `MAX_P2P_GRANTS`, oldest-created first -- mirrors peer.py's
+ * `_prune_expired` + `_evict_oldest_beyond_cap`, called opportunistically on
+ * issuance/booking. */
 export async function pruneExpiredP2pGrants(db: D1Database, nowSeconds: number): Promise<void> {
-  await db.prepare("DELETE FROM p2p_grants WHERE expires_at <= ?").bind(nowSeconds).run();
+  await db
+    .prepare("DELETE FROM p2p_grants WHERE expires_at + ? <= ?")
+    .bind(GRANT_RETENTION_SECONDS, nowSeconds)
+    .run();
+  await db
+    .prepare(
+      `DELETE FROM p2p_grants WHERE grant_id IN (
+         SELECT grant_id FROM p2p_grants ORDER BY created_at ASC, grant_id ASC
+         LIMIT MAX((SELECT COUNT(*) FROM p2p_grants) - ?, 0)
+       )`
+    )
+    .bind(MAX_P2P_GRANTS)
+    .run();
 }
 
 // ---------------------------------------------------------------------------

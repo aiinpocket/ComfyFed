@@ -41,6 +41,23 @@ logger = logging.getLogger(__name__)
 # Global Constraints: TTL 600s, single file/puller/seeder per grant.
 GRANT_TTL_SECONDS = 600
 
+# M4 final-review fix: a grant whose transfer is still active when its TTL
+# elapses must still be able to book its bandwidth -- the seeder's
+# expiry-triggered report (peerserve.due_for_report fires at/after
+# expires_at) would otherwise race a prune that deletes the grant at exactly
+# that same boundary, guaranteeing every such report 404s and retries
+# forever. Retain an expired grant for this long past `expires_at` before
+# actually deleting it, so `peer_served` still finds it; issuance
+# (`_active_grant_count`) already only counts grants with `expires_at > now`,
+# so this retention window does not affect seeder selection.
+_GRANT_RETENTION_SECONDS = 3600
+
+# L1 final-review fix: hard cap on the in-memory grant book so an
+# authenticated worker looping `POST /api/agent/peer-grant` can't grow it
+# without bound even within the retention window above -- oldest-issued
+# entries are evicted first once the cap is hit.
+_MAX_GRANTS = 10000
+
 # Global Constraints: agent protocol becomes 4 for P2P; older agents never
 # advertise peer_url and are never picked as a seeder (see db.Worker.protocol).
 _MIN_PEER_PROTOCOL = 4
@@ -74,8 +91,24 @@ def _error(status_code: int, code: str, message: str = "") -> HTTPException:
 
 
 def _prune_expired(now: float) -> None:
-    expired = [grant_id for grant_id, g in _grants.items() if g["expires_at"] <= now]
+    """Delete grants that are past their RETENTION window (`_GRANT_RETENTION_SECONDS`
+    past `expires_at`), not merely past `expires_at` itself -- see
+    `_GRANT_RETENTION_SECONDS`'s docstring (M4) for why an exact-TTL prune
+    guarantees an expiry-triggered `peer_served` 404s."""
+    expired = [grant_id for grant_id, g in _grants.items() if g["expires_at"] + _GRANT_RETENTION_SECONDS <= now]
     for grant_id in expired:
+        del _grants[grant_id]
+
+
+def _evict_oldest_beyond_cap() -> None:
+    """L1 final-review fix: hard cap `_grants` at `_MAX_GRANTS`, evicting the
+    oldest-issued entries first (dict insertion order) once issuance would
+    exceed it -- bounds the in-memory book even for grants still inside
+    their retention window."""
+    overflow = len(_grants) - _MAX_GRANTS
+    if overflow <= 0:
+        return
+    for grant_id in list(_grants.keys())[:overflow]:
         del _grants[grant_id]
 
 
@@ -268,6 +301,7 @@ def create_router(data_dir: str) -> APIRouter:
                 raise _error(400, "peer.invalid_field", str(exc)) from exc
 
             _grants[grant_id] = {**grant, "booked": False}
+            _evict_oldest_beyond_cap()
 
             chunk_sha256s = json.loads(hash_row.chunk_sha256s) if hash_row.chunk_sha256s else None
             peer_url = seeder.peer_url

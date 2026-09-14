@@ -181,21 +181,68 @@ def _split_inventory_name(inventory_name: str) -> tuple[str, str]:
     return directory, remainder
 
 
-def _peer_only_entry(session, signing_key, row: db.ModelHash) -> Optional[dict]:
+def _seeder_candidate_files(session) -> frozenset[tuple[str, int, str]]:
+    """Every `(name, size_bytes, sha256)` triple currently offered by an
+    online, protocol>=4, peer_url-advertising worker -- built ONCE per
+    `entries()` call (final-review M3 fix) so the per-`model_hashes`-row loop
+    below can answer "does this row have an online seeder right now?" with an
+    O(1) set-membership check instead of calling `peer.online_seeders` (its
+    own `db.Worker` query plus a fresh `json.loads` of every worker's
+    `model_inventory`) once per row. Before this, R hash rows and W workers
+    meant R worker queries and R x W inventory parses every `entries()` call
+    (every 5s dispatch tick, per-request from jobs.py/comfyapi.py) -- this
+    hoists the worker query and every inventory parse out of that loop
+    entirely, to run exactly once.
+
+    Same predicate as `peer.online_seeders` (online, protocol>=4, peer_url
+    not null), reused as a plain SQL filter here since the module already
+    defines `_MIN_PEER_PROTOCOL`, rather than re-deriving it.
+    """
+    query = (
+        session.query(db.Worker)
+        .filter(db.Worker.status != "offline")
+        .filter(db.Worker.protocol >= peer._MIN_PEER_PROTOCOL)
+        .filter(db.Worker.peer_url.isnot(None))
+    )
+    files: set[tuple[str, int, str]] = set()
+    for worker in query.all():
+        for inv_entry in peer._worker_inventory(worker):
+            if not isinstance(inv_entry, dict):
+                continue
+            name = inv_entry.get("name")
+            size_bytes = inv_entry.get("size_bytes")
+            sha256 = inv_entry.get("sha256")
+            if not isinstance(name, str) or not isinstance(sha256, str):
+                continue
+            if not isinstance(size_bytes, int) or isinstance(size_bytes, bool):
+                continue
+            files.add((name, size_bytes, sha256))
+    return files
+
+
+def _row_has_seeder(row: db.ModelHash, seeder_files: frozenset[tuple[str, int, str]]) -> bool:
+    """Whether `row` (name, size_bytes, sha256) is in the batched
+    `_seeder_candidate_files()` set -- the per-row replacement for calling
+    `peer.online_seeders(session, row.name, row.size_bytes)` (see M3)."""
+    return (row.name, row.size_bytes, row.sha256) in seeder_files
+
+
+def _peer_only_entry(signing_key, row: db.ModelHash, seeder_files: frozenset[tuple[str, int, str]]) -> Optional[dict]:
     """Build a peer-only manifest entry for `row` (a non-conflicted
     `model_hashes` row with no known download source), or None when it has no
     online seeder right now.
 
     This is `entries()`'s embodiment of the task brief's `fetchable(name,
-    size)` predicate for the peer branch: "consensus hash exists AND
-    `peer.online_seeders(...)` is non-empty" -- `online_seeders` is the
-    single seeder predicate (see its docstring), imported and reused here
-    rather than re-derived, exactly as the plan's Global Constraints require.
+    size)` predicate for the peer branch: "consensus hash exists AND at least
+    one online seeder offers it" -- `seeder_files`, the batched set built
+    once per `entries()` call by `_seeder_candidate_files` (M3), replaces a
+    direct `peer.online_seeders` call here so this stays a cheap set lookup
+    per row instead of its own DB query + inventory parse.
     `url`/`backup_url` are None and `peer: True` marks the entry so a
     consumer (assess.verdict's protocol>=4 gate, the agent fetcher) knows
     this model has no URL fallback at all.
     """
-    if not peer.online_seeders(session, row.name, row.size_bytes):
+    if not _row_has_seeder(row, seeder_files):
         return None
 
     directory, name = _split_inventory_name(row.name)
@@ -271,6 +318,10 @@ def entries(data_dir: str) -> list[dict]:
             session.query(db.ModelHash).filter(db.ModelHash.conflict == False).all()  # noqa: E712
         )
 
+        # M3 final-review fix: one worker query + one inventory parse per
+        # worker for this whole call, instead of once per hash row below.
+        seeder_files = _seeder_candidate_files(session)
+
         result: list[dict] = []
         used_rows: set[tuple[str, int]] = set()
         for name in sorted(names):
@@ -313,7 +364,7 @@ def entries(data_dir: str) -> list[dict]:
                 "size_bytes": row.size_bytes,
                 "sig": sig,
             }
-            if peer.online_seeders(session, row.name, row.size_bytes):
+            if _row_has_seeder(row, seeder_files):
                 entry["peer"] = True
             result.append(entry)
             used_rows.add((row.name, row.size_bytes))
@@ -325,7 +376,7 @@ def entries(data_dir: str) -> list[dict]:
             key = (row.name, row.size_bytes)
             if key in used_rows:
                 continue
-            peer_entry = _peer_only_entry(session, signing_key, row)
+            peer_entry = _peer_only_entry(signing_key, row, seeder_files)
             if peer_entry is not None:
                 result.append(peer_entry)
 

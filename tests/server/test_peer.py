@@ -447,6 +447,67 @@ def test_peer_grant_picks_seeder_with_fewest_active_grants_then_name(client):
     assert second.json()["grant"]["seeder_id"] == seeder_b  # seeder-a now has 1 active grant
 
 
+# --- M4: expiry-triggered reports must still book within the retention window
+
+
+def test_peer_served_books_a_grant_reported_after_its_ttl_expired(client):
+    """M4 final-review fix: `peerserve.due_for_report` fires an expiry-
+    triggered report at/after `expires_at` -- the grant must still be found
+    (and bookable) at that moment, not just up to the exact TTL boundary."""
+    csrf = _login(client)
+    grant, seeder_id, seeder_sk, _, _ = _issue_grant(client, csrf)
+
+    with peer._grant_lock:
+        peer._grants[grant["grant_id"]]["expires_at"] = int(time.time()) - 1
+
+    r = _agent_post(
+        client, seeder_id, seeder_sk, "/api/agent/peer-served",
+        {"grant_id": grant["grant_id"], "bytes_served": _bytes(1.0)},
+    )
+    assert r.status_code == 200
+
+
+def test_peer_served_404s_once_the_retention_window_has_passed(client):
+    csrf = _login(client)
+    grant, seeder_id, seeder_sk, _, _ = _issue_grant(client, csrf)
+
+    with peer._grant_lock:
+        peer._grants[grant["grant_id"]]["expires_at"] = (
+            int(time.time()) - peer._GRANT_RETENTION_SECONDS - 1
+        )
+
+    r = _agent_post(
+        client, seeder_id, seeder_sk, "/api/agent/peer-served",
+        {"grant_id": grant["grant_id"], "bytes_served": _bytes(1.0)},
+    )
+    assert r.status_code == 404
+    assert r.json()["error"]["code"] == "peer.no_grant"
+
+
+def test_grant_book_evicts_oldest_entries_beyond_the_cap(client, monkeypatch):
+    monkeypatch.setattr(peer, "_MAX_GRANTS", 3)
+    now = time.time()
+    for i in range(3):
+        peer._grants[f"old-{i}"] = {
+            "grant_id": f"old-{i}", "name": "x", "size_bytes": 1, "sha256": "s",
+            "seeder_id": "s1", "puller_id": "p1", "expires_at": int(now) + 600, "booked": False,
+        }
+
+    csrf = _login(client)
+    sha = _sha("model")
+    _make_online_seeder(client, csrf, "seeder", sha256=sha)
+    puller_id, puller_sk = _register_worker(client, csrf, "puller")
+
+    r = _agent_post(
+        client, puller_id, puller_sk, "/api/agent/peer-grant",
+        {"name": "checkpoints/model.safetensors", "size_bytes": _bytes(1.0)},
+    )
+    assert r.status_code == 200
+    assert len(peer._grants) == 3
+    assert "old-0" not in peer._grants  # oldest evicted first
+    assert r.json()["grant"]["grant_id"] in peer._grants
+
+
 # --- POST /api/agent/peer-served -------------------------------------------
 
 

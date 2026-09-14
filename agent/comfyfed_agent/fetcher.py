@@ -538,16 +538,25 @@ async def _pull_chunks_from_offset(
     cancel_event,
     on_bytes: Callable[[int], Awaitable[None]],
     client_factory: Callable[..., httpx.AsyncClient],
+    ignore_chunk_verification: bool = False,
 ) -> None:
     """Pull `target_path`'s `.part` from `start_offset` through end-of-file
     via sequential `_PEER_CHUNK_SIZE` Range GETs against the seeder,
     appending each verified chunk. Raises `comfy.JobCancelled`,
     `_PeerGrantExpired`, `_PeerChunkMismatch`, or `_PeerFailure` -- never
     returns partway through, always either finishes (returns normally, every
-    byte through `size_bytes` on disk) or raises."""
+    byte through `size_bytes` on disk) or raises.
+
+    `ignore_chunk_verification=True` (the spec's 整檔重驗兜底, M2 final-review
+    fix) skips the per-chunk hash check entirely regardless of whether the
+    grant carries a `chunk_sha256s` list -- used for the one blind retry
+    `_fetch_via_peer` makes after a chunk mismatch, since a poisoned/wrong
+    chunk table must not be able to permanently block a peer-only model: the
+    mandatory whole-file SHA-256 in `_finalize_download` is still the actual
+    trust root either way."""
     size_bytes = entry.get("size_bytes")
     part_path = target_path + _PART_SUFFIX
-    chunk_sha256s = grant_response.get("chunk_sha256s")
+    chunk_sha256s = None if ignore_chunk_verification else grant_response.get("chunk_sha256s")
     peer_url = grant_response.get("peer_url")
     grant = grant_response.get("grant")
     if not isinstance(peer_url, str) or not peer_url or not isinstance(grant, dict) or "sig" not in grant:
@@ -657,9 +666,16 @@ async def _fetch_via_peer(
     # of "a fresh grant could not be obtained at all" (_request_peer_grant
     # returning None), which already bails immediately with no cap needed.
     no_progress_regrants = 0
+    # Set once a chunk mismatch has already triggered the one blind retry
+    # below (M2 final-review fix, spec 整檔重驗兜底) -- a second mismatch while
+    # ALREADY ignoring the chunk list is a genuine unrecoverable peer failure
+    # (bad data from the network, not a bad chunk table), so it falls back to
+    # the URL chain exactly as before.
+    blind_retry_used = False
 
     while True:
         offset_before_attempt = offset
+        ignore_chunks = blind_retry_used
         try:
             await _pull_chunks_from_offset(
                 entry=entry,
@@ -670,6 +686,7 @@ async def _fetch_via_peer(
                 cancel_event=cancel_event,
                 on_bytes=on_bytes,
                 client_factory=peer_client_factory,
+                ignore_chunk_verification=ignore_chunks,
             )
             break
         except _PeerGrantExpired:
@@ -708,8 +725,27 @@ async def _fetch_via_peer(
                     return False
             continue
         except _PeerChunkMismatch:
+            if not blind_retry_used:
+                # Spec's 整檔重驗兜底: a chunk list can be poisoned by a
+                # malicious/buggy reporter (final-review M2) without the
+                # whole-file hash itself being wrong, so a mismatch alone
+                # must not permanently block a peer-only model. Discard the
+                # chunk-verified prefix (it was checked against a chunk list
+                # we no longer trust at all) and pull the ENTIRE file again
+                # from this same seeder with chunk verification off -- the
+                # mandatory whole-file SHA-256 below is still the actual
+                # trust root, exactly as it always is.
+                logger.info(
+                    "fetcher: peer chunk hash mismatch for %r, retrying once blind "
+                    "(ignoring chunk list, whole-file sha256 will adjudicate)", name
+                )
+                _safe_unlink(part_path)
+                offset = 0
+                blind_retry_used = True
+                continue
             logger.info(
-                "fetcher: peer chunk hash mismatch for %r, falling back to URL chain", name
+                "fetcher: peer chunk hash mismatch for %r persisted through the blind "
+                "retry, falling back to URL chain", name
             )
             _safe_unlink(part_path)
             return False

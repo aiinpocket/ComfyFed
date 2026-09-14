@@ -86,6 +86,14 @@ _IDLE_REPORT_SECONDS = 60.0
 _REPORT_POLL_SECONDS = 5.0
 _ROUTE_PREFIX = "/peer/models/"
 
+# M4 final-review fix: cap consecutive failed `peer-served` report attempts
+# per grant -- an unbounded retry loop (the pre-fix behavior) means a grant
+# rejected for any terminal reason (the platform pruned it, already booked,
+# bad bytes, wrong seeder) polls forever for the rest of this process's
+# life. After this many failed attempts, give up and log once rather than
+# silently retrying, so a stuck grant is at least visible in the logs.
+_MAX_REPORT_ATTEMPTS = 5
+
 # Ordered exactly as comfyfed_server.peer._GRANT_FIELDS / the signed payload
 # (Global Constraints: grant_id|name|size_bytes|sha256|seeder_id|puller_id|expires_at).
 _GRANT_FIELDS = ("grant_id", "name", "size_bytes", "sha256", "seeder_id", "puller_id", "expires_at")
@@ -307,6 +315,7 @@ class _GrantTracker:
         self._last_activity: dict[str, float] = {}
         self._expires_at: dict[str, int] = {}
         self._reported: set = set()
+        self._report_attempts: dict[str, int] = {}
 
     def note_grant(self, grant: dict, platform: PlatformEntry) -> None:
         grant_id = grant["grant_id"]
@@ -367,6 +376,13 @@ class _GrantTracker:
         with self._lock:
             self._reported.add(grant_id)
 
+    def record_failed_attempt(self, grant_id: str) -> int:
+        """Increment and return the failed-report attempt count for
+        `grant_id` (M4 final-review fix's retry cap)."""
+        with self._lock:
+            self._report_attempts[grant_id] = self._report_attempts.get(grant_id, 0) + 1
+            return self._report_attempts[grant_id]
+
 
 def _make_handler_class(server_state: "_ServerState") -> type:
     """Build a `BaseHTTPRequestHandler` subclass closed over `server_state`
@@ -378,6 +394,15 @@ def _make_handler_class(server_state: "_ServerState") -> type:
     class _Handler(BaseHTTPRequestHandler):
         server_version = "ComfyFedPeer/1"
         protocol_version = "HTTP/1.1"
+        # M6 final-review fix: `BaseHTTPRequestHandler` sets no socket
+        # timeout by default, so an unauthenticated client that opens a
+        # keep-alive connection and sends nothing blocks `rfile.readline()`
+        # indefinitely -- with `ThreadingHTTPServer` spawning one thread per
+        # connection and no cap, enough idle connections exhaust threads/file
+        # handles on the machine that's also running ComfyUI jobs. This
+        # attribute is `socketserver.BaseRequestHandler`'s own timeout hook:
+        # it reaps an idle connection (read/handle timeout) after 30s.
+        timeout = 30
 
         def log_message(self, fmt: str, *args) -> None:  # noqa: A002
             logger.debug("peerserve: %s - " + fmt, self.client_address[0], *args)
@@ -415,12 +440,15 @@ def _make_handler_class(server_state: "_ServerState") -> type:
                 self._deny(403)
                 return
 
-            resolved = server_state.index.resolve(name)
-            if resolved is None:
-                self._deny(404)
-                return
-            abs_path, size_bytes = resolved
-
+            # M5 final-review fix: authorize the grant BEFORE ever consulting
+            # the model index. `authorize_grant` only needs the requested
+            # `name` string (not whether this agent actually has that file),
+            # so this ordering costs nothing -- and it means an
+            # unauthenticated request can no longer distinguish "no such
+            # model" (previously 404, before auth) from "auth failed"
+            # (403): both are now 403, and the index (a directory-scan-backed
+            # lookup) is never even queried for a request that fails auth,
+            # closing the pre-auth model-inventory oracle.
             grant_header = self.headers.get("X-ComfyFed-Grant")
             if not grant_header:
                 self._deny(403)
@@ -435,6 +463,12 @@ def _make_handler_class(server_state: "_ServerState") -> type:
             if platform is None:
                 self._deny(403)
                 return
+
+            resolved = server_state.index.resolve(name)
+            if resolved is None:
+                self._deny(404)
+                return
+            abs_path, size_bytes = resolved
 
             server_state.tracker.note_grant(grant, platform)
 
@@ -585,9 +619,20 @@ class PeerHTTPServer:
                 continue
             if self._post_peer_served(platform, grant_id, bytes_served):
                 self._tracker.mark_reported(grant_id)
-            # On failure, leave it un-reported: the next poll retries with
-            # whatever additional bytes may have accrued since (pragmatic
-            # MVP -- no cap on retries, matching the brief).
+                continue
+            # M4 final-review fix: on failure, leave it un-reported so the
+            # next poll retries (whatever additional bytes may have accrued
+            # since) UP TO `_MAX_REPORT_ATTEMPTS` -- beyond that, a stuck
+            # grant (platform pruned it, already booked by a prior attempt
+            # that timed out client-side, or any other terminal rejection)
+            # must not retry for the rest of this process's life.
+            attempts = self._tracker.record_failed_attempt(grant_id)
+            if attempts >= _MAX_REPORT_ATTEMPTS:
+                logger.warning(
+                    "peerserve: giving up reporting bandwidth for grant %s after %d failed attempts",
+                    grant_id, attempts,
+                )
+                self._tracker.mark_reported(grant_id)
 
     def _post_peer_served(self, entry: PlatformEntry, grant_id: str, bytes_served: int) -> bool:
         path = "/api/agent/peer-served"

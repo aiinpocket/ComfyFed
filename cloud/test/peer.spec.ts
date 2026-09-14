@@ -4,6 +4,7 @@ import { call, db, SETUP_TOKEN } from "./helpers/http";
 import * as modelManifest from "../src/core/model_manifest";
 import * as modelGuide from "../src/core/model_guide";
 import { resolvePlatformSeed } from "../src/db/queries";
+import * as queries from "../src/db/queries";
 import { derivePublicKeyHexFromSeed, verifyHex } from "../src/lib/ed25519";
 import { signRequest } from "../src/lib/signing";
 import golden from "./fixtures/golden.json";
@@ -332,6 +333,37 @@ describe("POST /api/agent/peer-served", () => {
   it("404s peer.no_grant for an unknown grant_id", async () => {
     const seeder = await registerWorker("seeder", 1);
     const r = await signedPost(seeder, "/api/agent/peer-served", { grant_id: "nonexistent", bytes_served: 100 });
+    expect(r.status).toBe(404);
+    expect(r.body.error.code).toBe("peer.no_grant");
+  });
+
+  it("M4: books a grant reported after its TTL expired but within the retention window", async () => {
+    const puller = await registerWorker("puller", 0);
+    const seeder = await registerWorker("seeder", 1);
+    const sizeBytes = bytesFor(1.0);
+    const { grantId } = await issueGrant(puller, seeder, "loras/a.safetensors", sizeBytes, await shaHex("model-a"));
+
+    await db()
+      .prepare("UPDATE p2p_grants SET expires_at = ? WHERE grant_id = ?")
+      .bind(Math.floor(Date.now() / 1000) - 1, grantId)
+      .run();
+
+    const r = await signedPost(seeder, "/api/agent/peer-served", { grant_id: grantId, bytes_served: sizeBytes });
+    expect(r.status).toBe(200);
+  });
+
+  it("M4: 404s peer.no_grant once the retention window has fully passed", async () => {
+    const puller = await registerWorker("puller", 0);
+    const seeder = await registerWorker("seeder", 1);
+    const sizeBytes = bytesFor(1.0);
+    const { grantId } = await issueGrant(puller, seeder, "loras/a.safetensors", sizeBytes, await shaHex("model-a"));
+
+    await db()
+      .prepare("UPDATE p2p_grants SET expires_at = ? WHERE grant_id = ?")
+      .bind(Math.floor(Date.now() / 1000) - queries.GRANT_RETENTION_SECONDS - 1, grantId)
+      .run();
+
+    const r = await signedPost(seeder, "/api/agent/peer-served", { grant_id: grantId, bytes_served: sizeBytes });
     expect(r.status).toBe(404);
     expect(r.body.error.code).toBe("peer.no_grant");
   });

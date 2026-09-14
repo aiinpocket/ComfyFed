@@ -62,6 +62,18 @@ def _coerce_optional_str(value, default: str | None) -> str | None:
     return default
 
 
+def _coerce_str(value, default: str) -> str:
+    """`peer_bind_host` from agent.json (M6 final-review fix): a non-empty
+    string passes through, anything else (missing, empty, wrong type) falls
+    back to `default` -- same defensive posture as the other coercers, so a
+    malformed hand-edited value degrades to the safe default (still
+    `"0.0.0.0"`, unchanged behavior) instead of raising or binding to
+    something unintended."""
+    if isinstance(value, str) and value:
+        return value
+    return default
+
+
 @dataclass
 class PlatformEntry:
     platform_url: str
@@ -103,6 +115,13 @@ class AgentConfig:
     peer_serve: bool = False
     peer_listen_port: int | None = None
     peer_advertise_host: str | None = None
+    # M6 final-review fix: which interface(s) the peer listener binds --
+    # defaults to "0.0.0.0" (unchanged behavior) but is now user-configurable
+    # so a worker on a machine with a public IP can bind LAN-only (e.g.
+    # "127.0.0.1" behind a reverse proxy, or a specific LAN interface IP)
+    # instead of exposing the listener to the internet the moment
+    # `peer_serve` is enabled.
+    peer_bind_host: str = "0.0.0.0"
 
     @classmethod
     def load(cls, path: str) -> "AgentConfig":
@@ -135,6 +154,7 @@ class AgentConfig:
             peer_advertise_host=_coerce_optional_str(
                 data.get("peer_advertise_host"), cls.peer_advertise_host
             ),
+            peer_bind_host=_coerce_str(data.get("peer_bind_host"), cls.peer_bind_host),
         )
 
     def save(self, path: str) -> None:
@@ -158,6 +178,7 @@ class AgentConfig:
             "peer_serve": self.peer_serve,
             "peer_listen_port": self.peer_listen_port,
             "peer_advertise_host": self.peer_advertise_host,
+            "peer_bind_host": self.peer_bind_host,
         }
 
         tmp_path = f"{path}.tmp-{os.getpid()}"

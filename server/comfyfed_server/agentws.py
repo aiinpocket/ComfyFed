@@ -1303,6 +1303,8 @@ async def dispatch_tick() -> None:
         except Exception:
             logger.exception("agentws: failed to relay requeued jobs to the panel")
 
+    idle_worker_ids = [worker_id for worker_id, conn in _connections.items() if conn.state == "idle"]
+
     # Compiled ONCE per sweep, not per candidate/job: `fetchable_models`
     # (name -> size_bytes) feeds `assess.verdict` inside `assign_jobs`'s
     # ranking AND the per-push recompute below; `manifest_by_name` (name ->
@@ -1310,10 +1312,27 @@ async def dispatch_tick() -> None:
     # push once a name is confirmed missing. `_data_dir` unset (no router
     # registered -- practically only in ad-hoc tests) degrades to "nothing
     # fetchable", identical to Task 3's default.
+    #
+    # M3 final-review fix: skipped entirely unless there is BOTH an idle
+    # worker to dispatch to AND a queued job for it to be dispatched against
+    # this tick -- `assign_jobs` is a no-op without both, so building the
+    # manifest (a worker query + every online seeder's inventory parse,
+    # `model_guide.harvest`'s directory scan) every `_TICK_INTERVAL_SECONDS`
+    # would be pure waste. Mirrors `hub.ts`'s `hasQueuedWork` gate, which
+    # already did this on the cloud stack.
     fetchable_models: dict[str, int] = {}
     manifest_by_name: dict[str, dict] = {}
     peer_only_models: frozenset[str] = frozenset()
-    if _data_dir is not None:
+    has_queued_work = False
+    if idle_worker_ids:
+        try:
+            with db.get_session() as session:
+                has_queued_work = (
+                    session.query(db.Job.id).filter(db.Job.status == "queued").first() is not None
+                )
+        except Exception:
+            logger.exception("agentws: failed to check for queued work")
+    if has_queued_work and _data_dir is not None:
         try:
             manifest_entries = model_manifest.entries(_data_dir)
             fetchable_models = {e["name"]: e["size_bytes"] for e in manifest_entries}
@@ -1321,8 +1340,6 @@ async def dispatch_tick() -> None:
             peer_only_models = model_manifest.peer_only_names(manifest_entries)
         except Exception:
             logger.exception("agentws: failed to build fetch manifest for dispatch tick")
-
-    idle_worker_ids = [worker_id for worker_id, conn in _connections.items() if conn.state == "idle"]
     try:
         assignments = dispatch.assign_jobs(idle_worker_ids, fetchable_models, peer_only_models)
     except Exception:

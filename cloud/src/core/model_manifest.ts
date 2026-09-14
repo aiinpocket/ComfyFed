@@ -154,9 +154,12 @@ function splitInventoryName(inventoryName: string): [directory: string, name: st
  * `backup_url` are null and `peer: true` marks the entry so a consumer
  * (`core/assess.ts`'s protocol>=4 gate, the agent fetcher) knows this model
  * has no URL fallback at all. */
-async function peerOnlyEntry(db: D1Database, seedHex: string, row: queries.ModelHashRow): Promise<ManifestEntry | null> {
-  const seeders = await peer.onlineSeeders(db, row.name, row.sizeBytes);
-  if (seeders.length === 0) return null;
+async function peerOnlyEntry(
+  seedHex: string,
+  row: queries.ModelHashRow,
+  seederFiles: ReadonlySet<string>
+): Promise<ManifestEntry | null> {
+  if (!peer.rowHasSeeder(row, seederFiles)) return null;
 
   const [directory, name] = splitInventoryName(row.name);
 
@@ -209,6 +212,10 @@ export async function entries(db: D1Database, store: R2Bucket, seedHex: string):
 
   const hashRows = await queries.getAllModelHashes(db);
 
+  // M3 final-review fix: one worker query + one inventory parse per worker
+  // for this whole call, instead of once per hash row below.
+  const seederFiles = await peer.seederCandidateFiles(db);
+
   const result: ManifestEntry[] = [];
   const usedRows = new Set<string>();
   for (const name of [...names].sort()) {
@@ -242,7 +249,7 @@ export async function entries(db: D1Database, store: R2Bucket, seedHex: string):
       size_bytes: row.sizeBytes,
       sig,
     };
-    if ((await peer.onlineSeeders(db, row.name, row.sizeBytes)).length > 0) {
+    if (peer.rowHasSeeder(row, seederFiles)) {
       entry.peer = true;
     }
     result.push(entry);
@@ -254,7 +261,7 @@ export async function entries(db: D1Database, store: R2Bucket, seedHex: string):
   // right now.
   for (const row of hashRows) {
     if (usedRows.has(`${row.name} ${row.sizeBytes}`)) continue;
-    const peerEntry = await peerOnlyEntry(db, seedHex, row);
+    const peerEntry = await peerOnlyEntry(seedHex, row, seederFiles);
     if (peerEntry !== null) result.push(peerEntry);
   }
 

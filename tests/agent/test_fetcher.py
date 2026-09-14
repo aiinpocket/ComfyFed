@@ -837,16 +837,79 @@ async def test_peer_happy_path_multi_chunk_pull(tmp_path, monkeypatch):
         srv.stop()
 
 
-async def test_peer_chunk_mismatch_falls_back_to_url(tmp_path, monkeypatch):
-    """A per-chunk hash mismatch abandons the peer source entirely (`.part`
-    cleared, no retry against the peer) and falls to the URL chain, which
-    completes normally."""
+async def test_peer_poisoned_chunk_list_recovers_via_blind_retry(tmp_path, monkeypatch):
+    """M2 final-review fix (spec's 整檔重驗兜底): a poisoned/wrong chunk list
+    must not permanently brick a peer pull when the actual file content is
+    correct. A per-chunk hash mismatch triggers exactly ONE additional peer
+    attempt with chunk verification disabled (pull blind, rely on the
+    mandatory whole-file SHA-256 in `_finalize_download`); since the seeder's
+    bytes are genuinely correct, that blind retry succeeds and the URL chain
+    is never touched."""
     monkeypatch.setattr(fetcher, "_PEER_CHUNK_SIZE", 1000)
 
     content = os.urandom(3000)
     seed_dir = tmp_path / "seed"
     (seed_dir / "checkpoints").mkdir(parents=True)
     (seed_dir / "checkpoints" / "model.bin").write_bytes(content)
+
+    seeder_signing_key, seeder_entry = _platform(worker_id="seeder-1")
+    srv = peerserve.PeerHTTPServer(
+        models_dir=str(seed_dir), port=0, platforms=[seeder_entry], bind_host="127.0.0.1"
+    )
+    srv.start()
+    try:
+        manifest_key, manifest_pubkey_hex = _keypair()
+        entry = _signed_entry(
+            manifest_key, name="model.bin", directory="checkpoints", content=content,
+            url="http://models.example/should-not-be-fetched",
+        )
+
+        bad_chunks = _chunk_sha256s(content, 1000)
+        bad_chunks[1] = "0" * 64  # corrupt the second chunk's expected hash (poisoned table)
+
+        issuer = _grant_issuer(
+            name="checkpoints/model.bin", size_bytes=len(content), seeder_id=seeder_entry.worker_id,
+            signing_key=seeder_signing_key, peer_url=f"http://127.0.0.1:{srv.port}",
+            chunk_sha256s=bad_chunks,
+        )
+
+        dest = tmp_path / "dest"
+        await fetcher.fetch_and_verify_models(
+            entries=[entry],
+            platform_pubkey_hex=manifest_pubkey_hex,
+            models_dir=str(dest),
+            max_fetch_gb=100,
+            cancel_event=asyncio.Event(),
+            report_progress=_noop_progress,
+            client_factory=_ExplodingURLClient,  # URL chain must never run
+            platform_entry=_puller_platform_entry(),
+            peer_client_factory=httpx.AsyncClient,
+            platform_client_factory=_platform_client_factory(issuer),
+        )
+
+        final_path = dest / "checkpoints" / "model.bin"
+        assert final_path.read_bytes() == content
+        assert not (dest / "checkpoints" / "model.bin.part").exists()
+        # Same grant reused for the blind retry -- no re-grant needed since
+        # it never expired, only the chunk list was distrusted.
+        assert issuer.calls() == 1
+    finally:
+        srv.stop()
+
+
+async def test_peer_chunk_mismatch_persists_through_blind_retry_falls_back_to_url(tmp_path, monkeypatch):
+    """When even the blind retry can't produce a whole-file match (the
+    seeder's actual bytes are wrong, not just its chunk table), the peer
+    source is genuinely abandoned after the one retry and the URL chain
+    runs -- the fallback path still exists, it's just no longer triggered by
+    a chunk-list-only problem."""
+    monkeypatch.setattr(fetcher, "_PEER_CHUNK_SIZE", 1000)
+
+    content = os.urandom(3000)
+    wrong_content = os.urandom(3000)  # what the seeder actually serves
+    seed_dir = tmp_path / "seed"
+    (seed_dir / "checkpoints").mkdir(parents=True)
+    (seed_dir / "checkpoints" / "model.bin").write_bytes(wrong_content)
 
     seeder_signing_key, seeder_entry = _platform(worker_id="seeder-1")
     srv = peerserve.PeerHTTPServer(
@@ -887,10 +950,10 @@ async def test_peer_chunk_mismatch_falls_back_to_url(tmp_path, monkeypatch):
         )
 
         final_path = dest / "checkpoints" / "model.bin"
-        assert final_path.read_bytes() == content
+        assert final_path.read_bytes() == content  # landed via URL chain, correct content
         assert not (dest / "checkpoints" / "model.bin.part").exists()
         assert recorded == [entry["url"]]
-        assert issuer.calls() == 1  # peer tried exactly once, no retry loop after a mismatch
+        assert issuer.calls() == 1  # same grant reused for the blind retry, no re-grant
     finally:
         srv.stop()
 
