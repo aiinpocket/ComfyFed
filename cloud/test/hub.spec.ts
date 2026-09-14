@@ -422,6 +422,35 @@ describe("job_done", () => {
     ws.close();
   });
 
+  it("accepts an in-flight receipt_ack from a worker deleted mid-flight (review L7)", async () => {
+    // `handleReceiptAck` resolves the worker with the UNFILTERED lookup: the
+    // delete route's fire-and-forget kick normally closes the socket first,
+    // but if it loses the race (or fails) the ack must still land -- otherwise
+    // that receipt keeps `worker_sig = NULL` forever with no retry path. Every
+    // other live handler (hello/heartbeat/inventory) may keep dropping.
+    const kp = KEYPAIRS[0]!;
+    const workerId = await makeWorker({ pubkeyHex: kp.pubkey_hex });
+    const ws = await connectAgent(workerId, kp.seed_hex);
+    ws.send(JSON.stringify({ type: "hello", protocol: 2 }));
+
+    const jobId = await makeJob({ status: "running", workerId, startedAt: new Date(Date.now() - 10_000) });
+    const receiptMsg = nextMessage(ws);
+    ws.send(JSON.stringify({ type: "job_done", job_id: jobId, result_files: ["a.png"], exec_seconds: 5 }));
+    const receipt = await receiptMsg;
+
+    // The admin deletes the worker while the ack is in flight.
+    await db().prepare("UPDATE workers SET deleted = 1, disabled = 1 WHERE id = ?").bind(workerId).run();
+    expect(await getWorkerById(db(), workerId)).toBeNull();
+
+    const workerSig = await signHex(kp.seed_hex, new TextEncoder().encode(receipt.payload));
+    ws.send(JSON.stringify({ type: "receipt_ack", receipt_id: receipt.receipt_id, worker_sig: workerSig }));
+    await new Promise((r) => setTimeout(r, 50));
+
+    const acked = await getReceiptsForJob(db(), jobId);
+    expect(acked[0]!.workerSig).toBe(workerSig);
+    ws.close();
+  });
+
   it("caps exec_seconds at the wall-clock span", async () => {
     const kp = KEYPAIRS[0]!;
     const workerId = await makeWorker({ pubkeyHex: kp.pubkey_hex });

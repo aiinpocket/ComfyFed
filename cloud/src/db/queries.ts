@@ -294,6 +294,18 @@ export async function getWorkerById(db: D1Database, id: string): Promise<Worker 
   return row ? rowToWorker(row) : null;
 }
 
+/** A worker by id INCLUDING soft-deleted rows -- the ledger-side twin of
+ * `getWorkerById`, for the same reason `getWorkersByIds` is unfiltered.
+ * Its one caller is the Hub DO's `receipt_ack` handler: an ack already in
+ * flight when the admin deleted the worker still has to be verified and
+ * stored, or that receipt keeps `worker_sig = NULL` forever with no retry
+ * path (the socket is closed moments later). Never use it on a live path --
+ * authentication and dispatch must keep reading a deleted row as absent. */
+export async function getWorkerByIdIncludingDeleted(db: D1Database, id: string): Promise<Worker | null> {
+  const row = await db.prepare("SELECT * FROM workers WHERE id = ?").bind(id).first<WorkerRow>();
+  return row ? rowToWorker(row) : null;
+}
+
 export async function getWorkersByIds(db: D1Database, ids: string[]): Promise<Worker[]> {
   if (ids.length === 0) return [];
   const placeholders = ids.map(() => "?").join(",");
@@ -862,6 +874,9 @@ export async function getOnlinePeerCapableWorkers(
   minProtocol: number,
   excludeWorkerId?: string
 ): Promise<Worker[]> {
+  // No `deleted = 0` clause, same accepted ~90s window as `peer.online_seeders`
+  // (review L6): a just-deleted seeder stays eligible until the stale sweep
+  // marks it offline, and the worst case is one wasted fetch round trip.
   let sql = "SELECT * FROM workers WHERE status != 'offline' AND protocol >= ? AND peer_url IS NOT NULL";
   const binds: unknown[] = [minProtocol];
   if (excludeWorkerId !== undefined) {

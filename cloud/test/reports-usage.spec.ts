@@ -359,6 +359,21 @@ describe("GET /api/reports/payout", () => {
     expect(r.body.workers.map((w: any) => w.gpu_seconds)).toEqual([30, 10]);
   });
 
+  it("still pays out a SOFT-DELETED worker, by name (review M4)", async () => {
+    // Same unfiltered `getWorkersByIds` invariant reports.spec.ts pins for
+    // /contributions: a deleted worker's already-earned seconds stay payable.
+    const admin = await adminSession();
+    await insertWorker("w1", "retired-rig");
+    await db().prepare("UPDATE workers SET deleted = 1, disabled = 1 WHERE id = 'w1'").run();
+    await insertReceipt({ id: "j1", jobId: "j1", workerId: "w1", gpuSeconds: 30 });
+
+    const r = await call("/api/reports/payout?pool=100", { method: "GET", cookie: admin.cookie });
+    expect(r.status).toBe(200);
+    expect(r.body.total_gpu_seconds).toBe(30);
+    expect(r.body.workers).toHaveLength(1);
+    expect(r.body.workers[0]).toMatchObject({ worker_id: "w1", name: "retired-rig", gpu_seconds: 30, amount: 100 });
+  });
+
   it("returns an empty workers list on a zero total instead of dividing by zero", async () => {
     const admin = await adminSession();
     const r = await call("/api/reports/payout?pool=50", { method: "GET", cookie: admin.cookie });

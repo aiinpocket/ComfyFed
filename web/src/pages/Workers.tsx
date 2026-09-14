@@ -182,7 +182,11 @@ export function Workers() {
             }
           />
         ) : (
-          <Table.ScrollContainer minWidth={880}>
+          <Table.ScrollContainer
+            // 980 = the old 880 + the action column's growth (110 -> 210)
+            // when the disable + delete pair replaced disable alone.
+            minWidth={980}
+          >
             <Table verticalSpacing="sm" horizontalSpacing="md" highlightOnHover>
               <Table.Thead style={{ background: theme.other.surfaces.raised }}>
                 <Table.Tr>
@@ -275,9 +279,13 @@ export function Workers() {
                             {t('workers.disable')}
                           </Button>
                         )}
+                        {/* Deliberately NOT a second `variant="subtle"`
+                            red button: delete is irreversible and sits right
+                            next to disable, so it carries its own outline
+                            weight to break the misclick pair. */}
                         <Button
                           size="compact-sm"
-                          variant="subtle"
+                          variant="outline"
                           color="red"
                           leftSection={<IconTrash size={14} />}
                           onClick={() => setDeleteTarget(worker)}
@@ -326,6 +334,9 @@ export function Workers() {
       >
         <Stack gap="md">
           <Text size="sm">{t('workers.delete_confirm', { name: deleteTarget?.name ?? '' })}</Text>
+          <Text size="xs" c="dimmed">
+            {t('workers.delete_confirm_hint')}
+          </Text>
           <Group justify="flex-end" gap="sm">
             <Button variant="default" onClick={() => setDeleteTarget(null)}>
               {t('common.cancel')}

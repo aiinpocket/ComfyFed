@@ -170,6 +170,37 @@ describe("GET /api/reports/contributions", () => {
     expect(r.body[0].name).toBe("");
   });
 
+  it("still names a SOFT-DELETED worker (the whole point of the soft delete -- review M4)", async () => {
+    // `getWorkersByIds` is deliberately UNFILTERED, unlike `getWorkerById`/
+    // `getAllWorkers`: the billing ledger has to keep resolving a deleted
+    // worker's historical receipts. A future "tidy up: filter deleted here
+    // too" would silently blank these names, hence this pin.
+    const { cookie } = await adminSession();
+    await insertWorker("w1", "retired-rig");
+    await db().prepare("UPDATE workers SET deleted = 1, disabled = 1 WHERE id = 'w1'").run();
+    await insertReceipt({
+      id: "r1",
+      jobId: "j1",
+      workerId: "w1",
+      gpuSeconds: 30,
+      kind: "completed",
+      billable: true,
+      basis: "exec",
+      workerSig: null,
+    });
+
+    const r = await call("/api/reports/contributions", { method: "GET", cookie });
+    expect(r.status).toBe(200);
+    expect(r.body).toHaveLength(1);
+    expect(r.body[0].worker_id).toBe("w1");
+    expect(r.body[0].name).toBe("retired-rig");
+    expect(r.body[0].gpu_seconds).toBe(30);
+
+    // ...and the worker is genuinely gone from the live listing.
+    const listed = await call("/api/workers", { method: "GET", cookie });
+    expect(listed.body.some((w: any) => w.id === "w1")).toBe(false);
+  });
+
   it("sums p2p_upload bytes per worker, kept out of jobs/gpu_seconds (Phase 3.1 P2P)", async () => {
     const { cookie } = await adminSession();
     await insertWorker("w1", "alpha");

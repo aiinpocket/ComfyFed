@@ -260,6 +260,7 @@
     "delete": "刪除",
     "delete_confirm_title": "確定刪除這台 Worker？",
     "delete_confirm": "確定要刪除 worker「{{name}}」嗎？帳務紀錄會保留，但它會從列表消失且無法再連線。",
+    "delete_confirm_hint": "此動作無法復原。",
     "deleted_title": "已刪除 Worker",
     "deleted_message": "「{{name}}」已從列表移除，帳務紀錄仍然保留。",
     "delete_failed": "無法刪除這台 Worker"

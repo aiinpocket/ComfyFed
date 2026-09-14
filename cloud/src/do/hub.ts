@@ -1420,7 +1420,14 @@ export class Hub extends DurableObject<Env> {
       return;
     }
 
-    const worker = await queries.getWorkerById(db, workerId);
+    // Deliberately UNFILTERED (review L7): this is a ledger write, not a live
+    // path. If the admin deleted this worker while its ack was in flight (the
+    // delete route's fire-and-forget kick normally closes the socket first,
+    // but it can lose the race or fail), dropping the ack would leave the
+    // receipt's `worker_sig` NULL forever. The signature below is still
+    // verified against the row's pubkey, so a deleted worker gains nothing
+    // beyond acking a receipt it had already been issued.
+    const worker = await queries.getWorkerByIdIncludingDeleted(db, workerId);
     if (!worker) return;
 
     // Phase 3.1: a p2p_upload receipt (job_id NULL) is never pushed over
