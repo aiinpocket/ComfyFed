@@ -11,11 +11,11 @@ import asyncio
 
 import pytest
 
-from comfyfed_agent import control, hardware, idle, whitelist
+from comfyfed_agent import comfy, control, hardware, idle, whitelist
 from comfyfed_agent import runner as runner_module
 from comfyfed_agent.config import AgentConfig
 from comfyfed_agent.runner import AgentLoop
-from tests.agent.test_runner import FakeConnection, _entry
+from tests.agent.test_runner import FakeConnection, _entry, _job_message
 
 
 @pytest.fixture()
@@ -25,6 +25,7 @@ def pause_loop(monkeypatch, tmp_path):
     monkeypatch.setattr(whitelist, "allowed_classes", lambda *a, **k: {"KSampler"})
     monkeypatch.setattr(whitelist, "check", lambda *a, **k: None)
     monkeypatch.setattr(hardware, "collect_dynamic", lambda *a, **k: {})
+    monkeypatch.setattr(comfy, "run_workflow", lambda *a, **k: ([], None))
     monkeypatch.setattr(idle, "seconds_since_input", lambda: 9999.0)
     monkeypatch.setattr(runner_module, "_HEARTBEAT_INTERVAL_SECONDS", 0)
     monkeypatch.setattr(runner_module, "_RECV_POLL_TIMEOUT_SECONDS", 0.01)
@@ -99,6 +100,55 @@ async def test_a_busy_tick_is_never_rewritten_to_paused(pause_loop):
 
     assert conn.heartbeats
     assert all(hb["state"] == "busy" for hb in conn.heartbeats)
+
+
+async def test_completing_a_job_while_paused_reports_paused_not_idle(pause_loop):
+    """Review round 1 (HIGH): the job-completion beat fires the instant the
+    job ends. If it reported a bare "idle" it would hand a paused worker
+    straight back to the dispatcher for a whole heartbeat interval."""
+    conn = pause_loop.connections["worker-a"]
+    control.request_pause(pause_loop._config_dir)
+
+    await pause_loop.handle_job(conn, _job_message("job-paused"))
+
+    assert conn.job_done == ("job-paused", [], None)
+    # Busy beats are never rewritten; the wind-down beat is.
+    assert [hb["state"] for hb in conn.heartbeats if hb["state"] == "busy"]
+    assert conn.heartbeats[-1]["state"] == "paused"
+
+
+async def test_completing_a_job_while_the_user_is_active_reports_paused(pause_loop, monkeypatch):
+    monkeypatch.setattr(idle, "seconds_since_input", lambda: 1.0)
+    conn = pause_loop.connections["worker-a"]
+
+    await pause_loop.handle_job(conn, _job_message("job-active"))
+
+    assert conn.heartbeats[-1]["state"] == "paused"
+
+
+async def test_a_failed_job_while_paused_also_reports_paused(pause_loop, monkeypatch):
+    """Completion, failure and cancel all wind down through the same
+    `finally`, so the gate has to cover the failure path too."""
+
+    def boom(*args, **kwargs):
+        raise comfy.ComfyError("kaboom")
+
+    monkeypatch.setattr(comfy, "run_workflow", boom)
+    conn = pause_loop.connections["worker-a"]
+    control.request_pause(pause_loop._config_dir)
+
+    await pause_loop.handle_job(conn, _job_message("job-failed"))
+
+    assert conn.job_failed == ("job-failed", "kaboom", None)
+    assert conn.heartbeats[-1]["state"] == "paused"
+
+
+async def test_completing_a_job_when_available_still_reports_idle(pause_loop):
+    conn = pause_loop.connections["worker-a"]
+
+    await pause_loop.handle_job(conn, _job_message("job-free"))
+
+    assert conn.heartbeats[-1]["state"] == "idle"
 
 
 async def test_each_tick_publishes_the_effective_state(pause_loop):

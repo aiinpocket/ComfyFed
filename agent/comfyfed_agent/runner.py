@@ -576,6 +576,14 @@ class AgentLoop:
         fetch_pct: Optional[float] = None,
         fetch_model: Optional[str] = None,
     ) -> None:
+        # EVERY would-be-"idle" beat goes through the availability gate, not
+        # just the periodic tick: the job-completion beat (which is also the
+        # failure and cancel wind-down beat -- one `finally` feeds them all)
+        # fires the instant a job ends, and an ungated "idle" there would
+        # make a paused worker dispatch-eligible again for a whole heartbeat
+        # interval. `"busy"` is passed through untouched (see
+        # `_effective_state`), so a running job is never affected.
+        state = self._effective_state(state)
         for worker_id, conn in self.connections.items():
             try:
                 await conn.send_heartbeat(

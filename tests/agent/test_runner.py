@@ -116,14 +116,22 @@ def _entry(worker_id: str) -> PlatformEntry:
 
 
 @pytest.fixture()
-def two_platform_loop(monkeypatch):
+def two_platform_loop(monkeypatch, tmp_path):
     monkeypatch.setattr(whitelist, "allowed_classes", lambda *a, **k: {"KSampler"})
     monkeypatch.setattr(whitelist, "check", lambda *a, **k: None)
     monkeypatch.setattr(comfy, "run_workflow", lambda *a, **k: ([], None))
     monkeypatch.setattr(hardware, "collect_dynamic", lambda *a, **k: {})
 
-    config = AgentConfig(platforms=[_entry("worker-a"), _entry("worker-b")])
-    return AgentLoop(config, "unused-config.json", connection_factory=FakeConnection)
+    # These tests are about job handling, not availability: idle detection
+    # off keeps every would-be-"idle" heartbeat reporting "idle" regardless
+    # of whether a human happens to be touching the machine running the
+    # suite (see `AgentLoop.broadcast_heartbeat`'s availability gate). The
+    # config path is a tmp dir so the runner's control files (agent_state.json)
+    # land there instead of the test process's CWD.
+    config = AgentConfig(
+        platforms=[_entry("worker-a"), _entry("worker-b")], pause_when_active=False
+    )
+    return AgentLoop(config, str(tmp_path / "agent.json"), connection_factory=FakeConnection)
 
 
 async def test_job_on_one_platform_broadcasts_busy_to_all_platforms(two_platform_loop):
