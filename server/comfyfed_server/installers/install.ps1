@@ -308,7 +308,22 @@ Set-Content -Path $HelperScript -Value $helperSource -Encoding UTF8
 # 3. Registration
 # ---------------------------------------------------------------------------
 
-if ($RegisterToken -ne '') {
+# Idempotent re-run: a register token is single-use, so a second run of this
+# script (e.g. after a failed autostart step) must NOT try to register again
+# -- if agent.json already pins this platform, skip straight to the later
+# steps instead of dying on a consumed token (live-caught: the first real
+# install aborted at autostart, and re-running was the natural fix).
+$alreadyRegistered = $false
+if ((Test-Path $AgentConfigPath)) {
+    try {
+        $existingConfig = [System.IO.File]::ReadAllText($AgentConfigPath)
+        if ($existingConfig.Contains($PlatformUrl)) { $alreadyRegistered = $true }
+    } catch {}
+}
+
+if ($alreadyRegistered) {
+    Write-Bilingual '此機器已註冊過本平台，跳過註冊步驟' 'Already registered with this platform; skipping registration'
+} elseif ($RegisterToken -ne '') {
     Write-Bilingual '註冊 worker...' 'Registering worker...'
     try {
         $platformInfo = Invoke-RestMethod -Uri "$PlatformUrl/api/platform" -UseBasicParsing
@@ -512,13 +527,31 @@ Set-Content -Path $LauncherScript -Value $launcherSource -Encoding UTF8
 
 Write-Bilingual '設定開機自動啟動...' 'Configuring auto-start on logon...'
 $taskCmd = "powershell.exe -NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -File `"$LauncherScript`""
+# `schtasks /SC ONLOGON` requires elevation. A plain (non-admin) terminal is
+# the NORMAL way people run this one-liner (live-caught: the first real
+# install died right here and never reached the start step below), so:
+# try the scheduled task first, fall back to the per-user HKCU Run key --
+# which needs no elevation and autostarts at logon just the same -- and if
+# even that fails, WARN and keep going: a missing autostart must never
+# abort an otherwise working install.
+$autostartOk = $false
 try {
-    schtasks /Create /F /TN ComfyFedAgent /SC ONLOGON /TR $taskCmd | Out-Null
-    if ($LASTEXITCODE -ne 0) { throw "schtasks exited $LASTEXITCODE" }
-} catch {
-    Fail-Step '建立排程工作' 'creating the scheduled task' `
-        "請手動以系統管理員身分執行: schtasks /Create /F /TN ComfyFedAgent /SC ONLOGON /TR `"$taskCmd`"" `
-        "please run manually as administrator: schtasks /Create /F /TN ComfyFedAgent /SC ONLOGON /TR `"$taskCmd`""
+    schtasks /Create /F /TN ComfyFedAgent /SC ONLOGON /TR $taskCmd 2>$null | Out-Null
+    if ($LASTEXITCODE -eq 0) { $autostartOk = $true }
+} catch {}
+if ($autostartOk) {
+    Write-Bilingual '已建立排程工作 ComfyFedAgent' 'Created scheduled task ComfyFedAgent'
+} else {
+    try {
+        New-ItemProperty -Path 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Run' `
+            -Name 'ComfyFedAgent' -Value $taskCmd -PropertyType String -Force | Out-Null
+        $autostartOk = $true
+        Write-Bilingual '未以系統管理員執行，已改用使用者層級自動啟動（登錄檔 Run 鍵）' `
+            'Not elevated; using per-user autostart (registry Run key) instead'
+    } catch {
+        Write-Host "[警告/WARNING] 無法設定開機自動啟動 / could not configure auto-start" -ForegroundColor Yellow
+        Write-Host "手動替代 / Manual alternative: 以系統管理員執行 / run as administrator: schtasks /Create /F /TN ComfyFedAgent /SC ONLOGON /TR `"$taskCmd`"" -ForegroundColor Yellow
+    }
 }
 
 Write-Bilingual '立即啟動...' 'Starting now...'
@@ -527,5 +560,10 @@ Start-Process -FilePath 'powershell.exe' -ArgumentList `
     -WindowStyle Hidden
 
 Write-Host ''
-Write-Bilingual '安裝完成！ComfyFed agent 已在背景執行，並會於每次登入時自動啟動。' `
-    'Install complete! The ComfyFed agent is now running in the background and will auto-start on every logon.'
+if ($autostartOk) {
+    Write-Bilingual '安裝完成！ComfyFed agent 已在背景執行，並會於每次登入時自動啟動。' `
+        'Install complete! The ComfyFed agent is now running in the background and will auto-start on every logon.'
+} else {
+    Write-Bilingual '安裝完成！ComfyFed agent 已在背景執行（但自動啟動設定失敗，重開機後請手動啟動，或參考上方警告）。' `
+        'Install complete! The ComfyFed agent is running in the background (but autostart could not be configured -- start it manually after a reboot, or see the warning above).'
+}

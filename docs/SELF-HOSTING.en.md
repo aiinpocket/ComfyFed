@@ -108,7 +108,7 @@ server {
 ### Adding a worker
 
 1. In the console, go to **Workers** → add, name it, and the platform issues a one-time registration token and shows three one-line install commands right away (Windows PowerShell / Windows cmd / Linux + macOS), each with its own copy button.
-2. On the machine that will contribute compute, paste the matching line into a terminal:
+2. On the machine that will contribute compute, paste the matching line into a terminal. **No administrator/sudo needed**: on Windows a plain terminal works (an elevated one gets a Task Scheduler autostart, a non-elevated one automatically falls back to a per-user registry Run key — same effect); on Linux/macOS run as your normal user, **without sudo** (everything installs into your home directory; the script refuses to run as root). The script is safe to re-run: an already-registered machine skips the registration step automatically.
 
 ```powershell
 # Windows (PowerShell)
@@ -131,7 +131,7 @@ That one line does the whole install: missing Python gets installed automaticall
 
 **Uninstalling**:
 
-- **Windows**: `schtasks /Delete /TN ComfyFedAgent /F`, then delete the `%LOCALAPPDATA%\ComfyFed` folder.
+- **Windows**: `schtasks /Delete /TN ComfyFedAgent /F` (for a non-admin install: `reg delete "HKCU\Software\Microsoft\Windows\CurrentVersion\Run" /v ComfyFedAgent /f`), then delete the `%LOCALAPPDATA%\ComfyFed` folder.
 - **Linux**: `systemctl --user disable --now comfyfed-agent comfyfed-comfyui`, then delete `~/.comfyfed`.
 - **macOS**: `launchctl unload -w ~/Library/LaunchAgents/com.comfyfed.agent.plist` (and `com.comfyfed.comfyui.plist` too, if ComfyUI was installed by the script), delete those `.plist` files, then delete `~/.comfyfed`.
 

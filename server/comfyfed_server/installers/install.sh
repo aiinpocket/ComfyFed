@@ -16,6 +16,17 @@ PLATFORM_URL='{{PLATFORM_URL}}'
 PLATFORM_URL="${PLATFORM_URL%/}"
 REGISTER_TOKEN='{{REGISTER_TOKEN}}'
 
+# 不需要（也不應該）用 root/sudo 執行：所有東西都裝在使用者家目錄，服務用
+# systemd --user / launchd 使用者層級，root 執行只會把整套裝進 /root。
+# No root/sudo needed (or wanted): everything installs into the user's home
+# and autostart uses user-level systemd/launchd; running as root would
+# install the whole stack into /root instead.
+if [ "$(id -u)" -eq 0 ] && [ -z "${COMFYFED_ALLOW_ROOT:-}" ]; then
+    echo "[錯誤/ERROR] 請不要用 sudo/root 執行本安裝：直接以一般使用者執行同一行指令即可。/ Do not run this installer as root: run the same one-liner as your normal user." >&2
+    echo "（若你真的要裝給 root 使用者，設 COMFYFED_ALLOW_ROOT=1 再執行。/ To really install for root, set COMFYFED_ALLOW_ROOT=1.）" >&2
+    exit 1
+fi
+
 COMFY_VERSION_PINNED='v0.35.0'
 COMFY_GIT_URL="${COMFYFED_COMFY_GIT_URL:-https://github.com/Comfy-Org/ComfyUI}"
 COMFY_GIT_REF="${COMFYFED_COMFY_REF:-$COMFY_VERSION_PINNED}"
@@ -274,7 +285,17 @@ PYEOF
 # 3. Registration
 # ---------------------------------------------------------------------------
 
-if [ -n "$REGISTER_TOKEN" ]; then
+# Idempotent re-run: a register token is single-use, so a second run (e.g.
+# after a later step failed) must not die on a consumed token -- if
+# agent.json already pins this platform, skip registration.
+ALREADY_REGISTERED=0
+if [ -f "$HOME/.comfyfed/agent.json" ] && grep -qF "$PLATFORM_URL" "$HOME/.comfyfed/agent.json" 2>/dev/null; then
+    ALREADY_REGISTERED=1
+fi
+
+if [ "$ALREADY_REGISTERED" -eq 1 ]; then
+    bilingual "此機器已註冊過本平台，跳過註冊步驟" "Already registered with this platform; skipping registration"
+elif [ -n "$REGISTER_TOKEN" ]; then
     bilingual "註冊 worker..." "Registering worker..."
     PLATFORM_JSON="$(curl -fsSL "$PLATFORM_URL/api/platform")" || fail_step \
         "取得平台資訊" "fetching platform info" \

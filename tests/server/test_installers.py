@@ -403,3 +403,41 @@ def test_ps1_writes_the_register_bundle_without_a_bom():
     assert "[System.IO.File]::WriteAllText($bundlePath" in text
     assert "New-Object System.Text.UTF8Encoding($false)" in text
     assert "Set-Content -Path $bundlePath" not in text
+
+
+def test_ps1_autostart_never_aborts_and_falls_back_to_hkcu_run():
+    """Live-caught: `schtasks /SC ONLOGON` needs elevation, and the old
+    Fail-Step there killed the script BEFORE the immediate-start step, so a
+    plain-terminal install registered the worker but never started the
+    agent. Autostart must now (a) fall back to the per-user HKCU Run key,
+    (b) warn-and-continue when even that fails -- no Fail-Step in the
+    autostart section."""
+    text = open(_source_path("install.ps1"), encoding="utf-8").read()
+    assert "HKCU:\Software\Microsoft\Windows\CurrentVersion\Run" in text
+    autostart = text[text.index("Configuring auto-start on logon") : text.index("Starting now")]
+    assert "Fail-Step" not in autostart
+    assert "exit 1" not in autostart
+    # The completion message reflects whether autostart actually stuck.
+    assert "$autostartOk" in text
+
+
+def test_installers_skip_registration_when_already_registered():
+    """A register token is single-use; re-running the script (the natural
+    recovery after any later step fails) must skip registration instead of
+    dying on the consumed token -- both platforms."""
+    ps1 = open(_source_path("install.ps1"), encoding="utf-8").read()
+    assert "$alreadyRegistered" in ps1
+    assert "Already registered with this platform; skipping registration" in ps1
+    sh = open(_source_path("install.sh"), encoding="utf-8").read()
+    assert 'grep -qF "$PLATFORM_URL" "$HOME/.comfyfed/agent.json"' in sh
+    assert "Already registered with this platform; skipping registration" in sh
+
+
+def test_sh_refuses_to_run_as_root():
+    """sudo would install the whole stack into /root and set up user-level
+    services for the wrong account; the script must refuse root unless
+    COMFYFED_ALLOW_ROOT=1 is set."""
+    sh = open(_source_path("install.sh"), encoding="utf-8").read()
+    assert '[ "$(id -u)" -eq 0 ]' in sh
+    assert "COMFYFED_ALLOW_ROOT" in sh
+    assert "Do not run this installer as root" in sh

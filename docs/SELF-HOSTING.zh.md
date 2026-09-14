@@ -108,7 +108,7 @@ server {
 ### 新增一台 worker
 
 1. 在主控台 → **Workers** → 新增，輸入名稱後系統會產生一次性的註冊 token，並直接顯示三條一行安裝指令（Windows PowerShell／Windows cmd／Linux + macOS），各附複製按鈕。
-2. 在要貢獻算力的那台機器上，貼上對應那一行貼到終端機執行：
+2. 在要貢獻算力的那台機器上，貼上對應那一行貼到終端機執行。**不需要系統管理員／sudo**：Windows 用一般終端機即可（有系統管理員權限會用工作排程器設自啟，沒有就自動改用使用者層級的登錄檔 Run 鍵，效果相同）；Linux／macOS 請以一般使用者執行、**不要加 sudo**（整套裝在你的家目錄，root 執行會被腳本擋下）。腳本可安全重跑：已註冊過的機器會自動跳過註冊步驟。
 
 ```powershell
 # Windows（PowerShell）
@@ -131,7 +131,7 @@ curl -fsSL "<你的平台網址>/install.sh?token=<一次性 token>" | bash
 
 **解除安裝**：
 
-- **Windows**：`schtasks /Delete /TN ComfyFedAgent /F`，再刪除 `%LOCALAPPDATA%\ComfyFed` 資料夾。
+- **Windows**：`schtasks /Delete /TN ComfyFedAgent /F`（非系統管理員安裝則是 `reg delete "HKCU\Software\Microsoft\Windows\CurrentVersion\Run" /v ComfyFedAgent /f`），再刪除 `%LOCALAPPDATA%\ComfyFed` 資料夾。
 - **Linux**：`systemctl --user disable --now comfyfed-agent comfyfed-comfyui`，再刪除 `~/.comfyfed`。
 - **macOS**：`launchctl unload -w ~/Library/LaunchAgents/com.comfyfed.agent.plist`（若有安裝 ComfyUI 再加一行 `com.comfyfed.comfyui.plist`），刪掉這些 `.plist` 檔，再刪除 `~/.comfyfed`。
 
