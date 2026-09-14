@@ -11,7 +11,7 @@ import sys
 
 import httpx
 
-from . import __version__, identity, update
+from . import __version__, detect, identity, update
 from .config import AgentConfig
 from .runner import AgentLoop
 
@@ -30,12 +30,45 @@ def _cmd_register(args: argparse.Namespace) -> None:
     print(f"Registered worker '{name}' ({entry.worker_id}) with platform {entry.platform_url}")
     print(f"Config saved to {args.config}")
 
+    # Auto-detect the local ComfyUI so a fresh install needs no hand-edited
+    # agent.json (user directive, 2026-09-14): port via /system_stats
+    # fingerprint, models/output/input dirs via /internal/folder_paths.
+    cfg = AgentConfig.load(args.config)
+    with httpx.Client() as client:
+        notes = detect.apply_detection(cfg, client, AgentConfig.comfy_url)
+    if notes:
+        cfg.save(args.config)
+        for note in notes:
+            print(f"  {note}")
+    with httpx.Client() as client:
+        comfy_ok = detect.probe_comfy(cfg.comfy_url, client)
+    if not comfy_ok:
+        print(
+            "找不到本機 ComfyUI（請確認它正在執行，或在 agent.json 填 comfy_url）。/ "
+            "No local ComfyUI found -- make sure it is running, or set comfy_url in agent.json."
+        )
+
 
 def _cmd_run(args: argparse.Namespace) -> None:
     cfg = AgentConfig.load(args.config)
     if not cfg.platforms:
         print(f"No platforms registered in {args.config}. Run 'comfyfed-agent register <bundle.json>' first.")
         return
+
+    # Auto-detect / re-detect the local ComfyUI before starting: fills any
+    # still-missing dirs and recovers a moved port (only when comfy_url is
+    # the untouched default) -- see detect.apply_detection's contract.
+    with httpx.Client() as client:
+        notes = detect.apply_detection(cfg, client, AgentConfig.comfy_url)
+        if notes:
+            cfg.save(args.config)
+            for note in notes:
+                print(f"  {note}")
+        if not detect.probe_comfy(cfg.comfy_url, client):
+            print(
+                f"連不上 ComfyUI（{cfg.comfy_url}）——請確認它正在執行，或在 {args.config} 修改 comfy_url。/ "
+                f"Cannot reach ComfyUI at {cfg.comfy_url} -- make sure it is running, or fix comfy_url in {args.config}."
+            )
 
     # One agent install may be pinned to multiple platforms; checking the
     # first is enough since any pinned platform can vouch for whether this

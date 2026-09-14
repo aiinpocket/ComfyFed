@@ -118,7 +118,7 @@ comfyfed-agent run
 
 `register` 會用 bundle 裡的一次性 token 向伺服器換發正式憑證，並把設定寫到 `~/.comfyfed/agent.json`；`run` 會連上所有已註冊的平台並開始接工作。
 
-這台機器上需要有本機的 ComfyUI 在跑（預設抓 `http://127.0.0.1:8188`），如果 ComfyUI 跑在別的位置，可在 `agent.json` 的 `comfy_url` 欄位改掉。
+**ComfyUI 的位置與資料夾會自動偵測**：註冊（與每次啟動）時 agent 會自己找本機的 ComfyUI——先試常見的埠（8188／8000 等），找不到就掃 8000–8399 並用 `/system_stats` 指紋確認；找到後再從 `/internal/folder_paths` 推導出模型庫（`models_dir`）與 ComfyUI 真正的 output／input 資料夾，一併寫進 `agent.json`。只有在完全找不到（ComfyUI 沒開、或跑在很冷門的埠）時才需要手動在 `agent.json` 填 `comfy_url`；你手動填過的值永遠不會被自動偵測覆蓋。
 
 **要停掉 agent**：在它的終端機按 `Ctrl-C`（Windows 上 `CTRL_BREAK` 也可以）就會優雅關機——agent 會先請求 ComfyUI 中斷正在跑的工作、清掉暫存的檔案，確認收尾完成才結束程序，不會留下半殘的工作或垃圾檔案。
 

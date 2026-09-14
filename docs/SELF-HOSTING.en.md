@@ -118,7 +118,7 @@ comfyfed-agent run
 
 `register` exchanges the bundle's one-time token for a real certificate from the platform and writes the config to `~/.comfyfed/agent.json`; `run` connects to every registered platform and starts processing jobs.
 
-That machine needs a local ComfyUI running (defaults to `http://127.0.0.1:8188`); if yours runs elsewhere, set `comfy_url` in `agent.json`.
+**ComfyUI's location and folders are auto-detected**: at registration (and every startup) the agent finds the local ComfyUI on its own — well-known ports first (8188/8000/...), then a sweep of 8000-8399 confirmed by the `/system_stats` fingerprint — and derives the model library (`models_dir`) plus ComfyUI's real output/input folders from `/internal/folder_paths`, writing them all into `agent.json`. You only need to set `comfy_url` by hand when nothing can be found (ComfyUI isn't running, or listens on an unusual port); a value you set by hand is never overwritten by detection.
 
 **Stopping an agent**: press `Ctrl-C` in its terminal (`CTRL_BREAK` works too on Windows) for a graceful shutdown — the agent asks ComfyUI to interrupt whatever it's running, cleans up its own temp files, and only exits once that wind-down is confirmed, instead of leaving a half-finished job or stray files behind.
 
