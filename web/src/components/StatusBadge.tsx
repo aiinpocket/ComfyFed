@@ -5,6 +5,7 @@ const WORKER_COLORS: Record<string, MantineColor> = {
   online: 'teal',
   busy: 'yellow',
   offline: 'gray',
+  paused: 'slate',
 };
 
 const JOB_COLORS: Record<string, MantineColor> = {
