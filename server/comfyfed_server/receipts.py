@@ -8,6 +8,7 @@ receipt_ack exchange). This module just reports on the resulting rows.
 from __future__ import annotations
 
 import math
+import re
 from datetime import datetime, timezone
 from typing import Optional
 
@@ -20,17 +21,32 @@ def _error(status_code: int, code: str, message: str = "") -> HTTPException:
     return HTTPException(status_code=status_code, detail={"code": code, "message": message or code})
 
 
+_POOL_RE = re.compile(r"^[+-]?(\d+(\.\d*)?|\.\d+)([eE][+-]?\d+)?$")
+
+
 def _parse_pool(value: Optional[str]) -> float:
     """Parse the `pool` query parameter for the payout report.
 
     Declared as a plain string (not FastAPI's `float` query type) so a bad
     value becomes our own `{code, message}` 400 -- consistent with
     `_parse_date` -- rather than FastAPI's default 422 validation-error body.
+
+    Final review finding #10: gated behind a plain-decimal regex BEFORE
+    `float()` ever sees it, matching cloud's `parsePoolParam` byte-for-byte.
+    `float()` alone accepts forms beyond plain decimal notation that the
+    `isfinite`/non-negative checks below cannot catch on their own --
+    notably `"1_0"` (Python's underscore digit-group separator, parses to
+    the perfectly finite `10.0`) -- and cloud's `Number()` separately
+    accepts `"0x10"` as hex 16, which the same regex also kills so both
+    stacks reject it identically. `"nan"`/`"inf"` were already handled by
+    the `isfinite` check (non-finite) before this fix; the regex rejects
+    them earlier now, but the outcome is unchanged. Trimmed first so
+    incidental whitespace around an otherwise-valid number still parses.
     """
-    try:
-        pool = float(value)
-    except (TypeError, ValueError):
+    trimmed = (value or "").strip()
+    if not _POOL_RE.fullmatch(trimmed):
         raise _error(400, "reports.bad_pool", f"Not a valid number: {value!r}")
+    pool = float(trimmed)
     if not math.isfinite(pool):
         raise _error(400, "reports.bad_pool", f"Not a valid number: {value!r}")
     if pool < 0:

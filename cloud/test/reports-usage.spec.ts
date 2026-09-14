@@ -365,6 +365,15 @@ describe("GET /api/reports/payout", () => {
     expect(r.body.error.code).toBe("reports.bad_pool");
   });
 
+  it("400s reports.bad_pool on non-decimal literals both stacks must reject uniformly (final review finding #10)", async () => {
+    const admin = await adminSession();
+    for (const bad of ["0x10", "1_0"]) {
+      const r = await call(`/api/reports/payout?pool=${bad}`, { method: "GET", cookie: admin.cookie });
+      expect(r.status).toBe(400);
+      expect(r.body.error.code).toBe("reports.bad_pool");
+    }
+  });
+
   it("filters by from/to range -- only in-range billable receipts feed the pool split", async () => {
     const admin = await adminSession();
     await insertWorker("w1", "alpha");

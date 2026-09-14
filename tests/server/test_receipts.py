@@ -768,6 +768,15 @@ def test_payout_report_rejects_missing_or_bad_or_negative_pool(client):
         assert r.json()["error"]["code"] == "reports.bad_pool"
     assert r.json()["error"]["code"] == "reports.bad_pool"
 
+    # Final review finding #10: gated behind a plain-decimal regex now, so
+    # forms `float()` alone would happily accept -- but that are NOT plain
+    # decimal notation, and that cloud's `Number()` parses differently or
+    # not at all -- are rejected uniformly on both stacks.
+    for bad in ("0x10", "1_0"):
+        r = client.get("/api/reports/payout", params={"pool": bad}, headers={"X-CSRF": admin_csrf})
+        assert r.status_code == 400, bad
+        assert r.json()["error"]["code"] == "reports.bad_pool"
+
 
 def test_payout_report_requires_admin(client):
     admin_csrf = _login(client)

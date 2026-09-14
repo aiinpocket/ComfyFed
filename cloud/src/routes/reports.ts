@@ -143,6 +143,15 @@ class BadPoolError extends Error {
   }
 }
 
+// Final review finding #10: plain-decimal grammar, applied to the trimmed
+// string BEFORE `Number()` ever sees it -- byte-for-byte the same pattern
+// as receipts.py's `_POOL_RE`. `Number()` alone accepts forms beyond plain
+// decimal notation that `Number.isFinite` cannot catch on their own --
+// notably `"0x10"` (hex 16, perfectly finite) -- and Python's `float()`
+// separately accepts `"1_0"` (underscore digit-group separator), which this
+// same regex also kills so both stacks reject it identically.
+const POOL_RE = /^[+-]?(\d+(\.\d*)?|\.\d+)([eE][+-]?\d+)?$/;
+
 /** Parses the `pool` query parameter for `/api/reports/payout` -- mirrors
  * receipts.py's `_parse_pool`. Declared as a plain string (Hono's
  * `c.req.query` already gives us that) so a bad value becomes our own
@@ -156,8 +165,11 @@ function parsePoolParam(raw: string | undefined): number {
     throw new BadPoolError("Not a valid number: None");
   }
   const trimmed = raw.trim();
+  if (!POOL_RE.test(trimmed)) {
+    throw new BadPoolError(`Not a valid number: ${pyStrRepr(raw)}`);
+  }
   const value = Number(trimmed);
-  if (trimmed === "" || !Number.isFinite(value)) {
+  if (!Number.isFinite(value)) {
     throw new BadPoolError(`Not a valid number: ${pyStrRepr(raw)}`);
   }
   if (value < 0) {
