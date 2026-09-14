@@ -6,6 +6,7 @@ gained alongside it.
 import hashlib
 import json
 import secrets
+import threading
 import time
 
 import pytest
@@ -164,6 +165,27 @@ def test_verify_grant_rejects_malformed_hex():
     assert peer.verify_grant(sk.verify_key, grant, "not-hex") is False
 
 
+def test_verify_grant_rejects_an_expired_grant():
+    sk = SigningKey.generate()
+    grant = _grant_fields(expires_at=int(time.time()) - 1)
+    sig = peer.sign_grant(sk, grant)
+    assert peer.verify_grant(sk.verify_key, grant, sig) is False
+
+
+def test_verify_grant_never_raises_on_malformed_input():
+    sk = SigningKey.generate()
+    # Missing required keys.
+    assert peer.verify_grant(sk.verify_key, {"grant_id": "g1"}, "deadbeef") is False
+    # Wrong type entirely.
+    assert peer.verify_grant(sk.verify_key, "not-a-dict", "deadbeef") is False
+    # int-shaped field holding a string.
+    bad = _grant_fields(size_bytes="not-an-int")
+    assert peer.verify_grant(sk.verify_key, bad, "deadbeef") is False
+    # int-shaped field holding a bool (bool is technically an int subclass).
+    bad_bool = _grant_fields(expires_at=True)
+    assert peer.verify_grant(sk.verify_key, bad_bool, "deadbeef") is False
+
+
 # --- online_seeders ----------------------------------------------------
 
 
@@ -256,8 +278,11 @@ def test_peer_grant_404_no_seeder_when_none_online(client):
     assert r.json()["error"]["code"] == "peer.no_seeder"
 
 
-def test_peer_grant_excludes_the_requester_itself_as_seeder(client):
-    """The only worker with the file is the requester itself: no seeder."""
+def test_peer_grant_rejects_requester_that_already_has_the_file(client):
+    """Spec: the platform verifies the requester actually lacks the file
+    before issuing a grant (拉方確缺此檔). Here the only worker with the file
+    is the requester itself, so this is caught by the already-has-model
+    check rather than by an empty seeder pool."""
     csrf = _login(client)
     sha = _sha("model")
     puller_id, puller_sk = _make_online_seeder(client, csrf, "puller", sha256=sha)
@@ -266,8 +291,26 @@ def test_peer_grant_excludes_the_requester_itself_as_seeder(client):
         client, puller_id, puller_sk, "/api/agent/peer-grant",
         {"name": "checkpoints/model.safetensors", "size_bytes": _bytes(1.0)},
     )
-    assert r.status_code == 404
-    assert r.json()["error"]["code"] == "peer.no_seeder"
+    assert r.status_code == 400
+    assert r.json()["error"]["code"] == "peer.already_has_model"
+
+
+def test_peer_grant_rejects_requester_that_already_has_the_file_even_with_another_seeder(client):
+    """The already-has-model check must fire even when a *different* worker
+    is a perfectly valid seeder -- a requester that already has the file has
+    no business asking for a grant to fetch it again, regardless of who else
+    could serve it."""
+    csrf = _login(client)
+    sha = _sha("model")
+    _make_online_seeder(client, csrf, "other-seeder", sha256=sha)
+    puller_id, puller_sk = _make_online_seeder(client, csrf, "puller", sha256=sha)
+
+    r = _agent_post(
+        client, puller_id, puller_sk, "/api/agent/peer-grant",
+        {"name": "checkpoints/model.safetensors", "size_bytes": _bytes(1.0)},
+    )
+    assert r.status_code == 400
+    assert r.json()["error"]["code"] == "peer.already_has_model"
 
 
 def test_peer_grant_happy_path_shape_and_signature(client):
@@ -333,6 +376,25 @@ def test_peer_grant_expiry_is_ttl_seconds_ahead(client):
     after = int(time.time())
     expires_at = r.json()["grant"]["expires_at"]
     assert before + peer.GRANT_TTL_SECONDS <= expires_at <= after + peer.GRANT_TTL_SECONDS
+
+
+def test_peer_grant_rejects_a_name_containing_the_payload_delimiter(client):
+    """A model name can't normally contain `|` via inventory scanning, but if
+    one somehow did, issuance must refuse it with the module's typed 400
+    error (matching `sign_grant`'s docstring) rather than let the ValueError
+    escape as an unhandled 500."""
+    csrf = _login(client)
+    name = "checkpoints/evil|name.safetensors"
+    sha = _sha("model")
+    _make_online_seeder(client, csrf, "seeder", model_name=name, sha256=sha)
+    puller_id, puller_sk = _register_worker(client, csrf, "puller")
+
+    r = _agent_post(
+        client, puller_id, puller_sk, "/api/agent/peer-grant",
+        {"name": name, "size_bytes": _bytes(1.0)},
+    )
+    assert r.status_code == 400
+    assert r.json()["error"]["code"] == "peer.invalid_field"
 
 
 def test_peer_grant_picks_seeder_with_fewest_active_grants_then_name(client):
@@ -446,6 +508,39 @@ def test_peer_served_dedupe_already_booked(client):
     )
     assert second.status_code == 409
     assert second.json()["error"]["code"] == "peer.already_booked"
+
+
+def test_peer_served_concurrent_calls_race_only_one_claim_wins(client):
+    """RACE: claim (check-not-booked + mark-booked) must be atomic under
+    `peer._grant_lock`, taken BEFORE the DB insert -- otherwise two
+    concurrent calls for the same grant_id (e.g. a client retry racing the
+    original request across the threadpool dispatch) could both observe
+    `booked is False` and both insert a receipt. Fire two real requests
+    concurrently from separate threads against the same grant and confirm
+    exactly one wins (200) and the other is rejected as already-booked
+    (409) -- never both succeeding, never both failing.
+    """
+    csrf = _login(client)
+    grant, seeder_id, seeder_sk, _, _ = _issue_grant(client, csrf)
+
+    results = []
+    barrier = threading.Barrier(2)
+
+    def call():
+        barrier.wait(timeout=5)
+        r = _agent_post(
+            client, seeder_id, seeder_sk, "/api/agent/peer-served",
+            {"grant_id": grant["grant_id"], "bytes_served": _bytes(1.0)},
+        )
+        results.append(r.status_code)
+
+    threads = [threading.Thread(target=call) for _ in range(2)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join(timeout=10)
+
+    assert sorted(results) == [200, 409]
 
 
 def test_peer_served_rejects_zero_or_negative_bytes(client):

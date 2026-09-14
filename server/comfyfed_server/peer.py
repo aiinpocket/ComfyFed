@@ -24,6 +24,7 @@ from __future__ import annotations
 
 import json
 import logging
+import threading
 import time
 import uuid
 from typing import Optional
@@ -57,6 +58,15 @@ _GRANT_FIELDS = ("grant_id", "name", "size_bytes", "sha256", "seeder_id", "pulle
 # Pruned opportunistically by `_prune_expired` on each issuance/booking call,
 # same pattern as `workers._prune_nonces`.
 _grants: dict[str, dict] = {}
+
+# Guards claim (check-not-booked-then-mark-booked) on `_grants` entries.
+# `peer_served` runs the claim under this lock BEFORE the DB insert, so two
+# concurrent requests for the same grant_id (e.g. a client retry racing the
+# original request across a threadpool dispatch) can never both observe
+# `booked is False` and both proceed -- only one can flip it under the lock.
+# If the DB insert after the claim fails, the caller re-acquires this lock to
+# un-mark the grant so a legitimate retry can still succeed.
+_grant_lock = threading.Lock()
 
 
 def _error(status_code: int, code: str, message: str = "") -> HTTPException:
@@ -92,14 +102,27 @@ def sign_grant(signing_key: SigningKey, grant: dict) -> str:
 
 def verify_grant(verify_key: VerifyKey, grant: dict, sig: str) -> bool:
     """Whether `sig` (hex) is `verify_key`'s valid signature over `grant`'s
-    fields. Never raises -- a bad hex string or a bad signature both just
-    read as "not valid" (fail-closed, matching `workers.verify_agent`'s
-    treatment of a malformed signature).
+    fields, the grant is field-shape-valid, and it has not expired (against
+    `time.time()`). Never raises -- a missing/wrong-typed field, a bad hex
+    string, and a bad signature all just read as "not valid" (fail-closed,
+    matching `workers.verify_agent`'s treatment of a malformed signature).
+    Task 4's seeder-side gate reuses this same check before serving bytes.
     """
     try:
+        if not isinstance(grant, dict):
+            return False
+        for field in _GRANT_FIELDS:
+            if field not in grant:
+                return False
+        for field in ("size_bytes", "expires_at"):
+            value = grant[field]
+            if not isinstance(value, int) or isinstance(value, bool):
+                return False
+        if grant["expires_at"] <= time.time():
+            return False
         verify_key.verify(_grant_payload(grant).encode(), bytes.fromhex(sig))
         return True
-    except (BadSignatureError, ValueError):
+    except (BadSignatureError, ValueError, TypeError, KeyError):
         return False
 
 
@@ -207,6 +230,13 @@ def create_router(data_dir: str) -> APIRouter:
             if hash_row is None or hash_row.conflict:
                 raise _error(404, "peer.no_model", "No consensus hash for this model.")
 
+            # Spec: the platform verifies the requester actually lacks the
+            # file before handing out a grant for it (拉方確缺此檔) -- checked
+            # against the requester's OWN reported inventory, same predicate
+            # `online_seeders` uses for a candidate seeder.
+            if _worker_has_consensus_file(worker, body.name, body.size_bytes, hash_row.sha256):
+                raise _error(400, "peer.already_has_model", "You already have this model.")
+
             seeders = online_seeders(session, body.name, body.size_bytes, exclude_worker_id=worker.id)
             if not seeders:
                 raise _error(404, "peer.no_seeder", "No online seeder for this model.")
@@ -225,7 +255,14 @@ def create_router(data_dir: str) -> APIRouter:
                 "expires_at": expires_at,
             }
             signing_key, _ = security.load_platform_keys(data_dir)
-            sig = sign_grant(signing_key, grant)
+            try:
+                sig = sign_grant(signing_key, grant)
+            except ValueError as exc:
+                # A field (in practice only `name`, an agent-reported path)
+                # contains the payload delimiter -- refuse the request with
+                # the module's typed 400 error rather than let the ValueError
+                # escape as an unhandled 500.
+                raise _error(400, "peer.invalid_field", str(exc)) from exc
 
             _grants[grant_id] = {**grant, "booked": False}
 
@@ -243,15 +280,24 @@ def create_router(data_dir: str) -> APIRouter:
         now = time.time()
         _prune_expired(now)
 
-        grant = _grants.get(body.grant_id)
-        if grant is None:
-            raise _error(404, "peer.no_grant", "Grant not found or expired.")
-        if grant["seeder_id"] != worker.id:
-            raise _error(403, "peer.not_seeder", "Only the grant's seeder may report bandwidth served.")
-        if grant["booked"]:
-            raise _error(409, "peer.already_booked", "This grant has already been booked.")
-        if body.bytes_served <= 0 or body.bytes_served > grant["size_bytes"] * _BYTES_SERVED_SLACK:
-            raise _error(400, "peer.bad_bytes", "bytes_served is out of bounds for this grant.")
+        # Claim atomically under `_grant_lock`: check-not-booked and
+        # mark-booked happen as one step, BEFORE the DB insert below, so two
+        # concurrent calls for the same grant_id (a client retry racing the
+        # original across the threadpool) can't both pass the `booked` check
+        # and both insert a receipt (TOCTOU double-booking). Only one thread
+        # can hold the lock at a time, so only one can observe `booked is
+        # False` and flip it.
+        with _grant_lock:
+            grant = _grants.get(body.grant_id)
+            if grant is None:
+                raise _error(404, "peer.no_grant", "Grant not found or expired.")
+            if grant["seeder_id"] != worker.id:
+                raise _error(403, "peer.not_seeder", "Only the grant's seeder may report bandwidth served.")
+            if grant["booked"]:
+                raise _error(409, "peer.already_booked", "This grant has already been booked.")
+            if body.bytes_served <= 0 or body.bytes_served > grant["size_bytes"] * _BYTES_SERVED_SLACK:
+                raise _error(400, "peer.bad_bytes", "bytes_served is out of bounds for this grant.")
+            grant["booked"] = True
 
         # Dedicated signing string for p2p receipts: agentws._sign_and_store_receipt's
         # f"{job_id}|{worker_id}|{gpu_seconds:.1f}" helper is NOT reused here --
@@ -260,27 +306,36 @@ def create_router(data_dir: str) -> APIRouter:
         # rather than reflect the receipt's actual (job-less) nature. Canonical
         # pipe-joined payload, mirroring the same signing convention:
         # f"p2p_upload|{grant_id}|{worker_id}|{bytes_served}".
-        payload = f"p2p_upload|{body.grant_id}|{worker.id}|{body.bytes_served}"
-        signing_key, _ = security.load_platform_keys(data_dir)
-        platform_sig = signing_key.sign(payload.encode()).signature.hex()
+        try:
+            payload = f"p2p_upload|{body.grant_id}|{worker.id}|{body.bytes_served}"
+            signing_key, _ = security.load_platform_keys(data_dir)
+            platform_sig = signing_key.sign(payload.encode()).signature.hex()
 
-        with db.get_session() as session:
-            receipt = db.Receipt(
-                job_id=None,
-                worker_id=worker.id,
-                gpu_seconds=0.0,
-                platform_sig=platform_sig,
-                worker_sig=None,
-                kind="p2p_upload",
-                billable=False,
-                basis="wall",
-                bytes=body.bytes_served,
-            )
-            session.add(receipt)
-            session.commit()
-            receipt_id = receipt.id
-
-        grant["booked"] = True
+            with db.get_session() as session:
+                receipt = db.Receipt(
+                    job_id=None,
+                    worker_id=worker.id,
+                    gpu_seconds=0.0,
+                    platform_sig=platform_sig,
+                    worker_sig=None,
+                    kind="p2p_upload",
+                    billable=False,
+                    basis="wall",
+                    bytes=body.bytes_served,
+                )
+                session.add(receipt)
+                session.commit()
+                receipt_id = receipt.id
+        except Exception:
+            # DB insert failed after the claim above already marked the
+            # grant booked -- un-mark it under the same lock so a legitimate
+            # client retry can still succeed instead of permanently wedging
+            # on a grant nothing ever actually booked.
+            with _grant_lock:
+                still_present = _grants.get(body.grant_id)
+                if still_present is not None:
+                    still_present["booked"] = False
+            raise
 
         return {"ok": True, "receipt_id": receipt_id}
 
