@@ -189,3 +189,45 @@ Decisions of record:
 
 ### Cloud 對等
 - D1 migration 0006（users＋jobs.user_id＋login_attempts.username＋資料遷移 SQL）；`/api/setup` 建 admin user 列；auth／users／jobs 範圍／comfy 面板範圍／reports 三端點 byte-parity 移植；既有部署跑遷移後舊 cookie 自然失效。
+
+---
+
+## Phase 3.1 addendum: 成員間 P2P 分塊傳輸（2026-09-14）
+
+User directives: 完成 Phase 3 最後一項 P2P 分塊傳輸；安全原則沿用使用者 2026-09-14 指示——**傳輸憑證必須是平台簽發、短效、單次範圍綁定**，「而不是讓他可以一直持有，不然每個 worker 都可以跑上去搗亂」；worker 之間不互留常駐信任。
+
+Decisions of record:
+
+### 定位與範圍（MVP＝spec §8 既定方向）
+- **HTTP Range 分塊互拉**：拉方 worker 直接向種子 worker 的 HTTP 端點分塊拉檔；NAT 打洞不做（§8 列為 fallback，此處裁定：拉不到就走既有官方載點→GCS 鏈，該鏈永遠可用，平台中繼留待有真實需求再議——**私有模型（無官方 URL）僅在有可直連種子時可派**，判定透明列在 UI 原因裡，不是靜默失敗）。
+- P2P 帶來的新能力：**無官方 URL 的模型也能分發**——`fetchable` 判定擴為「有簽章來源 URL **或** 有在線可直連的 P2P 種子」。
+
+### 分塊雜湊（chunk hashes，64 MiB）
+- agent 惰性雜湊器改為**單趟同時算**整檔 SHA-256＋每 64 MiB 分塊 SHA-256，sidecar 快取一併存分塊表；庫存回報攜帶分塊表（僅在整檔雜湊首次回報或變更時傳，避免心跳膨脹）。
+- 平台 `model_hashes` 加 `chunk_sha256s`（JSON 陣列）。**整檔雜湊仍是唯一共識權威**（衝突偵測不變）；分塊表僅用於早期中止壞塊——最終整檔驗證永遠執行，分塊表不對即整檔重驗兜底，投毒面不變。
+- 協定升級：agent protocol 4（分塊表欄位＋peer 欄位；舊 agent 照常運作、不參與 P2P）。
+
+### 種子端（peer serving，worker 主權：預設關閉）
+- `agent.json` 新增 `peer_serve: false`、`peer_listen_port`、`peer_advertise_host`（未設則不啟）。啟用時 agent 起一個僅服務模型檔的 HTTP listener（stdlib ThreadingHTTPServer，不新增依賴），握手/心跳向平台通告 peer URL。
+- **每個請求都要憑證**：拉方先向平台要 grant，種子端逐請求驗證，**fail-closed**（缺憑證/驗簽失敗/過期/範圍不符一律 403，無匿名路徑）。listener 只認 `GET /peer/models/<manifest name>`＋Range，路徑正規化防穿越。
+- 種子資格與 worker 停用狀態脫鉤（停用=不接工作，仍可分享模型；文件明載，worker 可用 peer_serve=false 單獨關）。
+
+### 傳輸憑證（grant，使用者安全原則）
+- 拉方（已簽名的 agent 請求）`POST /api/agent/peer-grant {name, size_bytes}` → 平台驗證拉方確缺此檔、挑一個在線種子，簽發 grant：`{grant_id, name, size_bytes, sha256, seeder_id, puller_id, expires_at}`，平台 Ed25519 簽章覆蓋全欄位（pipe-join 同 manifest 慣例，欄位含 `|` 即拒發）。
+- **TTL 10 分鐘**（同雲端上傳 token 慣例）、綁死單一檔案＋單一拉方＋單一種子；TTL 內允許多個 Range 請求（分塊傳輸本質），過期重新申請（平台無狀態重發）；grant_id 供帳務對帳。
+- 種子端驗：平台簽章（用已釘選的平台公鑰）＋expires＋seeder_id==自己＋name 與本地庫存相符。拉方身分不需另驗——能出示有效 grant 即代表平台已認證過拉方。
+
+### 頻寬入帳（§8「上傳頻寬計入收據帳本」）
+- `receipts` 加 `bytes`（nullable INTEGER）與 kind `p2p_upload`：種子 agent 完成一個 grant 的服務後（或連線關閉時）以簽名請求回報 `{grant_id, bytes_served}`，平台核對 grant 簽發紀錄後入帳：kind=p2p_upload、billable=false、gpu_seconds=0、bytes=實際服務量、worker=種子。分潤試算維持 GPU 秒數；貢獻報表新增「P2P 上傳量」欄（web 同步顯示）。job_id 不適用（NULL）——receipts.job_id 放寬為 nullable，僅 p2p_upload 允許 NULL。
+
+### 拉方整合（fetcher）
+- 來源優先序改為：**P2P 種子 → 官方載點 → GCS 備援**（省外部流量；P2P 失敗即刻落回，不重試多種子超過一輪）。
+- 分塊拉取：逐 64 MiB Range 請求、逐塊即時驗 chunk hash（壞塊即中止換來源）、`.part` 續傳=從最後一個完整驗證塊開始（斷線/取消後重申請 grant 續拉）；完成後整檔 SHA-256 終驗（不變的鐵律）→原子落地→立即重掃回報。取消/關機中止並清理，行為與現有 fetcher 相同；下載期間計費規則不變（stage=fetching_models，永不計費）。
+- 派工：`eligible_after_fetch` 的 fetchable 判定納入 P2P 種子；push 內嵌的 fetch_models 條目對 peer-only 模型 `url: null` 標 `peer: true`（sig 覆蓋 name|directory|sha256|size_bytes 不變——URL 本就不入簽）。
+
+### 雲端對等
+- cloud 對等實作 tracker／grant 簽發／p2p_upload 入帳（D1 migration 0007：model_hashes.chunk_sha256s、receipts.bytes＋job_id nullable、workers peer 欄位）。worker 間傳輸本就不經平台，Workers 平台無額外限制。
+
+### Web／文件
+- Worker 頁：P2P 分享中 badge＋通告位址；貢獻報表加 P2P 上傳量欄。zh-TW＋en。
+- SELF-HOSTING 兩語新增 P2P 章節：開啟方式、防火牆/埠、安全模型（短效憑證、fail-closed、整檔驗證兜底）、種子與停用脫鉤。
