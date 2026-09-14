@@ -231,3 +231,17 @@ Decisions of record:
 ### Web／文件
 - Worker 頁：P2P 分享中 badge＋通告位址；貢獻報表加 P2P 上傳量欄。zh-TW＋en。
 - SELF-HOSTING 兩語新增 P2P 章節：開啟方式、防火牆/埠、安全模型（短效憑證、fail-closed、整檔驗證兜底）、種子與停用脫鉤。
+
+---
+
+## Phase 3.2 addendum: 零持有者自動下載（curated 雜湊入庫）（2026-09-14）
+
+User directive（2026-09-14）：如果沒有任何一台 worker 有該模型，挑一台磁碟餘裕足夠的 worker 直接要求下載，不要跳手動下載提示；下載完立即回報清單（後者 Phase 2.1 已實作）。
+
+Decisions of record:
+- **現況根因**：fetch manifest 的 sha256 只從「持有者共識」學得——全聯邦皆缺的模型沒有可信雜湊 → 平台拒簽下載指令 → 才落到 400 手動提示。這是安全設計（不叫 worker 下載無法驗證的內容），不是缺陷；解法是給 curated registry 補上**平台維運者背書的 sha256＋size_bytes**（值取自本聯邦實測共識，2026-09-14 由 controller 從 live 共識庫固化）。
+- `ModelSource` 增 `sha256`／`size_bytes`（僅 curated 11 條全填；官方範本收割條目無可信雜湊維持原樣，仍走共識路徑）。
+- manifest 合成：無共識列的 curated 模型以 guide 雜湊簽發條目（**共識存在時共識優先**；guide 雜湊與後來學得的共識不一致 → 記 log、以共識為準——共識代表聯邦實際持有的位元組；衝突 tripwire 規則不變，僅限回報者間衝突）。
+- 送單放行：缺模型 400（`prompt.missing_models`）僅對「manifest 不可取得」的模型觸發——curated 模型即使零持有者也能排隊，由 `eligible_after_fetch` 既有機制（auto_fetch＋磁碟 1.2×＋protocol 門檻）挑 worker 下載（來源順序不變：P2P（此情境無種子）→官方→GCS）。下載完成即回報（既有）。
+- 挑 worker 準則誠實聲明：磁碟餘裕與最小下載量（既有 tier-2）；**頻寬不量測**（未實作的不寫進文件）。
+- 雲端對等（model_guide.ts 鏡像同值）；文件更新（SELF-HOSTING 缺模型章節truth-update）。
