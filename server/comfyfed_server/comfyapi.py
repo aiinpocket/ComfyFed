@@ -20,10 +20,16 @@ ComfyUI's own JavaScript, not our console:
 Deliberate deviations from upstream, all forced by ComfyFed being a
 federation rather than a single GPU:
 
-* Everything is behind an admin session (`require_admin`). `POST /prompt` is
-  intentionally NOT behind `require_csrf`: the stock ComfyUI frontend has no
-  way to send our `X-CSRF` header. The session cookie is `SameSite`-scoped,
-  which is what keeps this from being cross-site submittable.
+* Everything is behind a logged-in session (`require_user`) -- Phase 3.0
+  Task 4 made the panel a per-user workspace, so any non-disabled account
+  reaches it now, not just admin. What stays admin-only is nothing here:
+  every panel-native read/control is instead SCOPED to `origin == "panel"
+  AND user_id == <the session's own uid>`, including for an admin session
+  (full fleet visibility lives in the console's `/api/jobs`, not the panel).
+  `POST /prompt` is intentionally NOT behind `require_csrf`: the stock
+  ComfyUI frontend has no way to send our `X-CSRF` header. The session
+  cookie is `SameSite`-scoped, which is what keeps this from being
+  cross-site submittable.
 * `/object_info` is the union over online, enabled workers -- no single
   worker defines the node set. When no worker is online the response is an
   empty dict plus `X-ComfyFed-No-Workers: 1`, so the panel can say "no
@@ -675,7 +681,17 @@ def create_router(
         lambda name: _default_resolve_asset(data_dir, name)
     )
 
-    r = APIRouter(prefix="/comfy/api", dependencies=[Depends(auth.require_admin)])
+    # Phase 3.0 Task 4: the panel is a per-user workspace, not an admin-only
+    # surface -- any authenticated, non-disabled user may reach it
+    # (`require_user`), same rule as the static `/comfy` gate and the panel
+    # WS handshake below. What changes per role is NOT gate access but
+    # per-route SCOPE: every panel-native read/control (`/queue`, `/history`,
+    # `/interrupt`, `/queue` delete/clear, `/history` hide, `/view`) is
+    # additionally filtered to `origin == "panel" AND user_id == <the
+    # session's own uid>` -- including for an admin session, whose panel is
+    # just as personal as anyone else's (the spec's ruling: full fleet
+    # visibility lives in the console, not here).
+    r = APIRouter(prefix="/comfy/api", dependencies=[Depends(auth.require_user)])
 
     @r.get("/object_info")
     def object_info() -> Response:
@@ -713,7 +729,7 @@ def create_router(
         return JSONResponse(content={})
 
     @r.post("/prompt")
-    async def post_prompt(request: Request) -> Response:
+    async def post_prompt(request: Request, user: auth.SessionUser = Depends(auth.require_user)) -> Response:
         try:
             body = await request.json()
         except (ValueError, TypeError):
@@ -784,24 +800,18 @@ def create_router(
             if path:
                 resolved[name] = path
 
-        # Phase 3.0: stamp the submitting session's user onto the job, same
-        # as the console's `POST /api/jobs`. Hand-resolved (rather than a
-        # `Depends(auth.require_user)` param) because this route sits behind
-        # the router-level `require_admin` dependency (panel access stays
-        # admin-gated until Task 4) -- resolving the session again here does
-        # NOT assume the caller is an admin, since Task 4 will widen who can
-        # reach this route to any logged-in user.
-        with db.get_session() as db_session:
-            session_user = auth.resolve_session_user(db_session, request)
-        user_id = session_user.uid if session_user is not None else None
-
+        # Phase 3.0 Task 4: stamp the submitting session's user onto the job,
+        # same as the console's `POST /api/jobs`. `user` now comes from the
+        # router-level `require_user` dependency (the panel is open to any
+        # logged-in user, not just admin), cached per-request by FastAPI so
+        # this doesn't re-run the cookie decode a second time.
         try:
             job_id = jobs.create_job(
                 json.dumps(prompt),
                 prompt,
                 available_assets=set(resolved),
                 origin="panel",
-                user_id=user_id,
+                user_id=user.uid,
             )
         except jobs.MissingAssetsError as exc:
             return _comfy_error(
@@ -853,12 +863,16 @@ def create_router(
         return JSONResponse(content={"name": filename, "subfolder": "", "type": "input"})
 
     @r.get("/queue")
-    def get_queue() -> Response:
+    def get_queue(user: auth.SessionUser = Depends(auth.require_user)) -> Response:
         with db.get_session() as session:
             numbers = _numbers_by_job_id(session)
             rows = (
                 session.query(db.Job)
-                .filter(db.Job.status.in_(_RUNNING_STATUSES + _PENDING_STATUSES))
+                .filter(
+                    db.Job.status.in_(_RUNNING_STATUSES + _PENDING_STATUSES),
+                    db.Job.origin == "panel",
+                    db.Job.user_id == user.uid,
+                )
                 .order_by(db.Job.created_at.asc())
                 .all()
             )
@@ -871,7 +885,7 @@ def create_router(
         return JSONResponse(content={"queue_running": running, "queue_pending": pending})
 
     @r.post("/interrupt")
-    async def post_interrupt() -> Response:
+    async def post_interrupt(user: auth.SessionUser = Depends(auth.require_user)) -> Response:
         """Cancel whatever the panel currently sees as executing.
 
         Upstream's `/interrupt` targets the single job ComfyUI itself is
@@ -888,7 +902,11 @@ def create_router(
         with db.get_session() as session:
             job = (
                 session.query(db.Job)
-                .filter(db.Job.status.in_(_RUNNING_STATUSES), db.Job.origin == "panel")
+                .filter(
+                    db.Job.status.in_(_RUNNING_STATUSES),
+                    db.Job.origin == "panel",
+                    db.Job.user_id == user.uid,
+                )
                 .order_by(db.Job.created_at.asc())
                 .first()
             )
@@ -900,7 +918,9 @@ def create_router(
         return JSONResponse(content={})
 
     @r.post("/queue")
-    async def post_queue(request: Request) -> Response:
+    async def post_queue(
+        request: Request, user: auth.SessionUser = Depends(auth.require_user)
+    ) -> Response:
         """ComfyUI-compat queue mutation: `{"delete": [prompt_ids]}` cancels
         those specific jobs; `{"clear": true}` cancels every non-terminal
         job currently in the federation's queue (upstream empties the whole
@@ -927,6 +947,7 @@ def create_router(
                     .filter(
                         db.Job.status.in_(_PENDING_STATUSES + _RUNNING_STATUSES),
                         db.Job.origin == "panel",
+                        db.Job.user_id == user.uid,
                     )
                     .all()
                 ]
@@ -940,7 +961,11 @@ def create_router(
                     job_ids = [
                         j.id
                         for j in session.query(db.Job)
-                        .filter(db.Job.id.in_(requested_ids), db.Job.origin == "panel")
+                        .filter(
+                            db.Job.id.in_(requested_ids),
+                            db.Job.origin == "panel",
+                            db.Job.user_id == user.uid,
+                        )
                         .all()
                     ]
             else:
@@ -960,13 +985,17 @@ def create_router(
         return JSONResponse(content={})
 
     @r.get("/history")
-    def get_history(max_items: Optional[int] = None) -> Response:
-        """Scoped to `origin == "panel"`, matching `POST /history`'s write
-        scope: the panel's history is the panel's own, and a console job
-        that this endpoint could never let the panel hide (`panel_hidden`
-        is set only by panel-origin history mutations) must never appear
-        here in the first place. The console's all-seeing audit surface is
-        `/api/jobs`, which ignores `panel_hidden` and `origin` both.
+    def get_history(
+        max_items: Optional[int] = None, user: auth.SessionUser = Depends(auth.require_user)
+    ) -> Response:
+        """Scoped to `origin == "panel" AND user_id == <session uid>`,
+        matching `POST /history`'s write scope: the panel's history is each
+        user's own -- including an admin's -- and a job that this endpoint
+        could never let its viewer hide (`panel_hidden` is set only by
+        panel-origin history mutations, themselves scoped the same way) must
+        never appear here in the first place. The console's all-seeing audit
+        surface is `/api/jobs`, which ignores `panel_hidden`, `origin` and
+        `user_id` alike.
         """
         with db.get_session() as session:
             numbers = _numbers_by_job_id(session)
@@ -976,6 +1005,7 @@ def create_router(
                     db.Job.status.in_(_HISTORY_STATUSES),
                     db.Job.panel_hidden == False,  # noqa: E712
                     db.Job.origin == "panel",
+                    db.Job.user_id == user.uid,
                 )
                 .order_by(db.Job.finished_at.asc(), db.Job.created_at.asc())
             )
@@ -986,7 +1016,9 @@ def create_router(
         return JSONResponse(content=out)
 
     @r.get("/history/{prompt_id}")
-    def get_history_prompt_id(prompt_id: str) -> Response:
+    def get_history_prompt_id(
+        prompt_id: str, user: auth.SessionUser = Depends(auth.require_user)
+    ) -> Response:
         with db.get_session() as session:
             job = session.get(db.Job, prompt_id)
             if (
@@ -994,6 +1026,7 @@ def create_router(
                 or job.status not in _HISTORY_STATUSES
                 or job.panel_hidden
                 or job.origin != "panel"
+                or job.user_id != user.uid
             ):
                 # Upstream returns {} for an unknown prompt id, never a 404.
                 return JSONResponse(content={})
@@ -1002,7 +1035,9 @@ def create_router(
         return JSONResponse(content=out)
 
     @r.post("/history")
-    async def post_history(request: Request) -> Response:
+    async def post_history(
+        request: Request, user: auth.SessionUser = Depends(auth.require_user)
+    ) -> Response:
         """ComfyUI-compat history mutation, mirroring `/queue`'s shapes:
         `{"delete": [prompt_ids]}` and `{"clear": true}` (verified against
         the shipped frontend dist -- `ComfyApi.deleteItem('history', id)`
@@ -1024,7 +1059,9 @@ def create_router(
 
         with db.get_session() as session:
             query = session.query(db.Job).filter(
-                db.Job.status.in_(_HISTORY_STATUSES), db.Job.origin == "panel"
+                db.Job.status.in_(_HISTORY_STATUSES),
+                db.Job.origin == "panel",
+                db.Job.user_id == user.uid,
             )
             if not body.get("clear"):
                 requested = body.get("delete")
@@ -1044,15 +1081,24 @@ def create_router(
         return JSONResponse(content={})
 
     @r.get("/view")
-    def view(filename: str = "", type: str = "output", subfolder: str = "") -> Response:
+    def view(
+        filename: str = "",
+        type: str = "output",
+        subfolder: str = "",
+        user: auth.SessionUser = Depends(auth.require_user),
+    ) -> Response:
         try:
             safe_name = storage.sanitize_path_component(filename, what="filename")
         except ValueError:
             return Response(status_code=400)
 
         if type == "input":
-            # The staging area is genuinely flat, so a subfolder there can
-            # only be a traversal attempt or a request we cannot satisfy.
+            # The staging area is genuinely flat and shared across every
+            # panel user (uploads land in one process-wide directory, same
+            # as before Task 4 widened who can reach the panel at all) --
+            # there is no job, and therefore no `user_id`, to scope this
+            # branch against yet at upload time. A subfolder here can only
+            # be a traversal attempt or a request we cannot satisfy.
             if subfolder:
                 return Response(status_code=404)
             path = os.path.join(staging_dir(data_dir), safe_name)
@@ -1077,15 +1123,27 @@ def create_router(
                 return Response(status_code=400)
             with db.get_session() as session:
                 job = session.get(db.Job, job_id)
-                if job is None or safe_name not in _result_files(job):
+                if (
+                    job is None
+                    or safe_name not in _result_files(job)
+                    or job.origin != "panel"
+                    or job.user_id != user.uid
+                ):
                     return Response(status_code=404)
         else:
             # Legacy fallback for links minted before outputs carried a
-            # subfolder: scan done jobs newest-first for the filename.
+            # subfolder: scan this user's OWN done panel jobs newest-first
+            # for the filename -- same scope as every other panel-native
+            # route, so this fallback can't be used to read another user's
+            # (or the console's) artifact just by omitting `subfolder`.
             with db.get_session() as session:
                 candidates = (
                     session.query(db.Job)
-                    .filter(db.Job.status == "done")
+                    .filter(
+                        db.Job.status == "done",
+                        db.Job.origin == "panel",
+                        db.Job.user_id == user.uid,
+                    )
                     .order_by(db.Job.finished_at.desc(), db.Job.created_at.desc())
                     .all()
                 )
@@ -1279,13 +1337,21 @@ def create_ws_router() -> APIRouter:
     async def panel_ws(websocket: WebSocket) -> None:
         await websocket.accept()
 
+        # Phase 3.0 Task 4: any authenticated, non-disabled user may open the
+        # panel socket now, not just admin -- `resolve_session_user` already
+        # applies the disabled/stale-epoch checks `require_user` would, it
+        # just returns `None` instead of raising, which is what lets this
+        # handshake answer with a close code rather than an HTTPException
+        # (see this router's docstring). The resolved uid is remembered on
+        # the connection (`panelws.register`) so `panelws.post_event` can
+        # scope every job-specific frame to this socket's own jobs.
         with db.get_session() as db_session:
             user = auth.resolve_session_user(db_session, websocket)
-        if user is None or user.role != "admin":
+        if user is None:
             await websocket.close(code=_CLOSE_UNAUTHORIZED)
             return
 
-        sid = panelws.register(websocket)
+        sid = panelws.register(websocket, uid=user.uid)
         try:
             await websocket.send_json(
                 {"type": "status", "data": {"status": panelws.queue_status(), "sid": sid}}

@@ -198,25 +198,30 @@ def create_app(data_dir: str) -> FastAPI:
 
     @app.middleware("http")
     async def _comfy_session_gate(request: Request, call_next):
-        """Require an admin session for the panel and its static assets.
+        """Require a logged-in, non-disabled session for the panel and its
+        static assets -- any role, not just admin.
 
         `/comfy/api/*` is excluded: those routes carry their own
-        `require_admin` dependency and must answer with JSON/401 rather than
+        `require_user` dependency and must answer with JSON/401 rather than
         a redirect, because the ComfyUI frontend's fetches cannot follow a
         login redirect meaningfully. Everything else under `/comfy` is a page
         or asset a browser is loading directly, so an unauthenticated hit is
         sent to the console login at `/`.
+
+        Phase 3.0 Task 4: the panel became a per-user workspace -- ANY
+        authenticated user may open it now (Task 1's admin-only gate was
+        explicitly a placeholder pending this task, since only admin
+        accounts existed yet). Per-role SCOPE (what a session sees once
+        inside) is enforced by `comfyapi`'s routes and the panel WS
+        handshake, not by this gate.
         """
         path = request.url.path
         in_panel = path == _COMFY_PREFIX or path.startswith(_COMFY_PREFIX + "/")
         in_api = path == _COMFY_API_PREFIX or path.startswith(_COMFY_API_PREFIX + "/")
         if in_panel and not in_api:
-            # Task 1 keeps this exactly as admin-gated as it was before
-            # multi-user (today only admin accounts exist); a later task
-            # opens the panel to any logged-in user.
             with db.get_session() as session:
                 user = auth.resolve_session_user(session, request)
-            if user is None or user.role != "admin":
+            if user is None:
                 return RedirectResponse("/", status_code=302)
         return await call_next(request)
 
