@@ -53,6 +53,14 @@ _FETCH_DISK_MARGIN = 1.2
 # predates lazy hashing / lazy inventory sha256 -- see agentws._handle_hello).
 _MIN_AUTO_FETCH_PROTOCOL = 3
 
+# Phase 3.2 F1 fix: fallback budget assumed for a worker whose hello never
+# reported `max_fetch_gb` at all -- either it's missing/malformed (an old or
+# non-conforming agent), or hello simply predates the field. Mirrors the
+# agent's own default (agent/comfyfed_agent/config.py AgentConfig.max_fetch_gb)
+# so a fleet of agents that never customized the setting behaves identically
+# whether the server knows about the field or not.
+_DEFAULT_MAX_FETCH_GB = 30.0
+
 # hello.protocol below which an agent cannot pull from a peer seeder at all
 # (Phase 3.1 P2P -- mirrors peer._MIN_PEER_PROTOCOL, the same floor the
 # platform requires of a SEEDER; a puller needs the matching capability, not
@@ -512,17 +520,43 @@ def _worker_protocol(worker) -> int:
     return protocol
 
 
+def _worker_max_fetch_gb(worker) -> float:
+    """This worker's configured auto-fetch budget (hello's optional
+    `max_fetch_gb`, Phase 3.2 F1 fix), stashed into the `hardware` JSON blob
+    by `agentws._handle_hello` alongside the agent-reported hardware fields.
+    Missing/non-numeric/non-positive (never reported it, an old agent, or a
+    malformed value) degrades to `_DEFAULT_MAX_FETCH_GB` -- the same default
+    the agent itself applies when the operator never customized the setting,
+    so an old-or-silent agent is treated exactly like a fresh one, never as
+    "unlimited".
+    """
+    value = _worker_hardware(worker).get("max_fetch_gb")
+    if not isinstance(value, (int, float)) or isinstance(value, bool) or value <= 0:
+        return _DEFAULT_MAX_FETCH_GB
+    return float(value)
+
+
 def _worker_fetch_capacity_ok(worker, dynamic: dict, total_missing_gb: float) -> bool:
-    """Protocol/auto_fetch/disk-margin gate, independent of WHICH models are
-    missing -- shared by `_eligible_after_fetch` (per-candidate gate inside
-    `verdict`) and `partition_fleet_fetchable` (fleet-wide submission-time
-    gate). `dynamic` is the caller's already-parsed `worker.dynamic` JSON
-    (avoids re-parsing it once per candidate in `verdict`'s hot path).
+    """Protocol/auto_fetch/budget/disk-margin gate, independent of WHICH
+    models are missing -- shared by `_eligible_after_fetch` (per-candidate
+    gate inside `verdict`) and `partition_fleet_fetchable` (fleet-wide
+    submission-time gate). `dynamic` is the caller's already-parsed
+    `worker.dynamic` JSON (avoids re-parsing it once per candidate in
+    `verdict`'s hot path).
     """
     if _worker_protocol(worker) < _MIN_AUTO_FETCH_PROTOCOL:
         return False
 
     if not getattr(worker, "auto_fetch", False):
+        return False
+
+    # Phase 3.2 F1 fix: a worker that would refuse the download itself
+    # (fetcher._check_budget_and_disk's own max_fetch_gb check) must not be
+    # counted fetch-capable here -- otherwise the platform queues a job that
+    # is guaranteed to fail post-dispatch instead of 400ing at submission
+    # time with an actionable reason (see assess.verdict's missing_models
+    # reporting / partition_fleet_fetchable's callers).
+    if total_missing_gb > _worker_max_fetch_gb(worker):
         return False
 
     free_disk_gb = dynamic.get("free_disk_gb")

@@ -1682,6 +1682,7 @@ async def test_send_hello_declares_protocol_4_and_auto_fetch_false_by_default():
     assert payload["type"] == "hello"
     assert payload["protocol"] == 4
     assert payload["auto_fetch"] is False
+    assert payload["max_fetch_gb"] == 30
     assert payload["hardware"]["platform"] == "Windows"
     assert "peer_url" not in payload
 
@@ -1723,6 +1724,24 @@ async def test_send_hello_reports_auto_fetch_true_from_config():
 
     payload = json.loads(conn.ws.sent[0])
     assert payload["auto_fetch"] is True
+
+
+@pytest.mark.asyncio
+async def test_send_hello_reports_configured_max_fetch_gb():
+    entry = PlatformEntry(
+        platform_url="http://p",
+        platform_pubkey="aa",
+        worker_id="w1",
+        certificate="cert",
+        signing_key_hex="00" * 32,
+    )
+    conn = PlatformConnection(entry, AgentConfig(max_fetch_gb=5))
+    conn.ws = _RecordingWS()
+
+    await conn.send_hello({"cpu": "x", "platform": "Windows"}, "cuda", "2.0", ["KSampler"])
+
+    payload = json.loads(conn.ws.sent[0])
+    assert payload["max_fetch_gb"] == 5
 
 
 # --- Console-signal (Ctrl-C / Ctrl-Break) shutdown --------------------------

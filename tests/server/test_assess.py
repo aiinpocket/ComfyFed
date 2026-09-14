@@ -300,6 +300,76 @@ def test_verdict_ineligible_when_manifest_size_sum_exceeds_margin():
     assert v2.kind == "eligible_after_fetch"
 
 
+def test_verdict_ineligible_when_total_missing_exceeds_worker_max_fetch_gb():
+    """Phase 3.2 F1 fix: a worker whose hello reported max_fetch_gb=5 must
+    not be counted eligible_after_fetch for a 31 GiB curated set even though
+    disk margin easily clears -- it would refuse the download itself
+    (fetcher._check_budget_and_disk) once dispatched, so the platform must
+    say so at verdict/submission time instead of post-dispatch."""
+    worker = _fetch_ready_worker(
+        "w1",
+        model_inventory=[],
+        hardware={"max_fetch_gb": 5},
+        dynamic={"free_disk_gb": 1000.0},
+    )
+    needs = assess.JobNeeds(nodes=set(), models={"big.safetensors"}, est_vram_gb=None)
+    fetchable = {"big.safetensors": 31 * 1024**3}
+    v = assess.verdict(worker, needs, {}, [worker], fetchable_models=fetchable)
+    assert v.kind == "ineligible"
+    assert any(r.startswith("missing_models_unavailable:") for r in v.reasons)
+
+
+def test_verdict_eligible_after_fetch_when_worker_max_fetch_gb_budget_covers_it():
+    worker = _fetch_ready_worker(
+        "w1",
+        model_inventory=[],
+        hardware={"max_fetch_gb": 100},
+        dynamic={"free_disk_gb": 1000.0},
+    )
+    needs = assess.JobNeeds(nodes=set(), models={"big.safetensors"}, est_vram_gb=None)
+    fetchable = {"big.safetensors": 31 * 1024**3}
+    v = assess.verdict(worker, needs, {}, [worker], fetchable_models=fetchable)
+    assert v.kind == "eligible_after_fetch"
+
+
+def test_verdict_missing_max_fetch_gb_defaults_to_30_like_the_agent():
+    """No hello.max_fetch_gb reported at all (old/legacy agent) degrades to
+    the same default the agent itself applies -- 30 GB is NOT enough for a
+    31 GiB set."""
+    worker = _fetch_ready_worker(
+        "w1", model_inventory=[], hardware={}, dynamic={"free_disk_gb": 1000.0}
+    )
+    needs = assess.JobNeeds(nodes=set(), models={"big.safetensors"}, est_vram_gb=None)
+    fetchable = {"big.safetensors": 31 * 1024**3}
+    v = assess.verdict(worker, needs, {}, [worker], fetchable_models=fetchable)
+    assert v.kind == "ineligible"
+
+
+def test_partition_fleet_fetchable_excludes_models_over_low_budget_worker_and_restores_with_high_budget():
+    """The exact F1 scenario: a max_fetch_gb=5 worker is not fetch-capable
+    for a 31 GB curated set (submission-time 400 still lists it as
+    unfetchable, actionable), but a max_fetch_gb=100 worker restores
+    queueing."""
+    low_budget = _fetch_ready_worker(
+        "w1", hardware={"max_fetch_gb": 5}, dynamic={"free_disk_gb": 1000.0}
+    )
+    fetchable = {"a.safetensors": 31 * 1024**3}
+    fetchable_set, unfetchable = assess.partition_fleet_fetchable(
+        {"a.safetensors"}, fetchable, [low_budget]
+    )
+    assert fetchable_set == set()
+    assert unfetchable == {"a.safetensors"}
+
+    high_budget = _fetch_ready_worker(
+        "w2", hardware={"max_fetch_gb": 100}, dynamic={"free_disk_gb": 1000.0}
+    )
+    fetchable_set2, unfetchable2 = assess.partition_fleet_fetchable(
+        {"a.safetensors"}, fetchable, [high_budget]
+    )
+    assert fetchable_set2 == {"a.safetensors"}
+    assert unfetchable2 == set()
+
+
 def test_verdict_eligible_after_fetch_for_zero_holder_curated_model():
     """Phase 3.2: an empty-inventory worker with auto_fetch opted in becomes
     `eligible_after_fetch` for a curated model that NOT A SINGLE fleet worker

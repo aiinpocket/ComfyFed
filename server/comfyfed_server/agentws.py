@@ -641,14 +641,37 @@ def _parse_peer_url(message: dict, worker_id: str) -> Optional[str]:
     return peer_url
 
 
+def _parse_max_fetch_gb(message: dict) -> Optional[float]:
+    """Validate hello's optional `max_fetch_gb` (Phase 3.2 F1 fix): a
+    positive int/float, else `None` (missing, wrong type, or non-positive) --
+    the caller then omits it from what gets stored, and
+    `assess._worker_max_fetch_gb` degrades that to the same default the
+    agent itself uses. A stray/hostile value must never be read as a bigger
+    budget than the agent will actually honor."""
+    value = message.get("max_fetch_gb")
+    if not isinstance(value, (int, float)) or isinstance(value, bool) or value <= 0:
+        return None
+    return float(value)
+
+
 async def _handle_hello(worker_id: str, conn: "_Connection", message: dict) -> None:
     protocol = _parse_protocol(message)
     peer_url = _parse_peer_url(message, worker_id)
+    max_fetch_gb = _parse_max_fetch_gb(message)
     with db.get_session() as session:
         worker = session.get(db.Worker, worker_id)
         if worker is None:
             return
-        worker.hardware = json.dumps(message.get("hardware") or {})
+        # Phase 3.2 F1 fix: no new column/migration -- `max_fetch_gb` rides
+        # inside the same `hardware` JSON blob this hello fully replaces
+        # every time, read back by assess._worker_max_fetch_gb. Omitted
+        # entirely when hello didn't report a valid value, so a stale value
+        # from a PREVIOUS hello can never survive an agent reconnecting
+        # without it (matches every other hello-replaced field here).
+        hardware_blob = dict(message.get("hardware") or {})
+        if max_fetch_gb is not None:
+            hardware_blob["max_fetch_gb"] = max_fetch_gb
+        worker.hardware = json.dumps(hardware_blob)
         worker.backend = message.get("backend") or ""
         worker.torch_version = message.get("torch_version") or ""
         worker.node_classes = json.dumps(message.get("node_classes") or [])

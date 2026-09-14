@@ -375,13 +375,13 @@ async def test_hash_mismatch_deletes_part_and_names_the_file(tmp_path, monkeypat
     content = b"correct-bytes"
     entry = _signed_entry(signing_key, name="model.safetensors", directory="checkpoints", content=content)
 
-    # Server sends different bytes than what the manifest was signed for --
-    # every attempt (2 against the sole url, no backup configured) mismatches.
+    # Server sends different bytes than what the manifest was signed for. A
+    # verified sha256 mismatch is deterministic, so it must NOT be retried
+    # against the same url -- exactly one attempt against the sole url (no
+    # backup configured), then straight to the final failure.
     wrong_content = b"corrupted!!!!"
     recorded = []
-    client_cls = _client_factory(
-        [_StreamSpec(chunks=[wrong_content]), _StreamSpec(chunks=[wrong_content])], recorded
-    )
+    client_cls = _client_factory([_StreamSpec(chunks=[wrong_content])], recorded)
 
     with pytest.raises(fetcher.FetchError) as exc_info:
         await fetcher.fetch_and_verify_models(
@@ -397,6 +397,47 @@ async def test_hash_mismatch_deletes_part_and_names_the_file(tmp_path, monkeypat
     assert "model.safetensors" in str(exc_info.value)
     assert not (tmp_path / "checkpoints" / "model.safetensors.part").exists()
     assert not (tmp_path / "checkpoints" / "model.safetensors").exists()
+    assert recorded == [entry["url"]]
+
+
+async def test_hash_mismatch_on_primary_advances_to_backup_without_retrying_primary(tmp_path):
+    """A verified mismatch is deterministic -- retrying the same url just
+    re-downloads the same wrong bytes. So exactly one attempt against the
+    primary (not two), then straight to the backup, which succeeds."""
+    signing_key, pubkey_hex = _keypair()
+    content = b"weights-from-backup"
+    entry = _signed_entry(
+        signing_key,
+        name="model.safetensors",
+        directory="checkpoints",
+        content=content,
+        url="http://primary.example/f.bin",
+        backup_url="http://backup.example/f.bin",
+    )
+
+    wrong_content = b"corrupted!!!!"
+    recorded = []
+    client_cls = _client_factory(
+        [
+            _StreamSpec(chunks=[wrong_content]),  # primary attempt 1: verified mismatch
+            _StreamSpec(chunks=[content]),  # backup attempt 1 succeeds
+        ],
+        recorded,
+    )
+
+    await fetcher.fetch_and_verify_models(
+        entries=[entry],
+        platform_pubkey_hex=pubkey_hex,
+        models_dir=str(tmp_path),
+        max_fetch_gb=100,
+        cancel_event=asyncio.Event(),
+        report_progress=_noop_progress,
+        client_factory=client_cls,
+    )
+
+    final_path = tmp_path / "checkpoints" / "model.safetensors"
+    assert final_path.read_bytes() == content
+    assert recorded == [entry["url"], entry["backup_url"]]
 
 
 # --- backup url fallback ------------------------------------------------------
