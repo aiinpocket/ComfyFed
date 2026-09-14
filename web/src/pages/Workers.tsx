@@ -1,4 +1,5 @@
 import {
+  Accordion,
   Alert,
   Badge,
   Box,
@@ -287,6 +288,7 @@ function AddWorkerModal({ opened, onClose, onCreated }: AddWorkerModalProps) {
   const [bundle, setBundle] = useState<TokenBundle | null>(null);
 
   const bundleText = bundle ? JSON.stringify(bundle, null, 2) : '';
+  const platformUrl = bundle?.platform_url || window.location.origin;
 
   const reset = () => {
     setName('');
@@ -371,47 +373,122 @@ function AddWorkerModal({ opened, onClose, onCreated }: AddWorkerModalProps) {
           <Alert color="yellow" variant="light" p="sm" icon={<IconAlertTriangle size={16} />}>
             <Text size="sm">{t('workers.bundle_warning')}</Text>
           </Alert>
-          <Text size="sm" c="dimmed">
-            {t('workers.bundle_body')}
+
+          <Text size="sm" fw={500}>
+            {t('workers.install_title')}
           </Text>
-          <Box
-            style={{
-              maxHeight: 260,
-              overflow: 'auto',
-              borderRadius: theme.radius.md,
-              border: `1px solid ${theme.other.surfaces.border}`,
-            }}
-          >
-            <Code block style={{ background: theme.other.surfaces.raised, fontSize: 12 }}>
-              {bundleText}
-            </Code>
-          </Box>
-          <Group justify="space-between" gap="sm">
+          <Stack gap="sm">
+            <InstallCommandBlock
+              label={t('workers.install_windows_ps')}
+              command={`irm "${platformUrl}/install.ps1?token=${bundle.register_token}" | iex`}
+            />
+            <InstallCommandBlock
+              label={t('workers.install_windows_cmd')}
+              command={`curl -fsSL "${platformUrl}/install.cmd?token=${bundle.register_token}" -o install.cmd && install.cmd && del install.cmd`}
+            />
+            <InstallCommandBlock
+              label={t('workers.install_unix')}
+              command={`curl -fsSL "${platformUrl}/install.sh?token=${bundle.register_token}" | bash`}
+            />
+          </Stack>
+
+          <Accordion variant="separated">
+            <Accordion.Item value="manual">
+              <Accordion.Control>{t('workers.manual_install')}</Accordion.Control>
+              <Accordion.Panel>
+                <Stack gap="md">
+                  <Text size="sm" c="dimmed">
+                    {t('workers.bundle_body')}
+                  </Text>
+                  <Box
+                    style={{
+                      maxHeight: 260,
+                      overflow: 'auto',
+                      borderRadius: theme.radius.md,
+                      border: `1px solid ${theme.other.surfaces.border}`,
+                    }}
+                  >
+                    <Code block style={{ background: theme.other.surfaces.raised, fontSize: 12 }}>
+                      {bundleText}
+                    </Code>
+                  </Box>
+                  <Group gap="sm">
+                    <CopyButton value={bundleText} timeout={1800}>
+                      {({ copied, copy }) => (
+                        <Tooltip label={copied ? t('common.copied') : t('common.copy')}>
+                          <Button
+                            variant="light"
+                            color={copied ? 'teal' : 'federation'}
+                            leftSection={copied ? <IconCheck size={16} /> : <IconCopy size={16} />}
+                            onClick={copy}
+                          >
+                            {copied ? t('common.copied') : t('workers.copy_bundle')}
+                          </Button>
+                        </Tooltip>
+                      )}
+                    </CopyButton>
+                    <Button leftSection={<IconDownload size={16} />} onClick={downloadBundle}>
+                      {t('workers.download_bundle')}
+                    </Button>
+                  </Group>
+                </Stack>
+              </Accordion.Panel>
+            </Accordion.Item>
+          </Accordion>
+
+          <Group justify="flex-end">
             <Button variant="default" onClick={close}>
               {t('common.done')}
             </Button>
-            <Group gap="sm">
-              <CopyButton value={bundleText} timeout={1800}>
-                {({ copied, copy }) => (
-                  <Tooltip label={copied ? t('common.copied') : t('common.copy')}>
-                    <Button
-                      variant="light"
-                      color={copied ? 'teal' : 'federation'}
-                      leftSection={copied ? <IconCheck size={16} /> : <IconCopy size={16} />}
-                      onClick={copy}
-                    >
-                      {copied ? t('common.copied') : t('workers.copy_bundle')}
-                    </Button>
-                  </Tooltip>
-                )}
-              </CopyButton>
-              <Button leftSection={<IconDownload size={16} />} onClick={downloadBundle}>
-                {t('workers.download_bundle')}
-              </Button>
-            </Group>
           </Group>
         </Stack>
       )}
     </Modal>
+  );
+}
+
+interface InstallCommandBlockProps {
+  label: string;
+  command: string;
+}
+
+function InstallCommandBlock({ label, command }: InstallCommandBlockProps) {
+  const { t } = useTranslation();
+  const theme = useMantineTheme();
+
+  return (
+    <Box>
+      <Group justify="space-between" gap="sm" mb={4}>
+        <Badge variant="light" tt="none" fw={500}>
+          {label}
+        </Badge>
+        <CopyButton value={command} timeout={1800}>
+          {({ copied, copy }) => (
+            <Tooltip label={copied ? t('common.copied') : t('common.copy')}>
+              <Button
+                size="compact-xs"
+                variant="subtle"
+                color={copied ? 'teal' : 'federation'}
+                leftSection={copied ? <IconCheck size={14} /> : <IconCopy size={14} />}
+                onClick={copy}
+              >
+                {copied ? t('common.copied') : t('common.copy')}
+              </Button>
+            </Tooltip>
+          )}
+        </CopyButton>
+      </Group>
+      <Box
+        style={{
+          overflowX: 'auto',
+          borderRadius: theme.radius.md,
+          border: `1px solid ${theme.other.surfaces.border}`,
+        }}
+      >
+        <Code block style={{ background: theme.other.surfaces.raised, fontSize: 12, whiteSpace: 'pre' }}>
+          {command}
+        </Code>
+      </Box>
+    </Box>
   );
 }

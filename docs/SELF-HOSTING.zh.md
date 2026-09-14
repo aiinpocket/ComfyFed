@@ -107,8 +107,37 @@ server {
 
 ### 新增一台 worker
 
-1. 在主控台 → **Workers** → 新增，輸入名稱後系統會產生一次性的註冊 bundle（`bundle.json`），下載它。
-2. 在要貢獻算力的那台機器上：
+1. 在主控台 → **Workers** → 新增，輸入名稱後系統會產生一次性的註冊 token，並直接顯示三條一行安裝指令（Windows PowerShell／Windows cmd／Linux + macOS），各附複製按鈕。
+2. 在要貢獻算力的那台機器上，貼上對應那一行貼到終端機執行：
+
+```powershell
+# Windows（PowerShell）
+irm "<你的平台網址>/install.ps1?token=<一次性 token>" | iex
+```
+
+```cmd
+:: Windows（cmd）
+curl -fsSL "<你的平台網址>/install.cmd?token=<一次性 token>" -o install.cmd && install.cmd && del install.cmd
+```
+
+```bash
+# Linux / macOS
+curl -fsSL "<你的平台網址>/install.sh?token=<一次性 token>" | bash
+```
+
+（實際指令請直接從主控台複製，網址與 token 已經幫你填好。）
+
+這一行指令會自動完成整套安裝：缺 Python 會自動安裝（Windows 走官方安裝器、Linux 依發行版用 apt/dnf、macOS 引導 Xcode CLT／官方 pkg）；找不到本機 ComfyUI 就連 ComfyUI 一起裝（釘死 v0.35.0，依 GPU 自動選 CUDA／CPU／MPS）；裝完會用 token 自動完成 `register`，並把整組（ComfyUI + agent）設成開機自動啟動、在背景執行，不需要再手動下指令。重跑同一行指令是安全的（冪等）：已經裝過的機器會修好任務排程／服務並升級 agent，不會重灌 ComfyUI。
+
+**解除安裝**：
+
+- **Windows**：`schtasks /Delete /TN ComfyFedAgent /F`，再刪除 `%LOCALAPPDATA%\ComfyFed` 資料夾。
+- **Linux**：`systemctl --user disable --now comfyfed-agent comfyfed-comfyui`，再刪除 `~/.comfyfed`。
+- **macOS**：`launchctl unload -w ~/Library/LaunchAgents/com.comfyfed.agent.plist`（若有安裝 ComfyUI 再加一行 `com.comfyfed.comfyui.plist`），刪掉這些 `.plist` 檔，再刪除 `~/.comfyfed`。
+
+#### 手動安裝（進階）
+
+一行指令背後其實就是「裝 Python 套件 + 註冊」，需要自行掌控環境（例如已經有現成的 ComfyUI、想自訂 venv）時可以照舊手動做。主控台的「手動安裝（進階）」摺疊區塊仍可下載同一份 `bundle.json`：
 
 ```bash
 pip install -e .
@@ -116,7 +145,7 @@ comfyfed-agent register bundle.json
 comfyfed-agent run
 ```
 
-`register` 會用 bundle 裡的一次性 token 向伺服器換發正式憑證，並把設定寫到 `~/.comfyfed/agent.json`；`run` 會連上所有已註冊的平台並開始接工作。
+`register` 會用 bundle 裡的一次性 token 向伺服器換發正式憑證，並把設定寫到 `~/.comfyfed/agent.json`；`run` 會連上所有已註冊的平台並開始接工作。手動流程不會幫你裝 ComfyUI 或設開機自啟，這些要自己處理。
 
 **ComfyUI 的位置與資料夾會自動偵測**：註冊（與每次啟動）時 agent 會自己找本機的 ComfyUI——先試常見的埠（8188／8000 等），找不到就掃 8000–8399 並用 `/system_stats` 指紋確認；找到後再從 `/internal/folder_paths` 推導出模型庫（`models_dir`）與 ComfyUI 真正的 output／input 資料夾，一併寫進 `agent.json`。只有在完全找不到（ComfyUI 沒開、或跑在很冷門的埠）時才需要手動在 `agent.json` 填 `comfy_url`；你手動填過的值永遠不會被自動偵測覆蓋。
 
