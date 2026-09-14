@@ -85,6 +85,7 @@ def create_job(
     requirements: Optional[dict] = None,
     available_assets: Optional[set[str]] = None,
     origin: str = "console",
+    user_id: Optional[str] = None,
 ) -> str:
     """Assess a workflow and persist a queued Job row. Returns the job id.
 
@@ -104,6 +105,12 @@ def create_job(
     `comfyapi.post_prompt`). It is what lets the panel's own controls
     (`/comfy/api/interrupt`, `/comfy/api/queue`, panel history) act only on
     jobs the panel itself submitted.
+
+    `user_id` (Phase 3.0) is the submitting session's `SessionUser.uid` --
+    `None` when the caller couldn't resolve one (should not normally happen
+    for either live entry point, both of which sit behind a login gate, but
+    this function makes no assumption about who is allowed to call it or
+    what role they hold).
     """
     needs = assess.extract(workflow)
     available = set(available_assets or ())
@@ -124,6 +131,7 @@ def create_job(
             est_vram_gb=est_vram_gb,
             input_assets=json.dumps(sorted(available)),
             origin=origin,
+            user_id=user_id,
         )
         session.add(job)
         session.commit()
@@ -182,6 +190,17 @@ def _job_dict_full(job: db.Job, receipt: Optional["db.Receipt"] = None) -> dict:
     return d
 
 
+def _require_owner_or_admin(job: db.Job, user: auth.SessionUser) -> None:
+    """Owner-or-admin gate for the per-job console routes.
+
+    Raises the SAME 404 a nonexistent job would -- a non-owner, non-admin
+    caller must not be able to tell "not mine" apart from "doesn't exist"
+    (that would leak which job ids are in use).
+    """
+    if user.role != "admin" and job.user_id != user.uid:
+        raise _error(404, "jobs.not_found", "Job not found.")
+
+
 def create_router(data_dir: str) -> APIRouter:
     r = APIRouter()
 
@@ -190,7 +209,7 @@ def create_router(data_dir: str) -> APIRouter:
         workflow_json: str = Form(...),
         requirements: Optional[str] = Form(default=None),
         assets: list[UploadFile] = File(default=[]),
-        _payload: dict = Depends(auth.require_csrf),
+        user: auth.SessionUser = Depends(auth.require_csrf_user),
     ):
         try:
             workflow = json.loads(workflow_json)
@@ -231,6 +250,7 @@ def create_router(data_dir: str) -> APIRouter:
                 requirements=requirements_dict,
                 available_assets=set(uploaded_names),
                 origin="console",
+                user_id=user.uid,
             )
         except MissingAssetsError as exc:
             raise _error(
@@ -250,22 +270,40 @@ def create_router(data_dir: str) -> APIRouter:
         return {"job_id": job_id}
 
     @r.get("/api/jobs")
-    def list_jobs(status: Optional[str] = None, _payload: dict = Depends(auth.require_admin)):
+    def list_jobs(status: Optional[str] = None, user: auth.SessionUser = Depends(auth.require_user)):
+        is_admin = user.role == "admin"
         with db.get_session() as session:
             query = session.query(db.Job)
+            if not is_admin:
+                query = query.filter(db.Job.user_id == user.uid)
             if status:
                 statuses = [s.strip() for s in status.split(",") if s.strip()]
                 if statuses:
                     query = query.filter(db.Job.status.in_(statuses))
             jobs = query.order_by(db.Job.created_at.asc()).all()
-            return [_job_dict(j) for j in jobs]
+
+            if is_admin:
+                user_ids = {j.user_id for j in jobs if j.user_id}
+                username_by_id = {
+                    u.id: u.username
+                    for u in session.query(db.User).filter(db.User.id.in_(user_ids)).all()
+                } if user_ids else {}
+                return [
+                    {**_job_dict(j), "username": username_by_id.get(j.user_id)} for j in jobs
+                ]
+
+            # Non-admin: every row here is already the caller's own (filtered
+            # above), so the username is always the caller's own -- included
+            # anyway so admin and non-admin list items share the same shape.
+            return [{**_job_dict(j), "username": user.username} for j in jobs]
 
     @r.get("/api/jobs/{job_id}")
-    def get_job(job_id: str, _payload: dict = Depends(auth.require_admin)):
+    def get_job(job_id: str, user: auth.SessionUser = Depends(auth.require_user)):
         with db.get_session() as session:
             job = session.get(db.Job, job_id)
             if job is None:
                 raise _error(404, "jobs.not_found", "Job not found.")
+            _require_owner_or_admin(job, user)
             # A retried job can accumulate more than one receipt across
             # attempts; the newest one is what the detail page should show.
             receipt = (
@@ -277,11 +315,12 @@ def create_router(data_dir: str) -> APIRouter:
             return _job_dict_full(job, receipt)
 
     @r.get("/api/jobs/{job_id}/assessment")
-    def get_job_assessment(job_id: str, _payload: dict = Depends(auth.require_admin)):
+    def get_job_assessment(job_id: str, user: auth.SessionUser = Depends(auth.require_user)):
         with db.get_session() as session:
             job = session.get(db.Job, job_id)
             if job is None:
                 raise _error(404, "jobs.not_found", "Job not found.")
+            _require_owner_or_admin(job, user)
 
             needs = assess.needs_from_job(job)
 
@@ -415,11 +454,14 @@ def create_router(data_dir: str) -> APIRouter:
         return {"stored": stored, "sha256": computed_sha256}
 
     @r.get("/api/jobs/{job_id}/artifacts/{filename}")
-    def get_job_artifact(job_id: str, filename: str, _payload: dict = Depends(auth.require_admin)):
+    def get_job_artifact(
+        job_id: str, filename: str, user: auth.SessionUser = Depends(auth.require_user)
+    ):
         with db.get_session() as session:
             job = session.get(db.Job, job_id)
             if job is None:
                 raise _error(404, "jobs.not_found", "Job not found.")
+            _require_owner_or_admin(job, user)
 
         store = storage.get_store(data_dir)
         try:
@@ -434,13 +476,16 @@ def create_router(data_dir: str) -> APIRouter:
         )
 
     @r.post("/api/jobs/{job_id}/cancel")
-    async def cancel_job(job_id: str, _payload: dict = Depends(auth.require_csrf)):
+    async def cancel_job(
+        job_id: str, user: auth.SessionUser = Depends(auth.require_csrf_user)
+    ):
         """Cancel a queued/assigned/running job from the console.
 
-        404 for an unknown job, 409 (with the terminal status in the body)
-        for one that already finished, was already cancelled, or failed --
-        cancelling twice, or cancelling something that finished moments
-        before the request landed, must not stomp on a real result.
+        404 for an unknown job OR one owned by a different non-admin user
+        (do not leak job existence), 409 (with the terminal status in the
+        body) for one that already finished, was already cancelled, or
+        failed -- cancelling twice, or cancelling something that finished
+        moments before the request landed, must not stomp on a real result.
 
         The terminal case is decided by `cancel_and_notify`'s own return
         rather than by a separate status read beforehand: that read and the
@@ -450,8 +495,10 @@ def create_router(data_dir: str) -> APIRouter:
         back afterwards, to say *which* terminal state the caller lost to.
         """
         with db.get_session() as session:
-            if session.get(db.Job, job_id) is None:
+            job = session.get(db.Job, job_id)
+            if job is None:
                 raise _error(404, "jobs.not_found", "Job not found.")
+            _require_owner_or_admin(job, user)
 
         if not await agentws.cancel_and_notify(job_id, reason="cancelled by admin"):
             with db.get_session() as session:

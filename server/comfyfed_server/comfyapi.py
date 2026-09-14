@@ -784,9 +784,24 @@ def create_router(
             if path:
                 resolved[name] = path
 
+        # Phase 3.0: stamp the submitting session's user onto the job, same
+        # as the console's `POST /api/jobs`. Hand-resolved (rather than a
+        # `Depends(auth.require_user)` param) because this route sits behind
+        # the router-level `require_admin` dependency (panel access stays
+        # admin-gated until Task 4) -- resolving the session again here does
+        # NOT assume the caller is an admin, since Task 4 will widen who can
+        # reach this route to any logged-in user.
+        with db.get_session() as db_session:
+            session_user = auth.resolve_session_user(db_session, request)
+        user_id = session_user.uid if session_user is not None else None
+
         try:
             job_id = jobs.create_job(
-                json.dumps(prompt), prompt, available_assets=set(resolved), origin="panel"
+                json.dumps(prompt),
+                prompt,
+                available_assets=set(resolved),
+                origin="panel",
+                user_id=user_id,
             )
         except jobs.MissingAssetsError as exc:
             return _comfy_error(

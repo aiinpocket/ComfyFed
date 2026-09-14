@@ -246,6 +246,23 @@ async def require_csrf(
     return user
 
 
+async def require_csrf_user(
+    user: SessionUser = Depends(require_user),
+    cf_session: Optional[str] = Cookie(default=None),
+    x_csrf: Optional[str] = Header(default=None, alias="X-CSRF"),
+) -> SessionUser:
+    """Like `require_csrf` but for any logged-in user, not just admin.
+
+    Phase 3.0 job ownership (jobs.py): `POST /api/jobs` and `POST
+    /api/jobs/{id}/cancel` are owner-or-admin gated rather than admin-only,
+    but still need the same CSRF enforcement any state-changing,
+    cookie-authenticated route gets. `require_csrf` can't be reused as-is
+    because it hangs off `require_admin`.
+    """
+    _payload_and_csrf(cf_session, x_csrf)
+    return user
+
+
 def issue_session_cookie(response: Response, user: db.User) -> str:
     """Set the session cookie for `user` and return the fresh CSRF token.
 
