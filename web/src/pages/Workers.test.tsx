@@ -94,19 +94,21 @@ describe('Workers page: P2P sharing badge', () => {
     vi.unstubAllGlobals();
   });
 
-  it('shows the P2P sharing badge for a worker with peer_url set', async () => {
+  it('shows the P2P sharing badge and the advertised peer_url for a worker with peer_url set', async () => {
     stubFetch([BASE_WORKER]);
     renderWorkers();
 
     expect(await screen.findByText('runner-sharing')).toBeInTheDocument();
     expect(await screen.findByText('P2P sharing')).toBeInTheDocument();
+    expect(await screen.findByText('http://192.168.1.5:8850')).toBeInTheDocument();
   });
 
-  it('shows no badge for a worker with peer_url null', async () => {
+  it('shows no badge and no peer_url text for a worker with peer_url null', async () => {
     stubFetch([QUIET_WORKER]);
     renderWorkers();
 
     expect(await screen.findByText('runner-quiet')).toBeInTheDocument();
     expect(screen.queryByText('P2P sharing')).not.toBeInTheDocument();
+    expect(screen.queryByText('http://192.168.1.5:8850')).not.toBeInTheDocument();
   });
 });

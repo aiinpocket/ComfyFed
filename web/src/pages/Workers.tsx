@@ -148,6 +148,11 @@ export function Workers() {
                         <Mono size="xs" title={worker.id}>
                           {shortId(worker.id)}
                         </Mono>
+                        {worker.peer_url && (
+                          <Mono size="xs" title={worker.peer_url}>
+                            {worker.peer_url}
+                          </Mono>
+                        )}
                       </Stack>
                     </Table.Td>
                     <Table.Td>
