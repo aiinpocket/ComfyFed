@@ -502,10 +502,13 @@ def test_scan_models_upgrades_chunkless_sidecar_entry(tmp_path):
         encoding="utf-8",
     )
 
-    # First pass must NOT report the stale (chunkless) cached sha256 as-is;
-    # it should treat the entry as un-hashed and schedule a re-hash instead.
+    # First pass keeps reporting the still-valid ((size, mtime) unchanged)
+    # whole-file sha256 -- an upgraded worker must not go hash-dark (the P2P
+    # seeder predicate needs it) -- while chunk_sha256s stays absent until
+    # the background re-hash lands.
     entries = hardware.scan_models(str(models_dir))
-    assert "sha256" not in entries[0]
+    assert entries[0]["sha256"] == hashlib.sha256(content).hexdigest()
+    assert "chunk_sha256s" not in entries[0]
 
     expected = hashlib.sha256(content).hexdigest()
     # Deliberately not `_wait_for_hash`: the pre-seeded cache entry already

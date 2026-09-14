@@ -360,11 +360,24 @@ def scan_models(models_dir: str, hash_models: bool = True) -> list[dict]:
                 else:
                     # No cache hit, a stale (size, mtime), OR a cache entry
                     # from before chunk hashing existed (no chunk_sha256s):
-                    # all three are treated the same -- un-hashed -- so an
-                    # old sidecar upgrades to carrying chunks over the
-                    # normal one-file-per-pass smallest-first schedule below,
-                    # without a separate "upgrade pass" that could starve
-                    # genuinely new files.
+                    # all three re-hash over the normal one-file-per-pass
+                    # smallest-first schedule below, without a separate
+                    # "upgrade pass" that could starve genuinely new files.
+                    #
+                    # BUT a pre-3.1 sidecar's whole-file sha256 is still
+                    # valid ((size, mtime) unchanged) -- keep reporting it
+                    # while the chunk table pends, or every upgraded worker
+                    # would go hash-dark for hours (live-caught: the P2P
+                    # seeder predicate requires the inventory entry to carry
+                    # the consensus sha, so a fully-hashed pre-3.1 worker
+                    # could not seed anything until full re-hash).
+                    if (
+                        cached
+                        and cached.get("size") == size_bytes
+                        and cached.get("mtime") == mtime
+                        and isinstance(cached.get("sha256"), str)
+                    ):
+                        entry["sha256"] = cached["sha256"]
                     candidates.append((size_bytes, full_path, rel_path, mtime))
 
             results.append(entry)
