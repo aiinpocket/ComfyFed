@@ -195,6 +195,31 @@ bilingual "安裝 agent..." "Installing agent..."
     "請重跑本腳本" "please re-run this script"
 rm -rf "$WHEEL_TMPDIR"
 
+# `comfyfed pause`/`resume`/`status`/`stop` on PATH: symlink the venv's
+# console-script into ~/.local/bin (the de-facto per-user bin dir on both
+# Linux and macOS). Non-fatal -- a missing PATH entry just means the user
+# has to invoke the venv binary directly, so warn instead of failing the
+# whole install.
+# The mkdir is guarded too: the script runs under `set -euo pipefail`, so an
+# unwritable $HOME would otherwise abort the whole install on a step the
+# comment above calls non-fatal.
+if mkdir -p "$HOME/.local/bin" 2>/dev/null && ln -sf "$VENV_DIR/bin/comfyfed" "$HOME/.local/bin/comfyfed"; then
+    bilingual "已將 comfyfed 加入 ~/.local/bin" "Linked comfyfed into ~/.local/bin"
+    # ~/.local/bin is NOT on the default PATH on macOS (stock /etc/paths) nor
+    # on minimal Linux images, so say so instead of letting `comfyfed pause`
+    # answer "command not found".
+    case ":$PATH:" in
+        *":$HOME/.local/bin:"*) ;;
+        *)
+            echo "[提示/NOTE] ~/.local/bin 不在 PATH 上。請加入（zsh 用 ~/.zshrc，bash 用 ~/.bashrc）： / ~/.local/bin is not on your PATH. Add it (zsh: ~/.zshrc, bash: ~/.bashrc):" >&2
+            echo "    echo 'export PATH=\"\$HOME/.local/bin:\$PATH\"' >> ~/.zshrc && exec \$SHELL -l" >&2
+            ;;
+    esac
+else
+    echo "[警告/WARNING] 無法建立 ~/.local/bin/comfyfed 符號連結 / could not create the ~/.local/bin/comfyfed symlink" >&2
+    echo "手動替代 / Manual alternative: 直接執行 $VENV_DIR/bin/comfyfed / run $VENV_DIR/bin/comfyfed directly" >&2
+fi
+
 # ---------------------------------------------------------------------------
 # Helper python script (ComfyUI detection), dropped to disk instead of
 # fragile inline -c one-liners.
@@ -467,6 +492,11 @@ PLISTEOF
     fi
 
     VENV_AGENT_XML="$(xml_escape "$VENV_AGENT")"
+    # An upgrade rewrites the plist, but `launchctl load -w` on an
+    # already-loaded job is a no-op: the running job would keep the OLD
+    # KeepAlive=true definition (and resurrect the agent after every
+    # `comfyfed stop`) until the user logged out. Unload first.
+    launchctl unload -w "$LAUNCH_AGENTS_DIR/com.comfyfed.agent.plist" 2>/dev/null || true
     cat > "$LAUNCH_AGENTS_DIR/com.comfyfed.agent.plist" <<PLISTEOF
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
@@ -479,7 +509,10 @@ PLISTEOF
         <string>run</string>
     </array>
     <key>RunAtLoad</key><true/>
-    <key>KeepAlive</key><true/>
+    <key>KeepAlive</key>
+    <dict>
+        <key>SuccessfulExit</key><false/>
+    </dict>
 </dict>
 </plist>
 PLISTEOF

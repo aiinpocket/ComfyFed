@@ -158,7 +158,7 @@ export interface WorkerDynamic {
   free_disk_gb?: number | null;
 }
 
-export type WorkerStatus = 'online' | 'busy' | 'offline';
+export type WorkerStatus = 'online' | 'busy' | 'offline' | 'paused';
 
 export interface AgentVersion {
   latest: string;

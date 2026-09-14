@@ -20,7 +20,7 @@ import httpx
 import websockets
 from nacl.signing import SigningKey
 
-from . import comfy, fetcher, hardware, peerserve, signing, whitelist
+from . import comfy, control, fetcher, hardware, peerserve, signing, whitelist
 from .config import AgentConfig, PlatformEntry
 
 logger = logging.getLogger(__name__)
@@ -28,6 +28,11 @@ logger = logging.getLogger(__name__)
 _HEARTBEAT_INTERVAL_SECONDS = 30
 _OBJECT_INFO_INTERVAL_SECONDS = 600
 _RECV_POLL_TIMEOUT_SECONDS = 1.0
+# How often the platform-independent control loop republishes
+# `agent_state.json` and looks for a `stop.request`. Deliberately much
+# shorter than the heartbeat interval: `comfyfed stop` / `comfyfed status`
+# must answer promptly, and neither touches the network.
+_CONTROL_TICK_SECONDS = 5.0
 _BACKOFF_START_SECONDS = 5
 _BACKOFF_MAX_SECONDS = 60
 
@@ -533,6 +538,10 @@ class AgentLoop:
     def __init__(self, config: AgentConfig, cfg_path: str, connection_factory=PlatformConnection):
         self.config = config
         self.cfg_path = cfg_path
+        # Where the cross-process control files live (pause flag, stop
+        # request, published state) -- always beside agent.json, so a CLI
+        # invoked with the same `--config` finds exactly this directory.
+        self._config_dir = os.path.dirname(os.path.abspath(cfg_path))
         self.connections: dict[str, PlatformConnection] = {
             entry.worker_id: connection_factory(entry, config) for entry in config.platforms
         }
@@ -561,6 +570,9 @@ class AgentLoop:
         # connection (see peerserve.PeerHTTPServer's docstring).
         self._peer_server: Optional["peerserve.PeerHTTPServer"] = None
         self._peer_advertised_url: Optional[str] = None
+        # The single platform-independent control task (see `_control_loop`),
+        # started by `run()` and stopped on either shutdown path.
+        self._control_task: Optional[asyncio.Task] = None
 
     async def broadcast_heartbeat(
         self,
@@ -572,6 +584,14 @@ class AgentLoop:
         fetch_pct: Optional[float] = None,
         fetch_model: Optional[str] = None,
     ) -> None:
+        # EVERY would-be-"idle" beat goes through the availability gate, not
+        # just the periodic tick: the job-completion beat (which is also the
+        # failure and cancel wind-down beat -- one `finally` feeds them all)
+        # fires the instant a job ends, and an ungated "idle" there would
+        # make a paused worker dispatch-eligible again for a whole heartbeat
+        # interval. `"busy"` is passed through untouched (see
+        # `_effective_state`), so a running job is never affected.
+        state = self._effective_state(state)
         for worker_id, conn in self.connections.items():
             try:
                 await conn.send_heartbeat(
@@ -586,6 +606,115 @@ class AgentLoop:
                 )
             except Exception:
                 logger.exception("runner: failed to broadcast heartbeat to %s", worker_id)
+
+    def _effective_state(self, state: str) -> str:
+        """Rewrite an availability-bearing heartbeat state for this tick.
+
+        `"busy"` (and any other non-availability state) is returned
+        untouched: a running job keeps its busy beats and its job_id, because
+        pausing never aborts work in flight -- it only stops NEW intake.
+        Otherwise the tick reports `"idle"` or `"paused"` according to
+        `control.availability`. `"paused"` is accepted as an input too: it is
+        what the previous tick left on `conn.state`, and treating it as
+        "would be idle" is what lets a resume flip back to `"idle"`.
+        """
+        if state not in ("idle", "paused"):
+            return state
+        return "idle" if control.availability(self.config, self._config_dir) == "available" else "paused"
+
+    def _aggregate_state(self) -> tuple[str, Optional[str]]:
+        """What this PROCESS is doing, for `agent_state.json` -- one verdict
+        for the whole agent, not one per platform connection.
+
+        The published state is read by `comfyfed status` in another terminal,
+        which asks "is it safe to stop this machine's agent?". That question
+        has no per-platform answer: a worker registered with two platforms
+        running a job for platform A is busy, full stop. Deriving it from
+        `handle.running` (the same source `_job_id_for` uses) rather than
+        from any connection's `conn.state` is what keeps two connection loops
+        from alternately publishing `busy` and `idle` into one file.
+        """
+        for handle in self._jobs.values():
+            if handle.running:
+                return "busy", handle.job_id
+        return self._effective_state("idle"), None
+
+    def _publish_control_state(self) -> None:
+        state, job_id = self._aggregate_state()
+        control.write_state(self._config_dir, state, job_id)
+
+    async def _control_loop(self) -> None:
+        """Publish the agent's state and honour `comfyfed stop`, independently
+        of every platform connection.
+
+        This deliberately does NOT live on the heartbeat: the heartbeat only
+        ticks while a socket is established, so with the platform down (or
+        the laptop off the VPN) `comfyfed stop` would write its request and
+        wait forever while `comfyfed status` claimed the very-much-running
+        agent was not running -- exactly the situation in which an operator
+        most wants both commands to work. Nothing here touches the network.
+        """
+        while True:
+            try:
+                self._publish_control_state()
+                self._poll_stop_request()
+            except Exception:
+                # Local control is a convenience layer; a surprise here must
+                # never take down a working agent. The next tick retries.
+                logger.exception("runner: control loop tick failed")
+            await asyncio.sleep(_CONTROL_TICK_SECONDS)
+
+    async def _stop_control_loop(self) -> None:
+        """Cancel the control task and drop the published state.
+
+        Both shutdown paths end here, so `comfyfed status` says "not running"
+        the instant the process is on its way out instead of waiting out the
+        120 s staleness window.
+        """
+        task = self._control_task
+        self._control_task = None
+        if task is not None:
+            task.cancel()
+            try:
+                await task
+            except asyncio.CancelledError:
+                pass
+            except Exception:
+                logger.exception("runner: control loop raised while stopping")
+        control.clear_state(self._config_dir)
+
+    def _poll_stop_request(self) -> None:
+        """Honour a `comfyfed stop` dropped by another process.
+
+        The stop file is consumed (cleared) before the wind-down starts, so a
+        crash mid-shutdown cannot leave a request that instantly kills the
+        next run. Everything after that mirrors `_on_os_signal`: set
+        `_shutdown_in_progress` and schedule exactly the same
+        `_graceful_shutdown_and_stop` task on the running loop. A request
+        arriving while a wind-down is already under way is a no-op -- unlike
+        a second Ctrl-C there is no impatient operator at a console to
+        escalate to `os._exit` for.
+        """
+        if not control.is_stop_requested(self._config_dir):
+            return
+
+        control.clear_stop(self._config_dir)
+        if self._shutdown_in_progress:
+            logger.info(
+                "已在停止流程中，忽略重複的停止要求 / already shutting down, "
+                "ignoring a repeated stop request"
+            )
+            return
+
+        self._shutdown_in_progress = True
+        logger.info(
+            "收到停止要求，正在取消進行中的工作並清理（等同 Ctrl-C） / stop requested, "
+            "cancelling the running job and cleaning up (same as Ctrl-C)"
+        )
+        loop = asyncio.get_running_loop()
+        loop.create_task(
+            self._graceful_shutdown_and_stop(loop), name="comfyfed-stop-request-shutdown"
+        )
 
     async def refresh_object_info(self, conn: PlatformConnection, force: bool = False) -> None:
         """Fetch ComfyUI's full `/object_info` and upload it if it changed.
@@ -1530,6 +1659,11 @@ class AgentLoop:
             os._exit(1)
             return
 
+        # `loop.stop()` below never resumes `run()`, so its `finally` -- and
+        # the state cleanup in it -- would otherwise never run on either the
+        # signal or the `comfyfed stop` path, leaving `status` insisting the
+        # agent is alive for the next 120 s.
+        await self._stop_control_loop()
         loop.stop()
 
     @property
@@ -1572,12 +1706,14 @@ class AgentLoop:
             if now - last_heartbeat >= _HEARTBEAT_INTERVAL_SECONDS:
                 dynamic = hardware.collect_dynamic(self.config.models_dir)
                 fetch_status = self._fetch_status_for(conn) or {}
+                job_id = self._job_id_for(conn)
+                effective_state = self._effective_state(conn.state)
                 await conn.send_heartbeat(
-                    conn.state,
+                    effective_state,
                     # Carrying the job id is what lets the server notice a
                     # worker still grinding on a job it no longer owns; see
                     # `_job_id_for` for why it is scoped to this connection.
-                    job_id=self._job_id_for(conn),
+                    job_id=job_id,
                     dynamic=dynamic,
                     object_info_hash=conn.object_info_hash or None,
                     # While the auto-fetch pre-phase is active, the periodic
@@ -1611,6 +1747,23 @@ class AgentLoop:
                     self.config.whitelist_extra,
                 )
                 await conn.send_hello(hw, backend, torch_version, allowed, peer_url=self._peer_advertised_url)
+
+                # One immediate beat carrying the real availability. Both
+                # platforms record a freshly handshaked agent as `idle` and
+                # will dispatch to it at once, while the first periodic beat
+                # -- the only thing that can say `paused` -- is a full
+                # heartbeat interval away. Without this, every connect and
+                # every reconnect (Wi-Fi blip, platform deploy) reopens a
+                # 30 s window in which a render can start on the machine a
+                # human is actively using. It goes through `_effective_state`
+                # like every other availability-bearing beat, so a busy
+                # reconnect is still reported busy.
+                await conn.send_heartbeat(
+                    self._effective_state(conn.state),
+                    job_id=self._job_id_for(conn),
+                    dynamic=hardware.collect_dynamic(self.config.models_dir),
+                    object_info_hash=conn.object_info_hash or None,
+                )
 
                 models = (
                     hardware.scan_models(self.config.models_dir, hash_models=self.config.hash_models)
@@ -1658,7 +1811,15 @@ class AgentLoop:
             return
         loop = asyncio.get_running_loop()
         self._install_signal_handlers(loop)
+        # A stop.request left behind by a crash (or by the previous run being
+        # killed before it could consume the file) must not kill this fresh
+        # run on its very first heartbeat.
+        control.clear_stop(self._config_dir)
         self._start_peer_server()
+        # One control task for the whole process, started before any socket
+        # is attempted so `stop`/`status` work during the very first connect
+        # and through every reconnect backoff.
+        self._control_task = asyncio.create_task(self._control_loop(), name="comfyfed-control-loop")
         try:
             await asyncio.gather(*(self._run_platform(conn) for conn in self.connections.values()))
         finally:
@@ -1671,3 +1832,9 @@ class AgentLoop:
             # connection failing outright) that no signal ever touched.
             if not self._shutdown_in_progress:
                 await self.shutdown()
+            # The published state describes a LIVE agent; leaving it behind
+            # would have `comfyfed status` report this process as running
+            # until the 120s staleness window expires. (`_graceful_shutdown_
+            # and_stop` already did this on the signal/stop path, which never
+            # resumes this coroutine; calling it twice is harmless.)
+            await self._stop_control_loop()

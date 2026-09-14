@@ -151,6 +151,36 @@ comfyfed-agent run
 
 **要停掉 agent**：在它的終端機按 `Ctrl-C`（Windows 上 `CTRL_BREAK` 也可以）就會優雅關機——agent 會先請求 ComfyUI 中斷正在跑的工作、清掉暫存的檔案，確認收尾完成才結束程序，不會留下半殘的工作或垃圾檔案。
 
+### 暫停與停止 / Pause & stop
+
+Agent 內建 BOINC 風格的閒置偵測：**預設開啟**，只要偵測到使用者正在操作這台機器（滑鼠／鍵盤有輸入），就會暫停接新工作——正在跑的工作不受影響，會照常跑完，只是不會再接新的。也可以用 CLI 從另一個終端機手動控制同一個背景中的 agent：
+
+```bash
+comfyfed pause    # 暫停接新工作（跑到一半的工作照樣跑完）
+comfyfed resume   # 恢復接新工作
+comfyfed status   # 顯示目前狀態（available / paused-manual / paused-active，以及是否有工作在跑）
+comfyfed stop     # 請 agent 優雅結束：進行中的工作會被取消並清理（等同在它的終端機按 Ctrl-C）
+```
+
+**`stop` 不會等工作跑完**：它跑的就是 `Ctrl-C` 那一套收尾——請 ComfyUI 中斷、清掉暫存檔、然後結束程序，那個工作會由平台在逾時後重新派給別台。想讓手上的工作跑完再停，請依序：`comfyfed pause` →（用 `comfyfed status` 等到不再顯示 `busy`）→ `comfyfed stop`。
+
+（一行安裝指令裝好之後 `comfyfed` 就在 PATH 上；手動安裝時同一支指令叫 `comfyfed-agent`，兩者相通。）
+
+**暫停功能需要平台版本 ≥ 本版本**：`paused` 是 0.1.2 才加進心跳的狀態，舊版平台看不懂、會當成沒收到而繼續派工。agent 是新的、平台是舊的時，暫停會靜靜地沒有效果——請先把平台端升級。
+
+閒置偵測的參數寫在 `agent.json`：`pause_when_active`（預設 `true`）控制要不要偵測使用者活動；`idle_minutes`（預設 `5`）是「連續幾分鐘沒有任何鍵盤滑鼠輸入才算閒置」——距離最後一次輸入不滿這個分鐘數就視為使用者活動中、暫停接單，滿了才恢復接單。手動改完 `agent.json` 需要重啟 agent 才會生效。
+
+**偵測不到使用者活動時視為閒置，一律接單**：headless 機器（沒有實體螢幕/鍵盤滑鼠）或 Wayland 桌面若沒有裝 XWayland，agent 偵測不到活動訊號，這種情況一律當作「沒有人在用」，不會因為偵測失敗就把 worker 晾在一邊接不到工作。
+
+**Windows 找不到 `comfyfed` 指令**：剛裝完的那個終端機視窗看不到新加的 PATH，屬正常現象——關閉終端機重開一個新的即可。
+
+**macOS／Linux 找不到 `comfyfed` 指令**：安裝器把指令連到 `~/.local/bin`，但 macOS 預設的 PATH（`/etc/paths`）和精簡版 Linux 映像都不含這個目錄（安裝器偵測到時會提示）。加進去即可：
+
+```bash
+echo 'export PATH="$HOME/.local/bin:$PATH"' >> ~/.zshrc   # bash 請改 ~/.bashrc
+exec $SHELL -l
+```
+
 ### 任務分派：輕量工作優先派給弱卡
 
 伺服器派工時不是隨機挑一台 worker：完全不需要模型的輕量工作（例如影片剪接、多影片串接這類純後製任務）會優先派給沒有獨立 GPU 或 VRAM 較弱的 worker（含 Mac／CPU-only 機器），把吃模型、吃 VRAM 的算圖工作留給真正的大卡。這樣一台筆電也能幫忙分擔，不會浪費 4090 去跑剪接。

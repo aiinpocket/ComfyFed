@@ -18,10 +18,18 @@ Agent -> server message contract (all JSON):
          Stored on `Worker.peer_url`, and cleared whenever the worker is
          marked offline (see `dispatch.requeue_stale`) so a stale seeder
          endpoint is never handed out.
-  {"type": "heartbeat", "state": "idle"|"busy", "progress": float,
+  {"type": "heartbeat", "state": "idle"|"busy"|"paused", "progress": float,
    "job_id": str|null, "dynamic": {...}, "object_info_hash": str|null,
    "stage": "fetching_models"|absent, "fetch_pct": float|absent,
    "fetch_model": str|absent}
+      -- `"paused"` (agents >=0.1.2) means the agent is deliberately not
+         accepting new jobs (manual pause or user-activity idle detection --
+         see comfyfed_agent.control). Dispatch only ever considers `"idle"`
+         connections (see `idle_worker_ids` below), so a paused worker is
+         simply skipped -- never sent new work -- while its running job (if
+         any) keeps beating "busy" until done. Older agents (<=0.1.1) never
+         send this state; platforms keep accepting plain "idle"/"busy"
+         unchanged.
       -- `object_info_hash` is the agent's current sha256 of its local
          ComfyUI's canonical `/object_info` (see comfyfed_agent.comfy). When
          it doesn't match `Worker.object_info_hash`, or the platform's stored
@@ -221,7 +229,7 @@ class _Connection:
     ws: WebSocket
     worker_id: str
     loop: asyncio.AbstractEventLoop
-    state: str = "idle"  # idle | busy | dispatched
+    state: str = "idle"  # idle | busy | dispatched | paused
     # Agent protocol version from `hello.protocol`, defaulting to 1 (never
     # sent a hello, or an old agent that doesn't send the field at all) --
     # see `_handle_hello` and `_send_job_cancelled`.
@@ -709,7 +717,7 @@ async def _handle_heartbeat(worker_id: str, conn: _Connection, message: dict) ->
     worker has on record, or the stored snapshot file has gone missing.
     """
     state = message.get("state")
-    if state in ("idle", "busy"):
+    if state in ("idle", "busy", "paused"):
         conn.state = state
 
     dynamic = message.get("dynamic") or {}
@@ -724,6 +732,8 @@ async def _handle_heartbeat(worker_id: str, conn: _Connection, message: dict) ->
             worker.status = "online"
         elif state == "busy":
             worker.status = "busy"
+        elif state == "paused":
+            worker.status = "paused"
         worker.dynamic = json.dumps(dynamic)
         worker_name = worker.name
         stored_hash = worker.object_info_hash or ""

@@ -11,11 +11,20 @@ import sys
 
 import httpx
 
-from . import __version__, detect, identity, update
+from datetime import datetime, timezone
+
+from . import __version__, control, detect, identity, update
 from .config import AgentConfig
 from .runner import AgentLoop
 
 DEFAULT_CONFIG_PATH = os.path.join(os.path.expanduser("~"), ".comfyfed", "agent.json")
+
+# How stale the agent's published state may be before `status` calls the
+# agent "not running". The control loop refreshes agent_state.json every 5s
+# (runner._CONTROL_TICK_SECONDS), so four ticks' worth of slack means one
+# missed or slow tick never reads as a dead service, while a genuinely dead
+# agent is reported as such within ~20s instead of two minutes.
+_STATE_STALE_SECONDS = 20.0
 
 
 def _cmd_register(args: argparse.Namespace) -> None:
@@ -110,6 +119,115 @@ def _cmd_run(args: argparse.Namespace) -> None:
         raise
 
 
+def _config_dir(args: argparse.Namespace) -> str:
+    """The control files live beside the config file the agent was started
+    with, so `--config` is the only thing a second terminal has to match."""
+    return os.path.dirname(os.path.abspath(args.config))
+
+
+def _cmd_pause(args: argparse.Namespace) -> None:
+    control.request_pause(_config_dir(args))
+    print(
+        "已暫停接收新工作（最慢一個心跳週期內生效；進行中的工作會跑完）。/ "
+        "Paused: no new jobs will be accepted (takes effect within one heartbeat; "
+        "the running job finishes)."
+    )
+
+
+def _cmd_resume(args: argparse.Namespace) -> None:
+    control.clear_pause(_config_dir(args))
+    print(
+        "已恢復接收新工作（閒置偵測仍然有效：偵測到你在使用電腦時仍會自動暫停）。/ "
+        "Resumed: new jobs will be accepted again (idle detection still applies -- "
+        "the agent auto-pauses while you are using the machine, if enabled)."
+    )
+
+
+def _cmd_stop(args: argparse.Namespace) -> None:
+    control.request_stop(_config_dir(args))
+    print(
+        "已要求 agent 結束：進行中的工作會被取消並清理（等同按 Ctrl-C）。"
+        "想讓工作跑完再停，請先 comfyfed pause，用 comfyfed status 等到不是 busy，再 comfyfed stop。"
+        "開機自啟仍在：下次登入／開機會再啟動。/ "
+        "Stop requested: the running job is gracefully cancelled and cleaned up "
+        "(same as Ctrl-C). To drain first, run 'comfyfed pause', wait until "
+        "'comfyfed status' no longer reports busy, then 'comfyfed stop'. "
+        "Autostart remains: the agent returns at next logon/boot."
+    )
+
+
+def _state_age_seconds(state: dict) -> float | None:
+    """Seconds since the agent published `state`, or `None` if the timestamp
+    is missing or unparseable (a hand-mangled file reads as stale)."""
+    raw = state.get("updated_at")
+    if not isinstance(raw, str):
+        return None
+    try:
+        parsed = datetime.fromisoformat(raw)
+    except ValueError:
+        return None
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=timezone.utc)
+    return (datetime.now(timezone.utc) - parsed).total_seconds()
+
+
+_AVAILABILITY_TEXT = {
+    "available": "可接新工作 / available",
+    "paused-manual": "手動暫停中 / paused-manual",
+    "paused-active": "偵測到有人在用這台電腦 / paused-active",
+}
+
+
+def _availability_now(args: argparse.Namespace, config_dir: str) -> str | None:
+    """`control.availability` evaluated right now, from this terminal.
+
+    The state file only says what the agent last published (up to a tick
+    old, and nothing at all while it is not running); the verdict itself is
+    a pure function of the pause file plus idle detection, so `status` can
+    -- and the docs promise it does -- compute it live. `None` when the
+    config cannot be read, in which case the caller just omits the line.
+    """
+    try:
+        cfg = AgentConfig.load(args.config)
+    except Exception:
+        return None
+    return control.availability(cfg, config_dir)
+
+
+def _cmd_status(args: argparse.Namespace) -> None:
+    config_dir = _config_dir(args)
+    paused = control.is_pause_requested(config_dir)
+    state = control.read_state(config_dir)
+    age = _state_age_seconds(state) if state else None
+
+    if state is None or age is None or age > _STATE_STALE_SECONDS:
+        print("agent 未在執行 / agent not running")
+    else:
+        reported = state.get("state") or "unknown"
+        job_id = state.get("job_id")
+        print(f"agent 執行中，狀態：{reported} / agent running, state: {reported}")
+        if job_id:
+            print(f"進行中的工作 / running job: {job_id}")
+
+    verdict = _availability_now(args, config_dir)
+    if verdict is not None:
+        print(
+            f"目前可用狀態：{verdict}（{_AVAILABILITY_TEXT.get(verdict, verdict)}） / "
+            f"availability now: {verdict}"
+        )
+
+    if paused:
+        print(
+            "手動暫停中（執行 comfyfed resume 以恢復）。/ "
+            "Manually paused (run 'comfyfed resume' to resume)."
+        )
+    else:
+        print(
+            "未手動暫停（閒置偵測可能仍會自動暫停）。/ "
+            "Not manually paused (idle detection may still auto-pause)."
+        )
+
+
 def cli() -> None:
     parser = argparse.ArgumentParser(prog="comfyfed-agent", description="ComfyFed agent: run ComfyUI jobs for a platform.")
     sub = parser.add_subparsers(dest="command", required=True)
@@ -123,6 +241,16 @@ def cli() -> None:
     runp = sub.add_parser("run", help="Connect to all registered platforms and process jobs.")
     runp.add_argument("--config", default=DEFAULT_CONFIG_PATH, help="Path to the agent config file.")
     runp.set_defaults(func=_cmd_run)
+
+    for name, help_text, handler in (
+        ("pause", "暫停接收新工作 / Stop accepting new jobs (the running job finishes).", _cmd_pause),
+        ("resume", "恢復接收新工作 / Accept new jobs again.", _cmd_resume),
+        ("status", "顯示 agent 狀態 / Show the agent's current state.", _cmd_status),
+        ("stop", "要求 agent 結束（取消進行中的工作，等同 Ctrl-C） / Ask a running agent to shut down (the running job is cancelled, same as Ctrl-C).", _cmd_stop),
+    ):
+        p = sub.add_parser(name, help=help_text)
+        p.add_argument("--config", default=DEFAULT_CONFIG_PATH, help="Path to the agent config file.")
+        p.set_defaults(func=handler)
 
     args = parser.parse_args()
     args.func(args)

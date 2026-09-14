@@ -1,6 +1,6 @@
-import { afterEach, describe, expect, it } from "vitest";
-import { env, runDurableObjectAlarm } from "cloudflare:test";
-import { toSqliteTimestamp, getJobById, getReceiptsForJob } from "../src/db/queries";
+import { afterEach, beforeEach, describe, expect, it } from "vitest";
+import { env, runDurableObjectAlarm, runInDurableObject } from "cloudflare:test";
+import { toSqliteTimestamp, getJobById, getReceiptsForJob, getWorkerById } from "../src/db/queries";
 import { signHex } from "../src/lib/ed25519";
 import { connectAgent, expectNoMessage, hub, nextMessage, openAgentWs, waitForClose } from "./helpers/ws";
 import golden from "./fixtures/golden.json";
@@ -14,7 +14,23 @@ function db(): D1Database {
   return (env as any).DB as D1Database;
 }
 
+// Every `connectAgent` handshake arms a REAL 5s dispatch alarm
+// (`scheduleAlarmIfNeeded`), and miniflare fires due alarms for real. Once
+// the file's cumulative runtime crosses 5s -- which only happens under
+// full-suite load, never in a solo run -- an alarm armed by an EARLIER
+// test fires inside a later test's `expectNoMessage` window and dispatches
+// that test's own queued job to its idle worker (live-caught flake in
+// "pushes job_cancelled once for a not-owned job, then dedups"). Delete
+// the pending alarm around every test so ticks only ever run when a test
+// explicitly calls `runDurableObjectAlarm`.
+async function deletePendingAlarm(): Promise<void> {
+  await runInDurableObject(hub(), (_instance, state) => state.storage.deleteAlarm());
+}
+
+beforeEach(deletePendingAlarm);
+
 afterEach(async () => {
+  await deletePendingAlarm();
   await db().prepare("DELETE FROM jobs").run();
   await db().prepare("DELETE FROM workers").run();
   await db().prepare("DELETE FROM receipts").run();
@@ -319,6 +335,24 @@ describe("heartbeat job_cancelled dedup", () => {
 });
 
 // ---------------------------------------------------------------------------
+// heartbeat: paused state
+
+describe("heartbeat paused", () => {
+  it("sets worker status to paused", async () => {
+    const kp = KEYPAIRS[0]!;
+    const workerId = await makeWorker({ pubkeyHex: kp.pubkey_hex });
+    const ws = await connectAgent(workerId, kp.seed_hex);
+
+    ws.send(JSON.stringify({ type: "heartbeat", state: "paused" }));
+    await new Promise((r) => setTimeout(r, 50)); // let the heartbeat land.
+
+    const worker = await getWorkerById(db(), workerId);
+    expect(worker!.status).toBe("paused");
+    ws.close();
+  });
+});
+
+// ---------------------------------------------------------------------------
 // job_done -> receipt -> receipt_ack roundtrip
 
 describe("job_done", () => {
@@ -493,6 +527,35 @@ describe("dispatch alarm", () => {
 
     const job = await getJobById(db(), jobId);
     expect(job!.status).toBe("queued");
+    ws.close();
+  });
+
+  it("does not assign to a paused worker, but does after a subsequent idle heartbeat", async () => {
+    const kp = KEYPAIRS[0]!;
+    const workerId = await makeWorker({ pubkeyHex: kp.pubkey_hex });
+    const ws = await connectAgent(workerId, kp.seed_hex);
+    ws.send(JSON.stringify({ type: "heartbeat", state: "paused" }));
+    await new Promise((r) => setTimeout(r, 50)); // let the heartbeat land before the alarm ticks.
+
+    const jobId = await makeJob({ status: "queued" });
+    await runDurableObjectAlarm(hub());
+
+    let job = await getJobById(db(), jobId);
+    expect(job!.status).toBe("queued");
+
+    const pushedPromise = nextMessage(ws);
+    ws.send(JSON.stringify({ type: "heartbeat", state: "idle" }));
+    await new Promise((r) => setTimeout(r, 50)); // let the idle heartbeat land before the alarm ticks.
+    const ran = await runDurableObjectAlarm(hub());
+    expect(ran).toBe(true);
+
+    const pushed = await pushedPromise;
+    expect(pushed.type).toBe("job");
+    expect(pushed.job_id).toBe(jobId);
+
+    job = await getJobById(db(), jobId);
+    expect(job!.status).toBe("assigned");
+    expect(job!.workerId).toBe(workerId);
     ws.close();
   });
 });

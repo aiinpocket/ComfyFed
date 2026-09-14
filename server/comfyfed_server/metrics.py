@@ -63,7 +63,7 @@ class Metrics:
 
         self.worker_up = Gauge(
             "comfyfed_worker_up",
-            "1 if the worker is connected (online/busy), 0 if offline.",
+            "1 if the worker is connected (online/busy/paused), 0 if offline.",
             ["worker"],
             registry=self.registry,
         )

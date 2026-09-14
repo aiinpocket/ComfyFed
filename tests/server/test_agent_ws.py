@@ -145,6 +145,65 @@ def test_heartbeat_updates_last_seen_and_status(client):
             assert json.loads(worker.dynamic)["free_vram_gb"] == 10.0
 
 
+def test_paused_heartbeat_sets_worker_status_and_connection_state(client):
+    csrf = _login(client)
+    worker_id, sk = _register_worker(client, csrf, "w1")
+
+    with client.websocket_connect("/api/agent/ws") as ws:
+        challenge = ws.receive_json()
+        sig = sk.sign(challenge["nonce"].encode()).signature.hex()
+        ws.send_json({"type": "auth", "worker_id": worker_id, "sig": sig})
+        assert ws.receive_json()["type"] == "ready"
+
+        ws.send_json(
+            {"type": "heartbeat", "state": "paused", "progress": 0.0, "job_id": None, "dynamic": {}}
+        )
+        agentws.dispatch_once(worker_id)
+
+        with db.get_session() as session:
+            worker = session.get(db.Worker, worker_id)
+            assert worker.last_seen is not None
+            assert worker.status == "paused"
+
+        assert agentws._connections[worker_id].state == "paused"
+
+
+def test_paused_worker_excluded_from_dispatch_idle_worker_still_gets_the_job(client):
+    """Two connected workers, one paused: the queued job must go only to the
+    idle one, never to the paused one -- dispatch stays idle-only (Task 4
+    leaves `idle_worker_ids` untouched)."""
+    csrf = _login(client)
+    worker_paused, key_paused = _register_worker(client, csrf, "w-paused")
+    worker_idle, key_idle = _register_worker(client, csrf, "w-idle")
+    job_id = _submit(client, csrf)
+
+    ws_paused = _connect(client, worker_paused, key_paused)
+    try:
+        ws_paused.send_json(
+            {"type": "heartbeat", "state": "paused", "progress": 0.0, "job_id": None, "dynamic": {}}
+        )
+        agentws.dispatch_once(worker_paused)
+
+        ws_idle = _connect(client, worker_idle, key_idle)
+        try:
+            ws_idle.send_json(
+                {"type": "heartbeat", "state": "idle", "progress": 0.0, "job_id": None, "dynamic": {}}
+            )
+            agentws.dispatch_once(worker_idle)
+
+            job_msg = ws_idle.receive_json()
+            assert job_msg["type"] == "job"
+            assert job_msg["job_id"] == job_id
+
+            with db.get_session() as session:
+                job = session.get(db.Job, job_id)
+                assert job.worker_id == worker_idle
+        finally:
+            ws_idle.close()
+    finally:
+        ws_paused.close()
+
+
 def test_enqueued_job_pushed_to_idle_worker_and_job_done_marks_complete(client):
     csrf = _login(client)
     worker_id, sk = _register_worker(client, csrf, "w1")

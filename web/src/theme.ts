@@ -54,6 +54,7 @@ export const statusColor = {
   busy: 'yellow',
   offline: 'gray',
   disabled: 'gray',
+  paused: 'slate',
   queued: 'slate',
   assigned: 'indigo',
   running: 'federation',
