@@ -43,6 +43,17 @@
  *       R2 if that 404s -- see Task 10's report). Pure file copy, no
  *       transformation: Python serves the exact same directory as static
  *       files at the same relative shape.
+ *
+ *   (d) **One-line installer scripts** (`assets/install-templates/`) -- a
+ *       flat, BINARY-FAITHFUL copy of `server/comfyfed_server/installers/`
+ *       (`install.ps1`, `install.sh`, `install.cmd`), which
+ *       `routes/installer.ts` reads via
+ *       `env.ASSETS.fetch("/install-templates/<name>")` (see that file's
+ *       docstring). `fs.cp` copies raw bytes with no encoding pass, so
+ *       `install.ps1`'s UTF-8 BOM and `install.sh`'s LF-only line endings
+ *       survive the copy exactly as `installer_routes.py`'s single source of
+ *       truth stores them -- `routes/installer.ts` (not this script) is
+ *       what normalizes/strips at serve time, mirroring the Python module.
  */
 
 import { spawn } from "node:child_process";
@@ -56,9 +67,11 @@ const HERE = path.dirname(fileURLToPath(import.meta.url));
 const CLOUD_DIR = path.join(HERE, "..");
 const WEB_DIR = path.join(CLOUD_DIR, "..", "web");
 const TEMPLATES_DATA_DIR = path.join(CLOUD_DIR, "..", "server", "comfyfed_server", "templates_data");
+const INSTALLERS_SRC_DIR = path.join(CLOUD_DIR, "..", "server", "comfyfed_server", "installers");
 const ASSETS_DIR = path.join(CLOUD_DIR, "assets");
 const COMFY_ASSETS_DIR = path.join(ASSETS_DIR, "comfy");
 const TEMPLATES_ASSETS_DIR = path.join(ASSETS_DIR, "comfyfed_templates");
+const INSTALL_TEMPLATES_ASSETS_DIR = path.join(ASSETS_DIR, "install-templates");
 
 // Keep in sync with server/comfyfed_server/comfy_frontend.py's
 // `FRONTEND_VERSION` / `FRONTEND_SHA256` -- SAME pinned wheel, same digest.
@@ -228,6 +241,22 @@ async function buildTemplates() {
   log(`templates: copied templates_data -> assets/comfyfed_templates/ (${count} files, ${humanBytes(bytes)})`);
 }
 
+// --- (d) one-line installer scripts --------------------------------------
+
+async function buildInstallTemplates() {
+  if (!(await exists(INSTALLERS_SRC_DIR))) {
+    throw new Error(`Installer scripts source directory not found: ${INSTALLERS_SRC_DIR}`);
+  }
+  await rm(INSTALL_TEMPLATES_ASSETS_DIR, { recursive: true, force: true });
+  await mkdir(INSTALL_TEMPLATES_ASSETS_DIR, { recursive: true });
+  // `cp` (no transform) -- binary-faithful, preserving install.ps1's UTF-8
+  // BOM and install.sh's LF-only endings exactly as checked in.
+  await cp(INSTALLERS_SRC_DIR, INSTALL_TEMPLATES_ASSETS_DIR, { recursive: true, force: true });
+
+  const { count, bytes } = await countFiles(INSTALL_TEMPLATES_ASSETS_DIR);
+  log(`install templates: copied installers -> assets/install-templates/ (${count} files, ${humanBytes(bytes)})`);
+}
+
 // -------------------------------------------------------------------------
 
 async function main() {
@@ -239,6 +268,7 @@ async function main() {
   await buildConsole();
   await buildComfyFrontend({ skip: skipComfy });
   await buildTemplates();
+  await buildInstallTemplates();
 
   const { count, bytes } = await countFiles(ASSETS_DIR);
   log(`Done: assets/ has ${count} files totaling ${humanBytes(bytes)}.`);

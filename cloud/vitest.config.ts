@@ -33,6 +33,11 @@ export default defineConfig({
     __COMFYFED_EXT_JS_SOURCE__: JSON.stringify(comfyfedExtJsSource),
   },
   test: {
+    // Node-side, once for the whole run (unlike `setupFiles` below, which
+    // runs per-test-file inside the workerd sandbox): stages the real
+    // installer scripts into the ASSETS fixture root. See
+    // `test/global-setup.ts`'s docstring.
+    globalSetup: ["./test/global-setup.ts"],
     setupFiles: ["./test/apply-migrations.ts"],
   },
   plugins: [
