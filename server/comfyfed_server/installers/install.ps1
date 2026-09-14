@@ -194,6 +194,35 @@ try {
 }
 Remove-Item -Force $wheelFile -ErrorAction SilentlyContinue
 
+# `comfyfed` on PATH: Windows venvs don't get a symlinked console script the
+# way *nix venvs do, so drop a tiny .cmd shim in a per-app bin dir and add
+# that dir to the user PATH. Both steps are best-effort -- a machine where
+# PATH can't be changed (locked-down policy, etc.) must not fail the install.
+$binDir = Join-Path $InstallDir 'bin'
+New-Item -ItemType Directory -Force -Path $binDir | Out-Null
+$venvRelative = $VenvDir.Substring($env:LOCALAPPDATA.TrimEnd('\').Length).TrimStart('\')
+$shimContent = "@`"%LOCALAPPDATA%\$venvRelative\Scripts\comfyfed.exe`" %*"
+try {
+    Set-Content -Path (Join-Path $binDir 'comfyfed.cmd') -Value $shimContent -Encoding ASCII
+    Write-Bilingual '已建立 comfyfed 指令' 'Created the comfyfed command'
+} catch {
+    Write-Host "[警告/WARNING] 無法建立 comfyfed.cmd / could not create comfyfed.cmd" -ForegroundColor Yellow
+}
+
+try {
+    $currentUserPath = [Environment]::GetEnvironmentVariable('Path', 'User')
+    if ($null -eq $currentUserPath) { $currentUserPath = '' }
+    $alreadyOnPath = $currentUserPath.ToLower().Contains($binDir.ToLower())
+    if (-not $alreadyOnPath) {
+        $newUserPath = $binDir
+        if ($currentUserPath.Length -gt 0) { $newUserPath = "$currentUserPath;$binDir" }
+        [Environment]::SetEnvironmentVariable('Path', $newUserPath, 'User')
+        Write-Bilingual '已將 comfyfed 加入使用者 PATH（需重開終端機才會生效）' 'Added comfyfed to the user PATH (restart your terminal for it to take effect)'
+    }
+} catch {
+    Write-Host "[警告/WARNING] 無法更新使用者 PATH / could not update the user PATH" -ForegroundColor Yellow
+}
+
 # ---------------------------------------------------------------------------
 # Helper python script (detection + extraction), dropped to disk instead of
 # fragile inline -c one-liners.

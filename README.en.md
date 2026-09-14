@@ -50,6 +50,7 @@ Members can also hand model files to each other directly, so nobody has to re-do
 ComfyFed is designed for people who know each other, not the open internet:
 
 - **One-line join**: copy the install command the admin gives you and run it on that machine to turn it into a compute member — missing Python or ComfyUI gets installed automatically, and it's set to start on login
+- **Idle-detection auto-pause**: it notices when you're actively using the machine and stops taking new jobs (anything already running finishes normally), then resumes once you step away — or control it by hand from the command line with `comfyfed pause`/`resume`
 - **Invite-only**: joining requires a one-time registration link the admin issued, which stops working the moment it's used
 - **Node whitelist**: a worker can restrict which kinds of ComfyUI nodes it's willing to run, so a workflow someone else submits can't do arbitrary things on your machine
 - **Dual-signed receipts**: contribution records are signed by both sides — auditable, and neither side can forge them alone

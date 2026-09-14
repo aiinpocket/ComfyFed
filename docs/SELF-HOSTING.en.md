@@ -151,6 +151,25 @@ comfyfed-agent run
 
 **Stopping an agent**: press `Ctrl-C` in its terminal (`CTRL_BREAK` works too on Windows) for a graceful shutdown — the agent asks ComfyUI to interrupt whatever it's running, cleans up its own temp files, and only exits once that wind-down is confirmed, instead of leaving a half-finished job or stray files behind.
 
+### Pause & stop
+
+The agent has BOINC-style idle detection built in, **on by default**: whenever it detects someone actively using the machine (mouse/keyboard input), it stops taking new jobs — anything already running keeps going to completion, only new intake stops. You can also control an already-running background agent from a second terminal with the CLI:
+
+```bash
+comfyfed pause    # stop taking new jobs (any job already running finishes normally)
+comfyfed resume   # start taking new jobs again
+comfyfed status   # show the current state (available / paused-manual / paused-active, plus whether a job is running)
+comfyfed stop     # ask the agent to shut down gracefully (same as Ctrl-C in its terminal)
+```
+
+(`comfyfed` is on PATH after the one-line installer runs; the manual-install flow uses the same binary under the name `comfyfed-agent` — they're the same commands.)
+
+Idle-detection settings live in `agent.json`: `pause_when_active` (default `true`) toggles activity detection on/off, and `idle_minutes` (default `5`) is how many minutes of no input count as "the user is active" (within that window → paused). After editing `agent.json` by hand, restart the agent (or at least `comfyfed stop` then `comfyfed pause`/`run`) for the change to take effect.
+
+**When activity can't be detected, the worker is always treated as idle and keeps accepting jobs**: headless machines (no display/keyboard/mouse) and Wayland desktops without XWayland give the agent no signal to read, so detection failure never makes a worker unschedulable — it just behaves as if pause-when-active is off.
+
+**Windows: can't find the `comfyfed` command?** The terminal window the installer ran in doesn't pick up the new PATH entry — that's expected. Close it and open a new terminal.
+
 ### Job dispatch: light jobs go to weak GPUs first
 
 Dispatch isn't a random pick among eligible workers: jobs that need zero models (pure post-processing work like video trimming or concatenation) are preferentially routed to workers with no dedicated GPU or weaker VRAM (Mac/CPU-only machines included), saving the model-heavy, VRAM-hungry rendering jobs for the real GPUs. That means a laptop can pull its weight in the federation instead of a 4090 getting stuck doing video-editing busywork.

@@ -195,6 +195,19 @@ bilingual "安裝 agent..." "Installing agent..."
     "請重跑本腳本" "please re-run this script"
 rm -rf "$WHEEL_TMPDIR"
 
+# `comfyfed pause`/`resume`/`status`/`stop` on PATH: symlink the venv's
+# console-script into ~/.local/bin (the de-facto per-user bin dir on both
+# Linux and macOS). Non-fatal -- a missing PATH entry just means the user
+# has to invoke the venv binary directly, so warn instead of failing the
+# whole install.
+mkdir -p "$HOME/.local/bin"
+if ln -sf "$VENV_DIR/bin/comfyfed" "$HOME/.local/bin/comfyfed"; then
+    bilingual "已將 comfyfed 加入 ~/.local/bin" "Linked comfyfed into ~/.local/bin"
+else
+    echo "[警告/WARNING] 無法建立 ~/.local/bin/comfyfed 符號連結 / could not create the ~/.local/bin/comfyfed symlink" >&2
+    echo "手動替代 / Manual alternative: 直接執行 $VENV_DIR/bin/comfyfed / run $VENV_DIR/bin/comfyfed directly" >&2
+fi
+
 # ---------------------------------------------------------------------------
 # Helper python script (ComfyUI detection), dropped to disk instead of
 # fragile inline -c one-liners.
@@ -479,7 +492,10 @@ PLISTEOF
         <string>run</string>
     </array>
     <key>RunAtLoad</key><true/>
-    <key>KeepAlive</key><true/>
+    <key>KeepAlive</key>
+    <dict>
+        <key>SuccessfulExit</key><false/>
+    </dict>
 </dict>
 </plist>
 PLISTEOF
