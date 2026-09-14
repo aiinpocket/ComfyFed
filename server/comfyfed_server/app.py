@@ -139,9 +139,11 @@ def create_app(data_dir: str) -> FastAPI:
     bootstrap.ensure_installed(data_dir, lang=None, url=None, interactive=False)
     metrics.init()
 
-    # Put the template library's input images where the panel looks for
-    # uploads, so a freshly opened template's `LoadImage` already resolves.
-    seeded = templates.seed_staging(comfyapi.staging_dir(data_dir))
+    # Put the template library's input images where every user's panel looks
+    # for uploads, so a freshly opened template's `LoadImage` already
+    # resolves for any account -- the shared pseudo-uid namespace, not any
+    # one user's own staging directory (final review finding #1).
+    seeded = templates.seed_staging(comfyapi.staging_dir(data_dir, comfyapi.SHARED_STAGING_UID))
     if seeded:
         logger.info("comfyfed_server: seeded template assets into staging: %s", ", ".join(seeded))
 

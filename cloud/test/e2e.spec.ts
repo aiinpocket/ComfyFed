@@ -220,7 +220,8 @@ describe("cloud end-to-end", () => {
       const uploadRes = await raw("/comfy/api/upload/image", { method: "POST", body: uploadForm, cookie });
       expect(uploadRes.status).toBe(200);
       expect(uploadRes.body).toEqual({ name: "input.png", subfolder: "", type: "input" });
-      expect(await store().get("staging/input.png")).not.toBeNull();
+      const adminRow = await db().prepare("SELECT id FROM users WHERE username = 'admin'").first<{ id: string }>();
+      expect(await store().get(`staging/${adminRow!.id}/input.png`)).not.toBeNull();
 
       // -----------------------------------------------------------------
       // 7. Panel POST /comfy/api/prompt with a ZERO-model workflow (no

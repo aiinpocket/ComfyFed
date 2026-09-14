@@ -34,11 +34,13 @@ federation rather than a single GPU:
   worker defines the node set. When no worker is online the response is an
   empty dict plus `X-ComfyFed-No-Workers: 1`, so the panel can say "no
   workers" instead of "ComfyUI has no nodes".
-* `/view?type=input` and `/upload/image` are backed by a flat staging
-  directory (`<data_dir>/comfy_staging/`), not ComfyUI's `input/` folder with
-  subfolders -- a prompt referencing a staged filename gets it COPIED into
-  the job's own inputs at submission time (see `_default_resolve_asset`), so
-  the same staged file can be reused across several prompts.
+* `/view?type=input` and `/upload/image` are backed by a per-user staging
+  directory (`<data_dir>/comfy_staging/<uid>/`), not ComfyUI's `input/`
+  folder with worker-side subfolders -- a prompt referencing a staged
+  filename gets it COPIED into the job's own inputs at submission time (see
+  `_default_resolve_asset`), so the same staged file can be reused across
+  several of that user's own prompts. Namespaced by uid since Phase 3.0
+  Task 4 widened the panel to every logged-in user.
 * `prompt_id` is the ComfyFed job id, so a prompt submitted here is the same
   row the console's `/api/jobs` shows.
 * `/ws` is served by `create_ws_router` (not this module's admin-gated
@@ -108,13 +110,23 @@ _text_artifact_cache: "OrderedDict[tuple[str, str], str]" = OrderedDict()
 # startup is simpler than threading `data_dir` through both call paths.
 _data_dir: Optional[str] = None
 
-# Flat staging area for images/masks/audio uploaded through the ComfyUI
+# Per-user staging area for images/masks/audio uploaded through the ComfyUI
 # frontend's upload widgets, ahead of being referenced by a submitted prompt.
-# Unlike ComfyUI's own `input/`, there are no subfolders: a name here is
-# reusable across any number of prompts (see `_default_resolve_asset`), and
-# staged files are never cleaned up automatically -- Phase 1.5 leaves that
-# to the admin.
+# Unlike ComfyUI's own `input/`, there are no subfolders within a user's own
+# namespace: a name here is reusable across any number of that user's own
+# prompts (see `_default_resolve_asset`), and staged files are never cleaned
+# up automatically -- Phase 1.5 leaves that to the admin.
 _STAGING_DIRNAME = "comfy_staging"
+
+# Reserved pseudo-uid for the packaged template sample assets
+# (`templates.seed_staging`), namespaced alongside real per-user staging
+# directories but readable by EVERY user -- these are platform-shipped
+# public samples (e.g. `amyntas_ref.png`), not private uploads, so every
+# user's templates must still resolve on first run even though uploads are
+# now isolated per uid (final review finding #1). Never collides with a real
+# `db.User.id` (`uuid4().hex` is 32 lowercase hex chars, never starting with
+# `_`).
+SHARED_STAGING_UID = "_shared"
 
 # Panel UI preferences (theme, canvas options, ...), the ComfyFed stand-in for
 # upstream's per-user `comfy.settings.json`. One file, because ComfyFed has
@@ -136,43 +148,98 @@ _CLOSE_UNAUTHORIZED = 4401
 _WORKER_COUNT_HEADER = "X-ComfyFed-Worker-Count"
 
 
-def staging_dir(data_dir: str) -> str:
-    return os.path.join(data_dir, _STAGING_DIRNAME)
+def staging_dir(data_dir: str, uid: str) -> str:
+    """Per-user staging directory: `<data_dir>/comfy_staging/<uid>/`.
+
+    Phase 3.0 Task 4 widened `/comfy/*` to any logged-in user, but the
+    staging area used to be one flat, process-wide directory -- any user
+    could list, read, or overwrite any other user's staged upload (final
+    review finding #1). Namespacing by uid keeps the "flat and short-lived,
+    reused by name across prompts" property intact WITHIN a user while
+    isolating users from each other. `uid` is path-sanitized the same way a
+    client-supplied filename is (`storage.sanitize_path_component`) -- it
+    always comes from an authenticated session, but defense in depth costs
+    nothing here.
+
+    A pre-Task-4 flat file directly under `comfy_staging/` (if any survive
+    on an upgraded deployment) is simply unreachable through this path now --
+    staging data is transient, so no migration is needed.
+    """
+    safe_uid = storage.sanitize_path_component(uid, what="user id")
+    return os.path.join(data_dir, _STAGING_DIRNAME, safe_uid)
 
 
-def _settings_path(data_dir: str) -> str:
+def _legacy_settings_path(data_dir: str) -> str:
+    """The pre-Task-4 single global blob -- ComfyFed had exactly one admin
+    then, so one file was the direct equivalent of upstream's per-user
+    `comfy.settings.json`. Kept as a read-only fallback default (final
+    review finding #7): a user who has never written their own settings
+    reads this so their editor doesn't appear to reset on upgrade."""
     return os.path.join(data_dir, _SETTINGS_FILENAME)
 
 
-def _load_settings(data_dir: str) -> dict:
+def _user_settings_path(data_dir: str, uid: str) -> str:
+    """Per-user settings file: `<data_dir>/comfy_settings.<uid>.json`.
+
+    Final review finding #7: now that any role reaches `/comfy/api/*`, one
+    global settings blob meant a regular user's panel preference write
+    silently overwrote every other user's (including admins'), contradicting
+    the "面板改為個人工作區" ruling the rest of Task 4 implements carefully.
+    `uid` is path-sanitized the same way a client-supplied filename is.
+    """
+    safe_uid = storage.sanitize_path_component(uid, what="user id")
+    return os.path.join(data_dir, f"comfy_settings.{safe_uid}.json")
+
+
+def _load_json_dict(path: str) -> dict:
     try:
-        with open(_settings_path(data_dir), "r", encoding="utf-8") as f:
+        with open(path, "r", encoding="utf-8") as f:
             loaded = json.load(f)
     except (OSError, ValueError):
         return {}
     return loaded if isinstance(loaded, dict) else {}
 
 
-def _save_settings(data_dir: str, values: dict) -> None:
+def _load_settings(data_dir: str, uid: str) -> dict:
+    """`uid`'s own settings, falling back to the legacy global blob when
+    this user has never written their own (see `_legacy_settings_path`).
+    Once a user writes anything, `_save_settings` forks their own file
+    (seeded from this same effective view), so this fallback only ever
+    applies before their very first write.
+    """
+    own_path = _user_settings_path(data_dir, uid)
+    if os.path.exists(own_path):
+        return _load_json_dict(own_path)
+    return _load_json_dict(_legacy_settings_path(data_dir))
+
+
+def _save_settings(data_dir: str, uid: str, values: dict) -> None:
     os.makedirs(data_dir, exist_ok=True)
-    with open(_settings_path(data_dir), "w", encoding="utf-8") as f:
+    with open(_user_settings_path(data_dir, uid), "w", encoding="utf-8") as f:
         json.dump(values, f, ensure_ascii=False, indent=1, sort_keys=True)
 
 
-def _default_resolve_asset(data_dir: str, name: str) -> Optional[str]:
-    """Look `name` up in the staging directory. `None` if unsafe or absent.
+def _default_resolve_asset(data_dir: str, uid: str, name: str) -> Optional[str]:
+    """Look `name` up in `uid`'s own staging directory. `None` if unsafe or absent.
 
     Used as `create_router`'s default `resolve_asset` so `/prompt` submissions
     actually pick up files uploaded via `/upload/image` without every caller
     having to wire that together -- tests can still override the hook to
-    isolate themselves from the filesystem.
+    isolate themselves from the filesystem. Scoped to the submitting session's
+    own uid so `/prompt` can never resolve another user's staged file by name
+    (final review finding #1).
     """
     try:
         safe_name = storage.sanitize_path_component(name, what="asset filename")
     except ValueError:
         return None
-    path = os.path.join(staging_dir(data_dir), safe_name)
-    return path if os.path.isfile(path) else None
+    path = os.path.join(staging_dir(data_dir, uid), safe_name)
+    if os.path.isfile(path):
+        return path
+    # Fall back to the shared, packaged template samples -- public by
+    # design, so every user's templates resolve on first run.
+    shared_path = os.path.join(staging_dir(data_dir, SHARED_STAGING_UID), safe_name)
+    return shared_path if os.path.isfile(shared_path) else None
 
 
 _RUNNING_STATUSES = ("assigned", "running")
@@ -546,16 +613,22 @@ def _partition_missing_models(missing_models: set[str], data_dir: str) -> tuple[
     return assess.partition_fleet_fetchable(missing_models, fetchable_map, online_workers)
 
 
-def staged_image_names(data_dir: str) -> list[str]:
-    """Sorted filenames currently sitting in the panel's staging directory."""
+def _dir_file_names(directory: str) -> set[str]:
     try:
-        staging = staging_dir(data_dir)
-        return sorted(
-            name for name in os.listdir(staging)
-            if os.path.isfile(os.path.join(staging, name))
-        )
+        return {
+            name for name in os.listdir(directory)
+            if os.path.isfile(os.path.join(directory, name))
+        }
     except OSError:
-        return []
+        return set()
+
+
+def staged_image_names(data_dir: str, uid: str) -> list[str]:
+    """Sorted filenames currently sitting in `uid`'s own staging directory,
+    plus the shared, packaged template samples every user can see."""
+    names = _dir_file_names(staging_dir(data_dir, uid))
+    names |= _dir_file_names(staging_dir(data_dir, SHARED_STAGING_UID))
+    return sorted(names)
 
 
 def _merge_options(spec: list, names: list[str]) -> Optional[list]:
@@ -664,21 +737,22 @@ def _with_staged_images(object_info: dict, names: list[str]) -> dict:
 
 def create_router(
     data_dir: str,
-    resolve_asset: Optional[Callable[[str], Optional[str]]] = None,
+    resolve_asset: Optional[Callable[[str, str], Optional[str]]] = None,
 ) -> APIRouter:
     """Build the `/comfy/api` router.
 
-    `resolve_asset(filename) -> path | None` given a filename a submitted
-    prompt references, returns a local path to copy into the job's inputs, or
-    None if the file is unavailable. Defaults to `_default_resolve_asset`,
-    which looks the name up in `<data_dir>/comfy_staging/`; tests pass their
-    own to isolate themselves from the filesystem.
+    `resolve_asset(uid, filename) -> path | None` given the submitting
+    session's uid and a filename a submitted prompt references, returns a
+    local path to copy into the job's inputs, or None if the file is
+    unavailable. Defaults to `_default_resolve_asset`, which looks the name
+    up in `<data_dir>/comfy_staging/<uid>/`; tests pass their own to isolate
+    themselves from the filesystem.
     """
     global _data_dir
     _data_dir = data_dir
 
     resolver = resolve_asset if resolve_asset is not None else (
-        lambda name: _default_resolve_asset(data_dir, name)
+        lambda uid, name: _default_resolve_asset(data_dir, uid, name)
     )
 
     # Phase 3.0 Task 4: the panel is a per-user workspace, not an admin-only
@@ -694,7 +768,7 @@ def create_router(
     r = APIRouter(prefix="/comfy/api", dependencies=[Depends(auth.require_user)])
 
     @r.get("/object_info")
-    def object_info() -> Response:
+    def object_info(user: auth.SessionUser = Depends(auth.require_user)) -> Response:
         with db.get_session() as session:
             fleet = _online_worker_hashes(session)
             mode = _object_info_mode(session)
@@ -712,8 +786,11 @@ def create_router(
             _object_info_cache.clear()
             _object_info_cache[key] = cached
 
+        # Staged filenames are merged in per-request (never cached), scoped to
+        # the CALLING session's own uid -- otherwise B's dropdown would list
+        # A's staged uploads (final review finding #1).
         return JSONResponse(
-            content=_with_staged_images(cached, staged_image_names(data_dir)),
+            content=_with_staged_images(cached, staged_image_names(data_dir, user.uid)),
             headers={_WORKER_COUNT_HEADER: str(len(fleet))},
         )
 
@@ -796,7 +873,7 @@ def create_router(
 
         resolved: dict[str, str] = {}
         for name in sorted(needs.assets):
-            path = resolver(name)
+            path = resolver(user.uid, name)
             if path:
                 resolved[name] = path
 
@@ -838,6 +915,7 @@ def create_router(
     async def upload_image(
         image: UploadFile = File(...),
         overwrite: Optional[str] = Form(default=None),
+        user: auth.SessionUser = Depends(auth.require_user),
     ) -> Response:
         # `overwrite` is accepted (the stock frontend's upload widget sends
         # it) but not branched on: ComfyUI's own dance -- auto-rename with a
@@ -854,7 +932,7 @@ def create_router(
         except ValueError:
             return Response(status_code=400)
 
-        staging = staging_dir(data_dir)
+        staging = staging_dir(data_dir, user.uid)
         os.makedirs(staging, exist_ok=True)
         content = await image.read()
         with open(os.path.join(staging, filename), "wb") as f:
@@ -1093,15 +1171,19 @@ def create_router(
             return Response(status_code=400)
 
         if type == "input":
-            # The staging area is genuinely flat and shared across every
-            # panel user (uploads land in one process-wide directory, same
-            # as before Task 4 widened who can reach the panel at all) --
-            # there is no job, and therefore no `user_id`, to scope this
-            # branch against yet at upload time. A subfolder here can only
-            # be a traversal attempt or a request we cannot satisfy.
+            # The staging area is namespaced per uid (final review finding
+            # #1) -- there is no job, and therefore no `user_id`, to scope
+            # this branch against yet at upload time, so the caller's OWN
+            # staging directory is the scope instead. A subfolder here can
+            # only be a traversal attempt or a request we cannot satisfy.
             if subfolder:
                 return Response(status_code=404)
-            path = os.path.join(staging_dir(data_dir), safe_name)
+            path = os.path.join(staging_dir(data_dir, user.uid), safe_name)
+            if not os.path.isfile(path):
+                # Shared, packaged template samples are visible to every
+                # user; anything else in another user's own namespace stays
+                # unreachable here.
+                path = os.path.join(staging_dir(data_dir, SHARED_STAGING_UID), safe_name)
             if not os.path.isfile(path):
                 return Response(status_code=404)
             media_type = mimetypes.guess_type(safe_name)[0] or "application/octet-stream"
@@ -1271,34 +1353,42 @@ def create_router(
         return JSONResponse(content=panelws.queue_status())
 
     @r.get("/settings")
-    def get_settings() -> Response:
-        return JSONResponse(content=_load_settings(data_dir))
+    def get_settings(user: auth.SessionUser = Depends(auth.require_user)) -> Response:
+        return JSONResponse(content=_load_settings(data_dir, user.uid))
 
     @r.get("/settings/{setting_id}")
-    def get_setting(setting_id: str) -> Response:
+    def get_setting(
+        setting_id: str, user: auth.SessionUser = Depends(auth.require_user)
+    ) -> Response:
         # Upstream answers `null` (not 404) for a setting never written.
-        return JSONResponse(content=_load_settings(data_dir).get(setting_id))
+        return JSONResponse(content=_load_settings(data_dir, user.uid).get(setting_id))
 
     @r.post("/settings")
-    async def post_settings(request: Request) -> Response:
+    async def post_settings(
+        request: Request, user: auth.SessionUser = Depends(auth.require_user)
+    ) -> Response:
         try:
             incoming = await request.json()
         except (ValueError, TypeError):
             return Response(status_code=400)
         if not isinstance(incoming, dict):
             return Response(status_code=400)
-        _save_settings(data_dir, {**_load_settings(data_dir), **incoming})
+        _save_settings(data_dir, user.uid, {**_load_settings(data_dir, user.uid), **incoming})
         return Response(status_code=200)
 
     @r.post("/settings/{setting_id}")
-    async def post_setting(setting_id: str, request: Request) -> Response:
+    async def post_setting(
+        setting_id: str,
+        request: Request,
+        user: auth.SessionUser = Depends(auth.require_user),
+    ) -> Response:
         try:
             value = await request.json()
         except (ValueError, TypeError):
             return Response(status_code=400)
-        settings = _load_settings(data_dir)
+        settings = _load_settings(data_dir, user.uid)
         settings[setting_id] = value
-        _save_settings(data_dir, settings)
+        _save_settings(data_dir, user.uid, settings)
         return Response(status_code=200)
 
     return r

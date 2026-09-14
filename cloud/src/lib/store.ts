@@ -84,8 +84,21 @@ export function jobInputKey(jobId: string, filename: string): string {
   return `${JOB_INPUTS_PREFIX}/${sanitizePathComponent(jobId, "job id")}/${sanitizePathComponent(filename, "asset filename")}`;
 }
 
-export function stagingKey(filename: string): string {
-  return `${STAGING_PREFIX}/${sanitizePathComponent(filename, "staging filename")}`;
+/** Reserved pseudo-uid for the packaged template sample assets (mirrors
+ * `comfyapi.py`'s `SHARED_STAGING_UID`) -- namespaced alongside real
+ * per-user staging keys but readable by EVERY user, since these are
+ * platform-shipped public samples, not private uploads. Never collides with
+ * a real `users.id` (a UUID, never starting with `_`). */
+export const SHARED_STAGING_UID = "_shared";
+
+/** Per-user staging key: `staging/<uid>/<filename>`. Final review finding
+ * #1 -- the staging area used to be one flat, process-wide R2 prefix, so
+ * any logged-in user could view, list, or overwrite any other user's
+ * staged upload. `uid` is sanitized the same way a client-supplied
+ * filename is; it always comes from an authenticated session, but defense
+ * in depth costs nothing here. */
+export function stagingKey(uid: string, filename: string): string {
+  return `${STAGING_PREFIX}/${sanitizePathComponent(uid, "user id")}/${sanitizePathComponent(filename, "staging filename")}`;
 }
 
 /** Ports `LocalStore.url` -- the API path clients fetch a stored artifact

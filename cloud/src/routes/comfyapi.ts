@@ -36,9 +36,12 @@
  * R2 key layout used by this file (beyond `lib/store.ts`'s `artifacts/` /
  * `job_inputs/`): `object_info/<worker_id>.json.gz` (written by
  * `routes/workers.ts`'s `POST /api/agent/object_info`) and
- * `staging/<filename>` (`lib/store.ts`'s `stagingKey`, written by this
- * file's `POST /upload/image`) -- the cloud equivalent of Python's flat
- * `<data_dir>/comfy_staging/` directory.
+ * `staging/<uid>/<filename>` (`lib/store.ts`'s `stagingKey`, written by this
+ * file's `POST /upload/image`) -- the cloud equivalent of Python's per-user
+ * `<data_dir>/comfy_staging/<uid>/` directory (final review finding #1:
+ * namespaced per uid so one user can never view or overwrite another's
+ * staged upload; `SHARED_STAGING_UID` is the one deliberate exception for
+ * platform-shipped template samples every user can see).
  */
 
 import { Hono } from "hono";
@@ -56,6 +59,7 @@ import {
   artifactKey,
   jobInputKey,
   stagingKey,
+  SHARED_STAGING_UID,
 } from "../lib/store";
 import { boundedGunzip } from "../lib/gzip";
 import { requireUser, errorJson, SESSION_VAR } from "../lib/guard";
@@ -358,31 +362,52 @@ function withStagedImages(objectInfo: Record<string, unknown>, names: string[]):
   return result;
 }
 
-async function stagedImageNames(store: R2Bucket): Promise<string[]> {
-  const listed = await store.list({ prefix: "staging/" });
-  return listed.objects.map((o) => o.key.slice("staging/".length)).sort();
+/** Filenames sitting in `uid`'s own staging namespace, plus the shared
+ * packaged template samples every user can see. Final review finding #1:
+ * the staging listing used to be one flat, process-wide R2 prefix, so every
+ * user's `/object_info` dropdown listed every other user's staged uploads. */
+async function stagedImageNames(store: R2Bucket, uid: string): Promise<string[]> {
+  const names = new Set<string>();
+  for (const namespace of [uid, SHARED_STAGING_UID]) {
+    const prefix = `staging/${namespace}/`;
+    const listed = await store.list({ prefix });
+    for (const o of listed.objects) names.add(o.key.slice(prefix.length));
+  }
+  return [...names].sort();
 }
 
 // ---------------------------------------------------------------------------
-// Comfy settings JSON blob (Task 9 ruling: one D1 settings row,
-// `comfy_settings_json`, holding the whole dict as a JSON string -- NOT R2.
-// Mirrors Python's `_load_settings`/`_save_settings`, which persist a single
-// `comfy_settings.json` file next to the DB; ComfyFed has exactly one admin,
-// so a single row is the direct equivalent with no per-user split needed.
+// Comfy settings JSON blob -- one D1 settings row PER USER, holding the
+// whole dict as a JSON string -- NOT R2. Mirrors Python's per-uid
+// `comfy_settings.<uid>.json` files (final review finding #7): now that any
+// role reaches `/comfy/api/*`, one global row meant a regular user's write
+// silently overwrote every other user's, including admins'. The original
+// Task 9 single-row key (`comfy_settings_json`, no suffix) is kept as a
+// read-only legacy fallback default: a user who has never written their own
+// settings reads it if present, so nobody's editor appears to reset.
 
-async function loadComfySettings(db: D1Database): Promise<Record<string, unknown>> {
-  const raw = await queries.getSetting(db, COMFY_SETTINGS_KEY);
-  if (!raw) return {};
+function userComfySettingsKey(uid: string): string {
+  return `${COMFY_SETTINGS_KEY}:${uid}`;
+}
+
+function parseSettingsBlob(raw: string | null): Record<string, unknown> | null {
+  if (!raw) return null;
   try {
     const parsed = JSON.parse(raw);
-    return typeof parsed === "object" && parsed !== null && !Array.isArray(parsed) ? parsed : {};
+    return typeof parsed === "object" && parsed !== null && !Array.isArray(parsed) ? parsed : null;
   } catch {
-    return {};
+    return null;
   }
 }
 
-async function saveComfySettings(db: D1Database, values: Record<string, unknown>): Promise<void> {
-  await queries.setSetting(db, COMFY_SETTINGS_KEY, JSON.stringify(values));
+async function loadComfySettings(db: D1Database, uid: string): Promise<Record<string, unknown>> {
+  const own = parseSettingsBlob(await queries.getSetting(db, userComfySettingsKey(uid)));
+  if (own !== null) return own;
+  return parseSettingsBlob(await queries.getSetting(db, COMFY_SETTINGS_KEY)) ?? {};
+}
+
+async function saveComfySettings(db: D1Database, uid: string, values: Record<string, unknown>): Promise<void> {
+  await queries.setSetting(db, userComfySettingsKey(uid), JSON.stringify(values));
 }
 
 // ---------------------------------------------------------------------------
@@ -394,6 +419,7 @@ app.use("/comfy/api/*", requireUser);
 // --- GET /comfy/api/object_info -------------------------------------------
 
 app.get("/comfy/api/object_info", async (c) => {
+  const user = c.get(SESSION_VAR).user;
   const fleetWorkers = await queries.getOnlineEnabledWorkers(c.env.DB);
   const fleet: [string, string][] = fleetWorkers.map((w) => [w.id, w.objectInfoHash || ""]);
   const modeRaw = await queries.getSetting(c.env.DB, OBJECT_INFO_MODE_KEY);
@@ -412,7 +438,7 @@ app.get("/comfy/api/object_info", async (c) => {
     objectInfoCache = { key, value: merged };
   }
 
-  const names = await stagedImageNames(c.env.STORE);
+  const names = await stagedImageNames(c.env.STORE, user.uid);
   return c.json(withStagedImages(merged, names), 200, { [WORKER_COUNT_HEADER]: String(fleet.length) });
 });
 
@@ -490,13 +516,18 @@ app.post("/comfy/api/prompt", async (c) => {
   // reusable across prompts, same as Python's `comfy_staging/` directory).
   const resolved = new Map<string, R2ObjectBody>();
   for (const name of [...needs.assets].sort()) {
-    let key: string;
+    let obj: R2ObjectBody | null = null;
     try {
-      key = stagingKey(name);
+      obj = await c.env.STORE.get(stagingKey(user.uid, name));
+      if (!obj) {
+        // Shared, packaged template samples are resolvable for every user
+        // (final review finding #1: real uploads are namespaced per uid,
+        // but the platform-shipped samples stay public by design).
+        obj = await c.env.STORE.get(stagingKey(SHARED_STAGING_UID, name));
+      }
     } catch {
       continue;
     }
-    const obj = await c.env.STORE.get(key);
     if (obj) resolved.set(name, obj);
   }
 
@@ -539,6 +570,7 @@ app.post("/comfy/api/prompt", async (c) => {
 // --- POST /comfy/api/upload/image ------------------------------------------
 
 app.post("/comfy/api/upload/image", async (c) => {
+  const user = c.get(SESSION_VAR).user;
   const form = await c.req.parseBody().catch(() => null);
   if (!form) return c.body(null, 400);
   const image = form["image"];
@@ -552,7 +584,7 @@ app.post("/comfy/api/upload/image", async (c) => {
   }
 
   const content = await image.arrayBuffer();
-  await c.env.STORE.put(stagingKey(filename), content);
+  await c.env.STORE.put(stagingKey(user.uid, filename), content);
 
   return c.json({ name: filename, subfolder: "", type: "input" });
 });
@@ -744,7 +776,12 @@ app.get("/comfy/api/view", async (c) => {
 
   if (type === "input") {
     if (subfolder) return c.body(null, 404);
-    const obj = await c.env.STORE.get(stagingKey(safeName));
+    let obj = await c.env.STORE.get(stagingKey(user.uid, safeName));
+    if (!obj) {
+      // Shared, packaged template samples are visible to every user;
+      // anything else in another user's own namespace stays unreachable.
+      obj = await c.env.STORE.get(stagingKey(SHARED_STAGING_UID, safeName));
+    }
     if (!obj) return c.body(null, 404);
     return new Response(obj.body, { headers: { "content-type": guessMediaType(safeName) } });
   }
@@ -842,14 +879,17 @@ app.get("/comfy/api/prompt", async (c) => {
   return c.json({ exec_info: { queue_remaining: remaining } });
 });
 
-app.get("/comfy/api/settings", async (c) => c.json(await loadComfySettings(c.env.DB)));
+app.get("/comfy/api/settings", async (c) =>
+  c.json(await loadComfySettings(c.env.DB, c.get(SESSION_VAR).user.uid))
+);
 
 app.get("/comfy/api/settings/:settingId", async (c) => {
-  const settings = await loadComfySettings(c.env.DB);
+  const settings = await loadComfySettings(c.env.DB, c.get(SESSION_VAR).user.uid);
   return c.json(settings[c.req.param("settingId")] ?? null);
 });
 
 app.post("/comfy/api/settings", async (c) => {
+  const uid = c.get(SESSION_VAR).user.uid;
   let incoming: unknown;
   try {
     incoming = await c.req.json();
@@ -859,21 +899,22 @@ app.post("/comfy/api/settings", async (c) => {
   if (typeof incoming !== "object" || incoming === null || Array.isArray(incoming)) {
     return c.body(null, 400);
   }
-  const current = await loadComfySettings(c.env.DB);
-  await saveComfySettings(c.env.DB, { ...current, ...(incoming as Record<string, unknown>) });
+  const current = await loadComfySettings(c.env.DB, uid);
+  await saveComfySettings(c.env.DB, uid, { ...current, ...(incoming as Record<string, unknown>) });
   return c.body(null, 200);
 });
 
 app.post("/comfy/api/settings/:settingId", async (c) => {
+  const uid = c.get(SESSION_VAR).user.uid;
   let value: unknown;
   try {
     value = await c.req.json();
   } catch {
     return c.body(null, 400);
   }
-  const settings = await loadComfySettings(c.env.DB);
+  const settings = await loadComfySettings(c.env.DB, uid);
   settings[c.req.param("settingId")] = value;
-  await saveComfySettings(c.env.DB, settings);
+  await saveComfySettings(c.env.DB, uid, settings);
   return c.body(null, 200);
 });
 

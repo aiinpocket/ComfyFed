@@ -676,7 +676,61 @@ describe("POST /comfy/api/upload/image", () => {
     expect(await inputObj!.text()).toBe("STAGED");
 
     // Copy, not move -- the staged file is still there for reuse.
-    expect(await store().get("staging/ref.png")).not.toBeNull();
+    const adminRow = await db().prepare("SELECT id FROM users WHERE username = 'admin'").first<{ id: string }>();
+    expect(await store().get(`staging/${adminRow!.id}/ref.png`)).not.toBeNull();
+  });
+});
+
+async function uploadImage(cookie: string | null, filename: string, content: string): Promise<Response> {
+  const form = new FormData();
+  form.set("image", new File([new TextEncoder().encode(content)], filename, { type: "image/png" }));
+  const worker = (await import("../src/index")).default;
+  const { createExecutionContext, waitOnExecutionContext } = await import("cloudflare:test");
+  const ctx = createExecutionContext();
+  const res = await worker.fetch(
+    new Request("http://example.com/comfy/api/upload/image", { method: "POST", headers: { Cookie: cookie ?? "" }, body: form }),
+    env as any,
+    ctx
+  );
+  await waitOnExecutionContext(ctx);
+  return res;
+}
+
+describe("panel input staging is isolated between users (final review finding #1)", () => {
+  it("B cannot view or overwrite A's staged input; A's next /prompt uses her own file", async () => {
+    const admin = await loginSession();
+    const alice = await userSession(admin, "alice");
+    const bob = await userSession(admin, "bob");
+
+    await uploadImage(alice.cookie, "reference.png", "ALICE-BYTES");
+
+    // Bob cannot view Alice's staged file even though he knows its exact name.
+    const bobView = await call("/comfy/api/view?filename=reference.png&type=input", { method: "GET", cookie: bob.cookie });
+    expect(bobView.status).toBe(404);
+
+    // Bob's own object_info dropdown does not list Alice's staged file.
+    const w1 = await registerWorker(admin.cookie, admin.csrf, "w1");
+    await seedObjectInfo(w1, "h1", {
+      LoadImage: { input: { required: { image: [[], { image_upload: true }] } } },
+    });
+    const bobObjectInfo = await call("/comfy/api/object_info", { method: "GET", cookie: bob.cookie });
+    expect(bobObjectInfo.body.LoadImage?.input?.required?.image?.[0] ?? []).not.toContain("reference.png");
+
+    // Bob uploads a same-named file -- it must NOT overwrite Alice's.
+    const bobUpload = await uploadImage(bob.cookie, "reference.png", "BOB-BYTES");
+    expect(bobUpload.status).toBe(200);
+
+    const aliceRow = await db().prepare("SELECT id FROM users WHERE username = 'alice'").first<{ id: string }>();
+    const aliceStaged = await store().get(`staging/${aliceRow!.id}/reference.png`);
+    expect(await aliceStaged!.text()).toBe("ALICE-BYTES");
+
+    // Alice's own next /prompt still resolves against her own file.
+    const prompt = { "1": { class_type: "LoadImage", inputs: { image: "reference.png" } } };
+    const r = await postPrompt(alice.cookie, prompt);
+    expect(r.status).toBe(200);
+    const jobId = r.body.prompt_id;
+    const jobInput = await store().get(`job_inputs/${jobId}/reference.png`);
+    expect(await jobInput!.text()).toBe("ALICE-BYTES");
   });
 });
 
@@ -751,6 +805,42 @@ describe("panel bootstrap routes", () => {
     await call("/comfy/api/settings/theme", { json: "light", cookie });
     const after = await call("/comfy/api/settings", { method: "GET", cookie });
     expect(after.body).toEqual({ theme: "light" });
+  });
+
+  it("settings are isolated between users, with the pre-existing legacy blob as a fallback default (final review finding #7)", async () => {
+    const admin = await loginSession();
+    // A legacy, pre-Task-4 global row (no per-uid suffix), as if written
+    // before this fix shipped.
+    await db()
+      .prepare("INSERT INTO settings (key, value) VALUES ('comfy_settings_json', ?)")
+      .bind(JSON.stringify({ theme: "legacy-theme" }))
+      .run();
+
+    const alice = await userSession(admin, "alice");
+    const bob = await userSession(admin, "bob");
+
+    // Alice has never written her own settings -- she reads the legacy blob.
+    const aliceBefore = await call("/comfy/api/settings", { method: "GET", cookie: alice.cookie });
+    expect(aliceBefore.body).toEqual({ theme: "legacy-theme" });
+
+    // Alice writes her own setting -- forks her OWN row from here on.
+    await call("/comfy/api/settings", { json: { zoom: 2.0 }, cookie: alice.cookie });
+    const aliceAfter = await call("/comfy/api/settings", { method: "GET", cookie: alice.cookie });
+    expect(aliceAfter.body).toEqual({ theme: "legacy-theme", zoom: 2.0 });
+
+    // Bob, who has also never written his own settings, still reads the
+    // legacy blob -- Alice's write did not touch it.
+    const bobBefore = await call("/comfy/api/settings", { method: "GET", cookie: bob.cookie });
+    expect(bobBefore.body).toEqual({ theme: "legacy-theme" });
+
+    // Bob's own write is independent of Alice's.
+    await call("/comfy/api/settings", { json: { theme: "bobs-theme" }, cookie: bob.cookie });
+    const bobAfter = await call("/comfy/api/settings", { method: "GET", cookie: bob.cookie });
+    expect(bobAfter.body).toEqual({ theme: "bobs-theme" });
+
+    // Alice's settings are untouched by Bob's write.
+    const aliceStill = await call("/comfy/api/settings", { method: "GET", cookie: alice.cookie });
+    expect(aliceStill.body).toEqual({ theme: "legacy-theme", zoom: 2.0 });
   });
 });
 

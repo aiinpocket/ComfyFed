@@ -51,6 +51,12 @@ def _login(client, username="admin", password=None):
     return r.json()["csrf"]
 
 
+def _uid(username="admin"):
+    with db.get_session() as session:
+        row = session.query(db.User).filter(db.User.username == username).one()
+        return row.id
+
+
 def _create_user(client, admin_csrf, username, role="user", password="password123"):
     r = client.post(
         "/api/users",
@@ -1434,7 +1440,7 @@ def test_upload_image_lands_in_staging_and_response_shape(client):
     assert r.status_code == 200
     assert r.json() == {"name": "ref.png", "subfolder": "", "type": "input"}
 
-    staged = os.path.join(client.data_dir, "comfy_staging", "ref.png")
+    staged = os.path.join(client.data_dir, "comfy_staging", _uid(), "ref.png")
     assert os.path.isfile(staged)
     with open(staged, "rb") as f:
         assert f.read() == b"PNGDATA"
@@ -1450,7 +1456,7 @@ def test_upload_image_same_name_overwrites(client):
     )
     assert r.status_code == 200
 
-    staged = os.path.join(client.data_dir, "comfy_staging", "ref.png")
+    staged = os.path.join(client.data_dir, "comfy_staging", _uid(), "ref.png")
     with open(staged, "rb") as f:
         assert f.read() == b"NEW"
 
@@ -1479,6 +1485,45 @@ def test_view_input_type_missing_staged_file_404(client):
     assert r.status_code == 404
 
 
+def test_staging_is_isolated_between_users(client, two_users):
+    """Final review finding #1: the staging area used to be one flat,
+    process-wide directory -- any user could view or overwrite any other
+    user's staged upload, and the next `/prompt` would silently resolve
+    against the wrong bytes."""
+    _login(client, *ALICE)
+    client.post(
+        "/comfy/api/upload/image", files={"image": ("reference.png", b"ALICE-BYTES", "image/png")}
+    )
+
+    # Bob cannot view Alice's staged file even though he knows its exact name.
+    _login(client, *BOB)
+    r = client.get("/comfy/api/view?filename=reference.png&type=input")
+    assert r.status_code == 404
+
+    # Bob's own object_info dropdown does not list Alice's staged file.
+    assert "reference.png" not in comfyapi.staged_image_names(client.data_dir, _uid("bob"))
+
+    # Bob uploads a same-named file -- it must NOT overwrite Alice's.
+    r = client.post(
+        "/comfy/api/upload/image", files={"image": ("reference.png", b"BOB-BYTES", "image/png")}
+    )
+    assert r.status_code == 200
+
+    alice_staged = os.path.join(client.data_dir, "comfy_staging", _uid("alice"), "reference.png")
+    with open(alice_staged, "rb") as f:
+        assert f.read() == b"ALICE-BYTES"
+
+    # Alice's own next /prompt still resolves against her own file.
+    _login(client, *ALICE)
+    prompt = {"1": {"class_type": "LoadImage", "inputs": {"image": "reference.png"}}}
+    r = client.post("/comfy/api/prompt", json={"prompt": prompt})
+    assert r.status_code == 200
+    job_id = r.json()["prompt_id"]
+    job_input = os.path.join(client.data_dir, "job_inputs", job_id, "reference.png")
+    with open(job_input, "rb") as f:
+        assert f.read() == b"ALICE-BYTES"
+
+
 def test_prompt_copies_staged_asset_into_job_inputs(client):
     _login(client)
     client.post("/comfy/api/upload/image", files={"image": ("ref.png", b"STAGED", "image/png")})
@@ -1494,7 +1539,7 @@ def test_prompt_copies_staged_asset_into_job_inputs(client):
         assert f.read() == b"STAGED"
 
     # Copy, not move: the staged file is still there for reuse by another prompt.
-    staged = os.path.join(client.data_dir, "comfy_staging", "ref.png")
+    staged = os.path.join(client.data_dir, "comfy_staging", _uid(), "ref.png")
     assert os.path.isfile(staged)
 
     with db.get_session() as session:
@@ -1804,6 +1849,51 @@ def test_panel_settings_round_trip_and_persist(client):
         "Comfy.Zoom": 1.25,
     }
 
-    # Written through to disk, so a restart keeps the panel's preferences.
-    with open(os.path.join(client.data_dir, "comfy_settings.json"), encoding="utf-8") as f:
+    # Written through to disk, so a restart keeps the panel's preferences --
+    # per-user (final review finding #7), not the legacy global file.
+    with open(
+        os.path.join(client.data_dir, f"comfy_settings.{_uid()}.json"), encoding="utf-8"
+    ) as f:
         assert json.load(f)["Comfy.ColorPalette"] == "dark"
+
+
+def test_panel_settings_are_isolated_between_users_and_a_legacy_global_blob_is_the_fallback_default(
+    client, two_users
+):
+    """Final review finding #7: `/comfy/api/settings` used to be one global
+    blob writable by every user -- a regular user's write silently
+    overwrote every other user's, admins included. Also verifies the
+    upgrade-safety fallback: a user who has never written their own
+    settings reads the pre-Task-4 legacy global blob if one exists, so
+    nobody's editor appears to reset."""
+    legacy_path = os.path.join(client.data_dir, "comfy_settings.json")
+    os.makedirs(client.data_dir, exist_ok=True)
+    with open(legacy_path, "w", encoding="utf-8") as f:
+        json.dump({"Comfy.ColorPalette": "legacy-theme"}, f)
+
+    # Alice has never written her own settings -- she reads the legacy blob.
+    _login(client, *ALICE)
+    assert client.get("/comfy/api/settings").json() == {"Comfy.ColorPalette": "legacy-theme"}
+
+    # Alice writes her own setting -- this forks her OWN file from here on.
+    assert client.post("/comfy/api/settings/Comfy.Zoom", json=2.0).status_code == 200
+    assert client.get("/comfy/api/settings").json() == {
+        "Comfy.ColorPalette": "legacy-theme",
+        "Comfy.Zoom": 2.0,
+    }
+
+    # Bob, who has also never written his own settings, still reads the
+    # legacy blob -- Alice's write did not touch it.
+    _login(client, *BOB)
+    assert client.get("/comfy/api/settings").json() == {"Comfy.ColorPalette": "legacy-theme"}
+
+    # Bob's own write is independent of Alice's.
+    assert client.post("/comfy/api/settings/Comfy.ColorPalette", json="bobs-theme").status_code == 200
+    assert client.get("/comfy/api/settings").json() == {"Comfy.ColorPalette": "bobs-theme"}
+
+    # Alice's settings are untouched by Bob's write.
+    _login(client, *ALICE)
+    assert client.get("/comfy/api/settings").json() == {
+        "Comfy.ColorPalette": "legacy-theme",
+        "Comfy.Zoom": 2.0,
+    }
