@@ -20,9 +20,11 @@ from .runner import AgentLoop
 DEFAULT_CONFIG_PATH = os.path.join(os.path.expanduser("~"), ".comfyfed", "agent.json")
 
 # How stale the agent's published state may be before `status` calls the
-# agent "not running": four heartbeats' worth of slack over the 30s beat, so
-# one missed or slow tick never reads as a dead service.
-_STATE_STALE_SECONDS = 120.0
+# agent "not running". The control loop refreshes agent_state.json every 5s
+# (runner._CONTROL_TICK_SECONDS), so four ticks' worth of slack means one
+# missed or slow tick never reads as a dead service, while a genuinely dead
+# agent is reported as such within ~20s instead of two minutes.
+_STATE_STALE_SECONDS = 20.0
 
 
 def _cmd_register(args: argparse.Namespace) -> None:
