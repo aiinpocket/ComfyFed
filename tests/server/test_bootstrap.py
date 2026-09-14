@@ -16,6 +16,26 @@ def test_second_run_no_password(tmp_path):
     assert not r2.first_run and r2.admin_password is None
 
 
+def test_installed_predicate_is_any_user_not_specifically_named_admin(tmp_path):
+    """Final review finding #12: aligned to cloud's `hasAnyUser` semantics --
+    renaming the sole account away from `admin` must not make the server
+    look uninstalled again (the old predicate checked specifically for a
+    user named `admin`)."""
+    r1 = bootstrap.ensure_installed(str(tmp_path), lang="en", url="http://h", interactive=False)
+    assert r1.first_run
+
+    with db.get_session() as s:
+        user = s.query(db.User).filter(db.User.username == "admin").one()
+        user.username = "renamed-owner"
+        s.commit()
+
+    r2 = bootstrap.ensure_installed(str(tmp_path), lang=None, url=None, interactive=False)
+    assert not r2.first_run and r2.admin_password is None
+
+    with db.get_session() as s:
+        assert s.query(db.User).count() == 1  # not re-seeded with a second admin row
+
+
 def test_platform_keys_persist(tmp_path):
     sk1, _ = security.load_platform_keys(str(tmp_path))
     sk2, _ = security.load_platform_keys(str(tmp_path))

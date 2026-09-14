@@ -22,7 +22,17 @@ class InstallResult:
 
 
 def _is_installed(session) -> bool:
-    return session.query(db.User).filter(db.User.username == _ADMIN_USERNAME).first() is not None
+    """Whether the server has already been through first-run setup.
+
+    Final review finding #12: aligned to cloud's `hasAnyUser` semantics --
+    ANY `users` row means installed, not specifically one named `admin`.
+    Immaterial today (there is no username rename and no DELETE), but the
+    two answers would otherwise diverge the moment a future task adds
+    either -- e.g. an admin renaming their own account would make this
+    return `False` again under the old definition, offering a fresh
+    install wizard on top of a live, populated database.
+    """
+    return session.query(db.User).first() is not None
 
 
 def get_lang() -> str:
