@@ -75,6 +75,13 @@ _PEER_ROUTE_PREFIX = "/peer/models/"
 _PEER_GRANT_HEADER = "X-ComfyFed-Grant"
 _PEER_CONNECT_TIMEOUT_SECONDS = 30.0
 _PEER_READ_TIMEOUT_SECONDS = 120.0
+# Cap on consecutive re-grants that make NO forward progress (offset
+# unchanged after re-verifying `.part`) before giving up on the peer source
+# entirely -- without this, a seeder that keeps 403-ing a range while the
+# platform keeps issuing fresh grants would re-grant forever, and the
+# fetch-stage heartbeat would keep the job "alive" the whole time instead of
+# ever failing or falling back (final review, Task 5).
+_MAX_NO_PROGRESS_REGRANTS = 3
 
 
 class _PeerGrantExpired(Exception):
@@ -639,7 +646,20 @@ async def _fetch_via_peer(
     if offset:
         await on_bytes(offset)
 
+    # A seeder that keeps 403-ing (or a platform that keeps granting against
+    # a seeder that never actually delivers a byte) must not re-grant
+    # forever: the fetch-stage heartbeat keeps the job "alive" from the
+    # platform's point of view, so an unbounded loop here would wedge the
+    # job indefinitely rather than fail. Tracked as consecutive re-grant
+    # attempts that land with NO forward progress (the resumed offset after
+    # re-verifying `.part` is no larger than it was before this attempt);
+    # reset the instant a re-grant DOES make progress. This is independent
+    # of "a fresh grant could not be obtained at all" (_request_peer_grant
+    # returning None), which already bails immediately with no cap needed.
+    no_progress_regrants = 0
+
     while True:
+        offset_before_attempt = offset
         try:
             await _pull_chunks_from_offset(
                 entry=entry,
@@ -673,6 +693,19 @@ async def _fetch_via_peer(
             # expired grant were already reported via on_bytes as they
             # landed, so this must NOT be re-reported here.
             offset = _verify_local_chunks(part_path, chunk_sha256s, size_bytes)
+
+            if offset > offset_before_attempt:
+                no_progress_regrants = 0
+            else:
+                no_progress_regrants += 1
+                if no_progress_regrants >= _MAX_NO_PROGRESS_REGRANTS:
+                    logger.info(
+                        "fetcher: peer source made no progress across %d re-grant(s) for %r, "
+                        "falling back to URL chain",
+                        no_progress_regrants, name,
+                    )
+                    _safe_unlink(part_path)
+                    return False
             continue
         except _PeerChunkMismatch:
             logger.info(

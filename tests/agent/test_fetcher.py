@@ -974,6 +974,75 @@ async def test_peer_resume_after_disconnect_regrants_and_skips_verified_chunks(t
     assert ("g-2", "bytes=1000-1999") in requests
 
 
+async def test_peer_always_403_falls_back_after_no_progress_cap(tmp_path):
+    """A seeder that always 403s (grant expiry that never resolves, even
+    across re-grants) must not loop forever: after
+    `fetcher._MAX_NO_PROGRESS_REGRANTS` re-grants that make no forward
+    progress, the peer source is abandoned and the URL chain runs. Request
+    accounting proves the exact cap, not just "it terminated"."""
+    content = b"weights" * 50
+    inventory_name = "checkpoints/model.bin"
+
+    peer_requests: list[str] = []  # grant_id per attempted pull
+
+    class _AlwaysFailingPeerServer:
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *a):
+            return False
+
+        async def get(self, url, headers=None):
+            grant_obj = json.loads(base64.b64decode(headers[fetcher._PEER_GRANT_HEADER]))
+            peer_requests.append(grant_obj["grant_id"])
+            return httpx.Response(403, content=b"")
+
+    def _peer_client_factory(**kwargs):
+        return _AlwaysFailingPeerServer()
+
+    seeder_signing_key, seeder_entry = _platform(worker_id="seeder-1")
+    issuer = _grant_issuer(
+        name=inventory_name, size_bytes=len(content), seeder_id=seeder_entry.worker_id,
+        signing_key=seeder_signing_key, peer_url="http://fake-peer.example",
+        chunk_sha256s=None,  # no per-chunk list -- offset is always 0, so every re-grant is "no progress"
+    )
+
+    manifest_key, manifest_pubkey_hex = _keypair()
+    entry = _signed_entry(
+        manifest_key, name="model.bin", directory="checkpoints", content=content,
+        url="http://models.example/f.bin",
+    )
+
+    recorded = []
+    url_client_cls = _client_factory([_StreamSpec(chunks=[content])], recorded)
+
+    dest = tmp_path / "dest"
+    await fetcher.fetch_and_verify_models(
+        entries=[entry],
+        platform_pubkey_hex=manifest_pubkey_hex,
+        models_dir=str(dest),
+        max_fetch_gb=100,
+        cancel_event=asyncio.Event(),
+        report_progress=_noop_progress,
+        client_factory=url_client_cls,
+        platform_entry=_puller_platform_entry(),
+        peer_client_factory=_peer_client_factory,
+        platform_client_factory=_platform_client_factory(issuer),
+    )
+
+    final_path = dest / "checkpoints" / "model.bin"
+    assert final_path.read_bytes() == content  # URL chain fallback succeeded
+    assert recorded == [entry["url"]]
+
+    # Exactly _MAX_NO_PROGRESS_REGRANTS pull attempts were made against the
+    # peer (one per grant, each 403ing), plus the initial + that many
+    # re-grants issued -- proving the loop actually stopped at the cap
+    # rather than retrying forever or bailing early/late.
+    assert len(peer_requests) == fetcher._MAX_NO_PROGRESS_REGRANTS
+    assert peer_requests == [f"g-{i}" for i in range(1, fetcher._MAX_NO_PROGRESS_REGRANTS + 1)]
+    assert issuer.calls() == fetcher._MAX_NO_PROGRESS_REGRANTS + 1
+
+
 async def test_peer_only_entry_failure_is_fetch_failure(tmp_path):
     """A `url: None, peer: True` entry skips the URL chain entirely -- a
     failed peer grant for it is a plain fetch failure, not a silent
