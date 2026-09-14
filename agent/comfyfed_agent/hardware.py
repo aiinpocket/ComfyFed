@@ -25,6 +25,10 @@ logger = logging.getLogger(__name__)
 
 _HASH_SIDECAR_NAME = ".comfyfed_hashes.json"
 _HASH_READ_CHUNK = 1024 * 1024  # 1 MiB, per the brief's "1MB read loop"
+# P2P chunk boundary (Phase 3.1 addendum, 分塊雜湊). Fixed at 64 MiB so every
+# agent and the server (`model_hashes.chunk_sha256s`) agree on chunk offsets
+# without exchanging a chunk size out of band.
+CHUNK_SIZE = 64 * 1024 * 1024
 
 # In-flight hashing threads, keyed by absolute file path, so a scan pass
 # never schedules a second thread for a file that is already being hashed --
@@ -133,14 +137,45 @@ def collect_dynamic(model_dir_or_none: str | None) -> dict:
     }
 
 
-def _hash_file_sha256(path: str) -> str:
-    """Sha256 of `path`'s contents, read in 1MB chunks so a multi-GB model
-    never needs to be loaded into memory whole."""
-    digest = hashlib.sha256()
+def _hash_file_sha256(path: str) -> tuple[str, list[str]]:
+    """Single-pass whole-file SHA-256 + per-`CHUNK_SIZE` chunk SHA-256 list.
+
+    `path` is read exactly once, in `_HASH_READ_CHUNK` (1 MiB) pieces so a
+    multi-GB model never needs to be loaded into memory whole; each piece
+    feeds both the running whole-file digest and the current 64 MiB chunk
+    digest. When the chunk digest reaches `CHUNK_SIZE` bytes it is finalized
+    and a fresh one started -- this is what makes the per-chunk hashes
+    (Phase 3.1 addendum, 分塊雜湊) "free": no second read pass over the file.
+
+    Returns `(whole_file_sha256_hex, [chunk_sha256_hex, ...])`. The last
+    chunk is short unless the file size is an exact multiple of
+    `CHUNK_SIZE`. A file smaller than one chunk (including an empty file)
+    yields exactly one chunk hash, equal to the whole-file hash.
+    """
+    whole = hashlib.sha256()
+    chunk_hashes: list[str] = []
+    chunk = hashlib.sha256()
+    chunk_bytes = 0
     with open(path, "rb") as f:
-        for chunk in iter(lambda: f.read(_HASH_READ_CHUNK), b""):
-            digest.update(chunk)
-    return digest.hexdigest()
+        for piece in iter(lambda: f.read(_HASH_READ_CHUNK), b""):
+            whole.update(piece)
+            offset = 0
+            while offset < len(piece):
+                room = CHUNK_SIZE - chunk_bytes
+                take = piece[offset : offset + room]
+                chunk.update(take)
+                chunk_bytes += len(take)
+                offset += len(take)
+                if chunk_bytes == CHUNK_SIZE:
+                    chunk_hashes.append(chunk.hexdigest())
+                    chunk = hashlib.sha256()
+                    chunk_bytes = 0
+    if chunk_bytes > 0 or not chunk_hashes:
+        # Trailing partial chunk, or a file with no bytes at all (an empty
+        # file never enters the loop above, so without this it would end up
+        # with zero chunk hashes instead of the required one).
+        chunk_hashes.append(chunk.hexdigest())
+    return whole.hexdigest(), chunk_hashes
 
 
 def _load_hash_cache(cache_path: str) -> dict:
@@ -190,7 +225,7 @@ def _hash_worker(full_path: str, rel_path: str, cache_path: str, size_bytes: int
     file was deleted mid-hash).
     """
     try:
-        digest = _hash_file_sha256(full_path)
+        digest, chunk_hashes = _hash_file_sha256(full_path)
     except OSError:
         logger.warning("hardware: failed to hash %s", full_path, exc_info=True)
         return
@@ -203,7 +238,12 @@ def _hash_worker(full_path: str, rel_path: str, cache_path: str, size_bytes: int
         # been written to this same cache file by a previous pass while this
         # one was in flight.
         cache = _load_hash_cache(cache_path)
-        cache[rel_path] = {"size": size_bytes, "mtime": mtime, "sha256": digest}
+        cache[rel_path] = {
+            "size": size_bytes,
+            "mtime": mtime,
+            "sha256": digest,
+            "chunk_sha256s": chunk_hashes,
+        }
         try:
             _save_hash_cache_atomic(cache_path, cache)
         except OSError:
@@ -214,8 +254,15 @@ def scan_models(models_dir: str, hash_models: bool = True) -> list[dict]:
     """Walk `models_dir` and return the local model inventory.
 
     Returns `[{"name": "relative/posix/path", "size": <GB>, "size_bytes": <int>,
-    "sha256": <hex>}, ...]`. `sha256` is present only once known -- see below.
-    `size_bytes` is the file's EXACT `os.stat().st_size` -- additive
+    "sha256": <hex>, "chunk_sha256s": [<hex>, ...]}, ...]`. `sha256` and
+    `chunk_sha256s` are present only once known, and always together -- see
+    below. `chunk_sha256s` (Phase 3.1 addendum) is the per-`CHUNK_SIZE`
+    (64 MiB) chunk hash list computed in the SAME read pass as `sha256` (see
+    `_hash_file_sha256`); an inventory report just forwards these entries
+    verbatim (`runner.refresh_model_inventory`/`_handle_hello`), so there is
+    no separate report-assembly step to keep in sync -- adding the field
+    here is the whole change. `size_bytes` is the file's EXACT `os.stat().
+    st_size` -- additive
     alongside `size` (GB, rounded, kept for display/back-compat with older
     server builds and the VRAM/disk estimates) so the server's signed
     fetch-manifest trust payload (Phase 2.1 Task 2) can pin the real byte
@@ -240,15 +287,20 @@ def scan_models(models_dir: str, hash_models: bool = True) -> list[dict]:
 
     Hashing is lazy and cached (Phase 2.1 model auto-distribution
     groundwork). A sidecar `<models_dir>/.comfyfed_hashes.json` maps relpath
-    -> `{size, mtime, sha256}`. On each call:
+    -> `{size, mtime, sha256, chunk_sha256s}`. On each call:
 
-    - a file whose (size, mtime) match the cache gets its cached sha256
-      immediately, with no re-read;
-    - a file that is new, changed, or never hashed is a *candidate*; at most
-      ONE candidate is handed to a background thread per call, chosen
-      smallest-first so cheap models converge on a hash immediately instead
-      of queueing behind one multi-GB file. The 10-minute agent rescan loop
-      means every model eventually gets caught up over several passes.
+    - a file whose (size, mtime) match the cache AND whose cache entry
+      already carries a non-empty `chunk_sha256s` gets its cached sha256 +
+      chunk_sha256s immediately, with no re-read;
+    - a file that is new, changed, never hashed, OR whose cache entry
+      predates chunk hashing (matching size/mtime but no `chunk_sha256s` --
+      an old sidecar) is a *candidate*, all judged by the same rule so an
+      upgrade can't starve a genuinely new file; at most ONE candidate is
+      handed to a background thread per call, chosen smallest-first over
+      that combined set so cheap models converge on a hash immediately
+      instead of queueing behind one multi-GB file. The 10-minute agent
+      rescan loop means every model eventually gets caught up over several
+      passes.
     - a file whose hash is already being computed by a still-running thread
       from a previous call is left alone rather than scheduled again.
     - any sidecar entry for a file no longer found on disk (deleted or
@@ -295,9 +347,24 @@ def scan_models(models_dir: str, hash_models: bool = True) -> list[dict]:
 
             if hash_models:
                 cached = cache.get(rel_path)
-                if cached and cached.get("size") == size_bytes and cached.get("mtime") == mtime:
+                cached_chunks = cached.get("chunk_sha256s") if cached else None
+                if (
+                    cached
+                    and cached.get("size") == size_bytes
+                    and cached.get("mtime") == mtime
+                    and isinstance(cached_chunks, list)
+                    and cached_chunks
+                ):
                     entry["sha256"] = cached["sha256"]
+                    entry["chunk_sha256s"] = cached_chunks
                 else:
+                    # No cache hit, a stale (size, mtime), OR a cache entry
+                    # from before chunk hashing existed (no chunk_sha256s):
+                    # all three are treated the same -- un-hashed -- so an
+                    # old sidecar upgrades to carrying chunks over the
+                    # normal one-file-per-pass smallest-first schedule below,
+                    # without a separate "upgrade pass" that could starve
+                    # genuinely new files.
                     candidates.append((size_bytes, full_path, rel_path, mtime))
 
             results.append(entry)
