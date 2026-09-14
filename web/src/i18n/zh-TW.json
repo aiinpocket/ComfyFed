@@ -256,7 +256,13 @@
     "confirm_hint": "已經在跑的任務不受影響。這個動作無法從控制台復原。",
     "disabled_title": "已停用 Worker",
     "disabled_message": "「{{name}}」之後不會再收到任務。",
-    "disable_failed": "無法停用這台 Worker"
+    "disable_failed": "無法停用這台 Worker",
+    "delete": "刪除",
+    "delete_confirm_title": "確定刪除這台 Worker？",
+    "delete_confirm": "確定要刪除 worker「{{name}}」嗎？帳務紀錄會保留，但它會從列表消失且無法再連線。",
+    "deleted_title": "已刪除 Worker",
+    "deleted_message": "「{{name}}」已從列表移除，帳務紀錄仍然保留。",
+    "delete_failed": "無法刪除這台 Worker"
   },
   "users": {
     "title": "使用者",

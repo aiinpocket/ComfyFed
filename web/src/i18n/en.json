@@ -256,7 +256,13 @@
     "confirm_hint": "Jobs already running on it are unaffected. This cannot be undone from the console.",
     "disabled_title": "Worker disabled",
     "disabled_message": "\"{{name}}\" will no longer receive jobs.",
-    "disable_failed": "Could not disable the worker"
+    "disable_failed": "Could not disable the worker",
+    "delete": "Delete",
+    "delete_confirm_title": "Delete this worker?",
+    "delete_confirm": "Delete worker \"{{name}}\"? Billing records are kept, but it disappears from the list and can no longer connect.",
+    "deleted_title": "Worker deleted",
+    "deleted_message": "\"{{name}}\" is gone from the list; its billing records are kept.",
+    "delete_failed": "Could not delete the worker"
   },
   "users": {
     "title": "Users",

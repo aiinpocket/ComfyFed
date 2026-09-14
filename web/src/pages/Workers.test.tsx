@@ -9,7 +9,7 @@
 import '@testing-library/jest-dom/vitest';
 
 import { MantineProvider } from '@mantine/core';
-import { cleanup, fireEvent, render, screen } from '@testing-library/react';
+import { cleanup, fireEvent, render, screen, waitFor } from '@testing-library/react';
 import { MemoryRouter } from 'react-router-dom';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 
@@ -172,5 +172,76 @@ describe('Workers page: add worker one-line install commands', () => {
     fireEvent.click(screen.getByText('Manual install (advanced)'));
     expect(await screen.findByRole('button', { name: 'Copy bundle' })).toBeInTheDocument();
     expect(screen.getByRole('button', { name: 'Download .json' })).toBeInTheDocument();
+  });
+});
+
+describe('Workers page: delete a worker', () => {
+  afterEach(() => {
+    cleanup();
+    vi.unstubAllGlobals();
+  });
+
+  /** Serves the list from a mutable array so the post-delete refetch returns
+   * the shortened list the real API would -- the row must actually vanish,
+   * not merely stop being clickable. */
+  function stubFetchWithDelete(initial: Worker[]) {
+    let workers = [...initial];
+    const fetchMock = vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+      const url = typeof input === 'string' ? input : input.toString();
+      if (init?.method === 'DELETE') {
+        const id = decodeURIComponent(url.slice('/api/workers/'.length));
+        workers = workers.filter((w) => w.id !== id);
+        return jsonResponse({ ok: true });
+      }
+      if (url.startsWith('/api/workers')) return jsonResponse(workers);
+      return jsonResponse({ error: { code: 'http_error', message: 'not stubbed' } }, 404);
+    });
+    vi.stubGlobal('fetch', fetchMock);
+    return fetchMock;
+  }
+
+  it('asks for confirmation, then DELETEs the worker and drops the row', async () => {
+    const fetchMock = stubFetchWithDelete([BASE_WORKER, QUIET_WORKER]);
+    renderWorkers();
+
+    expect(await screen.findByText('runner-sharing')).toBeInTheDocument();
+    fireEvent.click(screen.getAllByRole('button', { name: 'Delete' })[0]!);
+
+    // The confirm spells out that billing records survive.
+    expect(
+      await screen.findByText(
+        'Delete worker "runner-sharing"? Billing records are kept, but it disappears from the list and can no longer connect.',
+      ),
+    ).toBeInTheDocument();
+
+    const confirmButtons = screen.getAllByRole('button', { name: 'Delete' });
+    fireEvent.click(confirmButtons[confirmButtons.length - 1]!);
+
+    await waitFor(() => {
+      expect(
+        fetchMock.mock.calls.some(
+          ([input, init]) =>
+            (typeof input === 'string' ? input : String(input)) === `/api/workers/${BASE_WORKER.id}` &&
+            (init as RequestInit | undefined)?.method === 'DELETE',
+        ),
+      ).toBe(true);
+    });
+
+    await waitFor(() => expect(screen.queryByText('runner-sharing')).not.toBeInTheDocument());
+    expect(screen.getByText('runner-quiet')).toBeInTheDocument();
+  });
+
+  it('does not call DELETE when the confirm is cancelled', async () => {
+    const fetchMock = stubFetchWithDelete([BASE_WORKER]);
+    renderWorkers();
+
+    expect(await screen.findByText('runner-sharing')).toBeInTheDocument();
+    fireEvent.click(screen.getAllByRole('button', { name: 'Delete' })[0]!);
+    fireEvent.click(await screen.findByRole('button', { name: 'Cancel' }));
+
+    expect(
+      fetchMock.mock.calls.some(([, init]) => (init as RequestInit | undefined)?.method === 'DELETE'),
+    ).toBe(false);
+    expect(screen.getByText('runner-sharing')).toBeInTheDocument();
   });
 });

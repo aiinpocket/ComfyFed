@@ -25,6 +25,7 @@ import {
   IconDownload,
   IconPlus,
   IconServerOff,
+  IconTrash,
   IconX,
 } from '@tabler/icons-react';
 import { useCallback, useState, useEffect } from 'react';
@@ -93,6 +94,42 @@ export function Workers() {
     }
   };
 
+  // Soft delete: the row disappears from this list for good (and the worker
+  // can never reconnect), but its receipts stay in the billing reports --
+  // hence a separate confirm from `disable`, spelling that out. The whole
+  // page is admin-only at the route level (see App.tsx), so no extra role
+  // gate is needed on the action itself.
+  const [deleteTarget, setDeleteTarget] = useState<Worker | null>(null);
+  const [deleting, setDeleting] = useState(false);
+
+  const remove = async () => {
+    if (!deleteTarget) return;
+    setDeleting(true);
+    try {
+      await api.deleteWorker(deleteTarget.id);
+      notifications.show({
+        color: 'teal',
+        icon: <IconCheck size={16} />,
+        title: t('workers.deleted_title'),
+        message: t('workers.deleted_message', { name: deleteTarget.name }),
+      });
+      setDeleteTarget(null);
+      await refresh();
+    } catch (caught) {
+      notifications.show({
+        color: 'red',
+        icon: <IconX size={16} />,
+        title: t('workers.delete_failed'),
+        message:
+          caught instanceof ApiError
+            ? t(`errors.${caught.code}`, { defaultValue: caught.message })
+            : t('errors.network'),
+      });
+    } finally {
+      setDeleting(false);
+    }
+  };
+
   return (
     <Stack gap="lg">
       <SectionHeader
@@ -155,7 +192,8 @@ export function Workers() {
                   <Table.Th>{t('workers.col_backend')}</Table.Th>
                   <Table.Th>{t('workers.col_models')}</Table.Th>
                   <Table.Th>{t('workers.col_last_seen')}</Table.Th>
-                  <Table.Th w={110} />
+                  {/* Wide enough for the disable + delete pair. */}
+                  <Table.Th w={210} />
                 </Table.Tr>
               </Table.Thead>
               <Table.Tbody>
@@ -225,17 +263,28 @@ export function Workers() {
                       </Text>
                     </Table.Td>
                     <Table.Td>
-                      {!worker.disabled && (
+                      <Group gap={4} wrap="nowrap" justify="flex-end">
+                        {!worker.disabled && (
+                          <Button
+                            size="compact-sm"
+                            variant="subtle"
+                            color="red"
+                            leftSection={<IconBan size={14} />}
+                            onClick={() => setConfirmTarget(worker)}
+                          >
+                            {t('workers.disable')}
+                          </Button>
+                        )}
                         <Button
                           size="compact-sm"
                           variant="subtle"
                           color="red"
-                          leftSection={<IconBan size={14} />}
-                          onClick={() => setConfirmTarget(worker)}
+                          leftSection={<IconTrash size={14} />}
+                          onClick={() => setDeleteTarget(worker)}
                         >
-                          {t('workers.disable')}
+                          {t('workers.delete')}
                         </Button>
-                      )}
+                      </Group>
                     </Table.Td>
                   </Table.Tr>
                 ))}
@@ -264,6 +313,25 @@ export function Workers() {
             </Button>
             <Button color="red" onClick={disable} loading={disabling}>
               {t('workers.disable')}
+            </Button>
+          </Group>
+        </Stack>
+      </Modal>
+
+      <Modal
+        opened={deleteTarget !== null}
+        onClose={() => setDeleteTarget(null)}
+        title={t('workers.delete_confirm_title')}
+        size="sm"
+      >
+        <Stack gap="md">
+          <Text size="sm">{t('workers.delete_confirm', { name: deleteTarget?.name ?? '' })}</Text>
+          <Group justify="flex-end" gap="sm">
+            <Button variant="default" onClick={() => setDeleteTarget(null)}>
+              {t('common.cancel')}
+            </Button>
+            <Button color="red" onClick={remove} loading={deleting}>
+              {t('workers.delete')}
             </Button>
           </Group>
         </Stack>

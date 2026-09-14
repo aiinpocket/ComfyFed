@@ -69,7 +69,7 @@ async function parseError(response: Response): Promise<ApiError> {
   return new ApiError(code, message, response.status);
 }
 
-type Method = 'GET' | 'POST' | 'PATCH';
+type Method = 'GET' | 'POST' | 'PATCH' | 'DELETE';
 
 async function request<T>(
   method: Method,
@@ -121,6 +121,12 @@ function patchJson<T>(path: string, payload: unknown): Promise<T> {
   return request<T>('PATCH', path, JSON.stringify(payload ?? {}), {
     'Content-Type': 'application/json',
   });
+}
+
+/** No body at all -- the server's DELETE routes take everything from the
+ * path, and `request` still attaches the X-CSRF header (non-GET). */
+function deleteJson<T>(path: string): Promise<T> {
+  return request<T>('DELETE', path);
 }
 
 /* ------------------------------------------------------------------ types */
@@ -412,6 +418,13 @@ export const api = {
 
   disableWorker(workerId: string): Promise<{ ok: boolean }> {
     return postJson(`/api/workers/${encodeURIComponent(workerId)}/disable`, {});
+  },
+
+  /** Admin soft delete: the worker disappears from this list and can never
+   * reconnect, but its billing records stay resolvable. 404 for an unknown
+   * or already-deleted worker. */
+  deleteWorker(workerId: string): Promise<{ ok: boolean }> {
+    return deleteJson(`/api/workers/${encodeURIComponent(workerId)}`);
   },
 
   listJobs(statuses?: string[]): Promise<Job[]> {
