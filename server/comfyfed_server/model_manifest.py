@@ -45,6 +45,7 @@ which names are excluded.
 
 from __future__ import annotations
 
+import json
 import logging
 from datetime import datetime, timezone
 
@@ -59,8 +60,15 @@ def _utcnow() -> datetime:
     return datetime.now(timezone.utc).replace(tzinfo=None)
 
 
-def record_hash(worker_id: str, name: str, size_bytes: int, sha256: str) -> None:
-    """Learn one inventory entry's sha256 for (name, size_bytes).
+def record_hash(
+    worker_id: str,
+    name: str,
+    size_bytes: int,
+    sha256: str,
+    chunk_sha256s: list[str] | None = None,
+) -> None:
+    """Learn one inventory entry's sha256 for (name, size_bytes), and (Phase
+    3.1 addendum) its per-64-MiB-chunk hash list alongside it.
 
     `size_bytes` must be the EXACT byte count (an agent's `os.stat().
     st_size`, per `hardware.scan_models`'s `size_bytes` field) -- this is
@@ -78,7 +86,22 @@ def record_hash(worker_id: str, name: str, size_bytes: int, sha256: str) -> None
     True so `entries()` excludes it. Persistent, not in-memory: unlike the
     old per-process poisoned-name set, this survives a restart and is
     visible to every replica immediately (see this module's docstring).
+
+    `chunk_sha256s` (Phase 3.1 addendum, `db.ModelHash.chunk_sha256s`):
+    stored (as JSON text) the FIRST time a reporter's whole-file hash
+    matches/establishes consensus for (name, size_bytes) and no chunk list
+    is on the row yet. Once a chunk list is stored it is never overwritten
+    by a later, different one -- the whole-file hash is the sole trust
+    root (final whole-file verification always runs on every P2P download
+    regardless of chunk hashes), so a second reporter's differing chunk
+    list is merely suspicious, not a poisoning event: logged once at
+    WARNING and otherwise ignored, WITHOUT touching `conflict` (that stays
+    reserved for a genuine whole-file sha256 disagreement). A report that
+    disagrees on the whole-file hash never contributes its chunk list
+    either -- see the conflict branch below.
     """
+    chunk_json = json.dumps(chunk_sha256s) if chunk_sha256s else None
+
     with db.get_session() as session:
         existing = session.get(db.ModelHash, (name, size_bytes))
         if existing is None:
@@ -89,12 +112,29 @@ def record_hash(worker_id: str, name: str, size_bytes: int, sha256: str) -> None
                     sha256=sha256,
                     first_worker_id=worker_id,
                     created_at=_utcnow(),
+                    chunk_sha256s=chunk_json,
                 )
             )
             session.commit()
             return
 
         if existing.sha256 == sha256:
+            if chunk_json is not None:
+                if existing.chunk_sha256s is None:
+                    existing.chunk_sha256s = chunk_json
+                    session.commit()
+                elif existing.chunk_sha256s != chunk_json:
+                    logger.warning(
+                        "model_manifest: chunk_sha256s mismatch for %s "
+                        "(size_bytes=%s) reported by worker %s -- whole-file "
+                        "sha256 still agrees, so this is not a conflict; "
+                        "keeping the first-seen chunk list (final whole-file "
+                        "verification is the trust root regardless of any "
+                        "chunk list)",
+                        name,
+                        size_bytes,
+                        worker_id,
+                    )
             return
 
         logger.warning(

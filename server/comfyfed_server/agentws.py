@@ -883,7 +883,15 @@ def _record_model_hashes(worker_id: str, models: list) -> None:
             # size_bytes: reconstruct from the rounded GB figure.
             exact_size_bytes = round(size * (1024 ** 3))
 
-        model_manifest.record_hash(worker_id, name, exact_size_bytes, sha256)
+        chunk_sha256s = entry.get("chunk_sha256s")
+        if not (
+            isinstance(chunk_sha256s, list)
+            and chunk_sha256s
+            and all(isinstance(c, str) and c for c in chunk_sha256s)
+        ):
+            chunk_sha256s = None
+
+        model_manifest.record_hash(worker_id, name, exact_size_bytes, sha256, chunk_sha256s)
 
 
 def _sign_and_store_receipt(
