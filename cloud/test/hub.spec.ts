@@ -1,6 +1,6 @@
 import { afterEach, describe, expect, it } from "vitest";
 import { env, runDurableObjectAlarm } from "cloudflare:test";
-import { toSqliteTimestamp, getJobById, getReceiptsForJob } from "../src/db/queries";
+import { toSqliteTimestamp, getJobById, getReceiptsForJob, getWorkerById } from "../src/db/queries";
 import { signHex } from "../src/lib/ed25519";
 import { connectAgent, expectNoMessage, hub, nextMessage, openAgentWs, waitForClose } from "./helpers/ws";
 import golden from "./fixtures/golden.json";
@@ -319,6 +319,24 @@ describe("heartbeat job_cancelled dedup", () => {
 });
 
 // ---------------------------------------------------------------------------
+// heartbeat: paused state
+
+describe("heartbeat paused", () => {
+  it("sets worker status to paused", async () => {
+    const kp = KEYPAIRS[0]!;
+    const workerId = await makeWorker({ pubkeyHex: kp.pubkey_hex });
+    const ws = await connectAgent(workerId, kp.seed_hex);
+
+    ws.send(JSON.stringify({ type: "heartbeat", state: "paused" }));
+    await new Promise((r) => setTimeout(r, 50)); // let the heartbeat land.
+
+    const worker = await getWorkerById(db(), workerId);
+    expect(worker!.status).toBe("paused");
+    ws.close();
+  });
+});
+
+// ---------------------------------------------------------------------------
 // job_done -> receipt -> receipt_ack roundtrip
 
 describe("job_done", () => {
@@ -493,6 +511,35 @@ describe("dispatch alarm", () => {
 
     const job = await getJobById(db(), jobId);
     expect(job!.status).toBe("queued");
+    ws.close();
+  });
+
+  it("does not assign to a paused worker, but does after a subsequent idle heartbeat", async () => {
+    const kp = KEYPAIRS[0]!;
+    const workerId = await makeWorker({ pubkeyHex: kp.pubkey_hex });
+    const ws = await connectAgent(workerId, kp.seed_hex);
+    ws.send(JSON.stringify({ type: "heartbeat", state: "paused" }));
+    await new Promise((r) => setTimeout(r, 50)); // let the heartbeat land before the alarm ticks.
+
+    const jobId = await makeJob({ status: "queued" });
+    await runDurableObjectAlarm(hub());
+
+    let job = await getJobById(db(), jobId);
+    expect(job!.status).toBe("queued");
+
+    const pushedPromise = nextMessage(ws);
+    ws.send(JSON.stringify({ type: "heartbeat", state: "idle" }));
+    await new Promise((r) => setTimeout(r, 50)); // let the idle heartbeat land before the alarm ticks.
+    const ran = await runDurableObjectAlarm(hub());
+    expect(ran).toBe(true);
+
+    const pushed = await pushedPromise;
+    expect(pushed.type).toBe("job");
+    expect(pushed.job_id).toBe(jobId);
+
+    job = await getJobById(db(), jobId);
+    expect(job!.status).toBe("assigned");
+    expect(job!.workerId).toBe(workerId);
     ws.close();
   });
 });

@@ -144,7 +144,7 @@ interface AgentAttachment {
   /** null only during the handshake phase. */
   workerId: string | null;
   protocol: number;
-  state: "idle" | "busy" | "dispatched";
+  state: "idle" | "busy" | "dispatched" | "paused";
 }
 
 /** A connected panel (ComfyUI-frontend) client -- ports panelws.py's
@@ -871,13 +871,17 @@ export class Hub extends DurableObject<Env> {
     const worker = await queries.getWorkerById(db, workerId);
     if (!worker) return;
 
-    const state = msg.state === "idle" || msg.state === "busy" ? (msg.state as "idle" | "busy") : undefined;
+    const state =
+      msg.state === "idle" || msg.state === "busy" || msg.state === "paused"
+        ? (msg.state as "idle" | "busy" | "paused")
+        : undefined;
     const dynamic =
       typeof msg.dynamic === "object" && msg.dynamic !== null && !Array.isArray(msg.dynamic)
         ? (msg.dynamic as Record<string, unknown>)
         : {};
     const now = new Date();
-    const newStatus = state === "idle" ? "online" : state === "busy" ? "busy" : worker.status;
+    const newStatus =
+      state === "idle" ? "online" : state === "busy" ? "busy" : state === "paused" ? "paused" : worker.status;
 
     ephemeral.dynamic = dynamic;
     await queries.updateWorkerHeartbeat(db, workerId, { status: newStatus, dynamic, lastSeen: toSqliteTimestamp(now) });
