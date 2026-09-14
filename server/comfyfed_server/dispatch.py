@@ -240,6 +240,12 @@ def requeue_stale(now: datetime) -> list[str]:
                 requeued.append(job.id)
 
             worker.status = "offline"
+            # Phase 3.1 P2P: a seeder endpoint only means anything while the
+            # worker is actually reachable -- clear it here so a stale
+            # worker is never handed out as a grant's seeder (see
+            # agentws._handle_hello, which is the only place peer_url gets
+            # set again, on the agent's next hello).
+            worker.peer_url = None
             metrics.get_metrics().worker_up.labels(worker=worker.name).set(0)
 
         session.commit()

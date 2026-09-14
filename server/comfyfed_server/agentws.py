@@ -8,7 +8,16 @@ connections.
 Agent -> server message contract (all JSON):
 
   {"type": "hello", "hardware": {...}, "backend": str, "torch_version": str,
-   "node_classes": [str]}
+   "node_classes": [str], "protocol": int, "auto_fetch": bool|absent,
+   "peer_url": str|absent}
+      -- `peer_url` (Phase 3.1, protocol 4) is present when the agent has
+         `peer_serve` enabled: its own advertised "http://host:port" P2P
+         serving endpoint. Validated as an http(s) URL with a host (see
+         `_parse_peer_url`); anything else is ignored (logged, not stored).
+         Hello-only, not refreshed on heartbeat -- see `db.Worker.peer_url`.
+         Stored on `Worker.peer_url`, and cleared whenever the worker is
+         marked offline (see `dispatch.requeue_stale`) so a stale seeder
+         endpoint is never handed out.
   {"type": "heartbeat", "state": "idle"|"busy", "progress": float,
    "job_id": str|null, "dynamic": {...}, "object_info_hash": str|null,
    "stage": "fetching_models"|absent, "fetch_pct": float|absent,
@@ -85,6 +94,7 @@ import math
 import os
 import secrets
 from collections import OrderedDict
+from urllib.parse import urlsplit
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from typing import Optional
@@ -608,8 +618,32 @@ def _parse_protocol(message: dict) -> int:
     return protocol
 
 
+def _parse_peer_url(message: dict, worker_id: str) -> Optional[str]:
+    """Validate hello's optional `peer_url` (Phase 3.1 P2P seeder
+    advertisement): must be a string that parses as an http:// or https://
+    URL with a host. Anything else (missing, wrong type, wrong scheme, no
+    host, a bare path) is ignored -- logged, not stored -- so a malformed
+    or hostile value can never end up handed out as a seeder endpoint."""
+    peer_url = message.get("peer_url")
+    if peer_url is None:
+        return None
+    if not isinstance(peer_url, str):
+        logger.warning("agentws: worker %s hello.peer_url not a string, ignoring", worker_id)
+        return None
+    parsed = urlsplit(peer_url)
+    if parsed.scheme not in ("http", "https") or not parsed.hostname:
+        logger.warning(
+            "agentws: worker %s hello.peer_url %r is not a valid http(s) URL, ignoring",
+            worker_id,
+            peer_url,
+        )
+        return None
+    return peer_url
+
+
 async def _handle_hello(worker_id: str, conn: "_Connection", message: dict) -> None:
     protocol = _parse_protocol(message)
+    peer_url = _parse_peer_url(message, worker_id)
     with db.get_session() as session:
         worker = session.get(db.Worker, worker_id)
         if worker is None:
@@ -625,6 +659,11 @@ async def _handle_hello(worker_id: str, conn: "_Connection", message: dict) -> N
         # degrades to False -- an old or malformed hello must never be read
         # as consent to download.
         worker.auto_fetch = message.get("auto_fetch") is True
+        # Phase 3.1 P2P seeder advertisement (protocol 4). Fully replaced
+        # from this hello, same as every other field above -- an agent that
+        # reconnects with `peer_serve` now off (or an old/malformed value)
+        # must not keep a previous session's endpoint alive.
+        worker.peer_url = peer_url
         worker.status = "online"
         worker.last_seen = _utcnow()
         session.commit()

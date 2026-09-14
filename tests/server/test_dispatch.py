@@ -136,7 +136,116 @@ def test_alembic_migration_8_adds_worker_protocol_defaulting_to_1(tmp_path):
     assert "protocol" not in cols_after
 
 
+def test_alembic_migration_e1f2a3b4c5d6_adds_p2p_columns(tmp_path):
+    """Phase 3.1 Task 1: a DB at the previous head (d0e1f2a3b4c5, users/
+    multi-user) must upgrade to head cleanly, gaining
+    model_hashes.chunk_sha256s, receipts.bytes, workers.peer_url (all
+    nullable) and receipts.job_id turning nullable (needed for the
+    job-less p2p_upload receipt kind) -- while pre-existing rows keep
+    their values."""
+    import sqlite3
+    import uuid
+
+    db_path = str(tmp_path / "t.db")
+    cfg = Config()
+    cfg.set_main_option("script_location", db._alembic_dir())
+    cfg.set_main_option("sqlalchemy.url", f"sqlite+pysqlite:///{db_path}")
+
+    command.upgrade(cfg, "d0e1f2a3b4c5")  # pre-existing DB, one migration behind
+
+    conn = sqlite3.connect(db_path)
+    try:
+        conn.execute(
+            "INSERT INTO workers (id, name, pubkey, created_at) VALUES "
+            "('w1', 'w1', 'pk', '2026-01-01 00:00:00')"
+        )
+        conn.execute(
+            "INSERT INTO model_hashes (name, size_bytes, sha256, first_worker_id, "
+            "created_at) VALUES ('m/f.safetensors', 100, 'deadbeef', 'w1', "
+            "'2026-01-01 00:00:00')"
+        )
+        job_id = uuid.uuid4().hex
+        conn.execute(
+            "INSERT INTO jobs (id, workflow_json, status, progress, created_at, "
+            "result_files, requirements, required_nodes, required_models, "
+            "input_assets, result_hashes, origin, panel_hidden) VALUES "
+            "(:id, '{}', 'queued', 0, '2026-01-01 00:00:00', '[]', '{}', '[]', "
+            "'[]', '[]', '{}', 'console', 0)".replace(":id", f"'{job_id}'")
+        )
+        receipt_id = uuid.uuid4().hex
+        conn.execute(
+            "INSERT INTO receipts (id, job_id, worker_id, gpu_seconds, "
+            "platform_sig, created_at) VALUES "
+            f"('{receipt_id}', '{job_id}', 'w1', 1.5, 'sig', '2026-01-01 00:00:00')"
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+    command.upgrade(cfg, "head")
+
+    conn = sqlite3.connect(db_path)
+    try:
+        worker_cols = {row[1]: row for row in conn.execute("PRAGMA table_info(workers)").fetchall()}
+        hash_cols = {row[1]: row for row in conn.execute("PRAGMA table_info(model_hashes)").fetchall()}
+        receipt_cols = {row[1]: row for row in conn.execute("PRAGMA table_info(receipts)").fetchall()}
+
+        peer_url = conn.execute("SELECT peer_url FROM workers WHERE id = 'w1'").fetchone()[0]
+        chunk_sha256s = conn.execute(
+            "SELECT chunk_sha256s FROM model_hashes WHERE name = 'm/f.safetensors'"
+        ).fetchone()[0]
+        receipt_row = conn.execute(
+            "SELECT job_id, bytes, worker_id, gpu_seconds FROM receipts WHERE id = ?", (receipt_id,)
+        ).fetchone()
+
+        # New p2p_upload-style row: no job_id, has bytes -- must be insertable
+        # now that job_id is nullable.
+        conn.execute(
+            "INSERT INTO receipts (id, job_id, worker_id, gpu_seconds, "
+            "platform_sig, created_at, bytes) VALUES "
+            "('r2', NULL, 'w1', 0.0, 'sig', '2026-01-01 00:00:00', 12345)"
+        )
+        conn.commit()
+        bytes_row = conn.execute("SELECT job_id, bytes FROM receipts WHERE id = 'r2'").fetchone()
+    finally:
+        conn.close()
+
+    assert "peer_url" in worker_cols and worker_cols["peer_url"][3] == 0  # nullable
+    assert peer_url is None
+
+    assert "chunk_sha256s" in hash_cols and hash_cols["chunk_sha256s"][3] == 0  # nullable
+    assert chunk_sha256s is None
+
+    assert "bytes" in receipt_cols and receipt_cols["bytes"][3] == 0  # nullable
+    assert receipt_cols["job_id"][3] == 0  # now nullable
+    # pre-existing receipt row untouched
+    assert receipt_row == (job_id, None, "w1", 1.5)
+    # new job-less p2p_upload-shaped row went in fine
+    assert bytes_row == (None, 12345)
+
+
 # --- Step 2: requeue_stale records last_worker_id ------------------------
+
+
+def test_requeue_stale_clears_peer_url(_db):
+    """Phase 3.1 P2P: a worker's advertised seeder endpoint is only good
+    while it's actually reachable. requeue_stale is the one place that
+    flips a worker to offline (see its docstring), so it must clear
+    peer_url there -- otherwise a dead endpoint could be handed out as a
+    grant's seeder."""
+    worker_id = _make_worker()
+    with db.get_session() as session:
+        worker = session.get(db.Worker, worker_id)
+        worker.last_seen = _utcnow() - timedelta(seconds=200)
+        worker.peer_url = "http://192.168.1.5:8850"
+        session.commit()
+
+    dispatch.requeue_stale(_utcnow())
+
+    with db.get_session() as session:
+        worker = session.get(db.Worker, worker_id)
+        assert worker.status == "offline"
+        assert worker.peer_url is None
 
 
 def test_requeue_stale_records_last_worker_id_and_clears_worker_id(_db):

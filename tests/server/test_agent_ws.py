@@ -2165,6 +2165,169 @@ def test_hello_without_auto_fetch_field_defaults_to_false(client):
         ws.close()
 
 
+def test_hello_with_protocol_4_is_accepted_with_no_deprecation_frame(client):
+    """Phase 3.1: protocol 4 (chunk-hash fields + peer_url) is a new agent,
+    not an old one -- it must be recorded plainly and never earn the
+    protocol-too-old deprecation frame."""
+    csrf = _login(client)
+    worker_id, sk = _register_worker(client, csrf, "w1")
+    job_id = _submit(client, csrf)
+
+    ws = _connect(client, worker_id, sk)
+    try:
+        ws.send_json(
+            {
+                "type": "hello",
+                "hardware": {"cpu": "x"},
+                "backend": "cuda",
+                "torch_version": "2.0",
+                "node_classes": [],
+                "protocol": 4,
+            }
+        )
+        ws.send_json({"type": "heartbeat", "state": "idle", "progress": 0.0, "job_id": None, "dynamic": {}})
+        agentws.dispatch_once(worker_id)
+
+        # First frame is the job push, not a deprecation notice.
+        job_msg = ws.receive_json()
+        assert job_msg["type"] == "job"
+        assert job_msg["job_id"] == job_id
+
+        with db.get_session() as session:
+            worker = session.get(db.Worker, worker_id)
+            assert worker.protocol == 4
+    finally:
+        ws.close()
+
+
+def test_hello_stores_valid_peer_url(client):
+    """Phase 3.1 P2P: a protocol-4 agent with peer_serve enabled advertises
+    its seeder endpoint in hello.peer_url; it must land on Worker.peer_url
+    verbatim."""
+    csrf = _login(client)
+    worker_id, sk = _register_worker(client, csrf, "w1")
+
+    ws = _connect(client, worker_id, sk)
+    try:
+        ws.send_json(
+            {
+                "type": "hello",
+                "hardware": {"cpu": "x"},
+                "backend": "cuda",
+                "torch_version": "2.0",
+                "node_classes": [],
+                "protocol": 4,
+                "peer_url": "http://192.168.1.5:8850",
+            }
+        )
+        agentws.dispatch_once(worker_id)
+
+        with db.get_session() as session:
+            worker = session.get(db.Worker, worker_id)
+            assert worker.peer_url == "http://192.168.1.5:8850"
+    finally:
+        ws.close()
+
+
+def test_hello_without_peer_url_leaves_it_none(client):
+    csrf = _login(client)
+    worker_id, sk = _register_worker(client, csrf, "w1")
+
+    ws = _connect(client, worker_id, sk)
+    try:
+        ws.send_json(
+            {
+                "type": "hello",
+                "hardware": {"cpu": "x"},
+                "backend": "cuda",
+                "torch_version": "2.0",
+                "node_classes": [],
+                "protocol": 4,
+            }
+        )
+        agentws.dispatch_once(worker_id)
+
+        with db.get_session() as session:
+            worker = session.get(db.Worker, worker_id)
+            assert worker.peer_url is None
+    finally:
+        ws.close()
+
+
+@pytest.mark.parametrize(
+    "bad_peer_url",
+    [
+        "not-a-url",
+        "ftp://192.168.1.5:8850",
+        "http://",
+        "javascript:alert(1)",
+        123,
+    ],
+)
+def test_hello_with_invalid_peer_url_is_ignored_and_logged(client, caplog, bad_peer_url):
+    """An invalid peer_url (bad scheme, no host, wrong type) must never be
+    stored -- it's ignored with a log line, not silently coerced or crashed
+    on."""
+    csrf = _login(client)
+    worker_id, sk = _register_worker(client, csrf, "w1")
+
+    ws = _connect(client, worker_id, sk)
+    try:
+        with caplog.at_level(logging.WARNING):
+            ws.send_json(
+                {
+                    "type": "hello",
+                    "hardware": {"cpu": "x"},
+                    "backend": "cuda",
+                    "torch_version": "2.0",
+                    "node_classes": [],
+                    "protocol": 4,
+                    "peer_url": bad_peer_url,
+                }
+            )
+            agentws.dispatch_once(worker_id)
+
+        with db.get_session() as session:
+            worker = session.get(db.Worker, worker_id)
+            assert worker.peer_url is None
+        assert any("peer_url" in rec.message for rec in caplog.records)
+    finally:
+        ws.close()
+
+
+def test_hello_replaces_stale_peer_url_when_no_longer_advertised(client):
+    """peer_url is fully replaced from each hello, same as the other hello
+    fields -- an agent that reconnects with peer_serve now off must not
+    keep a previous session's endpoint alive."""
+    csrf = _login(client)
+    worker_id, sk = _register_worker(client, csrf, "w1")
+
+    with db.get_session() as session:
+        worker = session.get(db.Worker, worker_id)
+        worker.peer_url = "http://old-host:8850"
+        session.commit()
+
+    ws = _connect(client, worker_id, sk)
+    try:
+        ws.send_json(
+            {
+                "type": "hello",
+                "hardware": {"cpu": "x"},
+                "backend": "cuda",
+                "torch_version": "2.0",
+                "node_classes": [],
+                "protocol": 4,
+            }
+        )
+        agentws.dispatch_once(worker_id)
+
+        with db.get_session() as session:
+            worker = session.get(db.Worker, worker_id)
+            assert worker.peer_url is None
+    finally:
+        ws.close()
+
+
 def test_hello_with_protocol_2_sends_no_deprecation_frame(client):
     csrf = _login(client)
     worker_id, sk = _register_worker(client, csrf, "w1")
