@@ -2,9 +2,10 @@
 
 Console `POST /api/jobs` stamps `user_id` on the row it creates; `GET
 /api/jobs` and the per-job routes (`GET /{id}`, `/assessment`,
-`/artifacts/{filename}`, `POST /cancel`) are owner-or-admin scoped -- a
-non-owner non-admin gets 404 (not 403) so job existence isn't leaked. Admin
-sees every job (with a `username` field); a plain user sees only their own.
+`/artifacts/{filename}`, `POST /cancel`, `POST /retry`) are owner-or-admin
+scoped -- a non-owner non-admin gets 404 (not 403) so job existence isn't
+leaked. Admin sees every job (with a `username` field); a plain user sees
+only their own.
 
 `TestClient` shares one cookie jar across the whole test, so unlike the
 console (a real browser per user), acting "as" a different user here means
@@ -304,3 +305,64 @@ def test_submit_job_without_login_is_401(client):
         files=[],
     )
     assert r.status_code == 401
+
+
+def _fail_job(job_id):
+    with db.get_session() as session:
+        job = session.get(db.Job, job_id)
+        job.status = "failed"
+        job.error = "boom"
+        session.commit()
+
+
+def test_owner_can_retry_own_failed_job(client, two_users):
+    """Controller ruling: retry is owner-or-admin, same rule as cancel."""
+    csrf = _login_as(client, ALICE)
+    job_id = _submit(client, csrf).json()["job_id"]
+    _fail_job(job_id)
+
+    r = client.post(f"/api/jobs/{job_id}/retry", headers={"X-CSRF": csrf})
+    assert r.status_code == 200
+    assert r.json() == {"ok": True, "job_id": job_id}
+
+    with db.get_session() as session:
+        job = session.get(db.Job, job_id)
+        assert job.status == "queued"
+        assert job.error is None
+
+
+def test_non_owner_retry_is_404(client, two_users):
+    alice_csrf = _login_as(client, ALICE)
+    job_id = _submit(client, alice_csrf).json()["job_id"]
+    _fail_job(job_id)
+
+    bob_csrf = _login_as(client, BOB)
+    r = client.post(f"/api/jobs/{job_id}/retry", headers={"X-CSRF": bob_csrf})
+    assert r.status_code == 404
+    assert r.json()["error"]["code"] == "jobs.not_found"
+
+    with db.get_session() as session:
+        assert session.get(db.Job, job_id).status == "failed"
+
+
+def test_admin_can_retry_any_failed_job(client, two_users):
+    alice_csrf = _login_as(client, ALICE)
+    job_id = _submit(client, alice_csrf).json()["job_id"]
+    _fail_job(job_id)
+
+    admin_csrf = _login(client)
+    r = client.post(f"/api/jobs/{job_id}/retry", headers={"X-CSRF": admin_csrf})
+    assert r.status_code == 200
+
+    with db.get_session() as session:
+        assert session.get(db.Job, job_id).status == "queued"
+
+
+def test_retry_still_requires_csrf_for_owner(client, two_users):
+    csrf = _login_as(client, ALICE)
+    job_id = _submit(client, csrf).json()["job_id"]
+    _fail_job(job_id)
+
+    r = client.post(f"/api/jobs/{job_id}/retry")
+    assert r.status_code == 403
+    assert r.json()["error"]["code"] == "auth.csrf"

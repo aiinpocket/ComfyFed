@@ -520,8 +520,12 @@ def create_router(data_dir: str) -> APIRouter:
         return {"status": "cancelled"}
 
     @r.post("/api/jobs/{job_id}/retry")
-    def retry_job(job_id: str, _payload: dict = Depends(auth.require_csrf)):
+    def retry_job(job_id: str, user: auth.SessionUser = Depends(auth.require_csrf_user)):
         """Requeue a failed job, clearing the previous attempt's outcome.
+
+        Owner-or-admin, same rule as cancel: a user may retry their own
+        failed job; non-owner non-admin gets 404 (not 403), same
+        existence-hiding reasoning as `_require_owner_or_admin`'s docstring.
 
         Only `failed` jobs are retryable: anything queued/assigned/running is
         still in flight, and re-running a `done` job would orphan its receipt.
@@ -530,6 +534,7 @@ def create_router(data_dir: str) -> APIRouter:
             job = session.get(db.Job, job_id)
             if job is None:
                 raise _error(404, "jobs.not_found", "Job not found.")
+            _require_owner_or_admin(job, user)
             if job.status != "failed":
                 raise _error(409, "jobs.not_retryable", "Only failed jobs can be retried.")
 
