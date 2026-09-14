@@ -288,7 +288,7 @@ function AddWorkerModal({ opened, onClose, onCreated }: AddWorkerModalProps) {
   const [bundle, setBundle] = useState<TokenBundle | null>(null);
 
   const bundleText = bundle ? JSON.stringify(bundle, null, 2) : '';
-  const platformUrl = bundle?.platform_url || window.location.origin;
+  const platformUrl = (bundle?.platform_url || window.location.origin).replace(/\/+$/, '');
 
   const reset = () => {
     setName('');
