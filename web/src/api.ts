@@ -69,7 +69,7 @@ async function parseError(response: Response): Promise<ApiError> {
   return new ApiError(code, message, response.status);
 }
 
-type Method = 'GET' | 'POST';
+type Method = 'GET' | 'POST' | 'PATCH';
 
 async function request<T>(
   method: Method,
@@ -115,6 +115,12 @@ function postJson<T>(path: string, payload: unknown): Promise<T> {
 function postForm<T>(path: string, form: FormData): Promise<T> {
   // No Content-Type header: the browser must set the multipart boundary.
   return request<T>('POST', path, form);
+}
+
+function patchJson<T>(path: string, payload: unknown): Promise<T> {
+  return request<T>('PATCH', path, JSON.stringify(payload ?? {}), {
+    'Content-Type': 'application/json',
+  });
 }
 
 /* ------------------------------------------------------------------ types */
@@ -236,6 +242,24 @@ export interface TokenBundle {
   platform_url: string;
   platform_pubkey: string;
   register_token: string;
+}
+
+/** Row shape for `GET /api/users` (see server/comfyfed_server/users.py's `_user_list_row`). */
+export interface AppUser {
+  id: string;
+  username: string;
+  role: Role;
+  disabled: boolean;
+  created_at: string | null;
+  jobs: number;
+}
+
+/** `POST /api/users` echoes the plaintext password exactly once. */
+export interface CreatedUser {
+  id: string;
+  username: string;
+  role: Role;
+  password: string;
 }
 
 export interface Contribution {
@@ -379,6 +403,23 @@ export const api = {
     if (to) params.set('to', to);
     const query = params.toString();
     return getJson<Contribution[]>(`/api/reports/contributions${query ? `?${query}` : ''}`);
+  },
+
+  async listUsers(): Promise<AppUser[]> {
+    const result = await getJson<{ users: AppUser[] }>('/api/users');
+    return result.users;
+  },
+
+  createUser(username: string, role: Role, password?: string): Promise<CreatedUser> {
+    return postJson<CreatedUser>('/api/users', password ? { username, role, password } : { username, role });
+  },
+
+  resetUserPassword(userId: string): Promise<{ password: string }> {
+    return postJson(`/api/users/${encodeURIComponent(userId)}/reset-password`, {});
+  },
+
+  patchUser(userId: string, update: { role?: Role; disabled?: boolean }): Promise<AppUser> {
+    return patchJson<AppUser>(`/api/users/${encodeURIComponent(userId)}`, update);
   },
 };
 

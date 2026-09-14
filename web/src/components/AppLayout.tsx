@@ -22,6 +22,7 @@ import {
   IconServer2,
   IconSettings,
   IconStack2,
+  IconUsers,
   IconWorldBolt,
 } from '@tabler/icons-react';
 import { useTranslation } from 'react-i18next';
@@ -36,8 +37,8 @@ const APP_VERSION = '0.1.0';
 const NAV_ITEMS = [
   { to: '/dashboard', labelKey: 'nav.dashboard', icon: IconLayoutDashboard, adminOnly: false },
   { to: '/jobs', labelKey: 'nav.jobs', icon: IconStack2, adminOnly: false },
-  // Admin-only. Task 7 adds a Users page here alongside it.
   { to: '/workers', labelKey: 'nav.workers', icon: IconServer2, adminOnly: true },
+  { to: '/users', labelKey: 'nav.users', icon: IconUsers, adminOnly: true },
   { to: '/reports', labelKey: 'nav.reports', icon: IconChartBar, adminOnly: false },
   { to: '/settings', labelKey: 'nav.settings', icon: IconSettings, adminOnly: false },
 ] as const;

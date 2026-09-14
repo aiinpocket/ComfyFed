@@ -13,6 +13,7 @@ import { Login } from './pages/Login';
 import { Reports } from './pages/Reports';
 import { Settings } from './pages/Settings';
 import { Setup } from './pages/Setup';
+import { Users } from './pages/Users';
 import { Workers } from './pages/Workers';
 
 type AuthState = 'checking' | 'authenticated' | 'anonymous' | 'setup_needed';
@@ -142,6 +143,10 @@ export function App() {
         <Route
           path="/workers"
           element={isAdmin ? <Workers /> : <Navigate to="/dashboard" replace />}
+        />
+        <Route
+          path="/users"
+          element={isAdmin ? <Users /> : <Navigate to="/dashboard" replace />}
         />
         <Route path="/reports" element={<Reports />} />
         <Route path="/settings" element={<Settings platformUrl={platformUrl} role={role} />} />
