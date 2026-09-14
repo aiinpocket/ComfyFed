@@ -809,18 +809,23 @@ export async function getOnlineEnabledWorkers(db: D1Database): Promise<Worker[]>
   return results.map(rowToWorker);
 }
 
-/** Phase 3.1 P2P: online (`status != 'offline'`), not-disabled workers at or
- * above `minProtocol` that are advertising a `peer_url` -- the SQL half of
+/** Phase 3.1 P2P: online (`status != 'offline'`) workers at or above
+ * `minProtocol` that are advertising a `peer_url` -- the SQL half of
  * `core/peer.ts`'s `onlineSeeders` predicate (the remaining
  * inventory/consensus-hash check happens in JS since it must inspect each
  * worker's JSON `model_inventory`). `excludeWorkerId`, when given, omits
- * that worker (the requester itself, in grant issuance). */
+ * that worker (the requester itself, in grant issuance).
+ *
+ * Deliberately does NOT filter `disabled`: seeding eligibility is decoupled
+ * from a worker's disabled status (spec: 種子資格與 worker 停用狀態脫鉤 --
+ * disabled means "does not take dispatched jobs", not "stops sharing models
+ * it already holds"). Only a genuinely offline worker can't serve a byte. */
 export async function getOnlinePeerCapableWorkers(
   db: D1Database,
   minProtocol: number,
   excludeWorkerId?: string
 ): Promise<Worker[]> {
-  let sql = "SELECT * FROM workers WHERE disabled = 0 AND status != 'offline' AND protocol >= ? AND peer_url IS NOT NULL";
+  let sql = "SELECT * FROM workers WHERE status != 'offline' AND protocol >= ? AND peer_url IS NOT NULL";
   const binds: unknown[] = [minProtocol];
   if (excludeWorkerId !== undefined) {
     sql += " AND id != ?";

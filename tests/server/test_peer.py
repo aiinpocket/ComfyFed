@@ -203,11 +203,10 @@ def test_online_seeders_excludes_conflicted_hash(client):
         assert peer.online_seeders(session, "checkpoints/model.safetensors", _bytes(1.0)) == []
 
 
-def test_online_seeders_excludes_offline_disabled_low_protocol_and_no_peer_url(client):
+def test_online_seeders_excludes_offline_low_protocol_and_no_peer_url(client):
     csrf = _login(client)
     sha = _sha("model")
     _make_online_seeder(client, csrf, "s-offline", sha256=sha, status="offline")
-    _make_online_seeder(client, csrf, "s-disabled", sha256=sha, disabled=True)
     _make_online_seeder(client, csrf, "s-old-protocol", sha256=sha, protocol=3)
     _make_online_seeder(client, csrf, "s-no-peer-url", sha256=sha, peer_url=None)
     good_id, _ = _make_online_seeder(client, csrf, "s-good", sha256=sha)
@@ -215,6 +214,32 @@ def test_online_seeders_excludes_offline_disabled_low_protocol_and_no_peer_url(c
     with db.get_session() as session:
         seeders = peer.online_seeders(session, "checkpoints/model.safetensors", _bytes(1.0))
     assert [w.id for w in seeders] == [good_id]
+
+
+def test_online_seeders_includes_disabled_but_online_worker(client):
+    """Spec: 種子資格與 worker 停用狀態脫鉤 -- disabling a worker (parking it from
+    job dispatch) must NOT stop it from seeding models it already holds."""
+    csrf = _login(client)
+    sha = _sha("model")
+    disabled_id, _ = _make_online_seeder(client, csrf, "s-disabled", sha256=sha, disabled=True)
+
+    with db.get_session() as session:
+        seeders = peer.online_seeders(session, "checkpoints/model.safetensors", _bytes(1.0))
+    assert [w.id for w in seeders] == [disabled_id]
+
+
+def test_peer_grant_issues_to_a_disabled_but_connected_seeder(client):
+    csrf = _login(client)
+    sha = _sha("model")
+    seeder_id, _ = _make_online_seeder(client, csrf, "seeder", sha256=sha, disabled=True)
+    puller_id, puller_sk = _register_worker(client, csrf, "puller")
+
+    r = _agent_post(
+        client, puller_id, puller_sk, "/api/agent/peer-grant",
+        {"name": "checkpoints/model.safetensors", "size_bytes": _bytes(1.0)},
+    )
+    assert r.status_code == 200
+    assert r.json()["grant"]["seeder_id"] == seeder_id
 
 
 def test_online_seeders_excludes_worker_with_wrong_size_or_hash(client):

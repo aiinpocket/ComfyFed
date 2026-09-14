@@ -170,10 +170,14 @@ def online_seeders(session, name: str, size_bytes: int, *, exclude_worker_id: Op
     reported hash, if either, is genuine, so it can't hand out a grant that
     claims an authoritative `sha256`.
 
-    "Online" mirrors `assess._online_enabled_workers`'s definition (`status
-    != "offline"`, `disabled == False`) -- a disabled worker's peer-serving is
-    independent of dispatch eligibility per spec (worker sovereignty), but a
-    genuinely offline one obviously can't serve a byte.
+    "Online" mirrors `assess._online_enabled_workers`'s definition EXCEPT
+    `disabled`: seeding eligibility is deliberately decoupled from a worker's
+    disabled status (spec: 種子資格與 worker 停用狀態脫鉤 -- disabled means "does
+    not take dispatched jobs", not "stops sharing models it already holds";
+    a worker can be parked from job dispatch with `disabled=true` while
+    remaining a seeder, and separately turn off peer-serving entirely with
+    its own `peer_serve=false`). Only a genuinely offline worker can't serve
+    a byte, so `status != "offline"` is the only liveness predicate here.
     """
     hash_row = session.get(db.ModelHash, (name, size_bytes))
     if hash_row is None or hash_row.conflict:
@@ -181,7 +185,6 @@ def online_seeders(session, name: str, size_bytes: int, *, exclude_worker_id: Op
 
     query = (
         session.query(db.Worker)
-        .filter(db.Worker.disabled == False)  # noqa: E712
         .filter(db.Worker.status != "offline")
         .filter(db.Worker.protocol >= _MIN_PEER_PROTOCOL)
         .filter(db.Worker.peer_url.isnot(None))

@@ -221,6 +221,21 @@ describe("POST /api/agent/peer-grant", () => {
     expect(r.body.error.code).toBe("peer.no_seeder");
   });
 
+  it("issues a grant to a disabled-but-online seeder (seeding is decoupled from disabled)", async () => {
+    const seeder = await registerWorker("seeder", 0);
+    const puller = await registerWorker("puller", 0);
+    const sha = await shaHex("model-a");
+    const sizeBytes = bytesFor(1.0);
+    await modelManifest.recordHash(db(), seeder.workerId, "loras/a.safetensors", sizeBytes, sha);
+    await makeSeeder(seeder, [{ name: "loras/a.safetensors", size_bytes: sizeBytes, sha256: sha }], {
+      disabled: true,
+    });
+
+    const r = await signedPost(puller, "/api/agent/peer-grant", { name: "loras/a.safetensors", size_bytes: sizeBytes });
+    expect(r.status).toBe(200);
+    expect(r.body.grant.seeder_id).toBe(seeder.workerId);
+  });
+
   it("400s peer.invalid_field when name contains the '|' payload delimiter", async () => {
     const puller = await registerWorker("puller", 0);
     const seeder = await registerWorker("seeder", 1);
