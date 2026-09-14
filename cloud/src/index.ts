@@ -133,6 +133,22 @@ app.route("/", usersRoutes);
 app.route("/", peerRoutes);
 app.route("/", installerRoutes);
 
+// Any `/comfy/api/*` path no route above claimed is an API endpoint this
+// Worker does not implement -- it must 404 as JSON, NEVER fall through to
+// the SPA asset fallback below. Live-caught: the panel called
+// `/comfy/api/experiment/models`, the asset binding's SPA fallback answered
+// 200 + index.html, and the frontend's `.json()` blew up with a red
+// "Unexpected token '<'" toast on every page load. A JSON 404 is what the
+// pinned frontend expects from an unsupported optional endpoint (it probes
+// several and degrades quietly); the Python stack already behaves this way
+// via FastAPI's default 404.
+app.all("/comfy/api/*", (c) =>
+  c.json(
+    { error: "not_found", message: "此端點不存在 / no such endpoint" },
+    404
+  )
+);
+
 // Anything under `/comfy/*` not claimed by a route above (the panel's own
 // `index.html`, its JS/CSS/font/image bundle) has already passed
 // `comfySessionGate` by the time it gets here -- serve it straight from the

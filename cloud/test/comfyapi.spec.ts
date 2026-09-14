@@ -1065,3 +1065,29 @@ describe("Phase 3.0: panel per-user scoping", () => {
     expect(row.user_id).toBe(aliceRow!.id);
   });
 });
+
+// ---------------------------------------------------------------------------
+// Unimplemented /comfy/api/* endpoints must 404 as JSON, never fall through
+// to the SPA asset fallback (live-caught: `experiment/models` came back as
+// 200 + index.html and the panel's .json() threw a red toast on every load).
+
+describe("unmatched /comfy/api/* routes", () => {
+  it("returns JSON 404, not the SPA's index.html", async () => {
+    const admin = await loginSession();
+    for (const path of ["/comfy/api/experiment/models", "/comfy/api/definitely/not/a/route"]) {
+      const res = await call(path, { method: "GET", cookie: admin.cookie });
+      expect(res.status).toBe(404);
+      // Parsed body with our error shape proves JSON came back, not the
+      // SPA's index.html (which would fail call()'s JSON parse or carry no
+      // `error` field).
+      expect(res.body.error).toBe("not_found");
+    }
+  });
+
+  it("leaves real comfy api routes and the SPA page itself untouched", async () => {
+    const admin = await loginSession();
+    const real = await call("/comfy/api/embeddings", { method: "GET", cookie: admin.cookie });
+    expect(real.status).toBe(200);
+    expect(real.body).toEqual([]);
+  });
+});
