@@ -130,6 +130,27 @@ describe("POST /api/auth/login", () => {
     expect(unknown.body.error.code).toBe(wrongPassword.body.error.code);
   });
 
+  it("422s with the server's validation_error shape when username is missing (final review finding #9)", async () => {
+    await setup();
+    const r = await call("/api/auth/login", { json: { password: ADMIN_PASSWORD } });
+    expect(r.status).toBe(422);
+    expect(r.body.error.code).toBe("validation_error");
+  });
+
+  it("422s with the server's validation_error shape when password is missing (symmetric with username)", async () => {
+    await setup();
+    const r = await call("/api/auth/login", { json: { username: "admin" } });
+    expect(r.status).toBe(422);
+    expect(r.body.error.code).toBe("validation_error");
+  });
+
+  it("422s when the body has neither field at all", async () => {
+    await setup();
+    const r = await call("/api/auth/login", { json: {} });
+    expect(r.status).toBe(422);
+    expect(r.body.error.code).toBe("validation_error");
+  });
+
   it("normalizes username casing/whitespace (login is case-insensitive, matching creation)", async () => {
     await setup();
     const r = await call("/api/auth/login", { json: { username: "  ADMIN  ", password: ADMIN_PASSWORD } });

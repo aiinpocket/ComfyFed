@@ -120,6 +120,16 @@ describe("POST /api/users", () => {
     expect(login.status).toBe(200);
   });
 
+  it("rejects a too-short explicit password (final review finding #8)", async () => {
+    const admin = await adminSession();
+    const r = await createUser(admin, { username: "shortpw", role: "user", password: "a" });
+    expect(r.status).toBe(400);
+    expect(r.body.error.code).toBe("auth.password_too_short");
+
+    const login = await call("/api/auth/login", { json: { username: "shortpw", password: "a" } });
+    expect(login.status).toBe(401);
+  });
+
   it("generates a random one-time password when none is given, returned only in this response", async () => {
     const admin = await adminSession();
     const r = await createUser(admin, { username: "carol", role: "admin" });
