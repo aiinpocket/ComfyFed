@@ -245,3 +245,28 @@ Decisions of record:
 - 送單放行：缺模型 400（`prompt.missing_models`）僅對「manifest 不可取得」的模型觸發——curated 模型即使零持有者也能排隊，由 `eligible_after_fetch` 既有機制（auto_fetch＋磁碟 1.2×＋protocol 門檻）挑 worker 下載（來源順序不變：P2P（此情境無種子）→官方→GCS）。下載完成即回報（既有）。
 - 挑 worker 準則誠實聲明：磁碟餘裕與最小下載量（既有 tier-2）；**頻寬不量測**（未實作的不寫進文件）。
 - 雲端對等（model_guide.ts 鏡像同值）；文件更新（SELF-HOSTING 缺模型章節truth-update）。
+
+---
+
+## 一行安裝指令 addendum（2026-09-14）
+
+User directive: 連三行指令都不要——像 Claude Code 那樣，每個 OS 一行複製貼上就裝完（Windows `irm <url> | iex`、Linux/macOS `curl -fsSL <url> | bash`）；從 Python 開始缺什麼裝什麼，**沒有 ComfyUI 就連 ComfyUI 一起裝**；裝完設成開機自動啟動、整組在背景執行。
+
+Decisions of record:
+
+### 端點（server＋cloud 對等）
+- `GET /install.ps1`、`GET /install.sh`、`GET /install.cmd`（cmd 只是一行轉呼叫 ps1）——公開供檔，回應時做模板替換：`{{PLATFORM_URL}}`（自 settings）與 `{{REGISTER_TOKEN}}`（來自 `?token=` 查詢參數；未帶 token 則替換為空字串，腳本裝完印「請到主控台發 bundle 再執行 register」指引）。
+- 新公開端點 `GET /api/platform` → `{platform_url, platform_pubkey}`（pubkey 本就隨每個 bundle 發放，非機密；腳本用它＋token 自行組出 bundle.json——一行指令裡只需要 token）。
+- Console「新增 Worker」對話框：產 token 後直接顯示三条一行指令（Windows PS／Windows cmd／Linux+macOS）附複製按鈕；bundle.json 下載保留為手動備援。
+- 腳本單一源頭：`server/comfyfed_server/installers/`（package data，FastAPI 直接讀）；cloud 由 build.mjs 複製進 assets `install-templates/`，Worker 執行期以 ASSETS binding 讀入後替換模板供檔；vitest globalSetup 從單一源頭複製到測試 fixtures（不二源維護）。
+
+### 安裝腳本行為（install.ps1／install.sh 同語意）
+1. **Python**：找 `python3.12`／`python3`／`python`（≥3.10 即收）；缺→Windows 由 python.org 官方安裝器 3.12 靜默安裝（`/quiet InstallAllUsers=0 PrependPath=1`）；Linux 依發行版 apt/dnf 裝 `python3-venv python3-pip`（需 sudo 時明說）；macOS 引導 `xcode-select`/python.org pkg 靜默安裝。
+2. **Agent**：`%LOCALAPPDATA%\ComfyFed`（Win）／`~/.comfyfed/app`（*nix）建 venv → 從平台下載 wheel（URL 與 **sha256 由 `/api/agent/version` 取得並驗證**）→ pip 安裝。
+3. **註冊**：有 token → 以 `/api/platform` ＋ token 組 bundle.json → `comfyfed-agent register`（自動偵測 ComfyUI 已在 0.1.1 的 register 裡）。無 token → 跳過並印指引。
+4. **ComfyUI**：register 的偵測找不到本機 ComfyUI 時（腳本以 `/system_stats` 指紋自行複核）→ 自動安裝 **v0.35.0（釘死）**：Windows 下載官方 portable 7z（GPU 偵測：NVIDIA→nvidia、AMD→amd、其餘→nvidia 包跑 `--cpu`；py7zr 解壓——7z 無內建解法，venv 內 pip 裝 py7zr）；Linux/macOS `git clone --branch v0.35.0` ＋ 專屬 venv ＋ torch（nvidia-smi→cu126 index、mac→預設 MPS、否則 cpu index）＋ requirements.txt。裝在 agent 同層 `ComfyUI/` 下；裝完啟動並等 `/system_stats` 就緒，再跑一次 agent 偵測把設定補齊。**第三方軟體（Python/ComfyUI/torch）信任錨＝官方 HTTPS 來源與套件管理器**（與 pip 生態一致）；**我方 wheel 必驗 sha256**。可用環境變數覆寫 portable URL／版本（測試與離線鏡像用）。
+5. **開機自啟＋背景**：產 launcher（先起 ComfyUI——僅當由本安裝器管理——等就緒再起 agent，全程隱藏視窗/背景）；Windows 註冊 Scheduled Task（ONLOGON）並立即啟動；Linux systemd --user service `enable --now`（提示 linger）；macOS launchd LaunchAgent。解除安裝說明寫進文件。
+6. **冪等**：重跑安全（已裝→升級 wheel、修復 task/service；不重灌 ComfyUI）。失敗訊息雙語、明確指出卡在哪一步與手動替代。
+
+### 文件
+- SELF-HOSTING zh/en「新增 worker」改為一行指令為主、三行流程降級為手動備援；README 面向一般人補一句「複製一行指令就能把電腦變成算力成員」。

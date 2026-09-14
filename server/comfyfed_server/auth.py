@@ -445,9 +445,18 @@ def update_settings(
 
     if body.platform_url is not None:
         url = body.platform_url.strip()
-        if url and not (url.startswith("http://") or url.startswith("https://")):
+        # Same strict shape the installer endpoints enforce at read time
+        # (installer_routes._PLATFORM_URL_RE): a URL that passes here but
+        # fails there would 500 every /install.* and /api/platform request,
+        # discoverable only when a worker tries to install. Reject it now,
+        # while the admin is looking at the settings form.
+        from . import installer_routes
+
+        if url and not installer_routes.PLATFORM_URL_RE.fullmatch(url):
             raise _error(
-                400, "settings.bad_platform_url", "Platform URL must start with http:// or https://."
+                400,
+                "settings.bad_platform_url",
+                "Platform URL must be a plain http(s) origin (optional path; no query, quotes or spaces).",
             )
         updates[_PLATFORM_URL_KEY] = url
 

@@ -107,8 +107,37 @@ server {
 
 ### Adding a worker
 
-1. In the console, go to **Workers** → add, name it, and the platform generates a one-time registration bundle (`bundle.json`) — download it.
-2. On the machine that will contribute compute:
+1. In the console, go to **Workers** → add, name it, and the platform issues a one-time registration token and shows three one-line install commands right away (Windows PowerShell / Windows cmd / Linux + macOS), each with its own copy button.
+2. On the machine that will contribute compute, paste the matching line into a terminal:
+
+```powershell
+# Windows (PowerShell)
+irm "<your platform URL>/install.ps1?token=<one-time token>" | iex
+```
+
+```cmd
+:: Windows (cmd)
+curl -fsSL "<your platform URL>/install.cmd?token=<one-time token>" -o install.cmd && install.cmd && del install.cmd
+```
+
+```bash
+# Linux / macOS
+curl -fsSL "<your platform URL>/install.sh?token=<one-time token>" | bash
+```
+
+(Copy the actual command straight from the console — the URL and token are already filled in for you.)
+
+That one line does the whole install: missing Python gets installed automatically (the official installer on Windows, apt/dnf per distro on Linux, Xcode CLT/the official pkg on macOS); if no local ComfyUI is found it installs ComfyUI too (pinned at v0.35.0, with CUDA/CPU/MPS picked automatically from your GPU); once done it uses the token to run `register` on its own and sets the whole stack (ComfyUI + agent) to start on login and run in the background — no further manual steps. Re-running the same line is safe (idempotent): a machine that's already set up gets its scheduled task/service repaired and its agent upgraded, without reinstalling ComfyUI.
+
+**Uninstalling**:
+
+- **Windows**: `schtasks /Delete /TN ComfyFedAgent /F`, then delete the `%LOCALAPPDATA%\ComfyFed` folder.
+- **Linux**: `systemctl --user disable --now comfyfed-agent comfyfed-comfyui`, then delete `~/.comfyfed`.
+- **macOS**: `launchctl unload -w ~/Library/LaunchAgents/com.comfyfed.agent.plist` (and `com.comfyfed.comfyui.plist` too, if ComfyUI was installed by the script), delete those `.plist` files, then delete `~/.comfyfed`.
+
+#### Manual install (advanced)
+
+Under the hood, the one-liner is just "install the Python package, then register." If you need to control the environment yourself (an existing ComfyUI, a custom venv), you can still do it by hand — the console's collapsed "Manual install (advanced)" section still lets you download the same `bundle.json`:
 
 ```bash
 pip install -e .
@@ -116,7 +145,7 @@ comfyfed-agent register bundle.json
 comfyfed-agent run
 ```
 
-`register` exchanges the bundle's one-time token for a real certificate from the platform and writes the config to `~/.comfyfed/agent.json`; `run` connects to every registered platform and starts processing jobs.
+`register` exchanges the bundle's one-time token for a real certificate from the platform and writes the config to `~/.comfyfed/agent.json`; `run` connects to every registered platform and starts processing jobs. The manual flow does not install ComfyUI or set up autostart for you — you're on your own for both.
 
 **ComfyUI's location and folders are auto-detected**: at registration (and every startup) the agent finds the local ComfyUI on its own — well-known ports first (8188/8000/...), then a sweep of 8000-8399 confirmed by the `/system_stats` fingerprint — and derives the model library (`models_dir`) plus ComfyUI's real output/input folders from `/internal/folder_paths`, writing them all into `agent.json`. You only need to set `comfy_url` by hand when nothing can be found (ComfyUI isn't running, or listens on an unusual port); a value you set by hand is never overwritten by detection.
 

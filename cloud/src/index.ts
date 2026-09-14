@@ -10,6 +10,7 @@ import reportsRoutes from "./routes/reports";
 import metricsRoutes from "./routes/metrics";
 import usersRoutes from "./routes/users";
 import peerRoutes from "./routes/peer";
+import installerRoutes from "./routes/installer";
 import { comfySessionGate, serveComfyAsset } from "./lib/gate";
 
 export { Hub } from "./do/hub";
@@ -130,6 +131,7 @@ app.route("/", reportsRoutes);
 app.route("/", metricsRoutes);
 app.route("/", usersRoutes);
 app.route("/", peerRoutes);
+app.route("/", installerRoutes);
 
 // Anything under `/comfy/*` not claimed by a route above (the panel's own
 // `index.html`, its JS/CSS/font/image bundle) has already passed

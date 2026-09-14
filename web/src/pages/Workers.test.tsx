@@ -9,11 +9,11 @@
 import '@testing-library/jest-dom/vitest';
 
 import { MantineProvider } from '@mantine/core';
-import { cleanup, render, screen } from '@testing-library/react';
+import { cleanup, fireEvent, render, screen } from '@testing-library/react';
 import { MemoryRouter } from 'react-router-dom';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 
-import type { Worker } from '../api';
+import type { TokenBundle, Worker } from '../api';
 import '../i18n';
 import { theme } from '../theme';
 import { Workers } from './Workers';
@@ -88,6 +88,25 @@ function stubFetch(workers: Worker[]) {
   return fetchMock;
 }
 
+const TOKEN_BUNDLE: TokenBundle = {
+  platform_url: 'https://console.example.com',
+  platform_pubkey: 'ed25519-pubkey-stub',
+  register_token: 'tok_abc123XYZ',
+};
+
+function stubFetchWithTokenIssuance(workers: Worker[], bundle: TokenBundle = TOKEN_BUNDLE) {
+  const fetchMock = vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+    const url = typeof input === 'string' ? input : input.toString();
+    if (url.startsWith('/api/workers/tokens') && init?.method === 'POST') {
+      return jsonResponse({ bundle });
+    }
+    if (url.startsWith('/api/workers')) return jsonResponse(workers);
+    return jsonResponse({ error: { code: 'http_error', message: 'not stubbed' } }, 404);
+  });
+  vi.stubGlobal('fetch', fetchMock);
+  return fetchMock;
+}
+
 describe('Workers page: P2P sharing badge', () => {
   afterEach(() => {
     cleanup();
@@ -110,5 +129,48 @@ describe('Workers page: P2P sharing badge', () => {
     expect(await screen.findByText('runner-quiet')).toBeInTheDocument();
     expect(screen.queryByText('P2P sharing')).not.toBeInTheDocument();
     expect(screen.queryByText('http://192.168.1.5:8850')).not.toBeInTheDocument();
+  });
+});
+
+describe('Workers page: add worker one-line install commands', () => {
+  afterEach(() => {
+    cleanup();
+    vi.unstubAllGlobals();
+  });
+
+  async function issueToken() {
+    stubFetchWithTokenIssuance([]);
+    renderWorkers();
+
+    fireEvent.click(await screen.findByRole('button', { name: 'Add worker' }));
+    const nameInput = await screen.findByLabelText('Worker name');
+    fireEvent.change(nameInput, { target: { value: 'studio-5080' } });
+    fireEvent.click(screen.getByRole('button', { name: 'Issue bundle' }));
+
+    await screen.findAllByText(TOKEN_BUNDLE.register_token, { exact: false });
+  }
+
+  it('renders the three one-line commands containing the token and platform_url', async () => {
+    await issueToken();
+
+    const ps1 = `irm "${TOKEN_BUNDLE.platform_url}/install.ps1?token=${TOKEN_BUNDLE.register_token}" | iex`;
+    const cmd = `curl -fsSL "${TOKEN_BUNDLE.platform_url}/install.cmd?token=${TOKEN_BUNDLE.register_token}" -o install.cmd && install.cmd && del install.cmd`;
+    const sh = `curl -fsSL "${TOKEN_BUNDLE.platform_url}/install.sh?token=${TOKEN_BUNDLE.register_token}" | bash`;
+
+    expect(await screen.findByText(ps1)).toBeInTheDocument();
+    expect(screen.getByText(cmd)).toBeInTheDocument();
+    expect(screen.getByText(sh)).toBeInTheDocument();
+  });
+
+  it('shows a copy button for each install command and keeps the manual bundle fallback reachable', async () => {
+    await issueToken();
+
+    const copyButtons = screen.getAllByRole('button', { name: 'Copy' });
+    // One per install command block, plus the manual-fallback copy button once expanded.
+    expect(copyButtons.length).toBeGreaterThanOrEqual(3);
+
+    fireEvent.click(screen.getByText('Manual install (advanced)'));
+    expect(await screen.findByRole('button', { name: 'Copy bundle' })).toBeInTheDocument();
+    expect(screen.getByRole('button', { name: 'Download .json' })).toBeInTheDocument();
   });
 });
