@@ -1,5 +1,5 @@
-import { afterEach, describe, expect, it } from "vitest";
-import { env, runDurableObjectAlarm } from "cloudflare:test";
+import { afterEach, beforeEach, describe, expect, it } from "vitest";
+import { env, runDurableObjectAlarm, runInDurableObject } from "cloudflare:test";
 import { toSqliteTimestamp, getJobById, getReceiptsForJob, getWorkerById } from "../src/db/queries";
 import { signHex } from "../src/lib/ed25519";
 import { connectAgent, expectNoMessage, hub, nextMessage, openAgentWs, waitForClose } from "./helpers/ws";
@@ -14,7 +14,23 @@ function db(): D1Database {
   return (env as any).DB as D1Database;
 }
 
+// Every `connectAgent` handshake arms a REAL 5s dispatch alarm
+// (`scheduleAlarmIfNeeded`), and miniflare fires due alarms for real. Once
+// the file's cumulative runtime crosses 5s -- which only happens under
+// full-suite load, never in a solo run -- an alarm armed by an EARLIER
+// test fires inside a later test's `expectNoMessage` window and dispatches
+// that test's own queued job to its idle worker (live-caught flake in
+// "pushes job_cancelled once for a not-owned job, then dedups"). Delete
+// the pending alarm around every test so ticks only ever run when a test
+// explicitly calls `runDurableObjectAlarm`.
+async function deletePendingAlarm(): Promise<void> {
+  await runInDurableObject(hub(), (_instance, state) => state.storage.deleteAlarm());
+}
+
+beforeEach(deletePendingAlarm);
+
 afterEach(async () => {
+  await deletePendingAlarm();
   await db().prepare("DELETE FROM jobs").run();
   await db().prepare("DELETE FROM workers").run();
   await db().prepare("DELETE FROM receipts").run();
