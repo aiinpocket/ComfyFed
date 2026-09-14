@@ -132,6 +132,22 @@ describe("GET /metrics", () => {
     expect(text.includes('comfyfed_worker_free_vram_gb{worker="beta"}')).toBe(false);
   });
 
+  it("counts a paused worker as up, matching the server stack", async () => {
+    // agentws.py sets worker_up on ANY heartbeat, paused included: a paused
+    // worker is connected, it just declines new intake. Counting it as down
+    // here would page admins alerting on `comfyfed_worker_up == 0` whenever
+    // someone touched their keyboard.
+    await insertWorker("w3", "gamma", "paused", { free_vram_gb: 4 });
+    await insertWorker("w4", "delta", "busy", {});
+    await insertWorker("w5", "epsilon", "offline", {});
+    const r = await call("/metrics", { method: "GET" });
+    const text = r.body as string;
+    expect(text).toContain('comfyfed_worker_up{worker="gamma"} 1');
+    expect(text).toContain('comfyfed_worker_up{worker="delta"} 1');
+    expect(text).toContain('comfyfed_worker_up{worker="epsilon"} 0');
+    expect(text).toContain("# HELP comfyfed_worker_up 1 if the worker is connected (online/busy/paused), 0 if offline.");
+  });
+
   it("computes the queued-jobs gauge fresh from D1", async () => {
     await insertJob({ id: "j1", status: "queued", createdAt: toSqliteTimestamp(new Date()) });
     await insertJob({ id: "j2", status: "queued", createdAt: toSqliteTimestamp(new Date()) });

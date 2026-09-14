@@ -34,7 +34,7 @@ import {
   SectionHeader,
   StatCard,
 } from '../components/Primitives';
-import { WorkerStatusBadge } from '../components/StatusBadge';
+import { WORKER_COLORS, WorkerStatusBadge } from '../components/StatusBadge';
 import { JobStatusBadge } from '../components/StatusBadge';
 import { formatGb, formatRelative, shortId } from '../lib/format';
 import { usePolling } from '../lib/usePolling';
@@ -76,7 +76,11 @@ export function Dashboard({ role }: DashboardProps) {
   const jobs = data?.jobs ?? [];
 
   const active = workers.filter((w) => !w.disabled);
-  const onlineCount = active.filter((w) => w.status === 'online').length;
+  // `paused` counts as online: the worker is connected and healthy, it has
+  // just stopped taking NEW jobs while someone uses the machine. Excluding
+  // it made an evening dashboard read "0 online" with five live workers
+  // attached (final review M9).
+  const onlineCount = active.filter((w) => w.status === 'online' || w.status === 'paused').length;
   const busyCount = active.filter((w) => w.status === 'busy').length;
   const queuedCount = jobs.filter((j) => j.status === 'queued').length;
   const runningCount = jobs.filter((j) => j.status === 'running' || j.status === 'assigned').length;
@@ -292,8 +296,9 @@ function WorkerCard({ worker, job }: { worker: Worker; job: Job | null }) {
   const hardware = worker.hardware ?? {};
   const dynamic = worker.dynamic ?? {};
   const backend = (worker.backend || '').toLowerCase();
-  const accent =
-    worker.disabled ? 'gray' : worker.status === 'online' ? 'teal' : worker.status === 'busy' ? 'yellow' : 'gray';
+  // Same map the badge uses, so `paused` gets its slate accent instead of
+  // the offline grey (final review M9).
+  const accent = worker.disabled ? 'gray' : (WORKER_COLORS[worker.status] ?? 'gray');
 
   return (
     <Card

@@ -130,7 +130,13 @@ async function renderMetrics(env: Env): Promise<string> {
 
   const workerUpSamples: Sample[] = workers.map((w) => ({
     labels: { worker: w.name },
-    value: w.status === "online" || w.status === "busy" ? 1 : 0,
+    // `paused` counts as up: the worker is connected and healthy, it is
+    // just declining new intake while someone uses the machine. The server
+    // stack sets this gauge on ANY heartbeat, so counting paused as down
+    // here would page an admin alerting on `comfyfed_worker_up == 0` every
+    // time someone touched their keyboard, and make the two stacks report
+    // different numbers for identical agent behaviour.
+    value: w.status === "online" || w.status === "busy" || w.status === "paused" ? 1 : 0,
   }));
 
   const dynamicSamples = (key: string): Sample[] => {
@@ -160,7 +166,7 @@ async function renderMetrics(env: Env): Promise<string> {
   const queuedCount = jobs.filter((j) => j.status === "queued").length;
 
   const blocks = [
-    renderGauge("comfyfed_worker_up", "1 if the worker is connected (online/busy), 0 if offline.", workerUpSamples),
+    renderGauge("comfyfed_worker_up", "1 if the worker is connected (online/busy/paused), 0 if offline.", workerUpSamples),
     renderGauge(
       "comfyfed_worker_free_vram_gb",
       "Free VRAM in GB, from the worker's last heartbeat.",

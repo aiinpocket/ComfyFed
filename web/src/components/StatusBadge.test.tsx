@@ -54,4 +54,26 @@ describe('WorkerStatusBadge: paused status', () => {
     );
     expect(await screen.findByText('Paused')).toBeInTheDocument();
   });
+
+  it('paints paused slate, never the offline grey', async () => {
+    // Final review I1: the text-only assertions above stay green even if the
+    // `paused: 'slate'` entry is deleted, because WorkerStatusBadge falls
+    // back to 'gray' for unknown statuses. Pin the colour itself.
+    await i18n.changeLanguage('en');
+    const { container } = render(
+      <MantineProvider theme={theme}>
+        <WorkerStatusBadge status="paused" disabled={false} />
+      </MantineProvider>,
+    );
+
+    const badge = container.querySelector('.mantine-Badge-root') as HTMLElement | null;
+    expect(badge).not.toBeNull();
+    expect(badge!.getAttribute('style') ?? '').toContain('slate');
+    // The dot next to it, too -- both come from the one WORKER_COLORS map.
+    const dot = container.querySelector('span[style*="border-radius"]') as HTMLElement | null;
+    expect(dot).not.toBeNull();
+    expect(dot!.getAttribute('style') ?? '').toContain('slate');
+    expect(badge!.getAttribute('style') ?? '').not.toContain('gray');
+    expect(dot!.getAttribute('style') ?? '').not.toContain('gray');
+  });
 });
