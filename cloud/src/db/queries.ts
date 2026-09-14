@@ -966,6 +966,71 @@ export async function getReceiptById(db: D1Database, id: string): Promise<Receip
   return row ? rowToReceipt(row) : null;
 }
 
+/** One receipt joined through `jobs.user_id` to `users.username` -- the raw
+ * row shape `/api/reports/usage`, `/my-usage`, and `/payout`'s underlying
+ * aggregation need. Mirrors receipts.py's `_usage_rows` outer-join query:
+ * `userId`/`username` are `null` when the receipt's job is missing (orphan
+ * receipt) or the job's `user_id` is `null` (pre-Phase-3.0 data), or when the
+ * job's `user_id` doesn't match any current `users` row. */
+export interface UsageJoinRow {
+  userId: string | null;
+  username: string | null;
+  gpuSeconds: number;
+  billable: boolean;
+}
+
+interface UsageJoinRowRaw {
+  user_id: string | null;
+  username: string | null;
+  gpu_seconds: number;
+  billable: number;
+}
+
+/** Receipts with `created_at` in `[start, end]` (either bound optional),
+ * outer-joined through `jobs` to `users` -- mirrors receipts.py's
+ * `_usage_rows` query exactly, including the LEFT JOINs (a receipt whose job
+ * row is missing, or whose job has a `null`/dangling `user_id`, still comes
+ * back with `userId: null` rather than being dropped). `onlyUserId`, when
+ * given, filters on `jobs.user_id` (post-join) same as `_usage_rows`'s
+ * `only_user_id` -- used by `/my-usage` to scope to the session user. No
+ * `ORDER BY`: aggregation order doesn't matter, the route sorts the
+ * aggregated result. */
+export async function getUsageRowsInRange(
+  db: D1Database,
+  start: string | null,
+  end: string | null,
+  onlyUserId?: string
+): Promise<UsageJoinRow[]> {
+  let sql = `SELECT j.user_id AS user_id, u.username AS username, r.gpu_seconds AS gpu_seconds, r.billable AS billable
+             FROM receipts r
+             LEFT JOIN jobs j ON j.id = r.job_id
+             LEFT JOIN users u ON u.id = j.user_id
+             WHERE 1=1`;
+  const binds: string[] = [];
+  if (start !== null) {
+    sql += " AND r.created_at >= ?";
+    binds.push(start);
+  }
+  if (end !== null) {
+    sql += " AND r.created_at <= ?";
+    binds.push(end);
+  }
+  if (onlyUserId !== undefined) {
+    sql += " AND j.user_id = ?";
+    binds.push(onlyUserId);
+  }
+  const { results } = await db
+    .prepare(sql)
+    .bind(...binds)
+    .all<UsageJoinRowRaw>();
+  return results.map((row) => ({
+    userId: row.user_id,
+    username: row.username,
+    gpuSeconds: row.gpu_seconds,
+    billable: row.billable !== 0,
+  }));
+}
+
 export interface NewReceipt {
   id: string;
   jobId: string;
