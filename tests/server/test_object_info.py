@@ -35,7 +35,7 @@ def client(tmp_path):
 
 
 def _login(client):
-    r = client.post("/api/auth/login", json={"password": client.admin_password})
+    r = client.post("/api/auth/login", json={"username": "admin", "password": client.admin_password})
     assert r.status_code == 200
     return r.json()["csrf"]
 

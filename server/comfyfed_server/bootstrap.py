@@ -10,7 +10,7 @@ from . import db, i18n, security
 
 _DB_FILENAME = "comfyfed.db"
 
-_ADMIN_PASSWORD_HASH_KEY = "admin_password_hash"
+_ADMIN_USERNAME = "admin"
 _PLATFORM_URL_KEY = "platform_url"
 _LANG_KEY = "lang"
 
@@ -22,7 +22,7 @@ class InstallResult:
 
 
 def _is_installed(session) -> bool:
-    return session.get(db.Setting, _ADMIN_PASSWORD_HASH_KEY) is not None
+    return session.query(db.User).filter(db.User.username == _ADMIN_USERNAME).first() is not None
 
 
 def get_lang() -> str:
@@ -81,7 +81,13 @@ def ensure_installed(
         admin_password = secrets.token_urlsafe(12)
         admin_password_hash = security.hash_password(admin_password)
 
-        session.add(db.Setting(key=_ADMIN_PASSWORD_HASH_KEY, value=admin_password_hash))
+        session.add(
+            db.User(
+                username=_ADMIN_USERNAME,
+                password_hash=admin_password_hash,
+                role="admin",
+            )
+        )
         session.add(db.Setting(key=_PLATFORM_URL_KEY, value=url))
         session.add(db.Setting(key=_LANG_KEY, value=lang))
         session.commit()

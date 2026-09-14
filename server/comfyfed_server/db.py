@@ -24,6 +24,10 @@ def _uuid_str() -> str:
     return str(uuid.uuid4())
 
 
+def _uuid_hex() -> str:
+    return uuid.uuid4().hex
+
+
 class Base(DeclarativeBase):
     pass
 
@@ -33,6 +37,28 @@ class Setting(Base):
 
     key: Mapped[str] = mapped_column(String, primary_key=True)
     value: Mapped[str] = mapped_column(String)
+
+
+class User(Base):
+    """A login account (Phase 3.0 multi-user). Created by `bootstrap` (the
+    initial admin) or, later, the admin-only `/api/users` management surface.
+
+    `session_epoch` is bumped whenever every existing session for this user
+    must stop validating (password change, disable, reset-password) --
+    `auth.require_user` rejects a cookie whose `epoch` claim no longer
+    matches. This replaces the old global session-secret rotation, which
+    logged out every user on any password change.
+    """
+
+    __tablename__ = "users"
+
+    id: Mapped[str] = mapped_column(String, primary_key=True, default=_uuid_hex)
+    username: Mapped[str] = mapped_column(String, unique=True)
+    password_hash: Mapped[str] = mapped_column(String)
+    role: Mapped[str] = mapped_column(String)
+    disabled: Mapped[bool] = mapped_column(Boolean, default=False, server_default="0")
+    session_epoch: Mapped[int] = mapped_column(Integer, default=0, server_default="0")
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=_utcnow)
 
 
 class Worker(Base):
@@ -132,6 +158,13 @@ class Job(Base):
     # ignores this entirely -- it is the audit surface and must always show
     # everything.
     panel_hidden: Mapped[bool] = mapped_column(Boolean, default=False, server_default="0")
+    # Who submitted the job (Phase 3.0 multi-user). Nullable, no FK -- matches
+    # this module's existing loose-reference style (see e.g. `worker_id`) --
+    # because pre-migration jobs are backfilled to whichever user the
+    # migration created from the old single admin hash, and a user is never
+    # actually deleted (only disabled), so the column stays populated for any
+    # job created from here on.
+    user_id: Mapped[Optional[str]] = mapped_column(String, nullable=True)
 
 
 class Receipt(Base):
@@ -168,6 +201,11 @@ class LoginAttempt(Base):
     id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
     at: Mapped[datetime] = mapped_column(DateTime, default=_utcnow)
     ok: Mapped[bool] = mapped_column(Boolean)
+    # The attempted username (Phase 3.0 multi-user), lowercased same as
+    # `User.username`. Nullable because pre-migration rows predate it and are
+    # never backfilled (there is no way to recover who was being guessed
+    # against). Backoff is now per-username: see `auth._consecutive_failures`.
+    username: Mapped[Optional[str]] = mapped_column(String, nullable=True)
 
 
 _engine: Optional[Engine] = None

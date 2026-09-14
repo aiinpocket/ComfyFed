@@ -22,7 +22,7 @@ def server(tmp_path):
 
 
 def _issue_bundle(server) -> dict:
-    login = server.post("/api/auth/login", json={"password": server.admin_password})
+    login = server.post("/api/auth/login", json={"username": "admin", "password": server.admin_password})
     assert login.status_code == 200
     csrf = login.json()["csrf"]
 

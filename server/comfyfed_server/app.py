@@ -128,7 +128,7 @@ def create_app(data_dir: str) -> FastAPI:
     """
     db.init_db(os.path.join(data_dir, bootstrap._DB_FILENAME))
     with db.get_session() as session:
-        installed = session.get(db.Setting, bootstrap._ADMIN_PASSWORD_HASH_KEY) is not None
+        installed = bootstrap._is_installed(session)
 
     if not installed:
         raise RuntimeError(
@@ -175,9 +175,12 @@ def create_app(data_dir: str) -> FastAPI:
         if not public:
             # Conditional auth: whether admin is required depends on a DB
             # setting, so this can't be a static `Depends(auth.require_admin)`
-            # on the route. Reuse the same session-payload check it uses.
-            payload = auth.read_session_payload(request.cookies.get(auth.SESSION_COOKIE_NAME))
-            if not payload or not payload.get("authenticated"):
+            # on the route. Reuse the same session-resolution `require_admin`
+            # itself is built on, so a disabled user or a stale (epoch-
+            # mismatched) cookie is rejected here exactly as everywhere else.
+            with db.get_session() as session:
+                user = auth.resolve_session_user(session, request)
+            if user is None or user.role != "admin":
                 raise auth._error(401, "auth.required", "Login required.")
 
         data = generate_latest(metrics.get_metrics().registry)
@@ -206,8 +209,12 @@ def create_app(data_dir: str) -> FastAPI:
         in_panel = path == _COMFY_PREFIX or path.startswith(_COMFY_PREFIX + "/")
         in_api = path == _COMFY_API_PREFIX or path.startswith(_COMFY_API_PREFIX + "/")
         if in_panel and not in_api:
-            payload = auth.read_session_payload(request.cookies.get(auth.SESSION_COOKIE_NAME))
-            if not payload or not payload.get("authenticated"):
+            # Task 1 keeps this exactly as admin-gated as it was before
+            # multi-user (today only admin accounts exist); a later task
+            # opens the panel to any logged-in user.
+            with db.get_session() as session:
+                user = auth.resolve_session_user(session, request)
+            if user is None or user.role != "admin":
                 return RedirectResponse("/", status_code=302)
         return await call_next(request)
 

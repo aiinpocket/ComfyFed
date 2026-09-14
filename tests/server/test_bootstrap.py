@@ -5,8 +5,9 @@ def test_first_run_generates_password(tmp_path):
     r = bootstrap.ensure_installed(str(tmp_path), lang="zh-TW", url="http://h:8388", interactive=False)
     assert r.first_run and len(r.admin_password) >= 12
     with db.get_session() as s:
-        h = s.get(db.Setting, "admin_password_hash").value
-        assert security.verify_password(r.admin_password, h)
+        user = s.query(db.User).filter(db.User.username == "admin").one()
+        assert user.role == "admin"
+        assert security.verify_password(r.admin_password, user.password_hash)
 
 
 def test_second_run_no_password(tmp_path):
