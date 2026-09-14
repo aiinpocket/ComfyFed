@@ -53,6 +53,7 @@ class FakeConnection:
         self.object_info_uploads: list[tuple[bytes, str]] = []
         self.receipt_acks: list[tuple[str, str]] = []
         self.model_inventory_hash = ""
+        self.chunks_sent: dict[str, str] = {}
         self.inventories: list[list[dict]] = []
         # A live socket, as far as the reporting retry is concerned; a test
         # simulates a blip by setting it to None (what `close()` does).
@@ -364,6 +365,77 @@ async def test_refresh_model_inventory_failure_is_swallowed_and_hash_stays_unset
 
     await loop.refresh_model_inventory(conn_a)  # must not raise
     assert conn_a.model_inventory_hash == ""
+
+
+# --- M7 final-review fix: chunk-table payload dedup --------------------------
+
+
+def test_dedup_chunk_lists_keeps_chunks_for_a_never_sent_name():
+    models = [{"name": "a.bin", "sha256": "s1", "chunk_sha256s": ["c0", "c1"]}]
+    out, updates = runner_module._dedup_chunk_lists(models, {})
+    assert out == models
+    assert updates == {"a.bin": "s1"}
+
+
+def test_dedup_chunk_lists_strips_chunks_for_an_already_sent_unchanged_name():
+    models = [{"name": "a.bin", "sha256": "s1", "chunk_sha256s": ["c0", "c1"]}]
+    out, updates = runner_module._dedup_chunk_lists(models, {"a.bin": "s1"})
+    assert out == [{"name": "a.bin", "sha256": "s1"}]
+    assert updates == {}
+
+
+def test_dedup_chunk_lists_keeps_chunks_when_the_hash_changed():
+    """A file rehashed since the last report (different sha256) must carry
+    its chunk list again even though its name was already sent before."""
+    models = [{"name": "a.bin", "sha256": "s2", "chunk_sha256s": ["c2", "c3"]}]
+    out, updates = runner_module._dedup_chunk_lists(models, {"a.bin": "s1"})
+    assert out == models
+    assert updates == {"a.bin": "s2"}
+
+
+def test_dedup_chunk_lists_passes_through_entries_without_chunks():
+    models = [{"name": "a.bin", "sha256": "s1"}]
+    out, updates = runner_module._dedup_chunk_lists(models, {})
+    assert out == models
+    assert updates == {}
+
+
+async def test_refresh_model_inventory_omits_chunks_on_second_report_keeps_new_ones(
+    two_platform_loop, tmp_path, monkeypatch
+):
+    """Integration-level pin for M7: the first inventory report after
+    connect carries chunk_sha256s; an unchanged second periodic report omits
+    them; a file (re)hashed since the last report still carries its (new)
+    chunk list."""
+    loop = two_platform_loop
+    loop.config.models_dir = str(tmp_path)
+    conn_a = loop.connections["worker-a"]
+
+    scans = [
+        [
+            {"name": "a.bin", "size": 0.0, "size_bytes": 3, "sha256": "sha-a-1", "chunk_sha256s": ["ca0"]},
+            {"name": "b.bin", "size": 0.0, "size_bytes": 3, "sha256": "sha-b-1", "chunk_sha256s": ["cb0"]},
+        ],
+        [
+            {"name": "a.bin", "size": 0.0, "size_bytes": 3, "sha256": "sha-a-1", "chunk_sha256s": ["ca0"]},
+            # b.bin rehashed -- different sha256/chunk list.
+            {"name": "b.bin", "size": 0.0, "size_bytes": 3, "sha256": "sha-b-2", "chunk_sha256s": ["cb1"]},
+        ],
+    ]
+    calls = iter(scans)
+    monkeypatch.setattr(hardware, "scan_models", lambda *a, **k: next(calls))
+
+    await loop.refresh_model_inventory(conn_a)
+    assert len(conn_a.inventories) == 1
+    first = {m["name"]: m for m in conn_a.inventories[0]}
+    assert first["a.bin"]["chunk_sha256s"] == ["ca0"]
+    assert first["b.bin"]["chunk_sha256s"] == ["cb0"]
+
+    await loop.refresh_model_inventory(conn_a)
+    assert len(conn_a.inventories) == 2
+    second = {m["name"]: m for m in conn_a.inventories[1]}
+    assert "chunk_sha256s" not in second["a.bin"]  # unchanged -- omitted
+    assert second["b.bin"]["chunk_sha256s"] == ["cb1"]  # rehashed -- still sent
 
 
 async def test_connection_loop_rescans_models_on_the_object_info_timer(
@@ -1592,7 +1664,7 @@ class _RecordingWS:
 
 
 @pytest.mark.asyncio
-async def test_send_hello_declares_protocol_3_and_auto_fetch_false_by_default():
+async def test_send_hello_declares_protocol_4_and_auto_fetch_false_by_default():
     entry = PlatformEntry(
         platform_url="http://p",
         platform_pubkey="aa",
@@ -1608,9 +1680,31 @@ async def test_send_hello_declares_protocol_3_and_auto_fetch_false_by_default():
     assert len(conn.ws.sent) == 1
     payload = json.loads(conn.ws.sent[0])
     assert payload["type"] == "hello"
-    assert payload["protocol"] == 3
+    assert payload["protocol"] == 4
     assert payload["auto_fetch"] is False
     assert payload["hardware"]["platform"] == "Windows"
+    assert "peer_url" not in payload
+
+
+@pytest.mark.asyncio
+async def test_send_hello_includes_peer_url_when_given():
+    entry = PlatformEntry(
+        platform_url="http://p",
+        platform_pubkey="aa",
+        worker_id="w1",
+        certificate="cert",
+        signing_key_hex="00" * 32,
+    )
+    conn = PlatformConnection(entry, AgentConfig())
+    conn.ws = _RecordingWS()
+
+    await conn.send_hello(
+        {"cpu": "x", "platform": "Windows"}, "cuda", "2.0", ["KSampler"],
+        peer_url="http://192.168.1.5:8850",
+    )
+
+    payload = json.loads(conn.ws.sent[0])
+    assert payload["peer_url"] == "http://192.168.1.5:8850"
 
 
 @pytest.mark.asyncio

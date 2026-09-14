@@ -38,6 +38,7 @@ import * as queries from "../db/queries";
 import { toSqliteTimestamp, sqliteTimestampToIsoformat } from "../db/queries";
 import type { Job, Receipt } from "../db/queries";
 import { extract, estimateVram, needsFromJob, verdict, fleetWideGaps, partitionFleetFetchable, type JobNeeds, type FetchableModels } from "../core/assess";
+import { peerOnlyNames } from "../core/model_manifest";
 import { sanitizePathComponentOrThrow, artifactKey, jobInputKey } from "../lib/store";
 import { verifyAgentRequest, type VerifyAgentResult } from "../lib/verify_agent";
 import { requireUser, requireCsrfUser, errorJson, SESSION_VAR } from "../lib/guard";
@@ -242,7 +243,7 @@ async function unfetchableMissingModels(env: Env, needs: JobNeeds): Promise<Set<
   const fetchableMap: FetchableModels = {};
   for (const e of manifestEntries) fetchableMap[e.name] = e.size_bytes;
 
-  const [, unfetchable] = partitionFleetFetchable(missingModels, fetchableMap, onlineWorkers);
+  const [, unfetchable] = partitionFleetFetchable(missingModels, fetchableMap, onlineWorkers, peerOnlyNames(manifestEntries));
   return unfetchable;
 }
 
@@ -406,9 +407,10 @@ app.get("/api/jobs/:jobId/assessment", requireUser, async (c) => {
   const manifestEntries = await modelManifest.entries(c.env.DB, c.env.STORE, seed);
   const fetchableModels: FetchableModels = {};
   for (const e of manifestEntries) fetchableModels[e.name] = e.size_bytes;
+  const peerOnlyModels = peerOnlyNames(manifestEntries);
 
   const results = allWorkers.map((worker) => {
-    const v = verdict(worker, needs, job.requirements, allWorkers, fetchableModels);
+    const v = verdict(worker, needs, job.requirements, allWorkers, fetchableModels, peerOnlyModels);
     return {
       worker_id: worker.id,
       name: worker.name,

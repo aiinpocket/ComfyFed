@@ -43,6 +43,8 @@ If you have a spare GPU you'd like to lend the group, install a small program ca
 
 Every finished job produces a receipt **signed by both sides** — you (the worker) and the platform — recording exactly how much compute you contributed. Since neither side can fake a signature the other didn't make, that record is trustworthy on its own, and the Reports page turns it into a leaderboard.
 
+Members can also hand model files to each other directly, so nobody has to re-download the same thing from the outside world — a new machine joining in gets missing models faster and with less bandwidth, as long as someone in the circle is online and already has them.
+
 ### Safety and trust
 
 ComfyFed is designed for people who know each other, not the open internet:

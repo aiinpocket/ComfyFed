@@ -675,6 +675,43 @@ def test_prompt_mixed_fetchable_and_unfetchable_lists_only_unfetchable(client):
     assert set(body["node_errors"].keys()) == {"2"}
 
 
+# --- Phase 3.1 P2P: peer-seeded models never reach the missing-model gate -
+
+
+def test_prompt_queues_when_missing_model_is_only_reachable_via_a_peer_seeder(client):
+    """Task 6 deliverable #3's finding, pinned as a test: a peer-only manifest
+    entry can only exist for a model that some registered worker's inventory
+    already has (`model_manifest._peer_only_entry` requires
+    `peer.online_seeders` non-empty, which itself requires a worker's
+    inventory to hold the consensus file -- see `peer.online_seeders`'s
+    docstring). `comfyapi._fleet_wide_gaps` -> `assess.fleet_wide_gaps` checks
+    every registered worker's inventory (online or not) before a model is
+    ever considered "missing" -- so a model any worker holds, seeder or not,
+    NEVER reaches `_partition_missing_models`/the guidance-rendering 400 path
+    at all. No `model_guide`/guidance wording change was needed for the peer
+    branch: this submission queues normally, exactly like the pre-existing
+    "the only worker with the model is offline" case, for the same reason.
+    """
+    csrf = _login(client)
+    seeder = _register_worker(client, csrf, "seeder-box")
+    _set_model_inventory(
+        client, seeder, [{"name": "diffusion_models/flux1-dev.safetensors", "size": 22.17}]
+    )
+    with db.get_session() as session:
+        worker = session.get(db.Worker, seeder)
+        worker.protocol = 4
+        worker.peer_url = "http://10.0.0.5:8850"
+        session.commit()
+    # The requesting worker has neither the model nor any fetch opt-in --
+    # only the seeder above holds it.
+    _register_worker(client, csrf, "requester-box")
+
+    r = _post_prompt(client, prompt=FLUX_PROMPT)
+    assert r.status_code == 200
+    with db.get_session() as session:
+        assert session.query(db.Job).count() == 1
+
+
 def test_prompt_rejection_also_names_fleet_wide_missing_nodes(client):
     """Both missing: the guidance must not send the admin off to download
     22 GB for a job that still cannot run for want of a custom node."""

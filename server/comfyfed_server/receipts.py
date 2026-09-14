@@ -109,6 +109,7 @@ def create_router() -> APIRouter:
                     "jobs": 0,
                     "gpu_seconds": 0.0,
                     "unbilled_gpu_seconds": 0.0,
+                    "p2p_upload_bytes": 0,
                     "receipts": [],
                 },
             )
@@ -118,11 +119,17 @@ def create_router() -> APIRouter:
             # exactly for data that predates this column). Failed/cancelled
             # receipts still show up in `unbilled_gpu_seconds` and the
             # per-receipt listing below, just never in the headline numbers.
+            # `p2p_upload` receipts are also billable=False with
+            # gpu_seconds=0.0, so they harmlessly add nothing to
+            # unbilled_gpu_seconds either -- their bytes are tracked
+            # separately in `p2p_upload_bytes` below.
             if rec.billable:
                 entry["jobs"] += 1
                 entry["gpu_seconds"] += rec.gpu_seconds
             else:
                 entry["unbilled_gpu_seconds"] += rec.gpu_seconds
+            if rec.kind == "p2p_upload" and rec.bytes:
+                entry["p2p_upload_bytes"] += rec.bytes
             entry["receipts"].append(
                 {
                     "job_id": rec.job_id,
@@ -131,6 +138,9 @@ def create_router() -> APIRouter:
                     "basis": rec.basis,
                     "gpu_seconds": rec.gpu_seconds,
                     "acked": rec.worker_sig is not None,
+                    # Only meaningful for kind=="p2p_upload" -- null/absent
+                    # for every other kind (gpu_seconds is the metric there).
+                    "bytes": rec.bytes,
                 }
             )
 
@@ -142,12 +152,21 @@ def create_router() -> APIRouter:
         unbilled split as `contributions`. A receipt whose job is missing or
         whose job has no `user_id` (pre-Phase-3.0 data) aggregates into a
         single `user_id: None` row rather than being dropped.
+
+        L4 final-review fix: `kind == "p2p_upload"` rows are excluded
+        entirely -- they're worker-side bandwidth (job_id is always NULL for
+        them, see `peer.peer_served`), not consumer usage, and outer-joining
+        them through a nonexistent job otherwise materializes a phantom
+        `{username: null, jobs: 0, gpu_seconds: 0}` row in any range with
+        P2P activity. `/contributions` (above) still aggregates them into
+        `p2p_upload_bytes`; only this usage view drops them.
         """
         with db.get_session() as session:
             query = (
                 session.query(db.Receipt, db.Job.user_id, db.User.username)
                 .outerjoin(db.Job, db.Job.id == db.Receipt.job_id)
                 .outerjoin(db.User, db.User.id == db.Job.user_id)
+                .filter(db.Receipt.kind != "p2p_upload")
             )
             if start is not None:
                 query = query.filter(db.Receipt.created_at >= start)

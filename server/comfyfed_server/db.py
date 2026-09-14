@@ -81,12 +81,29 @@ class Worker(Base):
     # Agent protocol version reported in `hello` (see agentws._handle_hello).
     # 1 = pre-Phase-1.9 agent: no guaranteed exec_seconds, doesn't understand
     # `job_cancelled` pushes -- still served, but gets a one-time deprecation
-    # frame and is never sent job_cancelled. 2 = current comfyfed-agent.
+    # frame and is never sent job_cancelled. 2 = baseline exec_seconds/
+    # job_cancelled support. 3 = hello's auto_fetch opt-in exists (Phase 2.1;
+    # see assess._MIN_AUTO_FETCH_PROTOCOL). 4 = Phase 3.1 P2P: hello may carry
+    # `peer_url`, and chunk-hash fields exist on inventory reports -- older
+    # agents are still fully served, just never handed peer_url or
+    # peer-only fetch_models entries.
     protocol: Mapped[int] = mapped_column(Integer, default=1, server_default="1")
     # Opt-in: whether this worker should auto-fetch missing models from the
     # signed manifest (Phase 2.1 Task 3). Every existing worker predates the
     # feature and defaults to off.
     auto_fetch: Mapped[bool] = mapped_column(Boolean, default=False, server_default="0")
+    # Phase 3.1 P2P: this worker's advertised peer-serving HTTP endpoint
+    # (e.g. "http://192.168.1.5:8850"), set from `hello.peer_url` when the
+    # agent has `peer_serve` enabled and validates as an http(s) URL with a
+    # host (see agentws._parse_peer_url). Hello-only, not heartbeat -- unlike
+    # `dynamic` (an opaque per-heartbeat blob forwarded verbatim), this is a
+    # dedicated column and the endpoint is effectively static agent config,
+    # not a fast-changing runtime value, so re-parsing it every heartbeat
+    # would add work for no benefit. None when the agent doesn't advertise
+    # (protocol < 4, peer_serve off, or an invalid value), and cleared
+    # whenever the worker is marked offline (see dispatch.requeue_stale) so
+    # a stale endpoint is never handed out as a seeder.
+    peer_url: Mapped[Optional[str]] = mapped_column(String, nullable=True)
 
 
 class ModelHash(Base):
@@ -109,6 +126,14 @@ class ModelHash(Base):
     # `model_manifest.entries()` excludes any row with this set, and it
     # survives a restart/second-replica since it lives on the row itself.
     conflict: Mapped[bool] = mapped_column(Boolean, default=False, server_default="0")
+    # Phase 3.1 P2P: per-64-MiB-chunk SHA-256 list (JSON array of hex
+    # strings), learned from an agent's inventory report the same way
+    # `sha256` above is (see model_manifest). An early-abort optimization
+    # only -- the whole-file `sha256` stays the sole consensus/trust root;
+    # a chunk mismatch just aborts that one P2P source, it never substitutes
+    # for the final whole-file verification. Null until some report on this
+    # (name, size_bytes) carries chunk hashes (older agents never do).
+    chunk_sha256s: Mapped[Optional[str]] = mapped_column(String, nullable=True)
 
 
 class RegisterToken(Base):
@@ -171,7 +196,11 @@ class Receipt(Base):
     __tablename__ = "receipts"
 
     id: Mapped[str] = mapped_column(String, primary_key=True, default=_uuid_str)
-    job_id: Mapped[str] = mapped_column(String)
+    # Nullable as of Phase 3.1: `kind == "p2p_upload"` receipts (a seeder's
+    # bandwidth booking for serving a P2P grant) aren't tied to any job, so
+    # job_id is NULL for those and those alone -- every other kind still
+    # always sets it. See agentws/peer.py receipt minting.
+    job_id: Mapped[Optional[str]] = mapped_column(String, nullable=True)
     worker_id: Mapped[str] = mapped_column(String)
     gpu_seconds: Mapped[float] = mapped_column(Float)
     platform_sig: Mapped[str] = mapped_column(String)
@@ -193,6 +222,11 @@ class Receipt(Base):
     # span, or started_at-to-cancel span). Mirrors the exec/wall distinction
     # `_create_and_push_receipt` already logs for completed jobs.
     basis: Mapped[str] = mapped_column(String, default="exec", server_default="exec")
+    # Phase 3.1 P2P: bytes actually served for a `p2p_upload` receipt (the
+    # seeder's bandwidth booking). Null for every other kind -- gpu_seconds
+    # stays the payout/usage-report metric; this is purely the contributions
+    # report's separate "P2P upload volume" total.
+    bytes: Mapped[Optional[int]] = mapped_column(Integer, nullable=True)
 
 
 class LoginAttempt(Base):

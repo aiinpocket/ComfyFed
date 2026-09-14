@@ -51,13 +51,14 @@ async function makeWorker(
     autoFetch?: boolean;
     nodeClasses?: string[];
     modelInventory?: unknown[];
+    peerUrl?: string | null;
   } = {}
 ): Promise<string> {
   const id = uniqueId(label);
   await db()
     .prepare(
-      `INSERT INTO workers (id, name, pubkey, created_at, hardware, dynamic, backend, protocol, auto_fetch, node_classes, model_inventory)
-       VALUES (?, ?, 'pk', ?, ?, ?, ?, ?, ?, ?, ?)`
+      `INSERT INTO workers (id, name, pubkey, created_at, hardware, dynamic, backend, protocol, auto_fetch, node_classes, model_inventory, peer_url)
+       VALUES (?, ?, 'pk', ?, ?, ?, ?, ?, ?, ?, ?, ?)`
     )
     .bind(
       id,
@@ -69,7 +70,8 @@ async function makeWorker(
       opts.protocol ?? 1,
       opts.autoFetch ? 1 : 0,
       JSON.stringify(opts.nodeClasses ?? []),
-      JSON.stringify(opts.modelInventory ?? [])
+      JSON.stringify(opts.modelInventory ?? []),
+      opts.peerUrl ?? null
     )
     .run();
   return id;
@@ -136,6 +138,17 @@ describe("requeueStale", () => {
     expect(job.last_worker_id).toBe(workerId);
     const worker = await getWorkerRow(workerId);
     expect(worker.status).toBe("offline");
+  });
+
+  it("clears peer_url on the stale/offline transition (Phase 3.1 P2P)", async () => {
+    const workerId = await makeWorker("w", { peerUrl: "http://192.168.1.5:8850" });
+    await setWorkerLastSeen(workerId, new Date(now().getTime() - 200_000));
+
+    await dispatch.requeueStale(db(), now());
+
+    const worker = await getWorkerRow(workerId);
+    expect(worker.status).toBe("offline");
+    expect(worker.peer_url).toBeNull();
   });
 
   it("leaves a worker that heartbeated recently alone", async () => {

@@ -27,7 +27,8 @@ async function insertWorker(id: string, name: string): Promise<void> {
 
 interface ReceiptFixture {
   id: string;
-  jobId: string;
+  /** Phase 3.1: null only for a p2p_upload receipt. */
+  jobId: string | null;
   workerId: string;
   gpuSeconds: number;
   kind: string;
@@ -35,13 +36,14 @@ interface ReceiptFixture {
   basis: string;
   workerSig: string | null;
   createdAt?: string;
+  bytes?: number | null;
 }
 
 async function insertReceipt(r: ReceiptFixture): Promise<void> {
   await db()
     .prepare(
-      `INSERT INTO receipts (id, job_id, worker_id, gpu_seconds, platform_sig, worker_sig, created_at, kind, billable, basis)
-       VALUES (?, ?, ?, ?, 'sig', ?, ?, ?, ?, ?)`
+      `INSERT INTO receipts (id, job_id, worker_id, gpu_seconds, platform_sig, worker_sig, created_at, kind, billable, basis, bytes)
+       VALUES (?, ?, ?, ?, 'sig', ?, ?, ?, ?, ?, ?)`
     )
     .bind(
       r.id,
@@ -52,7 +54,8 @@ async function insertReceipt(r: ReceiptFixture): Promise<void> {
       r.createdAt ?? toSqliteTimestamp(new Date()),
       r.kind,
       r.billable ? 1 : 0,
-      r.basis
+      r.basis,
+      r.bytes ?? null
     )
     .run();
 }
@@ -122,9 +125,10 @@ describe("GET /api/reports/contributions", () => {
         jobs: 1,
         gpu_seconds: 10,
         unbilled_gpu_seconds: 3,
+        p2p_upload_bytes: 0,
         receipts: [
-          { job_id: "j1", kind: "completed", billable: true, basis: "exec", gpu_seconds: 10, acked: true },
-          { job_id: "j2", kind: "failed", billable: false, basis: "wall", gpu_seconds: 3, acked: false },
+          { job_id: "j1", kind: "completed", billable: true, basis: "exec", gpu_seconds: 10, acked: true, bytes: null },
+          { job_id: "j2", kind: "failed", billable: false, basis: "wall", gpu_seconds: 3, acked: false, bytes: null },
         ],
       },
       {
@@ -133,9 +137,10 @@ describe("GET /api/reports/contributions", () => {
         jobs: 1,
         gpu_seconds: 5,
         unbilled_gpu_seconds: 7,
+        p2p_upload_bytes: 0,
         receipts: [
-          { job_id: "j3", kind: "completed", billable: true, basis: "exec", gpu_seconds: 5, acked: false },
-          { job_id: "j4", kind: "cancelled", billable: false, basis: "wall", gpu_seconds: 7, acked: true },
+          { job_id: "j3", kind: "completed", billable: true, basis: "exec", gpu_seconds: 5, acked: false, bytes: null },
+          { job_id: "j4", kind: "cancelled", billable: false, basis: "wall", gpu_seconds: 7, acked: true, bytes: null },
         ],
       },
     ]);
@@ -163,6 +168,72 @@ describe("GET /api/reports/contributions", () => {
     const r = await call("/api/reports/contributions", { method: "GET", cookie });
     expect(r.status).toBe(200);
     expect(r.body[0].name).toBe("");
+  });
+
+  it("sums p2p_upload bytes per worker, kept out of jobs/gpu_seconds (Phase 3.1 P2P)", async () => {
+    const { cookie } = await adminSession();
+    await insertWorker("w1", "alpha");
+    await insertReceipt({
+      id: "r1",
+      jobId: "j1",
+      workerId: "w1",
+      gpuSeconds: 10,
+      kind: "completed",
+      billable: true,
+      basis: "exec",
+      workerSig: null,
+    });
+    await insertReceipt({
+      id: "r2",
+      jobId: null,
+      workerId: "w1",
+      gpuSeconds: 0,
+      kind: "p2p_upload",
+      billable: false,
+      basis: "wall",
+      workerSig: null,
+      bytes: 1_500_000,
+    });
+    await insertReceipt({
+      id: "r3",
+      jobId: null,
+      workerId: "w1",
+      gpuSeconds: 0,
+      kind: "p2p_upload",
+      billable: false,
+      basis: "wall",
+      workerSig: null,
+      bytes: 500_000,
+    });
+
+    const r = await call("/api/reports/contributions", { method: "GET", cookie });
+    expect(r.status).toBe(200);
+    const worker = r.body.find((w: any) => w.worker_id === "w1");
+    expect(worker.jobs).toBe(1); // only the billable "completed" receipt
+    expect(worker.gpu_seconds).toBe(10);
+    expect(worker.p2p_upload_bytes).toBe(2_000_000);
+    expect(worker.unbilled_gpu_seconds).toBe(0); // p2p_upload's gpu_seconds is 0
+    const p2pEntries = worker.receipts.filter((rec: any) => rec.kind === "p2p_upload");
+    expect(p2pEntries).toHaveLength(2);
+    expect(p2pEntries.map((rec: any) => rec.job_id)).toEqual([null, null]);
+    expect(p2pEntries.map((rec: any) => rec.bytes).sort((a: number, b: number) => a - b)).toEqual([500_000, 1_500_000]);
+  });
+
+  it("p2p_upload_bytes is 0 when there are no p2p_upload receipts", async () => {
+    const { cookie } = await adminSession();
+    await insertWorker("w1", "alpha");
+    await insertReceipt({
+      id: "r1",
+      jobId: "j1",
+      workerId: "w1",
+      gpuSeconds: 10,
+      kind: "completed",
+      billable: true,
+      basis: "exec",
+      workerSig: null,
+    });
+    const r = await call("/api/reports/contributions", { method: "GET", cookie });
+    expect(r.body[0].p2p_upload_bytes).toBe(0);
   });
 
   it("filters by from/to range", async () => {
@@ -198,7 +269,7 @@ describe("GET /api/reports/contributions", () => {
     expect(r.status).toBe(200);
     expect(r.body).toHaveLength(1);
     expect(r.body[0].receipts).toEqual([
-      { job_id: "j-new", kind: "completed", billable: true, basis: "exec", gpu_seconds: 2, acked: false },
+      { job_id: "j-new", kind: "completed", billable: true, basis: "exec", gpu_seconds: 2, acked: false, bytes: null },
     ]);
   });
 

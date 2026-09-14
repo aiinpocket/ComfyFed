@@ -46,6 +46,33 @@ function bytesFor(gb: number): number {
   return Math.round(gb * GB);
 }
 
+// Phase 3.1 P2P: inserts an online, protocol>=4, peer_url-advertising
+// worker whose inventory reports (name, sizeBytes, sha256) -- the exact
+// "online seeder" predicate `core/peer.ts`'s `onlineSeeders` checks.
+async function seedOnlineSeeder(
+  id: string,
+  name: string,
+  sizeBytes: number,
+  sha256: string,
+  opts: { protocol?: number; peerUrl?: string | null; disabled?: boolean; status?: string } = {}
+): Promise<void> {
+  await db()
+    .prepare(
+      `INSERT INTO workers (id, name, pubkey, created_at, status, disabled, protocol, peer_url, model_inventory)
+       VALUES (?, ?, 'pk', '2026-01-01 00:00:00.000000', ?, ?, ?, ?, ?)`
+    )
+    .bind(
+      id,
+      id,
+      opts.status ?? "online",
+      opts.disabled ? 1 : 0,
+      opts.protocol ?? 4,
+      opts.peerUrl === undefined ? "http://192.168.1.5:8850" : opts.peerUrl,
+      JSON.stringify([{ name, size_bytes: sizeBytes, sha256 }])
+    )
+    .run();
+}
+
 // --- recordHash: consensus + conflict --------------------------------------
 
 describe("recordHash", () => {
@@ -185,6 +212,140 @@ describe("entries", () => {
     const entry = entries.find((e) => e.name === "clip_l.safetensors")!;
     expect(entry.size_bytes).toBe(bytesFor(0.5));
     expect(entry.size_bytes).not.toBe(bytesFor(0.23));
+  });
+});
+
+// --- recordHash: chunk_sha256s (Phase 3.1 P2P) ------------------------------
+
+describe("recordHash: chunk_sha256s", () => {
+  it("a first report's chunk list is stored alongside the whole-file hash", async () => {
+    const sha = await shaHex("a");
+    await modelManifest.recordHash(db(), "w1", "ckpt.safetensors", bytesFor(0.5), sha, ["c1", "c2"]);
+    const row = await db()
+      .prepare("SELECT chunk_sha256s FROM model_hashes WHERE name = ? AND size_bytes = ?")
+      .bind("ckpt.safetensors", bytesFor(0.5))
+      .first<{ chunk_sha256s: string | null }>();
+    expect(JSON.parse(row!.chunk_sha256s!)).toEqual(["c1", "c2"]);
+  });
+
+  it("a matching-hash reporter's chunk list fills in a still-empty column", async () => {
+    const sha = await shaHex("a");
+    await modelManifest.recordHash(db(), "w1", "ckpt.safetensors", bytesFor(0.5), sha); // no chunks yet
+    await modelManifest.recordHash(db(), "w2", "ckpt.safetensors", bytesFor(0.5), sha, ["c1", "c2"]);
+    const row = await db()
+      .prepare("SELECT chunk_sha256s FROM model_hashes WHERE name = ? AND size_bytes = ?")
+      .bind("ckpt.safetensors", bytesFor(0.5))
+      .first<{ chunk_sha256s: string | null }>();
+    expect(JSON.parse(row!.chunk_sha256s!)).toEqual(["c1", "c2"]);
+  });
+
+  it("a chunk list is never overwritten once set, even by a later different one", async () => {
+    const sha = await shaHex("a");
+    await modelManifest.recordHash(db(), "w1", "ckpt.safetensors", bytesFor(0.5), sha, ["c1", "c2"]);
+    await modelManifest.recordHash(db(), "w2", "ckpt.safetensors", bytesFor(0.5), sha, ["different"]);
+    const row = await db()
+      .prepare("SELECT chunk_sha256s FROM model_hashes WHERE name = ? AND size_bytes = ?")
+      .bind("ckpt.safetensors", bytesFor(0.5))
+      .first<{ chunk_sha256s: string | null }>();
+    expect(JSON.parse(row!.chunk_sha256s!)).toEqual(["c1", "c2"]);
+  });
+
+  it("a conflicting whole-file hash never contributes its chunk list", async () => {
+    await modelManifest.recordHash(db(), "w1", "ckpt.safetensors", bytesFor(0.5), await shaHex("a"));
+    const result = await modelManifest.recordHash(
+      db(),
+      "w2",
+      "ckpt.safetensors",
+      bytesFor(0.5),
+      await shaHex("b"),
+      ["conflicting-chunks"]
+    );
+    expect(result.conflict).toBe(true);
+    const row = await db()
+      .prepare("SELECT chunk_sha256s FROM model_hashes WHERE name = ? AND size_bytes = ?")
+      .bind("ckpt.safetensors", bytesFor(0.5))
+      .first<{ chunk_sha256s: string | null }>();
+    expect(row?.chunk_sha256s).toBeNull();
+  });
+});
+
+// --- entries(): peer-only entries + peer flag (Phase 3.1 P2P) --------------
+
+describe("entries: peer-only entries", () => {
+  it("a hash row with no known source and an online seeder becomes a peer-only entry", async () => {
+    const sha = await shaHex("private");
+    const sizeBytes = bytesFor(1.0);
+    await modelManifest.recordHash(db(), "w1", "loras/my_style.safetensors", sizeBytes, sha);
+    await seedOnlineSeeder("seeder1", "loras/my_style.safetensors", sizeBytes, sha);
+
+    const entries = await modelManifest.entries(db(), store(), await seed());
+    const entry = entries.find((e) => e.name === "my_style.safetensors");
+    expect(entry).toBeDefined();
+    expect(entry!.directory).toBe("loras");
+    expect(entry!.url).toBeNull();
+    expect(entry!.backup_url).toBeNull();
+    expect(entry!.peer).toBe(true);
+    expect(entry!.sha256).toBe(sha);
+    expect(entry!.size_bytes).toBe(sizeBytes);
+
+    const pubkeyHex = await derivePublicKeyHexFromSeed(await seed());
+    const payload = `${entry!.name}|${entry!.directory}|${entry!.sha256}|${entry!.size_bytes}`;
+    expect(await verifyHex(pubkeyHex, new TextEncoder().encode(payload), entry!.sig)).toBe(true);
+  });
+
+  it("no online seeder -> no peer-only entry at all", async () => {
+    const sha = await shaHex("private");
+    await modelManifest.recordHash(db(), "w1", "loras/my_style.safetensors", bytesFor(1.0), sha);
+    const entries = await modelManifest.entries(db(), store(), await seed());
+    expect(entries.some((e) => e.name === "my_style.safetensors")).toBe(false);
+  });
+
+  it("an offline seeder does not count", async () => {
+    const sha = await shaHex("private");
+    const sizeBytes = bytesFor(1.0);
+    await modelManifest.recordHash(db(), "w1", "loras/x.safetensors", sizeBytes, sha);
+    await seedOnlineSeeder("seeder1", "loras/x.safetensors", sizeBytes, sha, { status: "offline" });
+    const entries = await modelManifest.entries(db(), store(), await seed());
+    expect(entries.some((e) => e.name === "x.safetensors")).toBe(false);
+  });
+
+  it("a protocol-3 seeder does not count (peer requires protocol>=4)", async () => {
+    const sha = await shaHex("private");
+    const sizeBytes = bytesFor(1.0);
+    await modelManifest.recordHash(db(), "w1", "loras/x.safetensors", sizeBytes, sha);
+    await seedOnlineSeeder("seeder1", "loras/x.safetensors", sizeBytes, sha, { protocol: 3 });
+    const entries = await modelManifest.entries(db(), store(), await seed());
+    expect(entries.some((e) => e.name === "x.safetensors")).toBe(false);
+  });
+
+  it("a curated URL-sourced model with an online seeder gets peer:true alongside its url", async () => {
+    const sha = await shaHex("clip");
+    const sizeBytes = bytesFor(0.23);
+    await modelManifest.recordHash(db(), "w1", "text_encoders/clip_l.safetensors", sizeBytes, sha);
+    await seedOnlineSeeder("seeder1", "text_encoders/clip_l.safetensors", sizeBytes, sha);
+
+    const entries = await modelManifest.entries(db(), store(), await seed());
+    const entry = entries.find((e) => e.name === "clip_l.safetensors")!;
+    expect(entry.url).not.toBeNull();
+    expect(entry.peer).toBe(true);
+  });
+
+  it("no `peer` key at all when there's no online seeder (never `peer: false`)", async () => {
+    const sha = await shaHex("clip");
+    await modelManifest.recordHash(db(), "w1", "text_encoders/clip_l.safetensors", bytesFor(0.23), sha);
+    const entries = await modelManifest.entries(db(), store(), await seed());
+    const entry = entries.find((e) => e.name === "clip_l.safetensors")!;
+    expect("peer" in entry).toBe(false);
+  });
+});
+
+describe("peerOnlyNames", () => {
+  it("includes only entries whose url is null", () => {
+    const names = modelManifest.peerOnlyNames([
+      { name: "a", directory: "", url: "https://x", backup_url: null, sha256: "s", size_bytes: 1, sig: "sig" },
+      { name: "b", directory: "", url: null, backup_url: null, sha256: "s", size_bytes: 1, sig: "sig", peer: true },
+    ]);
+    expect([...names]).toEqual(["b"]);
   });
 });
 

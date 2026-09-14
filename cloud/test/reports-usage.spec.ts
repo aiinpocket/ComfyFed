@@ -69,7 +69,7 @@ async function insertJob(id: string, userId: string | null): Promise<void> {
 
 interface ReceiptFixture {
   id: string;
-  jobId: string;
+  jobId: string | null;
   workerId: string;
   gpuSeconds: number;
   kind?: string;
@@ -165,6 +165,37 @@ describe("GET /api/reports/usage", () => {
     });
     expect(rows).toHaveLength(3);
     expect(rows.map((row) => row.gpu_seconds)).toEqual([...rows.map((row) => row.gpu_seconds)].sort((a, b) => b - a));
+  });
+
+  it("L4 final-review fix: excludes p2p_upload receipts entirely (no phantom null-user row)", async () => {
+    const admin = await adminSession();
+    await insertWorker("w1", "alpha");
+    const aliceId = await createUser(admin, "alice", "alice-pw-123");
+
+    await insertJob("job-alice-1", aliceId);
+    await insertReceipt({ id: "r1", jobId: "job-alice-1", workerId: "w1", gpuSeconds: 10 });
+    // job_id is always NULL for a p2p_upload receipt -- this used to fold
+    // into a phantom {username: null, jobs: 0, gpu_seconds: 0} row via the
+    // outer join. It must now be excluded from /usage entirely.
+    await insertReceipt({
+      id: "r2",
+      jobId: null,
+      workerId: "w1",
+      gpuSeconds: 0,
+      kind: "p2p_upload",
+      billable: false,
+    });
+
+    const r = await call("/api/reports/usage", { method: "GET", cookie: admin.cookie });
+    expect(r.status).toBe(200);
+    const rows: any[] = r.body;
+    const byUser = new Map(rows.map((row) => [row.user_id, row]));
+
+    expect(byUser.get(aliceId)).toEqual({
+      user_id: aliceId, username: "alice", jobs: 1, gpu_seconds: 10, unbilled_gpu_seconds: 0,
+    });
+    expect(byUser.has(null)).toBe(false);
+    expect(rows).toHaveLength(1);
   });
 
   it("returns an empty list when there are no receipts", async () => {

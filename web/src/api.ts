@@ -171,6 +171,9 @@ export interface Worker {
   backend: string;
   torch_version: string;
   model_count: number;
+  /** Phase 3.1 P2P: set when this worker's agent opted into serving chunks
+   * to other workers (`hello.peer_url`); null otherwise. */
+  peer_url: string | null;
 }
 
 export type JobStatus = 'queued' | 'assigned' | 'running' | 'done' | 'failed' | 'cancelled';
@@ -274,6 +277,9 @@ export interface Contribution {
   name: string;
   jobs: number;
   gpu_seconds: number;
+  /** Phase 3.1 P2P: total bytes this worker served across its
+   * `p2p_upload` receipts in the report's date range (0 when none). */
+  p2p_upload_bytes: number;
 }
 
 /** Row shape shared by `GET /api/reports/usage` (one per user) and

@@ -20,7 +20,7 @@ import httpx
 import websockets
 from nacl.signing import SigningKey
 
-from . import comfy, fetcher, hardware, signing, whitelist
+from . import comfy, fetcher, hardware, peerserve, signing, whitelist
 from .config import AgentConfig, PlatformEntry
 
 logger = logging.getLogger(__name__)
@@ -88,6 +88,13 @@ class PlatformConnection:
         # genuine change from a no-op rescan without resending the whole
         # (possibly large) model list just to compare it.
         self.model_inventory_hash: str = ""
+        # M7 final-review fix: name -> sha256 for every model whose
+        # `chunk_sha256s` has actually been sent to the platform on THIS
+        # connection. `_dedup_chunk_lists` consults this to omit
+        # `chunk_sha256s` from an inventory report for a file whose chunk
+        # list the platform already has at the same sha256 -- only the first
+        # report after connect, or a file (re)hashed since, carries it.
+        self.chunks_sent: dict[str, str] = {}
 
     def _ws_url(self) -> str:
         parsed = urlsplit(self.entry.platform_url)
@@ -124,26 +131,34 @@ class PlatformConnection:
     async def recv(self) -> dict:
         return json.loads(await self.ws.recv())
 
-    async def send_hello(self, hardware_info: dict, backend: str, torch_version: str, node_classes) -> None:
-        await self._send(
-            {
-                "type": "hello",
-                "hardware": hardware_info,
-                "backend": backend,
-                "torch_version": torch_version,
-                "node_classes": sorted(node_classes),
-                # Protocol 3: adds `auto_fetch` (below) and lazy sha256
-                # hashes on inventory entries (see hardware.scan_models) --
-                # groundwork for Phase 2.1 model auto-distribution. Still
-                # guarantees everything protocol 2 did: `exec_seconds` on
-                # job_done/job_failed whenever the run actually started, and
-                # understands `job_cancelled` pushes. See agentws.py. A
-                # server that doesn't know protocol 3 yet just ignores the
-                # unknown fields.
-                "protocol": 3,
-                "auto_fetch": self.config.auto_fetch_models,
-            }
-        )
+    async def send_hello(
+        self,
+        hardware_info: dict,
+        backend: str,
+        torch_version: str,
+        node_classes,
+        peer_url: Optional[str] = None,
+    ) -> None:
+        message = {
+            "type": "hello",
+            "hardware": hardware_info,
+            "backend": backend,
+            "torch_version": torch_version,
+            "node_classes": sorted(node_classes),
+            # Protocol 4 (Phase 3.1 P2P addendum): adds the optional
+            # `peer_url` field below, advertised only when this worker's
+            # peer HTTP server is enabled (see peerserve.is_enabled). Still
+            # guarantees everything protocol 3 did: `auto_fetch` and lazy
+            # sha256/chunk hashes on inventory entries (hardware.scan_models),
+            # `exec_seconds` on job_done/job_failed, and job_cancelled
+            # pushes. A server that doesn't know protocol 4 yet just ignores
+            # the unknown fields (see agentws.py).
+            "protocol": 4,
+            "auto_fetch": self.config.auto_fetch_models,
+        }
+        if peer_url:
+            message["peer_url"] = peer_url
+        await self._send(message)
 
     async def send_inventory(self, models: list[dict]) -> None:
         await self._send({"type": "inventory", "models": models})
@@ -230,6 +245,40 @@ def _model_inventory_digest(models: list[dict]) -> str:
     """
     canonical = json.dumps(sorted(models, key=lambda m: m["name"]), sort_keys=True)
     return hashlib.sha256(canonical.encode()).hexdigest()
+
+
+def _dedup_chunk_lists(models: list[dict], chunks_sent: dict[str, str]) -> tuple[list[dict], dict[str, str]]:
+    """M7 final-review fix: strip `chunk_sha256s` from an outgoing inventory
+    entry whose (name, sha256) was already sent-with-chunks on this same
+    connection, per `chunks_sent` -- spec: 庫存回報攜帶分塊表僅在整檔雜湊首次回報或
+    變更時傳. Returns `(outgoing_models, updates)`; `updates` is every
+    (name -> sha256) pair that DOES go out with its chunk list this call --
+    the caller applies it to `conn.chunks_sent` only once `send_inventory`
+    actually succeeds (mirroring how `model_inventory_hash` is only updated
+    after a successful send), so a failed send never wrongly marks a chunk
+    list as delivered.
+
+    Every other field is untouched -- the server already tolerates (and
+    first-wins-stores) an inventory entry with no `chunk_sha256s`
+    (`model_manifest.record_hash`'s `chunk_json is None` branch), so omitting
+    it here is purely a payload-size optimization, never a behavior change
+    for the server side.
+    """
+    out: list[dict] = []
+    updates: dict[str, str] = {}
+    for entry in models:
+        chunk_list = entry.get("chunk_sha256s")
+        name = entry.get("name")
+        sha256 = entry.get("sha256")
+        if not chunk_list or not isinstance(name, str) or not isinstance(sha256, str):
+            out.append(entry)
+            continue
+        if chunks_sent.get(name) == sha256:
+            out.append({k: v for k, v in entry.items() if k != "chunk_sha256s"})
+        else:
+            out.append(entry)
+            updates[name] = sha256
+    return out, updates
 
 
 def _is_safe_relative_path(path: str) -> bool:
@@ -498,6 +547,12 @@ class AgentLoop:
         # recognised as "already shutting down" and forces an immediate exit
         # instead of layering a second wind-down on top of the first.
         self._shutdown_in_progress = False
+        # Phase 3.1 P2P addendum (種子端): started in `run()` when
+        # `peerserve.is_enabled(config)`, stopped in `shutdown()`. One
+        # listener for the whole process, shared across every platform
+        # connection (see peerserve.PeerHTTPServer's docstring).
+        self._peer_server: Optional["peerserve.PeerHTTPServer"] = None
+        self._peer_advertised_url: Optional[str] = None
 
     async def broadcast_heartbeat(
         self,
@@ -580,8 +635,9 @@ class AgentLoop:
         if digest == conn.model_inventory_hash:
             return
 
+        outgoing, chunk_updates = _dedup_chunk_lists(models, conn.chunks_sent)
         try:
-            await conn.send_inventory(models)
+            await conn.send_inventory(outgoing)
         except Exception:
             logger.exception(
                 "runner: failed to push updated model inventory to %s", conn.entry.platform_url
@@ -589,6 +645,7 @@ class AgentLoop:
             return
 
         conn.model_inventory_hash = digest
+        conn.chunks_sent.update(chunk_updates)
 
     async def handle_job(self, conn: PlatformConnection, job_msg: dict) -> None:
         """Run one job dispatched over `conn`, broadcasting busy state to every platform.
@@ -679,6 +736,11 @@ class AgentLoop:
                         max_fetch_gb=self.config.max_fetch_gb,
                         cancel_event=handle.cancel_event,
                         report_progress=report_fetch_progress,
+                        # Phase 3.1 P2P addendum: the ISSUING platform (the
+                        # one that dispatched this job over `conn`) is who
+                        # mints a peer grant -- fetcher tries that source
+                        # first, per entry, before falling to the URL chain.
+                        platform_entry=conn.entry,
                     )
 
                     # Fetch phase over: from here on heartbeats go back to
@@ -1328,6 +1390,48 @@ class AgentLoop:
         self._stop_tasks.clear()
         self._jobs.clear()
 
+        if self._peer_server is not None:
+            try:
+                self._peer_server.stop()
+            except Exception:
+                logger.exception("runner: failed to stop peer HTTP server cleanly")
+            self._peer_server = None
+            self._peer_advertised_url = None
+
+    def _start_peer_server(self) -> None:
+        """Start the peer HTTP server when `peer_serve`/`peer_listen_port`
+        are configured, so `_run_platform` has an advertisable `peer_url`
+        for every connection's `hello`. Best-effort: a bind failure (port in
+        use, no permission) disables peer serving for this run rather than
+        crashing agent startup -- the agent still works fine as a puller-only
+        or non-P2P worker.
+        """
+        if not peerserve.is_enabled(self.config):
+            return
+        if not self.config.models_dir:
+            logger.warning(
+                "runner: peer_serve is enabled but models_dir is not configured; "
+                "skipping the peer HTTP server for this run"
+            )
+            return
+        try:
+            self._peer_server = peerserve.PeerHTTPServer(
+                models_dir=self.config.models_dir,
+                port=self.config.peer_listen_port,
+                platforms=list(self.config.platforms),
+                bind_host=self.config.peer_bind_host,
+            )
+            self._peer_server.start()
+            self._peer_advertised_url = peerserve.advertised_url(self.config)
+            logger.info(
+                "runner: peer HTTP server listening on port %s, advertising %s",
+                self.config.peer_listen_port, self._peer_advertised_url,
+            )
+        except Exception:
+            logger.exception("runner: failed to start the peer HTTP server; P2P serving disabled for this run")
+            self._peer_server = None
+            self._peer_advertised_url = None
+
     def _install_signal_handlers(self, loop: asyncio.AbstractEventLoop) -> None:
         """Install SIGINT/SIGTERM (and SIGBREAK on Windows) handlers.
 
@@ -1498,15 +1602,23 @@ class AgentLoop:
                     self.config.comfy_url,
                     self.config.whitelist_extra,
                 )
-                await conn.send_hello(hw, backend, torch_version, allowed)
+                await conn.send_hello(hw, backend, torch_version, allowed, peer_url=self._peer_advertised_url)
 
                 models = (
                     hardware.scan_models(self.config.models_dir, hash_models=self.config.hash_models)
                     if self.config.models_dir
                     else []
                 )
-                await conn.send_inventory(models)
+                # M7 final-review fix: a fresh connection (including a
+                # reconnect) always sends every currently-hashed file's
+                # chunk_sha256s at least once -- `chunks_sent` resets here so
+                # "first report after connect" is exactly the hello-time
+                # inventory send, matching the spec's wording literally.
+                conn.chunks_sent = {}
+                outgoing, chunk_updates = _dedup_chunk_lists(models, conn.chunks_sent)
+                await conn.send_inventory(outgoing)
                 conn.model_inventory_hash = _model_inventory_digest(models)
+                conn.chunks_sent.update(chunk_updates)
 
                 await self.refresh_object_info(conn)
 
@@ -1538,6 +1650,7 @@ class AgentLoop:
             return
         loop = asyncio.get_running_loop()
         self._install_signal_handlers(loop)
+        self._start_peer_server()
         try:
             await asyncio.gather(*(self._run_platform(conn) for conn in self.connections.values()))
         finally:

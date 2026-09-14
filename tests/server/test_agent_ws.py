@@ -270,6 +270,135 @@ def test_job_push_includes_fetch_models_for_an_eligible_after_fetch_worker(clien
         assert session.get(db.Job, job_id).status == "assigned"
 
 
+def test_job_push_includes_peer_only_entry_for_a_protocol_4_worker(client):
+    """Phase 3.1 P2P: a model with NO download source but an online seeder
+    becomes a peer-only `fetch_models` entry (`url`/`backup_url` None,
+    `peer: True`) in the push to a protocol>=4 puller -- the dispatch-time
+    re-verdict (`agentws._fetch_models_for_push`) embeds exactly what
+    `model_manifest.entries()` built, peer-only shape included."""
+    csrf = _login(client)
+    seeder_id, _seeder_sk = _register_worker(client, csrf, "seeder")
+    with db.get_session() as session:
+        seeder = session.get(db.Worker, seeder_id)
+        seeder.status = "online"
+        seeder.protocol = 4
+        seeder.peer_url = "http://10.0.0.9:8850"
+        seeder.model_inventory = json.dumps(
+            [{
+                "name": "loras/wuxia/my_style.safetensors",
+                "size_bytes": _bytes(0.5),
+                "sha256": _sha("style"),
+            }]
+        )
+        session.commit()
+    model_manifest.record_hash(
+        seeder_id, "loras/wuxia/my_style.safetensors", _bytes(0.5), _sha("style")
+    )
+
+    puller_id, sk = _register_worker(client, csrf, "puller")
+
+    workflow = {"1": {"class_type": "LoraLoader", "inputs": {"lora_name": "wuxia/my_style.safetensors"}}}
+    job_id = _submit(client, csrf, workflow=workflow)
+
+    with client.websocket_connect("/api/agent/ws") as ws:
+        challenge = ws.receive_json()
+        sig = sk.sign(challenge["nonce"].encode()).signature.hex()
+        ws.send_json({"type": "auth", "worker_id": puller_id, "sig": sig})
+        assert ws.receive_json()["type"] == "ready"
+
+        ws.send_json(
+            {
+                "type": "hello",
+                "hardware": {},
+                "backend": "cuda",
+                "torch_version": "",
+                "node_classes": [],
+                "protocol": 4,
+                "auto_fetch": True,
+            }
+        )
+        ws.send_json(
+            {
+                "type": "heartbeat",
+                "state": "idle",
+                "progress": 0.0,
+                "job_id": None,
+                "dynamic": {"free_disk_gb": 100.0},
+            }
+        )
+        agentws.dispatch_once(puller_id)
+
+        job_msg = ws.receive_json()
+        assert job_msg["job_id"] == job_id
+        assert "fetch_models" in job_msg
+        entries = job_msg["fetch_models"]
+        assert len(entries) == 1
+        entry = entries[0]
+        assert entry["name"] == "wuxia/my_style.safetensors"
+        assert entry["directory"] == "loras"
+        assert entry["url"] is None
+        assert entry["backup_url"] is None
+        assert entry["peer"] is True
+
+    with db.get_session() as session:
+        assert session.get(db.Job, job_id).status == "assigned"
+
+
+def test_job_push_omits_peer_only_model_job_from_a_protocol_3_worker(client):
+    """A protocol-3 worker is not peer-pull capable -- a job needing a
+    peer-only model must never be pushed to it (it stays queued, not
+    assigned, since no other worker is idle/eligible either)."""
+    csrf = _login(client)
+    seeder_id, _seeder_sk = _register_worker(client, csrf, "seeder")
+    with db.get_session() as session:
+        seeder = session.get(db.Worker, seeder_id)
+        seeder.status = "online"
+        seeder.protocol = 4
+        seeder.peer_url = "http://10.0.0.9:8850"
+        seeder.model_inventory = json.dumps(
+            [{"name": "loras/x.safetensors", "size_bytes": _bytes(0.2), "sha256": _sha("x")}]
+        )
+        session.commit()
+    model_manifest.record_hash(seeder_id, "loras/x.safetensors", _bytes(0.2), _sha("x"))
+
+    puller_id, sk = _register_worker(client, csrf, "puller-old")
+
+    workflow = {"1": {"class_type": "LoraLoader", "inputs": {"lora_name": "x.safetensors"}}}
+    job_id = _submit(client, csrf, workflow=workflow)
+
+    with client.websocket_connect("/api/agent/ws") as ws:
+        challenge = ws.receive_json()
+        sig = sk.sign(challenge["nonce"].encode()).signature.hex()
+        ws.send_json({"type": "auth", "worker_id": puller_id, "sig": sig})
+        assert ws.receive_json()["type"] == "ready"
+
+        ws.send_json(
+            {
+                "type": "hello",
+                "hardware": {},
+                "backend": "cuda",
+                "torch_version": "",
+                "node_classes": [],
+                "protocol": 3,
+                "auto_fetch": True,
+            }
+        )
+        ws.send_json(
+            {
+                "type": "heartbeat",
+                "state": "idle",
+                "progress": 0.0,
+                "job_id": None,
+                "dynamic": {"free_disk_gb": 100.0},
+            }
+        )
+        agentws.dispatch_once(puller_id)
+        ws.send_json({"type": "heartbeat", "state": "idle", "progress": 0.0, "job_id": None, "dynamic": {}})
+
+    with db.get_session() as session:
+        assert session.get(db.Job, job_id).status == "queued"
+
+
 def test_job_push_never_sent_to_a_protocol_2_worker_even_when_manifest_covers_it(client):
     """Defensive gate: a protocol<3 agent can never be dispatched an
     eligible_after_fetch job at all (assess._eligible_after_fetch already
@@ -2161,6 +2290,169 @@ def test_hello_without_auto_fetch_field_defaults_to_false(client):
         with db.get_session() as session:
             worker = session.get(db.Worker, worker_id)
             assert worker.auto_fetch is False
+    finally:
+        ws.close()
+
+
+def test_hello_with_protocol_4_is_accepted_with_no_deprecation_frame(client):
+    """Phase 3.1: protocol 4 (chunk-hash fields + peer_url) is a new agent,
+    not an old one -- it must be recorded plainly and never earn the
+    protocol-too-old deprecation frame."""
+    csrf = _login(client)
+    worker_id, sk = _register_worker(client, csrf, "w1")
+    job_id = _submit(client, csrf)
+
+    ws = _connect(client, worker_id, sk)
+    try:
+        ws.send_json(
+            {
+                "type": "hello",
+                "hardware": {"cpu": "x"},
+                "backend": "cuda",
+                "torch_version": "2.0",
+                "node_classes": [],
+                "protocol": 4,
+            }
+        )
+        ws.send_json({"type": "heartbeat", "state": "idle", "progress": 0.0, "job_id": None, "dynamic": {}})
+        agentws.dispatch_once(worker_id)
+
+        # First frame is the job push, not a deprecation notice.
+        job_msg = ws.receive_json()
+        assert job_msg["type"] == "job"
+        assert job_msg["job_id"] == job_id
+
+        with db.get_session() as session:
+            worker = session.get(db.Worker, worker_id)
+            assert worker.protocol == 4
+    finally:
+        ws.close()
+
+
+def test_hello_stores_valid_peer_url(client):
+    """Phase 3.1 P2P: a protocol-4 agent with peer_serve enabled advertises
+    its seeder endpoint in hello.peer_url; it must land on Worker.peer_url
+    verbatim."""
+    csrf = _login(client)
+    worker_id, sk = _register_worker(client, csrf, "w1")
+
+    ws = _connect(client, worker_id, sk)
+    try:
+        ws.send_json(
+            {
+                "type": "hello",
+                "hardware": {"cpu": "x"},
+                "backend": "cuda",
+                "torch_version": "2.0",
+                "node_classes": [],
+                "protocol": 4,
+                "peer_url": "http://192.168.1.5:8850",
+            }
+        )
+        agentws.dispatch_once(worker_id)
+
+        with db.get_session() as session:
+            worker = session.get(db.Worker, worker_id)
+            assert worker.peer_url == "http://192.168.1.5:8850"
+    finally:
+        ws.close()
+
+
+def test_hello_without_peer_url_leaves_it_none(client):
+    csrf = _login(client)
+    worker_id, sk = _register_worker(client, csrf, "w1")
+
+    ws = _connect(client, worker_id, sk)
+    try:
+        ws.send_json(
+            {
+                "type": "hello",
+                "hardware": {"cpu": "x"},
+                "backend": "cuda",
+                "torch_version": "2.0",
+                "node_classes": [],
+                "protocol": 4,
+            }
+        )
+        agentws.dispatch_once(worker_id)
+
+        with db.get_session() as session:
+            worker = session.get(db.Worker, worker_id)
+            assert worker.peer_url is None
+    finally:
+        ws.close()
+
+
+@pytest.mark.parametrize(
+    "bad_peer_url",
+    [
+        "not-a-url",
+        "ftp://192.168.1.5:8850",
+        "http://",
+        "javascript:alert(1)",
+        123,
+    ],
+)
+def test_hello_with_invalid_peer_url_is_ignored_and_logged(client, caplog, bad_peer_url):
+    """An invalid peer_url (bad scheme, no host, wrong type) must never be
+    stored -- it's ignored with a log line, not silently coerced or crashed
+    on."""
+    csrf = _login(client)
+    worker_id, sk = _register_worker(client, csrf, "w1")
+
+    ws = _connect(client, worker_id, sk)
+    try:
+        with caplog.at_level(logging.WARNING):
+            ws.send_json(
+                {
+                    "type": "hello",
+                    "hardware": {"cpu": "x"},
+                    "backend": "cuda",
+                    "torch_version": "2.0",
+                    "node_classes": [],
+                    "protocol": 4,
+                    "peer_url": bad_peer_url,
+                }
+            )
+            agentws.dispatch_once(worker_id)
+
+        with db.get_session() as session:
+            worker = session.get(db.Worker, worker_id)
+            assert worker.peer_url is None
+        assert any("peer_url" in rec.message for rec in caplog.records)
+    finally:
+        ws.close()
+
+
+def test_hello_replaces_stale_peer_url_when_no_longer_advertised(client):
+    """peer_url is fully replaced from each hello, same as the other hello
+    fields -- an agent that reconnects with peer_serve now off must not
+    keep a previous session's endpoint alive."""
+    csrf = _login(client)
+    worker_id, sk = _register_worker(client, csrf, "w1")
+
+    with db.get_session() as session:
+        worker = session.get(db.Worker, worker_id)
+        worker.peer_url = "http://old-host:8850"
+        session.commit()
+
+    ws = _connect(client, worker_id, sk)
+    try:
+        ws.send_json(
+            {
+                "type": "hello",
+                "hardware": {"cpu": "x"},
+                "backend": "cuda",
+                "torch_version": "2.0",
+                "node_classes": [],
+                "protocol": 4,
+            }
+        )
+        agentws.dispatch_once(worker_id)
+
+        with db.get_session() as session:
+            worker = session.get(db.Worker, worker_id)
+            assert worker.peer_url is None
     finally:
         ws.close()
 

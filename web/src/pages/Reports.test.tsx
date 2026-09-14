@@ -42,7 +42,7 @@ if (!('ResizeObserver' in window)) {
 }
 
 const CONTRIBUTIONS: Contribution[] = [
-  { worker_id: 'w1', name: 'runner-1', jobs: 3, gpu_seconds: 120 },
+  { worker_id: 'w1', name: 'runner-1', jobs: 3, gpu_seconds: 120, p2p_upload_bytes: 1_572_864 },
 ];
 
 const USAGE_ROWS: UsageRow[] = [
@@ -110,6 +110,8 @@ describe('Reports page: admin role', () => {
     expect(screen.getByRole('tab', { name: /Payout estimate/ })).toBeInTheDocument();
 
     expect(await screen.findByText('runner-1')).toBeInTheDocument();
+    // Task 7: P2P upload volume column, human-readable via formatBytes.
+    expect(await screen.findByText('1.5 MB')).toBeInTheDocument();
   });
 
   it('switching to the 使用者用量 tab loads /api/reports/usage and renders a legacy row', async () => {

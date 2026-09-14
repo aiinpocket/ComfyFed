@@ -80,12 +80,17 @@ function parseDateParam(value: string): string {
 }
 
 interface ReceiptEntry {
-  job_id: string;
+  job_id: string | null;
   kind: string;
   billable: boolean;
   basis: string;
   gpu_seconds: number;
   acked: boolean;
+  /** Phase 3.1: the receipt's `bytes` column -- present (non-null) only for
+   * kind === "p2p_upload"; null for every other kind. Documented here rather
+   * than omitted entirely, matching how every other optional field on this
+   * payload (e.g. `job_id`) is handled. */
+  bytes: number | null;
 }
 
 interface WorkerAggregate {
@@ -94,6 +99,9 @@ interface WorkerAggregate {
   jobs: number;
   gpu_seconds: number;
   unbilled_gpu_seconds: number;
+  /** Phase 3.1: sum of `.bytes` over this worker's `kind === "p2p_upload"`
+   * receipts in the date range -- 0 when none. */
+  p2p_upload_bytes: number;
   receipts: ReceiptEntry[];
 }
 
@@ -109,6 +117,7 @@ function aggregate(receipts: Receipt[], names: Map<string, string>): WorkerAggre
         jobs: 0,
         gpu_seconds: 0,
         unbilled_gpu_seconds: 0,
+        p2p_upload_bytes: 0,
         receipts: [],
       };
       byWorker.set(rec.workerId, entry);
@@ -121,6 +130,10 @@ function aggregate(receipts: Receipt[], names: Map<string, string>): WorkerAggre
       entry.unbilled_gpu_seconds += rec.gpuSeconds;
     }
 
+    if (rec.kind === "p2p_upload" && typeof rec.bytes === "number") {
+      entry.p2p_upload_bytes += rec.bytes;
+    }
+
     entry.receipts.push({
       job_id: rec.jobId,
       kind: rec.kind,
@@ -128,6 +141,7 @@ function aggregate(receipts: Receipt[], names: Map<string, string>): WorkerAggre
       basis: rec.basis,
       gpu_seconds: rec.gpuSeconds,
       acked: rec.workerSig !== null,
+      bytes: rec.bytes,
     });
   }
 

@@ -192,6 +192,39 @@ UPDATE model_hashes SET conflict = 0 WHERE name = '...' AND size_bytes = ...;
 
 There's no admin-UI conflict-resolution button this phase — this manual query is the only recovery path.
 
+### Member-to-member P2P chunked transfer
+
+Besides the official-download-then-GCS-backup chain, workers can also hand model files to each other directly: a worker missing a model a job needs first asks the platform for a transfer grant, then pulls the file in 64 MiB HTTP Range chunks from another online worker that already has it, falling back to the official download chain only if that fails. This unlocks one extra capability: **a private model with no official download URL can still be dispatched, as long as some online member is sharing it right now** — whether it's dispatchable is fully transparent in the dispatch verdict and in the job page's ineligibility reasons, never a silent failure.
+
+**Enabling it (off by default)**: each worker decides for itself whether to share its models, via `agent.json`:
+
+```json
+{
+  "peer_serve": true,
+  "peer_listen_port": 8850,
+  "peer_advertise_host": "your-lan-or-public-ip",
+  "peer_bind_host": "0.0.0.0"
+}
+```
+
+- `peer_serve` (default `false`): when off, the agent never starts the sharing HTTP service, and never advertises any peer address in its handshake (`hello`) -- advertised once at handshake time only, not on every heartbeat.
+- `peer_listen_port`: required for sharing to actually turn on (`peer_serve: true` alone with no port is a no-op). This listener is a stdlib HTTP server built into the agent — no new dependency — and only serves one route, `GET /peer/models/<name>`; each connection gets a 30-second socket timeout so an idle connection doesn't hold a thread forever.
+- `peer_advertise_host` (optional): left unset, the agent auto-detects its LAN IP to advertise; if the worker sits behind NAT and other members need a fixed IP or DDNS name to reach it, set the reachable address here.
+- `peer_bind_host` (optional, default `"0.0.0.0"`): which interface the listener binds. **If this machine has a public IP** (a rented GPU box, the common case), the default exposes the sharing listener to the entire internet the moment `peer_serve` is on — to restrict it to a LAN/VPN, set this to a LAN interface IP (e.g. `192.168.1.10`) or `127.0.0.1` (only combined with a reverse proxy).
+- **Remember to open `peer_listen_port` in your firewall** — otherwise, once the platform picks you as a seeder, pullers still can't reach you (it just falls back to the official download chain instead of stalling the job, but your share does nothing).
+- **Sharing and "job intake disabled" are independent**: disabling a worker on the Workers page (so it stops taking new jobs) doesn't stop it from continuing to share models it already has; conversely, `peer_serve: false` only turns off sharing — it doesn't affect normal job intake. The two can be combined any way you like.
+
+**Security model**: every single transfer requires a grant — there's no anonymous path.
+
+- The puller (an already signature-verified agent request) asks the platform for an **Ed25519-signed transfer grant**, valid for **10 minutes**, bound to one file, one puller, and one seeder — not something a worker can hold onto and reuse at will; once it expires, a fresh one has to be requested.
+- The seeder (the worker sharing the model) **verifies the grant on every single request, before even consulting its own inventory**: platform signature, expiry, whether `seeder_id` matches itself, and whether the requested name matches its local inventory — a missing grant, a bad signature, an expired grant, or a mismatched range all **fail closed with a bare 403**, leaking no detail (including whether a given filename even exists — an unauthenticated request always gets 403, never a name-revealing 404).
+- Workers **never keep standing trust with each other** — sharing a model with one member today doesn't let that member reconnect without a grant later; every transfer needs a freshly issued one from the platform.
+- Per-chunk hashes only exist to abort a bad chunk early; the **final whole-file SHA-256 verification always runs**, same iron rule as any other model download — the chunk table itself is never the trust root.
+- **Transfers are currently plaintext HTTP**: the grant only authorizes *who can pull what* — it does not encrypt the content. Both the `X-ComfyFed-Grant` header and the model bytes travel unencrypted, and the grant is a bearer credential: anyone who observes that header within its 10-minute window can pull the file it authorizes. If your members talk over a public network, only enable this feature within a trusted LAN or VPN (Tailscale, WireGuard, etc.) — don't expose `peer_listen_port` to the open internet.
+- **The advertised address is self-reported by the worker, and the platform does not independently verify it**: `peer_advertise_host` (or the auto-detected IP) is never probed or reverse-checked by the platform, so a malicious worker could in principle advertise an address reachable only from inside the platform's or another member's network (e.g. `127.0.0.1`, `169.254.169.254`, another worker's LAN IP), causing other agents to issue a ranged GET against it. The response gets discarded on a signature/shape mismatch, so nothing is exfiltrated, but this is still an address-unfiltered request-forwarding surface — `peer_url` is trusted only as far as the worker's own registration trust already extends, no further.
+
+**Bandwidth accounting**: once a seeder finishes serving a grant, it reports the bytes served back to the platform, which records it in the receipt ledger (`kind: p2p_upload`, non-billable, no GPU seconds); the Reports page's contribution report gains a "P2P upload volume" column, and the Workers page shows whether each worker is currently sharing models and what address it's advertising.
+
 ### Job assessment
 
 When a job arrives, the server automatically extracts the node classes, model files, and (when known) VRAM needs from the workflow, and rules on each candidate worker:
@@ -318,8 +351,8 @@ Once published, an agent asks `/api/agent/version` at startup, compares versions
 - Model manifest distribution (to actually implement `eligible_after_fetch` transfers)
 - S3/R2-compatible artifact storage
 
-**Phase 3** (**multi-user accounts plus multi-admin support and payout estimation shipped in Phase 3.0**: an admin can create and manage other user accounts, and the Reports page offers payout estimation — enter a pool amount and it's split by each worker's contribution share; see "Users & permissions" above. The two items below remain for Phase 3.1)
-- Member-to-member P2P chunked transfer
+**Phase 3** (**multi-user accounts plus multi-admin support and payout estimation shipped in Phase 3.0**: an admin can create and manage other user accounts, and the Reports page offers payout estimation — enter a pool amount and it's split by each worker's contribution share; see "Users & permissions" above. **Member-to-member P2P chunked transfer shipped in Phase 3.1 (2026-09-14)**, see "Member-to-member P2P chunked transfer" above. The item below remains outstanding)
+- ~~Member-to-member P2P chunked transfer~~ ✅ Phase 3.1
 - Revenue-share ledger (today's payout estimation only computes ratios — it doesn't record actual disbursements)
 
 **ComfyFed Cloud** (shipped): a hosted variant built on Cloudflare Workers + D1 + R2, so there's no machine of your own to keep powered on. See [`cloud/README.md`](../cloud/README.md).

@@ -20,6 +20,7 @@ describe("D1 migration 0001_initial", () => {
         "login_attempts",
         "model_hashes",
         "nonces",
+        "p2p_grants",
         "receipts",
         "register_tokens",
         "settings",
@@ -152,5 +153,100 @@ describe("D1 migration 0006_users", () => {
 
     const attemptCols = await db.prepare("PRAGMA table_info(login_attempts)").all<{ name: string }>();
     expect(attemptCols.results.some((c) => c.name === "username")).toBe(true);
+  });
+});
+
+// Phase 3.1 addendum (P2P), Task 8 cloud parity.
+describe("D1 migration 0007_p2p", () => {
+  it("model_hashes has chunk_sha256s and workers has peer_url", async () => {
+    const db = (env as any).DB as D1Database;
+    const hashCols = await db.prepare("PRAGMA table_info(model_hashes)").all<{ name: string }>();
+    expect(hashCols.results.some((c) => c.name === "chunk_sha256s")).toBe(true);
+
+    const workerCols = await db.prepare("PRAGMA table_info(workers)").all<{ name: string }>();
+    expect(workerCols.results.some((c) => c.name === "peer_url")).toBe(true);
+  });
+
+  it("receipts has a nullable job_id and a bytes column, preserving every other column", async () => {
+    const db = (env as any).DB as D1Database;
+    const cols = await db.prepare("PRAGMA table_info(receipts)").all<{ name: string; notnull: number }>();
+    const byName = new Map(cols.results.map((c) => [c.name, c]));
+    expect(byName.get("job_id")?.notnull).toBe(0);
+    expect(byName.has("bytes")).toBe(true);
+    for (const col of ["id", "worker_id", "gpu_seconds", "platform_sig", "worker_sig", "created_at", "kind", "billable", "basis"]) {
+      expect(byName.has(col), `receipts.${col} missing after rebuild`).toBe(true);
+    }
+
+    // A p2p_upload-shaped row with a NULL job_id must insert cleanly.
+    await db
+      .prepare(
+        `INSERT INTO receipts (id, job_id, worker_id, gpu_seconds, platform_sig, created_at, kind, billable, basis, bytes)
+         VALUES ('r-p2p', NULL, 'w1', 0, 'sig', '2026-01-01 00:00:00.000000', 'p2p_upload', 0, 'wall', 1234)`
+      )
+      .run();
+    const row = await db.prepare("SELECT job_id, bytes FROM receipts WHERE id = 'r-p2p'").first<{ job_id: string | null; bytes: number }>();
+    expect(row?.job_id).toBeNull();
+    expect(row?.bytes).toBe(1234);
+    await db.prepare("DELETE FROM receipts WHERE id = 'r-p2p'").run();
+  });
+
+  it("preserves existing receipt rows across the table rebuild", async () => {
+    // vitest-pool-workers applies every migration in order against a fresh
+    // D1 instance, so there is no pre-0007 data to actually migrate here --
+    // this instead confirms a row inserted the OLD way (NOT NULL job_id,
+    // no bytes) still round-trips through the post-rebuild schema.
+    const db = (env as any).DB as D1Database;
+    await db
+      .prepare(
+        `INSERT INTO receipts (id, job_id, worker_id, gpu_seconds, platform_sig, created_at, kind, billable, basis)
+         VALUES ('r-old', 'job-1', 'w1', 5.0, 'sig', '2026-01-01 00:00:00.000000', 'completed', 1, 'exec')`
+      )
+      .run();
+    const row = await db
+      .prepare("SELECT job_id, bytes, kind, billable FROM receipts WHERE id = 'r-old'")
+      .first<{ job_id: string; bytes: number | null; kind: string; billable: number }>();
+    expect(row?.job_id).toBe("job-1");
+    expect(row?.bytes).toBeNull();
+    expect(row?.kind).toBe("completed");
+    expect(row?.billable).toBe(1);
+    await db.prepare("DELETE FROM receipts WHERE id = 'r-old'").run();
+  });
+
+  it("creates the p2p_grants table with grant_id as primary key", async () => {
+    const db = (env as any).DB as D1Database;
+    const cols = await db.prepare("PRAGMA table_info(p2p_grants)").all<{ name: string; pk: number }>();
+    const byName = new Map(cols.results.map((c) => [c.name, c]));
+    expect(byName.get("grant_id")?.pk).toBeGreaterThan(0);
+    for (const col of ["name", "size_bytes", "sha256", "seeder_id", "puller_id", "expires_at", "booked", "created_at"]) {
+      expect(byName.has(col), `p2p_grants.${col} missing`).toBe(true);
+    }
+
+    await db
+      .prepare(
+        `INSERT INTO p2p_grants (grant_id, name, size_bytes, sha256, seeder_id, puller_id, expires_at, created_at)
+         VALUES ('g1', 'n', 1, 'h', 's', 'p', 100, 1)`
+      )
+      .run();
+    const row = await db.prepare("SELECT booked FROM p2p_grants WHERE grant_id = 'g1'").first<{ booked: number }>();
+    expect(row?.booked).toBe(0);
+    await db.prepare("DELETE FROM p2p_grants WHERE grant_id = 'g1'").run();
+
+    await expect(
+      db
+        .prepare(
+          `INSERT INTO p2p_grants (grant_id, name, size_bytes, sha256, seeder_id, puller_id, expires_at, created_at)
+           VALUES ('g2', 'n', 1, 'h', 's', 'p', 100, 1)`
+        )
+        .run()
+    ).resolves.toBeDefined();
+    await expect(
+      db
+        .prepare(
+          `INSERT INTO p2p_grants (grant_id, name, size_bytes, sha256, seeder_id, puller_id, expires_at, created_at)
+           VALUES ('g2', 'n2', 2, 'h2', 's2', 'p2', 200, 2)`
+        )
+        .run()
+    ).rejects.toThrow();
+    await db.prepare("DELETE FROM p2p_grants WHERE grant_id = 'g2'").run();
   });
 });

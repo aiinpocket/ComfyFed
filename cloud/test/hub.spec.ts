@@ -190,6 +190,52 @@ describe("hello", () => {
     expect(JSON.parse(row!.node_classes)).toEqual(["KSampler"]);
     ws.close();
   });
+
+  // Phase 3.1 P2P seeder advertisement -- ports agentws.py's _parse_peer_url
+  // test coverage.
+  it("stores a valid http(s) peer_url", async () => {
+    const kp = KEYPAIRS[0]!;
+    const workerId = await makeWorker({ pubkeyHex: kp.pubkey_hex });
+    const ws = await connectAgent(workerId, kp.seed_hex);
+    const none = expectNoMessage(ws, 300);
+    ws.send(JSON.stringify({ type: "hello", protocol: 4, peer_url: "http://192.168.1.5:8850" }));
+    await none;
+
+    const row = await db().prepare("SELECT peer_url, protocol FROM workers WHERE id = ?").bind(workerId).first<{ peer_url: string | null; protocol: number }>();
+    expect(row!.peer_url).toBe("http://192.168.1.5:8850");
+    expect(row!.protocol).toBe(4);
+    ws.close();
+  });
+
+  it("ignores a malformed peer_url (no host, wrong scheme, non-string) and stores null", async () => {
+    for (const badPeerUrl of ["not-a-url", "ftp://host/path", 12345]) {
+      const kp = KEYPAIRS[0]!;
+      const workerId = await makeWorker({ pubkeyHex: kp.pubkey_hex });
+      const ws = await connectAgent(workerId, kp.seed_hex);
+      const none = expectNoMessage(ws, 200);
+      ws.send(JSON.stringify({ type: "hello", protocol: 4, peer_url: badPeerUrl }));
+      await none;
+
+      const row = await db().prepare("SELECT peer_url FROM workers WHERE id = ?").bind(workerId).first<{ peer_url: string | null }>();
+      expect(row!.peer_url).toBeNull();
+      ws.close();
+    }
+  });
+
+  it("a reconnecting hello without peer_url clears a previously-advertised one", async () => {
+    const kp = KEYPAIRS[0]!;
+    const workerId = await makeWorker({ pubkeyHex: kp.pubkey_hex });
+    await db().prepare("UPDATE workers SET peer_url = 'http://stale:1' WHERE id = ?").bind(workerId).run();
+
+    const ws = await connectAgent(workerId, kp.seed_hex);
+    const none = expectNoMessage(ws, 200);
+    ws.send(JSON.stringify({ type: "hello", protocol: 4 })); // no peer_url this time
+    await none;
+
+    const row = await db().prepare("SELECT peer_url FROM workers WHERE id = ?").bind(workerId).first<{ peer_url: string | null }>();
+    expect(row!.peer_url).toBeNull();
+    ws.close();
+  });
 });
 
 // ---------------------------------------------------------------------------

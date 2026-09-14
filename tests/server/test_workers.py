@@ -124,6 +124,37 @@ def test_list_workers_shows_registered_worker(client):
     assert "status" in worker and "last_seen" in worker and "id" in worker
 
 
+def test_list_workers_exposes_peer_url(client):
+    """Task 7: `/api/workers` serialization gains `peer_url` (null until the
+    agent's `hello.peer_url` sets it -- see agentws._parse_peer_url).
+    Admin-only page, so no privacy concern surfacing it here."""
+    csrf = _login(client)
+    r = client.post(
+        "/api/workers/tokens",
+        json={"name": "worker-peer"},
+        headers={"X-CSRF": csrf},
+    )
+    token = r.json()["bundle"]["register_token"]
+    reg = client.post(
+        "/api/agent/register",
+        json={"token": token, "name": "worker-peer", "pubkey": "56" * 32},
+    )
+    worker_id = reg.json()["worker_id"]
+
+    listed = client.get("/api/workers", headers={"X-CSRF": csrf}).json()
+    worker = next(w for w in listed if w["id"] == worker_id)
+    assert worker["peer_url"] is None
+
+    with db.get_session() as session:
+        w = session.get(db.Worker, worker_id)
+        w.peer_url = "http://192.168.1.5:8850"
+        session.commit()
+
+    listed_after = client.get("/api/workers", headers={"X-CSRF": csrf}).json()
+    worker_after = next(w for w in listed_after if w["id"] == worker_id)
+    assert worker_after["peer_url"] == "http://192.168.1.5:8850"
+
+
 def test_disable_worker(client):
     csrf = _login(client)
     r = client.post(

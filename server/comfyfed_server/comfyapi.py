@@ -609,8 +609,10 @@ def _partition_missing_models(missing_models: set[str], data_dir: str) -> tuple[
         return set(), set()
     with db.get_session() as session:
         online_workers = _online_enabled_workers(session)
-    fetchable_map = {e["name"]: e["size_bytes"] for e in model_manifest.entries(data_dir)}
-    return assess.partition_fleet_fetchable(missing_models, fetchable_map, online_workers)
+    manifest_entries = model_manifest.entries(data_dir)
+    fetchable_map = {e["name"]: e["size_bytes"] for e in manifest_entries}
+    peer_only_models = model_manifest.peer_only_names(manifest_entries)
+    return assess.partition_fleet_fetchable(missing_models, fetchable_map, online_workers, peer_only_models)
 
 
 def _dir_file_names(directory: str) -> set[str]:

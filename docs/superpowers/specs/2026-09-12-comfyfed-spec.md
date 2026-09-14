@@ -81,7 +81,7 @@ worker 斷線（>90s 無心跳）→ assigned/running 的任務自動回 queued 
 - **Phase 1（本計畫）**：平台核心＋Agent 核心端到端可用——安裝→登入→發識別碼→worker 註冊上線→送 workflow→派工執行→結果回傳→收據入帳→儀表板可視。
 - **Phase 1.5（2026-09-12 使用者定案提前）：內嵌 ComfyUI 工作流編輯器**——「要使用者自己在別處做好 workflow 再貼 JSON」對非 IT 使用者不可用。平台內嵌**官方 ComfyUI 前端**（comfyui-frontend-package 靜態包，pinned 版本＋SHA256，`comfyfed-server fetch-comfy-ui` 下載）於 `/comfy`（admin session 保護），平台實作 ComfyUI 相容 API（`/comfy/api/*`）：`object_info`=**在線 worker 能力聯集**（agent 以簽名請求回傳完整 /object_info JSON，gzip＋hash 去重，存平台檔案系統）、`prompt`→聯邦 job、`queue`/`history`/`view`→佇列與 artifacts 映射、`upload/image`→任務附檔管線、WS 進度轉發。Console 任務頁保留貼 JSON 作為進階路徑，主按鈕改為開啟編輯器。
 - **Phase 2**：模型 manifest＋自動下載（**已於 Phase 2.1 實作**：worker 惰性回報模型 SHA-256（sidecar 快取），平台以「全體回報者一致」共識學得雜湊（衝突永久標記 `model_hashes.conflict` 並排除），與 model_guide 來源合成**平台簽章的 fetch manifest**（`name|directory|sha256|size_bytes` Ed25519 簽章、URL 刻意不入簽——以雜湊釘住內容）；`eligible_after_fetch` 成為真判定（protocol 3＋worker 端 `auto_fetch_models` 選擇性開啟＋磁碟餘裕 1.2×）；派工第二層：無直接合格者時挑最小下載量的自動抓取 worker，job push 內嵌 fetch_models；agent 驗簽→官方載點（跟隨轉址）→GCS 備援→逐位元組 SHA-256 驗證→原子落地→立即重掃回報→續跑；下載期間 stage=fetching_models 貫穿所有心跳，started_at 不設——**下載時間永不計費**；console/面板顯示下載進度。雲端版完整對等。中繼下載不再需要——直連原始來源即可）；`/object_info` 能力交集模式（保守選項，**已於 Phase 1.9 提前實作** `auth`/`comfyapi` 的 `object_info_mode: union|intersection`）。
-- **Phase 3**：成員間 P2P 分塊傳輸；貢獻報表進階（分潤試算）；多管理員。（**多使用者帳號系統／多管理員／分潤試算已於 Phase 3.0 實作**，見下方「Phase 3.0 addendum」：admin 建立與管理其他使用者帳號、一般使用者只看自己的 job／artifacts、`/comfy` 面板改為任何角色都能用的個人工作區、Reports 新增「使用者用量」與「分潤試算」（依 worker GPU 秒數比例試算分潤，未落地實際撥款）、既有安裝升級時原 admin 沿用同一組密碼但全員需重新登入一次、cloud 端 D1 migration 0006 對等實作。**成員間 P2P 分塊傳輸另立 Phase 3.1**，尚未實作。）
+- **Phase 3**：成員間 P2P 分塊傳輸；貢獻報表進階（分潤試算）；多管理員。（**多使用者帳號系統／多管理員／分潤試算已於 Phase 3.0 實作**，見下方「Phase 3.0 addendum」：admin 建立與管理其他使用者帳號、一般使用者只看自己的 job／artifacts、`/comfy` 面板改為任何角色都能用的個人工作區、Reports 新增「使用者用量」與「分潤試算」（依 worker GPU 秒數比例試算分潤，未落地實際撥款）、既有安裝升級時原 admin 沿用同一組密碼但全員需重新登入一次、cloud 端 D1 migration 0006 對等實作。**成員間 P2P 分塊傳輸另立 Phase 3.1，已於 2026-09-14 實作**，見下方「Phase 3.1 addendum」：worker 間 HTTP Range 分塊互拉（64 MiB、逐塊驗證、`.part` 斷點續傳）、來源優先序 P2P 種子→官方載點→GCS 備援、無官方 URL 的私有模型在有在線種子時也能派工、平台簽發 Ed25519 傳輸憑證（10 分鐘效期、綁定單一檔案＋拉方＋種子、種子端 fail-closed 逐請求驗證、worker 間不互留常駐信任）、上傳頻寬入收據帳本（`p2p_upload`、不計費）、Worker 頁顯示分享狀態、Reports 新增 P2P 上傳量欄、cloud 端 D1 migration 0007 對等實作。**至此 Phase 3 全部項目皆已出貨。**）
 - **Phase 1.9（backlog zero，2026-09-13）**：job origin 欄位＋範圍限定（面板原生控制只動面板自己送的工作）；面板任務歷史可刪除；node_errors 前端引導文案；隱藏面板內失效的 Comfy-cloud 登入按鈕；失敗／取消任務不計費（收據 0）；agent 通訊協定升級到 v2；派工優先序偏好弱 GPU／Mac 之類的機器優先接零模型需求的工作，把重活留給有模型的機器；範本快取與下載上限；一個間歇性 flake 已根治（非重跑掩蓋）；console 新增任務詳情頁（完整錯誤引導＋artifacts）；專案採用 AGPL-3.0 授權。
 - **ComfyFed Cloud（2026-09-12 提出，Phase 2.0 已上線）**——平台端的 Cloudflare Workers＋D1＋R2 免自架部署形態：D1=SQLite（schema 近乎原樣）、R2=ArtifactStore 的 S3 介面（presigned 直傳、零出口費）、agent 長連 WS 由 Durable Objects（hibernation）承接、派工迴圈為 DO alarms、Ed25519 驗簽走 WebCrypto。`cloud/` 目錄的 TypeScript Workers 實作已完成並部署在 workers.dev 網域上，見 `cloud/README.md`。定位：**自架 Python 版仍是本體**（內網/離線場景＋資料自主），Cloud 版是第二部署形態；現有架構決策（outbound-only WS、S3 介面、簽章收據）已刻意為此保留可移植性。
 
@@ -189,3 +189,45 @@ Decisions of record:
 
 ### Cloud 對等
 - D1 migration 0006（users＋jobs.user_id＋login_attempts.username＋資料遷移 SQL）；`/api/setup` 建 admin user 列；auth／users／jobs 範圍／comfy 面板範圍／reports 三端點 byte-parity 移植；既有部署跑遷移後舊 cookie 自然失效。
+
+---
+
+## Phase 3.1 addendum: 成員間 P2P 分塊傳輸（2026-09-14）
+
+User directives: 完成 Phase 3 最後一項 P2P 分塊傳輸；安全原則沿用使用者 2026-09-14 指示——**傳輸憑證必須是平台簽發、短效、單次範圍綁定**，「而不是讓他可以一直持有，不然每個 worker 都可以跑上去搗亂」；worker 之間不互留常駐信任。
+
+Decisions of record:
+
+### 定位與範圍（MVP＝spec §8 既定方向）
+- **HTTP Range 分塊互拉**：拉方 worker 直接向種子 worker 的 HTTP 端點分塊拉檔；NAT 打洞不做（§8 列為 fallback，此處裁定：拉不到就走既有官方載點→GCS 鏈，該鏈永遠可用，平台中繼留待有真實需求再議——**私有模型（無官方 URL）僅在有可直連種子時可派**，判定透明列在 UI 原因裡，不是靜默失敗）。
+- P2P 帶來的新能力：**無官方 URL 的模型也能分發**——`fetchable` 判定擴為「有簽章來源 URL **或** 有在線可直連的 P2P 種子」。
+
+### 分塊雜湊（chunk hashes，64 MiB）
+- agent 惰性雜湊器改為**單趟同時算**整檔 SHA-256＋每 64 MiB 分塊 SHA-256，sidecar 快取一併存分塊表；庫存回報攜帶分塊表（僅在整檔雜湊首次回報或變更時傳，避免心跳膨脹）。
+- 平台 `model_hashes` 加 `chunk_sha256s`（JSON 陣列）。**整檔雜湊仍是唯一共識權威**（衝突偵測不變）；分塊表僅用於早期中止壞塊——最終整檔驗證永遠執行，分塊表不對即整檔重驗兜底，投毒面不變。
+- 協定升級：agent protocol 4（分塊表欄位＋peer 欄位；舊 agent 照常運作、不參與 P2P）。
+
+### 種子端（peer serving，worker 主權：預設關閉）
+- `agent.json` 新增 `peer_serve: false`、`peer_listen_port`、`peer_advertise_host`（未設則不啟）。啟用時 agent 起一個僅服務模型檔的 HTTP listener（stdlib ThreadingHTTPServer，不新增依賴），握手/心跳向平台通告 peer URL。
+- **每個請求都要憑證**：拉方先向平台要 grant，種子端逐請求驗證，**fail-closed**（缺憑證/驗簽失敗/過期/範圍不符一律 403，無匿名路徑）。listener 只認 `GET /peer/models/<manifest name>`＋Range，路徑正規化防穿越。
+- 種子資格與 worker 停用狀態脫鉤（停用=不接工作，仍可分享模型；文件明載，worker 可用 peer_serve=false 單獨關）。
+
+### 傳輸憑證（grant，使用者安全原則）
+- 拉方（已簽名的 agent 請求）`POST /api/agent/peer-grant {name, size_bytes}` → 平台驗證拉方確缺此檔、挑一個在線種子，簽發 grant：`{grant_id, name, size_bytes, sha256, seeder_id, puller_id, expires_at}`，平台 Ed25519 簽章覆蓋全欄位（pipe-join 同 manifest 慣例，欄位含 `|` 即拒發）。
+- **TTL 10 分鐘**（同雲端上傳 token 慣例）、綁死單一檔案＋單一拉方＋單一種子；TTL 內允許多個 Range 請求（分塊傳輸本質），過期重新申請（平台無狀態重發）；grant_id 供帳務對帳。
+- 種子端驗：平台簽章（用已釘選的平台公鑰）＋expires＋seeder_id==自己＋name 與本地庫存相符。拉方身分不需另驗——能出示有效 grant 即代表平台已認證過拉方。
+
+### 頻寬入帳（§8「上傳頻寬計入收據帳本」）
+- `receipts` 加 `bytes`（nullable INTEGER）與 kind `p2p_upload`：種子 agent 完成一個 grant 的服務後（或連線關閉時）以簽名請求回報 `{grant_id, bytes_served}`，平台核對 grant 簽發紀錄後入帳：kind=p2p_upload、billable=false、gpu_seconds=0、bytes=實際服務量、worker=種子。分潤試算維持 GPU 秒數；貢獻報表新增「P2P 上傳量」欄（web 同步顯示）。job_id 不適用（NULL）——receipts.job_id 放寬為 nullable，僅 p2p_upload 允許 NULL。
+
+### 拉方整合（fetcher）
+- 來源優先序改為：**P2P 種子 → 官方載點 → GCS 備援**（省外部流量；P2P 失敗即刻落回，不重試多種子超過一輪）。
+- 分塊拉取：逐 64 MiB Range 請求、逐塊即時驗 chunk hash（壞塊即中止換來源）、`.part` 續傳=從最後一個完整驗證塊開始（斷線/取消後重申請 grant 續拉）；完成後整檔 SHA-256 終驗（不變的鐵律）→原子落地→立即重掃回報。取消/關機中止並清理，行為與現有 fetcher 相同；下載期間計費規則不變（stage=fetching_models，永不計費）。
+- 派工：`eligible_after_fetch` 的 fetchable 判定納入 P2P 種子；push 內嵌的 fetch_models 條目對 peer-only 模型 `url: null` 標 `peer: true`（sig 覆蓋 name|directory|sha256|size_bytes 不變——URL 本就不入簽）。
+
+### 雲端對等
+- cloud 對等實作 tracker／grant 簽發／p2p_upload 入帳（D1 migration 0007：model_hashes.chunk_sha256s、receipts.bytes＋job_id nullable、workers peer 欄位）。worker 間傳輸本就不經平台，Workers 平台無額外限制。
+
+### Web／文件
+- Worker 頁：P2P 分享中 badge＋通告位址；貢獻報表加 P2P 上傳量欄。zh-TW＋en。
+- SELF-HOSTING 兩語新增 P2P 章節：開啟方式、防火牆/埠、安全模型（短效憑證、fail-closed、整檔驗證兜底）、種子與停用脫鉤。

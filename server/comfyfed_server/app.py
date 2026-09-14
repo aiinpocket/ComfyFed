@@ -24,6 +24,7 @@ from . import (
     jobs,
     metrics,
     model_manifest,
+    peer,
     receipts,
     templates,
     users,
@@ -168,6 +169,7 @@ def create_app(data_dir: str) -> FastAPI:
     app.include_router(users.create_router())
     app.include_router(agentws.create_router(data_dir))
     app.include_router(model_manifest.create_router(data_dir))
+    app.include_router(peer.create_router(data_dir))
     app.include_router(comfyapi.create_router(data_dir))
     app.include_router(comfyapi.create_ws_router())
     app.include_router(templates.create_router(data_dir))
