@@ -62,6 +62,8 @@ _TOKEN_RE = re.compile(r"^[A-Za-z0-9_-]{1,128}$")
 # unreserved URL characters. No query string, no fragment, no quotes,
 # backticks, `$`, or whitespace.
 _PLATFORM_URL_RE = re.compile(r"^https?://[A-Za-z0-9.\[\]:_-]+(/[A-Za-z0-9._~/-]*)?$")
+# Public alias: auth.py applies the same shape at settings-write time.
+PLATFORM_URL_RE = _PLATFORM_URL_RE
 
 
 class InvalidTokenError(Exception):

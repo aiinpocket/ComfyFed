@@ -328,6 +328,10 @@ if (Test-Path $ManagedMarker) {
             } elseif ($gpuNames -match 'AMD|Radeon') {
                 $gpuVendor = 'amd'
                 $useCpu = $false
+            } elseif ($gpuNames -match 'Intel\(R\) Arc|Intel.*Graphics') {
+                # Comfy-Org publishes a dedicated Intel portable build.
+                $gpuVendor = 'intel'
+                $useCpu = $false
             } else {
                 $gpuVendor = 'nvidia'
                 $useCpu = $true

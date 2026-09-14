@@ -328,4 +328,4 @@ def test_ps1_served_response_has_no_bom_or_mojibake(client_with_url):
     r = client_with_url.get("/install.ps1")
     assert not r.text.startswith("﻿")
     assert "﻿" not in r.text
-    assert "中文/EN 雙語" in r.text or "中文/EN" in r.text
+    assert "中文/EN bilingual" in r.text  # exact CJK marker from line 2: mojibake would break it

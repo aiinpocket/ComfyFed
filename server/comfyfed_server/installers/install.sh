@@ -314,13 +314,16 @@ else
 
         if [ "$OS_KIND" = "darwin" ]; then
             bilingual "安裝 torch (macOS/MPS)..." "Installing torch (macOS/MPS)..."
-            "$COMFY_VENV_PIP" install torch torchvision torchaudio
+            "$COMFY_VENV_PIP" install torch torchvision torchaudio ||
+                fail_step "torch 安裝失敗（可手動執行同一指令後重跑本安裝器）" "torch install failed (run the same command manually, then re-run this installer)"
         elif command -v nvidia-smi >/dev/null 2>&1; then
             bilingual "偵測到 NVIDIA GPU，安裝 CUDA 版 torch..." "NVIDIA GPU detected, installing CUDA torch..."
-            "$COMFY_VENV_PIP" install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu126
+            "$COMFY_VENV_PIP" install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu126 ||
+                fail_step "CUDA torch 安裝失敗（可手動執行同一指令後重跑本安裝器）" "CUDA torch install failed (run the same command manually, then re-run this installer)"
         else
             bilingual "未偵測到 NVIDIA GPU，安裝 CPU 版 torch..." "No NVIDIA GPU detected, installing CPU torch..."
-            "$COMFY_VENV_PIP" install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cpu
+            "$COMFY_VENV_PIP" install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cpu ||
+                fail_step "CPU torch 安裝失敗（可手動執行同一指令後重跑本安裝器）" "CPU torch install failed (run the same command manually, then re-run this installer)"
         fi
 
         bilingual "安裝 ComfyUI 相依套件..." "Installing ComfyUI dependencies..."
@@ -355,7 +358,8 @@ with open(sys.argv[3], 'w', encoding='utf-8') as f:
         COMFY_MANAGED=1
 
         bilingual "重新偵測並套用設定..." "Re-running detection and saving config..."
-        "$VENV_PYTHON" "$HELPER_SCRIPT" apply "$AGENT_CONFIG_PATH"
+        "$VENV_PYTHON" "$HELPER_SCRIPT" apply "$AGENT_CONFIG_PATH" ||
+            fail_step "ComfyUI 偵測/設定寫入失敗" "ComfyUI detection/config write failed"
     fi
 fi
 
