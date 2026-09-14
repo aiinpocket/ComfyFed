@@ -887,9 +887,13 @@ FLUX_WORKFLOW = {
     "1": {"class_type": "UNETLoader", "inputs": {"unet_name": "flux1-dev.safetensors"}},
 }
 
+# The second model must be genuinely unknown to the platform: since Phase 3.2
+# every curated-registry model (clip_l included) is fetchable via its
+# operator-vouched guide hash even with zero holders, so an "unfetchable"
+# fixture has to use a name the guide has never heard of.
 TWO_MODEL_WORKFLOW = {
     "1": {"class_type": "UNETLoader", "inputs": {"unet_name": "flux1-dev.safetensors"}},
-    "2": {"class_type": "CLIPLoader", "inputs": {"clip_name": "clip_l.safetensors"}},
+    "2": {"class_type": "CLIPLoader", "inputs": {"clip_name": "totally-unknown-encoder.safetensors"}},
 }
 
 
@@ -960,7 +964,7 @@ def test_submit_mixed_fetchable_and_unfetchable_lists_only_unfetchable(client):
     r = _submit(client, csrf, workflow=TWO_MODEL_WORKFLOW)
     assert r.status_code == 400
     message = r.json()["error"]["message"]
-    assert "clip_l.safetensors" in message
+    assert "totally-unknown-encoder.safetensors" in message
     assert "flux1-dev.safetensors" not in message
 
 
@@ -985,7 +989,14 @@ def test_submit_rejects_when_combined_fetch_set_exceeds_disk_margin(client):
         dynamic={"free_disk_gb": 1.0},  # nowhere near 1.2 x (22.17 + 0.23)
     )
 
-    r = _submit(client, csrf, workflow=TWO_MODEL_WORKFLOW)
+    # Both models must be KNOWN (consensus rows seeded above) so the 400 is
+    # purely the disk gate -- TWO_MODEL_WORKFLOW's second model is unknown
+    # by design, so build the known pair locally.
+    two_known = {
+        "1": {"class_type": "UNETLoader", "inputs": {"unet_name": "flux1-dev.safetensors"}},
+        "2": {"class_type": "CLIPLoader", "inputs": {"clip_name": "clip_l.safetensors"}},
+    }
+    r = _submit(client, csrf, workflow=two_known)
     assert r.status_code == 400
     message = r.json()["error"]["message"]
     assert "flux1-dev.safetensors" in message

@@ -65,7 +65,16 @@ async function registerWorker(
 
 async function setWorkerRow(
   workerId: string,
-  fields: { status?: string; disabled?: boolean; modelInventory?: unknown[]; nodeClasses?: string[]; objectInfoHash?: string }
+  fields: {
+    status?: string;
+    disabled?: boolean;
+    modelInventory?: unknown[];
+    nodeClasses?: string[];
+    objectInfoHash?: string;
+    protocol?: number;
+    autoFetch?: boolean;
+    dynamic?: Record<string, unknown>;
+  }
 ): Promise<void> {
   if (fields.status !== undefined) {
     await db().prepare("UPDATE workers SET status = ? WHERE id = ?").bind(fields.status, workerId).run();
@@ -87,6 +96,15 @@ async function setWorkerRow(
   }
   if (fields.objectInfoHash !== undefined) {
     await db().prepare("UPDATE workers SET object_info_hash = ? WHERE id = ?").bind(fields.objectInfoHash, workerId).run();
+  }
+  if (fields.protocol !== undefined) {
+    await db().prepare("UPDATE workers SET protocol = ? WHERE id = ?").bind(fields.protocol, workerId).run();
+  }
+  if (fields.autoFetch !== undefined) {
+    await db().prepare("UPDATE workers SET auto_fetch = ? WHERE id = ?").bind(fields.autoFetch ? 1 : 0, workerId).run();
+  }
+  if (fields.dynamic !== undefined) {
+    await db().prepare("UPDATE workers SET dynamic = ? WHERE id = ?").bind(JSON.stringify(fields.dynamic), workerId).run();
   }
 }
 
@@ -385,6 +403,37 @@ describe("POST /comfy/api/prompt", () => {
         "缺少模型：t5xxl_fp16.safetensors，無法執行——詳見下方下載指引",
       ])
     );
+  });
+
+  it("Phase 3.2: queues a zero-holder curated model via its guide hash alone", async () => {
+    // flux1-dev.safetensors is curated with an operator-vouched sha256/
+    // sizeBytes in model_guide.SOURCES -- the manifest signs a zero-holder
+    // entry for it straight from those values, with NO worker ever having
+    // reported an inventory hash (model_manifest.recordHash is never called
+    // here). An online, opted-in, disk-capable worker is then enough to
+    // queue the job instead of 400ing with a manual-download prompt.
+    const { cookie, csrf } = await loginSession();
+    const fetcher = await registerWorker(cookie, csrf, "fetcher");
+    await setWorkerRow(fetcher, { protocol: 3, autoFetch: true, dynamic: { free_disk_gb: 100.0 } });
+
+    const r = await postPrompt(cookie, FLUX_PROMPT);
+    expect(r.status).toBe(200);
+  });
+
+  it("Phase 3.2: a genuinely unknown model still 400s even with a fetch-capable worker standing by", async () => {
+    // Unlike the 11 curated models, a name with neither a curated guide hash
+    // nor a harvested source nor a learned consensus never gets a manifest
+    // entry at all -- still a hard 400.
+    const { cookie, csrf } = await loginSession();
+    const fetcher = await registerWorker(cookie, csrf, "fetcher");
+    await setWorkerRow(fetcher, { protocol: 3, autoFetch: true, dynamic: { free_disk_gb: 100.0 } });
+
+    const prompt = {
+      "1": { class_type: "UNETLoader", inputs: { unet_name: "totally_unknown_model.safetensors" } },
+    };
+    const r = await postPrompt(cookie, prompt);
+    expect(r.status).toBe(400);
+    expect(r.body.error.type).toBe("prompt.missing_models");
   });
 
   it("still queues with zero workers registered", async () => {

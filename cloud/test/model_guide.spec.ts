@@ -49,6 +49,18 @@ describe("SOURCES (curated registry)", () => {
       "https://storage.googleapis.com/comfyfed-models/models/diffusion_models/flux1-dev.safetensors"
     );
     expect(source.gated).toBe(true);
+    // Phase 3.2: operator-vouched guide hash, copied verbatim from the plan's
+    // curated hash table.
+    expect(source.sha256).toBe("4610115bb0c89560703c892c59ac2742fa821e60ef5871b33493ba544683abd7");
+    expect(source.sizeBytes).toBe(23802932552);
+  });
+
+  it("Phase 3.2: every one of the eleven curated entries carries a guide sha256/sizeBytes", () => {
+    for (const [name, source] of Object.entries(modelGuide.SOURCES)) {
+      expect(source.sha256, `${name} sha256`).toBeDefined();
+      expect(source.sizeBytes, `${name} sizeBytes`).toBeDefined();
+      expect(source.sha256).toMatch(/^[0-9a-f]{64}$/);
+    }
   });
 
   it("qwen3vl_4b_bf16.safetensors fields (entry #10) match verbatim", () => {

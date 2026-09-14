@@ -33,6 +33,16 @@ pin the real byte length. An agent that hashes but predates the exact
 falls back to `round(size * 1024**3)` for those reports and documents the
 approximation there, at the one call site that needs it, rather than here.
 
+Phase 3.2 addendum: `entries()` no longer requires a learned consensus row at
+all for the 11 curated models in `model_guide.SOURCES` that carry an
+operator-vouched `sha256`/`size_bytes` -- a "zero-holder" curated model (no
+worker in the fleet has ever reported it, so no `model_hashes` row can exist)
+still gets a signed manifest entry, built straight from those guide values
+(see `_guide_hash_entry`). A learned consensus, once any worker reports one,
+always wins over the guide value for that entry; a guide/consensus mismatch
+is logged and the consensus hash is what ships. A conflicted `model_hashes`
+row still excludes the name outright, guide hash or not -- see `entries()`.
+
 A hash conflict is recorded directly on the `model_hashes` row (`conflict`,
 added by migration `c9d0e1f2a3b4`) rather than in an in-memory, per-process
 set -- this is a persistent replacement for an earlier in-memory
@@ -55,6 +65,24 @@ from fastapi import APIRouter, Depends
 from . import assess, auth, db, model_guide, peer, security, workers
 
 logger = logging.getLogger(__name__)
+
+# Guide-vs-consensus mismatch warnings already emitted (dedup; see entries()).
+_MISMATCH_LOGGED: set[tuple[str, str, str]] = set()
+
+
+def _clear_mismatch_log_for_tests() -> None:
+    """Test-only escape hatch (Phase 3.2 F6 fix): reset the per-process
+    guide-vs-consensus mismatch dedup set so a test asserting a WARNING was
+    logged isn't silently broken by test ORDER -- without this, only the
+    first execution of a given (name, guide, consensus) triple in the whole
+    process actually logs, so a second test (or a pytest-repeat run) hitting
+    the same triple would see nothing and fail. NOT used in production: the
+    dedup there is deliberately permanent for the process lifetime (see this
+    module's docstring) -- an operator who re-breaks a registry entry the
+    same way twice gets no second warning until a restart, which is an
+    accepted (documented) tradeoff, not something tests should paper over by
+    calling this outside test setup."""
+    _MISMATCH_LOGGED.clear()
 
 
 def _utcnow() -> datetime:
@@ -138,20 +166,55 @@ def record_hash(
                     )
             return
 
+        # Phase 3.2 F4 fix: when either side of the conflict happens to
+        # equal the curated guide's vouched hash for this name, say so --
+        # that's exactly the clue an operator needs to diagnose "this is a
+        # stale registry entry, not two genuinely different worker builds"
+        # at a glance, instead of having to go cross-reference model_guide.py
+        # by hand.
+        guide_sha256 = _guide_sha256_for(name)
+        guide_clue = ""
+        if guide_sha256 is not None:
+            if guide_sha256 == sha256:
+                guide_clue = (
+                    f" (NOTE: worker {worker_id}'s reported hash matches the "
+                    "curated guide value -- the OTHER report looks stale)"
+                )
+            elif guide_sha256 == existing.sha256:
+                guide_clue = (
+                    f" (NOTE: the existing hash matches the curated guide "
+                    f"value -- worker {worker_id}'s NEW report looks stale)"
+                )
+
         logger.warning(
             "model_manifest: sha256 conflict for %s (size_bytes=%s): "
             "worker %s reported %s, worker %s previously reported %s -- "
             "keeping the first-seen hash and excluding this name from the "
-            "fetch manifest",
+            "fetch manifest%s",
             name,
             size_bytes,
             worker_id,
             sha256,
             existing.first_worker_id,
             existing.sha256,
+            guide_clue,
         )
         existing.conflict = True
         session.commit()
+
+
+def _guide_sha256_for(name: str) -> Optional[str]:
+    """The curated guide sha256 for inventory-relative `name`, when it
+    matches one of the 11 `model_guide.SOURCES` entries that carries a
+    vouched hash -- else None. Used only to annotate a `record_hash`
+    conflict WARNING (Phase 3.2 F4 fix) with a diagnostic clue; never to
+    resolve/prefer a value -- a `model_hashes` conflict stays purely
+    reporter-vs-reporter, and the guide never writes to this table (see this
+    module's docstring)."""
+    for source in model_guide.SOURCES.values():
+        if source.sha256 and assess.matches_model_name(name, source.name):
+            return source.sha256
+    return None
 
 
 def _find_hash_row(rows: list, source_key: str):
@@ -225,6 +288,42 @@ def _row_has_seeder(row: db.ModelHash, seeder_files: frozenset[tuple[str, int, s
     `_seeder_candidate_files()` set -- the per-row replacement for calling
     `peer.online_seeders(session, row.name, row.size_bytes)` (see M3)."""
     return (row.name, row.size_bytes, row.sha256) in seeder_files
+
+
+def _guide_hash_entry(signing_key, source: model_guide.ModelSource) -> Optional[dict]:
+    """Phase 3.2 zero-holder entry: sign a manifest entry straight from
+    `source`'s operator-vouched `sha256`/`size_bytes` when NO `model_hashes`
+    row exists for it yet (nobody in the fleet holds the file, so no learned
+    consensus is even possible). Caller (`entries()`) only reaches here after
+    confirming no row -- conflicted or otherwise -- matches this name; a
+    learned consensus, once any worker reports one, always takes over from
+    this path (see `entries()`'s consensus-precedence branch).
+
+    `peer` is deliberately never set on this entry: by construction there is
+    no `model_hashes` row, so there is nothing for `_row_has_seeder` to have
+    matched -- an entry from this path always means zero holders right now.
+    """
+    if "|" in source.name or "|" in source.directory:
+        logger.warning(
+            "model_manifest: skipping guide-hash manifest candidate with a "
+            "'|' in name or directory (payload delimiter): name=%r directory=%r",
+            source.name,
+            source.directory,
+        )
+        return None
+
+    payload = f"{source.name}|{source.directory}|{source.sha256}|{source.size_bytes}"
+    sig = signing_key.sign(payload.encode()).signature.hex()
+
+    return {
+        "name": source.name,
+        "directory": source.directory,
+        "url": source.official_url,
+        "backup_url": source.backup_url,
+        "sha256": source.sha256,
+        "size_bytes": source.size_bytes,
+        "sig": sig,
+    }
 
 
 def _peer_only_entry(signing_key, row: db.ModelHash, seeder_files: frozenset[tuple[str, int, str]]) -> Optional[dict]:
@@ -317,6 +416,14 @@ def entries(data_dir: str) -> list[dict]:
         hash_rows = list(
             session.query(db.ModelHash).filter(db.ModelHash.conflict == False).all()  # noqa: E712
         )
+        # Phase 3.2: a conflicted row must still block the guide-hash
+        # fallback below -- "two reporters disagree" is not resolved by the
+        # operator's curated hash, so a name with one stays excluded exactly
+        # like before this phase (see `test_entries_excludes_a_conflicted_
+        # name_even_with_an_agreed_first_row_present`).
+        conflicted_rows = list(
+            session.query(db.ModelHash).filter(db.ModelHash.conflict == True).all()  # noqa: E712
+        )
 
         # M3 final-review fix: one worker query + one inventory parse per
         # worker for this whole call, instead of once per hash row below.
@@ -331,7 +438,34 @@ def entries(data_dir: str) -> list[dict]:
 
             row = _find_hash_row(hash_rows, name)
             if row is None:
+                # Phase 3.2: no learned consensus for this (curated or
+                # harvested) source. A conflicted row still excludes it
+                # outright -- consensus precedence never lets a curated
+                # guide hash paper over a genuine reporter disagreement.
+                if _find_hash_row(conflicted_rows, name) is not None:
+                    continue
+                if source.sha256 and source.size_bytes:
+                    guide_entry = _guide_hash_entry(signing_key, source)
+                    if guide_entry is not None:
+                        result.append(guide_entry)
                 continue
+
+            if (
+                source.sha256
+                and source.sha256 != row.sha256
+                and (source.name, source.sha256, row.sha256) not in _MISMATCH_LOGGED
+            ):
+                # Dedup per (name, pair): entries() runs every dispatch tick
+                # (~5s), and a standing mismatch would otherwise flood the log.
+                _MISMATCH_LOGGED.add((source.name, source.sha256, row.sha256))
+                logger.warning(
+                    "model_manifest: guide sha256 for %s differs from the "
+                    "learned consensus (guide=%s consensus=%s) -- consensus "
+                    "wins, the manifest entry uses the learned hash",
+                    source.name,
+                    source.sha256,
+                    row.sha256,
+                )
 
             # Defensive: `|` is the field delimiter in the signed payload
             # below. `source.name`/`source.directory` should never

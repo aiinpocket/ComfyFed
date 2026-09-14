@@ -242,6 +242,16 @@ function parseProtocol(value: unknown): number {
   return value;
 }
 
+/** Validate hello's optional `max_fetch_gb` (Phase 3.2 F1 fix): a positive
+ * finite number, else `null` (missing, wrong type, or non-positive) -- the
+ * caller then omits it from what gets stored, and `assess.ts`'s
+ * `workerMaxFetchGb` degrades that to the same default the agent itself
+ * uses. Ports agentws.py's `_parse_max_fetch_gb`. */
+function parseMaxFetchGb(value: unknown): number | null {
+  if (typeof value !== "number" || !Number.isFinite(value) || value <= 0) return null;
+  return value;
+}
+
 /** Ports agentws.py's `_is_valid_exec_seconds`. */
 function isValidExecSeconds(value: unknown): value is number {
   return typeof value === "number" && Number.isFinite(value) && value >= 0;
@@ -815,6 +825,15 @@ export class Hub extends DurableObject<Env> {
     // reconnects with peer_serve now off (or an old/malformed value) must
     // not keep a previous session's endpoint alive.
     const peerUrl = parsePeerUrl(msg.peer_url, workerId);
+    // Phase 3.2 F1 fix: no new column/migration -- `max_fetch_gb` rides
+    // inside the same `hardware` JSON blob this hello fully replaces every
+    // time, read back by assess.ts's `workerMaxFetchGb`. Omitted entirely
+    // when hello didn't report a valid value, so a stale value from a
+    // PREVIOUS hello can never survive an agent reconnecting without it.
+    const maxFetchGb = parseMaxFetchGb(msg.max_fetch_gb);
+    if (maxFetchGb !== null) {
+      hardware["max_fetch_gb"] = maxFetchGb;
+    }
 
     await queries.updateWorkerHello(this.env.DB, workerId, {
       hardware,

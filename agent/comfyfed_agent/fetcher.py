@@ -346,6 +346,18 @@ def _finalize_download(
     return None
 
 
+def _is_verified_mismatch(error: str) -> bool:
+    """True iff `_finalize_download`'s error came from a whole-file size or
+    sha256 check that actually ran against fully-downloaded bytes -- i.e. the
+    transfer completed and the content is definitively wrong, not merely
+    unreadable/unstatable (those remain retry-worthy, like a network error).
+    A verified mismatch is deterministic: retrying the SAME url will produce
+    the same bytes and fail again, so it must not consume a second attempt
+    against that url (see `_download_one`).
+    """
+    return "size mismatch (" in error or error.endswith("sha256 mismatch")
+
+
 async def _download_one(
     *,
     entry: dict,
@@ -355,15 +367,21 @@ async def _download_one(
     on_bytes: Callable[[int], Awaitable[None]],
 ) -> None:
     """Download one manifest entry to `target_path`, trying `url` then
-    `backup_url`, each once plus one retry, verifying size + sha256 before
-    an atomic rename. Every attempt's partial bytes are removed before the
+    `backup_url`, verifying size + sha256 before an atomic rename.
+
+    Each distinct source gets up to two attempts (one retry) for
+    transient/network failures. A VERIFIED content mismatch (whole-file size
+    or sha256 check against fully-downloaded bytes) is deterministic -- the
+    same url will just re-download the same wrong bytes -- so it is NOT
+    retried against that same url; the next distinct source is tried
+    immediately instead. Every attempt's partial bytes are removed before the
     next one starts; the final failure names every URL tried.
     """
     name = entry.get("name")
     primary = entry.get("url") or None
     backup = entry.get("backup_url") or None
-    attempts = [u for u in (primary, primary, backup, backup) if u]
-    if not attempts:
+    sources = [u for u in (primary, backup) if u]
+    if not sources:
         raise FetchError(f"模型 {name} 沒有可用的下載網址 / model {name} has no download url")
 
     expected_sha256 = entry.get("sha256")
@@ -379,56 +397,61 @@ async def _download_one(
         pool=_CONNECT_TIMEOUT_SECONDS,
     )
 
-    for url in attempts:
-        urls_tried.append(url)
-        if cancel_event.is_set():
-            _safe_unlink(part_path)
-            raise JobCancelled()
+    for url in sources:
+        for _attempt in range(2):
+            urls_tried.append(url)
+            if cancel_event.is_set():
+                _safe_unlink(part_path)
+                raise JobCancelled()
 
-        digest = hashlib.sha256()
-        written = 0
-        try:
-            async with client.stream("GET", url, timeout=timeout) as resp:
-                resp.raise_for_status()
-                if resp.is_redirect or 300 <= resp.status_code < 400:
-                    # Belt-and-suspenders: the client is constructed with
-                    # follow_redirects=True, so this should never trigger in
-                    # production, but a 3xx must never be treated as success
-                    # via the size-mismatch branch below (an un-followed
-                    # redirect's body is empty/small, not a hash mismatch).
-                    raise RuntimeError(f"unexpected redirect status {resp.status_code}")
-                with open(part_path, "wb") as f:
-                    async for chunk in resp.aiter_bytes(_CHUNK_SIZE):
-                        if cancel_event.is_set():
-                            raise JobCancelled()
-                        f.write(chunk)
-                        digest.update(chunk)
-                        written += len(chunk)
-                        await on_bytes(len(chunk))
-        except JobCancelled:
-            _safe_unlink(part_path)
-            raise
-        except Exception as exc:
-            last_error = f"{url} -> {exc}"
-            logger.warning("fetcher: download attempt for %r from %s failed: %s", name, url, exc)
-            _safe_unlink(part_path)
-            continue
+            digest = hashlib.sha256()
+            written = 0
+            try:
+                async with client.stream("GET", url, timeout=timeout) as resp:
+                    resp.raise_for_status()
+                    if resp.is_redirect or 300 <= resp.status_code < 400:
+                        # Belt-and-suspenders: the client is constructed with
+                        # follow_redirects=True, so this should never trigger in
+                        # production, but a 3xx must never be treated as success
+                        # via the size-mismatch branch below (an un-followed
+                        # redirect's body is empty/small, not a hash mismatch).
+                        raise RuntimeError(f"unexpected redirect status {resp.status_code}")
+                    with open(part_path, "wb") as f:
+                        async for chunk in resp.aiter_bytes(_CHUNK_SIZE):
+                            if cancel_event.is_set():
+                                raise JobCancelled()
+                            f.write(chunk)
+                            digest.update(chunk)
+                            written += len(chunk)
+                            await on_bytes(len(chunk))
+            except JobCancelled:
+                _safe_unlink(part_path)
+                raise
+            except Exception as exc:
+                last_error = f"{url} -> {exc}"
+                logger.warning("fetcher: download attempt for %r from %s failed: %s", name, url, exc)
+                _safe_unlink(part_path)
+                continue
 
-        error = _finalize_download(
-            part_path=part_path,
-            target_path=target_path,
-            expected_sha256=expected_sha256,
-            expected_size=expected_size,
-            source_label=url,
-            written_size=written,
-            precomputed_sha256=digest.hexdigest(),
-        )
-        if error is not None:
-            last_error = error
-            logger.warning("fetcher: %s", error)
-            continue
+            error = _finalize_download(
+                part_path=part_path,
+                target_path=target_path,
+                expected_sha256=expected_sha256,
+                expected_size=expected_size,
+                source_label=url,
+                written_size=written,
+                precomputed_sha256=digest.hexdigest(),
+            )
+            if error is not None:
+                last_error = error
+                logger.warning("fetcher: %s", error)
+                if _is_verified_mismatch(error):
+                    # Deterministic failure -- do not burn the retry on the
+                    # same url, move straight to the next distinct source.
+                    break
+                continue
 
-        return
+            return
 
     raise FetchError(
         f"模型 {name} 下載失敗（已嘗試：{', '.join(urls_tried)}）：{last_error} / "

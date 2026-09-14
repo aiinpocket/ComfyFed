@@ -155,6 +155,14 @@ class PlatformConnection:
             # the unknown fields (see agentws.py).
             "protocol": 4,
             "auto_fetch": self.config.auto_fetch_models,
+            # Optional (Phase 3.2 F1 fix): this worker's configured auto-fetch
+            # budget (see AgentConfig.max_fetch_gb / fetcher._check_budget_and_
+            # disk). No protocol bump -- an old server that doesn't know this
+            # field just ignores it (today's behavior, unchanged); a server
+            # that does know it folds this into the fleet fetchability gate
+            # (assess._worker_fetch_capacity_ok) instead of assuming this
+            # worker can absorb an unbounded download.
+            "max_fetch_gb": self.config.max_fetch_gb,
         }
         if peer_url:
             message["peer_url"] = peer_url

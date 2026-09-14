@@ -607,7 +607,11 @@ def _sha(label: str) -> str:
 
 TWO_MODEL_PROMPT = {
     "1": {"class_type": "UNETLoader", "inputs": {"unet_name": "flux1-dev.safetensors"}},
-    "2": {"class_type": "CLIPLoader", "inputs": {"clip_name": "clip_l.safetensors"}},
+    # A genuinely unknown model (not in model_guide.SOURCES, not harvested):
+    # unlike the 11 curated models (Phase 3.2), the manifest can never
+    # produce a fetchable entry for this one -- no guide-vouched hash, no
+    # learned consensus, nothing. This is the case that must still 400.
+    "2": {"class_type": "CLIPLoader", "inputs": {"clip_name": "totally_unknown_model.safetensors"}},
 }
 
 
@@ -633,11 +637,46 @@ def test_prompt_queues_when_missing_model_is_fully_fetchable(client):
         assert session.query(db.Job).count() == 1
 
 
-def test_prompt_rejects_when_missing_model_has_no_manifest_entry(client):
+def test_prompt_queues_zero_holder_curated_model_via_guide_hash_alone(client):
+    """Phase 3.2: `flux1-dev.safetensors` is curated with an operator-vouched
+    sha256/size_bytes in `model_guide.SOURCES` -- the manifest signs a
+    zero-holder entry for it straight from those values, with NO worker ever
+    having reported an inventory hash (`model_manifest.record_hash` is never
+    called here). An online, opted-in, disk-capable worker is then enough to
+    queue the job instead of 400ing with a manual-download prompt."""
     csrf = _login(client)
-    _register_worker(client, csrf, "runner-1")
+    fetcher = _register_worker(client, csrf, "fetcher", status="online")
+    with db.get_session() as session:
+        worker = session.get(db.Worker, fetcher)
+        worker.protocol = 3
+        worker.auto_fetch = True
+        worker.dynamic = json.dumps({"free_disk_gb": 100.0})
+        session.commit()
 
     r = _post_prompt(client, prompt=FLUX_PROMPT)
+    assert r.status_code == 200
+    with db.get_session() as session:
+        assert session.query(db.Job).count() == 1
+
+
+def test_prompt_rejects_when_missing_model_has_no_manifest_entry(client):
+    """Unlike the 11 curated models, a name with neither a curated guide hash
+    nor a harvested source nor a learned consensus never gets a manifest
+    entry at all -- still a hard 400 even with a fetch-capable worker
+    standing by."""
+    csrf = _login(client)
+    fetcher = _register_worker(client, csrf, "fetcher", status="online")
+    with db.get_session() as session:
+        worker = session.get(db.Worker, fetcher)
+        worker.protocol = 3
+        worker.auto_fetch = True
+        worker.dynamic = json.dumps({"free_disk_gb": 100.0})
+        session.commit()
+
+    prompt = {
+        "1": {"class_type": "UNETLoader", "inputs": {"unet_name": "totally_unknown_model.safetensors"}},
+    }
+    r = _post_prompt(client, prompt=prompt)
     assert r.status_code == 400
     assert r.json()["error"]["type"] == "prompt.missing_models"
 
@@ -670,7 +709,7 @@ def test_prompt_mixed_fetchable_and_unfetchable_lists_only_unfetchable(client):
     r = _post_prompt(client, prompt=TWO_MODEL_PROMPT)
     assert r.status_code == 400
     body = r.json()
-    assert "clip_l.safetensors" in body["error"]["message"]
+    assert "totally_unknown_model.safetensors" in body["error"]["message"]
     assert "flux1-dev.safetensors" not in body["error"]["message"]
     assert set(body["node_errors"].keys()) == {"2"}
 

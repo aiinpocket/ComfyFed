@@ -30,6 +30,20 @@
  * Hub DO's memory, and was forgotten on DO eviction. Persisting it makes
  * exclusion a plain SQL predicate every caller gets for free, with no
  * coordination and no staleness window.
+ *
+ * Phase 3.2 addendum, ported from `model_manifest.py`: `entries()` no
+ * longer requires a learned consensus row at all for the 11 curated models
+ * in `model_guide.SOURCES` that carry an operator-vouched `sha256`/
+ * `sizeBytes` -- a "zero-holder" curated model (no worker in the fleet has
+ * ever reported it, so no `model_hashes` row can exist) still gets a signed
+ * manifest entry, built straight from those guide values (see
+ * `guideHashEntry`). A learned consensus, once any worker reports one,
+ * always wins over the guide value for that entry; a guide/consensus
+ * mismatch is logged (deduped per (name, guide, consensus) triple via
+ * `MISMATCH_LOGGED`, a module-level Set -- fine for a single worker isolate,
+ * same as the Python process-level set) and the consensus hash is what
+ * ships. A conflicted `model_hashes` row still excludes the name outright,
+ * guide hash or not -- see `entries()`.
  */
 
 import { matchesModelName } from "./assess";
@@ -57,6 +71,35 @@ export interface ManifestEntry {
    * for a URL-sourced entry with no online seeder, matching peer.py's
    * `entries()` shape (`peer` key only set when true, never `false`). */
   peer?: true;
+}
+
+// Guide-vs-consensus mismatch warnings already emitted (dedup; see
+// `entries()`) -- module-level Set, ported from Python's `_MISMATCH_LOGGED`.
+// Fine to keep per-isolate: a repeat mismatch after an isolate recycle just
+// logs once more, no correctness dependency on this surviving a cold start.
+const MISMATCH_LOGGED = new Set<string>();
+
+/** Test-only escape hatch (Phase 3.2 F6 fix), ports model_manifest.py's
+ * `_clear_mismatch_log_for_tests`: reset the module-level guide-vs-consensus
+ * mismatch dedup set so a test asserting a warning was logged isn't broken
+ * by test ORDER -- only the first execution of a given (name, guide,
+ * consensus) triple in this module instance actually logs otherwise. NOT
+ * for production use. */
+export function clearMismatchLogForTests(): void {
+  MISMATCH_LOGGED.clear();
+}
+
+/** The curated guide sha256 for inventory-relative `name`, when it matches
+ * one of the 11 `model_guide.SOURCES` entries that carries a vouched hash --
+ * else null. Used only to annotate a `recordHash` conflict warning (Phase
+ * 3.2 F4 fix) with a diagnostic clue; never to resolve/prefer a value -- a
+ * `model_hashes` conflict stays purely reporter-vs-reporter, and the guide
+ * never writes to this table. Ports model_manifest.py's `_guide_sha256_for`. */
+function guideSha256For(name: string): string | null {
+  for (const source of Object.values(modelGuide.SOURCES)) {
+    if (source.sha256 && matchesModelName(name, source.name)) return source.sha256;
+  }
+  return null;
 }
 
 export interface RecordHashResult {
@@ -117,10 +160,24 @@ export async function recordHash(
     return { conflict: false };
   }
 
+  // Phase 3.2 F4 fix: when either side of the conflict happens to equal the
+  // curated guide's vouched hash for this name, say so -- that's exactly
+  // the clue an operator needs to diagnose "this is a stale registry entry,
+  // not two genuinely different worker builds" at a glance.
+  const guideSha256 = guideSha256For(name);
+  let guideClue = "";
+  if (guideSha256 !== null) {
+    if (guideSha256 === sha256) {
+      guideClue = ` (NOTE: worker ${workerId}'s reported hash matches the curated guide value -- the OTHER report looks stale)`;
+    } else if (guideSha256 === existing.sha256) {
+      guideClue = ` (NOTE: the existing hash matches the curated guide value -- worker ${workerId}'s NEW report looks stale)`;
+    }
+  }
+
   console.warn(
     `model_manifest: sha256 conflict for ${name} (size_bytes=${sizeBytes}): ` +
       `worker ${workerId} reported ${sha256}, worker ${existing.firstWorkerId} previously reported ` +
-      `${existing.sha256} -- keeping the first-seen hash and excluding this name from the fetch manifest`
+      `${existing.sha256} -- keeping the first-seen hash and excluding this name from the fetch manifest${guideClue}`
   );
   await queries.markModelHashConflict(db, name, sizeBytes);
   return { conflict: true };
@@ -146,6 +203,43 @@ function splitInventoryName(inventoryName: string): [directory: string, name: st
   const slash = normalized.indexOf("/");
   if (slash === -1) return ["", normalized];
   return [normalized.slice(0, slash), normalized.slice(slash + 1)];
+}
+
+/** Phase 3.2 zero-holder entry: sign a manifest entry straight from
+ * `source`'s operator-vouched `sha256`/`sizeBytes` when NO `model_hashes`
+ * row exists for it yet (nobody in the fleet holds the file, so no learned
+ * consensus is even possible) -- ports `model_manifest._guide_hash_entry`.
+ * Caller (`entries()`) only reaches here after confirming no row --
+ * conflicted or otherwise -- matches this name; a learned consensus, once
+ * any worker reports one, always takes over from this path (see
+ * `entries()`'s consensus-precedence branch).
+ *
+ * `peer` is deliberately never set on this entry: by construction there is
+ * no `model_hashes` row, so there is nothing for `rowHasSeeder` to have
+ * matched -- an entry from this path always means zero holders right now. */
+async function guideHashEntry(seedHex: string, source: modelGuide.ModelSource): Promise<ManifestEntry | null> {
+  if (source.sha256 === undefined || source.sizeBytes === undefined) return null;
+
+  if (source.name.includes("|") || source.directory.includes("|")) {
+    console.warn(
+      `model_manifest: skipping guide-hash manifest candidate with a '|' in name or directory ` +
+        `(payload delimiter): name=${JSON.stringify(source.name)} directory=${JSON.stringify(source.directory)}`
+    );
+    return null;
+  }
+
+  const payload = buildManifestEntryPayload(source.name, source.directory, source.sha256, source.sizeBytes);
+  const sig = await signHex(seedHex, new TextEncoder().encode(payload));
+
+  return {
+    name: source.name,
+    directory: source.directory,
+    url: source.officialUrl,
+    backup_url: source.backupUrl,
+    sha256: source.sha256,
+    size_bytes: source.sizeBytes,
+    sig,
+  };
 }
 
 /** Build a peer-only manifest entry for `row` (a non-conflicted
@@ -211,6 +305,11 @@ export async function entries(db: D1Database, store: R2Bucket, seedHex: string):
   const names = new Set([...Object.keys(modelGuide.SOURCES), ...Object.keys(harvested)]);
 
   const hashRows = await queries.getAllModelHashes(db);
+  // Phase 3.2: a conflicted row must still block the guide-hash fallback
+  // below -- "two reporters disagree" is not resolved by the operator's
+  // curated hash, so a name with one stays excluded exactly like before this
+  // phase.
+  const conflictedRows = await queries.getConflictedModelHashes(db);
 
   // M3 final-review fix: one worker query + one inventory parse per worker
   // for this whole call, instead of once per hash row below.
@@ -223,7 +322,31 @@ export async function entries(db: D1Database, store: R2Bucket, seedHex: string):
     if (source === null || !source.officialUrl) continue;
 
     const row = findHashRow(hashRows, name);
-    if (row === null) continue;
+    if (row === null) {
+      // Phase 3.2: no learned consensus for this (curated or harvested)
+      // source. A conflicted row still excludes it outright -- consensus
+      // precedence never lets a curated guide hash paper over a genuine
+      // reporter disagreement.
+      if (findHashRow(conflictedRows, name) !== null) continue;
+      const guideEntry = await guideHashEntry(seedHex, source);
+      if (guideEntry !== null) result.push(guideEntry);
+      continue;
+    }
+
+    if (source.sha256 !== undefined && source.sha256 !== row.sha256) {
+      const dedupKey = `${source.name} ${source.sha256} ${row.sha256}`;
+      // Dedup per (name, pair): entries() can be read repeatedly (every
+      // manifest fetch), and a standing mismatch would otherwise flood the
+      // log.
+      if (!MISMATCH_LOGGED.has(dedupKey)) {
+        MISMATCH_LOGGED.add(dedupKey);
+        console.warn(
+          `model_manifest: guide sha256 for ${source.name} differs from the learned consensus ` +
+            `(guide=${source.sha256} consensus=${row.sha256}) -- consensus wins, the manifest entry uses the ` +
+            `learned hash`
+        );
+      }
+    }
 
     // Defensive: `|` is the field delimiter in the signed payload below --
     // see model_manifest.py's docstring for why a harvested entry's

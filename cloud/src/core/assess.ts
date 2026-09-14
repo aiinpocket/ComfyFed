@@ -249,13 +249,41 @@ const FETCH_DISK_MARGIN = 1.2;
 
 const BYTES_PER_GB = 1024 ** 3;
 
-/** Protocol/auto_fetch/disk-margin gate, independent of WHICH models are
- * missing -- shared by `verdict`'s per-candidate gate and
+/** Fallback budget assumed for a worker whose hello never reported
+ * `max_fetch_gb` at all (Phase 3.2 F1 fix) -- missing/malformed, or hello
+ * simply predates the field. Mirrors the agent's own default
+ * (`agent/comfyfed_agent/config.py`'s `AgentConfig.max_fetch_gb`) so a fleet
+ * that never customized the setting behaves identically whether the server
+ * knows about the field or not. Ports assess.py's `_DEFAULT_MAX_FETCH_GB`. */
+const DEFAULT_MAX_FETCH_GB = 30.0;
+
+/** This worker's configured auto-fetch budget (hello's optional
+ * `max_fetch_gb`), stashed into the `hardware` JSON blob by `hub.ts`'s
+ * `handleHello` alongside the agent-reported hardware fields.
+ * Missing/non-numeric/non-positive degrades to `DEFAULT_MAX_FETCH_GB` -- the
+ * same default the agent itself applies, so an old-or-silent agent is
+ * treated exactly like a fresh one, never as "unlimited". Ports assess.py's
+ * `_worker_max_fetch_gb`. */
+function workerMaxFetchGb(worker: Worker): number {
+  const value = worker.hardware["max_fetch_gb"];
+  if (typeof value !== "number" || !Number.isFinite(value) || value <= 0) return DEFAULT_MAX_FETCH_GB;
+  return value;
+}
+
+/** Protocol/auto_fetch/budget/disk-margin gate, independent of WHICH models
+ * are missing -- shared by `verdict`'s per-candidate gate and
  * `partitionFleetFetchable`'s fleet-wide submission-time gate. Ports
  * `assess._worker_fetch_capacity_ok`. */
 function workerFetchCapacityOk(worker: Worker, dynamic: Record<string, unknown>, totalMissingGb: number): boolean {
   if (workerProtocol(worker) < MIN_AUTO_FETCH_PROTOCOL) return false;
   if (!worker.autoFetch) return false;
+
+  // Phase 3.2 F1 fix: a worker that would refuse the download itself
+  // (the agent's own max_fetch_gb check) must not be counted fetch-capable
+  // here -- otherwise the platform queues a job guaranteed to fail
+  // post-dispatch instead of 400ing at submission time with an actionable
+  // reason.
+  if (totalMissingGb > workerMaxFetchGb(worker)) return false;
 
   const freeDiskGb = asNumber(dynamic["free_disk_gb"]);
   if (freeDiskGb === null) {

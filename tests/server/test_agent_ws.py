@@ -2267,6 +2267,96 @@ def test_hello_stores_reported_auto_fetch_false(client):
         ws.close()
 
 
+def test_hello_stores_reported_max_fetch_gb_in_hardware_blob(client):
+    """Phase 3.2 F1 fix: hello's optional `max_fetch_gb` rides inside the
+    `hardware` JSON blob (no new column/migration) so
+    assess._worker_max_fetch_gb can read it back."""
+    csrf = _login(client)
+    worker_id, sk = _register_worker(client, csrf, "w1")
+
+    ws = _connect(client, worker_id, sk)
+    try:
+        ws.send_json(
+            {
+                "type": "hello",
+                "hardware": {"cpu": "x"},
+                "backend": "cuda",
+                "torch_version": "2.0",
+                "node_classes": [],
+                "protocol": 4,
+                "auto_fetch": True,
+                "max_fetch_gb": 5,
+            }
+        )
+        agentws.dispatch_once(worker_id)
+
+        with db.get_session() as session:
+            worker = session.get(db.Worker, worker_id)
+            hardware = json.loads(worker.hardware)
+            assert hardware["max_fetch_gb"] == 5
+            assert hardware["cpu"] == "x"
+    finally:
+        ws.close()
+
+
+def test_hello_without_max_fetch_gb_omits_it_from_hardware_blob(client):
+    """An old agent's hello (or one that never reports the field) must not
+    invent a value -- assess._worker_max_fetch_gb degrades to the shared
+    default instead of trusting a missing/absent key as unlimited."""
+    csrf = _login(client)
+    worker_id, sk = _register_worker(client, csrf, "w1")
+
+    ws = _connect(client, worker_id, sk)
+    try:
+        ws.send_json(
+            {
+                "type": "hello",
+                "hardware": {"cpu": "x"},
+                "backend": "cuda",
+                "torch_version": "2.0",
+                "node_classes": [],
+                "protocol": 3,
+                "auto_fetch": True,
+            }
+        )
+        agentws.dispatch_once(worker_id)
+
+        with db.get_session() as session:
+            worker = session.get(db.Worker, worker_id)
+            hardware = json.loads(worker.hardware)
+            assert "max_fetch_gb" not in hardware
+    finally:
+        ws.close()
+
+
+def test_hello_with_invalid_max_fetch_gb_is_ignored(client):
+    csrf = _login(client)
+    worker_id, sk = _register_worker(client, csrf, "w1")
+
+    ws = _connect(client, worker_id, sk)
+    try:
+        ws.send_json(
+            {
+                "type": "hello",
+                "hardware": {"cpu": "x"},
+                "backend": "cuda",
+                "torch_version": "2.0",
+                "node_classes": [],
+                "protocol": 4,
+                "auto_fetch": True,
+                "max_fetch_gb": -5,
+            }
+        )
+        agentws.dispatch_once(worker_id)
+
+        with db.get_session() as session:
+            worker = session.get(db.Worker, worker_id)
+            hardware = json.loads(worker.hardware)
+            assert "max_fetch_gb" not in hardware
+    finally:
+        ws.close()
+
+
 def test_hello_without_auto_fetch_field_defaults_to_false(client):
     """An old (pre-Task-1) agent's hello has no `auto_fetch` key at all --
     must never be read as consent to auto-download models."""
