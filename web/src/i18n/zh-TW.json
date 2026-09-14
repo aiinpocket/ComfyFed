@@ -37,10 +37,10 @@
     "subtitle": "登入以管理你的 GPU 聯邦。",
     "username": "使用者名稱",
     "username_placeholder": "請輸入使用者名稱",
-    "password": "管理員密碼",
-    "password_placeholder": "請輸入管理員密碼",
+    "password": "密碼",
+    "password_placeholder": "請輸入密碼",
     "submit": "登入",
-    "hint": "密碼在第一次執行安裝時會印在畫面上。",
+    "hint": "管理員的初始密碼在安裝時顯示；成員帳號由管理員建立並提供密碼。",
     "error": "登入失敗。"
   },
   "setup": {
@@ -347,7 +347,7 @@
   "settings": {
     "title": "設定",
     "subtitle": "控制台與平台設定。",
-    "password_heading": "管理員密碼",
+    "password_heading": "密碼",
     "password_hint": "改密碼會把所有已登入的工作階段（包含目前這一個）全部踢掉，需要重新登入。",
     "old_password": "目前密碼",
     "new_password": "新密碼",

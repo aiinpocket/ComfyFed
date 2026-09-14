@@ -68,7 +68,7 @@ describe('Login', () => {
     expect(username).toBeInTheDocument();
     expect(username).toHaveAttribute('autocomplete', 'username');
 
-    const password = screen.getByLabelText('Admin password');
+    const password = screen.getByLabelText('Password');
     expect(password).toBeInTheDocument();
     expect(password).toHaveAttribute('autocomplete', 'current-password');
   });
@@ -81,7 +81,7 @@ describe('Login', () => {
     fireEvent.change(screen.getByLabelText('Username'), { target: { value: 'alice' } });
     expect(submit).toBeDisabled();
 
-    fireEvent.change(screen.getByLabelText('Admin password'), {
+    fireEvent.change(screen.getByLabelText('Password'), {
       target: { value: 'correcthorse' },
     });
     expect(submit).not.toBeDisabled();
@@ -101,7 +101,7 @@ describe('Login', () => {
     renderLogin(onAuthenticated);
 
     fireEvent.change(screen.getByLabelText('Username'), { target: { value: 'alice' } });
-    fireEvent.change(screen.getByLabelText('Admin password'), {
+    fireEvent.change(screen.getByLabelText('Password'), {
       target: { value: 'correcthorse' },
     });
     fireEvent.click(screen.getByRole('button', { name: 'Sign in' }));
@@ -131,7 +131,7 @@ describe('Login', () => {
     renderLogin(onAuthenticated);
 
     fireEvent.change(screen.getByLabelText('Username'), { target: { value: 'alice' } });
-    fireEvent.change(screen.getByLabelText('Admin password'), { target: { value: 'wrong' } });
+    fireEvent.change(screen.getByLabelText('Password'), { target: { value: 'wrong' } });
     fireEvent.click(screen.getByRole('button', { name: 'Sign in' }));
 
     expect(await screen.findByText('Wrong password.')).toBeInTheDocument();

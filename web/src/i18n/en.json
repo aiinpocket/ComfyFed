@@ -37,10 +37,10 @@
     "subtitle": "Sign in to manage your GPU federation.",
     "username": "Username",
     "username_placeholder": "Enter your username",
-    "password": "Admin password",
-    "password_placeholder": "Enter the admin password",
+    "password": "Password",
+    "password_placeholder": "Enter your password",
     "submit": "Sign in",
-    "hint": "The password was printed by the installer on first run.",
+    "hint": "The admin's initial password is shown during install; member accounts are created by an admin who provides the password.",
     "error": "Sign-in failed."
   },
   "setup": {
@@ -347,7 +347,7 @@
   "settings": {
     "title": "Settings",
     "subtitle": "Console and platform configuration.",
-    "password_heading": "Admin password",
+    "password_heading": "Password",
     "password_hint": "Changing the password signs out every session, including this one — you will need to sign in again.",
     "old_password": "Current password",
     "new_password": "New password",

@@ -103,7 +103,7 @@ describe('App bootstrap: first-run setup gate', () => {
     stubFetch({ setupStatus: '404' });
     renderApp();
 
-    expect(await screen.findByLabelText('Admin password')).toBeInTheDocument();
+    expect(await screen.findByLabelText('Password')).toBeInTheDocument();
     expect(screen.queryByLabelText('Setup token')).not.toBeInTheDocument();
   });
 
@@ -111,14 +111,14 @@ describe('App bootstrap: first-run setup gate', () => {
     stubFetch({ setupStatus: 'network_error' });
     renderApp();
 
-    expect(await screen.findByLabelText('Admin password')).toBeInTheDocument();
+    expect(await screen.findByLabelText('Password')).toBeInTheDocument();
   });
 
   it('renders the normal login form when setup is not needed', async () => {
     stubFetch({ setupStatus: 'not_needed' });
     renderApp();
 
-    expect(await screen.findByLabelText('Admin password')).toBeInTheDocument();
+    expect(await screen.findByLabelText('Password')).toBeInTheDocument();
   });
 
   it('renders the Setup form instead of Login when setup is needed', async () => {
@@ -128,7 +128,7 @@ describe('App bootstrap: first-run setup gate', () => {
     expect(await screen.findByLabelText('Setup token')).toBeInTheDocument();
     expect(screen.getByLabelText('New admin password')).toBeInTheDocument();
     expect(screen.getByLabelText('Confirm new password')).toBeInTheDocument();
-    expect(screen.queryByLabelText('Admin password')).not.toBeInTheDocument();
+    expect(screen.queryByLabelText('Password')).not.toBeInTheDocument();
   });
 
   it('blocks submission client-side when the two passwords do not match', async () => {
@@ -170,7 +170,7 @@ describe('App bootstrap: first-run setup gate', () => {
 
     fireEvent.click(screen.getByRole('button', { name: 'Create admin password' }));
 
-    expect(await screen.findByLabelText('Admin password')).toBeInTheDocument();
+    expect(await screen.findByLabelText('Password')).toBeInTheDocument();
     expect(screen.queryByLabelText('Setup token')).not.toBeInTheDocument();
   });
 
