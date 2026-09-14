@@ -576,3 +576,199 @@ def test_contributions_accepts_a_timezone_aware_date(client):
     r = client.get(f"/api/reports/contributions?from={quote(tomorrow)}")
     assert r.status_code == 200
     assert r.json() == []
+
+
+# --- Task 5: per-user usage, my-usage, payout reports -----------------------
+
+
+def _create_user(client, admin_csrf, username, role="user", password="password123"):
+    r = client.post(
+        "/api/users",
+        json={"username": username, "role": role, "password": password},
+        headers={"X-CSRF": admin_csrf},
+    )
+    assert r.status_code == 200, r.text
+    return r.json()
+
+
+def test_usage_report_aggregates_per_user_and_null_legacy_row(client):
+    admin_csrf = _login(client)
+    worker_id, _sk = _register_worker_with_key(client, admin_csrf, "w1")
+    alice = _create_user(client, admin_csrf, "alice", password="alice-pw-123")
+    bob = _create_user(client, admin_csrf, "bob", password="bob-pw-123")
+
+    with db.get_session() as session:
+        session.add_all(
+            [
+                db.Job(id="job-alice-1", workflow_json="{}", user_id=alice["id"]),
+                db.Job(id="job-alice-2", workflow_json="{}", user_id=alice["id"]),
+                db.Job(id="job-bob-1", workflow_json="{}", user_id=bob["id"]),
+                db.Job(id="job-legacy", workflow_json="{}", user_id=None),
+            ]
+        )
+        session.add_all(
+            [
+                db.Receipt(job_id="job-alice-1", worker_id=worker_id, gpu_seconds=10.0, platform_sig="ab" * 32),
+                db.Receipt(
+                    job_id="job-alice-2", worker_id=worker_id, gpu_seconds=3.0, platform_sig="cd" * 32,
+                    kind="failed", billable=False,
+                ),
+                db.Receipt(job_id="job-bob-1", worker_id=worker_id, gpu_seconds=5.0, platform_sig="ef" * 32),
+                db.Receipt(job_id="job-legacy", worker_id=worker_id, gpu_seconds=7.0, platform_sig="99" * 32),
+            ]
+        )
+        session.commit()
+
+    res = client.get("/api/reports/usage", headers={"X-CSRF": admin_csrf})
+    assert res.status_code == 200
+    rows = res.json()
+    by_user = {row["user_id"]: row for row in rows}
+
+    assert by_user[alice["id"]] == {
+        "user_id": alice["id"], "username": "alice", "jobs": 1, "gpu_seconds": 10.0, "unbilled_gpu_seconds": 3.0,
+    }
+    assert by_user[bob["id"]] == {
+        "user_id": bob["id"], "username": "bob", "jobs": 1, "gpu_seconds": 5.0, "unbilled_gpu_seconds": 0.0,
+    }
+    assert by_user[None] == {
+        "user_id": None, "username": None, "jobs": 1, "gpu_seconds": 7.0, "unbilled_gpu_seconds": 0.0,
+    }
+    # sorted gpu_seconds DESC
+    assert [row["gpu_seconds"] for row in rows] == sorted((row["gpu_seconds"] for row in rows), reverse=True)
+
+
+def test_usage_report_requires_admin(client):
+    admin_csrf = _login(client)
+    _create_user(client, admin_csrf, "alice", password="alice-pw-123")
+
+    r = client.post("/api/auth/login", json={"username": "alice", "password": "alice-pw-123"})
+    assert r.status_code == 200
+    alice_csrf = r.json()["csrf"]
+
+    res = client.get("/api/reports/usage", headers={"X-CSRF": alice_csrf})
+    assert res.status_code == 403
+
+
+def test_my_usage_is_isolated_to_the_session_user(client):
+    admin_csrf = _login(client)
+    worker_id, _sk = _register_worker_with_key(client, admin_csrf, "w1")
+    alice = _create_user(client, admin_csrf, "alice", password="alice-pw-123")
+    bob = _create_user(client, admin_csrf, "bob", password="bob-pw-123")
+
+    with db.get_session() as session:
+        session.add_all(
+            [
+                db.Job(id="job-alice-1", workflow_json="{}", user_id=alice["id"]),
+                db.Job(id="job-bob-1", workflow_json="{}", user_id=bob["id"]),
+            ]
+        )
+        session.add_all(
+            [
+                db.Receipt(job_id="job-alice-1", worker_id=worker_id, gpu_seconds=12.0, platform_sig="ab" * 32),
+                db.Receipt(job_id="job-bob-1", worker_id=worker_id, gpu_seconds=99.0, platform_sig="cd" * 32),
+            ]
+        )
+        session.commit()
+
+    r = client.post("/api/auth/login", json={"username": "alice", "password": "alice-pw-123"})
+    assert r.status_code == 200
+    alice_csrf = r.json()["csrf"]
+
+    res = client.get("/api/reports/my-usage", headers={"X-CSRF": alice_csrf})
+    assert res.status_code == 200
+    assert res.json() == {
+        "user_id": alice["id"], "username": "alice", "jobs": 1, "gpu_seconds": 12.0, "unbilled_gpu_seconds": 0.0,
+    }
+
+
+def test_my_usage_returns_zeroed_row_when_no_receipts(client):
+    admin_csrf = _login(client)
+    carol = _create_user(client, admin_csrf, "carol", password="carol-pw-123")
+
+    r = client.post("/api/auth/login", json={"username": "carol", "password": "carol-pw-123"})
+    assert r.status_code == 200
+    carol_csrf = r.json()["csrf"]
+
+    res = client.get("/api/reports/my-usage", headers={"X-CSRF": carol_csrf})
+    assert res.status_code == 200
+    assert res.json() == {
+        "user_id": carol["id"], "username": "carol", "jobs": 0, "gpu_seconds": 0.0, "unbilled_gpu_seconds": 0.0,
+    }
+
+
+def test_my_usage_allows_any_authenticated_user(client):
+    # Admin's own bootstrap session can also call my-usage (any user, not
+    # admin-only).
+    admin_csrf = _login(client)
+    res = client.get("/api/reports/my-usage", headers={"X-CSRF": admin_csrf})
+    assert res.status_code == 200
+    assert res.json()["jobs"] == 0
+
+
+def test_payout_report_computes_ratio_and_amount_from_billable_gpu_seconds(client):
+    admin_csrf = _login(client)
+    w1_id, _sk1 = _register_worker_with_key(client, admin_csrf, "w1")
+    w2_id, _sk2 = _register_worker_with_key(client, admin_csrf, "w2")
+
+    with db.get_session() as session:
+        session.add_all(
+            [
+                db.Receipt(job_id="j1", worker_id=w1_id, gpu_seconds=30.0, platform_sig="ab" * 32),
+                db.Receipt(
+                    job_id="j2", worker_id=w1_id, gpu_seconds=999.0, platform_sig="cd" * 32,
+                    kind="failed", billable=False,
+                ),
+                db.Receipt(job_id="j3", worker_id=w2_id, gpu_seconds=10.0, platform_sig="ef" * 32),
+            ]
+        )
+        session.commit()
+
+    res = client.get("/api/reports/payout", params={"pool": "100"}, headers={"X-CSRF": admin_csrf})
+    assert res.status_code == 200
+    body = res.json()
+    assert body["total_gpu_seconds"] == 40.0
+    assert body["pool"] == 100.0
+    workers = {w["worker_id"]: w for w in body["workers"]}
+    assert workers[w1_id]["gpu_seconds"] == 30.0
+    assert workers[w1_id]["ratio"] == pytest.approx(0.75)
+    assert workers[w1_id]["amount"] == pytest.approx(75.0)
+    assert workers[w2_id]["gpu_seconds"] == 10.0
+    assert workers[w2_id]["ratio"] == pytest.approx(0.25)
+    assert workers[w2_id]["amount"] == pytest.approx(25.0)
+    # sorted gpu_seconds DESC
+    assert [w["gpu_seconds"] for w in body["workers"]] == [30.0, 10.0]
+
+
+def test_payout_report_zero_total_returns_empty_workers(client):
+    admin_csrf = _login(client)
+    res = client.get("/api/reports/payout", params={"pool": "50"}, headers={"X-CSRF": admin_csrf})
+    assert res.status_code == 200
+    assert res.json() == {"total_gpu_seconds": 0, "pool": 50.0, "workers": []}
+
+
+def test_payout_report_rejects_missing_or_bad_or_negative_pool(client):
+    admin_csrf = _login(client)
+
+    r = client.get("/api/reports/payout", headers={"X-CSRF": admin_csrf})
+    assert r.status_code == 400
+    assert r.json()["error"]["code"] == "reports.bad_pool"
+
+    r = client.get("/api/reports/payout", params={"pool": "not-a-number"}, headers={"X-CSRF": admin_csrf})
+    assert r.status_code == 400
+    assert r.json()["error"]["code"] == "reports.bad_pool"
+
+    r = client.get("/api/reports/payout", params={"pool": "-5"}, headers={"X-CSRF": admin_csrf})
+    assert r.status_code == 400
+    assert r.json()["error"]["code"] == "reports.bad_pool"
+
+
+def test_payout_report_requires_admin(client):
+    admin_csrf = _login(client)
+    _create_user(client, admin_csrf, "alice", password="alice-pw-123")
+
+    r = client.post("/api/auth/login", json={"username": "alice", "password": "alice-pw-123"})
+    assert r.status_code == 200
+    alice_csrf = r.json()["csrf"]
+
+    res = client.get("/api/reports/payout", params={"pool": "10"}, headers={"X-CSRF": alice_csrf})
+    assert res.status_code == 403
