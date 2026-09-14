@@ -10,12 +10,14 @@
 
 set -euo pipefail
 
+main() {
+
 PLATFORM_URL='{{PLATFORM_URL}}'
 PLATFORM_URL="${PLATFORM_URL%/}"
 REGISTER_TOKEN='{{REGISTER_TOKEN}}'
 
 COMFY_VERSION_PINNED='v0.35.0'
-COMFY_GIT_URL="${COMFYFED_COMFY_GIT_URL:-https://github.com/comfyanonymous/ComfyUI}"
+COMFY_GIT_URL="${COMFYFED_COMFY_GIT_URL:-https://github.com/Comfy-Org/ComfyUI}"
 COMFY_GIT_REF="${COMFYFED_COMFY_REF:-$COMFY_VERSION_PINNED}"
 
 APP_DIR="$HOME/.comfyfed/app"
@@ -170,14 +172,20 @@ case "$WHEEL_URL" in
     *) WHEEL_URL="$PLATFORM_URL$WHEEL_URL" ;;
 esac
 
-WHEEL_FILE="$(mktemp -t comfyfed-agent-XXXXXX.whl)"
+# A plain `mktemp -t NAME-XXXXXX.whl` only appends the `.whl` suffix on
+# GNU mktemp (Linux); BSD mktemp (macOS) ignores everything after the last
+# `X` and creates an extension-less file, and pip refuses to install a
+# wheel whose filename doesn't end in `.whl`. Make a temp *directory*
+# (portable across GNU/BSD mktemp) and give the wheel a fixed name inside it.
+WHEEL_TMPDIR="$(mktemp -d)"
+WHEEL_FILE="$WHEEL_TMPDIR/agent.whl"
 bilingual "下載 agent wheel..." "Downloading agent wheel..."
 curl -fsSL "$WHEEL_URL" -o "$WHEEL_FILE" || fail_step "下載 agent wheel" "downloading the agent wheel" \
     "請確認網路連線後重跑本腳本" "please check your network connection then re-run this script"
 
 ACTUAL_SHA256="$(sha256_of "$WHEEL_FILE")"
 if [ "$ACTUAL_SHA256" != "$WHEEL_SHA256" ]; then
-    rm -f "$WHEEL_FILE"
+    rm -rf "$WHEEL_TMPDIR"
     fail_step "agent wheel 的 sha256 驗證失敗" "agent wheel sha256 verification failed" \
         "請重跑本腳本；若持續失敗請聯絡平台管理員" "please re-run this script; contact the platform administrator if it keeps failing"
 fi
@@ -185,7 +193,7 @@ fi
 bilingual "安裝 agent..." "Installing agent..."
 "$VENV_PIP" install --upgrade "$WHEEL_FILE" || fail_step "安裝 agent wheel" "installing the agent wheel" \
     "請重跑本腳本" "please re-run this script"
-rm -f "$WHEEL_FILE"
+rm -rf "$WHEEL_TMPDIR"
 
 # ---------------------------------------------------------------------------
 # Helper python script (ComfyUI detection), dropped to disk instead of
@@ -352,28 +360,19 @@ with open(sys.argv[3], 'w', encoding='utf-8') as f:
 fi
 
 # ---------------------------------------------------------------------------
-# 5. Launcher + autostart
+# 5. Autostart
 # ---------------------------------------------------------------------------
+# Units/plists below exec the ComfyUI venv python and the agent binary
+# directly (ExecStart / ProgramArguments) -- there used to be a
+# launcher.sh generated here for them to go through, but nothing ever
+# referenced it, so it was dead code. Removed.
 
-LAUNCHER_SCRIPT="$APP_DIR/launcher.sh"
-cat > "$LAUNCHER_SCRIPT" <<SHEOF
-#!/usr/bin/env bash
-set -uo pipefail
-MANAGED_MARKER="$MANAGED_MARKER"
-if [ -f "\$MANAGED_MARKER" ]; then
-    START_EXE="\$(python3 -c "import json;print(json.load(open('\$MANAGED_MARKER'))['start_exe'])" 2>/dev/null)"
-    START_ARG="\$(python3 -c "import json;print(json.load(open('\$MANAGED_MARKER'))['args'][0])" 2>/dev/null)"
-    if [ -n "\$START_EXE" ]; then
-        nohup "\$START_EXE" "\$START_ARG" >>"$COMFY_DIR/comfyui.log" 2>&1 &
-        for _ in \$(seq 1 60); do
-            curl -fsS "http://127.0.0.1:8188/system_stats" >/dev/null 2>&1 && break
-            sleep 3
-        done
-    fi
-fi
-exec "$VENV_AGENT" run >>"$APP_DIR/agent.log" 2>&1
-SHEOF
-chmod +x "$LAUNCHER_SCRIPT"
+xml_escape() {
+    # Escape a value for use as XML character data / attribute content in
+    # the launchd plists below (paths are derived from $HOME, which is not
+    # fully trusted input).
+    printf '%s' "$1" | sed -e 's/&/\&amp;/g' -e 's/</\&lt;/g' -e 's/>/\&gt;/g'
+}
 
 bilingual "設定開機自動啟動..." "Configuring auto-start on login..."
 
@@ -388,7 +387,7 @@ Description=ComfyFed managed ComfyUI
 
 [Service]
 Type=simple
-ExecStart=$COMFY_VENV_DIR/bin/python $COMFY_DIR/main.py
+ExecStart="$COMFY_VENV_DIR/bin/python" "$COMFY_DIR/main.py"
 Restart=on-failure
 
 [Install]
@@ -406,18 +405,34 @@ $AFTER_LINE
 
 [Service]
 Type=simple
-ExecStart=$VENV_AGENT run
+ExecStart="$VENV_AGENT" run
 Restart=on-failure
 
 [Install]
 WantedBy=default.target
 UNITEOF
 
-    systemctl --user daemon-reload
+    # `systemctl --user` needs a user D-Bus/systemd session; that's absent
+    # in plenty of the environments this installer runs in (containers,
+    # WSL without systemd enabled, minimal chroots). Under `set -euo
+    # pipefail` a bare failed systemctl call would kill the whole
+    # installer *after* everything else has already succeeded, which is
+    # worse than just telling the user how to finish the last step by
+    # hand -- so route it through fail_step with that guidance instead.
+    systemctl --user daemon-reload || fail_step \
+        "systemctl --user daemon-reload 失敗" "systemctl --user daemon-reload failed" \
+        "容器/WSL 環境可能沒有 user D-Bus session；請先執行 'loginctl enable-linger $USER'（如適用）後手動執行: systemctl --user daemon-reload" \
+        "containers/WSL may lack a user D-Bus session; try 'loginctl enable-linger $USER' (if applicable) then run manually: systemctl --user daemon-reload"
     if [ "$COMFY_MANAGED" -eq 1 ]; then
-        systemctl --user enable --now comfyfed-comfyui.service
+        systemctl --user enable --now comfyfed-comfyui.service || fail_step \
+            "啟用 comfyfed-comfyui.service 失敗" "enabling comfyfed-comfyui.service failed" \
+            "請手動執行: systemctl --user enable --now comfyfed-comfyui.service" \
+            "please run manually: systemctl --user enable --now comfyfed-comfyui.service"
     fi
-    systemctl --user enable --now comfyfed-agent.service
+    systemctl --user enable --now comfyfed-agent.service || fail_step \
+        "啟用 comfyfed-agent.service 失敗" "enabling comfyfed-agent.service failed" \
+        "請手動執行: systemctl --user enable --now comfyfed-agent.service" \
+        "please run manually: systemctl --user enable --now comfyfed-agent.service"
 
     bilingual "提示: 若要讓服務在登出後仍持續執行，請執行 'loginctl enable-linger $USER'" \
         "Tip: to keep the service running after logout, run 'loginctl enable-linger $USER'"
@@ -426,6 +441,8 @@ elif [ "$OS_KIND" = "darwin" ]; then
     mkdir -p "$LAUNCH_AGENTS_DIR"
 
     if [ "$COMFY_MANAGED" -eq 1 ]; then
+        COMFY_VENV_PYTHON_XML="$(xml_escape "$COMFY_VENV_DIR/bin/python")"
+        COMFY_MAIN_XML="$(xml_escape "$COMFY_DIR/main.py")"
         cat > "$LAUNCH_AGENTS_DIR/com.comfyfed.comfyui.plist" <<PLISTEOF
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
@@ -434,8 +451,8 @@ elif [ "$OS_KIND" = "darwin" ]; then
     <key>Label</key><string>com.comfyfed.comfyui</string>
     <key>ProgramArguments</key>
     <array>
-        <string>$COMFY_VENV_DIR/bin/python</string>
-        <string>$COMFY_DIR/main.py</string>
+        <string>$COMFY_VENV_PYTHON_XML</string>
+        <string>$COMFY_MAIN_XML</string>
     </array>
     <key>RunAtLoad</key><true/>
     <key>KeepAlive</key><true/>
@@ -445,6 +462,7 @@ PLISTEOF
         launchctl load -w "$LAUNCH_AGENTS_DIR/com.comfyfed.comfyui.plist" 2>/dev/null || true
     fi
 
+    VENV_AGENT_XML="$(xml_escape "$VENV_AGENT")"
     cat > "$LAUNCH_AGENTS_DIR/com.comfyfed.agent.plist" <<PLISTEOF
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
@@ -453,7 +471,7 @@ PLISTEOF
     <key>Label</key><string>com.comfyfed.agent</string>
     <key>ProgramArguments</key>
     <array>
-        <string>$VENV_AGENT</string>
+        <string>$VENV_AGENT_XML</string>
         <string>run</string>
     </array>
     <key>RunAtLoad</key><true/>
@@ -467,3 +485,6 @@ fi
 echo ""
 bilingual "安裝完成！ComfyFed agent 已在背景執行，並會於每次登入時自動啟動。" \
     "Install complete! The ComfyFed agent is now running in the background and will auto-start on every login."
+}
+
+main "$@"

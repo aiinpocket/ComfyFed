@@ -1,4 +1,4 @@
-# ComfyFed one-line installer (Windows / PowerShell 5.1+)
+﻿# ComfyFed one-line installer (Windows / PowerShell 5.1+)
 # 中文/EN bilingual output. Idempotent: safe to re-run.
 #
 # Template placeholders substituted server-side before this script is served:
@@ -9,6 +9,12 @@
 
 $ErrorActionPreference = 'Stop'
 Set-StrictMode -Version Latest
+
+# Ensure TLS 1.2 is available regardless of the machine-wide default (some
+# Windows/.NET defaults still exclude it), and keep Invoke-WebRequest /
+# Invoke-RestMethod fast by not rendering a progress bar per chunk.
+[Net.ServicePointManager]::SecurityProtocol = [Net.ServicePointManager]::SecurityProtocol -bor [Net.SecurityProtocolType]::Tls12
+$ProgressPreference = 'SilentlyContinue'
 
 $PlatformUrl = '{{PLATFORM_URL}}'.TrimEnd('/')
 $RegisterToken = '{{REGISTER_TOKEN}}'
@@ -22,6 +28,7 @@ $ManagedMarker = Join-Path $InstallDir 'comfyui_managed.json'
 $AgentConfigPath = Join-Path $env:USERPROFILE '.comfyfed\agent.json'
 $PythonVersionPinned = '3.12.10'
 $ComfyVersionPinned = 'v0.35.0'
+if ($env:COMFYFED_COMFY_VERSION) { $ComfyVersionPinned = $env:COMFYFED_COMFY_VERSION }
 
 function Write-Bilingual {
     param([string]$Zh, [string]$En)
@@ -133,6 +140,7 @@ if (-not (Test-Path $venvPython)) {
     Write-Bilingual '建立虛擬環境...' 'Creating virtual environment...'
     try {
         & $py.Exe @($py.Args) -m venv $VenvDir
+        if ($LASTEXITCODE -ne 0) { throw "venv creation exited $LASTEXITCODE" }
     } catch {
         Fail-Step '建立虛擬環境' 'creating the virtual environment' `
             "請確認 Python 安裝完整（含 venv 模組）" "please confirm Python is installed completely (including the venv module)"
@@ -147,12 +155,14 @@ try {
         "請確認網路連線與平台網址 $PlatformUrl 正確" "please check your network connection and that $PlatformUrl is correct"
 }
 
-if (-not $versionInfo.wheel_url -or -not $versionInfo.sha256) {
+$wheelUrlProp = $versionInfo.PSObject.Properties['wheel_url']
+$sha256Prop = $versionInfo.PSObject.Properties['sha256']
+if ($null -eq $wheelUrlProp -or -not $wheelUrlProp.Value -or $null -eq $sha256Prop -or -not $sha256Prop.Value) {
     Fail-Step '平台尚未發佈 agent wheel' 'the platform has not published an agent wheel yet' `
         "請聯絡平台管理員" "please contact the platform administrator"
 }
 
-$wheelUrl = $versionInfo.wheel_url
+$wheelUrl = $wheelUrlProp.Value
 if ($wheelUrl -notmatch '^https?://') {
     $wheelUrl = "$PlatformUrl$wheelUrl"
 }
@@ -167,7 +177,7 @@ try {
 }
 
 $actualHash = (Get-FileHash -Path $wheelFile -Algorithm SHA256).Hash.ToLower()
-$expectedHash = $versionInfo.sha256.ToLower()
+$expectedHash = $sha256Prop.Value.ToLower()
 if ($actualHash -ne $expectedHash) {
     Remove-Item -Force $wheelFile -ErrorAction SilentlyContinue
     Fail-Step 'agent wheel 的 sha256 驗證失敗' 'agent wheel sha256 verification failed' `
@@ -177,6 +187,7 @@ if ($actualHash -ne $expectedHash) {
 Write-Bilingual '安裝 agent...' 'Installing agent...'
 try {
     & $venvPip install --upgrade $wheelFile
+    if ($LASTEXITCODE -ne 0) { throw "pip install exited $LASTEXITCODE" }
 } catch {
     Fail-Step '安裝 agent wheel' 'installing the agent wheel' `
         "請重跑本腳本" "please re-run this script"
@@ -341,6 +352,7 @@ if (Test-Path $ManagedMarker) {
         Write-Bilingual '安裝解壓工具 py7zr...' 'Installing py7zr for extraction...'
         try {
             & $venvPip install py7zr
+            if ($LASTEXITCODE -ne 0) { throw "pip install py7zr exited $LASTEXITCODE" }
         } catch {
             Fail-Step '安裝 py7zr' 'installing py7zr' "請重跑本腳本" "please re-run this script"
         }
@@ -350,6 +362,7 @@ if (Test-Path $ManagedMarker) {
         Write-Bilingual '解壓 ComfyUI...' 'Extracting ComfyUI...'
         try {
             & $venvPython $HelperScript extract7z $archivePath $extractTemp
+            if ($LASTEXITCODE -ne 0) { throw "extract7z exited $LASTEXITCODE" }
         } catch {
             Fail-Step '解壓 ComfyUI' 'extracting ComfyUI' `
                 "請手動解壓 $archivePath 到 $ComfyDir" "please manually extract $archivePath to $ComfyDir"
@@ -400,7 +413,13 @@ if (Test-Path $ManagedMarker) {
         $comfyManaged = $true
 
         Write-Bilingual '重新偵測並套用設定...' 'Re-running detection and saving config...'
-        & $venvPython $HelperScript apply $AgentConfigPath
+        try {
+            & $venvPython $HelperScript apply $AgentConfigPath
+            if ($LASTEXITCODE -ne 0) { throw "apply detection exited $LASTEXITCODE" }
+        } catch {
+            Fail-Step '套用偵測設定' 'applying detection settings' `
+                "請重跑本腳本" "please re-run this script"
+        }
     }
 }
 
@@ -438,6 +457,7 @@ Write-Bilingual '設定開機自動啟動...' 'Configuring auto-start on logon..
 $taskCmd = "powershell.exe -NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -File `"$LauncherScript`""
 try {
     schtasks /Create /F /TN ComfyFedAgent /SC ONLOGON /TR $taskCmd | Out-Null
+    if ($LASTEXITCODE -ne 0) { throw "schtasks exited $LASTEXITCODE" }
 } catch {
     Fail-Step '建立排程工作' 'creating the scheduled task' `
         "請手動以系統管理員身分執行: schtasks /Create /F /TN ComfyFedAgent /SC ONLOGON /TR `"$taskCmd`"" `
