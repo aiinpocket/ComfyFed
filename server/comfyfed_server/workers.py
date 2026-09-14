@@ -104,17 +104,29 @@ async def verify_agent(
     """Verify an Ed25519-signed agent request, enforcing replay protection.
 
     On success returns the `db.Worker` row. Raises 401 `agent.bad_signature`
-    for missing/malformed headers, an unknown worker, a bad signature, or a
-    stale timestamp (without distinguishing which, to avoid leaking worker
-    existence); 403 `agent.worker_disabled` for a disabled worker; 409
-    `agent.replay` for a reused nonce.
+    for missing/malformed headers, an unknown OR SOFT-DELETED worker, a bad
+    signature, or a stale timestamp (without distinguishing which, to avoid
+    leaking worker existence); 403 `agent.worker_disabled` for a disabled
+    (but not deleted) worker; 409 `agent.replay` for a reused nonce.
+
+    A deleted worker is indistinguishable from an unknown one here, on
+    purpose and for parity with the cloud twin (`lib/verify_agent.ts`, whose
+    `queries.getWorkerById` filters `deleted = 0` and so yields the same 401
+    `agent.bad_signature`), and with the WS handshake's single 4401 close.
+    `disabled` alone keeps its 403: a pause is a state the agent should hear
+    about and stop for, a delete is a row the agent may no longer learn
+    anything about.
     """
     if not x_worker_id or not x_ts or not x_nonce or not x_sig:
         raise _error(401, "agent.bad_signature", "Missing signature headers.")
 
     with db.get_session() as session:
         worker = session.get(db.Worker, x_worker_id)
-        if worker is None:
+        if worker is None or worker.deleted:
+            # Deleted reads as unknown, and does so BEFORE the signature is
+            # checked: there is nothing to leak, since the response is
+            # byte-identical to the one an id-guesser gets for an id that
+            # was never real.
             raise _error(401, "agent.bad_signature", "Invalid signature.")
 
         try:
@@ -455,6 +467,9 @@ def create_router(data_dir: str) -> APIRouter:
         return {"ok": True}
 
     @r.delete("/api/workers/{worker_id}")
+    # MUST stay a sync `def` (review L9): `agentws.kick_worker` below blocks on
+    # `run_coroutine_threadsafe(...).result()`, which needs this to run on a
+    # threadpool thread. Making it `async def` would deadlock it on its own loop.
     def delete_worker(
         worker_id: str,
         _payload: dict = Depends(auth.require_csrf),
@@ -503,7 +518,24 @@ def _forget_worker_metrics(worker_name: str) -> None:
     it. `remove` raises KeyError for a label set that was never set (a worker
     that never heartbeated), which is not an error here. Best-effort in full:
     metrics must never fail the delete.
+
+    Names are NOT unique (`register_worker` mints a fresh row from a
+    caller-supplied name every time), so a name still claimed by a live row --
+    the same machine re-registered as "rig-7", the stale old row then deleted
+    -- must keep its samples: dropping them would blank the LIVE worker's
+    gauges until its next heartbeat. Hence the guard query below: forget the
+    labels only once no non-deleted row answers to this name.
     """
+    with db.get_session() as session:
+        survivor = (
+            session.query(db.Worker.id)
+            .filter(db.Worker.name == worker_name)
+            .filter(db.Worker.deleted == False)  # noqa: E712
+            .first()
+        )
+    if survivor is not None:
+        return
+
     try:
         m = metrics.get_metrics()
     except RuntimeError:

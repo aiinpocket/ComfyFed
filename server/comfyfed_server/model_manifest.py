@@ -261,6 +261,8 @@ def _seeder_candidate_files(session) -> frozenset[tuple[str, int, str]]:
     not null), reused as a plain SQL filter here since the module already
     defines `_MIN_PEER_PROTOCOL`, rather than re-deriving it.
     """
+    # No `deleted` filter, same accepted ~90s window as `peer.online_seeders`
+    # (review L6) -- the two predicates must stay identical.
     query = (
         session.query(db.Worker)
         .filter(db.Worker.status != "offline")

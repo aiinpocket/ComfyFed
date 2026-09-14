@@ -578,7 +578,10 @@ def _fleet_wide_gaps(needs: assess.JobNeeds) -> tuple[set[str], set[str]]:
     see that function's docstring for the fleet-wide-vs-online-only rationale.
     """
     with db.get_session() as session:
-        all_workers = session.query(db.Worker).all()
+        # Soft-deleted rows excluded (`jobs._live_workers`), matching the
+        # cloud's `getAllWorkers`-backed twin: a deleted worker can never be
+        # assigned, so its inventory must not make a prompt look servable.
+        all_workers = jobs._live_workers(session)
     return assess.fleet_wide_gaps(needs, all_workers)
 
 

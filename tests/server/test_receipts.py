@@ -933,6 +933,37 @@ def test_payout_report_computes_ratio_and_amount_from_billable_gpu_seconds(clien
     assert [w["gpu_seconds"] for w in body["workers"]] == [30.0, 10.0]
 
 
+def test_reports_still_resolve_a_deleted_workers_receipts(client):
+    """Review M4: the whole point of the SOFT delete is that the billing ledger
+    keeps working -- the contributions and payout worker-name lookups
+    (`receipts.py`'s two `Worker.id.in_(...)` queries, and the cloud's
+    `getWorkersByIds`) must stay UNFILTERED. Pins that: delete a worker that has
+    receipts, then assert both reports still name it with its seconds intact."""
+    admin_csrf = _login(client)
+    worker_id, _sk = _register_worker_with_key(client, admin_csrf, "retired-rig")
+
+    with db.get_session() as session:
+        session.add(
+            db.Receipt(job_id="j1", worker_id=worker_id, gpu_seconds=30.0, platform_sig="ab" * 32)
+        )
+        session.commit()
+
+    assert client.delete(f"/api/workers/{worker_id}", headers={"X-CSRF": admin_csrf}).status_code == 200
+    assert all(w["id"] != worker_id for w in client.get("/api/workers").json())
+
+    contributions = client.get("/api/reports/contributions", headers={"X-CSRF": admin_csrf}).json()
+    entry = next(w for w in contributions if w["worker_id"] == worker_id)
+    assert entry["name"] == "retired-rig"
+    assert entry["gpu_seconds"] == 30.0
+
+    payout = client.get(
+        "/api/reports/payout", params={"pool": "100"}, headers={"X-CSRF": admin_csrf}
+    ).json()
+    paid = next(w for w in payout["workers"] if w["worker_id"] == worker_id)
+    assert paid["name"] == "retired-rig"
+    assert paid["gpu_seconds"] == 30.0
+
+
 def test_payout_report_zero_total_returns_empty_workers(client):
     admin_csrf = _login(client)
     res = client.get("/api/reports/payout", params={"pool": "50"}, headers={"X-CSRF": admin_csrf})

@@ -225,6 +225,20 @@ def requeue_stale(now: datetime) -> list[str]:
 
     A stale worker's assigned/running jobs go back to queued (worker_id
     cleared, progress reset), and the worker itself is marked offline.
+
+    Soft-deleted workers (`db.Worker.deleted`) are swept for JOBS but never
+    for METRICS. The job pass has to stay unfiltered: an admin delete kicks
+    the socket (`agentws.kick_worker`) without touching that worker's
+    in-flight rows, and this is the only path that ever requeues them -- skip
+    a deleted worker here and its running job is stranded `assigned` forever.
+    The metric pass must NOT run for them: a deleted worker never heartbeats
+    again, so `reference >= cutoff` is false on every subsequent tick, and
+    re-labelling `worker_up{worker=...} 0` every 5s would permanently undo
+    `workers._forget_worker_metrics` and page whoever alerts on it. The
+    offline/peer_url transition still happens, but only once (the
+    `!= "offline"` guard below), so a deleted row stops being peer-seeder
+    eligible (`peer.py`'s `status != 'offline'` filter) instead of churning
+    a write every tick.
     """
     cutoff = now - timedelta(seconds=_STALE_SECONDS)
     requeued: list[str] = []
@@ -251,14 +265,17 @@ def requeue_stale(now: datetime) -> list[str]:
                 job.progress = 0
                 requeued.append(job.id)
 
-            worker.status = "offline"
-            # Phase 3.1 P2P: a seeder endpoint only means anything while the
-            # worker is actually reachable -- clear it here so a stale
-            # worker is never handed out as a grant's seeder (see
-            # agentws._handle_hello, which is the only place peer_url gets
-            # set again, on the agent's next hello).
-            worker.peer_url = None
-            metrics.get_metrics().worker_up.labels(worker=worker.name).set(0)
+            if worker.status != "offline" or worker.peer_url is not None:
+                worker.status = "offline"
+                # Phase 3.1 P2P: a seeder endpoint only means anything while
+                # the worker is actually reachable -- clear it here so a
+                # stale worker is never handed out as a grant's seeder (see
+                # agentws._handle_hello, which is the only place peer_url
+                # gets set again, on the agent's next hello).
+                worker.peer_url = None
+
+            if not worker.deleted:
+                metrics.get_metrics().worker_up.labels(worker=worker.name).set(0)
 
         session.commit()
 

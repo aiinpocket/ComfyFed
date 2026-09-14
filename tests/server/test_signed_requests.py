@@ -142,6 +142,32 @@ def test_disabled_worker_with_invalid_signature_401_not_403(client):
     assert r.json()["error"]["code"] == "agent.bad_signature"
 
 
+def test_deleted_worker_answers_exactly_like_an_unknown_one(client):
+    """Review M5: a soft-deleted worker used to get 403 `agent.worker_disabled`
+    (the delete flips `disabled` too), while the cloud twin's filtered
+    `getWorkerById` gave 401 `agent.bad_signature`. Deleted now reads as
+    UNKNOWN on both stacks -- same status, same body, nothing to tell apart.
+    `test_disabled_worker_403` above pins that a plain disable is unaffected."""
+    entry = _register_worker(client)
+    csrf = _login(client)
+    assert client.delete(f"/api/workers/{entry.worker_id}", headers={"X-CSRF": csrf}).status_code == 200
+
+    deleted = _ping(client, entry)
+
+    ghost = PlatformEntry(
+        platform_url=entry.platform_url,
+        platform_pubkey=entry.platform_pubkey,
+        worker_id="no-such-worker-id",
+        certificate=entry.certificate,
+        signing_key_hex=entry.signing_key_hex,
+    )
+    unknown = _ping(client, ghost)
+
+    assert deleted.status_code == unknown.status_code == 401
+    assert deleted.json() == unknown.json()
+    assert deleted.json()["error"]["code"] == "agent.bad_signature"
+
+
 def test_query_string_is_covered_by_the_signature(client):
     """M14: a signature issued for one query must not validate for another.
 

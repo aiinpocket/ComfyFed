@@ -248,6 +248,26 @@ def test_requeue_stale_clears_peer_url(_db):
         assert worker.peer_url is None
 
 
+def test_requeue_stale_still_requeues_a_deleted_workers_job(_db):
+    """Review H1's counterweight: the metric/gauge bookkeeping skips deleted
+    rows, but the JOB pass must not -- an admin delete kicks the socket without
+    touching in-flight rows, and this is the only path that frees them."""
+    worker_id = _make_worker()
+    with db.get_session() as session:
+        worker = session.get(db.Worker, worker_id)
+        worker.last_seen = _utcnow() - timedelta(seconds=200)
+        worker.deleted = True
+        worker.disabled = True
+        session.commit()
+    job_id = _make_job(status="running", worker_id=worker_id)
+
+    assert dispatch.requeue_stale(_utcnow()) == [job_id]
+
+    with db.get_session() as session:
+        assert session.get(db.Job, job_id).status == "queued"
+        assert session.get(db.Worker, worker_id).status == "offline"
+
+
 def test_requeue_stale_records_last_worker_id_and_clears_worker_id(_db):
     worker_id = _make_worker()
     with db.get_session() as session:

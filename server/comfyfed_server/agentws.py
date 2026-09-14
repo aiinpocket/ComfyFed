@@ -392,6 +392,12 @@ def kick_worker(worker_id: str) -> bool:
         # A dead/closing socket, or a loop that's already gone: the row is
         # already flagged deleted and the connection is already unregistered,
         # so there is nothing left to undo -- never fail the delete over it.
+        # Accepted (review L8): if the close never lands, that socket's
+        # receive loop stays live and keeps refreshing `last_seen`, so its
+        # in-flight job is not requeued while it runs. The real barrier is
+        # the handshake gate below (`worker.deleted` -> 4401), which the
+        # agent hits on its next reconnect; the socket is already gone from
+        # `_connections`, so nothing new is ever dispatched to it.
         logger.exception("agentws: failed to kick deleted worker %s", worker_id)
     return True
 

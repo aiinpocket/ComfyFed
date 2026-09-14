@@ -39,6 +39,22 @@ def job_inputs_dir(data_dir: str, job_id: str) -> str:
     return os.path.join(data_dir, _JOB_INPUTS_DIRNAME, job_id)
 
 
+def _live_workers(session) -> list:
+    """Every NOT-soft-deleted worker row -- the fleet-wide population.
+
+    The Python twin of the cloud's `queries.getAllWorkers` (which filters
+    `deleted = 0`): "fleet-wide" means every worker the scheduler could ever
+    assign to, and `dispatch.assign_jobs` excludes deleted rows, so they must
+    not count towards feasibility or VRAM estimates either. Disabled rows DO
+    still count -- an admin pause is temporary, a delete is not.
+    """
+    return (
+        session.query(db.Worker)
+        .filter(db.Worker.deleted == False)  # noqa: E712
+        .all()
+    )
+
+
 def _online_enabled_workers(session) -> list:
     """Workers eligible to be asked to auto-fetch: online and not disabled.
 
@@ -64,7 +80,11 @@ def unfetchable_missing_models(needs: assess.JobNeeds, data_dir: str) -> set[str
     going through HTTP.
     """
     with db.get_session() as session:
-        all_workers = session.query(db.Worker).all()
+        # `deleted` filtered out, matching the cloud twin (`routes/jobs.ts`'s
+        # `getAllWorkers`): dispatch no longer considers a deleted worker, so
+        # counting its inventory here would accept a submit that can never be
+        # assigned and would sit `queued` forever instead of being rejected.
+        all_workers = _live_workers(session)
         online_workers = _online_enabled_workers(session)
 
     missing_models, _missing_nodes = assess.fleet_wide_gaps(needs, all_workers)
@@ -122,7 +142,9 @@ def create_job(
         raise MissingAssetsError(missing)
 
     with db.get_session() as session:
-        all_workers = session.query(db.Worker).all()
+        # Live rows only -- ghost hardware from a deleted worker would skew
+        # the fleet VRAM estimate the scheduler then matches against.
+        all_workers = _live_workers(session)
         est_vram_gb = assess.estimate_vram(needs.models, all_workers)
 
         job = db.Job(

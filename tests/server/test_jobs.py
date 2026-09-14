@@ -1020,6 +1020,61 @@ def test_submit_still_queues_when_missing_model_is_offline_worker_only(client):
     assert r.status_code == 200
 
 
+def test_submit_rejects_when_only_a_deleted_worker_holds_the_model(client):
+    """Review M2: the fleet-wide feasibility query counted soft-deleted rows,
+    so a model held only by a deleted worker looked present -- the submit was
+    accepted and then sat `queued` forever, because dispatch excludes that
+    worker. It must be rejected exactly like the no-capable-worker case
+    (`test_submit_rejects_when_missing_model_has_no_manifest_entry`)."""
+    csrf = _login(client)
+    # A live worker without the model: `assess.fleet_wide_gaps` short-circuits
+    # to "no gaps" on an empty fleet, so the deleted row must be the ONLY
+    # holder, not the only worker.
+    _register_worker(client, csrf, "other-box", status="online")
+    _register_worker(
+        client,
+        csrf,
+        "gpu-box",
+        status="online",
+        deleted=True,
+        disabled=True,
+        model_inventory=[{"name": "diffusion_models/flux1-dev.safetensors", "size": 22.17}],
+    )
+
+    r = _submit(client, csrf, workflow=FLUX_WORKFLOW)
+    assert r.status_code == 400
+    body = r.json()
+    assert body["error"]["code"] == "jobs.missing_models"
+    assert "flux1-dev.safetensors" in body["error"]["message"]
+
+
+def test_comfy_prompt_rejects_when_only_a_deleted_worker_holds_the_model(client):
+    """The ComfyUI-compatible twin of the gate above (`comfyapi._fleet_wide_gaps`
+    -- the same M2 parity fix, second call site)."""
+    csrf = _login(client)
+    # A live worker without the model: `assess.fleet_wide_gaps` short-circuits
+    # to "no gaps" on an empty fleet, so the deleted row must be the ONLY
+    # holder, not the only worker.
+    _register_worker(client, csrf, "other-box", status="online")
+    _register_worker(
+        client,
+        csrf,
+        "gpu-box",
+        status="online",
+        deleted=True,
+        disabled=True,
+        model_inventory=[{"name": "diffusion_models/flux1-dev.safetensors", "size": 22.17}],
+    )
+
+    r = client.post(
+        "/comfy/api/prompt",
+        json={"prompt": FLUX_WORKFLOW},
+        headers={"X-CSRF": csrf},
+    )
+    assert r.status_code == 400
+    assert "flux1-dev.safetensors" in json.dumps(r.json())
+
+
 def test_job_assessment_reports_eligible_after_fetch_when_manifest_wired(client):
     csrf = _login(client)
     model_manifest.record_hash(

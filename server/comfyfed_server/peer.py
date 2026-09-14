@@ -216,6 +216,10 @@ def online_seeders(session, name: str, size_bytes: int, *, exclude_worker_id: Op
     if hash_row is None or hash_row.conflict:
         return []
 
+    # Accepted (review L6): a soft-deleted worker stays seeder-eligible until
+    # `dispatch.requeue_stale` flips it offline, i.e. at most ~90s. The worst
+    # case is one wasted round trip -- its `peer_served` receipt mint is
+    # refused by `workers.verify_agent` -- so no `deleted` filter here.
     query = (
         session.query(db.Worker)
         .filter(db.Worker.status != "offline")

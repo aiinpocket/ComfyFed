@@ -1,4 +1,5 @@
 import json
+from datetime import datetime, timedelta, timezone
 
 import pytest
 from fastapi.testclient import TestClient
@@ -159,6 +160,64 @@ def test_job_lifecycle_updates_histograms(client):
     text = client.get("/metrics").text
     assert "comfyfed_job_wait_seconds_count 1.0" in text
     assert "comfyfed_job_run_seconds_count 1.0" in text
+
+
+def test_stale_sweep_does_not_resurrect_a_deleted_workers_gauge(client):
+    """Review H1: `requeue_stale` re-labelled `worker_up` for every stale row,
+    so a deleted worker's forgotten gauge came back on the next 5s tick (and
+    then forever, since it never heartbeats again)."""
+    csrf = _login(client)
+    worker_id, sk = _register_worker(client, csrf, "w-gone")
+
+    with client.websocket_connect("/api/agent/ws") as ws:
+        challenge = ws.receive_json()
+        sig = sk.sign(challenge["nonce"].encode()).signature.hex()
+        ws.send_json({"type": "auth", "worker_id": worker_id, "sig": sig})
+        assert ws.receive_json()["type"] == "ready"
+        ws.send_json({"type": "heartbeat", "state": "idle", "progress": 0.0, "job_id": None, "dynamic": {}})
+        agentws.dispatch_once(worker_id)
+
+    assert 'comfyfed_worker_up{worker="w-gone"}' in client.get("/metrics").text
+
+    assert client.delete(f"/api/workers/{worker_id}", headers={"X-CSRF": csrf}).status_code == 200
+    assert 'comfyfed_worker_up{worker="w-gone"}' not in client.get("/metrics").text
+
+    # Far enough ahead that every row is stale -- one sweep tick. Naive UTC,
+    # the convention every timestamp in the DB uses (`db._utcnow`).
+    dispatch.requeue_stale(datetime.now(timezone.utc).replace(tzinfo=None) + timedelta(days=1))
+
+    assert 'comfyfed_worker_up{worker="w-gone"}' not in client.get("/metrics").text
+
+
+def test_deleting_a_stale_namesake_keeps_the_live_workers_gauges(client):
+    """Review M3: worker names are not unique, and `_forget_worker_metrics`
+    keys the gauges by NAME -- deleting the stale "rig-7" row must not blank
+    the live "rig-7"'s samples."""
+    csrf = _login(client)
+    stale_id, _ = _register_worker(client, csrf, "rig-7")
+    live_id, live_sk = _register_worker(client, csrf, "rig-7")
+
+    with client.websocket_connect("/api/agent/ws") as ws:
+        challenge = ws.receive_json()
+        sig = live_sk.sign(challenge["nonce"].encode()).signature.hex()
+        ws.send_json({"type": "auth", "worker_id": live_id, "sig": sig})
+        assert ws.receive_json()["type"] == "ready"
+        ws.send_json(
+            {
+                "type": "heartbeat",
+                "state": "idle",
+                "progress": 0.0,
+                "job_id": None,
+                "dynamic": {"free_vram_gb": 7.5, "free_ram_gb": 16.0, "free_disk_gb": 64.0},
+            }
+        )
+        agentws.dispatch_once(live_id)
+
+    assert client.delete(f"/api/workers/{stale_id}", headers={"X-CSRF": csrf}).status_code == 200
+
+    text = client.get("/metrics").text
+    assert 'comfyfed_worker_up{worker="rig-7"} 1.0' in text
+    assert 'comfyfed_worker_free_vram_gb{worker="rig-7"} 7.5' in text
 
 
 def test_metrics_private_requires_admin(client):
