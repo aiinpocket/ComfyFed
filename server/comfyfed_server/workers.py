@@ -404,6 +404,11 @@ def create_router(data_dir: str) -> APIRouter:
                     "backend": w.backend,
                     "torch_version": w.torch_version,
                     "model_count": len(_json_or(w.model_inventory, [])),
+                    # Phase 3.1 P2P: set from the agent's `hello.peer_url`
+                    # when it opts into serving chunks to other workers (see
+                    # agentws._parse_peer_url). Admin-only page, so exposing
+                    # a LAN address here is not a privacy concern.
+                    "peer_url": w.peer_url,
                 }
                 for w in workers
             ]

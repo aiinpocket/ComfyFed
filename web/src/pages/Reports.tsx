@@ -26,7 +26,7 @@ import { useTranslation } from 'react-i18next';
 
 import { api, type Contribution, type PayoutResult, type Role, type UsageRow } from '../api';
 import { EmptyState, Mono, SectionHeader, StatCard, TableSkeleton } from '../components/Primitives';
-import { formatGpuSeconds, shortId } from '../lib/format';
+import { formatBytes, formatGpuSeconds, shortId } from '../lib/format';
 
 const DEFAULT_RANGE: () => [Date, Date] = () => [
   dayjs().subtract(29, 'day').startOf('day').toDate(),
@@ -178,6 +178,7 @@ function ContributionsPanel() {
                     <Table.Th>{t('reports.col_worker')}</Table.Th>
                     <Table.Th w={90}>{t('reports.col_jobs')}</Table.Th>
                     <Table.Th w={130}>{t('reports.col_gpu_time')}</Table.Th>
+                    <Table.Th w={130}>{t('reports.col_p2p_bytes')}</Table.Th>
                     <Table.Th>{t('reports.col_share')}</Table.Th>
                   </Table.Tr>
                 </Table.Thead>
@@ -205,6 +206,11 @@ function ContributionsPanel() {
                         <Table.Td>
                           <Text size="sm" style={{ fontVariantNumeric: 'tabular-nums' }}>
                             {formatGpuSeconds(row.gpu_seconds)}
+                          </Text>
+                        </Table.Td>
+                        <Table.Td>
+                          <Text size="sm" c="dimmed" style={{ fontVariantNumeric: 'tabular-nums' }}>
+                            {formatBytes(row.p2p_upload_bytes)}
                           </Text>
                         </Table.Td>
                         <Table.Td>

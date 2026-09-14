@@ -135,9 +135,16 @@ export function Workers() {
                   <Table.Tr key={worker.id} opacity={worker.disabled ? 0.55 : 1}>
                     <Table.Td>
                       <Stack gap={1}>
-                        <Text size="sm" fw={500}>
-                          {worker.name}
-                        </Text>
+                        <Group gap={6} wrap="nowrap">
+                          <Text size="sm" fw={500}>
+                            {worker.name}
+                          </Text>
+                          {worker.peer_url && (
+                            <Badge color="federation" variant="light" size="sm" tt="none" fw={500}>
+                              {t('workers.p2p_sharing')}
+                            </Badge>
+                          )}
+                        </Group>
                         <Mono size="xs" title={worker.id}>
                           {shortId(worker.id)}
                         </Mono>

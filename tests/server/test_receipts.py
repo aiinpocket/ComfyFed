@@ -470,7 +470,7 @@ def test_contributions_report_splits_billable_from_unbilled(client):
     receipts_by_job = {r["job_id"]: r for r in row["receipts"]}
     assert receipts_by_job["job-done"] == {
         "job_id": "job-done", "kind": "completed", "billable": True, "basis": "exec",
-        "gpu_seconds": 10.0, "acked": False,
+        "gpu_seconds": 10.0, "acked": False, "bytes": None,
     }
     assert receipts_by_job["job-failed"]["kind"] == "failed"
     assert receipts_by_job["job-failed"]["billable"] is False
@@ -543,6 +543,172 @@ def test_alembic_migration_7_adds_and_backfills_kind_billable_basis(tmp_path):
     finally:
         conn.close()
     assert not ({"kind", "billable", "basis"} & cols_after)
+
+
+# --- Task 7: P2P upload bandwidth surfaces in the contributions report ----
+
+
+def test_contributions_report_sums_p2p_upload_bytes_per_worker(client):
+    """`p2p_upload` receipts are billable=False, gpu_seconds=0.0, job_id=None
+    (booked by Task 3's peer-serving flow) and carry `bytes` = bytes actually
+    served. The contributions report sums those into a new
+    `p2p_upload_bytes` per worker, and the per-receipt listing entry for a
+    p2p_upload row carries `bytes` too."""
+    csrf = _login(client)
+    worker_id, sk = _register_worker_with_key(client, csrf, "w1")
+
+    with db.get_session() as session:
+        session.add_all(
+            [
+                db.Receipt(
+                    job_id=None,
+                    worker_id=worker_id,
+                    gpu_seconds=0.0,
+                    platform_sig="ab" * 32,
+                    kind="p2p_upload",
+                    billable=False,
+                    basis="exec",
+                    bytes=1_000_000,
+                ),
+                db.Receipt(
+                    job_id=None,
+                    worker_id=worker_id,
+                    gpu_seconds=0.0,
+                    platform_sig="cd" * 32,
+                    kind="p2p_upload",
+                    billable=False,
+                    basis="exec",
+                    bytes=500_000,
+                ),
+            ]
+        )
+        session.commit()
+
+    res = client.get("/api/reports/contributions", headers={"X-CSRF": csrf})
+    assert res.status_code == 200
+    rows = res.json()
+    assert len(rows) == 1
+    row = rows[0]
+
+    assert row["p2p_upload_bytes"] == 1_500_000
+    # p2p_upload receipts are billable=False -- must not count into `jobs`.
+    assert row["jobs"] == 0
+    assert row["gpu_seconds"] == 0.0
+
+    p2p_entries = [r for r in row["receipts"] if r["kind"] == "p2p_upload"]
+    assert len(p2p_entries) == 2
+    assert {e["bytes"] for e in p2p_entries} == {1_000_000, 500_000}
+    for e in p2p_entries:
+        assert e["job_id"] is None
+
+
+def test_contributions_report_p2p_upload_bytes_zero_when_no_p2p_receipts(client):
+    """A worker with only ordinary completed receipts gets p2p_upload_bytes=0,
+    and a regular (non-p2p) per-receipt entry's `bytes` is null/absent."""
+    csrf = _login(client)
+    worker_id, sk = _register_worker_with_key(client, csrf, "w1")
+
+    with db.get_session() as session:
+        session.add(
+            db.Receipt(
+                job_id="job-done",
+                worker_id=worker_id,
+                gpu_seconds=10.0,
+                platform_sig="ab" * 32,
+                kind="completed",
+                billable=True,
+                basis="exec",
+            )
+        )
+        session.commit()
+
+    res = client.get("/api/reports/contributions", headers={"X-CSRF": csrf})
+    row = res.json()[0]
+    assert row["p2p_upload_bytes"] == 0
+    assert row["receipts"][0]["bytes"] is None
+
+
+def test_contributions_report_unbilled_gpu_seconds_unaffected_by_p2p_upload(client):
+    """p2p_upload receipts have gpu_seconds=0.0 and billable=False, so they
+    land harmlessly in `unbilled_gpu_seconds` (adding zero) -- pinning that
+    the existing failed/cancelled unbilled total doesn't move."""
+    csrf = _login(client)
+    worker_id, sk = _register_worker_with_key(client, csrf, "w1")
+
+    with db.get_session() as session:
+        session.add_all(
+            [
+                db.Receipt(
+                    job_id="job-failed",
+                    worker_id=worker_id,
+                    gpu_seconds=4.0,
+                    platform_sig="cd" * 32,
+                    kind="failed",
+                    billable=False,
+                    basis="exec",
+                ),
+                db.Receipt(
+                    job_id=None,
+                    worker_id=worker_id,
+                    gpu_seconds=0.0,
+                    platform_sig="ef" * 32,
+                    kind="p2p_upload",
+                    billable=False,
+                    basis="exec",
+                    bytes=2_000_000,
+                ),
+            ]
+        )
+        session.commit()
+
+    res = client.get("/api/reports/contributions", headers={"X-CSRF": csrf})
+    row = res.json()[0]
+    assert row["unbilled_gpu_seconds"] == 4.0
+    assert row["p2p_upload_bytes"] == 2_000_000
+
+
+def test_usage_report_p2p_upload_receipt_does_not_distort_usage(client):
+    """A p2p_upload receipt has job_id=None -> in /usage it folds into the
+    `user_id: None` legacy row via the outer join, same as any job-less
+    receipt. Its billable=False keeps it out of `jobs`, and its
+    gpu_seconds=0.0 must not move the row's totals."""
+    admin_csrf = _login(client)
+    worker_id, _sk = _register_worker_with_key(client, admin_csrf, "w1")
+    alice = _create_user(client, admin_csrf, "alice", password="alice-pw-123")
+
+    with db.get_session() as session:
+        session.add(db.Job(id="job-alice-1", workflow_json="{}", user_id=alice["id"]))
+        session.add_all(
+            [
+                db.Receipt(
+                    job_id="job-alice-1", worker_id=worker_id, gpu_seconds=10.0, platform_sig="ab" * 32,
+                ),
+                db.Receipt(
+                    job_id=None,
+                    worker_id=worker_id,
+                    gpu_seconds=0.0,
+                    platform_sig="cd" * 32,
+                    kind="p2p_upload",
+                    billable=False,
+                    basis="exec",
+                    bytes=999,
+                ),
+            ]
+        )
+        session.commit()
+
+    res = client.get("/api/reports/usage", headers={"X-CSRF": admin_csrf})
+    assert res.status_code == 200
+    rows = res.json()
+    by_user = {row["user_id"]: row for row in rows}
+
+    assert by_user[alice["id"]] == {
+        "user_id": alice["id"], "username": "alice", "jobs": 1, "gpu_seconds": 10.0, "unbilled_gpu_seconds": 0.0,
+    }
+    # The p2p_upload receipt folds into the null-user legacy row, untouched.
+    assert by_user[None] == {
+        "user_id": None, "username": None, "jobs": 0, "gpu_seconds": 0.0, "unbilled_gpu_seconds": 0.0,
+    }
 
 
 def test_contributions_rejects_an_unparseable_date(client):

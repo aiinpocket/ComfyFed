@@ -94,6 +94,7 @@ const WORKER: Worker = {
   backend: 'cuda',
   torch_version: '2.0',
   model_count: 0,
+  peer_url: null,
 };
 
 function jsonResponse(body: unknown, status = 200): Response {
