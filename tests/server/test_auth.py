@@ -16,13 +16,13 @@ def client(tmp_path):
 
 
 def test_wrong_password_401(client):
-    r = client.post("/api/auth/login", json={"password": "wrong"})
+    r = client.post("/api/auth/login", json={"username": "admin", "password": "wrong"})
     assert r.status_code == 401
     assert r.json()["error"]["code"] == "auth.required"
 
 
 def test_login_success_sets_cookie_and_csrf(client):
-    r = client.post("/api/auth/login", json={"password": client.admin_password})
+    r = client.post("/api/auth/login", json={"username": "admin", "password": client.admin_password})
     assert r.status_code == 200
     body = r.json()
     assert "csrf" in body and body["csrf"]
@@ -30,13 +30,15 @@ def test_login_success_sets_cookie_and_csrf(client):
 
 
 def test_me_reports_authenticated(client):
-    r = client.post("/api/auth/login", json={"password": client.admin_password})
+    r = client.post("/api/auth/login", json={"username": "admin", "password": client.admin_password})
     assert r.status_code == 200
 
     me = client.get("/api/auth/me")
     assert me.status_code == 200
     body = me.json()
     assert body["authenticated"] is True
+    assert body["username"] == "admin"
+    assert body["role"] == "admin"
     assert body["lang"] == "en"
 
 
@@ -50,7 +52,7 @@ def test_me_unauthenticated_without_session(client):
 
 
 def test_change_password_requires_csrf(client):
-    login = client.post("/api/auth/login", json={"password": client.admin_password})
+    login = client.post("/api/auth/login", json={"username": "admin", "password": client.admin_password})
     assert login.status_code == 200
 
     r = client.post("/api/auth/change-password", json={"old": client.admin_password, "new": "newpassword123"})
@@ -59,7 +61,7 @@ def test_change_password_requires_csrf(client):
 
 
 def test_change_password_with_csrf_rotates_password(client):
-    login = client.post("/api/auth/login", json={"password": client.admin_password})
+    login = client.post("/api/auth/login", json={"username": "admin", "password": client.admin_password})
     csrf = login.json()["csrf"]
 
     r = client.post(
@@ -71,20 +73,20 @@ def test_change_password_with_csrf_rotates_password(client):
 
     # old password no longer works
     client.cookies.clear()
-    bad = client.post("/api/auth/login", json={"password": client.admin_password})
+    bad = client.post("/api/auth/login", json={"username": "admin", "password": client.admin_password})
     assert bad.status_code == 401
 
     # new password works
-    good = client.post("/api/auth/login", json={"password": "newpassword123"})
+    good = client.post("/api/auth/login", json={"username": "admin", "password": "newpassword123"})
     assert good.status_code == 200
 
 
 def test_backoff_after_four_failures_then_429(client):
     for _ in range(4):
-        r = client.post("/api/auth/login", json={"password": "wrong"})
+        r = client.post("/api/auth/login", json={"username": "admin", "password": "wrong"})
         assert r.status_code == 401
 
-    r5 = client.post("/api/auth/login", json={"password": "wrong"})
+    r5 = client.post("/api/auth/login", json={"username": "admin", "password": "wrong"})
     assert r5.status_code == 429
     assert r5.json()["error"]["code"] == "auth.too_many_attempts"
 
@@ -95,7 +97,7 @@ def test_create_app_raises_if_not_installed(tmp_path):
 
 
 def _csrf(client):
-    r = client.post("/api/auth/login", json={"password": client.admin_password})
+    r = client.post("/api/auth/login", json={"username": "admin", "password": client.admin_password})
     assert r.status_code == 200
     return r.json()["csrf"]
 
@@ -109,9 +111,14 @@ def test_verify_password_returns_false_for_a_corrupt_hash():
     assert security.verify_password("anything", "") is False
 
 
-def test_change_password_invalidates_the_existing_session(client):
-    """M7: rotating the session secret logs every session out, including this one."""
+def test_change_password_keeps_self_logged_in_but_kills_other_sessions(client):
+    """Phase 3.0: per-user `session_epoch` replaces the old global
+    session-secret rotation. Changing your own password re-issues your own
+    cookie at the new epoch (you stay logged in), but any OTHER cookie issued
+    before the change (a second browser/tab) stops validating."""
+    old_cookie = None
     csrf = _csrf(client)
+    old_cookie = client.cookies.get("cf_session")
 
     r = client.post(
         "/api/auth/change-password",
@@ -119,13 +126,24 @@ def test_change_password_invalidates_the_existing_session(client):
         headers={"X-CSRF": csrf},
     )
     assert r.status_code == 200
+    assert r.json()["csrf"]
 
+    # The caller's own session (its cookie jar was updated by the response's
+    # Set-Cookie) is still authenticated.
     me = client.get("/api/auth/me")
-    assert me.json()["authenticated"] is False
+    assert me.json()["authenticated"] is True
+
+    # A second session holding the pre-change cookie is now stale-epoch.
+    from comfyfed_server import auth
+
+    assert auth.read_session_payload(old_cookie) is not None  # signature still valid
+    with TestClient(client.app) as other:
+        other.cookies.set("cf_session", old_cookie)
+        assert other.get("/api/auth/me").json()["authenticated"] is False
 
     # The new password works; the old one does not.
-    assert client.post("/api/auth/login", json={"password": client.admin_password}).status_code == 401
-    assert client.post("/api/auth/login", json={"password": "a-new-long-password"}).status_code == 200
+    assert client.post("/api/auth/login", json={"username": "admin", "password": client.admin_password}).status_code == 401
+    assert client.post("/api/auth/login", json={"username": "admin", "password": "a-new-long-password"}).status_code == 200
 
 
 def test_validation_error_uses_the_standard_error_envelope(client):
@@ -240,7 +258,9 @@ def test_session_cookie_name_and_reader_are_public_and_agree(client):
     assert cookie
 
     payload = auth.read_session_payload(cookie)
-    assert payload["authenticated"] is True
+    assert payload["uid"]
+    assert payload["role"] == "admin"
+    assert "epoch" in payload
     assert payload["csrf"] == csrf
 
 
@@ -287,3 +307,140 @@ def test_no_module_hard_codes_the_session_cookie_name(client):
         if path.name != "auth.py" and '"cf_session"' in path.read_text(encoding="utf-8")
     ]
     assert offenders == []
+
+
+# --- Phase 3.0 multi-user ---------------------------------------------------
+
+
+def test_login_requires_username(client):
+    r = client.post("/api/auth/login", json={"password": client.admin_password})
+    assert r.status_code == 422
+    assert r.json()["error"]["code"] == "validation_error"
+
+
+def test_unknown_username_reports_the_same_error_as_wrong_password(client):
+    unknown = client.post("/api/auth/login", json={"username": "nobody", "password": "whatever"})
+    wrong = client.post("/api/auth/login", json={"username": "admin", "password": "whatever"})
+    assert unknown.status_code == wrong.status_code == 401
+    assert unknown.json()["error"]["code"] == wrong.json()["error"]["code"] == "auth.required"
+    assert unknown.json()["error"]["message"] == wrong.json()["error"]["message"]
+
+
+def test_disabled_user_rejected_with_the_same_message(client):
+    from comfyfed_server import db
+
+    with db.get_session() as s:
+        user = s.query(db.User).filter(db.User.username == "admin").one()
+        user.disabled = True
+        s.commit()
+
+    r = client.post("/api/auth/login", json={"username": "admin", "password": client.admin_password})
+    assert r.status_code == 401
+    assert r.json()["error"]["code"] == "auth.required"
+
+
+def test_username_is_lowercased(client):
+    r = client.post("/api/auth/login", json={"username": "ADMIN", "password": client.admin_password})
+    assert r.status_code == 200
+
+
+def test_per_username_backoff_does_not_lock_out_a_different_username(client):
+    for _ in range(4):
+        r = client.post("/api/auth/login", json={"username": "admin", "password": "wrong"})
+        assert r.status_code == 401
+
+    # "admin" is now backed off...
+    locked = client.post("/api/auth/login", json={"username": "admin", "password": "wrong"})
+    assert locked.status_code == 429
+
+    # ...but a different (even nonexistent) username is unaffected.
+    other = client.post("/api/auth/login", json={"username": "someone-else", "password": "wrong"})
+    assert other.status_code == 401
+
+
+def test_old_format_cookie_is_rejected(client):
+    """A pre-Phase-3.0 cookie -- `{authenticated, csrf}`, no `uid` -- must be
+    treated as not logged in rather than mapped onto any account. Everyone
+    re-authenticates once after this upgrade; there is no compatibility
+    mapping."""
+    from itsdangerous import URLSafeTimedSerializer
+
+    from comfyfed_server import auth, db
+
+    with db.get_session() as db_session:
+        secret = auth._get_or_create_session_secret(db_session)
+    serializer = URLSafeTimedSerializer(secret_key=secret, salt=auth._SESSION_SALT)
+    old_style = serializer.dumps({"authenticated": True, "csrf": "whatever"})
+
+    client.cookies.set("cf_session", old_style)
+    me = client.get("/api/auth/me")
+    assert me.json()["authenticated"] is False
+
+    r = client.post("/api/settings", json={"lang": "en"}, headers={"X-CSRF": "whatever"})
+    assert r.status_code == 401
+
+
+def test_migration_backfills_admin_user_from_settings_hash():
+    """Programmatic alembic upgrade: seed a pre-Phase-3.0 DB at revision
+    c9d0e1f2a3b4 (settings.admin_password_hash + one job row), upgrade to
+    head, and assert the data migration in d0e1f2a3b4c5 did its job."""
+    import os
+    import tempfile
+    import uuid
+
+    from alembic import command
+    from alembic.config import Config
+    from sqlalchemy import create_engine, text
+
+    from comfyfed_server import db as db_module
+    from comfyfed_server import security
+
+    with tempfile.TemporaryDirectory() as tmp:
+        db_path = os.path.join(tmp, "pre_migration.db")
+        url = f"sqlite+pysqlite:///{db_path}"
+
+        alembic_cfg = Config()
+        alembic_cfg.set_main_option("script_location", db_module._alembic_dir())
+        alembic_cfg.set_main_option("sqlalchemy.url", url)
+        command.upgrade(alembic_cfg, "c9d0e1f2a3b4")
+
+        password_hash = security.hash_password("old-admin-password")
+        job_id = uuid.uuid4().hex
+        engine = create_engine(url)
+        with engine.begin() as conn:
+            conn.execute(
+                text("INSERT INTO settings (key, value) VALUES ('admin_password_hash', :h)"),
+                {"h": password_hash},
+            )
+            conn.execute(
+                text(
+                    "INSERT INTO jobs (id, workflow_json, status, progress, created_at, "
+                    "result_files, requirements, required_nodes, required_models, "
+                    "input_assets, result_hashes, origin, panel_hidden) VALUES "
+                    "(:id, '{}', 'queued', 0, '2026-01-01 00:00:00', '[]', '{}', '[]', "
+                    "'[]', '[]', '{}', 'console', 0)"
+                ),
+                {"id": job_id},
+            )
+        engine.dispose()
+
+        command.upgrade(alembic_cfg, "head")
+
+        engine = create_engine(url)
+        with engine.begin() as conn:
+            user_row = conn.execute(
+                text("SELECT id, username, password_hash, role FROM users")
+            ).fetchone()
+            assert user_row is not None
+            assert user_row[1] == "admin"
+            assert user_row[2] == password_hash
+            assert user_row[3] == "admin"
+
+            job_row = conn.execute(text("SELECT user_id FROM jobs WHERE id = :id"), {"id": job_id}).fetchone()
+            assert job_row[0] == user_row[0]
+
+            setting_row = conn.execute(
+                text("SELECT value FROM settings WHERE key = 'admin_password_hash'")
+            ).fetchone()
+            assert setting_row is None
+        engine.dispose()

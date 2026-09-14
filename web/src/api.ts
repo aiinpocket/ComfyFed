@@ -69,7 +69,7 @@ async function parseError(response: Response): Promise<ApiError> {
   return new ApiError(code, message, response.status);
 }
 
-type Method = 'GET' | 'POST';
+type Method = 'GET' | 'POST' | 'PATCH';
 
 async function request<T>(
   method: Method,
@@ -117,14 +117,26 @@ function postForm<T>(path: string, form: FormData): Promise<T> {
   return request<T>('POST', path, form);
 }
 
+function patchJson<T>(path: string, payload: unknown): Promise<T> {
+  return request<T>('PATCH', path, JSON.stringify(payload ?? {}), {
+    'Content-Type': 'application/json',
+  });
+}
+
 /* ------------------------------------------------------------------ types */
 
 export interface SetupStatus {
   needed: boolean;
 }
 
+/** Phase 3.0 multi-user roles: `admin` sees everything, `user` is scoped to
+ * their own jobs and a reduced nav/settings surface. */
+export type Role = 'admin' | 'user';
+
 export interface MeResponse {
   authenticated: boolean;
+  username?: string;
+  role?: Role | string;
   lang: string;
   platform_url?: string;
 }
@@ -177,6 +189,13 @@ export interface Job {
   result_files: string[];
   input_assets: string[];
   est_vram_gb: number | null;
+  /**
+   * Who submitted the job (Phase 3.0 multi-user). Admins get every job's
+   * `username`; a plain user's own `GET /api/jobs` always echoes their own
+   * username (never null) since they only ever see their own jobs. Null
+   * shows up only for an admin viewing a pre-Phase-3.0 job with no owner.
+   */
+  username?: string | null;
   /**
    * Present only while a worker is fetching a missing model for this job
    * (Phase 2.1 model auto-fetch). Absent the rest of the time, in which case
@@ -232,11 +251,56 @@ export interface TokenBundle {
   register_token: string;
 }
 
+/** Row shape for `GET /api/users` (see server/comfyfed_server/users.py's `_user_list_row`). */
+export interface AppUser {
+  id: string;
+  username: string;
+  role: Role;
+  disabled: boolean;
+  created_at: string | null;
+  jobs: number;
+}
+
+/** `POST /api/users` echoes the plaintext password exactly once. */
+export interface CreatedUser {
+  id: string;
+  username: string;
+  role: Role;
+  password: string;
+}
+
 export interface Contribution {
   worker_id: string;
   name: string;
   jobs: number;
   gpu_seconds: number;
+}
+
+/** Row shape shared by `GET /api/reports/usage` (one per user) and
+ * `GET /api/reports/my-usage` (the caller's own row). `username` is `null`
+ * for the single aggregate row of pre-Phase-3.0 receipts whose job has no
+ * `user_id` -- rendered as "(historical)" rather than dropped. */
+export interface UsageRow {
+  user_id: string | null;
+  username: string | null;
+  jobs: number;
+  gpu_seconds: number;
+  unbilled_gpu_seconds: number;
+}
+
+/** One worker's share of a payout pool, from `GET /api/reports/payout`. */
+export interface PayoutWorker {
+  worker_id: string;
+  name: string;
+  gpu_seconds: number;
+  ratio: number;
+  amount: number;
+}
+
+export interface PayoutResult {
+  total_gpu_seconds: number;
+  pool: number;
+  workers: PayoutWorker[];
 }
 
 /** Compute backends a job can be pinned to via the advanced override. */
@@ -283,11 +347,11 @@ export const api = {
     return postJson('/api/setup', { token, password });
   },
 
-  async login(password: string): Promise<void> {
+  async login(username: string, password: string): Promise<void> {
     const result = await request<{ csrf: string }>(
       'POST',
       '/api/auth/login',
-      JSON.stringify({ password }),
+      JSON.stringify({ username, password }),
       { 'Content-Type': 'application/json' },
     );
     setCsrf(result.csrf);
@@ -305,8 +369,18 @@ export const api = {
     return getJson<MeResponse>('/api/auth/me');
   },
 
-  changePassword(oldPassword: string, newPassword: string): Promise<{ ok: boolean }> {
-    return postJson('/api/auth/change-password', { old: oldPassword, new: newPassword });
+  /** Final review finding #4: the server re-issues a fresh cookie AND a
+   * fresh CSRF token here (the epoch bump would otherwise invalidate the
+   * caller's own session too) -- the client must adopt it immediately via
+   * `setCsrf`, or every subsequent state-changing request silently fails
+   * `403 auth.csrf` until the next full login. */
+  async changePassword(oldPassword: string, newPassword: string): Promise<{ ok: boolean; csrf: string }> {
+    const result = await postJson<{ ok: boolean; csrf: string }>('/api/auth/change-password', {
+      old: oldPassword,
+      new: newPassword,
+    });
+    setCsrf(result.csrf);
+    return result;
   },
 
   listWorkers(): Promise<Worker[]> {
@@ -373,6 +447,52 @@ export const api = {
     if (to) params.set('to', to);
     const query = params.toString();
     return getJson<Contribution[]>(`/api/reports/contributions${query ? `?${query}` : ''}`);
+  },
+
+  /** GET /api/reports/usage (admin-only). Per-user aggregate, one row per
+   * user plus (when present) one `username: null` row for legacy receipts. */
+  reportUsage(from?: string, to?: string): Promise<UsageRow[]> {
+    const params = new URLSearchParams();
+    if (from) params.set('from', from);
+    if (to) params.set('to', to);
+    const query = params.toString();
+    return getJson<UsageRow[]>(`/api/reports/usage${query ? `?${query}` : ''}`);
+  },
+
+  /** GET /api/reports/my-usage (any signed-in user): the caller's own row. */
+  reportMyUsage(from?: string, to?: string): Promise<UsageRow> {
+    const params = new URLSearchParams();
+    if (from) params.set('from', from);
+    if (to) params.set('to', to);
+    const query = params.toString();
+    return getJson<UsageRow>(`/api/reports/my-usage${query ? `?${query}` : ''}`);
+  },
+
+  /** GET /api/reports/payout (admin-only). `pool` is the raw currency-
+   * agnostic amount to split across workers by billable GPU-second share. */
+  reportPayout(pool: number, from?: string, to?: string): Promise<PayoutResult> {
+    const params = new URLSearchParams();
+    params.set('pool', String(pool));
+    if (from) params.set('from', from);
+    if (to) params.set('to', to);
+    return getJson<PayoutResult>(`/api/reports/payout?${params.toString()}`);
+  },
+
+  async listUsers(): Promise<AppUser[]> {
+    const result = await getJson<{ users: AppUser[] }>('/api/users');
+    return result.users;
+  },
+
+  createUser(username: string, role: Role, password?: string): Promise<CreatedUser> {
+    return postJson<CreatedUser>('/api/users', password ? { username, role, password } : { username, role });
+  },
+
+  resetUserPassword(userId: string): Promise<{ password: string }> {
+    return postJson(`/api/users/${encodeURIComponent(userId)}/reset-password`, {});
+  },
+
+  patchUser(userId: string, update: { role?: Role; disabled?: boolean }): Promise<AppUser> {
+    return patchJson<AppUser>(`/api/users/${encodeURIComponent(userId)}`, update);
   },
 };
 

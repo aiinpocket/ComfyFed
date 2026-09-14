@@ -18,7 +18,7 @@ const ADMIN_PASSWORD = "correct-horse-battery-staple";
 
 async function loginSession(): Promise<{ cookie: string | null; csrf: string }> {
   await call("/api/setup", { json: { token: SETUP_TOKEN, password: ADMIN_PASSWORD } });
-  const login = await call("/api/auth/login", { json: { password: ADMIN_PASSWORD } });
+  const login = await call("/api/auth/login", { json: { username: "admin", password: ADMIN_PASSWORD } });
   return { cookie: login.setCookie, csrf: login.body.csrf };
 }
 
@@ -44,6 +44,7 @@ async function putPackagedRaw(filename: string, value: ArrayBuffer | Uint8Array)
 
 afterEach(async () => {
   await db().prepare("DELETE FROM settings").run();
+  await db().prepare("DELETE FROM users").run();
   clearTemplatesCacheForTests();
   for (const prefix of ["staging/", "official_templates/", "comfyfed_templates/"]) {
     const listed = await store().list({ prefix });
@@ -524,13 +525,13 @@ describe("staging seed (seed_staging parity)", () => {
     await putPackagedRaw("assets/amyntas_ref.png", new Uint8Array([1, 2, 3]));
     await putPackagedRaw("assets/comfyfed_sample_clip.mp4", new Uint8Array([4, 5, 6]));
 
-    const before = await store().head("staging/amyntas_ref.png");
+    const before = await store().head("staging/_shared/amyntas_ref.png");
     expect(before).toBeNull();
 
     await call("/comfy/templates/index.json", { cookie });
 
-    const seeded1 = await store().get("staging/amyntas_ref.png");
-    const seeded2 = await store().get("staging/comfyfed_sample_clip.mp4");
+    const seeded1 = await store().get("staging/_shared/amyntas_ref.png");
+    const seeded2 = await store().get("staging/_shared/comfyfed_sample_clip.mp4");
     expect(seeded1).not.toBeNull();
     expect(new Uint8Array(await seeded1!.arrayBuffer())).toEqual(new Uint8Array([1, 2, 3]));
     expect(seeded2).not.toBeNull();
@@ -538,10 +539,10 @@ describe("staging seed (seed_staging parity)", () => {
     // An operator-replaced staging file must not be clobbered by a second
     // template request (existing files are left alone -- ports Python's
     // "admin may have replaced it deliberately" rationale).
-    await store().put("staging/amyntas_ref.png", new Uint8Array([9, 9, 9]));
+    await store().put("staging/_shared/amyntas_ref.png", new Uint8Array([9, 9, 9]));
     clearTemplatesCacheForTests(); // reset the memoization flag, simulating a fresh isolate
     await call("/comfy/templates/index.json", { cookie });
-    const after = await store().get("staging/amyntas_ref.png");
+    const after = await store().get("staging/_shared/amyntas_ref.png");
     expect(new Uint8Array(await after!.arrayBuffer())).toEqual(new Uint8Array([9, 9, 9]));
   });
 
@@ -552,10 +553,10 @@ describe("staging seed (seed_staging parity)", () => {
     await putPackagedRaw("assets/comfyfed_sample_clip.mp4", new Uint8Array([2]));
 
     await call("/comfy/templates/index.json", { cookie });
-    await store().delete("staging/amyntas_ref.png"); // simulate deletion after the first seed
+    await store().delete("staging/_shared/amyntas_ref.png"); // simulate deletion after the first seed
     await call("/comfy/templates/index.json", { cookie }); // memoized: should NOT re-seed
 
-    const after = await store().head("staging/amyntas_ref.png");
+    const after = await store().head("staging/_shared/amyntas_ref.png");
     expect(after).toBeNull();
   });
 
@@ -568,7 +569,7 @@ describe("staging seed (seed_staging parity)", () => {
     const realPut = store().put.bind(store());
     let failNextAmyntas = true;
     (store() as any).put = (key: string, ...rest: unknown[]) => {
-      if (failNextAmyntas && key === "staging/amyntas_ref.png") {
+      if (failNextAmyntas && key === "staging/_shared/amyntas_ref.png") {
         failNextAmyntas = false;
         throw new Error("simulated transient R2 failure");
       }
@@ -580,15 +581,15 @@ describe("staging seed (seed_staging parity)", () => {
       // memoized as seeded -- the other asset (comfyfed_sample_clip.mp4)
       // still succeeds independently.
       await call("/comfy/templates/index.json", { cookie });
-      expect(await store().head("staging/amyntas_ref.png")).toBeNull();
-      expect(await store().head("staging/comfyfed_sample_clip.mp4")).not.toBeNull();
+      expect(await store().head("staging/_shared/amyntas_ref.png")).toBeNull();
+      expect(await store().head("staging/_shared/comfyfed_sample_clip.mp4")).not.toBeNull();
 
       // Second request: the transient failure is over, so this retries and
       // succeeds this time -- proving the earlier all-or-nothing memoization
       // flag (which would have permanently skipped every asset after one
       // failure) is gone.
       await call("/comfy/templates/index.json", { cookie });
-      const seeded = await store().get("staging/amyntas_ref.png");
+      const seeded = await store().get("staging/_shared/amyntas_ref.png");
       expect(seeded).not.toBeNull();
       expect(new Uint8Array(await seeded!.arrayBuffer())).toEqual(new Uint8Array([1, 2, 3]));
     } finally {

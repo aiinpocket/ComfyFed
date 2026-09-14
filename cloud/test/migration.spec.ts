@@ -24,6 +24,7 @@ describe("D1 migration 0001_initial", () => {
         "register_tokens",
         "settings",
         "upload_tokens",
+        "users",
         "workers",
       ].sort()
     );
@@ -100,5 +101,56 @@ describe("D1 migration 0002_nonces", () => {
     await expect(
       db.prepare("INSERT INTO nonces (worker_id, nonce, expires_at) VALUES ('w1', 'n1', 200)").run()
     ).rejects.toThrow();
+  });
+});
+
+// Task 9's `users` table, `jobs.user_id`, `login_attempts.username` (Phase
+// 3.0 multi-user). The `admin_password_hash` -> `users` data migration itself
+// is exercised end-to-end via `/api/setup` in test/auth.spec.ts (there is no
+// legacy `admin_password_hash` row for this fresh-install test DB to migrate
+// FROM -- vitest-pool-workers always applies every migration, 0001..0006,
+// against a brand-new D1 instance, so the data-migration's `INSERT ...
+// SELECT ... WHERE EXISTS`-shaped guard is a guaranteed no-op here).
+describe("D1 migration 0006_users", () => {
+  it("creates the users table with the expected columns and defaults", async () => {
+    const db = (env as any).DB as D1Database;
+    const cols = await db.prepare("PRAGMA table_info(users)").all<{ name: string }>();
+    const names = new Set(cols.results.map((c) => c.name));
+    for (const col of ["id", "username", "password_hash", "role", "disabled", "session_epoch", "created_at"]) {
+      expect(names.has(col), `users.${col} missing`).toBe(true);
+    }
+
+    await db
+      .prepare("INSERT INTO users (id, username, password_hash, role, created_at) VALUES ('u1', 'zed', 'hash', 'user', '2026-01-01 00:00:00.000000')")
+      .run();
+    const row = await db
+      .prepare("SELECT disabled, session_epoch FROM users WHERE id = 'u1'")
+      .first<{ disabled: number; session_epoch: number }>();
+    expect(row?.disabled).toBe(0);
+    expect(row?.session_epoch).toBe(0);
+
+    await db.prepare("DELETE FROM users").run();
+  });
+
+  it("rejects a duplicate username (UNIQUE constraint)", async () => {
+    const db = (env as any).DB as D1Database;
+    await db
+      .prepare("INSERT INTO users (id, username, password_hash, role, created_at) VALUES ('u1', 'zed', 'hash', 'user', '2026-01-01 00:00:00.000000')")
+      .run();
+    await expect(
+      db
+        .prepare("INSERT INTO users (id, username, password_hash, role, created_at) VALUES ('u2', 'zed', 'hash', 'user', '2026-01-01 00:00:00.000000')")
+        .run()
+    ).rejects.toThrow();
+    await db.prepare("DELETE FROM users").run();
+  });
+
+  it("jobs has a nullable user_id column and login_attempts has a nullable username column", async () => {
+    const db = (env as any).DB as D1Database;
+    const jobCols = await db.prepare("PRAGMA table_info(jobs)").all<{ name: string }>();
+    expect(jobCols.results.some((c) => c.name === "user_id")).toBe(true);
+
+    const attemptCols = await db.prepare("PRAGMA table_info(login_attempts)").all<{ name: string }>();
+    expect(attemptCols.results.some((c) => c.name === "username")).toBe(true);
   });
 });

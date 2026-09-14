@@ -62,10 +62,39 @@ def client(tmp_path):
     return c
 
 
-def _login(client):
-    r = client.post("/api/auth/login", json={"password": client.admin_password})
-    assert r.status_code == 200
+def _login(client, username="admin", password=None):
+    r = client.post(
+        "/api/auth/login",
+        json={"username": username, "password": password or client.admin_password},
+    )
+    assert r.status_code == 200, r.text
     return r.json()["csrf"]
+
+
+def _create_user(client, admin_csrf, username, role="user", password="password123"):
+    r = client.post(
+        "/api/users",
+        json={"username": username, "role": role, "password": password},
+        headers={"X-CSRF": admin_csrf},
+    )
+    assert r.status_code == 200, r.text
+    return r.json()
+
+
+ALICE = ("alice", "alice-pw-123")
+BOB = ("bob", "bob-pw-123")
+
+
+@pytest.fixture()
+def two_users(client):
+    """Creates admin (bootstrap) + two plain users, alice and bob. See
+    `test_comfyapi.py`'s fixture of the same name for the shared rationale:
+    `TestClient` has one cookie jar, so acting as a user means re-logging in
+    as them right before that action."""
+    admin_csrf = _login(client)
+    _create_user(client, admin_csrf, ALICE[0], password=ALICE[1])
+    _create_user(client, admin_csrf, BOB[0], password=BOB[1])
+    return {"admin_pw": client.admin_password}
 
 
 def _register_worker(client, csrf, name):
@@ -383,7 +412,11 @@ def test_job_failed_sends_execution_error(client):
 
 def test_job_cancelled_relay_clears_executing_and_refreshes_status(client):
     _login(client)
-    job_id = "some-job"
+    # A real, resolvable job -- final review finding #5 made an unresolved
+    # job-scoped frame fail CLOSED (dropped) rather than fail open to an
+    # unscoped broadcast, so this relay needs a job row `_job_owner` can
+    # actually find.
+    job_id = _post_prompt(client)
     with client.websocket_connect("/comfy/api/ws") as ws:
         ws.receive_json()  # initial status
         ws.receive_json()  # feature_flags
@@ -470,6 +503,141 @@ def test_broadcast_with_no_connected_clients_is_a_noop(client):
     relay(panelws.job_progress("nonexistent-job", 0.5))
     relay(panelws.job_running("nonexistent-job"))
     relay(panelws.job_failed("nonexistent-job", "boom"))
+
+
+def test_job_scoped_frame_for_an_unresolved_job_fails_closed(client):
+    """Final review finding #5: a job-scoped frame whose row can no longer be
+    resolved (deleted, or -- as here -- never existed) must be DROPPED, not
+    fanned out unscoped to every connected socket. Proven by ordering: relay
+    an unscoped `status` refresh right after the unresolvable job-scoped
+    frame, then assert `status` is the FIRST thing the connected socket
+    receives -- if the job-scoped frame had fallen back to an unscoped
+    broadcast (the old fail-OPEN behavior), `executing` for the bogus job
+    would arrive first instead."""
+    _login(client)
+    with client.websocket_connect("/comfy/api/ws") as ws:
+        ws.receive_json()  # initial status
+        ws.receive_json()  # feature_flags
+
+        relay(panelws.job_running("nonexistent-job"))
+        relay(panelws.job_status_refresh())
+
+        msg = ws.receive_json()
+        assert msg["type"] == "status"
+
+
+# --- Task 4: per-user relay scoping -------------------------------------------
+
+
+def test_ws_relays_only_the_sockets_own_job_frames(client, two_users):
+    """Two real panel sockets, two real accounts: a job-scoped frame for
+    Bob's job must never reach Alice's connection, and vice versa -- the
+    core of Task 4's "panel WS forwards only the socket's own jobs" rule.
+
+    Ordering is what makes this a real test rather than a tautology: Bob's
+    event is relayed FIRST, then Alice's. If scoping were broken (e.g. a
+    plain unfiltered broadcast), Alice's socket would receive Bob's event
+    first and this assertion would see the wrong prompt_id.
+    """
+    _login(client, *ALICE)
+    with client.websocket_connect("/comfy/api/ws") as alice_ws:
+        alice_ws.receive_json()  # initial status
+        alice_ws.receive_json()  # feature_flags
+        alice_job = _post_prompt(client)
+
+        _login(client, *BOB)
+        bob_job = _post_prompt(client)
+        with client.websocket_connect("/comfy/api/ws") as bob_ws:
+            bob_ws.receive_json()  # initial status
+            bob_ws.receive_json()  # feature_flags
+
+            relay(panelws.job_running(bob_job))
+            relay(panelws.job_running(alice_job))
+
+            alice_msg = alice_ws.receive_json()
+            assert alice_msg["data"]["prompt_id"] == alice_job
+
+            bob_msg = bob_ws.receive_json()
+            assert bob_msg["data"]["prompt_id"] == bob_job
+
+
+def test_ws_job_done_events_do_not_reach_a_non_owning_socket(client, two_users):
+    """`job_done` posts THREE events: two are job-scoped (`executed`,
+    `executing: null`) and the third (`status`) is an unscoped queue-badge
+    refresh (see `panelws.post_event`'s docstring -- only job-identifying
+    frames are scoped). A non-owning socket must skip the first two and see
+    only the third -- proving the scoped frames were filtered, not merely
+    delayed."""
+    admin_csrf = _login(client)
+    worker_id = _register_worker(client, admin_csrf, "runner-a")
+
+    _login(client, *ALICE)
+    alice_job = _post_prompt(client)
+    _pick_job_for(worker_id)
+    dispatch.mark_running(alice_job, worker_id)
+
+    with client.websocket_connect("/comfy/api/ws") as alice_ws:
+        alice_ws.receive_json()  # initial status
+        alice_ws.receive_json()  # feature_flags
+
+        _login(client, *BOB)
+        with client.websocket_connect("/comfy/api/ws") as bob_ws:
+            bob_ws.receive_json()  # initial status
+            bob_ws.receive_json()  # feature_flags
+
+            with db.get_session() as session:
+                job = session.get(db.Job, alice_job)
+                relay(panelws.job_done(job))
+
+            # Alice's socket gets her job's real lifecycle events, in order.
+            executed = alice_ws.receive_json()
+            assert executed["type"] == "executed"
+            assert executed["data"]["prompt_id"] == alice_job
+            executing = alice_ws.receive_json()
+            assert executing == {
+                "type": "executing",
+                "data": {"node": None, "prompt_id": alice_job},
+            }
+            assert alice_ws.receive_json()["type"] == "status"
+
+            # Bob's socket never saw `executed`/`executing` for Alice's job
+            # at all -- the ONLY thing `job_done` put in his queue is the
+            # unscoped status refresh.
+            assert bob_ws.receive_json()["type"] == "status"
+
+
+def test_ws_job_failed_scoped_to_the_owning_socket(client, two_users):
+    admin_csrf = _login(client)
+    worker_a = _register_worker(client, admin_csrf, "runner-a")
+
+    _login(client, *ALICE)
+    alice_job = _post_prompt(client)
+    _pick_job_for(worker_a)
+
+    # Alice's socket authenticates NOW, while her login is the active
+    # session -- `TestClient` has one shared cookie jar, so it must be
+    # opened before the session is switched to Bob below.
+    with client.websocket_connect("/comfy/api/ws") as alice_ws:
+        alice_ws.receive_json()  # initial status
+        alice_ws.receive_json()  # feature_flags
+
+        _login(client, *BOB)
+        bob_job = _post_prompt(client)
+
+        with client.websocket_connect("/comfy/api/ws") as bob_ws:
+            bob_ws.receive_json()  # initial status
+            bob_ws.receive_json()  # feature_flags
+
+            relay(panelws.job_failed(bob_job, "boom"))
+
+            bob_msg = bob_ws.receive_json()
+            assert bob_msg["type"] == "execution_error"
+            assert bob_msg["data"]["prompt_id"] == bob_job
+
+            # Alice's socket never received Bob's failure event -- the
+            # queue refresh `job_failed` sends afterwards is unscoped, so
+            # that is the only thing her socket has waiting.
+            assert alice_ws.receive_json()["type"] == "status"
 
 
 # --- end-to-end through the real agent socket ---------------------------------
@@ -766,3 +934,60 @@ async def test_dispatch_tick_relays_requeued_jobs_to_the_panel(client):
 
     with db.get_session() as session:
         assert session.get(db.Job, job_id).status == "queued"
+
+
+# --- Task 4/final review finding #6: session_epoch bump closes open panel sockets
+
+def test_change_password_closes_the_callers_open_panel_socket(client):
+    csrf = _login(client)
+    with client.websocket_connect("/comfy/api/ws") as ws:
+        ws.receive_json()  # initial status
+        ws.receive_json()  # feature_flags
+
+        r = client.post(
+            "/api/auth/change-password",
+            json={"old": client.admin_password, "new": "newpassword123"},
+            headers={"X-CSRF": csrf},
+        )
+        assert r.status_code == 200
+
+        with pytest.raises(WebSocketDisconnect):
+            ws.receive_json()
+
+
+def test_reset_password_closes_the_targets_open_panel_socket(client, two_users):
+    admin_csrf = _login(client)
+    with db.get_session() as session:
+        alice_id = session.query(db.User).filter(db.User.username == ALICE[0]).one().id
+
+    _login(client, *ALICE)
+    with client.websocket_connect("/comfy/api/ws") as alice_ws:
+        alice_ws.receive_json()  # initial status
+        alice_ws.receive_json()  # feature_flags
+
+        admin_csrf = _login(client)  # back to admin -- refreshes the csrf token too
+        r = client.post(f"/api/users/{alice_id}/reset-password", headers={"X-CSRF": admin_csrf})
+        assert r.status_code == 200
+
+        with pytest.raises(WebSocketDisconnect):
+            alice_ws.receive_json()
+
+
+def test_disabling_a_user_closes_their_open_panel_socket(client, two_users):
+    admin_csrf = _login(client)
+    with db.get_session() as session:
+        bob_id = session.query(db.User).filter(db.User.username == BOB[0]).one().id
+
+    _login(client, *BOB)
+    with client.websocket_connect("/comfy/api/ws") as bob_ws:
+        bob_ws.receive_json()  # initial status
+        bob_ws.receive_json()  # feature_flags
+
+        admin_csrf = _login(client)  # back to admin -- refreshes the csrf token too
+        r = client.patch(
+            f"/api/users/{bob_id}", json={"disabled": True}, headers={"X-CSRF": admin_csrf}
+        )
+        assert r.status_code == 200
+
+        with pytest.raises(WebSocketDisconnect):
+            bob_ws.receive_json()

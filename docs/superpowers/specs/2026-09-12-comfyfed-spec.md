@@ -81,7 +81,7 @@ worker 斷線（>90s 無心跳）→ assigned/running 的任務自動回 queued 
 - **Phase 1（本計畫）**：平台核心＋Agent 核心端到端可用——安裝→登入→發識別碼→worker 註冊上線→送 workflow→派工執行→結果回傳→收據入帳→儀表板可視。
 - **Phase 1.5（2026-09-12 使用者定案提前）：內嵌 ComfyUI 工作流編輯器**——「要使用者自己在別處做好 workflow 再貼 JSON」對非 IT 使用者不可用。平台內嵌**官方 ComfyUI 前端**（comfyui-frontend-package 靜態包，pinned 版本＋SHA256，`comfyfed-server fetch-comfy-ui` 下載）於 `/comfy`（admin session 保護），平台實作 ComfyUI 相容 API（`/comfy/api/*`）：`object_info`=**在線 worker 能力聯集**（agent 以簽名請求回傳完整 /object_info JSON，gzip＋hash 去重，存平台檔案系統）、`prompt`→聯邦 job、`queue`/`history`/`view`→佇列與 artifacts 映射、`upload/image`→任務附檔管線、WS 進度轉發。Console 任務頁保留貼 JSON 作為進階路徑，主按鈕改為開啟編輯器。
 - **Phase 2**：模型 manifest＋自動下載（**已於 Phase 2.1 實作**：worker 惰性回報模型 SHA-256（sidecar 快取），平台以「全體回報者一致」共識學得雜湊（衝突永久標記 `model_hashes.conflict` 並排除），與 model_guide 來源合成**平台簽章的 fetch manifest**（`name|directory|sha256|size_bytes` Ed25519 簽章、URL 刻意不入簽——以雜湊釘住內容）；`eligible_after_fetch` 成為真判定（protocol 3＋worker 端 `auto_fetch_models` 選擇性開啟＋磁碟餘裕 1.2×）；派工第二層：無直接合格者時挑最小下載量的自動抓取 worker，job push 內嵌 fetch_models；agent 驗簽→官方載點（跟隨轉址）→GCS 備援→逐位元組 SHA-256 驗證→原子落地→立即重掃回報→續跑；下載期間 stage=fetching_models 貫穿所有心跳，started_at 不設——**下載時間永不計費**；console/面板顯示下載進度。雲端版完整對等。中繼下載不再需要——直連原始來源即可）；`/object_info` 能力交集模式（保守選項，**已於 Phase 1.9 提前實作** `auth`/`comfyapi` 的 `object_info_mode: union|intersection`）。
-- **Phase 3**：成員間 P2P 分塊傳輸；貢獻報表進階（分潤試算）；多管理員。
+- **Phase 3**：成員間 P2P 分塊傳輸；貢獻報表進階（分潤試算）；多管理員。（**多使用者帳號系統／多管理員／分潤試算已於 Phase 3.0 實作**，見下方「Phase 3.0 addendum」：admin 建立與管理其他使用者帳號、一般使用者只看自己的 job／artifacts、`/comfy` 面板改為任何角色都能用的個人工作區、Reports 新增「使用者用量」與「分潤試算」（依 worker GPU 秒數比例試算分潤，未落地實際撥款）、既有安裝升級時原 admin 沿用同一組密碼但全員需重新登入一次、cloud 端 D1 migration 0006 對等實作。**成員間 P2P 分塊傳輸另立 Phase 3.1**，尚未實作。）
 - **Phase 1.9（backlog zero，2026-09-13）**：job origin 欄位＋範圍限定（面板原生控制只動面板自己送的工作）；面板任務歷史可刪除；node_errors 前端引導文案；隱藏面板內失效的 Comfy-cloud 登入按鈕；失敗／取消任務不計費（收據 0）；agent 通訊協定升級到 v2；派工優先序偏好弱 GPU／Mac 之類的機器優先接零模型需求的工作，把重活留給有模型的機器；範本快取與下載上限；一個間歇性 flake 已根治（非重跑掩蓋）；console 新增任務詳情頁（完整錯誤引導＋artifacts）；專案採用 AGPL-3.0 授權。
 - **ComfyFed Cloud（2026-09-12 提出，Phase 2.0 已上線）**——平台端的 Cloudflare Workers＋D1＋R2 免自架部署形態：D1=SQLite（schema 近乎原樣）、R2=ArtifactStore 的 S3 介面（presigned 直傳、零出口費）、agent 長連 WS 由 Durable Objects（hibernation）承接、派工迴圈為 DO alarms、Ed25519 驗簽走 WebCrypto。`cloud/` 目錄的 TypeScript Workers 實作已完成並部署在 workers.dev 網域上，見 `cloud/README.md`。定位：**自架 Python 版仍是本體**（內網/離線場景＋資料自主），Cloud 版是第二部署形態；現有架構決策（outbound-only WS、S3 介面、簽章收據）已刻意為此保留可移植性。
 
@@ -138,3 +138,54 @@ Decisions of record:
 - 圖生提示詞走內建模板＋` /no_think` 尾綴；文字生提示詞必須關閉內建模板、手動 `<|im_start|>` chat 包裹（否則編碼模板立即 EOS、輸出空字串）。chat 標記藏在「別動」節點，新手只碰想法欄。
 - 文字結果雙路呈現：panel 內 `PreviewAny`/`SaveText` 節點即席顯示（server 端 `job_outputs` 把 .txt artifacts 讀出為 `text` payload 映射到對應節點 id），同時以 .txt artifact 回傳 console。
 - 新模型入 curated registry（#10）＋GCS 鏡像。
+
+---
+
+## Phase 3.0 addendum: 多使用者帳號系統（multi-user, multi-admin, per-user billing）(2026-09-14)
+
+User directives: 推進 Phase 3；admin 登入後要可以幫 user 建立帳號；每個 user 只能看到自己的 job 跟產物；只有 admin 可以看到全部人的狀況；每個 user 個別使用了多少帳單資源要可以被計算。（Phase 3 既列項中的「多管理員」「分潤試算」併入本 phase；P2P 分塊傳輸另立 Phase 3.1。）
+
+Decisions of record:
+
+### 資料模型（server Alembic 新遷移＋cloud D1 0006，兩端對等）
+- 新表 `users`：`id`（uuid4 hex PK）、`username`（唯一；儲存前 lowercase 正規化，3–32 字元 `[a-z0-9_.-]`）、`password_hash`、`role`（`'admin'|'user'`）、`disabled`（bool，預設 false）、`session_epoch`（int，預設 0）、`created_at`。
+- 資料遷移：既有 `settings.admin_password_hash` → 建立 `username='admin'`、`role='admin'` 的 user 列（沿用原 hash，**既有 admin 密碼不變**），遷移後刪除該 setting key。全新安裝由 bootstrap／cloud `/api/setup` 直接建 admin user 列。
+- `jobs.user_id`（nullable TEXT）：新 job 一律蓋章提交者；既有 job 遷移時全數指到遷移出的 admin user。
+- `login_attempts` 加 `username` 欄；登入退避改**per-username**計算（同公式、同視窗）。
+
+### Session 與登入
+- Cookie payload 由 `{authenticated, csrf}` 改為 `{uid, role, epoch, csrf}`。舊 payload 缺 `uid` → 一律視為未登入（升級後全員重新登入一次，不做相容映射）。
+- `epoch` 必須等於該 user 當前 `session_epoch` 才有效：改密碼／被停用／重設密碼時 epoch +1 → 該 user 所有既有 session 立即失效（自己改密碼時當場重發新 cookie，本人不掉線）。**全域 session secret 不再因改密碼而輪替**（那會登出所有人）。
+- `POST /api/auth/login` 收 `{username, password}`；查無此人時仍對 dummy hash 做一次驗證（防 timing 枚舉），錯誤訊息不分「無此帳號／密碼錯」。`disabled` 使用者登入直接拒絕（同一種錯誤訊息）。
+- `GET /api/auth/me` 回 `{authenticated, username, role, lang, platform_url}`。
+- `POST /api/auth/change-password`：任何角色皆可自改（CSRF 保護），驗舊密碼。
+
+### 授權模型
+- 依賴鏈：`require_user`（任何已登入、未停用者，回傳 `{uid, role}`）→ `require_admin`（role=='admin'）。
+- Admin-only：使用者管理、workers、settings、註冊識別碼、`/api/reports/contributions`、`/api/reports/usage`、`/api/reports/payout`、`/metrics`、model manifest 管理面。
+- Owner-or-admin：`GET /api/jobs/{id}`、assessment、artifacts 下載、cancel。`GET /api/jobs` 列表：admin 看全部（附 `username`），一般 user 只回自己的。`POST /api/jobs` 蓋章 `user_id`。
+- **面板（/comfy）改為個人工作區（ruling）**：任何已登入 user 皆可用；`/comfy/api/queue`、`/history`、`/interrupt`、`/queue delete/clear`、`POST /history`（隱藏）、`/view`、job_outputs 一律範圍限定在「origin=='panel' 且 user_id==本人」——**admin 在面板內也只看自己的面板工作**（全視野走 console）。Console API 維持角色範圍。
+- 面板 WS 進度轉發同樣只推本人 job 的事件。
+
+### 使用者管理 API（admin-only，CSRF 保護）
+- `GET /api/users`：列表（id、username、role、disabled、created_at、job 數）。
+- `POST /api/users`：`{username, role, password?}`——未給密碼則產生隨機密碼（`secrets.token_urlsafe(12)`），**僅此一次**回傳明文。
+- `POST /api/users/{id}/reset-password`：產新隨機密碼（一次性回傳）＋epoch+1。
+- `PATCH /api/users/{id}`：`{role?, disabled?}`；**最後一名有效 admin 不可停用亦不可降級**（400）。停用即 epoch+1。
+- 不提供 DELETE（jobs/receipts 引用歷史）；停用即除役。
+
+### 帳單／報表
+- `GET /api/reports/usage`（admin，from/to 同 contributions）：receipts JOIN jobs.user_id，按 user 聚合 `{user_id, username, jobs, gpu_seconds, unbilled_gpu_seconds}`；user_id 為 NULL 的歷史列歸入 `username: null` 一列不丟失。
+- `GET /api/reports/my-usage`（任何登入者）：同形狀、僅本人。
+- **分潤試算** `GET /api/reports/payout?pool=<float>&from&to`（admin）：以區間內 billable gpu_seconds 按 worker 聚合，`ratio = worker_seconds / total_seconds`、`amount = pool × ratio`（raw float，前端格式化）；total 為 0 時回空列表＋`total_gpu_seconds: 0`。
+- `GET /api/reports/contributions` 維持不變。
+
+### Web
+- 登入頁加 username 欄；auth state 帶 `{username, role}`。
+- 導覽依角色：一般 user 只見 Dashboard（自己的統計）、Jobs（自己的）、Reports（我的用量）、Settings 縮減為改密碼＋語言；Workers／Users／完整 Settings／貢獻與分潤報表為 admin-only，路由層雙重把關（非僅藏選單）。
+- 新 Users 頁（admin）：列表、建帳號（一次性密碼顯示＋複製）、啟停用、角色切換、重設密碼。
+- Jobs 頁 admin 檢視加「使用者」欄；Reports 頁 admin 分頁：Worker 貢獻／使用者用量／分潤試算（pool 輸入框）。
+- zh-TW＋en 全量翻譯。
+
+### Cloud 對等
+- D1 migration 0006（users＋jobs.user_id＋login_attempts.username＋資料遷移 SQL）；`/api/setup` 建 admin user 列；auth／users／jobs 範圍／comfy 面板範圍／reports 三端點 byte-parity 移植；既有部署跑遷移後舊 cookie 自然失效。

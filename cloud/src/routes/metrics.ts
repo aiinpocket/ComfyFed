@@ -50,7 +50,7 @@
 import { Hono } from "hono";
 import type { Env } from "../env";
 import { getAllWorkers, getAllJobsOrderedByCreatedAt, getSetting, sqliteTimestampToEpochMs } from "../db/queries";
-import { readSession, errorJson } from "../lib/guard";
+import { resolveSessionUser, errorJson } from "../lib/guard";
 import { MESSAGES } from "../core/auth";
 
 const METRICS_PUBLIC_KEY = "metrics_public";
@@ -212,8 +212,12 @@ const app = new Hono<{ Bindings: Env }>();
 
 app.get("/metrics", async (c) => {
   if (!(await isPublic(c.env.DB))) {
-    const payload = await readSession(c);
-    if (!payload || !payload.authenticated) {
+    // Final review finding #2: admin-only, matching server's
+    // `metrics.py` (`user is None or user.role != "admin"`) -- a plain
+    // `user`-role session must not see the fleet-wide worker/queue/VRAM
+    // gauges just because it is logged in.
+    const user = await resolveSessionUser(c);
+    if (!user || user.role !== "admin") {
       return errorJson(c, 401, "auth.required", MESSAGES.authRequired);
     }
   }

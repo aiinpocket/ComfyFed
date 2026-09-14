@@ -103,18 +103,24 @@ function jsonResponse(body: unknown, status = 200): Response {
   });
 }
 
-function renderJobs() {
+function renderJobs(role: 'admin' | 'user' = 'user') {
   return render(
     <MantineProvider theme={theme}>
       <MemoryRouter>
-        <Jobs />
+        <Jobs role={role} />
       </MemoryRouter>
     </MantineProvider>,
   );
 }
 
-/** A fetch stub whose /api/jobs listing can be swapped between calls. */
-function stubFetch(jobsSequence: Job[][]) {
+/** A fetch stub whose /api/jobs listing can be swapped between calls.
+ *
+ * Final review finding #3: `GET /api/workers` is admin-only on both
+ * stacks -- a `user`-role session gets a real 403 from the server, which
+ * these tests must honestly reproduce (they previously always answered 200,
+ * which is exactly why the missing `isAdmin` guard in `Jobs.tsx` went
+ * uncaught). Defaults to `'user'`, matching `renderJobs`'s own default. */
+function stubFetch(jobsSequence: Job[][], role: 'admin' | 'user' = 'user') {
   let call = 0;
   const fetchMock = vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
     const url = typeof input === 'string' ? input : input.toString();
@@ -126,6 +132,9 @@ function stubFetch(jobsSequence: Job[][]) {
       return jsonResponse(jobs);
     }
     if (url === '/api/workers' && method === 'GET') {
+      if (role !== 'admin') {
+        return jsonResponse({ error: { code: 'auth.forbidden', message: 'Admin only.' } }, 403);
+      }
       return jsonResponse([WORKER]);
     }
     if (/\/api\/jobs\/[^/]+\/cancel$/.test(url) && method === 'POST') {
@@ -244,5 +253,49 @@ describe('Jobs page: cancellation', () => {
       return url.endsWith('/cancel');
     });
     expect(cancelCalls).toHaveLength(0);
+  });
+});
+
+describe('Jobs page: non-admin resilience to /api/workers 403 (final review finding #3)', () => {
+  afterEach(() => {
+    cleanup();
+    vi.unstubAllGlobals();
+  });
+
+  it('a plain user still sees their own jobs list when /api/workers 403s', async () => {
+    stubFetch([[RUNNING_JOB]], 'user');
+    renderJobs('user');
+
+    expect(await screen.findByText('Running')).toBeInTheDocument();
+    expect(screen.queryByText('Could not load jobs. Retrying automatically.')).not.toBeInTheDocument();
+  });
+});
+
+describe('Jobs page: 使用者 column (Task 8)', () => {
+  afterEach(() => {
+    cleanup();
+    vi.unstubAllGlobals();
+  });
+
+  const JOB_WITH_USER: Job = { ...RUNNING_JOB, username: 'alice' };
+  const JOB_LEGACY: Job = { ...DONE_JOB, id: 'job-legacy-0005', username: null };
+
+  it('shows the 使用者 column for an admin, including a dash for a null username', async () => {
+    stubFetch([[JOB_WITH_USER, JOB_LEGACY]], 'admin');
+    renderJobs('admin');
+
+    expect(await screen.findByText('Username')).toBeInTheDocument();
+    expect(await screen.findByText('alice')).toBeInTheDocument();
+    // The legacy job's null username renders as a muted dash, not blank/undefined.
+    expect(screen.getAllByText('—').length).toBeGreaterThan(0);
+  });
+
+  it('hides the 使用者 column entirely for a plain user', async () => {
+    stubFetch([[JOB_WITH_USER]]);
+    renderJobs('user');
+
+    await screen.findByText('Running');
+    expect(screen.queryByText('Username')).not.toBeInTheDocument();
+    expect(screen.queryByText('alice')).not.toBeInTheDocument();
   });
 });

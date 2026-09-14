@@ -14,10 +14,17 @@
  * resulting rows, same division of responsibility as the Python source.
  */
 
-import { Hono } from "hono";
+import { Hono, type Context } from "hono";
 import type { Env } from "../env";
-import { getReceiptsInRange, getWorkersByIds, toSqliteTimestamp, type Receipt } from "../db/queries";
-import { requireAdmin, errorJson } from "../lib/guard";
+import {
+  getReceiptsInRange,
+  getUsageRowsInRange,
+  getWorkersByIds,
+  toSqliteTimestamp,
+  type Receipt,
+  type UsageJoinRow,
+} from "../db/queries";
+import { requireAdmin, requireUser, errorJson, SESSION_VAR } from "../lib/guard";
 
 /** Thrown by `parseDateParam` for a value that doesn't parse as ISO-8601 --
  * carries the original (untrimmed) input so the 400 response can quote it
@@ -127,6 +134,115 @@ function aggregate(receipts: Receipt[], names: Map<string, string>): WorkerAggre
   return [...byWorker.values()];
 }
 
+/** Thrown by `parsePoolParam` for a `pool` query param that's missing, not a
+ * valid number, or negative -- carries the finished `{code, message}` 400
+ * body so the route can hand it straight to `errorJson`. */
+class BadPoolError extends Error {
+  constructor(message: string) {
+    super(message);
+  }
+}
+
+// Final review finding #10: plain-decimal grammar, applied to the trimmed
+// string BEFORE `Number()` ever sees it -- byte-for-byte the same pattern
+// as receipts.py's `_POOL_RE`. `Number()` alone accepts forms beyond plain
+// decimal notation that `Number.isFinite` cannot catch on their own --
+// notably `"0x10"` (hex 16, perfectly finite) -- and Python's `float()`
+// separately accepts `"1_0"` (underscore digit-group separator), which this
+// same regex also kills so both stacks reject it identically.
+const POOL_RE = /^[+-]?(\d+(\.\d*)?|\.\d+)([eE][+-]?\d+)?$/;
+
+/** Parses the `pool` query parameter for `/api/reports/payout` -- mirrors
+ * receipts.py's `_parse_pool`. Declared as a plain string (Hono's
+ * `c.req.query` already gives us that) so a bad value becomes our own
+ * `reports.bad_pool` 400, consistent with `parseDateParam`/`reports.bad_date`,
+ * rather than a framework validation error. `raw === undefined` (param
+ * absent) mirrors FastAPI handing `_parse_pool` a Python `None` -- `None!r`
+ * is the bare word `None`, not a quoted string, so that case is special-cased
+ * rather than routed through `pyStrRepr`. */
+function parsePoolParam(raw: string | undefined): number {
+  if (raw === undefined) {
+    throw new BadPoolError("Not a valid number: None");
+  }
+  const trimmed = raw.trim();
+  if (!POOL_RE.test(trimmed)) {
+    throw new BadPoolError(`Not a valid number: ${pyStrRepr(raw)}`);
+  }
+  const value = Number(trimmed);
+  if (!Number.isFinite(value)) {
+    throw new BadPoolError(`Not a valid number: ${pyStrRepr(raw)}`);
+  }
+  if (value < 0) {
+    throw new BadPoolError("pool must be non-negative");
+  }
+  return value;
+}
+
+interface UsageAggregate {
+  user_id: string | null;
+  username: string | null;
+  jobs: number;
+  gpu_seconds: number;
+  unbilled_gpu_seconds: number;
+}
+
+/** Shared aggregation for `/usage` and `/my-usage` -- mirrors receipts.py's
+ * `_usage_rows` grouping step (the join itself lives in
+ * `getUsageRowsInRange`). Same billable/unbilled split as `aggregate()`
+ * above; a `null` `user_id` (missing job, or job with no `user_id`) groups
+ * into a single row rather than being dropped -- `Map` distinguishes a
+ * `null` key from every string key, same as Python's dict keyed by
+ * `Optional[str]`. Sorted by `gpu_seconds` descending, matching `_usage_rows`'
+ * `sorted(..., reverse=True)`. */
+function aggregateUsage(rows: UsageJoinRow[]): UsageAggregate[] {
+  const byUser = new Map<string | null, UsageAggregate>();
+
+  for (const row of rows) {
+    let entry = byUser.get(row.userId);
+    if (!entry) {
+      entry = {
+        user_id: row.userId,
+        username: row.username,
+        jobs: 0,
+        gpu_seconds: 0,
+        unbilled_gpu_seconds: 0,
+      };
+      byUser.set(row.userId, entry);
+    }
+
+    if (row.billable) {
+      entry.jobs += 1;
+      entry.gpu_seconds += row.gpuSeconds;
+    } else {
+      entry.unbilled_gpu_seconds += row.gpuSeconds;
+    }
+  }
+
+  return [...byUser.values()].sort((a, b) => b.gpu_seconds - a.gpu_seconds);
+}
+
+/** Parses the shared `from`/`to` query params for a request, converting a
+ * `BadDateError` into the same `reports.bad_date` 400 body `/contributions`
+ * returns. A `Response` result means "already responded" -- callers must
+ * check for that (`instanceof Response`) before continuing. */
+function parseDateRange(
+  c: Context<{ Bindings: Env }>
+): { start: string | null; end: string | null } | Response {
+  const fromParam = c.req.query("from");
+  const toParam = c.req.query("to");
+  try {
+    return {
+      start: fromParam ? parseDateParam(fromParam) : null,
+      end: toParam ? parseDateParam(toParam) : null,
+    };
+  } catch (err) {
+    if (err instanceof BadDateError) {
+      return errorJson(c, 400, "reports.bad_date", `Not a valid ISO-8601 date: ${pyStrRepr(err.value)}`);
+    }
+    throw err;
+  }
+}
+
 const app = new Hono<{ Bindings: Env }>();
 
 app.get("/api/reports/contributions", requireAdmin, async (c) => {
@@ -152,6 +268,100 @@ app.get("/api/reports/contributions", requireAdmin, async (c) => {
   const names = new Map(workers.map((w) => [w.id, w.name]));
 
   return c.json(aggregate(receipts, names));
+});
+
+/**
+ * `GET /api/reports/usage` -- parity source: receipts.py's `usage` route
+ * (backed by `_usage_rows`). Admin-only, per-user aggregation of every
+ * receipt in the optional `from`/`to` range, joined through `jobs.user_id`
+ * to `users.username`; a receipt with no job or a job with no `user_id`
+ * aggregates into a single `{user_id: null, username: null}` row instead of
+ * being dropped. Sorted by `gpu_seconds` descending.
+ */
+app.get("/api/reports/usage", requireAdmin, async (c) => {
+  const range = parseDateRange(c);
+  if (range instanceof Response) return range;
+
+  const rows = await getUsageRowsInRange(c.env.DB, range.start, range.end);
+  return c.json(aggregateUsage(rows));
+});
+
+/**
+ * `GET /api/reports/my-usage` -- parity source: receipts.py's `my_usage`
+ * route. Any authenticated user (not admin-only); scoped to the session
+ * user's own receipts via `onlyUserId`. Returns a single object rather than
+ * a list -- the session user's aggregated row if they have any receipts in
+ * range, else a zeroed row with their own `user_id`/`username`, matching
+ * `my_usage`'s fallback when `_usage_rows` comes back empty.
+ */
+app.get("/api/reports/my-usage", requireUser, async (c) => {
+  const range = parseDateRange(c);
+  if (range instanceof Response) return range;
+
+  const user = c.get(SESSION_VAR).user;
+  const rows = await getUsageRowsInRange(c.env.DB, range.start, range.end, user.uid);
+  const aggregated = aggregateUsage(rows);
+  if (aggregated.length > 0) return c.json(aggregated[0]);
+
+  return c.json({
+    user_id: user.uid,
+    username: user.username,
+    jobs: 0,
+    gpu_seconds: 0,
+    unbilled_gpu_seconds: 0,
+  });
+});
+
+/**
+ * `GET /api/reports/payout` -- parity source: receipts.py's `payout` route.
+ * Admin-only; splits a `pool` amount across workers in proportion to their
+ * billable `gpu_seconds` over the optional `from`/`to` range. `pool` is
+ * required, must parse as a non-negative number, or this 400s
+ * `reports.bad_pool` (see `parsePoolParam`). A zero total (no billable
+ * receipts in range) short-circuits to an empty `workers` list rather than
+ * dividing by zero, matching `payout`'s `if total_gpu_seconds == 0` branch.
+ */
+app.get("/api/reports/payout", requireAdmin, async (c) => {
+  let poolValue: number;
+  try {
+    poolValue = parsePoolParam(c.req.query("pool"));
+  } catch (err) {
+    if (err instanceof BadPoolError) {
+      return errorJson(c, 400, "reports.bad_pool", err.message);
+    }
+    throw err;
+  }
+
+  const range = parseDateRange(c);
+  if (range instanceof Response) return range;
+
+  const receipts = (await getReceiptsInRange(c.env.DB, range.start, range.end)).filter((r) => r.billable);
+
+  const totals = new Map<string, number>();
+  for (const rec of receipts) {
+    totals.set(rec.workerId, (totals.get(rec.workerId) ?? 0) + rec.gpuSeconds);
+  }
+
+  const totalGpuSeconds = [...totals.values()].reduce((sum, v) => sum + v, 0);
+  if (totalGpuSeconds === 0) {
+    return c.json({ total_gpu_seconds: 0, pool: poolValue, workers: [] });
+  }
+
+  const workerIds = [...totals.keys()];
+  const workers = workerIds.length > 0 ? await getWorkersByIds(c.env.DB, workerIds) : [];
+  const names = new Map(workers.map((w) => [w.id, w.name]));
+
+  const payoutWorkers = [...totals.entries()]
+    .map(([workerId, gpuSeconds]) => ({
+      worker_id: workerId,
+      name: names.get(workerId) ?? "",
+      gpu_seconds: gpuSeconds,
+      ratio: gpuSeconds / totalGpuSeconds,
+      amount: poolValue * (gpuSeconds / totalGpuSeconds),
+    }))
+    .sort((a, b) => b.gpu_seconds - a.gpu_seconds);
+
+  return c.json({ total_gpu_seconds: totalGpuSeconds, pool: poolValue, workers: payoutWorkers });
 });
 
 export default app;

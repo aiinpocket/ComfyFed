@@ -294,8 +294,13 @@ def client(tmp_path):
     return c
 
 
+def _admin_uid():
+    with db.get_session() as session:
+        return session.query(db.User).filter(db.User.username == "admin").one().id
+
+
 def _login(client):
-    r = client.post("/api/auth/login", json={"password": client.admin_password})
+    r = client.post("/api/auth/login", json={"username": "admin", "password": client.admin_password})
     assert r.status_code == 200
     return r.json()["csrf"]
 
@@ -481,7 +486,9 @@ def test_workflow_templates_api_requires_auth(client):
 
 
 def test_create_app_seeds_template_assets_into_staging(client):
-    staged = os.path.join(comfyapi.staging_dir(client.data_dir), "amyntas_ref.png")
+    staged = os.path.join(
+        comfyapi.staging_dir(client.data_dir, comfyapi.SHARED_STAGING_UID), "amyntas_ref.png"
+    )
     assert os.path.isfile(staged)
 
 
@@ -545,7 +552,9 @@ def test_object_info_offers_staged_images_in_upload_dropdowns(client):
         },
     )
 
-    with open(os.path.join(comfyapi.staging_dir(client.data_dir), "uploaded.png"), "wb") as f:
+    admin_staging = comfyapi.staging_dir(client.data_dir, _admin_uid())
+    os.makedirs(admin_staging, exist_ok=True)
+    with open(os.path.join(admin_staging, "uploaded.png"), "wb") as f:
         f.write(b"x")
 
     body = client.get("/comfy/api/object_info").json()
@@ -580,8 +589,10 @@ def test_object_info_offers_staged_files_by_media_kind(client):
             },
         },
     )
+    admin_staging = comfyapi.staging_dir(client.data_dir, _admin_uid())
+    os.makedirs(admin_staging, exist_ok=True)
     for name in ("clip.mp4", "voice.wav"):
-        with open(os.path.join(comfyapi.staging_dir(client.data_dir), name), "wb") as f:
+        with open(os.path.join(admin_staging, name), "wb") as f:
             f.write(b"x")
 
     body = client.get("/comfy/api/object_info").json()

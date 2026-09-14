@@ -3,7 +3,7 @@ import { useCallback, useEffect, useState } from 'react';
 import { useTranslation } from 'react-i18next';
 import { Navigate, Route, Routes, useNavigate } from 'react-router-dom';
 
-import { api, onUnauthorized, setCsrf } from './api';
+import { api, onUnauthorized, setCsrf, type Role } from './api';
 import { AppLayout } from './components/AppLayout';
 import { Logo } from './components/Logo';
 import { Dashboard } from './pages/Dashboard';
@@ -13,22 +13,39 @@ import { Login } from './pages/Login';
 import { Reports } from './pages/Reports';
 import { Settings } from './pages/Settings';
 import { Setup } from './pages/Setup';
+import { Users } from './pages/Users';
 import { Workers } from './pages/Workers';
 
 type AuthState = 'checking' | 'authenticated' | 'anonymous' | 'setup_needed';
+
+/** The signed-in user, as far as the console's UI needs to know: enough to
+ * gate nav items and routes. `role` defaults to the least-privileged 'user'
+ * when the server ever omits it, rather than accidentally granting admin. */
+export interface CurrentUser {
+  username: string;
+  role: Role;
+}
 
 export function App() {
   const { t } = useTranslation();
   const navigate = useNavigate();
   const [auth, setAuth] = useState<AuthState>('checking');
   const [platformUrl, setPlatformUrl] = useState('');
+  const [user, setUser] = useState<CurrentUser | null>(null);
 
   const refreshSession = useCallback(async () => {
     try {
       const me = await api.me();
       setPlatformUrl(me.platform_url ?? '');
-      setAuth(me.authenticated ? 'authenticated' : 'anonymous');
+      if (me.authenticated) {
+        setUser({ username: me.username ?? '', role: me.role === 'admin' ? 'admin' : 'user' });
+        setAuth('authenticated');
+      } else {
+        setUser(null);
+        setAuth('anonymous');
+      }
     } catch {
+      setUser(null);
       setAuth('anonymous');
     }
   }, []);
@@ -64,6 +81,7 @@ export function App() {
   useEffect(() => {
     onUnauthorized(() => {
       setCsrf(null);
+      setUser(null);
       setAuth('anonymous');
       navigate('/login', { replace: true });
     });
@@ -102,15 +120,36 @@ export function App() {
     );
   }
 
+  const role: Role = user?.role ?? 'user';
+  const isAdmin = role === 'admin';
+
   return (
-    <AppLayout platformUrl={platformUrl} onLoggedOut={() => setAuth('anonymous')}>
+    <AppLayout
+      platformUrl={platformUrl}
+      role={role}
+      onLoggedOut={() => {
+        setUser(null);
+        setAuth('anonymous');
+      }}
+    >
       <Routes>
-        <Route path="/dashboard" element={<Dashboard />} />
-        <Route path="/jobs" element={<Jobs />} />
-        <Route path="/jobs/:id" element={<JobDetail />} />
-        <Route path="/workers" element={<Workers />} />
-        <Route path="/reports" element={<Reports />} />
-        <Route path="/settings" element={<Settings platformUrl={platformUrl} />} />
+        <Route path="/dashboard" element={<Dashboard role={role} />} />
+        <Route path="/jobs" element={<Jobs role={role} />} />
+        <Route path="/jobs/:id" element={<JobDetail role={role} />} />
+        {/* Admin-only: guarded at the route level, not just hidden from nav --
+            a non-admin navigating here directly (deep link, back button)
+            bounces to the dashboard instead of rendering a page whose
+            `/api/workers` call would just 403. */}
+        <Route
+          path="/workers"
+          element={isAdmin ? <Workers /> : <Navigate to="/dashboard" replace />}
+        />
+        <Route
+          path="/users"
+          element={isAdmin ? <Users /> : <Navigate to="/dashboard" replace />}
+        />
+        <Route path="/reports" element={<Reports role={role} />} />
+        <Route path="/settings" element={<Settings platformUrl={platformUrl} role={role} />} />
         <Route path="*" element={<Navigate to="/dashboard" replace />} />
       </Routes>
     </AppLayout>

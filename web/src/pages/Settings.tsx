@@ -24,17 +24,23 @@ import {
 import { useEffect, useState } from 'react';
 import { useTranslation } from 'react-i18next';
 
-import { ApiError, api, type ObjectInfoMode } from '../api';
+import { ApiError, api, type ObjectInfoMode, type Role } from '../api';
 import { Mono, SectionHeader } from '../components/Primitives';
 import { persistLang, type Lang } from '../i18n';
 
 interface SettingsProps {
   platformUrl: string;
+  /** `user` sees only change-password + language: `GET /api/settings` (the
+   * platform URL / object_info_mode section) is admin-only and 403s for
+   * anyone else, so that section -- and the fetch that feeds it -- is
+   * skipped entirely rather than shown broken. */
+  role: Role;
 }
 
-export function Settings({ platformUrl }: SettingsProps) {
+export function Settings({ platformUrl, role }: SettingsProps) {
   const { t, i18n } = useTranslation();
   const theme = useMantineTheme();
+  const isAdmin = role === 'admin';
 
   const [oldPassword, setOldPassword] = useState('');
   const [newPassword, setNewPassword] = useState('');
@@ -58,6 +64,7 @@ export function Settings({ platformUrl }: SettingsProps) {
   }, [platformUrl]);
 
   useEffect(() => {
+    if (!isAdmin) return;
     let cancelled = false;
     api
       .getSettings()
@@ -70,7 +77,7 @@ export function Settings({ platformUrl }: SettingsProps) {
     return () => {
       cancelled = true;
     };
-  }, []);
+  }, [isAdmin]);
 
   const urlValid = urlDraft.startsWith('http://') || urlDraft.startsWith('https://');
   const urlDirty = urlDraft !== savedUrl;
@@ -225,6 +232,7 @@ export function Settings({ platformUrl }: SettingsProps) {
         </Card>
 
         <Stack gap="md">
+          {isAdmin && (
           <Card style={cardStyle}>
             <Stack gap="sm">
               <Group gap="xs">
@@ -294,6 +302,7 @@ export function Settings({ platformUrl }: SettingsProps) {
               </form>
             </Stack>
           </Card>
+          )}
 
           <Card style={cardStyle}>
             <Stack gap="sm">

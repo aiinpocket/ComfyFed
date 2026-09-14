@@ -16,6 +16,7 @@ import golden from "./fixtures/golden.json";
 
 afterEach(async () => {
   await db().prepare("DELETE FROM settings").run();
+  await db().prepare("DELETE FROM users").run();
   await db().prepare("DELETE FROM workers").run();
   await db().prepare("DELETE FROM jobs").run();
   await db().prepare("DELETE FROM register_tokens").run();
@@ -40,7 +41,7 @@ const ADMIN_PASSWORD = "correct-horse-battery-staple";
 
 async function loginSession(): Promise<{ cookie: string | null; csrf: string }> {
   await call("/api/setup", { json: { token: SETUP_TOKEN, password: ADMIN_PASSWORD } });
-  const login = await call("/api/auth/login", { json: { password: ADMIN_PASSWORD } });
+  const login = await call("/api/auth/login", { json: { username: "admin", password: ADMIN_PASSWORD } });
   return { cookie: login.setCookie, csrf: login.body.csrf };
 }
 
@@ -123,9 +124,27 @@ async function postPrompt(cookie: string | null, prompt: unknown = SIMPLE_PROMPT
   return call("/comfy/api/prompt", { json: { prompt }, cookie });
 }
 
+/** Creates a non-admin `role: "user"` account (via the admin-only
+ * `/api/users` API) and logs in as it -- Phase 3.0 Task 10's panel per-user
+ * scoping tests need a second, non-admin session distinct from
+ * `loginSession()`'s admin. */
+async function userSession(
+  admin: { cookie: string | null; csrf: string },
+  username: string
+): Promise<{ cookie: string | null; csrf: string }> {
+  const password = "a-long-enough-password1";
+  await call("/api/users", {
+    json: { username, role: "user", password },
+    cookie: admin.cookie,
+    headers: { "X-CSRF": admin.csrf },
+  });
+  const login = await call("/api/auth/login", { json: { username, password } });
+  return { cookie: login.setCookie, csrf: login.body.csrf };
+}
+
 // --- auth --------------------------------------------------------------
 
-describe("every /comfy/api route requires an admin session", () => {
+describe("every /comfy/api route requires an authenticated session (any role, Phase 3.0 Task 4/10)", () => {
   const routes: [string, string][] = [
     ["GET", "/comfy/api/object_info"],
     ["GET", "/comfy/api/queue"],
@@ -657,7 +676,61 @@ describe("POST /comfy/api/upload/image", () => {
     expect(await inputObj!.text()).toBe("STAGED");
 
     // Copy, not move -- the staged file is still there for reuse.
-    expect(await store().get("staging/ref.png")).not.toBeNull();
+    const adminRow = await db().prepare("SELECT id FROM users WHERE username = 'admin'").first<{ id: string }>();
+    expect(await store().get(`staging/${adminRow!.id}/ref.png`)).not.toBeNull();
+  });
+});
+
+async function uploadImage(cookie: string | null, filename: string, content: string): Promise<Response> {
+  const form = new FormData();
+  form.set("image", new File([new TextEncoder().encode(content)], filename, { type: "image/png" }));
+  const worker = (await import("../src/index")).default;
+  const { createExecutionContext, waitOnExecutionContext } = await import("cloudflare:test");
+  const ctx = createExecutionContext();
+  const res = await worker.fetch(
+    new Request("http://example.com/comfy/api/upload/image", { method: "POST", headers: { Cookie: cookie ?? "" }, body: form }),
+    env as any,
+    ctx
+  );
+  await waitOnExecutionContext(ctx);
+  return res;
+}
+
+describe("panel input staging is isolated between users (final review finding #1)", () => {
+  it("B cannot view or overwrite A's staged input; A's next /prompt uses her own file", async () => {
+    const admin = await loginSession();
+    const alice = await userSession(admin, "alice");
+    const bob = await userSession(admin, "bob");
+
+    await uploadImage(alice.cookie, "reference.png", "ALICE-BYTES");
+
+    // Bob cannot view Alice's staged file even though he knows its exact name.
+    const bobView = await call("/comfy/api/view?filename=reference.png&type=input", { method: "GET", cookie: bob.cookie });
+    expect(bobView.status).toBe(404);
+
+    // Bob's own object_info dropdown does not list Alice's staged file.
+    const w1 = await registerWorker(admin.cookie, admin.csrf, "w1");
+    await seedObjectInfo(w1, "h1", {
+      LoadImage: { input: { required: { image: [[], { image_upload: true }] } } },
+    });
+    const bobObjectInfo = await call("/comfy/api/object_info", { method: "GET", cookie: bob.cookie });
+    expect(bobObjectInfo.body.LoadImage?.input?.required?.image?.[0] ?? []).not.toContain("reference.png");
+
+    // Bob uploads a same-named file -- it must NOT overwrite Alice's.
+    const bobUpload = await uploadImage(bob.cookie, "reference.png", "BOB-BYTES");
+    expect(bobUpload.status).toBe(200);
+
+    const aliceRow = await db().prepare("SELECT id FROM users WHERE username = 'alice'").first<{ id: string }>();
+    const aliceStaged = await store().get(`staging/${aliceRow!.id}/reference.png`);
+    expect(await aliceStaged!.text()).toBe("ALICE-BYTES");
+
+    // Alice's own next /prompt still resolves against her own file.
+    const prompt = { "1": { class_type: "LoadImage", inputs: { image: "reference.png" } } };
+    const r = await postPrompt(alice.cookie, prompt);
+    expect(r.status).toBe(200);
+    const jobId = r.body.prompt_id;
+    const jobInput = await store().get(`job_inputs/${jobId}/reference.png`);
+    expect(await jobInput!.text()).toBe("ALICE-BYTES");
   });
 });
 
@@ -732,5 +805,214 @@ describe("panel bootstrap routes", () => {
     await call("/comfy/api/settings/theme", { json: "light", cookie });
     const after = await call("/comfy/api/settings", { method: "GET", cookie });
     expect(after.body).toEqual({ theme: "light" });
+  });
+
+  it("settings are isolated between users, with the pre-existing legacy blob as a fallback default (final review finding #7)", async () => {
+    const admin = await loginSession();
+    // A legacy, pre-Task-4 global row (no per-uid suffix), as if written
+    // before this fix shipped.
+    await db()
+      .prepare("INSERT INTO settings (key, value) VALUES ('comfy_settings_json', ?)")
+      .bind(JSON.stringify({ theme: "legacy-theme" }))
+      .run();
+
+    const alice = await userSession(admin, "alice");
+    const bob = await userSession(admin, "bob");
+
+    // Alice has never written her own settings -- she reads the legacy blob.
+    const aliceBefore = await call("/comfy/api/settings", { method: "GET", cookie: alice.cookie });
+    expect(aliceBefore.body).toEqual({ theme: "legacy-theme" });
+
+    // Alice writes her own setting -- forks her OWN row from here on.
+    await call("/comfy/api/settings", { json: { zoom: 2.0 }, cookie: alice.cookie });
+    const aliceAfter = await call("/comfy/api/settings", { method: "GET", cookie: alice.cookie });
+    expect(aliceAfter.body).toEqual({ theme: "legacy-theme", zoom: 2.0 });
+
+    // Bob, who has also never written his own settings, still reads the
+    // legacy blob -- Alice's write did not touch it.
+    const bobBefore = await call("/comfy/api/settings", { method: "GET", cookie: bob.cookie });
+    expect(bobBefore.body).toEqual({ theme: "legacy-theme" });
+
+    // Bob's own write is independent of Alice's.
+    await call("/comfy/api/settings", { json: { theme: "bobs-theme" }, cookie: bob.cookie });
+    const bobAfter = await call("/comfy/api/settings", { method: "GET", cookie: bob.cookie });
+    expect(bobAfter.body).toEqual({ theme: "bobs-theme" });
+
+    // Alice's settings are untouched by Bob's write.
+    const aliceStill = await call("/comfy/api/settings", { method: "GET", cookie: alice.cookie });
+    expect(aliceStill.body).toEqual({ theme: "legacy-theme", zoom: 2.0 });
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Phase 3.0 Task 10: panel per-user scoping -- parity port of the Python
+// Task 4 rule that the panel is a per-user workspace for EVERY role,
+// including admin: every panel-native read/control is scoped to
+// `origin === "panel" AND user_id === <the session's own uid>`, so a second
+// user's (or admin's own OTHER surface's) panel jobs never leak across.
+
+describe("Phase 3.0: panel per-user scoping", () => {
+  it("a non-admin user can reach the panel surface (widened from admin-only in Task 4)", async () => {
+    const admin = await loginSession();
+    const alice = await userSession(admin, "alice");
+
+    const r = await postPrompt(alice.cookie);
+    expect(r.status).toBe(200);
+    expect(typeof r.body.prompt_id).toBe("string");
+
+    const queue = await call("/comfy/api/queue", { method: "GET", cookie: alice.cookie });
+    expect(queue.status).toBe(200);
+  });
+
+  it("GET /queue: each user's panel queue shows only their own pending/running jobs", async () => {
+    const admin = await loginSession();
+    const alice = await userSession(admin, "alice");
+    const bob = await userSession(admin, "bob");
+
+    const aliceJob = (await postPrompt(alice.cookie)).body.prompt_id;
+    const bobJob = (await postPrompt(bob.cookie)).body.prompt_id;
+
+    const aliceQueue = await call("/comfy/api/queue", { method: "GET", cookie: alice.cookie });
+    const aliceIds = [...aliceQueue.body.queue_running, ...aliceQueue.body.queue_pending].map((e: any) => e[1]);
+    expect(aliceIds).toContain(aliceJob);
+    expect(aliceIds).not.toContain(bobJob);
+
+    const bobQueue = await call("/comfy/api/queue", { method: "GET", cookie: bob.cookie });
+    const bobIds = [...bobQueue.body.queue_running, ...bobQueue.body.queue_pending].map((e: any) => e[1]);
+    expect(bobIds).toContain(bobJob);
+    expect(bobIds).not.toContain(aliceJob);
+  });
+
+  it("admin's own panel excludes another user's panel jobs -- full fleet visibility lives in the console, not here", async () => {
+    const admin = await loginSession();
+    const alice = await userSession(admin, "alice");
+
+    const aliceJob = (await postPrompt(alice.cookie)).body.prompt_id;
+    const adminJob = (await postPrompt(admin.cookie)).body.prompt_id;
+
+    const adminQueue = await call("/comfy/api/queue", { method: "GET", cookie: admin.cookie });
+    const adminIds = [...adminQueue.body.queue_running, ...adminQueue.body.queue_pending].map((e: any) => e[1]);
+    expect(adminIds).toContain(adminJob);
+    expect(adminIds).not.toContain(aliceJob);
+
+    // The console's /api/jobs list, by contrast, is admin's full-fleet view.
+    const consoleList = await call("/api/jobs", { method: "GET", cookie: admin.cookie });
+    const consoleIds = consoleList.body.map((j: any) => j.id);
+    expect(consoleIds).toContain(aliceJob);
+    expect(consoleIds).toContain(adminJob);
+  });
+
+  it("GET /history: each user's panel history shows only their own done jobs", async () => {
+    const admin = await loginSession();
+    const alice = await userSession(admin, "alice");
+    const bob = await userSession(admin, "bob");
+
+    const aliceJob = (await postPrompt(alice.cookie)).body.prompt_id;
+    const bobJob = (await postPrompt(bob.cookie)).body.prompt_id;
+    await finishJob(aliceJob, { status: "done", resultFiles: ["a.png"] });
+    await finishJob(bobJob, { status: "done", resultFiles: ["b.png"] });
+
+    const aliceHistory = await call("/comfy/api/history", { method: "GET", cookie: alice.cookie });
+    expect(aliceHistory.body[aliceJob]).toBeDefined();
+    expect(aliceHistory.body[bobJob]).toBeUndefined();
+
+    const bobHistory = await call("/comfy/api/history", { method: "GET", cookie: bob.cookie });
+    expect(bobHistory.body[bobJob]).toBeDefined();
+    expect(bobHistory.body[aliceJob]).toBeUndefined();
+
+    // GET /history/{id} (upstream's "{}" for an unresolvable id) also
+    // refuses to resolve another user's job.
+    const aliceByBobId = await call(`/comfy/api/history/${bobJob}`, { method: "GET", cookie: alice.cookie });
+    expect(aliceByBobId.body).toEqual({});
+  });
+
+  it("POST /history hide (delete + clear) never touches another user's panel jobs", async () => {
+    const admin = await loginSession();
+    const alice = await userSession(admin, "alice");
+    const bob = await userSession(admin, "bob");
+
+    const aliceJob = (await postPrompt(alice.cookie)).body.prompt_id;
+    const bobJob = (await postPrompt(bob.cookie)).body.prompt_id;
+    await finishJob(aliceJob, { status: "done", resultFiles: ["a.png"] });
+    await finishJob(bobJob, { status: "done", resultFiles: ["b.png"] });
+
+    // Alice's explicit delete-by-id naming Bob's job must not hide it.
+    await call("/comfy/api/history", { json: { delete: [bobJob] }, cookie: alice.cookie });
+    const bobRow = await db().prepare("SELECT panel_hidden FROM jobs WHERE id = ?").bind(bobJob).first<{ panel_hidden: number }>();
+    expect(bobRow?.panel_hidden).toBe(0);
+
+    // Alice's clear must only hide her own, never Bob's.
+    await call("/comfy/api/history", { json: { clear: true }, cookie: alice.cookie });
+    const aliceRow = await db().prepare("SELECT panel_hidden FROM jobs WHERE id = ?").bind(aliceJob).first<{ panel_hidden: number }>();
+    const bobRowAfter = await db().prepare("SELECT panel_hidden FROM jobs WHERE id = ?").bind(bobJob).first<{ panel_hidden: number }>();
+    expect(aliceRow?.panel_hidden).toBe(1);
+    expect(bobRowAfter?.panel_hidden).toBe(0);
+  });
+
+  it("POST /interrupt only ever cancels the caller's own running panel job", async () => {
+    const admin = await loginSession();
+    const alice = await userSession(admin, "alice");
+    const bob = await userSession(admin, "bob");
+
+    const aliceJob = (await postPrompt(alice.cookie)).body.prompt_id;
+    const bobJob = (await postPrompt(bob.cookie)).body.prompt_id;
+    await db().prepare("UPDATE jobs SET status = 'running' WHERE id IN (?, ?)").bind(aliceJob, bobJob).run();
+
+    await call("/comfy/api/interrupt", { method: "POST", cookie: alice.cookie });
+
+    const aliceRow = await db().prepare("SELECT status FROM jobs WHERE id = ?").bind(aliceJob).first<{ status: string }>();
+    const bobRow = await db().prepare("SELECT status FROM jobs WHERE id = ?").bind(bobJob).first<{ status: string }>();
+    expect(aliceRow?.status).toBe("cancelled");
+    expect(bobRow?.status).toBe("running");
+  });
+
+  it("POST /queue delete only cancels the caller's own named job, ignoring another user's id", async () => {
+    const admin = await loginSession();
+    const alice = await userSession(admin, "alice");
+    const bob = await userSession(admin, "bob");
+
+    const aliceJob = (await postPrompt(alice.cookie)).body.prompt_id;
+    const bobJob = (await postPrompt(bob.cookie)).body.prompt_id;
+
+    await call("/comfy/api/queue", { json: { delete: [aliceJob, bobJob] }, cookie: alice.cookie });
+
+    const aliceRow = await db().prepare("SELECT status FROM jobs WHERE id = ?").bind(aliceJob).first<{ status: string }>();
+    const bobRow = await db().prepare("SELECT status FROM jobs WHERE id = ?").bind(bobJob).first<{ status: string }>();
+    expect(aliceRow?.status).toBe("cancelled");
+    expect(bobRow?.status).toBe("queued");
+  });
+
+  it("GET /view: 404s for another user's panel output (both the subfolder and legacy fallback paths)", async () => {
+    const admin = await loginSession();
+    const alice = await userSession(admin, "alice");
+    const bob = await userSession(admin, "bob");
+
+    const aliceJob = (await postPrompt(alice.cookie)).body.prompt_id;
+    await finishJob(aliceJob, { status: "done", resultFiles: ["out.png"], bytes: new TextEncoder().encode("alices-bytes") });
+
+    // Owner can view it (subfolder-qualified).
+    const asOwner = await call(`/comfy/api/view?filename=out.png&subfolder=${aliceJob}`, { method: "GET", cookie: alice.cookie });
+    expect(asOwner.status).toBe(200);
+    expect(asOwner.body).toBe("alices-bytes");
+
+    // Another user, naming the exact same subfolder (job id), is refused.
+    const asOther = await call(`/comfy/api/view?filename=out.png&subfolder=${aliceJob}`, { method: "GET", cookie: bob.cookie });
+    expect(asOther.status).toBe(404);
+
+    // The subfolder-less legacy fallback must not let Bob find Alice's file
+    // by filename alone either.
+    const asOtherLegacy = await call("/comfy/api/view?filename=out.png", { method: "GET", cookie: bob.cookie });
+    expect(asOtherLegacy.status).toBe(404);
+  });
+
+  it("POST /prompt stamps user_id with the submitting session's own uid", async () => {
+    const admin = await loginSession();
+    const alice = await userSession(admin, "alice");
+    const jobId = (await postPrompt(alice.cookie)).body.prompt_id;
+
+    const row = await db().prepare("SELECT origin, user_id FROM jobs WHERE id = ?").bind(jobId).first<any>();
+    expect(row.origin).toBe("panel");
+    const aliceRow = await db().prepare("SELECT id FROM users WHERE username = 'alice'").first<{ id: string }>();
+    expect(row.user_id).toBe(aliceRow!.id);
   });
 });

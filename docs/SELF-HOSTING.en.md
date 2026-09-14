@@ -54,6 +54,24 @@ npm run build
 
 Don't want to self-host? There's a Cloudflare version too: see [`cloud/README.md`](../cloud/README.md) — the same federation protocol running on Cloudflare's free tier, no machine of your own to keep powered on.
 
+### Users & permissions
+
+Login is now **username + password** (not a single admin password). The first account created by the install wizard is always named `admin`, with the admin role.
+
+**Creating users**: log in as an admin, go to Console → **Users** → create a user, giving it a username and a role (admin or user). Leave the password blank and the system generates a random one, **shown exactly once** at creation time (with a copy button) — hand it to that person right away. If it's lost, an admin can hit "Reset password" on the same page to issue a fresh one-time password.
+
+**What each role sees**:
+
+- **User**: only their own jobs and artifacts (Dashboard, Jobs, and Reports all scope to their own data); Settings is trimmed down to change-password and language; no Workers page, no visibility into anyone else's data.
+- **Admin**: sees everyone's jobs and stats in the console, plus the Workers, Users, and full Settings pages, and all three report tabs (contributions, per-user usage, payout estimation).
+- The embedded workflow editor (`/comfy`) is a **personal workspace for every role**: whether admin or user, the panel only shows jobs that person submitted through the panel — see the full picture on the console's Jobs page instead.
+
+Every account on the Users page can be **disabled/re-enabled**, have its **role changed**, and have its **password reset**; disabling a user immediately invalidates all of its existing logins and blocks new ones. There's no delete (jobs and receipts need to keep their attribution), and **the last remaining admin can't be disabled or demoted**, so you can't lock yourself out.
+
+**Per-user usage and payout**: admins get two extra Reports tabs — "**Per-user usage**" (each account's job count and GPU-seconds) and "**Payout estimation**" (enter a payout pool amount and it splits it across workers by their share of GPU-seconds in the date range). A regular user's Reports page only shows their own "**My usage**".
+
+**Upgrade note**: when upgrading from an older install, the existing admin password automatically becomes the `admin` account (**the password itself doesn't change** — no reset needed), and all existing jobs/receipts are attributed to that account. But because the session cookie format changed, **everyone has to log in again once after the upgrade** (admin included) — old login cookies are treated as unauthenticated, with no compatibility fallback. Both self-hosted (Alembic migration) and Cloud (D1 migration 0006) run this data migration automatically on upgrade/deploy — no manual steps needed.
+
 ### Network: DDNS or a fixed IP both work
 
 The server just needs one address everyone can reach — a dynamic DNS hostname or a fixed IP both work fine. That address is the `platform_url` you enter during install, and it's the same value baked into every worker's registration bundle.
@@ -196,7 +214,7 @@ That downloads the `comfyui-frontend-package` wheel from PyPI — **both the ver
 
 - `--version X` fetches a different release, but then the sha256 check is **skipped** and compatibility with this platform's `/comfy/api` is not guaranteed (the command warns about both).
 - Until you fetch it, `/comfy` serves a bilingual notice page telling you to run the command above.
-- `/comfy` and all of its assets require an **admin session**; without one you are redirected to `/` (the console login).
+- `/comfy` and all of its assets only require **being logged in** (any role); without a session you are redirected to `/` (the console login). The panel is a **personal workspace**: everyone only sees the jobs and artifacts they submitted through it — even an admin only sees their own panel jobs there — see the full picture on the console's Jobs page instead.
 
 **Then fetch the official template library** (optional, but recommended): the frontend wheel is just the UI — it does not carry ComfyUI's official starter workflows. One more command:
 
@@ -300,10 +318,9 @@ Once published, an agent asks `/api/agent/version` at startup, compares versions
 - Model manifest distribution (to actually implement `eligible_after_fetch` transfers)
 - S3/R2-compatible artifact storage
 
-**Phase 3**
-- Direct member-to-member P2P transfer
-- Revenue-share ledger
-- Multi-admin support
+**Phase 3** (**multi-user accounts plus multi-admin support and payout estimation shipped in Phase 3.0**: an admin can create and manage other user accounts, and the Reports page offers payout estimation — enter a pool amount and it's split by each worker's contribution share; see "Users & permissions" above. The two items below remain for Phase 3.1)
+- Member-to-member P2P chunked transfer
+- Revenue-share ledger (today's payout estimation only computes ratios — it doesn't record actual disbursements)
 
 **ComfyFed Cloud** (shipped): a hosted variant built on Cloudflare Workers + D1 + R2, so there's no machine of your own to keep powered on. See [`cloud/README.md`](../cloud/README.md).
 

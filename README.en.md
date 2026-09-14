@@ -51,6 +51,7 @@ ComfyFed is designed for people who know each other, not the open internet:
 - **Node whitelist**: a worker can restrict which kinds of ComfyUI nodes it's willing to run, so a workflow someone else submits can't do arbitrary things on your machine
 - **Dual-signed receipts**: contribution records are signed by both sides — auditable, and neither side can forge them alone
 - **Signed end-to-end**: every connection and every API call is cryptographically verified, never sent in the clear
+- **Individual accounts**: an admin can set up a login for each person in the circle — everyone sees only the jobs and pieces they submitted, while the admin gets the full overview and billing picture
 
 ### Documentation
 

@@ -42,10 +42,48 @@ def client(tmp_path):
     yield c
 
 
-def _login(client):
-    r = client.post("/api/auth/login", json={"password": client.admin_password})
-    assert r.status_code == 200
+def _login(client, username="admin", password=None):
+    r = client.post(
+        "/api/auth/login",
+        json={"username": username, "password": password or client.admin_password},
+    )
+    assert r.status_code == 200, r.text
     return r.json()["csrf"]
+
+
+def _uid(username="admin"):
+    with db.get_session() as session:
+        row = session.query(db.User).filter(db.User.username == username).one()
+        return row.id
+
+
+def _create_user(client, admin_csrf, username, role="user", password="password123"):
+    r = client.post(
+        "/api/users",
+        json={"username": username, "role": role, "password": password},
+        headers={"X-CSRF": admin_csrf},
+    )
+    assert r.status_code == 200, r.text
+    return r.json()
+
+
+ALICE = ("alice", "alice-pw-123")
+BOB = ("bob", "bob-pw-123")
+
+
+@pytest.fixture()
+def two_users(client):
+    """Creates admin (bootstrap) + two plain users, alice and bob.
+
+    Mirrors `test_job_scoping.py`'s fixture of the same name/shape: leaves NO
+    particular session active on return, since `TestClient` holds one cookie
+    jar for the whole test -- callers must `_login(client, *ALICE)` (etc.)
+    right before acting as one of them.
+    """
+    admin_csrf = _login(client)
+    _create_user(client, admin_csrf, ALICE[0], password=ALICE[1])
+    _create_user(client, admin_csrf, BOB[0], password=BOB[1])
+    return {"admin_pw": client.admin_password}
 
 
 def _register_worker(client, csrf, name, *, status="online", object_info=None, disabled=False):
@@ -125,9 +163,36 @@ def _finish_job(client, csrf, job_id, *, result_files, artifact_bytes=b"png-byte
         ("post", "/comfy/api/history"),
     ],
 )
-def test_all_routes_require_admin_session(client, method, path):
+def test_all_routes_require_login(client, method, path):
+    """Phase 3.0 Task 4: the panel gate loosened from admin-only to
+    any-logged-in-user, but it is still a GATE -- an anonymous caller gets
+    401 exactly as before."""
     r = getattr(client, method)(path, follow_redirects=False)
     assert r.status_code == 401
+
+
+def test_non_admin_can_open_the_panel_surface(client, two_users):
+    """Task 4's whole point: a plain `user` role, not just admin, can reach
+    the panel's bootstrap/API surface. Scoping (what they SEE) is a separate
+    concern, covered by the isolation tests below."""
+    _login(client, *ALICE)
+    assert client.get("/comfy/api/object_info").status_code == 200
+    assert client.get("/comfy/api/features").status_code == 200
+    assert client.get("/comfy/api/queue").status_code == 200
+    assert client.get("/comfy/api/history").status_code == 200
+
+
+def test_non_admin_can_open_the_comfy_static_gate(client, two_users):
+    """The `/comfy` static-file gate in `app.py` (separate from this
+    router's own `require_user` dependency) must likewise accept any
+    logged-in user now, not just admin."""
+    _login(client, *ALICE)
+    r = client.get("/comfy/", follow_redirects=False)
+    assert r.status_code != 302
+
+    client.cookies.clear()
+    r_anon = client.get("/comfy/", follow_redirects=False)
+    assert r_anon.status_code == 302
 
 
 # --- object_info -----------------------------------------------------------
@@ -1375,7 +1440,7 @@ def test_upload_image_lands_in_staging_and_response_shape(client):
     assert r.status_code == 200
     assert r.json() == {"name": "ref.png", "subfolder": "", "type": "input"}
 
-    staged = os.path.join(client.data_dir, "comfy_staging", "ref.png")
+    staged = os.path.join(client.data_dir, "comfy_staging", _uid(), "ref.png")
     assert os.path.isfile(staged)
     with open(staged, "rb") as f:
         assert f.read() == b"PNGDATA"
@@ -1391,7 +1456,7 @@ def test_upload_image_same_name_overwrites(client):
     )
     assert r.status_code == 200
 
-    staged = os.path.join(client.data_dir, "comfy_staging", "ref.png")
+    staged = os.path.join(client.data_dir, "comfy_staging", _uid(), "ref.png")
     with open(staged, "rb") as f:
         assert f.read() == b"NEW"
 
@@ -1420,6 +1485,45 @@ def test_view_input_type_missing_staged_file_404(client):
     assert r.status_code == 404
 
 
+def test_staging_is_isolated_between_users(client, two_users):
+    """Final review finding #1: the staging area used to be one flat,
+    process-wide directory -- any user could view or overwrite any other
+    user's staged upload, and the next `/prompt` would silently resolve
+    against the wrong bytes."""
+    _login(client, *ALICE)
+    client.post(
+        "/comfy/api/upload/image", files={"image": ("reference.png", b"ALICE-BYTES", "image/png")}
+    )
+
+    # Bob cannot view Alice's staged file even though he knows its exact name.
+    _login(client, *BOB)
+    r = client.get("/comfy/api/view?filename=reference.png&type=input")
+    assert r.status_code == 404
+
+    # Bob's own object_info dropdown does not list Alice's staged file.
+    assert "reference.png" not in comfyapi.staged_image_names(client.data_dir, _uid("bob"))
+
+    # Bob uploads a same-named file -- it must NOT overwrite Alice's.
+    r = client.post(
+        "/comfy/api/upload/image", files={"image": ("reference.png", b"BOB-BYTES", "image/png")}
+    )
+    assert r.status_code == 200
+
+    alice_staged = os.path.join(client.data_dir, "comfy_staging", _uid("alice"), "reference.png")
+    with open(alice_staged, "rb") as f:
+        assert f.read() == b"ALICE-BYTES"
+
+    # Alice's own next /prompt still resolves against her own file.
+    _login(client, *ALICE)
+    prompt = {"1": {"class_type": "LoadImage", "inputs": {"image": "reference.png"}}}
+    r = client.post("/comfy/api/prompt", json={"prompt": prompt})
+    assert r.status_code == 200
+    job_id = r.json()["prompt_id"]
+    job_input = os.path.join(client.data_dir, "job_inputs", job_id, "reference.png")
+    with open(job_input, "rb") as f:
+        assert f.read() == b"ALICE-BYTES"
+
+
 def test_prompt_copies_staged_asset_into_job_inputs(client):
     _login(client)
     client.post("/comfy/api/upload/image", files={"image": ("ref.png", b"STAGED", "image/png")})
@@ -1435,12 +1539,225 @@ def test_prompt_copies_staged_asset_into_job_inputs(client):
         assert f.read() == b"STAGED"
 
     # Copy, not move: the staged file is still there for reuse by another prompt.
-    staged = os.path.join(client.data_dir, "comfy_staging", "ref.png")
+    staged = os.path.join(client.data_dir, "comfy_staging", _uid(), "ref.png")
     assert os.path.isfile(staged)
 
     with db.get_session() as session:
         job = session.get(db.Job, job_id)
         assert json.loads(job.input_assets) == ["ref.png"]
+
+
+# --- Task 4: per-user panel isolation ---------------------------------------
+#
+# The panel is a per-user workspace now (any logged-in user, not just admin):
+# every panel-native route is scoped to `origin == "panel" AND user_id ==
+# <the caller's own uid>`. These tests exercise that with two real distinct
+# accounts (`two_users`) rather than the single-admin scenario every test
+# above this section uses -- a single-admin fixture can never catch a missing
+# `user_id` predicate, since admin's own uid trivially "matches itself".
+
+
+def _queue_ids(body):
+    return {e[1] for e in body["queue_running"]} | {e[1] for e in body["queue_pending"]}
+
+
+def test_queue_isolated_between_users(client, two_users):
+    _login(client, *ALICE)
+    alice_job = _post_prompt(client).json()["prompt_id"]
+
+    _login(client, *BOB)
+    bob_job = _post_prompt(client).json()["prompt_id"]
+
+    _login(client, *ALICE)
+    alice_ids = _queue_ids(client.get("/comfy/api/queue").json())
+    assert alice_job in alice_ids
+    assert bob_job not in alice_ids
+
+    _login(client, *BOB)
+    bob_ids = _queue_ids(client.get("/comfy/api/queue").json())
+    assert bob_job in bob_ids
+    assert alice_job not in bob_ids
+
+
+def test_history_isolated_between_users(client, two_users):
+    admin_csrf = _login(client)
+    worker_id = _register_worker(client, admin_csrf, "shared-runner")
+
+    _login(client, *ALICE)
+    alice_job = _post_prompt(client).json()["prompt_id"]
+    _login(client, *BOB)
+    bob_job = _post_prompt(client).json()["prompt_id"]
+
+    for job_id in (alice_job, bob_job):
+        picked = _pick_job_for(worker_id)
+        assert picked is not None and picked.id == job_id
+        assert dispatch.mark_running(job_id, worker_id)
+        assert dispatch.mark_done(job_id, worker_id, [f"{job_id}.png"])
+
+    _login(client, *ALICE)
+    alice_history = client.get("/comfy/api/history").json()
+    assert set(alice_history) == {alice_job}
+    assert client.get(f"/comfy/api/history/{bob_job}").json() == {}
+
+    _login(client, *BOB)
+    bob_history = client.get("/comfy/api/history").json()
+    assert set(bob_history) == {bob_job}
+    assert client.get(f"/comfy/api/history/{alice_job}").json() == {}
+
+
+def test_interrupt_only_cancels_the_callers_own_running_job(client, two_users):
+    admin_csrf = _login(client)
+    worker_a = _register_worker(client, admin_csrf, "runner-a")
+    worker_b = _register_worker(client, admin_csrf, "runner-b")
+
+    _login(client, *ALICE)
+    alice_job = _post_prompt(client).json()["prompt_id"]
+    _login(client, *BOB)
+    bob_job = _post_prompt(client).json()["prompt_id"]
+
+    with db.get_session() as session:
+        for job_id, worker_id in ((alice_job, worker_a), (bob_job, worker_b)):
+            job = session.get(db.Job, job_id)
+            job.status = "running"
+            job.worker_id = worker_id
+        session.commit()
+
+    _login(client, *ALICE)
+    r = client.post("/comfy/api/interrupt")
+    assert r.status_code == 200
+
+    with db.get_session() as session:
+        assert session.get(db.Job, alice_job).status == "cancelled"
+        # Bob's job, also running, is untouched by Alice's interrupt.
+        assert session.get(db.Job, bob_job).status == "running"
+
+
+def test_queue_delete_only_touches_the_callers_own_job(client, two_users):
+    _login(client, *ALICE)
+    alice_job = _post_prompt(client).json()["prompt_id"]
+    _login(client, *BOB)
+    bob_job = _post_prompt(client).json()["prompt_id"]
+
+    # Bob tries to delete Alice's job by id -- scoping means it is simply
+    # not his to name, same as a console-origin job never was.
+    r = client.post("/comfy/api/queue", json={"delete": [alice_job, bob_job]})
+    assert r.status_code == 200
+
+    with db.get_session() as session:
+        assert session.get(db.Job, alice_job).status == "queued"
+        assert session.get(db.Job, bob_job).status == "cancelled"
+
+
+def test_queue_clear_only_touches_the_callers_own_jobs(client, two_users):
+    _login(client, *ALICE)
+    alice_job = _post_prompt(client).json()["prompt_id"]
+    _login(client, *BOB)
+    bob_job = _post_prompt(client).json()["prompt_id"]
+
+    _login(client, *ALICE)
+    r = client.post("/comfy/api/queue", json={"clear": True})
+    assert r.status_code == 200
+
+    with db.get_session() as session:
+        assert session.get(db.Job, alice_job).status == "cancelled"
+        assert session.get(db.Job, bob_job).status == "queued"
+
+
+def test_history_hide_only_touches_the_callers_own_job(client, two_users):
+    admin_csrf = _login(client)
+    worker_id = _register_worker(client, admin_csrf, "shared-runner")
+
+    _login(client, *ALICE)
+    alice_job = _post_prompt(client).json()["prompt_id"]
+    _login(client, *BOB)
+    bob_job = _post_prompt(client).json()["prompt_id"]
+
+    for job_id in (alice_job, bob_job):
+        picked = _pick_job_for(worker_id)
+        assert picked is not None and picked.id == job_id
+        assert dispatch.mark_running(job_id, worker_id)
+        assert dispatch.mark_done(job_id, worker_id, [f"{job_id}.png"])
+
+    _login(client, *ALICE)
+    r = client.post("/comfy/api/history", json={"delete": [alice_job, bob_job]})
+    assert r.status_code == 200
+
+    with db.get_session() as session:
+        assert session.get(db.Job, alice_job).panel_hidden is True
+        # Bob's job cannot be hidden by Alice's request, scoping prevented
+        # it from ever matching the write's own query.
+        assert session.get(db.Job, bob_job).panel_hidden is False
+
+
+def test_view_404_for_a_panel_job_owned_by_another_user(client, two_users):
+    admin_csrf = _login(client)
+    worker_id = _register_worker(client, admin_csrf, "shared-runner")
+
+    _login(client, *ALICE)
+    alice_job = _post_prompt(client).json()["prompt_id"]
+    picked = _pick_job_for(worker_id)
+    assert picked is not None and picked.id == alice_job
+    assert dispatch.mark_running(alice_job, worker_id)
+    store = storage.get_store(client.data_dir)
+    store.put(alice_job, "out.png", io.BytesIO(b"ALICE-BYTES"))
+    assert dispatch.mark_done(alice_job, worker_id, ["out.png"])
+
+    # Alice can see her own artifact...
+    r = client.get(
+        "/comfy/api/view",
+        params={"filename": "out.png", "type": "output", "subfolder": alice_job},
+    )
+    assert r.status_code == 200
+    assert r.content == b"ALICE-BYTES"
+    # ...and the subfolder-less legacy fallback also resolves it for her.
+    r = client.get("/comfy/api/view", params={"filename": "out.png"})
+    assert r.status_code == 200
+
+    # Bob names the exact same job id and filename -- 404, not Alice's bytes.
+    _login(client, *BOB)
+    r = client.get(
+        "/comfy/api/view",
+        params={"filename": "out.png", "type": "output", "subfolder": alice_job},
+    )
+    assert r.status_code == 404
+    # The legacy fallback must not leak it to Bob either.
+    r = client.get("/comfy/api/view", params={"filename": "out.png"})
+    assert r.status_code == 404
+
+
+def test_admin_panel_view_excludes_other_users_panel_jobs(client, two_users):
+    """Spec ruling: an admin's panel is personal too -- full fleet visibility
+    lives in the console (`/api/jobs`), not here."""
+    admin_csrf = _login(client)
+    worker_id = _register_worker(client, admin_csrf, "shared-runner")
+
+    _login(client, *ALICE)
+    alice_job = _post_prompt(client).json()["prompt_id"]
+
+    admin_csrf = _login(client)  # back to admin -- refreshes the csrf token too
+    admin_job = _post_prompt(client).json()["prompt_id"]
+
+    for job_id in (alice_job, admin_job):
+        picked = _pick_job_for(worker_id)
+        assert picked is not None and picked.id == job_id
+        assert dispatch.mark_running(job_id, worker_id)
+        assert dispatch.mark_done(job_id, worker_id, [f"{job_id}.png"])
+
+    admin_queue_ids = _queue_ids(client.get("/comfy/api/queue").json())
+    assert alice_job not in admin_queue_ids
+
+    admin_history = client.get("/comfy/api/history").json()
+    assert set(admin_history) == {admin_job}
+
+    r = client.get(
+        "/comfy/api/view",
+        params={"filename": f"{alice_job}.png", "type": "output", "subfolder": alice_job},
+    )
+    assert r.status_code == 404
+
+    # Admin's full-fleet audit surface (the console API) still sees both.
+    listed = {j["id"] for j in client.get("/api/jobs", headers={"X-CSRF": admin_csrf}).json()}
+    assert {alice_job, admin_job} <= listed
 
 
 # ------------------------------------------------------------ panel bootstrap
@@ -1532,6 +1849,51 @@ def test_panel_settings_round_trip_and_persist(client):
         "Comfy.Zoom": 1.25,
     }
 
-    # Written through to disk, so a restart keeps the panel's preferences.
-    with open(os.path.join(client.data_dir, "comfy_settings.json"), encoding="utf-8") as f:
+    # Written through to disk, so a restart keeps the panel's preferences --
+    # per-user (final review finding #7), not the legacy global file.
+    with open(
+        os.path.join(client.data_dir, f"comfy_settings.{_uid()}.json"), encoding="utf-8"
+    ) as f:
         assert json.load(f)["Comfy.ColorPalette"] == "dark"
+
+
+def test_panel_settings_are_isolated_between_users_and_a_legacy_global_blob_is_the_fallback_default(
+    client, two_users
+):
+    """Final review finding #7: `/comfy/api/settings` used to be one global
+    blob writable by every user -- a regular user's write silently
+    overwrote every other user's, admins included. Also verifies the
+    upgrade-safety fallback: a user who has never written their own
+    settings reads the pre-Task-4 legacy global blob if one exists, so
+    nobody's editor appears to reset."""
+    legacy_path = os.path.join(client.data_dir, "comfy_settings.json")
+    os.makedirs(client.data_dir, exist_ok=True)
+    with open(legacy_path, "w", encoding="utf-8") as f:
+        json.dump({"Comfy.ColorPalette": "legacy-theme"}, f)
+
+    # Alice has never written her own settings -- she reads the legacy blob.
+    _login(client, *ALICE)
+    assert client.get("/comfy/api/settings").json() == {"Comfy.ColorPalette": "legacy-theme"}
+
+    # Alice writes her own setting -- this forks her OWN file from here on.
+    assert client.post("/comfy/api/settings/Comfy.Zoom", json=2.0).status_code == 200
+    assert client.get("/comfy/api/settings").json() == {
+        "Comfy.ColorPalette": "legacy-theme",
+        "Comfy.Zoom": 2.0,
+    }
+
+    # Bob, who has also never written his own settings, still reads the
+    # legacy blob -- Alice's write did not touch it.
+    _login(client, *BOB)
+    assert client.get("/comfy/api/settings").json() == {"Comfy.ColorPalette": "legacy-theme"}
+
+    # Bob's own write is independent of Alice's.
+    assert client.post("/comfy/api/settings/Comfy.ColorPalette", json="bobs-theme").status_code == 200
+    assert client.get("/comfy/api/settings").json() == {"Comfy.ColorPalette": "bobs-theme"}
+
+    # Alice's settings are untouched by Bob's write.
+    _login(client, *ALICE)
+    assert client.get("/comfy/api/settings").json() == {
+        "Comfy.ColorPalette": "legacy-theme",
+        "Comfy.Zoom": 2.0,
+    }

@@ -80,7 +80,7 @@
 import { Hono } from "hono";
 import type { Env } from "../env";
 import { requireAdmin } from "../lib/guard";
-import { stagingKey } from "../lib/store";
+import { stagingKey, SHARED_STAGING_UID } from "../lib/store";
 import { OFFICIAL_TEMPLATES_PREFIX } from "../core/model_guide";
 
 // Content types stated outright, exactly mirroring `templates.py`'s
@@ -337,7 +337,12 @@ async function seedStagingOnce(env: Env): Promise<void> {
     if (seededAssets.has(name)) continue;
 
     try {
-      const key = stagingKey(name);
+      // Seeded into the SHARED pseudo-uid namespace, not any one user's own
+      // staging -- these are platform-shipped public samples that every
+      // user's templates must resolve against (final review finding #1
+      // namespaced staging by uid; the shared samples are the one
+      // deliberate exception).
+      const key = stagingKey(SHARED_STAGING_UID, name);
       const existing = await env.STORE.head(key);
       if (existing) {
         seededAssets.add(name); // an admin may have replaced it deliberately

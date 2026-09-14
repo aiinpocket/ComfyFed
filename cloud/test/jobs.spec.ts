@@ -8,6 +8,7 @@ import golden from "./fixtures/golden.json";
 
 afterEach(async () => {
   await db().prepare("DELETE FROM settings").run();
+  await db().prepare("DELETE FROM users").run();
   await db().prepare("DELETE FROM workers").run();
   await db().prepare("DELETE FROM register_tokens").run();
   await db().prepare("DELETE FROM nonces").run();
@@ -29,8 +30,27 @@ const ADMIN_PASSWORD = "correct-horse-battery-staple";
 
 async function adminSession(): Promise<{ cookie: string | null; csrf: string }> {
   await call("/api/setup", { json: { token: SETUP_TOKEN, password: ADMIN_PASSWORD } });
-  const login = await call("/api/auth/login", { json: { password: ADMIN_PASSWORD } });
+  const login = await call("/api/auth/login", { json: { username: "admin", password: ADMIN_PASSWORD } });
   return { cookie: login.setCookie, csrf: login.body.csrf };
+}
+
+/** Creates a non-admin `role: "user"` account (via the admin-only `/api/users`
+ * API) and logs in as it -- Phase 3.0 Task 10's two-user isolation tests need
+ * a second, non-admin session distinct from `adminSession()`'s. Returns the
+ * new session's cookie/csrf plus its uid, so a test can assert a job it owns
+ * is visible while one owned by the OTHER session's uid isn't. */
+async function userSession(
+  admin: { cookie: string | null; csrf: string },
+  username: string
+): Promise<{ cookie: string | null; csrf: string; uid: string }> {
+  const password = "a-long-enough-password1";
+  const created = await call("/api/users", {
+    json: { username, role: "user", password },
+    cookie: admin.cookie,
+    headers: { "X-CSRF": admin.csrf },
+  });
+  const login = await call("/api/auth/login", { json: { username, password } });
+  return { cookie: login.setCookie, csrf: login.body.csrf, uid: created.body.id };
 }
 
 interface RawCallResult {
@@ -688,5 +708,159 @@ describe("POST /api/jobs/{id}/retry", () => {
     expect(detail.body.error).toBeNull();
     expect(detail.body.progress).toBe(0);
     expect(detail.body.started_at).toBeNull();
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Phase 3.0 Task 10: job ownership & panel scoping -- parity port of the
+// Python Task 3's `_require_owner_or_admin` (jobs.py) two-user coverage.
+// Two non-admin users, each owning one job, plus the admin -- every route
+// below must let a user see/act on their OWN job, 404 (never 403, so a
+// non-owner can't distinguish "not mine" from "doesn't exist") on the
+// OTHER user's, and let admin reach both with the list additionally
+// carrying a `username` field.
+
+describe("Phase 3.0: two-user job ownership scoping", () => {
+  it("GET /api/jobs: admin sees every job with usernames; each user sees only their own", async () => {
+    const admin = await adminSession();
+    const alice = await userSession(admin, "alice");
+    const bob = await userSession(admin, "bob");
+
+    const aliceSubmit = await submitJob(alice.cookie, alice.csrf, SIMPLE_WORKFLOW);
+    const bobSubmit = await submitJob(bob.cookie, bob.csrf, SIMPLE_WORKFLOW);
+    expect(aliceSubmit.status).toBe(200);
+    expect(bobSubmit.status).toBe(200);
+
+    const adminList = await call("/api/jobs", { method: "GET", cookie: admin.cookie });
+    expect(adminList.status).toBe(200);
+    expect(adminList.body).toHaveLength(2);
+    const byId = Object.fromEntries(adminList.body.map((j: any) => [j.id, j]));
+    expect(byId[aliceSubmit.body.job_id].username).toBe("alice");
+    expect(byId[bobSubmit.body.job_id].username).toBe("bob");
+
+    const aliceList = await call("/api/jobs", { method: "GET", cookie: alice.cookie });
+    expect(aliceList.status).toBe(200);
+    expect(aliceList.body).toHaveLength(1);
+    expect(aliceList.body[0].id).toBe(aliceSubmit.body.job_id);
+    expect(aliceList.body[0].username).toBe("alice");
+
+    const bobList = await call("/api/jobs", { method: "GET", cookie: bob.cookie });
+    expect(bobList.body).toHaveLength(1);
+    expect(bobList.body[0].id).toBe(bobSubmit.body.job_id);
+  });
+
+  it("GET /api/jobs/{id}: 404s for a non-owner non-admin user, 200s for the owner and for admin", async () => {
+    const admin = await adminSession();
+    const alice = await userSession(admin, "alice");
+    const bob = await userSession(admin, "bob");
+    const submit = await submitJob(alice.cookie, alice.csrf, SIMPLE_WORKFLOW);
+    const jobId = submit.body.job_id;
+
+    const asOwner = await call(`/api/jobs/${jobId}`, { method: "GET", cookie: alice.cookie });
+    expect(asOwner.status).toBe(200);
+
+    const asOther = await call(`/api/jobs/${jobId}`, { method: "GET", cookie: bob.cookie });
+    expect(asOther.status).toBe(404);
+    expect(asOther.body.error.code).toBe("jobs.not_found");
+
+    const asAdmin = await call(`/api/jobs/${jobId}`, { method: "GET", cookie: admin.cookie });
+    expect(asAdmin.status).toBe(200);
+  });
+
+  it("GET /api/jobs/{id}/assessment: 404s for a non-owner non-admin user", async () => {
+    const admin = await adminSession();
+    const alice = await userSession(admin, "alice");
+    const bob = await userSession(admin, "bob");
+    const submit = await submitJob(alice.cookie, alice.csrf, SIMPLE_WORKFLOW);
+
+    const asOther = await call(`/api/jobs/${submit.body.job_id}/assessment`, { method: "GET", cookie: bob.cookie });
+    expect(asOther.status).toBe(404);
+  });
+
+  it("GET /api/jobs/{id}/artifacts/{filename}: 404s for a non-owner non-admin user, 200s for the owner", async () => {
+    const admin = await adminSession();
+    const alice = await userSession(admin, "alice");
+    const bob = await userSession(admin, "bob");
+    const submit = await submitJob(alice.cookie, alice.csrf, SIMPLE_WORKFLOW);
+    const jobId = submit.body.job_id;
+    await store().put(`artifacts/${jobId}/out.png`, "alices-bytes");
+
+    const asOther = await call(`/api/jobs/${jobId}/artifacts/out.png`, { method: "GET", cookie: bob.cookie });
+    expect(asOther.status).toBe(404);
+
+    const asOwner = await call(`/api/jobs/${jobId}/artifacts/out.png`, { method: "GET", cookie: alice.cookie });
+    expect(asOwner.status).toBe(200);
+    expect(asOwner.body).toBe("alices-bytes");
+  });
+
+  it("POST /api/jobs/{id}/cancel: 404s for a non-owner non-admin user, succeeds for the owner", async () => {
+    const admin = await adminSession();
+    const alice = await userSession(admin, "alice");
+    const bob = await userSession(admin, "bob");
+    const submit = await submitJob(alice.cookie, alice.csrf, SIMPLE_WORKFLOW);
+    const jobId = submit.body.job_id;
+
+    const asOther = await call(`/api/jobs/${jobId}/cancel`, {
+      method: "POST",
+      cookie: bob.cookie,
+      headers: { "X-CSRF": bob.csrf },
+    });
+    expect(asOther.status).toBe(404);
+    expect(asOther.body.error.code).toBe("jobs.not_found");
+
+    const detailUnchanged = await call(`/api/jobs/${jobId}`, { method: "GET", cookie: alice.cookie });
+    expect(detailUnchanged.body.status).toBe("queued");
+
+    const asOwner = await call(`/api/jobs/${jobId}/cancel`, {
+      method: "POST",
+      cookie: alice.cookie,
+      headers: { "X-CSRF": alice.csrf },
+    });
+    expect(asOwner.status).toBe(200);
+  });
+
+  it("POST /api/jobs/{id}/cancel: admin can cancel another user's job", async () => {
+    const admin = await adminSession();
+    const alice = await userSession(admin, "alice");
+    const submit = await submitJob(alice.cookie, alice.csrf, SIMPLE_WORKFLOW);
+
+    const asAdmin = await call(`/api/jobs/${submit.body.job_id}/cancel`, {
+      method: "POST",
+      cookie: admin.cookie,
+      headers: { "X-CSRF": admin.csrf },
+    });
+    expect(asAdmin.status).toBe(200);
+  });
+
+  it("POST /api/jobs/{id}/retry: 404s for a non-owner non-admin user, succeeds for the owner", async () => {
+    const admin = await adminSession();
+    const alice = await userSession(admin, "alice");
+    const bob = await userSession(admin, "bob");
+    const submit = await submitJob(alice.cookie, alice.csrf, SIMPLE_WORKFLOW);
+    const jobId = submit.body.job_id;
+    await db().prepare("UPDATE jobs SET status = 'failed' WHERE id = ?").bind(jobId).run();
+
+    const asOther = await call(`/api/jobs/${jobId}/retry`, {
+      method: "POST",
+      cookie: bob.cookie,
+      headers: { "X-CSRF": bob.csrf },
+    });
+    expect(asOther.status).toBe(404);
+
+    const asOwner = await call(`/api/jobs/${jobId}/retry`, {
+      method: "POST",
+      cookie: alice.cookie,
+      headers: { "X-CSRF": alice.csrf },
+    });
+    expect(asOwner.status).toBe(200);
+  });
+
+  it("POST /api/jobs stamps user_id with the submitting session's own uid", async () => {
+    const admin = await adminSession();
+    const alice = await userSession(admin, "alice");
+    const submit = await submitJob(alice.cookie, alice.csrf, SIMPLE_WORKFLOW);
+
+    const row = await db().prepare("SELECT user_id FROM jobs WHERE id = ?").bind(submit.body.job_id).first<any>();
+    expect(row.user_id).toBe(alice.uid);
   });
 });

@@ -6,6 +6,7 @@ import { toSqliteTimestamp } from "../src/db/queries";
 
 afterEach(async () => {
   await db().prepare("DELETE FROM settings").run();
+  await db().prepare("DELETE FROM users").run();
   await db().prepare("DELETE FROM login_attempts").run();
   await db().prepare("DELETE FROM workers").run();
   await db().prepare("DELETE FROM jobs").run();
@@ -15,7 +16,7 @@ const ADMIN_PASSWORD = "correct-horse-battery-staple";
 
 async function adminSession(): Promise<{ cookie: string | null; csrf: string }> {
   await call("/api/setup", { json: { token: SETUP_TOKEN, password: ADMIN_PASSWORD } });
-  const login = await call("/api/auth/login", { json: { password: ADMIN_PASSWORD } });
+  const login = await call("/api/auth/login", { json: { username: "admin", password: ADMIN_PASSWORD } });
   return { cookie: login.setCookie, csrf: login.body.csrf };
 }
 
@@ -78,6 +79,21 @@ describe("GET /metrics", () => {
     const r = await call("/metrics", { method: "GET", cookie });
     expect(r.status).toBe(200);
     expect(typeof r.body).toBe("string");
+  });
+
+  it("401s for a plain user-role session when metrics_public is false (final review finding #2)", async () => {
+    await db().prepare("INSERT INTO settings (key, value) VALUES ('metrics_public', 'false')").run();
+    const admin = await adminSession();
+    const password = "a-long-enough-password1";
+    await call("/api/users", {
+      json: { username: "alice", role: "user", password },
+      cookie: admin.cookie,
+      headers: { "X-CSRF": admin.csrf },
+    });
+    const login = await call("/api/auth/login", { json: { username: "alice", password } });
+    const r = await call("/metrics", { method: "GET", cookie: login.setCookie });
+    expect(r.status).toBe(401);
+    expect(r.body.error.code).toBe("auth.required");
   });
 
   it("serves Prometheus 0.0.4 text content-type", async () => {

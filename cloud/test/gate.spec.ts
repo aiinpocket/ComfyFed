@@ -14,13 +14,14 @@ const ADMIN_PASSWORD = "correct-horse-battery-staple";
 
 async function loginCookie(): Promise<string> {
   await call("/api/setup", { json: { token: SETUP_TOKEN, password: ADMIN_PASSWORD } });
-  const login = await call("/api/auth/login", { json: { password: ADMIN_PASSWORD } });
+  const login = await call("/api/auth/login", { json: { username: "admin", password: ADMIN_PASSWORD } });
   expect(login.setCookie).toBeTruthy();
   return login.setCookie as string;
 }
 
 afterEach(async () => {
   await db().prepare("DELETE FROM settings").run();
+  await db().prepare("DELETE FROM users").run();
 });
 
 describe("isGateExempt (pure predicate)", () => {

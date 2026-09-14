@@ -22,37 +22,41 @@ import {
   IconServer2,
   IconSettings,
   IconStack2,
+  IconUsers,
   IconWorldBolt,
 } from '@tabler/icons-react';
 import { useTranslation } from 'react-i18next';
 import { NavLink as RouterNavLink, useLocation, useNavigate } from 'react-router-dom';
 
-import { api } from '../api';
+import { api, type Role } from '../api';
 import { persistLang, type Lang } from '../i18n';
 import { Logo } from './Logo';
 
 const APP_VERSION = '0.1.0';
 
 const NAV_ITEMS = [
-  { to: '/dashboard', labelKey: 'nav.dashboard', icon: IconLayoutDashboard },
-  { to: '/jobs', labelKey: 'nav.jobs', icon: IconStack2 },
-  { to: '/workers', labelKey: 'nav.workers', icon: IconServer2 },
-  { to: '/reports', labelKey: 'nav.reports', icon: IconChartBar },
-  { to: '/settings', labelKey: 'nav.settings', icon: IconSettings },
+  { to: '/dashboard', labelKey: 'nav.dashboard', icon: IconLayoutDashboard, adminOnly: false },
+  { to: '/jobs', labelKey: 'nav.jobs', icon: IconStack2, adminOnly: false },
+  { to: '/workers', labelKey: 'nav.workers', icon: IconServer2, adminOnly: true },
+  { to: '/users', labelKey: 'nav.users', icon: IconUsers, adminOnly: true },
+  { to: '/reports', labelKey: 'nav.reports', icon: IconChartBar, adminOnly: false },
+  { to: '/settings', labelKey: 'nav.settings', icon: IconSettings, adminOnly: false },
 ] as const;
 
 interface AppLayoutProps {
   platformUrl: string;
+  role: Role;
   onLoggedOut: () => void;
   children: React.ReactNode;
 }
 
-export function AppLayout({ platformUrl, onLoggedOut, children }: AppLayoutProps) {
+export function AppLayout({ platformUrl, role, onLoggedOut, children }: AppLayoutProps) {
   const { t, i18n } = useTranslation();
   const theme = useMantineTheme();
   const location = useLocation();
   const navigate = useNavigate();
   const [mobileOpened, { toggle: toggleMobile, close: closeMobile }] = useDisclosure(false);
+  const navItems = NAV_ITEMS.filter((item) => !item.adminOnly || role === 'admin');
 
   const handleLogout = async () => {
     await api.logout().catch(() => undefined);
@@ -60,7 +64,7 @@ export function AppLayout({ platformUrl, onLoggedOut, children }: AppLayoutProps
     navigate('/login', { replace: true });
   };
 
-  const activeSection = NAV_ITEMS.find((item) => location.pathname.startsWith(item.to));
+  const activeSection = navItems.find((item) => location.pathname.startsWith(item.to));
 
   return (
     <AppShell
@@ -173,7 +177,7 @@ export function AppLayout({ platformUrl, onLoggedOut, children }: AppLayoutProps
 
         <AppShell.Section grow component={ScrollArea}>
           <Stack gap={2}>
-            {NAV_ITEMS.map(({ to, labelKey, icon: Icon }) => {
+            {navItems.map(({ to, labelKey, icon: Icon }) => {
               const active = location.pathname.startsWith(to);
               return (
                 <NavLink

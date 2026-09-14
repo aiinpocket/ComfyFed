@@ -10,7 +10,7 @@ from . import db, i18n, security
 
 _DB_FILENAME = "comfyfed.db"
 
-_ADMIN_PASSWORD_HASH_KEY = "admin_password_hash"
+_ADMIN_USERNAME = "admin"
 _PLATFORM_URL_KEY = "platform_url"
 _LANG_KEY = "lang"
 
@@ -22,7 +22,17 @@ class InstallResult:
 
 
 def _is_installed(session) -> bool:
-    return session.get(db.Setting, _ADMIN_PASSWORD_HASH_KEY) is not None
+    """Whether the server has already been through first-run setup.
+
+    Final review finding #12: aligned to cloud's `hasAnyUser` semantics --
+    ANY `users` row means installed, not specifically one named `admin`.
+    Immaterial today (there is no username rename and no DELETE), but the
+    two answers would otherwise diverge the moment a future task adds
+    either -- e.g. an admin renaming their own account would make this
+    return `False` again under the old definition, offering a fresh
+    install wizard on top of a live, populated database.
+    """
+    return session.query(db.User).first() is not None
 
 
 def get_lang() -> str:
@@ -81,7 +91,13 @@ def ensure_installed(
         admin_password = secrets.token_urlsafe(12)
         admin_password_hash = security.hash_password(admin_password)
 
-        session.add(db.Setting(key=_ADMIN_PASSWORD_HASH_KEY, value=admin_password_hash))
+        session.add(
+            db.User(
+                username=_ADMIN_USERNAME,
+                password_hash=admin_password_hash,
+                role="admin",
+            )
+        )
         session.add(db.Setting(key=_PLATFORM_URL_KEY, value=url))
         session.add(db.Setting(key=_LANG_KEY, value=lang))
         session.commit()

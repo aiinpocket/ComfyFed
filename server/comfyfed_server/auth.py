@@ -1,8 +1,17 @@
-"""Web session auth: signed cookie sessions, login backoff, CSRF, password change."""
+"""Web session auth: signed cookie sessions, login backoff, CSRF, password change.
+
+Phase 3.0 multi-user: sessions carry `{uid, role, epoch, csrf}` rather than
+the old single-admin `{authenticated, csrf}`. `SessionUser` / `require_user` /
+`require_admin` / `resolve_session_user` / `issue_session_cookie` are the
+interfaces later tasks (users API, per-user job scoping, panel scoping) build
+on -- see docs/superpowers/specs/2026-09-12-comfyfed-spec.md's Phase 3.0
+addendum.
+"""
 
 from __future__ import annotations
 
 import secrets
+from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from typing import Optional
 
@@ -10,10 +19,9 @@ from fastapi import APIRouter, Cookie, Depends, Header, HTTPException, Response
 from itsdangerous import BadSignature, SignatureExpired, URLSafeTimedSerializer
 from pydantic import BaseModel
 
-from . import db, security
+from . import db, panelws, security
 
 _SESSION_SECRET_KEY = "session_secret"
-_ADMIN_PASSWORD_HASH_KEY = "admin_password_hash"
 _LANG_KEY = "lang"
 _PLATFORM_URL_KEY = "platform_url"
 _OBJECT_INFO_MODE_KEY = "object_info_mode"
@@ -26,6 +34,13 @@ _SESSION_SALT = "comfyfed.session"
 
 _BACKOFF_WINDOW = timedelta(minutes=10)
 _BACKOFF_START_N = 4  # required wait kicks in once n >= this many consecutive failures
+
+# Verified against every login attempt for a username that doesn't exist (or
+# is disabled), so that "no such user" takes the same amount of time as "wrong
+# password" -- otherwise response latency would let an attacker enumerate
+# valid usernames. Computed once at import time, not per-request.
+_DUMMY_PASSWORD_FOR_TIMING = "comfyfed-dummy-password-for-timing"
+_DUMMY_HASH = security.hash_password(_DUMMY_PASSWORD_FOR_TIMING)
 
 
 def _get_setting(session, key: str) -> Optional[str]:
@@ -54,16 +69,20 @@ def _serializer(secret: str) -> URLSafeTimedSerializer:
     return URLSafeTimedSerializer(secret_key=secret, salt=_SESSION_SALT)
 
 
-def _consecutive_failures(session) -> tuple[int, Optional[datetime]]:
-    """Count consecutive failed LoginAttempt rows within the backoff window.
+def _consecutive_failures(session, username: str) -> tuple[int, Optional[datetime]]:
+    """Count consecutive failed LoginAttempt rows for `username` within the
+    backoff window.
 
-    "Consecutive" = failures since the last successful attempt. Returns
-    (count, timestamp of the most recent failure) or (0, None).
+    "Consecutive" = failures since the last successful attempt for this same
+    username. Backoff is per-username (Phase 3.0): failed logins against one
+    account never lock out a different one. Returns (count, timestamp of the
+    most recent failure) or (0, None).
     """
     cutoff = datetime.now(timezone.utc).replace(tzinfo=None) - _BACKOFF_WINDOW
     rows = (
         session.query(db.LoginAttempt)
         .filter(db.LoginAttempt.at >= cutoff)
+        .filter(db.LoginAttempt.username == username)
         .order_by(db.LoginAttempt.at.desc())
         .all()
     )
@@ -85,6 +104,7 @@ def _required_wait_seconds(n: int) -> float:
 
 
 class LoginBody(BaseModel):
+    username: str
     password: str
 
 
@@ -100,14 +120,20 @@ def _error(status_code: int, code: str, message: str = "") -> HTTPException:
 def read_session_payload(session_cookie: Optional[str]) -> Optional[dict]:
     """Decode and verify a session cookie value. `None` if absent or invalid.
 
-    Public, alongside `SESSION_COOKIE_NAME`, because the two callers that
-    cannot express their auth as a `Depends(require_admin)` -- the
-    conditionally-public `/metrics` route and the `/comfy` static gate, both
-    in app.py, plus comfyapi's panel WebSocket, which must answer a failure
-    with a close code rather than an HTTPException -- have to run exactly
-    this check by hand. They previously reached into `auth._read_session_payload`
-    and hard-coded the cookie name, which made the session format three
-    modules' business instead of this one's.
+    Public, alongside `SESSION_COOKIE_NAME`, because the callers that cannot
+    express their auth as a `Depends(require_admin)` -- the conditionally-
+    public `/metrics` route, the `/comfy` static gate, and comfyapi's panel
+    WebSocket, which must answer a failure with a close code rather than an
+    HTTPException -- have to run this decode by hand, then feed the result
+    through `resolve_session_user` for the uid/epoch/disabled checks. They
+    previously reached into `auth._read_session_payload` and hard-coded the
+    cookie name, which made the session format three modules' business
+    instead of this one's.
+
+    Note this only verifies the cookie's signature; it does NOT check that
+    the `uid` inside still refers to an existing, enabled user at the right
+    `session_epoch`. Use `resolve_session_user` (or `require_user` /
+    `require_admin` for a FastAPI route) for that.
     """
     if not session_cookie:
         return None
@@ -120,63 +146,139 @@ def read_session_payload(session_cookie: Optional[str]) -> Optional[dict]:
         return None
 
 
-async def require_admin(
+@dataclass
+class SessionUser:
+    """The authenticated principal behind a validated session cookie."""
+
+    uid: str
+    username: str
+    role: str
+
+
+def _session_user_from_payload(db_session, payload: Optional[dict]) -> Optional[SessionUser]:
+    """Validate a decoded cookie payload against the current `users` row.
+
+    Rejects (returns `None`) a payload with no `uid` (this includes every
+    pre-Phase-3.0 cookie, which only ever carried `{authenticated, csrf}` --
+    those are deliberately NOT mapped onto the old single admin account;
+    everyone re-authenticates once after this upgrade), a `uid` with no
+    matching row, a disabled user, or an `epoch` that no longer matches the
+    user's current `session_epoch` (password changed / reset / disabled since
+    this cookie was issued).
+    """
+    if not payload:
+        return None
+    uid = payload.get("uid")
+    if not uid:
+        return None
+    user = db_session.get(db.User, uid)
+    if user is None or user.disabled:
+        return None
+    if payload.get("epoch") != user.session_epoch:
+        return None
+    return SessionUser(uid=user.id, username=user.username, role=user.role)
+
+
+def resolve_session_user(db_session, request) -> Optional[SessionUser]:
+    """Full cookie-to-`SessionUser` resolution for hand-checked call sites.
+
+    `request` is anything exposing a `.cookies` mapping -- a Starlette
+    `Request` (the `/metrics` route, the `/comfy` static gate) or a
+    `WebSocket` (comfyapi's panel socket) both qualify, so this one helper
+    serves all three without them each re-implementing the uid/epoch/disabled
+    checks that `require_user` applies for ordinary routes.
+    """
+    cookie = request.cookies.get(SESSION_COOKIE_NAME)
+    payload = read_session_payload(cookie)
+    if payload is None:
+        return None
+    return _session_user_from_payload(db_session, payload)
+
+
+async def require_user(
     cf_session: Optional[str] = Cookie(default=None),
-) -> dict:
+) -> SessionUser:
+    """FastAPI dependency: any logged-in, enabled user with a current-epoch
+    session cookie. 401 if the cookie is absent/invalid/missing uid, or if
+    the referenced user is missing, disabled, or stale-epoch."""
     payload = read_session_payload(cf_session)
-    if not payload or not payload.get("authenticated"):
+    if payload is None:
         raise _error(401, "auth.required", "Login required.")
+    with db.get_session() as db_session:
+        user = _session_user_from_payload(db_session, payload)
+    if user is None:
+        raise _error(401, "auth.required", "Login required.")
+    return user
+
+
+async def require_admin(user: SessionUser = Depends(require_user)) -> SessionUser:
+    """`require_user` plus `role == 'admin'`. 401 unauthenticated (via
+    `require_user`), 403 for a logged-in non-admin."""
+    if user.role != "admin":
+        raise _error(403, "auth.forbidden", "Admin role required.")
+    return user
+
+
+def _payload_and_csrf(cf_session: Optional[str], x_csrf: Optional[str]) -> dict:
+    payload = read_session_payload(cf_session)
+    if payload is None:
+        raise _error(401, "auth.required", "Login required.")
+    if not x_csrf or x_csrf != payload.get("csrf"):
+        raise _error(403, "auth.csrf", "CSRF token missing or invalid.")
     return payload
 
 
-def _require_csrf(payload: dict, x_csrf: Optional[str]) -> None:
-    if not x_csrf or x_csrf != payload.get("csrf"):
-        raise _error(403, "auth.csrf", "CSRF token missing or invalid.")
-
-
 async def require_csrf(
-    payload: dict = Depends(require_admin),
+    user: SessionUser = Depends(require_admin),
+    cf_session: Optional[str] = Cookie(default=None),
     x_csrf: Optional[str] = Header(default=None, alias="X-CSRF"),
-) -> dict:
+) -> SessionUser:
     """Admin-session dependency that additionally enforces the X-CSRF header.
 
     Reusable across routers: depend on this for any admin-authenticated,
     state-changing route (POST/PUT/DELETE), and on `require_admin` alone for
-    read-only admin routes.
+    read-only admin routes. (`change-password` below is CSRF-protected too,
+    but any logged-in user -- not just admin -- may change their own
+    password, so it checks CSRF itself against `require_user` rather than
+    going through this admin-only dependency.)
     """
-    _require_csrf(payload, x_csrf)
-    return payload
+    _payload_and_csrf(cf_session, x_csrf)
+    return user
 
 
-router = APIRouter(prefix="/api/auth")
+async def require_csrf_user(
+    user: SessionUser = Depends(require_user),
+    cf_session: Optional[str] = Cookie(default=None),
+    x_csrf: Optional[str] = Header(default=None, alias="X-CSRF"),
+) -> SessionUser:
+    """Like `require_csrf` but for any logged-in user, not just admin.
+
+    Phase 3.0 job ownership (jobs.py): `POST /api/jobs` and `POST
+    /api/jobs/{id}/cancel` are owner-or-admin gated rather than admin-only,
+    but still need the same CSRF enforcement any state-changing,
+    cookie-authenticated route gets. `require_csrf` can't be reused as-is
+    because it hangs off `require_admin`.
+    """
+    _payload_and_csrf(cf_session, x_csrf)
+    return user
 
 
-@router.post("/login")
-def login(body: LoginBody, response: Response):
-    with db.get_session() as db_session:
-        n, latest_failure_at = _consecutive_failures(db_session)
-        wait_needed = _required_wait_seconds(n)
-        if wait_needed > 0 and latest_failure_at is not None:
-            now = datetime.now(timezone.utc).replace(tzinfo=None)
-            elapsed = (now - latest_failure_at).total_seconds()
-            if elapsed < wait_needed:
-                raise _error(429, "auth.too_many_attempts", "Too many attempts, please wait.")
+def issue_session_cookie(response: Response, user: db.User) -> str:
+    """Set the session cookie for `user` and return the fresh CSRF token.
 
-        admin_hash = _get_setting(db_session, _ADMIN_PASSWORD_HASH_KEY)
-        ok = bool(admin_hash) and security.verify_password(body.password, admin_hash)
-
-        db_session.add(db.LoginAttempt(ok=ok))
-        db_session.commit()
-
-        if not ok:
-            raise _error(401, "auth.required", "Invalid password.")
-
-        secret = _get_or_create_session_secret(db_session)
-
+    Payload is `{uid, role, epoch, csrf}`: `epoch` pins this cookie to the
+    user's `session_epoch` at issue time, so a later change-password/disable/
+    reset (which bumps it) invalidates this cookie without needing to touch
+    any other session -- no more global session-secret rotation logging
+    everyone out for one person's password change.
+    """
     csrf = secrets.token_urlsafe(32)
+    with db.get_session() as db_session:
+        secret = _get_or_create_session_secret(db_session)
     serializer = _serializer(secret)
-    token = serializer.dumps({"authenticated": True, "csrf": csrf})
-
+    token = serializer.dumps(
+        {"uid": user.id, "role": user.role, "epoch": user.session_epoch, "csrf": csrf}
+    )
     response.set_cookie(
         key=SESSION_COOKIE_NAME,
         value=token,
@@ -184,6 +286,43 @@ def login(body: LoginBody, response: Response):
         httponly=True,
         samesite="lax",
     )
+    return csrf
+
+
+router = APIRouter(prefix="/api/auth")
+
+
+@router.post("/login")
+def login(body: LoginBody, response: Response):
+    username = body.username.strip().lower()
+
+    with db.get_session() as db_session:
+        n, latest_failure_at = _consecutive_failures(db_session, username)
+        wait_needed = _required_wait_seconds(n)
+        if wait_needed > 0 and latest_failure_at is not None:
+            now = datetime.now(timezone.utc).replace(tzinfo=None)
+            elapsed = (now - latest_failure_at).total_seconds()
+            if elapsed < wait_needed:
+                raise _error(429, "auth.too_many_attempts", "Too many attempts, please wait.")
+
+        user = db_session.query(db.User).filter(db.User.username == username).one_or_none()
+        if user is None or user.disabled:
+            # Still run a verify against a dummy hash so an unknown or
+            # disabled username takes the same time as a wrong password --
+            # the error message below is identical either way.
+            security.verify_password(body.password, _DUMMY_HASH)
+            ok = False
+        else:
+            ok = security.verify_password(body.password, user.password_hash)
+
+        db_session.add(db.LoginAttempt(ok=ok, username=username))
+        db_session.commit()
+
+        if not ok:
+            raise _error(401, "auth.required", "Invalid password.")
+
+        csrf = issue_session_cookie(response, user)
+
     return {"csrf": csrf}
 
 
@@ -196,38 +335,68 @@ def logout(response: Response):
 @router.get("/me")
 def me(cf_session: Optional[str] = Cookie(default=None)):
     payload = read_session_payload(cf_session)
-    authenticated = bool(payload and payload.get("authenticated"))
     with db.get_session() as db_session:
         lang = _get_setting(db_session, _LANG_KEY) or "en"
         platform_url = _get_setting(db_session, _PLATFORM_URL_KEY) or ""
-    return {"authenticated": authenticated, "lang": lang, "platform_url": platform_url}
+        user = _session_user_from_payload(db_session, payload)
+
+    if user is None:
+        return {"authenticated": False, "lang": lang, "platform_url": platform_url}
+
+    return {
+        "authenticated": True,
+        "username": user.username,
+        "role": user.role,
+        "lang": lang,
+        "platform_url": platform_url,
+    }
 
 
 @router.post("/change-password")
 def change_password(
     body: ChangePasswordBody,
-    payload: dict = Depends(require_csrf),
+    response: Response,
+    cf_session: Optional[str] = Cookie(default=None),
+    x_csrf: Optional[str] = Header(default=None, alias="X-CSRF"),
 ):
+    """Any logged-in user may change their own password (CSRF-protected).
+
+    Not gated by `require_admin`/`require_csrf` -- those are admin-only --
+    since a future non-admin `user` role must be able to self-service this
+    too. Bumps `session_epoch` so every OTHER session for this account stops
+    validating, then immediately re-issues a fresh cookie at the new epoch so
+    the caller's own session stays logged in.
+    """
+    payload = _payload_and_csrf(cf_session, x_csrf)
+
     if len(body.new) < 8:
         raise _error(400, "auth.password_too_short", "New password must be at least 8 characters.")
 
     with db.get_session() as db_session:
-        admin_hash = _get_setting(db_session, _ADMIN_PASSWORD_HASH_KEY)
-        if not admin_hash or not security.verify_password(body.old, admin_hash):
+        user = _session_user_from_payload(db_session, payload)
+        if user is None:
+            raise _error(401, "auth.required", "Login required.")
+
+        db_user = db_session.get(db.User, user.uid)
+        if db_user is None or not security.verify_password(body.old, db_user.password_hash):
             raise _error(401, "auth.required", "Old password is incorrect.")
 
-        new_hash = security.hash_password(body.new)
-        _set_setting(db_session, _ADMIN_PASSWORD_HASH_KEY, new_hash)
-
-        # Rotate the cookie-signing secret so every session issued under the
-        # old password stops validating -- including this one. Changing a
-        # password that someone else may know is worthless if their existing
-        # session keeps working; the UI already tells the admin to sign in
-        # again afterwards.
-        _set_setting(db_session, _SESSION_SECRET_KEY, secrets.token_hex(32))
+        db_user.password_hash = security.hash_password(body.new)
+        db_user.session_epoch += 1
         db_session.commit()
+        uid = db_user.id
+        csrf = issue_session_cookie(response, db_user)
 
-    return {"ok": True}
+    # Final review finding #6: close any open panel WebSocket for this uid
+    # now that its epoch has moved -- the caller's OWN session stays alive
+    # via the fresh cookie issued above, but any other tab's panel socket
+    # (already-open, pre-bump) must not keep streaming. Called OUTSIDE the
+    # session block (like users.py's call sites): close_for_uid can block up
+    # to 5s per socket, and holding the SQLite connection through that wait
+    # would stall unrelated requests.
+    panelws.close_for_uid(uid)
+
+    return {"ok": True, "csrf": csrf}
 
 
 class SettingsBody(BaseModel):
@@ -248,7 +417,7 @@ def _current_settings(db_session) -> dict:
 
 
 @settings_router.get("/api/settings")
-def read_settings(_payload: dict = Depends(require_admin)):
+def read_settings(_user: SessionUser = Depends(require_admin)):
     """Current server-level settings, for a console that opens straight to the
     Settings page rather than seeding itself from a prior POST's response."""
     with db.get_session() as db_session:
@@ -258,7 +427,7 @@ def read_settings(_payload: dict = Depends(require_admin)):
 @settings_router.post("/api/settings")
 def update_settings(
     body: SettingsBody,
-    _payload: dict = Depends(require_csrf),
+    _user: SessionUser = Depends(require_csrf),
 ):
     """Update server-level settings. Only the keys present in the body change.
 

@@ -40,7 +40,7 @@ import type { Job, Receipt } from "../db/queries";
 import { extract, estimateVram, needsFromJob, verdict, fleetWideGaps, partitionFleetFetchable, type JobNeeds, type FetchableModels } from "../core/assess";
 import { sanitizePathComponentOrThrow, artifactKey, jobInputKey } from "../lib/store";
 import { verifyAgentRequest, type VerifyAgentResult } from "../lib/verify_agent";
-import { requireAdmin, requireCsrf, errorJson } from "../lib/guard";
+import { requireUser, requireCsrfUser, errorJson, SESSION_VAR } from "../lib/guard";
 import { bytesToBase64Url } from "../lib/base64";
 import { bytesToHex } from "../lib/hex";
 import { presignUrl, r2S3Host } from "../lib/sigv4";
@@ -198,6 +198,22 @@ async function jobDictFull(job: Job, receipt: Receipt | null, hub?: DurableObjec
 }
 
 // ---------------------------------------------------------------------------
+// Owner-or-admin gate for the per-job CONSOLE routes (Phase 3.0 parity port
+// of jobs.py's `_require_owner_or_admin`) -- NOT the agent-facing artifact
+// routes below, which have their own worker-ownership gate.
+
+/** Whether `user` may see/act on `job` under the owner-or-admin rule: an
+ * admin always may; anyone else only if `job.userId` is their own uid.
+ * Returns a boolean rather than throwing (unlike Python's exception-raising
+ * `_require_owner_or_admin`) so every call site can answer with jobs.ts's
+ * own existing 404 `errorJson`, keeping the "non-owner gets the SAME 404 a
+ * nonexistent job would" contract explicit at each call site rather than
+ * hidden inside a thrown error. */
+function isOwnerOrAdmin(job: Job, user: { uid: string; role: string }): boolean {
+  return user.role === "admin" || job.userId === user.uid;
+}
+
+// ---------------------------------------------------------------------------
 // Ownership gate shared by every /api/agent/jobs/{id}/artifacts* route --
 // ports jobs.py's `upload_job_artifact` inline check (owns_it OR the blip
 // re-adoption window).
@@ -234,7 +250,8 @@ const app = new Hono<{ Bindings: Env }>();
 
 // --- POST /api/jobs -----------------------------------------------------
 
-app.post("/api/jobs", requireCsrf, async (c) => {
+app.post("/api/jobs", requireCsrfUser, async (c) => {
+  const user = c.get(SESSION_VAR).user;
   const contentType = c.req.header("content-type") ?? "";
   if (!contentType.toLowerCase().includes("multipart/form-data")) {
     return errorJson(c, 400, "jobs.invalid_workflow", "Expected multipart/form-data.");
@@ -311,6 +328,7 @@ app.post("/api/jobs", requireCsrf, async (c) => {
     inputAssets: [...available].sort(),
     origin: "console",
     createdAt: toSqliteTimestamp(new Date()),
+    userId: user.uid,
   });
 
   for (const [file, filename] of assetFiles.map((f, i) => [f, uploadedNames[i]!] as const)) {
@@ -324,7 +342,9 @@ app.post("/api/jobs", requireCsrf, async (c) => {
 
 // --- GET /api/jobs -------------------------------------------------------
 
-app.get("/api/jobs", requireAdmin, async (c) => {
+app.get("/api/jobs", requireUser, async (c) => {
+  const user = c.get(SESSION_VAR).user;
+  const isAdmin = user.role === "admin";
   const statusParam = c.req.query("status");
   const statuses = statusParam
     ? statusParam
@@ -332,16 +352,33 @@ app.get("/api/jobs", requireAdmin, async (c) => {
         .map((s) => s.trim())
         .filter((s) => s.length > 0)
     : undefined;
-  const jobs = await queries.listJobs(c.env.DB, statuses);
-  return c.json(await Promise.all(jobs.map((job) => jobDict(job, c.env.HUB))));
+  const jobs = await queries.listJobs(c.env.DB, statuses, isAdmin ? {} : { userId: user.uid });
+
+  if (isAdmin) {
+    const userIds = [...new Set(jobs.map((j) => j.userId).filter((id): id is string => id !== null))];
+    const usernameById = await queries.getUsernamesByIds(c.env.DB, userIds);
+    return c.json(
+      await Promise.all(
+        jobs.map(async (job) => ({ ...(await jobDict(job, c.env.HUB)), username: usernameById.get(job.userId ?? "") ?? null }))
+      )
+    );
+  }
+
+  // Non-admin: every row here is already the caller's own (filtered above),
+  // so the username is always the caller's own -- included anyway so admin
+  // and non-admin list items share the same shape.
+  return c.json(
+    await Promise.all(jobs.map(async (job) => ({ ...(await jobDict(job, c.env.HUB)), username: user.username })))
+  );
 });
 
 // --- GET /api/jobs/{id} ---------------------------------------------------
 
-app.get("/api/jobs/:jobId", requireAdmin, async (c) => {
+app.get("/api/jobs/:jobId", requireUser, async (c) => {
   const jobId = c.req.param("jobId");
   const job = await queries.getJobById(c.env.DB, jobId);
   if (!job) return errorJson(c, 404, "jobs.not_found", "Job not found.");
+  if (!isOwnerOrAdmin(job, c.get(SESSION_VAR).user)) return errorJson(c, 404, "jobs.not_found", "Job not found.");
 
   const receipts = await queries.getReceiptsForJob(c.env.DB, jobId);
   // Newest first -- a retried job can accumulate more than one receipt
@@ -353,10 +390,11 @@ app.get("/api/jobs/:jobId", requireAdmin, async (c) => {
 
 // --- GET /api/jobs/{id}/assessment ----------------------------------------
 
-app.get("/api/jobs/:jobId/assessment", requireAdmin, async (c) => {
+app.get("/api/jobs/:jobId/assessment", requireUser, async (c) => {
   const jobId = c.req.param("jobId");
   const job = await queries.getJobById(c.env.DB, jobId);
   if (!job) return errorJson(c, 404, "jobs.not_found", "Job not found.");
+  if (!isOwnerOrAdmin(job, c.get(SESSION_VAR).user)) return errorJson(c, 404, "jobs.not_found", "Job not found.");
 
   const needs = needsFromJob(job);
   const allWorkers = (await queries.getAllWorkers(c.env.DB)).filter((w) => !w.disabled);
@@ -701,12 +739,13 @@ app.post("/api/agent/jobs/:jobId/artifacts/confirm", async (c) => {
 
 // --- GET /api/jobs/{id}/artifacts/{filename} (console download) ----------
 
-app.get("/api/jobs/:jobId/artifacts/:filename", requireAdmin, async (c) => {
+app.get("/api/jobs/:jobId/artifacts/:filename", requireUser, async (c) => {
   const jobId = c.req.param("jobId");
   const filename = c.req.param("filename");
 
   const job = await queries.getJobById(c.env.DB, jobId);
   if (!job) return errorJson(c, 404, "jobs.not_found", "Job not found.");
+  if (!isOwnerOrAdmin(job, c.get(SESSION_VAR).user)) return errorJson(c, 404, "jobs.not_found", "Job not found.");
 
   let key: string;
   try {
@@ -728,10 +767,11 @@ app.get("/api/jobs/:jobId/artifacts/:filename", requireAdmin, async (c) => {
 
 // --- POST /api/jobs/{id}/cancel -------------------------------------------
 
-app.post("/api/jobs/:jobId/cancel", requireCsrf, async (c) => {
+app.post("/api/jobs/:jobId/cancel", requireCsrfUser, async (c) => {
   const jobId = c.req.param("jobId");
   const existing = await queries.getJobById(c.env.DB, jobId);
   if (!existing) return errorJson(c, 404, "jobs.not_found", "Job not found.");
+  if (!isOwnerOrAdmin(existing, c.get(SESSION_VAR).user)) return errorJson(c, 404, "jobs.not_found", "Job not found.");
 
   const stub = c.env.HUB.get(c.env.HUB.idFromName("hub"));
   let res: Response;
@@ -770,10 +810,11 @@ app.post("/api/jobs/:jobId/cancel", requireCsrf, async (c) => {
 
 // --- POST /api/jobs/{id}/retry ---------------------------------------------
 
-app.post("/api/jobs/:jobId/retry", requireCsrf, async (c) => {
+app.post("/api/jobs/:jobId/retry", requireCsrfUser, async (c) => {
   const jobId = c.req.param("jobId");
   const job = await queries.getJobById(c.env.DB, jobId);
   if (!job) return errorJson(c, 404, "jobs.not_found", "Job not found.");
+  if (!isOwnerOrAdmin(job, c.get(SESSION_VAR).user)) return errorJson(c, 404, "jobs.not_found", "Job not found.");
   if (job.status !== "failed") {
     return errorJson(c, 409, "jobs.not_retryable", "Only failed jobs can be retried.");
   }

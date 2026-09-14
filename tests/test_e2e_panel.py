@@ -72,7 +72,7 @@ def server(tmp_path):
 
 
 def _login(server) -> str:
-    r = server.post("/api/auth/login", json={"password": server.admin_password})
+    r = server.post("/api/auth/login", json={"username": "admin", "password": server.admin_password})
     assert r.status_code == 200
     return r.json()["csrf"]
 

@@ -30,6 +30,7 @@ import golden from "./fixtures/golden.json";
 
 afterEach(async () => {
   await db().prepare("DELETE FROM settings").run();
+  await db().prepare("DELETE FROM users").run();
   await db().prepare("DELETE FROM workers").run();
   await db().prepare("DELETE FROM register_tokens").run();
   await db().prepare("DELETE FROM nonces").run();
@@ -124,7 +125,7 @@ describe("cloud end-to-end", () => {
       // 1. Setup + login (SETUP_TOKEN), issuing a cookie+csrf session.
       const setupRes = await call("/api/setup", { json: { token: SETUP_TOKEN, password: ADMIN_PASSWORD } });
       expect(setupRes.status).toBe(200);
-      const loginRes = await call("/api/auth/login", { json: { password: ADMIN_PASSWORD } });
+      const loginRes = await call("/api/auth/login", { json: { username: "admin", password: ADMIN_PASSWORD } });
       expect(loginRes.status).toBe(200);
       const cookie = loginRes.setCookie;
       const csrf = loginRes.body.csrf;
@@ -219,7 +220,8 @@ describe("cloud end-to-end", () => {
       const uploadRes = await raw("/comfy/api/upload/image", { method: "POST", body: uploadForm, cookie });
       expect(uploadRes.status).toBe(200);
       expect(uploadRes.body).toEqual({ name: "input.png", subfolder: "", type: "input" });
-      expect(await store().get("staging/input.png")).not.toBeNull();
+      const adminRow = await db().prepare("SELECT id FROM users WHERE username = 'admin'").first<{ id: string }>();
+      expect(await store().get(`staging/${adminRow!.id}/input.png`)).not.toBeNull();
 
       // -----------------------------------------------------------------
       // 7. Panel POST /comfy/api/prompt with a ZERO-model workflow (no
@@ -547,7 +549,7 @@ describe("cloud end-to-end", () => {
     async () => {
       const setupRes = await call("/api/setup", { json: { token: SETUP_TOKEN, password: ADMIN_PASSWORD } });
       expect(setupRes.status).toBe(200);
-      const loginRes = await call("/api/auth/login", { json: { password: ADMIN_PASSWORD } });
+      const loginRes = await call("/api/auth/login", { json: { username: "admin", password: ADMIN_PASSWORD } });
       const cookie = loginRes.setCookie;
       const csrf = loginRes.body.csrf;
 
@@ -675,9 +677,17 @@ describe("cloud end-to-end", () => {
       expect(assignedJob!.workerId).toBe(workerId);
 
       // -----------------------------------------------------------------
-      // 7. Fake agent reports the fetching_models progress stage; the panel
-      // sees it relayed on the `progress` event.
-      const fetchProgressPromise = nextMessage(panel);
+      // 7. Fake agent reports the fetching_models progress stage. Phase 3.0
+      // Task 10: the panel WS is a per-user PANEL workspace now -- a
+      // job-scoped frame only reaches a panel socket when the job's own
+      // `origin === "panel"` (see do/hub.ts's `panelVisibleTo`), which this
+      // one isn't (submitted via the console in step 5). So the panel must
+      // NOT see this relayed, unlike pre-Task-10 -- proven with
+      // `expectNoMessage` rather than the old `nextMessage` wait. The
+      // progress itself is still verified below via the console's own `GET
+      // /api/jobs/{id}` transient-field surface, which every role's own
+      // console session can read regardless of panel scoping.
+      const fetchProgressAbsence = expectNoMessage(panel, 300);
       agent.send(
         JSON.stringify({
           type: "heartbeat",
@@ -688,11 +698,7 @@ describe("cloud end-to-end", () => {
           fetch_model: modelName,
         })
       );
-      const fetchProgressEvent = await fetchProgressPromise;
-      expect(fetchProgressEvent).toEqual({
-        type: "progress",
-        data: { value: 0, max: 100, prompt_id: jobId, stage: "fetching_models", fetch_pct: 0.42, fetch_model: modelName },
-      });
+      await fetchProgressAbsence;
 
       // M1 fix: fetch wall time is not billable execution, so the
       // fetching_models stage must NOT start the job's clock -- it stays

@@ -31,7 +31,7 @@ import { useCallback, useEffect, useState } from 'react';
 import { useTranslation } from 'react-i18next';
 import { Link, useParams } from 'react-router-dom';
 
-import { ApiError, api, artifactUrl } from '../api';
+import { ApiError, api, artifactUrl, type Role, type Worker } from '../api';
 import { SectionHeader } from '../components/Primitives';
 import { JobStatusBadge } from '../components/StatusBadge';
 import { formatAbsolute, formatGpuSeconds, shortId } from '../lib/format';
@@ -58,16 +58,31 @@ function durationBetween(startIso: string | null, endIso: string | null): string
   return formatGpuSeconds((end - start) / 1000);
 }
 
-export function JobDetail() {
+interface JobDetailProps {
+  /** Only an admin's `GET /api/jobs/{id}` reflects the actual submitter --
+   * a plain user's own jobs are all theirs anyway, so the field is shown
+   * admin-only to avoid a redundant "you" line. */
+  role: Role;
+}
+
+export function JobDetail({ role }: JobDetailProps) {
   const { t } = useTranslation();
   const theme = useMantineTheme();
   const { id } = useParams<{ id: string }>();
+  const isAdmin = role === 'admin';
 
   const loadAll = useCallback(async () => {
     if (!id) throw new Error('missing job id');
-    const [job, workers] = await Promise.all([api.getJob(id), api.listWorkers()]);
+    // Final review finding #3: `GET /api/workers` is admin-only on both
+    // stacks -- a non-admin's call threw `ApiError(403)`, which rejected
+    // this whole loader and left a plain user's own job detail permanently
+    // showing `job_detail.load_error`. Mirrors Dashboard's Task-6 pattern.
+    const [job, workers] = await Promise.all([
+      api.getJob(id),
+      isAdmin ? api.listWorkers() : Promise.resolve<Worker[]>([]),
+    ]);
     return { job, workers };
-  }, [id]);
+  }, [id, isAdmin]);
 
   const { data, loading, error, refresh } = usePolling(loadAll, POLL_MS);
   const job = data?.job ?? null;
@@ -259,6 +274,16 @@ export function JobDetail() {
                     ? (workerName.get(job.worker_id) ?? shortId(job.worker_id))
                     : t('job_detail.no_worker')}
                 </Text>
+                {isAdmin && (
+                  <>
+                    <Text size="xs" c="dimmed">
+                      {t('job_detail.submitted_by')}
+                    </Text>
+                    <Text size="sm" c={job.username ? undefined : 'dimmed'}>
+                      {job.username ?? '—'}
+                    </Text>
+                  </>
+                )}
               </Stack>
             </Card>
           </SimpleGrid>

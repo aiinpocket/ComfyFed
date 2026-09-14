@@ -4,6 +4,7 @@ import { toSqliteTimestamp } from "../src/db/queries";
 
 afterEach(async () => {
   await db().prepare("DELETE FROM settings").run();
+  await db().prepare("DELETE FROM users").run();
   await db().prepare("DELETE FROM login_attempts").run();
   await db().prepare("DELETE FROM workers").run();
   await db().prepare("DELETE FROM receipts").run();
@@ -13,7 +14,7 @@ const ADMIN_PASSWORD = "correct-horse-battery-staple";
 
 async function adminSession(): Promise<{ cookie: string | null; csrf: string }> {
   await call("/api/setup", { json: { token: SETUP_TOKEN, password: ADMIN_PASSWORD } });
-  const login = await call("/api/auth/login", { json: { password: ADMIN_PASSWORD } });
+  const login = await call("/api/auth/login", { json: { username: "admin", password: ADMIN_PASSWORD } });
   return { cookie: login.setCookie, csrf: login.body.csrf };
 }
 
