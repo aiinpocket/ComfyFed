@@ -220,6 +220,12 @@ export interface Worker {
    * -- see `agentws._handle_hello` / `do/hub.ts`'s `handleHello`). Off by
    * default: workers keep sovereignty over unattended downloads. */
   autoFetch: boolean;
+  /** Admin SOFT delete (`DELETE /api/workers/:id`). The row survives so the
+   * billing ledger's receipts/jobs keep resolving, but the worker is gone
+   * from every user-visible surface and can never reconnect -- see
+   * `getAllWorkers`/`getWorkerById` (which filter it out) and
+   * `db.Worker.deleted`'s Python docstring. */
+  deleted: boolean;
   /** Phase 3.1 P2P: the agent's advertised peer-serving endpoint (e.g.
    * "http://192.168.1.5:8850"), set from `hello.peer_url` when the agent has
    * `peer_serve` enabled and a usable advertise host -- validated the same
@@ -246,6 +252,7 @@ interface WorkerRow {
   object_info_hash: string;
   protocol: number;
   auto_fetch: number;
+  deleted: number;
   peer_url: string | null;
 }
 
@@ -267,12 +274,23 @@ function rowToWorker(row: WorkerRow): Worker {
     objectInfoHash: row.object_info_hash,
     protocol: row.protocol,
     autoFetch: row.auto_fetch !== 0,
+    deleted: row.deleted !== 0,
     peerUrl: row.peer_url,
   };
 }
 
+/** A LIVE worker by id -- soft-deleted rows read as `null`, exactly like an
+ * unknown id (see `Worker.deleted`). Every caller is a live path (the Hub
+ * DO's handshake and message handlers, `lib/verify_agent.ts`, the delete
+ * route's own existence check), so this is the gate that makes a deleted
+ * worker un-connectable and its already-issued certificate inert.
+ * `getWorkersByIds` deliberately does NOT filter: it is the reports/payout
+ * lookup, which must keep resolving a deleted worker's historical receipts. */
 export async function getWorkerById(db: D1Database, id: string): Promise<Worker | null> {
-  const row = await db.prepare("SELECT * FROM workers WHERE id = ?").bind(id).first<WorkerRow>();
+  const row = await db
+    .prepare("SELECT * FROM workers WHERE id = ? AND deleted = 0")
+    .bind(id)
+    .first<WorkerRow>();
   return row ? rowToWorker(row) : null;
 }
 
@@ -286,8 +304,11 @@ export async function getWorkersByIds(db: D1Database, ids: string[]): Promise<Wo
   return results.map(rowToWorker);
 }
 
+/** Every LIVE worker -- soft-deleted rows are excluded, so the console
+ * listing, dispatch eligibility and `/metrics`'s `comfyfed_worker_up` all
+ * drop a deleted worker at once (see `Worker.deleted`). */
 export async function getAllWorkers(db: D1Database): Promise<Worker[]> {
-  const { results } = await db.prepare("SELECT * FROM workers").all<WorkerRow>();
+  const { results } = await db.prepare("SELECT * FROM workers WHERE deleted = 0").all<WorkerRow>();
   return results.map(rowToWorker);
 }
 
@@ -415,6 +436,20 @@ export async function setWorkerDisabled(db: D1Database, workerId: string, disabl
   const result = await db
     .prepare("UPDATE workers SET disabled = ? WHERE id = ?")
     .bind(disabled ? 1 : 0, workerId)
+    .run();
+  return (result.meta.changes ?? 0) > 0;
+}
+
+/** Soft-deletes a worker, returning true only if a LIVE row was flagged --
+ * `deleted = 0` in the WHERE makes a second delete a no-op, which the route
+ * turns into the same 404 an unknown id gets. `disabled` is set in the same
+ * statement as belt and braces: every pre-existing gate already refuses a
+ * disabled worker, so nothing can serve a deleted one even on a path that
+ * predates this column. Mirrors `workers.py`'s `delete_worker`. */
+export async function setWorkerDeleted(db: D1Database, workerId: string): Promise<boolean> {
+  const result = await db
+    .prepare("UPDATE workers SET deleted = 1, disabled = 1 WHERE id = ? AND deleted = 0")
+    .bind(workerId)
     .run();
   return (result.meta.changes ?? 0) > 0;
 }
@@ -804,7 +839,9 @@ export async function updateJobProgress(db: D1Database, jobId: string, progress:
  * query (`GET /object_info`'s fleet). */
 export async function getOnlineEnabledWorkers(db: D1Database): Promise<Worker[]> {
   const { results } = await db
-    .prepare("SELECT * FROM workers WHERE disabled = 0 AND status != 'offline' ORDER BY created_at ASC, id ASC")
+    .prepare(
+      "SELECT * FROM workers WHERE deleted = 0 AND disabled = 0 AND status != 'offline' ORDER BY created_at ASC, id ASC"
+    )
     .all<WorkerRow>();
   return results.map(rowToWorker);
 }

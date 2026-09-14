@@ -72,6 +72,7 @@ function makeWorker(id: string, overrides: Partial<Worker> = {}): Worker {
     objectInfoHash: "",
     protocol: 1,
     autoFetch: false,
+    deleted: false,
     peerUrl: null,
     ...overrides,
   };

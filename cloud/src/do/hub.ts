@@ -72,6 +72,10 @@ import { jobOutputs, FALLBACK_OUTPUT_KEY, type JobOutputsInput } from "../core/o
 const AUTH_TIMEOUT_MS = 10_000;
 const TICK_INTERVAL_MS = 5_000;
 const CLOSE_UNAUTHORIZED = 4401;
+/** An admin soft-deleted this worker while it was connected -- parity with
+ * agentws.py's `_CLOSE_WORKER_DELETED`, pushed here through
+ * `/internal/kick_worker` (see `handleInternalKickWorker`). */
+const CLOSE_WORKER_DELETED = 4403;
 
 /** Minimum `hello.protocol` that guarantees exec_seconds and understands
  * `job_cancelled` pushes -- see agentws.py's `_CURRENT_PROTOCOL`. */
@@ -392,6 +396,9 @@ export class Hub extends DurableObject<Env> {
     if (url.pathname === "/internal/close_panel_for_uid" && request.method === "POST") {
       return this.handleInternalClosePanelForUid(request);
     }
+    if (url.pathname === "/internal/kick_worker" && request.method === "POST") {
+      return this.handleInternalKickWorker(request);
+    }
     return new Response("not found", { status: 404 });
   }
 
@@ -599,6 +606,41 @@ export class Hub extends DurableObject<Env> {
       }
     }
     return new Response(null, { status: 202 });
+  }
+
+  /** Closes a soft-deleted worker's live agent socket, if it has one --
+   * cloud parity of `agentws.kick_worker`, reached from `routes/workers.ts`'s
+   * `DELETE /api/workers/:id` over the same internal-HTTP hop
+   * `/internal/close_panel_for_uid` uses (a route runs as a plain Worker
+   * fetch handler, with no handle on this DO's live sockets).
+   *
+   * The handshake gate (`getWorkerById` now filters `deleted`) only stops the
+   * NEXT connection attempt; without this, an already-connected agent would
+   * keep heartbeating against a worker the console no longer shows. Returns
+   * `{kicked}` so the caller/tests can tell "closed a live connection" from
+   * "nothing was connected", both of which are success. */
+  private async handleInternalKickWorker(request: Request): Promise<Response> {
+    const body = await request
+      .json<{ worker_id?: unknown }>()
+      .catch(() => ({}) as { worker_id?: unknown });
+    const workerId = typeof body.worker_id === "string" ? body.worker_id : "";
+    if (!workerId) {
+      return Response.json({ error: "missing worker_id" }, { status: 400 });
+    }
+    const ws = this.findWsForWorker(workerId);
+    if (!ws) {
+      return Response.json({ kicked: false });
+    }
+    this.ephemeral.delete(ws);
+    try {
+      ws.close(CLOSE_WORKER_DELETED, "worker deleted");
+    } catch (err) {
+      // Best-effort, exactly like the supersede-close in the handshake: the
+      // row is already flagged deleted, so a socket that is already closing
+      // needs nothing undone.
+      console.warn(`hub: failed to close agent socket for deleted worker ${workerId}`, err);
+    }
+    return Response.json({ kicked: true });
   }
 
   private async handleInternalDynamic(url: URL): Promise<Response> {

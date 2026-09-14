@@ -86,7 +86,13 @@ export async function assignJobs(
 ): Promise<Assignment[]> {
   if (idleWorkerIds.length === 0) return [];
 
-  const idleWorkers = await queries.getWorkersByIds(db, idleWorkerIds);
+  // `getWorkersByIds` deliberately does not filter soft-deleted rows (it is
+  // also the reports lookup, which must keep resolving them), so dispatch
+  // eligibility excludes them here: an admin can delete a worker while its
+  // socket is still being torn down, and this tick must not hand it a job.
+  // `getAllWorkers` below already filters, so the seeder/feasibility view
+  // drops it too. Mirrors dispatch.py's `deleted == False` filters.
+  const idleWorkers = (await queries.getWorkersByIds(db, idleWorkerIds)).filter((w) => !w.deleted);
   if (idleWorkers.length === 0) return [];
   const workersById = new Map(idleWorkers.map((w) => [w.id, w] as const));
 

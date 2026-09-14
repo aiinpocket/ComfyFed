@@ -45,11 +45,25 @@ function uniqueId(base: string): string {
 
 const KEYPAIRS = golden.keypairs;
 
-async function makeWorker(opts: { pubkeyHex: string; disabled?: boolean; id?: string }): Promise<string> {
+async function makeWorker(opts: {
+  pubkeyHex: string;
+  disabled?: boolean;
+  deleted?: boolean;
+  id?: string;
+}): Promise<string> {
   const id = opts.id ?? uniqueId("w");
   await db()
-    .prepare("INSERT INTO workers (id, name, pubkey, created_at, disabled) VALUES (?, ?, ?, ?, ?)")
-    .bind(id, id, opts.pubkeyHex, toSqliteTimestamp(new Date()), opts.disabled ? 1 : 0)
+    .prepare(
+      "INSERT INTO workers (id, name, pubkey, created_at, disabled, deleted) VALUES (?, ?, ?, ?, ?, ?)"
+    )
+    .bind(
+      id,
+      id,
+      opts.pubkeyHex,
+      toSqliteTimestamp(new Date()),
+      opts.disabled ? 1 : 0,
+      opts.deleted ? 1 : 0
+    )
     .run();
   return id;
 }
@@ -120,6 +134,21 @@ describe("handshake", () => {
   it("rejects a disabled worker with 4401", async () => {
     const kp = KEYPAIRS[0]!;
     const workerId = await makeWorker({ pubkeyHex: kp.pubkey_hex, disabled: true });
+    const ws = await openAgentWs();
+    const challenge = await nextMessage(ws);
+    const closed = waitForClose(ws);
+    const sig = await signHex(kp.seed_hex, new TextEncoder().encode(challenge.nonce));
+    ws.send(JSON.stringify({ type: "auth", worker_id: workerId, sig }));
+    const result = await closed;
+    expect(result.code).toBe(4401);
+  });
+
+  it("rejects a soft-deleted worker with 4401", async () => {
+    // `getWorkerById` filters `deleted`, so a deleted worker's handshake is
+    // indistinguishable from an unknown id -- its certificate is inert for
+    // good. Ports test_agent_ws.py's deleted-handshake test.
+    const kp = KEYPAIRS[0]!;
+    const workerId = await makeWorker({ pubkeyHex: kp.pubkey_hex, deleted: true });
     const ws = await openAgentWs();
     const challenge = await nextMessage(ws);
     const closed = waitForClose(ws);
@@ -556,6 +585,73 @@ describe("dispatch alarm", () => {
     job = await getJobById(db(), jobId);
     expect(job!.status).toBe("assigned");
     expect(job!.workerId).toBe(workerId);
+    ws.close();
+  });
+});
+
+// ---------------------------------------------------------------------------
+// /internal/kick_worker -- the live half of the admin soft delete
+
+describe("internal kick_worker", () => {
+  it("closes a connected worker's socket with 4403", async () => {
+    const kp = KEYPAIRS[0]!;
+    const workerId = await makeWorker({ pubkeyHex: kp.pubkey_hex });
+    const ws = await connectAgent(workerId, kp.seed_hex);
+
+    const closed = waitForClose(ws);
+    // What `DELETE /api/workers/:id` does right after flagging the row: the
+    // handshake gate alone only stops the NEXT connection, so an already
+    // connected agent has to be dropped explicitly.
+    await db().prepare("UPDATE workers SET deleted = 1, disabled = 1 WHERE id = ?").bind(workerId).run();
+    const res = await hub().fetch("http://hub.internal/internal/kick_worker", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ worker_id: workerId }),
+    });
+    expect(res.status).toBe(200);
+    expect(await res.json()).toEqual({ kicked: true });
+
+    const result = await closed;
+    expect(result.code).toBe(4403);
+  });
+
+  it("reports kicked:false when the worker has no live connection", async () => {
+    const kp = KEYPAIRS[0]!;
+    const workerId = await makeWorker({ pubkeyHex: kp.pubkey_hex });
+    const res = await hub().fetch("http://hub.internal/internal/kick_worker", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ worker_id: workerId }),
+    });
+    expect(res.status).toBe(200);
+    expect(await res.json()).toEqual({ kicked: false });
+  });
+
+  it("400s without a worker_id", async () => {
+    const res = await hub().fetch("http://hub.internal/internal/kick_worker", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({}),
+    });
+    expect(res.status).toBe(400);
+  });
+
+  it("never dispatches a queued job to a deleted worker", async () => {
+    const kp = KEYPAIRS[0]!;
+    const workerId = await makeWorker({ pubkeyHex: kp.pubkey_hex });
+    const jobId = await makeJob({ status: "queued" });
+    const ws = await connectAgent(workerId, kp.seed_hex);
+    ws.send(JSON.stringify({ type: "heartbeat", state: "idle" }));
+    await new Promise((r) => setTimeout(r, 50));
+
+    await db().prepare("UPDATE workers SET deleted = 1, disabled = 1 WHERE id = ?").bind(workerId).run();
+
+    const quiet = expectNoMessage(ws);
+    await runDurableObjectAlarm(hub());
+    await quiet;
+
+    const job = await getJobById(db(), jobId);
+    expect(job!.status).toBe("queued");
     ws.close();
   });
 });

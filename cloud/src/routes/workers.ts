@@ -7,14 +7,14 @@
  * certificate), `POST /api/agent/ping` and `POST /api/agent/object_info`
  * (signed agent requests -- see `lib/verify_agent.ts`), `GET /api/workers`
  * (console listing, admin), `GET /api/agent/version`, `POST
- * /api/workers/{id}/disable` (admin).
+ * /api/workers/{id}/disable` (admin), `DELETE /api/workers/{id}` (admin soft
+ * delete -- mirrors workers.py's `delete_worker`).
  *
  * NOT ported -- confirmed absent from workers.py, not a parity gap:
- *  - Any `enable`/`delete` worker route. The Python module has exactly one
- *    worker-mutation route below `disable`; there is no re-enable or
- *    permanent-delete endpoint anywhere in the server (checked across
- *    agentws.py/comfyapi.py/dispatch.py/jobs.py/receipts.py too -- none
- *    define one). Nothing to port.
+ *  - Any `enable` worker route. There is no re-enable (nor a HARD delete)
+ *    endpoint anywhere in the server (checked across agentws.py/comfyapi.py/
+ *    dispatch.py/jobs.py/receipts.py too -- none define one). Nothing to
+ *    port.
  *  - Register-token *expiry*. `db.RegisterToken` has no `expires_at`/TTL
  *    column and `issue_token` sets none -- a token is valid until used, full
  *    stop. (The task brief mentions "expiry"; the actual source has none,
@@ -44,6 +44,7 @@ import {
   insertWorker,
   updateWorkerObjectInfoHash,
   setWorkerDisabled,
+  setWorkerDeleted,
   getDynamic,
   insertRegisterToken,
   getRegisterToken,
@@ -401,6 +402,46 @@ app.post("/api/workers/:workerId/disable", requireCsrf, async (c) => {
   if (!found) {
     return errorJson(c, 404, "workers.not_found", "Worker not found.");
   }
+  return c.json({ ok: true });
+});
+
+// --- DELETE /api/workers/{id} ---------------------------------------------------
+//
+// Admin SOFT delete, parity with workers.py's `delete_worker`. The row
+// survives (receipts/jobs reference workers for the billing ledger, and
+// `/api/reports/*` must keep resolving them by id); `deleted = 1` + `disabled
+// = 1` is what makes the worker vanish from `GET /api/workers`, dispatch
+// eligibility and `/metrics`, and makes the Hub DO refuse its next handshake.
+// Same admin+CSRF gate as `disable` above (`requireCsrf` implies admin).
+
+/** Fire-and-forget hop to the Hub DO to close a deleted worker's live agent
+ * socket -- same pattern `routes/users.ts`'s `closePanelForUid` uses, for the
+ * same reason (this route has no handle on the DO's sockets). Never throws: a
+ * Hub hiccup must not fail a delete whose row change is already committed,
+ * and the handshake gate alone still keeps the worker out for good. */
+async function kickWorker(env: Env, workerId: string): Promise<void> {
+  try {
+    const stub = env.HUB.get(env.HUB.idFromName("hub"));
+    await stub.fetch("http://hub.internal/internal/kick_worker", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ worker_id: workerId }),
+    });
+  } catch (err) {
+    console.warn("workers: failed to kick deleted worker", workerId, err);
+  }
+}
+
+app.delete("/api/workers/:workerId", requireCsrf, async (c) => {
+  const workerId = c.req.param("workerId");
+  // Already-deleted is 404, identical to unknown: from the caller's point of
+  // view the worker no longer exists (the `deleted = 0` predicate inside
+  // `setWorkerDeleted` is what makes the second call a no-op).
+  const deleted = await setWorkerDeleted(c.env.DB, workerId);
+  if (!deleted) {
+    return errorJson(c, 404, "workers.not_found", "Worker not found.");
+  }
+  await kickWorker(c.env, workerId);
   return c.json({ ok: true });
 });
 

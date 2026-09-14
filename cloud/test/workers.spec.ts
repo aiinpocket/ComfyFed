@@ -659,3 +659,111 @@ describe("agent releases (cloud publish-agent parity)", () => {
     expect(bad.body.error.code).toBe("agent.bad_release_filename");
   });
 });
+
+// ---------------------------------------------------------------------------
+// DELETE /api/workers/{id} -- admin soft delete (ports tests/server/
+// test_workers.py's delete section; the live-socket kick lives in hub.spec.ts)
+
+describe("DELETE /api/workers/:id", () => {
+  it("401s without a session", async () => {
+    const w = await registerWorker();
+    const r = await call(`/api/workers/${w.workerId}`, { method: "DELETE" });
+    expect(r.status).toBe(401);
+  });
+
+  it("403s without X-CSRF", async () => {
+    const w = await registerWorker();
+    const { cookie } = await adminSession();
+    const r = await call(`/api/workers/${w.workerId}`, { method: "DELETE", cookie });
+    expect(r.status).toBe(403);
+  });
+
+  it("403s for a logged-in non-admin", async () => {
+    const w = await registerWorker();
+    const { cookie, csrf } = await adminSession();
+    await call("/api/users", {
+      json: { username: "bob", role: "user", password: "a-long-password1" },
+      cookie,
+      headers: { "X-CSRF": csrf },
+    });
+    const bob = await call("/api/auth/login", { json: { username: "bob", password: "a-long-password1" } });
+    const r = await call(`/api/workers/${w.workerId}`, {
+      method: "DELETE",
+      cookie: bob.setCookie,
+      headers: { "X-CSRF": bob.body.csrf },
+    });
+    expect(r.status).toBe(403);
+  });
+
+  it("soft-deletes the row (deleted + disabled) and keeps it in the table", async () => {
+    const w = await registerWorker();
+    const { cookie, csrf } = await adminSession();
+    const r = await call(`/api/workers/${w.workerId}`, {
+      method: "DELETE",
+      cookie,
+      headers: { "X-CSRF": csrf },
+    });
+    expect(r.status).toBe(200);
+    expect(r.body).toEqual({ ok: true });
+
+    // The row SURVIVES -- receipts/jobs reference it for the billing ledger.
+    const row = await db()
+      .prepare("SELECT deleted, disabled FROM workers WHERE id = ?")
+      .bind(w.workerId)
+      .first<any>();
+    expect(row.deleted).toBe(1);
+    expect(row.disabled).toBe(1);
+  });
+
+  it("drops the worker from GET /api/workers", async () => {
+    const w = await registerWorker();
+    const { cookie, csrf } = await adminSession();
+
+    const before = await call("/api/workers", { method: "GET", cookie });
+    expect(before.body.map((x: any) => x.id)).toContain(w.workerId);
+
+    await call(`/api/workers/${w.workerId}`, { method: "DELETE", cookie, headers: { "X-CSRF": csrf } });
+
+    const after = await call("/api/workers", { method: "GET", cookie });
+    expect(after.status).toBe(200);
+    expect(after.body.map((x: any) => x.id)).not.toContain(w.workerId);
+  });
+
+  it("404s for an unknown worker id", async () => {
+    const { cookie, csrf } = await adminSession();
+    const r = await call("/api/workers/does-not-exist", { method: "DELETE", cookie, headers: { "X-CSRF": csrf } });
+    expect(r.status).toBe(404);
+    expect(r.body.error.code).toBe("workers.not_found");
+  });
+
+  it("404s on a second delete of the same worker", async () => {
+    const w = await registerWorker();
+    const { cookie, csrf } = await adminSession();
+    const first = await call(`/api/workers/${w.workerId}`, {
+      method: "DELETE",
+      cookie,
+      headers: { "X-CSRF": csrf },
+    });
+    expect(first.status).toBe(200);
+
+    const second = await call(`/api/workers/${w.workerId}`, {
+      method: "DELETE",
+      cookie,
+      headers: { "X-CSRF": csrf },
+    });
+    expect(second.status).toBe(404);
+    expect(second.body.error.code).toBe("workers.not_found");
+  });
+
+  it("refuses a deleted worker's signed agent requests", async () => {
+    const w = await registerWorker();
+    const { cookie, csrf } = await adminSession();
+    await call(`/api/workers/${w.workerId}`, { method: "DELETE", cookie, headers: { "X-CSRF": csrf } });
+
+    // `getWorkerById` filters deleted rows, so the signed-request path can't
+    // tell this worker from one that never existed: 401, not 403 disabled.
+    const r = await signedPost(w, "/api/agent/ping");
+    expect(r.status).toBe(401);
+    expect(r.body.error.code).toBe("agent.bad_signature");
+  });
+});
