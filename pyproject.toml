@@ -25,7 +25,10 @@ include-package-data = true
 # The workflow-template library (index, UI-format workflows, thumbnails and
 # the input images templates reference) has to travel inside the wheel --
 # `templates.py` locates it with importlib.resources, not a repo path.
-comfyfed_server = ["templates_data/*.json", "templates_data/*.webp", "templates_data/assets/*"]
+comfyfed_server = [
+  "templates_data/*.json", "templates_data/*.webp", "templates_data/assets/*",
+  "installers/*",
+]
 # `panel_ext/` has its own `__init__.py` (unlike `templates_data/`, which has
 # none), so setuptools treats it as the subpackage `comfyfed_server.panel_ext`
 # and its package-data has to be listed under that name, not the parent's.
