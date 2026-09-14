@@ -90,9 +90,18 @@ function jsonResponse(body: unknown, status = 200): Response {
   });
 }
 
-function stubFetch(job: JobDetailType, opts: { workers?: Worker[]; artifacts?: Record<string, string> } = {}) {
+/** Final review finding #3: `GET /api/workers` is admin-only on both
+ * stacks -- a `user`-role session gets a real 403, which this stub must
+ * honestly reproduce (it previously always answered 200, which is exactly
+ * why the missing `isAdmin` guard in `JobDetail.tsx` went uncaught).
+ * Defaults to `'user'`, matching `renderDetail`'s own default. */
+function stubFetch(
+  job: JobDetailType,
+  opts: { workers?: Worker[]; artifacts?: Record<string, string>; role?: 'admin' | 'user' } = {},
+) {
   const workers = opts.workers ?? [WORKER];
   const artifacts = opts.artifacts ?? {};
+  const role = opts.role ?? 'user';
   const fetchMock = vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
     const url = typeof input === 'string' ? input : input.toString();
     const method = init?.method ?? 'GET';
@@ -101,6 +110,9 @@ function stubFetch(job: JobDetailType, opts: { workers?: Worker[]; artifacts?: R
       return jsonResponse(job);
     }
     if (url === '/api/workers' && method === 'GET') {
+      if (role !== 'admin') {
+        return jsonResponse({ error: { code: 'auth.forbidden', message: 'Admin only.' } }, 403);
+      }
       return jsonResponse(workers);
     }
     for (const [filename, content] of Object.entries(artifacts)) {
@@ -235,7 +247,7 @@ describe('JobDetail', () => {
 
   it('shows the submitting user for an admin', async () => {
     const jobWithUser: JobDetailType = { ...BASE_JOB, username: 'alice' };
-    stubFetch(jobWithUser);
+    stubFetch(jobWithUser, { role: 'admin' });
     renderDetail(BASE_JOB.id, 'admin');
 
     expect(await screen.findByText('alice')).toBeInTheDocument();
@@ -248,5 +260,13 @@ describe('JobDetail', () => {
 
     await screen.findByText(LONG_ERROR);
     expect(screen.queryByText('alice')).not.toBeInTheDocument();
+  });
+
+  it('a plain user still sees their own job detail when /api/workers 403s (final review finding #3)', async () => {
+    stubFetch(BASE_JOB, { role: 'user' });
+    renderDetail(BASE_JOB.id, 'user');
+
+    expect(await screen.findByText(LONG_ERROR)).toBeInTheDocument();
+    expect(screen.queryByText('Could not load this job.')).not.toBeInTheDocument();
   });
 });

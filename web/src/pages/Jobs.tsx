@@ -82,10 +82,18 @@ export function Jobs({ role }: JobsProps) {
   const theme = useMantineTheme();
   const isAdmin = role === 'admin';
 
-  const loadAll = useCallback(
-    async () => ({ jobs: await api.listJobs(), workers: await api.listWorkers() }),
-    [],
-  );
+  const loadAll = useCallback(async () => {
+    // Final review finding #3: `GET /api/workers` is admin-only on both
+    // stacks -- a non-admin's call throws `ApiError(403)`, which used to
+    // reject this whole loader and leave a plain user with a permanent
+    // `jobs.load_error` and never their own jobs. Mirrors Dashboard's
+    // Task-6 pattern: skip the call entirely for a non-admin session.
+    const [jobs, workers] = await Promise.all([
+      api.listJobs(),
+      isAdmin ? api.listWorkers() : Promise.resolve<Worker[]>([]),
+    ]);
+    return { jobs, workers };
+  }, [isAdmin]);
   const { data, loading, error, refresh } = usePolling(loadAll, POLL_MS);
 
   const jobs = data?.jobs ?? [];
