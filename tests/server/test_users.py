@@ -81,6 +81,19 @@ def test_create_user_with_explicit_password_can_login(client):
     assert login.status_code == 200
 
 
+def test_create_user_rejects_a_too_short_explicit_password(client):
+    """Final review finding #8: an admin-supplied password must meet the
+    same 8-char minimum self-service change-password enforces -- an admin
+    could otherwise create an account with password `a`."""
+    csrf = _login(client)
+    r = _create_user(client, csrf, "shortpw", password="a")
+    assert r.status_code == 400
+    assert r.json()["error"]["code"] == "auth.password_too_short"
+
+    login = client.post("/api/auth/login", json={"username": "shortpw", "password": "a"})
+    assert login.status_code == 401
+
+
 def test_create_user_duplicate_username_case_insensitive(client):
     csrf = _login(client)
     r1 = _create_user(client, csrf, "dave")
