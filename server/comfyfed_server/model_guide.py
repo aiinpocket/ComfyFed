@@ -60,6 +60,18 @@ class ModelSource:
     official_url: str
     backup_url: str | None
     gated: bool
+    # Phase 3.2: operator-vouched trust anchor for the 11 curated entries
+    # ONLY -- `model_manifest.entries()` uses these to sign a fetch-manifest
+    # entry straight from the guide even when no worker's reported inventory
+    # has ever established a learned consensus hash for this (name,
+    # size_bytes) yet (the "zero-holder" case: every worker in the fleet is
+    # missing the model, so no `model_hashes` row can exist). A learned
+    # consensus row, once one exists, always wins over these -- see that
+    # module's docstring and the Phase 3.2 addendum. `harvest()`-sourced
+    # entries never set these (no trustworthy value to curate for them), so
+    # they keep going through the consensus-only path exactly as before.
+    sha256: str | None = None
+    size_bytes: int | None = None
 
 
 def _curated(
@@ -69,6 +81,8 @@ def _curated(
     official_page: str,
     filename: str,
     gated: bool = False,
+    sha256: str | None = None,
+    size_bytes: int | None = None,
 ) -> ModelSource:
     official_url = f"{official_page}/resolve/main/{filename}"
     backup_url = f"{_GCS_BACKUP_BASE}/{directory}/{name}"
@@ -80,6 +94,8 @@ def _curated(
         official_url=official_url,
         backup_url=backup_url,
         gated=gated,
+        sha256=sha256,
+        size_bytes=size_bytes,
     )
 
 
@@ -95,6 +111,8 @@ SOURCES: dict[str, ModelSource] = {
         "https://huggingface.co/black-forest-labs/FLUX.1-dev",
         "flux1-dev.safetensors",
         gated=True,
+        sha256="4610115bb0c89560703c892c59ac2742fa821e60ef5871b33493ba544683abd7",
+        size_bytes=23802932552,
     ),
     "ae.safetensors": _curated(
         "ae.safetensors",
@@ -103,6 +121,8 @@ SOURCES: dict[str, ModelSource] = {
         "https://huggingface.co/black-forest-labs/FLUX.1-dev",
         "ae.safetensors",
         gated=True,
+        sha256="afc8e28272cd15db3919bacdb6918ce9c1ed22e96cb12c4d5ed0fba823529e38",
+        size_bytes=335304388,
     ),
     "clip_l.safetensors": _curated(
         "clip_l.safetensors",
@@ -110,6 +130,8 @@ SOURCES: dict[str, ModelSource] = {
         0.23,
         "https://huggingface.co/comfyanonymous/flux_text_encoders",
         "clip_l.safetensors",
+        sha256="660c6f5b1abae9dc498ac2d21e1347d2abdb0cf6c0c0c8576cd796491d9a6cdd",
+        size_bytes=246144152,
     ),
     "t5xxl_fp16.safetensors": _curated(
         "t5xxl_fp16.safetensors",
@@ -117,6 +139,8 @@ SOURCES: dict[str, ModelSource] = {
         9.12,
         "https://huggingface.co/comfyanonymous/flux_text_encoders",
         "t5xxl_fp16.safetensors",
+        sha256="6e480b09fae049a72d2a8c5fbccb8d3e92febeb233bbe9dfe7256958a9167635",
+        size_bytes=9787841024,
     ),
     "qwen3vl_32b_heretic_minimax_h3_nvfp4.safetensors": _curated(
         "qwen3vl_32b_heretic_minimax_h3_nvfp4.safetensors",
@@ -124,6 +148,8 @@ SOURCES: dict[str, ModelSource] = {
         14.61,
         "https://huggingface.co/sakamakismile/Qwen3-VL-32B-Heretic-MiniMax-H3-NVFP4",
         "qwen3vl_32b_heretic_minimax_h3_nvfp4.safetensors",
+        sha256="a166c7bbbe66a22065159e478335fee4a633c4a3e3bb34c8e8ac4cc91bf4996f",
+        size_bytes=15683129587,
     ),
     "minimax_h3_ref2va_pruned_int8_convrot.safetensors": ModelSource(
         name="minimax_h3_ref2va_pruned_int8_convrot.safetensors",
@@ -136,6 +162,8 @@ SOURCES: dict[str, ModelSource] = {
         ),
         backup_url=f"{_GCS_BACKUP_BASE}/diffusion_models/minimax_h3_ref2va_pruned_int8_convrot.safetensors",
         gated=False,
+        sha256="9255f52b6677845ad238f20dfaafa94727053694127ab7f255c048f0f9365779",
+        size_bytes=20970379616,
     ),
     "minimax_h3_video_vae_fp16.safetensors": ModelSource(
         name="minimax_h3_video_vae_fp16.safetensors",
@@ -148,6 +176,8 @@ SOURCES: dict[str, ModelSource] = {
         ),
         backup_url=f"{_GCS_BACKUP_BASE}/vae/minimax_h3_video_vae_fp16.safetensors",
         gated=False,
+        sha256="7c1f131492e7eddacaac9069a61b81bdd39de5cc96561e677c5eab1cdce5e522",
+        size_bytes=5207808496,
     ),
     "minimax_h3_audio_vae_fp32.safetensors": ModelSource(
         name="minimax_h3_audio_vae_fp32.safetensors",
@@ -160,6 +190,8 @@ SOURCES: dict[str, ModelSource] = {
         ),
         backup_url=f"{_GCS_BACKUP_BASE}/vae/minimax_h3_audio_vae_fp32.safetensors",
         gated=False,
+        sha256="8e505d95dd1561d47abd43d4238fd40d9bb1ae9e147ed0a4cba778d76ae4db48",
+        size_bytes=605254808,
     ),
     "minimax_h3_ref2v_turbo_8step_v1.0_768p_comfyui_resized_avg_rank_64_bf16.safetensors": _curated(
         "minimax_h3_ref2v_turbo_8step_v1.0_768p_comfyui_resized_avg_rank_64_bf16.safetensors",
@@ -167,6 +199,8 @@ SOURCES: dict[str, ModelSource] = {
         0.91,
         "https://huggingface.co/drbaph/MiniMax-H3-Turbo-Lora-ComfyUI",
         "minimax_h3_ref2v_turbo_8step_v1.0_768p_comfyui_resized_avg_rank_64_bf16.safetensors",
+        sha256="374dfbce47a9f44b19a4d78b44c63bf613ba74110077582603b3d74ad3d47254",
+        size_bytes=978227408,
     ),
     # Direct URL has a `text_encoders/` path segment before the filename
     # (unlike the flat FLUX text-encoder layout), so this is built manually
@@ -182,6 +216,8 @@ SOURCES: dict[str, ModelSource] = {
         ),
         backup_url=f"{_GCS_BACKUP_BASE}/text_encoders/qwen3vl_4b_bf16.safetensors",
         gated=False,
+        sha256="36f3ff447ef59201722e8f9ce6020c9819fdcfba6aa2608c4e09b1c0ce114e34",
+        size_bytes=8875719384,
     ),
     # Entry #11, Phase 1.10 -- a GitHub release asset rather than a HuggingFace
     # `resolve/main/` URL, so this is built manually like the MiniMax-H3
@@ -194,6 +230,8 @@ SOURCES: dict[str, ModelSource] = {
         official_url="https://github.com/xinntao/Real-ESRGAN/releases/download/v0.1.0/RealESRGAN_x4plus.pth",
         backup_url=f"{_GCS_BACKUP_BASE}/upscale_models/RealESRGAN_x4plus.pth",
         gated=False,
+        sha256="4fa0d38905f75ac06eb49a7951b426670021be3018265fd191d2125df9d682f1",
+        size_bytes=67040989,
     ),
 }
 

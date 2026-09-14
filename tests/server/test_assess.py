@@ -2,7 +2,7 @@ import json
 
 import pytest
 
-from comfyfed_server import assess, db
+from comfyfed_server import assess, db, model_guide
 
 
 def _worker(
@@ -298,6 +298,37 @@ def test_verdict_ineligible_when_manifest_size_sum_exceeds_margin():
     )
     v2 = assess.verdict(roomy, needs, {}, [roomy], fetchable_models=fetchable)
     assert v2.kind == "eligible_after_fetch"
+
+
+def test_verdict_eligible_after_fetch_for_zero_holder_curated_model():
+    """Phase 3.2: an empty-inventory worker with auto_fetch opted in becomes
+    `eligible_after_fetch` for a curated model that NOT A SINGLE fleet worker
+    holds, as long as the manifest entry it was handed (built from
+    `model_guide.SOURCES`' operator-vouched sha256/size_bytes -- see
+    `model_manifest._guide_hash_entry`) is present in `fetchable_models`. This
+    is the same `_eligible_after_fetch` gate as always; the only thing Phase
+    3.2 changes is that `fetchable_models` can now contain a curated model's
+    entry even when zero workers have ever reported it -- confirmed here
+    using the REAL curated size_bytes from model_guide.SOURCES rather than an
+    arbitrary test fixture size, so this stays honest about what the manifest
+    would actually sign."""
+    source = model_guide.SOURCES["RealESRGAN_x4plus.pth"]
+    assert source.sha256 is not None and source.size_bytes is not None
+
+    worker = _fetch_ready_worker(
+        "w1",
+        node_classes=["UpscaleModelLoader"],
+        model_inventory=[],  # zero holders anywhere, including this worker
+        dynamic={"free_disk_gb": 100.0},
+    )
+    needs = assess.JobNeeds(
+        nodes={"UpscaleModelLoader"}, models={"RealESRGAN_x4plus.pth"}, est_vram_gb=None
+    )
+    fetchable = {"RealESRGAN_x4plus.pth": source.size_bytes}
+
+    v = assess.verdict(worker, needs, {}, [worker], fetchable_models=fetchable)
+    assert v.kind == "eligible_after_fetch"
+    assert v.missing_models == ["RealESRGAN_x4plus.pth"]
 
 
 # --- Phase 3.1 P2P: peer-only fetch source requires protocol>=4 -----------

@@ -96,7 +96,115 @@ def test_record_hash_different_sizes_are_independent_keys(data_dir):
 # --- entries(): the signed manifest ---------------------------------------
 
 
-def test_entries_excludes_model_with_no_learned_hash(data_dir):
+def test_entries_excludes_model_with_no_learned_hash_and_no_guide_hash(data_dir, monkeypatch):
+    """A source with NO guide-vouched sha256/size_bytes (harvest()-sourced
+    entries never carry one -- see model_guide.ModelSource's docstring) and
+    no learned consensus still gets no manifest entry at all -- the Phase 3.2
+    guide-hash fallback only ever applies to a source that actually carries
+    those fields."""
+    hashless_source = model_guide.ModelSource(
+        name="hashless_model.safetensors",
+        directory="checkpoints",
+        size_gb=1.0,
+        official_page=None,
+        official_url="https://example.invalid/hashless_model.safetensors",
+        backup_url=None,
+        gated=False,
+    )
+    monkeypatch.setitem(model_guide.SOURCES, "hashless_model.safetensors", hashless_source)
+
+    names = {e["name"] for e in model_manifest.entries(data_dir)}
+    assert "hashless_model.safetensors" not in names
+
+
+# --- Phase 3.2: zero-holder curated entries (guide-hash fallback) ---------
+
+
+def test_entries_synthesizes_zero_holder_entry_from_guide_hash(data_dir):
+    """`clip_l.safetensors` is curated with a guide-vouched sha256/size_bytes
+    and NO worker has ever reported it (`record_hash` never called) -- the
+    manifest still signs an entry straight from the guide values, `peer`
+    omitted (no model_hashes row to have a seeder at all)."""
+    entries = model_manifest.entries(data_dir)
+    matches = [e for e in entries if e["name"] == "clip_l.safetensors"]
+    assert len(matches) == 1
+    entry = matches[0]
+
+    source = model_guide.SOURCES["clip_l.safetensors"]
+    assert entry["directory"] == "text_encoders"
+    assert entry["url"] == source.official_url
+    assert entry["backup_url"] == source.backup_url
+    assert entry["sha256"] == source.sha256
+    assert entry["size_bytes"] == source.size_bytes
+    assert "peer" not in entry
+
+    _, verify_key = security.load_platform_keys(data_dir)
+    payload = f"{entry['name']}|{entry['directory']}|{entry['sha256']}|{entry['size_bytes']}"
+    verify_key.verify(payload.encode(), bytes.fromhex(entry["sig"]))  # raises on mismatch
+
+
+def test_entries_all_eleven_curated_models_are_zero_holder_fetchable(data_dir):
+    """Every curated model in `model_guide.SOURCES` now carries a guide hash
+    (Phase 3.2), so with zero workers ever having reported anything, all 11
+    still produce a manifest entry."""
+    names = {e["name"] for e in model_manifest.entries(data_dir)}
+    for curated_name in model_guide.SOURCES:
+        assert curated_name in names
+
+
+def test_entries_learned_consensus_wins_over_guide_hash_and_logs_mismatch(data_dir, caplog):
+    """A learned consensus hash (from a real reporting worker) always takes
+    over from the guide-hash fallback entry -- and when it disagrees with the
+    curated guide value, that disagreement is logged, but the manifest entry
+    still ships the CONSENSUS hash (the bytes the fleet actually holds)."""
+    source = model_guide.SOURCES["clip_l.safetensors"]
+    consensus_sha = _sha("actually-reported-bytes")
+    assert consensus_sha != source.sha256  # the whole point of this test
+
+    with caplog.at_level(logging.WARNING, logger="comfyfed_server.model_manifest"):
+        model_manifest.record_hash(
+            "w1", "text_encoders/clip_l.safetensors", source.size_bytes, consensus_sha
+        )
+        entry = next(
+            e for e in model_manifest.entries(data_dir) if e["name"] == "clip_l.safetensors"
+        )
+
+    assert entry["sha256"] == consensus_sha
+    assert entry["sha256"] != source.sha256
+    assert any(
+        r.levelno == logging.WARNING
+        and "clip_l.safetensors" in r.message
+        and source.sha256 in r.message
+        and consensus_sha in r.message
+        for r in caplog.records
+    )
+
+
+def test_entries_consensus_matching_guide_hash_logs_nothing(data_dir, caplog):
+    """No mismatch, no log -- the common case where the fleet's reported
+    bytes agree with the operator's curated hash."""
+    source = model_guide.SOURCES["clip_l.safetensors"]
+    with caplog.at_level(logging.WARNING, logger="comfyfed_server.model_manifest"):
+        model_manifest.record_hash(
+            "w1", "text_encoders/clip_l.safetensors", source.size_bytes, source.sha256
+        )
+        entry = next(
+            e for e in model_manifest.entries(data_dir) if e["name"] == "clip_l.safetensors"
+        )
+
+    assert entry["sha256"] == source.sha256
+    assert not any("differs from the learned consensus" in r.message for r in caplog.records)
+
+
+def test_entries_conflicted_row_still_excludes_name_despite_guide_hash(data_dir):
+    """A genuine reporter-vs-reporter conflict still excludes the name
+    outright -- the curated guide hash must never paper over that, even
+    though (unlike before Phase 3.2) this name WOULD otherwise be fetchable
+    with zero holders."""
+    source = model_guide.SOURCES["clip_l.safetensors"]
+    model_manifest.record_hash("w1", "text_encoders/clip_l.safetensors", source.size_bytes, _sha("a"))
+    model_manifest.record_hash("w2", "text_encoders/clip_l.safetensors", source.size_bytes, _sha("b"))
+
     names = {e["name"] for e in model_manifest.entries(data_dir)}
     assert "clip_l.safetensors" not in names
 

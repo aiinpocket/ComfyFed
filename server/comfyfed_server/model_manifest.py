@@ -33,6 +33,16 @@ pin the real byte length. An agent that hashes but predates the exact
 falls back to `round(size * 1024**3)` for those reports and documents the
 approximation there, at the one call site that needs it, rather than here.
 
+Phase 3.2 addendum: `entries()` no longer requires a learned consensus row at
+all for the 11 curated models in `model_guide.SOURCES` that carry an
+operator-vouched `sha256`/`size_bytes` -- a "zero-holder" curated model (no
+worker in the fleet has ever reported it, so no `model_hashes` row can exist)
+still gets a signed manifest entry, built straight from those guide values
+(see `_guide_hash_entry`). A learned consensus, once any worker reports one,
+always wins over the guide value for that entry; a guide/consensus mismatch
+is logged and the consensus hash is what ships. A conflicted `model_hashes`
+row still excludes the name outright, guide hash or not -- see `entries()`.
+
 A hash conflict is recorded directly on the `model_hashes` row (`conflict`,
 added by migration `c9d0e1f2a3b4`) rather than in an in-memory, per-process
 set -- this is a persistent replacement for an earlier in-memory
@@ -227,6 +237,42 @@ def _row_has_seeder(row: db.ModelHash, seeder_files: frozenset[tuple[str, int, s
     return (row.name, row.size_bytes, row.sha256) in seeder_files
 
 
+def _guide_hash_entry(signing_key, source: model_guide.ModelSource) -> Optional[dict]:
+    """Phase 3.2 zero-holder entry: sign a manifest entry straight from
+    `source`'s operator-vouched `sha256`/`size_bytes` when NO `model_hashes`
+    row exists for it yet (nobody in the fleet holds the file, so no learned
+    consensus is even possible). Caller (`entries()`) only reaches here after
+    confirming no row -- conflicted or otherwise -- matches this name; a
+    learned consensus, once any worker reports one, always takes over from
+    this path (see `entries()`'s consensus-precedence branch).
+
+    `peer` is deliberately never set on this entry: by construction there is
+    no `model_hashes` row, so there is nothing for `_row_has_seeder` to have
+    matched -- an entry from this path always means zero holders right now.
+    """
+    if "|" in source.name or "|" in source.directory:
+        logger.warning(
+            "model_manifest: skipping guide-hash manifest candidate with a "
+            "'|' in name or directory (payload delimiter): name=%r directory=%r",
+            source.name,
+            source.directory,
+        )
+        return None
+
+    payload = f"{source.name}|{source.directory}|{source.sha256}|{source.size_bytes}"
+    sig = signing_key.sign(payload.encode()).signature.hex()
+
+    return {
+        "name": source.name,
+        "directory": source.directory,
+        "url": source.official_url,
+        "backup_url": source.backup_url,
+        "sha256": source.sha256,
+        "size_bytes": source.size_bytes,
+        "sig": sig,
+    }
+
+
 def _peer_only_entry(signing_key, row: db.ModelHash, seeder_files: frozenset[tuple[str, int, str]]) -> Optional[dict]:
     """Build a peer-only manifest entry for `row` (a non-conflicted
     `model_hashes` row with no known download source), or None when it has no
@@ -317,6 +363,14 @@ def entries(data_dir: str) -> list[dict]:
         hash_rows = list(
             session.query(db.ModelHash).filter(db.ModelHash.conflict == False).all()  # noqa: E712
         )
+        # Phase 3.2: a conflicted row must still block the guide-hash
+        # fallback below -- "two reporters disagree" is not resolved by the
+        # operator's curated hash, so a name with one stays excluded exactly
+        # like before this phase (see `test_entries_excludes_a_conflicted_
+        # name_even_with_an_agreed_first_row_present`).
+        conflicted_rows = list(
+            session.query(db.ModelHash).filter(db.ModelHash.conflict == True).all()  # noqa: E712
+        )
 
         # M3 final-review fix: one worker query + one inventory parse per
         # worker for this whole call, instead of once per hash row below.
@@ -331,7 +385,27 @@ def entries(data_dir: str) -> list[dict]:
 
             row = _find_hash_row(hash_rows, name)
             if row is None:
+                # Phase 3.2: no learned consensus for this (curated or
+                # harvested) source. A conflicted row still excludes it
+                # outright -- consensus precedence never lets a curated
+                # guide hash paper over a genuine reporter disagreement.
+                if _find_hash_row(conflicted_rows, name) is not None:
+                    continue
+                if source.sha256 and source.size_bytes:
+                    guide_entry = _guide_hash_entry(signing_key, source)
+                    if guide_entry is not None:
+                        result.append(guide_entry)
                 continue
+
+            if source.sha256 and source.sha256 != row.sha256:
+                logger.warning(
+                    "model_manifest: guide sha256 for %s differs from the "
+                    "learned consensus (guide=%s consensus=%s) -- consensus "
+                    "wins, the manifest entry uses the learned hash",
+                    source.name,
+                    source.sha256,
+                    row.sha256,
+                )
 
             # Defensive: `|` is the field delimiter in the signed payload
             # below. `source.name`/`source.directory` should never
