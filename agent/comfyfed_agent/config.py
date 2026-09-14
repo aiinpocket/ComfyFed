@@ -122,6 +122,15 @@ class AgentConfig:
     # instead of exposing the listener to the internet the moment
     # `peer_serve` is enabled.
     peer_bind_host: str = "0.0.0.0"
+    # BOINC-style idle detection (2026-09-14 directive): while the human is
+    # actively using this machine, the agent reports `paused` instead of
+    # `idle` so the platform stops pushing NEW jobs at it. A job already
+    # running is never aborted. `idle_minutes` is how long input must have
+    # been quiet before the machine counts as free again. Machines where the
+    # OS cannot report last-input (headless, Wayland without XWayland) are
+    # treated as always idle -- see idle.seconds_since_input.
+    pause_when_active: bool = True
+    idle_minutes: float = 5.0
 
     @classmethod
     def load(cls, path: str) -> "AgentConfig":
@@ -155,6 +164,12 @@ class AgentConfig:
                 data.get("peer_advertise_host"), cls.peer_advertise_host
             ),
             peer_bind_host=_coerce_str(data.get("peer_bind_host"), cls.peer_bind_host),
+            pause_when_active=_coerce_bool(
+                data.get("pause_when_active"), cls.pause_when_active
+            ),
+            idle_minutes=_coerce_positive_float(
+                data.get("idle_minutes"), cls.idle_minutes
+            ),
         )
 
     def save(self, path: str) -> None:
@@ -179,6 +194,8 @@ class AgentConfig:
             "peer_listen_port": self.peer_listen_port,
             "peer_advertise_host": self.peer_advertise_host,
             "peer_bind_host": self.peer_bind_host,
+            "pause_when_active": self.pause_when_active,
+            "idle_minutes": self.idle_minutes,
         }
 
         tmp_path = f"{path}.tmp-{os.getpid()}"
