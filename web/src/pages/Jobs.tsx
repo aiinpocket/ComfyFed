@@ -57,6 +57,7 @@ import {
   type Backend,
   type Job,
   type RequirementsOverride,
+  type Role,
   type Worker,
 } from '../api';
 import { EmptyState, Mono, SectionHeader, TableSkeleton } from '../components/Primitives';
@@ -69,9 +70,17 @@ import { ProgressCell } from './Dashboard';
 
 const POLL_MS = 5000;
 
-export function Jobs() {
+interface JobsProps {
+  /** Only an admin's `GET /api/jobs` includes other users' rows, so the
+   * 使用者 column is admin-only -- a plain user's jobs are all their own
+   * already, and the server always echoes their own username there anyway. */
+  role: Role;
+}
+
+export function Jobs({ role }: JobsProps) {
   const { t } = useTranslation();
   const theme = useMantineTheme();
+  const isAdmin = role === 'admin';
 
   const loadAll = useCallback(
     async () => ({ jobs: await api.listJobs(), workers: await api.listWorkers() }),
@@ -110,7 +119,7 @@ export function Jobs() {
           }}
         >
           {loading ? (
-            <TableSkeleton rows={4} cols={6} />
+            <TableSkeleton rows={4} cols={isAdmin ? 7 : 6} />
           ) : jobs.length === 0 ? (
             <EmptyState
               icon={<IconInbox size={26} />}
@@ -118,7 +127,7 @@ export function Jobs() {
               description={t('jobs.empty_hint')}
             />
           ) : (
-            <JobsTable jobs={jobs} workers={workers} onChanged={refresh} />
+            <JobsTable jobs={jobs} workers={workers} onChanged={refresh} showUser={isAdmin} />
           )}
         </Card>
       </Stack>
@@ -566,10 +575,12 @@ function JobsTable({
   jobs,
   workers,
   onChanged,
+  showUser,
 }: {
   jobs: Job[];
   workers: Worker[];
   onChanged: () => void;
+  showUser: boolean;
 }) {
   const { t } = useTranslation();
   const theme = useMantineTheme();
@@ -616,6 +627,7 @@ function JobsTable({
           <Table.Tr>
             <Table.Th w={34} />
             <Table.Th>{t('jobs.col_id')}</Table.Th>
+            {showUser && <Table.Th>{t('jobs.col_username')}</Table.Th>}
             <Table.Th>{t('jobs.col_status')}</Table.Th>
             <Table.Th>{t('jobs.col_progress')}</Table.Th>
             <Table.Th>{t('jobs.col_worker')}</Table.Th>
@@ -652,6 +664,13 @@ function JobsTable({
                       </Mono>
                     </Anchor>
                   </Table.Td>
+                  {showUser && (
+                    <Table.Td>
+                      <Text size="sm" c={job.username ? undefined : 'dimmed'}>
+                        {job.username ?? '—'}
+                      </Text>
+                    </Table.Td>
+                  )}
                   <Table.Td>
                     <Group gap={6} wrap="nowrap">
                       <JobStatusBadge status={job.status} />
@@ -720,7 +739,11 @@ function JobsTable({
                 </Table.Tr>
                 {expandable && (
                   <Table.Tr>
-                    <Table.Td colSpan={7} p={0} style={{ borderBottom: isOpen ? undefined : 'none' }}>
+                    <Table.Td
+                      colSpan={showUser ? 8 : 7}
+                      p={0}
+                      style={{ borderBottom: isOpen ? undefined : 'none' }}
+                    >
                       <Collapse in={isOpen}>
                         {isOpen && <AssessmentPanel jobId={job.id} estVram={job.est_vram_gb} />}
                       </Collapse>

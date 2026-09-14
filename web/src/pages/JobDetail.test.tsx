@@ -120,12 +120,12 @@ function stubFetch(job: JobDetailType, opts: { workers?: Worker[]; artifacts?: R
   return fetchMock;
 }
 
-function renderDetail(id = BASE_JOB.id) {
+function renderDetail(id = BASE_JOB.id, role: 'admin' | 'user' = 'user') {
   return render(
     <MantineProvider theme={theme}>
       <MemoryRouter initialEntries={[`/jobs/${id}`]}>
         <Routes>
-          <Route path="/jobs/:id" element={<JobDetail />} />
+          <Route path="/jobs/:id" element={<JobDetail role={role} />} />
         </Routes>
       </MemoryRouter>
     </MantineProvider>,
@@ -231,5 +231,22 @@ describe('JobDetail', () => {
     renderDetail();
 
     expect(await screen.findByText('42s')).toBeInTheDocument();
+  });
+
+  it('shows the submitting user for an admin', async () => {
+    const jobWithUser: JobDetailType = { ...BASE_JOB, username: 'alice' };
+    stubFetch(jobWithUser);
+    renderDetail(BASE_JOB.id, 'admin');
+
+    expect(await screen.findByText('alice')).toBeInTheDocument();
+  });
+
+  it('does not show a submitting-user field for a plain user', async () => {
+    const jobWithUser: JobDetailType = { ...BASE_JOB, username: 'alice' };
+    stubFetch(jobWithUser);
+    renderDetail(BASE_JOB.id, 'user');
+
+    await screen.findByText(LONG_ERROR);
+    expect(screen.queryByText('alice')).not.toBeInTheDocument();
   });
 });

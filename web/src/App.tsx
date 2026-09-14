@@ -134,8 +134,8 @@ export function App() {
     >
       <Routes>
         <Route path="/dashboard" element={<Dashboard role={role} />} />
-        <Route path="/jobs" element={<Jobs />} />
-        <Route path="/jobs/:id" element={<JobDetail />} />
+        <Route path="/jobs" element={<Jobs role={role} />} />
+        <Route path="/jobs/:id" element={<JobDetail role={role} />} />
         {/* Admin-only: guarded at the route level, not just hidden from nav --
             a non-admin navigating here directly (deep link, back button)
             bounces to the dashboard instead of rendering a page whose
@@ -148,7 +148,7 @@ export function App() {
           path="/users"
           element={isAdmin ? <Users /> : <Navigate to="/dashboard" replace />}
         />
-        <Route path="/reports" element={<Reports />} />
+        <Route path="/reports" element={<Reports role={role} />} />
         <Route path="/settings" element={<Settings platformUrl={platformUrl} role={role} />} />
         <Route path="*" element={<Navigate to="/dashboard" replace />} />
       </Routes>

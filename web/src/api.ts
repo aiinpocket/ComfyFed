@@ -190,6 +190,13 @@ export interface Job {
   input_assets: string[];
   est_vram_gb: number | null;
   /**
+   * Who submitted the job (Phase 3.0 multi-user). Admins get every job's
+   * `username`; a plain user's own `GET /api/jobs` always echoes their own
+   * username (never null) since they only ever see their own jobs. Null
+   * shows up only for an admin viewing a pre-Phase-3.0 job with no owner.
+   */
+  username?: string | null;
+  /**
    * Present only while a worker is fetching a missing model for this job
    * (Phase 2.1 model auto-fetch). Absent the rest of the time, in which case
    * rendering falls back to the plain progress bar.
@@ -267,6 +274,33 @@ export interface Contribution {
   name: string;
   jobs: number;
   gpu_seconds: number;
+}
+
+/** Row shape shared by `GET /api/reports/usage` (one per user) and
+ * `GET /api/reports/my-usage` (the caller's own row). `username` is `null`
+ * for the single aggregate row of pre-Phase-3.0 receipts whose job has no
+ * `user_id` -- rendered as "(historical)" rather than dropped. */
+export interface UsageRow {
+  user_id: string | null;
+  username: string | null;
+  jobs: number;
+  gpu_seconds: number;
+  unbilled_gpu_seconds: number;
+}
+
+/** One worker's share of a payout pool, from `GET /api/reports/payout`. */
+export interface PayoutWorker {
+  worker_id: string;
+  name: string;
+  gpu_seconds: number;
+  ratio: number;
+  amount: number;
+}
+
+export interface PayoutResult {
+  total_gpu_seconds: number;
+  pool: number;
+  workers: PayoutWorker[];
 }
 
 /** Compute backends a job can be pinned to via the advanced override. */
@@ -403,6 +437,35 @@ export const api = {
     if (to) params.set('to', to);
     const query = params.toString();
     return getJson<Contribution[]>(`/api/reports/contributions${query ? `?${query}` : ''}`);
+  },
+
+  /** GET /api/reports/usage (admin-only). Per-user aggregate, one row per
+   * user plus (when present) one `username: null` row for legacy receipts. */
+  reportUsage(from?: string, to?: string): Promise<UsageRow[]> {
+    const params = new URLSearchParams();
+    if (from) params.set('from', from);
+    if (to) params.set('to', to);
+    const query = params.toString();
+    return getJson<UsageRow[]>(`/api/reports/usage${query ? `?${query}` : ''}`);
+  },
+
+  /** GET /api/reports/my-usage (any signed-in user): the caller's own row. */
+  reportMyUsage(from?: string, to?: string): Promise<UsageRow> {
+    const params = new URLSearchParams();
+    if (from) params.set('from', from);
+    if (to) params.set('to', to);
+    const query = params.toString();
+    return getJson<UsageRow>(`/api/reports/my-usage${query ? `?${query}` : ''}`);
+  },
+
+  /** GET /api/reports/payout (admin-only). `pool` is the raw currency-
+   * agnostic amount to split across workers by billable GPU-second share. */
+  reportPayout(pool: number, from?: string, to?: string): Promise<PayoutResult> {
+    const params = new URLSearchParams();
+    params.set('pool', String(pool));
+    if (from) params.set('from', from);
+    if (to) params.set('to', to);
+    return getJson<PayoutResult>(`/api/reports/payout?${params.toString()}`);
   },
 
   async listUsers(): Promise<AppUser[]> {

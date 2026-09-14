@@ -103,11 +103,11 @@ function jsonResponse(body: unknown, status = 200): Response {
   });
 }
 
-function renderJobs() {
+function renderJobs(role: 'admin' | 'user' = 'user') {
   return render(
     <MantineProvider theme={theme}>
       <MemoryRouter>
-        <Jobs />
+        <Jobs role={role} />
       </MemoryRouter>
     </MantineProvider>,
   );
@@ -244,5 +244,34 @@ describe('Jobs page: cancellation', () => {
       return url.endsWith('/cancel');
     });
     expect(cancelCalls).toHaveLength(0);
+  });
+});
+
+describe('Jobs page: 使用者 column (Task 8)', () => {
+  afterEach(() => {
+    cleanup();
+    vi.unstubAllGlobals();
+  });
+
+  const JOB_WITH_USER: Job = { ...RUNNING_JOB, username: 'alice' };
+  const JOB_LEGACY: Job = { ...DONE_JOB, id: 'job-legacy-0005', username: null };
+
+  it('shows the 使用者 column for an admin, including a dash for a null username', async () => {
+    stubFetch([[JOB_WITH_USER, JOB_LEGACY]]);
+    renderJobs('admin');
+
+    expect(await screen.findByText('Username')).toBeInTheDocument();
+    expect(await screen.findByText('alice')).toBeInTheDocument();
+    // The legacy job's null username renders as a muted dash, not blank/undefined.
+    expect(screen.getAllByText('—').length).toBeGreaterThan(0);
+  });
+
+  it('hides the 使用者 column entirely for a plain user', async () => {
+    stubFetch([[JOB_WITH_USER]]);
+    renderJobs('user');
+
+    await screen.findByText('Running');
+    expect(screen.queryByText('Username')).not.toBeInTheDocument();
+    expect(screen.queryByText('alice')).not.toBeInTheDocument();
   });
 });
