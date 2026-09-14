@@ -184,4 +184,34 @@ describe('Users page: error mapping', () => {
       await screen.findByText('The last active admin cannot be disabled or demoted.'),
     ).toBeInTheDocument();
   });
+
+  it('surfaces the translated last_admin message when demoting the last admin is rejected', async () => {
+    const fetchMock = vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+      const url = typeof input === 'string' ? input : input.toString();
+      const method = init?.method ?? 'GET';
+      if (url === '/api/users' && method === 'GET') {
+        return jsonResponse({ users: [ADMIN_USER] });
+      }
+      if (url === `/api/users/${ADMIN_USER.id}` && method === 'PATCH') {
+        const body = JSON.parse(String(init?.body));
+        expect(body.role).toBe('user');
+        return jsonResponse({ error: { code: 'last_admin', message: 'Cannot disable or demote the only active admin.' } }, 400);
+      }
+      return jsonResponse({ error: { code: 'http_error', message: 'not stubbed' } }, 404);
+    });
+    vi.stubGlobal('fetch', fetchMock);
+
+    renderUsers();
+    await screen.findByText('alice');
+
+    fireEvent.click(screen.getByRole('button', { name: 'Make regular user' }));
+
+    const dialog = await screen.findByRole('dialog');
+    const confirmButton = within(dialog).getByRole('button', { name: 'Save' });
+    fireEvent.click(confirmButton);
+
+    expect(
+      await screen.findByText('The last active admin cannot be disabled or demoted.'),
+    ).toBeInTheDocument();
+  });
 });

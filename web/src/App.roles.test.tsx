@@ -78,6 +78,12 @@ function stubFetch(role: 'admin' | 'user') {
       }
       return jsonResponse([]);
     }
+    if (url === '/api/users' && method === 'GET') {
+      if (role !== 'admin') {
+        return jsonResponse({ error: { code: 'auth.forbidden', message: 'Admin role required.' } }, 403);
+      }
+      return jsonResponse({ users: [] });
+    }
     return jsonResponse({ error: { code: 'http_error', message: 'not stubbed' } }, 404);
   });
   vi.stubGlobal('fetch', fetchMock);
@@ -112,5 +118,25 @@ describe('App: role-based navigation and route guards', () => {
 
     expect(await screen.findByText('Registered GPU workers in this federation.')).toBeInTheDocument();
     expect(screen.getByRole('link', { name: /Workers/i })).toBeInTheDocument();
+  });
+
+  it('a "user" role has no Users nav item and is redirected from /users to /dashboard', async () => {
+    const fetchMock = stubFetch('user');
+    renderApp('/users');
+
+    expect(await screen.findByText('Dashboard')).toBeInTheDocument();
+    expect(screen.queryByText('Manage login accounts for this federation console.')).not.toBeInTheDocument();
+
+    expect(screen.queryByRole('link', { name: /Users/i })).not.toBeInTheDocument();
+
+    expect(fetchMock).not.toHaveBeenCalledWith('/api/users', expect.anything());
+  });
+
+  it('an "admin" role sees the Users nav item and /users renders the page', async () => {
+    stubFetch('admin');
+    renderApp('/users');
+
+    expect(await screen.findByText('Manage login accounts for this federation console.')).toBeInTheDocument();
+    expect(screen.getByRole('link', { name: /Users/i })).toBeInTheDocument();
   });
 });

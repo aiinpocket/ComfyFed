@@ -8,6 +8,7 @@ import {
   CopyButton,
   Group,
   Modal,
+  PasswordInput,
   Select,
   Stack,
   Table,
@@ -356,6 +357,8 @@ export function Users() {
         onClose={() => setOneTimePassword(null)}
         title={t('users.password_modal_title')}
         size="sm"
+        closeOnClickOutside={false}
+        closeOnEscape={false}
       >
         {oneTimePassword && (
           <Stack gap="md">
@@ -480,7 +483,7 @@ function CreateUserModal({ opened, onClose, onCreated, onShowOneTimePassword }: 
           ]}
           allowDeselect={false}
         />
-        <TextInput
+        <PasswordInput
           label={t('users.password_label')}
           placeholder={t('users.password_placeholder')}
           description={t('users.password_hint')}

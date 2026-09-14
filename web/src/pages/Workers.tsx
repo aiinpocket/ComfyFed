@@ -295,7 +295,14 @@ function AddWorkerModal({ opened, onClose, onCreated }: AddWorkerModalProps) {
   };
 
   return (
-    <Modal opened={opened} onClose={close} title={t('workers.add_title')} size="lg">
+    <Modal
+      opened={opened}
+      onClose={close}
+      title={t('workers.add_title')}
+      size="lg"
+      closeOnClickOutside={bundle === null}
+      closeOnEscape={bundle === null}
+    >
       {bundle === null ? (
         <Stack gap="md">
           <Text size="sm" c="dimmed">
