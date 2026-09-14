@@ -1,0 +1,5 @@
+# Installer scripts must keep their native line endings regardless of the
+# checkout platform: a CRLF install.sh piped into bash dies on '\r'.
+server/comfyfed_server/installers/install.sh text eol=lf
+server/comfyfed_server/installers/install.cmd text eol=crlf
+server/comfyfed_server/installers/install.ps1 text eol=lf

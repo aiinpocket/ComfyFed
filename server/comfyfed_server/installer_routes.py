@@ -54,8 +54,19 @@ def installers_dir() -> str:
 
 
 def _read_template(filename: str) -> str:
+    """Read a bundled installer script.
+
+    `install.sh` is normalized to LF unconditionally: a Windows checkout
+    (or a zealous git autocrlf) that turns it into CRLF would otherwise be
+    served verbatim and die inside `bash` on the stray carriage returns.
+    """
     path = resources.files(__package__).joinpath(_INSTALLERS_DIRNAME).joinpath(filename)
-    return path.read_text(encoding="utf-8")
+    text = path.read_text(encoding="utf-8")
+    if filename.endswith(".sh"):
+        text = text.replace("
+", "
+")
+    return text
 
 
 def create_router(data_dir: str) -> APIRouter:
