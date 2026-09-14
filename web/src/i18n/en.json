@@ -34,6 +34,8 @@
   },
   "login": {
     "subtitle": "Sign in to manage your GPU federation.",
+    "username": "Username",
+    "username_placeholder": "Enter your username",
     "password": "Admin password",
     "password_placeholder": "Enter the admin password",
     "submit": "Sign in",

@@ -25,7 +25,7 @@ import {
 import { useCallback } from 'react';
 import { useTranslation } from 'react-i18next';
 
-import { api, type Job, type Worker } from '../api';
+import { api, type Job, type Role, type Worker } from '../api';
 import {
   CardSkeleton,
   EmptyState,
@@ -49,17 +49,26 @@ const BACKEND_COLORS: Record<string, string> = {
   cpu: 'gray',
 };
 
-export function Dashboard() {
+interface DashboardProps {
+  /** Non-admins can't call `GET /api/workers` (403) -- their federation-wide
+   * worker fleet isn't their concern anyway, so this skips that fetch and the
+   * worker-facing stats/section below rather than spamming 403s. Their own
+   * jobs still come through `GET /api/jobs`, which is scoped server-side. */
+  role: Role;
+}
+
+export function Dashboard({ role }: DashboardProps) {
   const { t } = useTranslation();
   const theme = useMantineTheme();
+  const isAdmin = role === 'admin';
 
-  const loadAll = useCallback(
-    async () => ({
-      workers: await api.listWorkers(),
-      jobs: await api.listJobs(ACTIVE_STATUSES),
-    }),
-    [],
-  );
+  const loadAll = useCallback(async () => {
+    const [workers, jobs] = await Promise.all([
+      isAdmin ? api.listWorkers() : Promise.resolve<Worker[]>([]),
+      api.listJobs(ACTIVE_STATUSES),
+    ]);
+    return { workers, jobs };
+  }, [isAdmin]);
 
   const { data, loading, error } = usePolling(loadAll, POLL_MS);
 
@@ -90,21 +99,25 @@ export function Dashboard() {
         </Alert>
       )}
 
-      <SimpleGrid cols={{ base: 2, md: 4 }} spacing="md">
-        <StatCard
-          label={t('dashboard.stat_online')}
-          value={onlineCount}
-          icon={<IconCircleCheck size={19} />}
-          color="teal"
-          loading={loading}
-        />
-        <StatCard
-          label={t('dashboard.stat_busy')}
-          value={busyCount}
-          icon={<IconBolt size={19} />}
-          color="yellow"
-          loading={loading}
-        />
+      <SimpleGrid cols={{ base: 2, md: isAdmin ? 4 : 2 }} spacing="md">
+        {isAdmin && (
+          <>
+            <StatCard
+              label={t('dashboard.stat_online')}
+              value={onlineCount}
+              icon={<IconCircleCheck size={19} />}
+              color="teal"
+              loading={loading}
+            />
+            <StatCard
+              label={t('dashboard.stat_busy')}
+              value={busyCount}
+              icon={<IconBolt size={19} />}
+              color="yellow"
+              loading={loading}
+            />
+          </>
+        )}
         <StatCard
           label={t('dashboard.stat_queued')}
           value={queuedCount}
@@ -121,33 +134,35 @@ export function Dashboard() {
         />
       </SimpleGrid>
 
-      <Stack gap="sm">
-        <Text fw={600} fz="md">
-          {t('dashboard.workers_heading')}
-        </Text>
+      {isAdmin && (
+        <Stack gap="sm">
+          <Text fw={600} fz="md">
+            {t('dashboard.workers_heading')}
+          </Text>
 
-        {loading ? (
-          <SimpleGrid cols={{ base: 1, sm: 2, lg: 3 }} spacing="md">
-            <CardSkeleton />
-            <CardSkeleton />
-            <CardSkeleton />
-          </SimpleGrid>
-        ) : workers.length === 0 ? (
-          <Card style={{ background: theme.other.surfaces.card, borderColor: theme.other.surfaces.border }}>
-            <EmptyState
-              icon={<IconDeviceDesktopOff size={26} />}
-              title={t('dashboard.no_workers')}
-              description={t('dashboard.no_workers_hint')}
-            />
-          </Card>
-        ) : (
-          <SimpleGrid cols={{ base: 1, sm: 2, lg: 3 }} spacing="md">
-            {workers.map((worker) => (
-              <WorkerCard key={worker.id} worker={worker} job={jobByWorker.get(worker.id) ?? null} />
-            ))}
-          </SimpleGrid>
-        )}
-      </Stack>
+          {loading ? (
+            <SimpleGrid cols={{ base: 1, sm: 2, lg: 3 }} spacing="md">
+              <CardSkeleton />
+              <CardSkeleton />
+              <CardSkeleton />
+            </SimpleGrid>
+          ) : workers.length === 0 ? (
+            <Card style={{ background: theme.other.surfaces.card, borderColor: theme.other.surfaces.border }}>
+              <EmptyState
+                icon={<IconDeviceDesktopOff size={26} />}
+                title={t('dashboard.no_workers')}
+                description={t('dashboard.no_workers_hint')}
+              />
+            </Card>
+          ) : (
+            <SimpleGrid cols={{ base: 1, sm: 2, lg: 3 }} spacing="md">
+              {workers.map((worker) => (
+                <WorkerCard key={worker.id} worker={worker} job={jobByWorker.get(worker.id) ?? null} />
+              ))}
+            </SimpleGrid>
+          )}
+        </Stack>
+      )}
 
       <Stack gap="sm">
         <Text fw={600} fz="md">

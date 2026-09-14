@@ -123,8 +123,14 @@ export interface SetupStatus {
   needed: boolean;
 }
 
+/** Phase 3.0 multi-user roles: `admin` sees everything, `user` is scoped to
+ * their own jobs and a reduced nav/settings surface. */
+export type Role = 'admin' | 'user';
+
 export interface MeResponse {
   authenticated: boolean;
+  username?: string;
+  role?: Role | string;
   lang: string;
   platform_url?: string;
 }
@@ -283,11 +289,11 @@ export const api = {
     return postJson('/api/setup', { token, password });
   },
 
-  async login(password: string): Promise<void> {
+  async login(username: string, password: string): Promise<void> {
     const result = await request<{ csrf: string }>(
       'POST',
       '/api/auth/login',
-      JSON.stringify({ password }),
+      JSON.stringify({ username, password }),
       { 'Content-Type': 'application/json' },
     );
     setCsrf(result.csrf);

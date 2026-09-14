@@ -9,9 +9,10 @@ import {
   SegmentedControl,
   Stack,
   Text,
+  TextInput,
   useMantineTheme,
 } from '@mantine/core';
-import { IconAlertTriangle, IconLock } from '@tabler/icons-react';
+import { IconAlertTriangle, IconLock, IconUser } from '@tabler/icons-react';
 import { useState } from 'react';
 import { useTranslation } from 'react-i18next';
 
@@ -26,17 +27,18 @@ interface LoginProps {
 export function Login({ onAuthenticated }: LoginProps) {
   const { t, i18n } = useTranslation();
   const theme = useMantineTheme();
+  const [username, setUsername] = useState('');
   const [password, setPassword] = useState('');
   const [errorCode, setErrorCode] = useState<string | null>(null);
   const [busy, setBusy] = useState(false);
 
   const submit = async (event: React.FormEvent) => {
     event.preventDefault();
-    if (!password || busy) return;
+    if (!username || !password || busy) return;
     setBusy(true);
     setErrorCode(null);
     try {
-      await api.login(password);
+      await api.login(username, password);
       setPassword('');
       onAuthenticated();
     } catch (error) {
@@ -75,15 +77,26 @@ export function Login({ onAuthenticated }: LoginProps) {
           >
             <form onSubmit={submit}>
               <Stack gap="md">
+                <TextInput
+                  label={t('login.username')}
+                  placeholder={t('login.username_placeholder')}
+                  leftSection={<IconUser size={16} />}
+                  value={username}
+                  onChange={(event) => setUsername(event.currentTarget.value)}
+                  autoFocus
+                  autoComplete="username"
+                  size="md"
+                  data-autofocus
+                />
+
                 <PasswordInput
                   label={t('login.password')}
                   placeholder={t('login.password_placeholder')}
                   leftSection={<IconLock size={16} />}
                   value={password}
                   onChange={(event) => setPassword(event.currentTarget.value)}
-                  autoFocus
+                  autoComplete="current-password"
                   size="md"
-                  data-autofocus
                 />
 
                 {errorCode && (
@@ -100,7 +113,13 @@ export function Login({ onAuthenticated }: LoginProps) {
                   </Alert>
                 )}
 
-                <Button type="submit" size="md" loading={busy} disabled={!password} fullWidth>
+                <Button
+                  type="submit"
+                  size="md"
+                  loading={busy}
+                  disabled={!username || !password}
+                  fullWidth
+                >
                   {t('login.submit')}
                 </Button>
               </Stack>
