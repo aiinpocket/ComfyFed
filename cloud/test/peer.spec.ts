@@ -135,6 +135,40 @@ describe("POST /api/agent/peer-grant", () => {
     expect(await verifyHex(pubkeyHex, new TextEncoder().encode(payload), g.sig)).toBe(true);
   });
 
+  it("expires_at is exactly GRANT_TTL_SECONDS (600) ahead of issuance", async () => {
+    const puller = await registerWorker("puller", 0);
+    const seeder = await registerWorker("seeder", 1);
+    const sha = await shaHex("model-a");
+    const sizeBytes = bytesFor(1.0);
+    await modelManifest.recordHash(db(), "some-worker", "loras/a.safetensors", sizeBytes, sha);
+    await makeSeeder(seeder, [{ name: "loras/a.safetensors", size_bytes: sizeBytes, sha256: sha }]);
+
+    const before = Math.floor(Date.now() / 1000);
+    const r = await signedPost(puller, "/api/agent/peer-grant", { name: "loras/a.safetensors", size_bytes: sizeBytes });
+    const after = Math.floor(Date.now() / 1000);
+    expect(r.status).toBe(200);
+
+    // expires_at = floor(issuance time) + 600 -- pin the delta against the
+    // request's own before/after bracket rather than a fixed clock read, so
+    // this isn't flaky under real (if tiny) test-runner scheduling jitter.
+    expect(r.body.grant.expires_at).toBeGreaterThanOrEqual(before + 600);
+    expect(r.body.grant.expires_at).toBeLessThanOrEqual(after + 600);
+  });
+
+  it("chunk_sha256s is null in the response when no chunk list was ever established", async () => {
+    const puller = await registerWorker("puller", 0);
+    const seeder = await registerWorker("seeder", 1);
+    const sha = await shaHex("model-a");
+    const sizeBytes = bytesFor(1.0);
+    // No chunk list passed to recordHash -- model_hashes.chunk_sha256s stays NULL.
+    await modelManifest.recordHash(db(), "some-worker", "loras/a.safetensors", sizeBytes, sha);
+    await makeSeeder(seeder, [{ name: "loras/a.safetensors", size_bytes: sizeBytes, sha256: sha }]);
+
+    const r = await signedPost(puller, "/api/agent/peer-grant", { name: "loras/a.safetensors", size_bytes: sizeBytes });
+    expect(r.status).toBe(200);
+    expect(r.body.chunk_sha256s).toBeNull();
+  });
+
   it("404s peer.no_model when there's no consensus hash for the requested (name, size)", async () => {
     const puller = await registerWorker("puller", 0);
     const r = await signedPost(puller, "/api/agent/peer-grant", { name: "unknown.safetensors", size_bytes: 123 });
