@@ -310,6 +310,69 @@ def test_ps1_parses_via_powershell_tokenizer():
     assert result.returncode == 0, result.stderr
 
 
+def test_agent_plist_keeps_alive_only_on_failure():
+    """Final review M3/L8: the agent's launchd job must NOT be resurrected
+    after a clean `comfyfed stop` -- so its KeepAlive is the SuccessfulExit
+    dict, while ComfyUI's job keeps the plain always-on KeepAlive."""
+    text = open(_source_path("install.sh"), encoding="utf-8").read()
+
+    def _heredoc(plist_name: str) -> str:
+        marker = f'cat > "$LAUNCH_AGENTS_DIR/{plist_name}" <<PLISTEOF'
+        return text.split(marker, 1)[1].split("PLISTEOF", 1)[0]
+
+    agent_block = _heredoc("com.comfyfed.agent.plist")
+    assert "<key>KeepAlive</key>" in agent_block
+    assert "<key>SuccessfulExit</key><false/>" in agent_block
+
+    comfyui_block = _heredoc("com.comfyfed.comfyui.plist")
+    assert "<key>KeepAlive</key><true/>" in comfyui_block
+    assert "SuccessfulExit" not in comfyui_block
+
+
+def test_agent_plist_is_unloaded_before_it_is_rewritten():
+    """`launchctl load -w` on an already-loaded job is a no-op, so an upgrade
+    would keep the old KeepAlive definition without this."""
+    text = open(_source_path("install.sh"), encoding="utf-8").read()
+    unload = 'launchctl unload -w "$LAUNCH_AGENTS_DIR/com.comfyfed.agent.plist" 2>/dev/null || true'
+    assert unload in text
+    assert text.index(unload) < text.index('cat > "$LAUNCH_AGENTS_DIR/com.comfyfed.agent.plist"')
+
+
+def test_sh_guards_the_local_bin_link_and_hints_about_path():
+    text = open(_source_path("install.sh"), encoding="utf-8").read()
+    # Guarded: `set -euo pipefail` must not abort the install on a step the
+    # script itself calls non-fatal.
+    assert 'if mkdir -p "$HOME/.local/bin" 2>/dev/null && ln -sf' in text
+    assert '*":$HOME/.local/bin:"*' in text
+    assert "不在 PATH 上" in text
+    assert "is not on your PATH" in text
+
+
+def test_ps1_writes_the_cmd_shim_and_registry_path_inside_try():
+    """Final review M1/M2/L8: the shim + PATH block is genuinely best-effort
+    (everything inside `try`, under $ErrorActionPreference='Stop'), and the
+    user PATH is written through the registry with its existing value kind
+    so REG_EXPAND_SZ entries survive."""
+    text = open(_source_path("install.ps1"), encoding="utf-8").read()
+    shim_start = text.index("$shimContent = ")
+    bin_dir_start = text.index("$binDir = Join-Path $InstallDir 'bin'")
+    try_start = text.rindex("try {", 0, bin_dir_start)
+    # Nothing between the opening `try {` and the shim write escapes it.
+    assert try_start < bin_dir_start < shim_start
+    assert "Set-Content -Path (Join-Path $binDir 'comfyfed.cmd')" in text
+
+    assert "[Microsoft.Win32.Registry]::CurrentUser.OpenSubKey('Environment', $true)" in text
+    assert "$envKey.GetValue('Path', '', 'DoNotExpandEnvironmentNames')" in text
+    assert "$envKey.GetValueKind('Path')" in text
+    assert "$envKey.SetValue('Path', $newUserPath, $pathKind)" in text
+    assert "[Microsoft.Win32.RegistryValueKind]::ExpandString" in text
+    # The destructive .NET convenience API must be gone.
+    assert "[Environment]::SetEnvironmentVariable('Path'" not in text
+    # PS 5.1: no pipeline chain operators, no ternary.
+    registry_block = text[text.index("$envKey = "):text.index("$envKey.SetValue")]
+    assert "&&" not in registry_block
+
+
 def test_install_cmd_stored_with_crlf():
     """`install.cmd` is a Windows batch file -- pin it to CRLF line endings."""
     raw = open(_source_path("install.cmd"), "rb").read()

@@ -198,11 +198,15 @@ Remove-Item -Force $wheelFile -ErrorAction SilentlyContinue
 # way *nix venvs do, so drop a tiny .cmd shim in a per-app bin dir and add
 # that dir to the user PATH. Both steps are best-effort -- a machine where
 # PATH can't be changed (locked-down policy, etc.) must not fail the install.
-$binDir = Join-Path $InstallDir 'bin'
-New-Item -ItemType Directory -Force -Path $binDir | Out-Null
-$venvRelative = $VenvDir.Substring($env:LOCALAPPDATA.TrimEnd('\').Length).TrimStart('\')
-$shimContent = "@`"%LOCALAPPDATA%\$venvRelative\Scripts\comfyfed.exe`" %*"
+# EVERY statement here is inside a try: with $ErrorActionPreference='Stop'
+# and StrictMode, a locked bin directory or an empty $env:LOCALAPPDATA would
+# otherwise kill the installer after the wheel went in but before autostart
+# was registered, leaving a half-configured machine.
 try {
+    $binDir = Join-Path $InstallDir 'bin'
+    New-Item -ItemType Directory -Force -Path $binDir | Out-Null
+    $venvRelative = $VenvDir.Substring($env:LOCALAPPDATA.TrimEnd('\').Length).TrimStart('\')
+    $shimContent = "@`"%LOCALAPPDATA%\$venvRelative\Scripts\comfyfed.exe`" %*"
     Set-Content -Path (Join-Path $binDir 'comfyfed.cmd') -Value $shimContent -Encoding ASCII
     Write-Bilingual '已建立 comfyfed 指令' 'Created the comfyfed command'
 } catch {
@@ -210,14 +214,31 @@ try {
 }
 
 try {
-    $currentUserPath = [Environment]::GetEnvironmentVariable('Path', 'User')
-    if ($null -eq $currentUserPath) { $currentUserPath = '' }
-    $alreadyOnPath = $currentUserPath.ToLower().Contains($binDir.ToLower())
-    if (-not $alreadyOnPath) {
-        $newUserPath = $binDir
-        if ($currentUserPath.Length -gt 0) { $newUserPath = "$currentUserPath;$binDir" }
-        [Environment]::SetEnvironmentVariable('Path', $newUserPath, 'User')
-        Write-Bilingual '已將 comfyfed 加入使用者 PATH（需重開終端機才會生效）' 'Added comfyfed to the user PATH (restart your terminal for it to take effect)'
+    $binDir = Join-Path $InstallDir 'bin'
+    # The raw registry value, NOT [Environment]::GetEnvironmentVariable:
+    # that one returns the EXPANDED Path and SetEnvironmentVariable writes it
+    # back as REG_SZ, which permanently freezes legitimate %JAVA_HOME%\bin /
+    # %USERPROFILE%\bin entries this installer does not own. Read without
+    # expanding, write back with the kind the value already had.
+    $envKey = [Microsoft.Win32.Registry]::CurrentUser.OpenSubKey('Environment', $true)
+    try {
+        $currentUserPath = $envKey.GetValue('Path', '', 'DoNotExpandEnvironmentNames')
+        if ($null -eq $currentUserPath) { $currentUserPath = '' }
+        try {
+            $pathKind = $envKey.GetValueKind('Path')
+        } catch {
+            # No user Path yet: create it expandable, like Windows does.
+            $pathKind = [Microsoft.Win32.RegistryValueKind]::ExpandString
+        }
+        $alreadyOnPath = $currentUserPath.ToLower().Contains($binDir.ToLower())
+        if (-not $alreadyOnPath) {
+            $newUserPath = $binDir
+            if ($currentUserPath.Length -gt 0) { $newUserPath = "$currentUserPath;$binDir" }
+            $envKey.SetValue('Path', $newUserPath, $pathKind)
+            Write-Bilingual '已將 comfyfed 加入使用者 PATH（需重開終端機才會生效）' 'Added comfyfed to the user PATH (restart your terminal for it to take effect)'
+        }
+    } finally {
+        if ($null -ne $envKey) { $envKey.Close() }
     }
 } catch {
     Write-Host "[警告/WARNING] 無法更新使用者 PATH / could not update the user PATH" -ForegroundColor Yellow

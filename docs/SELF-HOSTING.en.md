@@ -159,16 +159,27 @@ The agent has BOINC-style idle detection built in, **on by default**: whenever i
 comfyfed pause    # stop taking new jobs (any job already running finishes normally)
 comfyfed resume   # start taking new jobs again
 comfyfed status   # show the current state (available / paused-manual / paused-active, plus whether a job is running)
-comfyfed stop     # ask the agent to shut down gracefully (same as Ctrl-C in its terminal)
+comfyfed stop     # ask the agent to shut down gracefully: the running job is cancelled and cleaned up (same as Ctrl-C in its terminal)
 ```
 
+**`stop` does not wait for the running job.** It runs exactly the `Ctrl-C` wind-down — ask ComfyUI to interrupt, clean up the temp files, exit — and the platform requeues that job onto another worker after its stale-job timeout. To drain first, do it in this order: `comfyfed pause` → wait until `comfyfed status` no longer reports `busy` → `comfyfed stop`.
+
 (`comfyfed` is on PATH after the one-line installer runs; the manual-install flow uses the same binary under the name `comfyfed-agent` — they're the same commands.)
+
+**Pause needs a platform on this release or newer.** `paused` is a heartbeat state added in 0.1.2; an older platform does not recognise it and keeps dispatching. A new agent against an old platform means pause silently has no effect — upgrade the platform side first.
 
 Idle-detection settings live in `agent.json`: `pause_when_active` (default `true`) toggles activity detection on/off, and `idle_minutes` (default `5`) is how many consecutive minutes without any keyboard/mouse input count as idle — while the last input is more recent than that, the agent treats the user as active and pauses intake, resuming once the machine has been idle that long. After editing `agent.json` by hand, restart the agent for the change to take effect.
 
 **When activity can't be detected, the worker is always treated as idle and keeps accepting jobs**: headless machines (no display/keyboard/mouse) and Wayland desktops without XWayland give the agent no signal to read, so detection failure never makes a worker unschedulable — it just behaves as if pause-when-active is off.
 
 **Windows: can't find the `comfyfed` command?** The terminal window the installer ran in doesn't pick up the new PATH entry — that's expected. Close it and open a new terminal.
+
+**macOS / Linux: can't find the `comfyfed` command?** The installer links it into `~/.local/bin`, which is not on the default PATH on macOS (stock `/etc/paths`) or on minimal Linux images (the installer says so when it notices). Add it:
+
+```bash
+echo 'export PATH="$HOME/.local/bin:$PATH"' >> ~/.zshrc   # bash: ~/.bashrc
+exec $SHELL -l
+```
 
 ### Job dispatch: light jobs go to weak GPUs first
 
