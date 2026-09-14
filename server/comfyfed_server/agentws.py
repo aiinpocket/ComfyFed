@@ -229,7 +229,7 @@ class _Connection:
     ws: WebSocket
     worker_id: str
     loop: asyncio.AbstractEventLoop
-    state: str = "idle"  # idle | busy | dispatched
+    state: str = "idle"  # idle | busy | dispatched | paused
     # Agent protocol version from `hello.protocol`, defaulting to 1 (never
     # sent a hello, or an old agent that doesn't send the field at all) --
     # see `_handle_hello` and `_send_job_cancelled`.

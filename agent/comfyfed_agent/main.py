@@ -144,10 +144,13 @@ def _cmd_resume(args: argparse.Namespace) -> None:
 def _cmd_stop(args: argparse.Namespace) -> None:
     control.request_stop(_config_dir(args))
     print(
-        "已要求 agent 結束（進行中的工作會先跑完）。開機自啟仍在：下次登入／開機會再啟動；"
-        "要恢復請執行 comfyfed resume 前先手動啟動，或重新登入。/ "
-        "Stop requested; the running job finishes first. Autostart remains: "
-        "the agent returns at next logon/boot."
+        "已要求 agent 結束：進行中的工作會被取消並清理（等同按 Ctrl-C）。"
+        "想讓工作跑完再停，請先 comfyfed pause，用 comfyfed status 等到不是 busy，再 comfyfed stop。"
+        "開機自啟仍在：下次登入／開機會再啟動。/ "
+        "Stop requested: the running job is gracefully cancelled and cleaned up "
+        "(same as Ctrl-C). To drain first, run 'comfyfed pause', wait until "
+        "'comfyfed status' no longer reports busy, then 'comfyfed stop'. "
+        "Autostart remains: the agent returns at next logon/boot."
     )
 
 
@@ -166,6 +169,29 @@ def _state_age_seconds(state: dict) -> float | None:
     return (datetime.now(timezone.utc) - parsed).total_seconds()
 
 
+_AVAILABILITY_TEXT = {
+    "available": "可接新工作 / available",
+    "paused-manual": "手動暫停中 / paused-manual",
+    "paused-active": "偵測到有人在用這台電腦 / paused-active",
+}
+
+
+def _availability_now(args: argparse.Namespace, config_dir: str) -> str | None:
+    """`control.availability` evaluated right now, from this terminal.
+
+    The state file only says what the agent last published (up to a tick
+    old, and nothing at all while it is not running); the verdict itself is
+    a pure function of the pause file plus idle detection, so `status` can
+    -- and the docs promise it does -- compute it live. `None` when the
+    config cannot be read, in which case the caller just omits the line.
+    """
+    try:
+        cfg = AgentConfig.load(args.config)
+    except Exception:
+        return None
+    return control.availability(cfg, config_dir)
+
+
 def _cmd_status(args: argparse.Namespace) -> None:
     config_dir = _config_dir(args)
     paused = control.is_pause_requested(config_dir)
@@ -180,6 +206,13 @@ def _cmd_status(args: argparse.Namespace) -> None:
         print(f"agent 執行中，狀態：{reported} / agent running, state: {reported}")
         if job_id:
             print(f"進行中的工作 / running job: {job_id}")
+
+    verdict = _availability_now(args, config_dir)
+    if verdict is not None:
+        print(
+            f"目前可用狀態：{verdict}（{_AVAILABILITY_TEXT.get(verdict, verdict)}） / "
+            f"availability now: {verdict}"
+        )
 
     if paused:
         print(
@@ -211,7 +244,7 @@ def cli() -> None:
         ("pause", "暫停接收新工作 / Stop accepting new jobs (the running job finishes).", _cmd_pause),
         ("resume", "恢復接收新工作 / Accept new jobs again.", _cmd_resume),
         ("status", "顯示 agent 狀態 / Show the agent's current state.", _cmd_status),
-        ("stop", "要求 agent 結束 / Ask a running agent to shut down gracefully.", _cmd_stop),
+        ("stop", "要求 agent 結束（取消進行中的工作，等同 Ctrl-C） / Ask a running agent to shut down (the running job is cancelled, same as Ctrl-C).", _cmd_stop),
     ):
         p = sub.add_parser(name, help=help_text)
         p.add_argument("--config", default=DEFAULT_CONFIG_PATH, help="Path to the agent config file.")

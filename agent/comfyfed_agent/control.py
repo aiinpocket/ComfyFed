@@ -86,6 +86,15 @@ def write_state(config_dir: str, state: str, job_id: str | None) -> None:
         with open(tmp_path, "w", encoding="utf-8") as f:
             json.dump(payload, f, ensure_ascii=False)
         os.replace(tmp_path, path)
+        try:
+            # Same posture as config.py's 0600 on agent.json: the contents
+            # (pid, state, job id) are low-sensitivity, but on a shared Unix
+            # host there is no reason to let every local user enumerate which
+            # jobs this worker runs and when it sits idle. Best-effort --
+            # chmod is a no-op-ish on Windows and must never break a tick.
+            os.chmod(path, 0o600)
+        except OSError:
+            pass
     except OSError:
         # Status reporting is a convenience; never let it break a heartbeat.
         pass

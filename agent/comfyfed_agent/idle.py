@@ -71,6 +71,12 @@ def _linux_seconds() -> float | None:
 
     x11.XOpenDisplay.restype = ctypes.c_void_p
     x11.XOpenDisplay.argtypes = (ctypes.c_char_p,)
+    # Without an explicit restype ctypes truncates the returned `Window` (an
+    # unsigned long, 64-bit here) to a signed int, which silently hands
+    # XScreenSaverQueryInfo a bogus drawable on any server that hands out a
+    # high root-window id.
+    x11.XDefaultRootWindow.restype = ctypes.c_ulong
+    x11.XDefaultRootWindow.argtypes = (ctypes.c_void_p,)
     xss.XScreenSaverAllocInfo.restype = ctypes.POINTER(_XScreenSaverInfo)
     xss.XScreenSaverQueryInfo.argtypes = (
         ctypes.c_void_p,
@@ -85,6 +91,12 @@ def _linux_seconds() -> float | None:
     info = None
     try:
         info = xss.XScreenSaverAllocInfo()
+        if not info:
+            # An allocation failure returns NULL; passing it to QueryInfo
+            # dereferences it and segfaults the whole agent -- the one
+            # failure mode this module's "never raises" contract cannot
+            # catch.
+            return None
         root = x11.XDefaultRootWindow(ctypes.c_void_p(display))
         if not xss.XScreenSaverQueryInfo(ctypes.c_void_p(display), root, info):
             return None

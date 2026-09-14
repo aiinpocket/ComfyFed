@@ -7,7 +7,7 @@ from datetime import datetime, timedelta, timezone
 
 import pytest
 
-from comfyfed_agent import control
+from comfyfed_agent import control, idle
 from comfyfed_agent import main as main_module
 
 
@@ -49,7 +49,22 @@ def test_stop_writes_the_request_and_warns_about_autostart(tmp_path, capsys):
     out = capsys.readouterr().out
     assert "已要求 agent 結束" in out
     assert "開機自啟仍在" in out
-    assert "the running job finishes first" in out
+    # Final review H1: stop is a graceful CANCEL (the same wind-down Ctrl-C
+    # runs), not a drain. The text must not promise otherwise.
+    assert "the running job finishes first" not in out
+    assert "進行中的工作會被取消並清理" in out
+    assert "same as Ctrl-C" in out
+
+
+def test_stop_tells_the_user_how_to_drain_instead(tmp_path, capsys):
+    """The honest replacement for the old promise: pause, wait, then stop."""
+    main_module._cmd_stop(_args(tmp_path))
+
+    out = capsys.readouterr().out
+    assert "先 comfyfed pause" in out
+    assert "comfyfed status" in out
+    assert "'comfyfed pause'" in out
+    assert "no longer reports busy" in out
 
 
 def test_status_reports_not_running_without_a_state_file(tmp_path, capsys):
@@ -115,6 +130,42 @@ def test_status_still_reports_the_manual_pause_flag_when_not_running(tmp_path, c
     assert "agent not running" in out
     assert "手動暫停中" in out
     assert "Manually paused" in out
+
+
+def test_status_prints_the_live_availability_verdict(tmp_path, capsys, monkeypatch):
+    """Final review L2: the docs promise the words `available` /
+    `paused-manual` / `paused-active`, so `status` computes the verdict live
+    rather than only echoing the heartbeat state."""
+    monkeypatch.setattr(idle, "seconds_since_input", lambda: 9999.0)
+
+    main_module._cmd_status(_args(tmp_path))
+
+    out = capsys.readouterr().out
+    assert "availability now: available" in out
+    assert "可接新工作" in out
+
+
+def test_status_availability_says_paused_manual_while_paused(tmp_path, capsys, monkeypatch):
+    monkeypatch.setattr(idle, "seconds_since_input", lambda: 9999.0)
+    control.request_pause(str(tmp_path))
+
+    main_module._cmd_status(_args(tmp_path))
+
+    out = capsys.readouterr().out
+    assert "availability now: paused-manual" in out
+    assert "手動暫停中" in out
+
+
+def test_status_availability_says_paused_active_while_the_user_is_typing(
+    tmp_path, capsys, monkeypatch
+):
+    monkeypatch.setattr(idle, "seconds_since_input", lambda: 1.0)
+
+    main_module._cmd_status(_args(tmp_path))
+
+    out = capsys.readouterr().out
+    assert "availability now: paused-active" in out
+    assert "偵測到有人在用這台電腦" in out
 
 
 @pytest.mark.parametrize("command", ["pause", "resume", "status", "stop"])

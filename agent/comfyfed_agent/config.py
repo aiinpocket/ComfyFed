@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import math
 import os
 from dataclasses import asdict, dataclass, field
 
@@ -11,12 +12,17 @@ def _coerce_positive_float(value, default: float) -> float:
     """`max_fetch_gb` from agent.json, defensively: a string like "30" is
     accepted, anything non-numeric or <= 0 falls back to the default instead
     of blowing up later inside fetcher's budget check as an opaque
-    job_failed (final-review m4)."""
+    job_failed (final-review m4).
+
+    Non-finite values are rejected too: `"idle_minutes": 1e999` parses as
+    `inf`, which would make the machine *never* count as idle -- a worker
+    permanently `paused` with no error message anywhere (final-review L5).
+    """
     try:
         result = float(value)
     except (TypeError, ValueError):
         return default
-    if result != result or result <= 0:  # NaN or non-positive
+    if not math.isfinite(result) or result <= 0:  # NaN, +/-inf or non-positive
         return default
     return result
 

@@ -35,14 +35,51 @@ def pause_loop(monkeypatch, tmp_path):
     return AgentLoop(config, cfg_path, connection_factory=FakeConnection)
 
 
-async def _run_connection_loop_briefly(loop, conn, seconds: float = 0.1) -> None:
-    loop_task = asyncio.create_task(loop._connection_loop(conn))
-    await asyncio.sleep(seconds)
-    loop_task.cancel()
+async def _cancel(task) -> None:
+    task.cancel()
     try:
-        await loop_task
+        await task
     except asyncio.CancelledError:
         pass
+
+
+async def _run_until(task, condition, timeout: float = 5.0) -> None:
+    """Drive `task` until `condition()` holds, then cancel it.
+
+    Condition-driven rather than "sleep a fixed 0.1 s and hope": with a
+    zeroed heartbeat interval the loop produces its first beat almost at
+    once, but a loaded CI box can miss any fixed window (final review I3).
+    The timeout only exists so a genuine regression fails loudly instead of
+    hanging the suite.
+    """
+    event_loop = asyncio.get_running_loop()
+    deadline = event_loop.time() + timeout
+    try:
+        while not condition():
+            if task.done():
+                await task
+                break
+            if event_loop.time() > deadline:
+                raise AssertionError("the loop never reached the expected state")
+            await asyncio.sleep(0.01)
+    finally:
+        await _cancel(task)
+
+
+async def _run_connection_loop_briefly(loop, conn, condition=None) -> None:
+    task = asyncio.create_task(loop._connection_loop(conn))
+    await _run_until(task, condition or (lambda: bool(conn.heartbeats)))
+
+
+async def _run_control_loop_briefly(loop, condition=None) -> None:
+    """At least one tick of the platform-independent control loop (its first
+    tick runs before the first `await`, so one scheduler turn is enough)."""
+    task = asyncio.create_task(loop._control_loop())
+    await asyncio.sleep(0)
+    if condition is None:
+        await _cancel(task)
+    else:
+        await _run_until(task, condition)
 
 
 async def test_idle_tick_stays_idle_when_available(pause_loop):
@@ -151,19 +188,66 @@ async def test_completing_a_job_when_available_still_reports_idle(pause_loop):
     assert conn.heartbeats[-1]["state"] == "idle"
 
 
-async def test_each_tick_publishes_the_effective_state(pause_loop):
-    conn = pause_loop.connections["worker-a"]
+async def test_each_control_tick_publishes_the_effective_state(pause_loop):
     control.request_pause(pause_loop._config_dir)
 
-    await _run_connection_loop_briefly(pause_loop, conn)
+    await _run_control_loop_briefly(pause_loop)
 
     state = control.read_state(pause_loop._config_dir)
     assert state["state"] == "paused"
     assert state["job_id"] is None
 
 
-async def test_a_stop_request_starts_the_graceful_shutdown(pause_loop, monkeypatch):
+async def test_the_control_loop_publishes_without_any_connection(pause_loop):
+    """Final review H3: `status` must work while every platform is
+    unreachable -- the control loop never touches a socket."""
+    await _run_control_loop_briefly(pause_loop)
+
+    state = control.read_state(pause_loop._config_dir)
+    assert state["state"] == "idle"
+
+
+async def test_the_published_state_is_process_wide_not_per_connection(pause_loop):
+    """Final review M4: two connection loops used to take turns writing one
+    file. The verdict now comes from the job table, so a worker running a
+    job for ANY platform publishes `busy` with that job's id."""
     conn = pause_loop.connections["worker-a"]
+    handle = runner_module._JobHandle(job_id="job-1", conn=conn)
+    handle.running = True
+    pause_loop._jobs["job-1"] = handle
+
+    await _run_control_loop_briefly(pause_loop)
+
+    state = control.read_state(pause_loop._config_dir)
+    assert state["state"] == "busy"
+    assert state["job_id"] == "job-1"
+
+
+async def test_a_busy_process_is_published_busy_even_while_paused(pause_loop):
+    conn = pause_loop.connections["worker-a"]
+    handle = runner_module._JobHandle(job_id="job-2", conn=conn)
+    handle.running = True
+    pause_loop._jobs["job-2"] = handle
+    control.request_pause(pause_loop._config_dir)
+
+    await _run_control_loop_briefly(pause_loop)
+
+    assert control.read_state(pause_loop._config_dir)["state"] == "busy"
+
+
+async def test_a_connection_tick_no_longer_polls_stop(pause_loop):
+    """The stop poll moved off the heartbeat, so a socket tick must leave the
+    request alone for the control loop to consume."""
+    conn = pause_loop.connections["worker-a"]
+    control.request_stop(pause_loop._config_dir)
+
+    await _run_connection_loop_briefly(pause_loop, conn)
+
+    assert control.is_stop_requested(pause_loop._config_dir) is True
+    assert pause_loop.shutdown_in_progress is False
+
+
+async def test_a_stop_request_starts_the_graceful_shutdown(pause_loop, monkeypatch):
     shutdowns = []
 
     async def fake_graceful(loop):
@@ -172,7 +256,7 @@ async def test_a_stop_request_starts_the_graceful_shutdown(pause_loop, monkeypat
     monkeypatch.setattr(pause_loop, "_graceful_shutdown_and_stop", fake_graceful)
     control.request_stop(pause_loop._config_dir)
 
-    await _run_connection_loop_briefly(pause_loop, conn)
+    await _run_control_loop_briefly(pause_loop, lambda: bool(shutdowns))
 
     assert pause_loop.shutdown_in_progress is True
     # The request is consumed, so a crash mid-shutdown cannot kill the next run.
@@ -184,7 +268,6 @@ async def test_a_stop_request_starts_the_graceful_shutdown(pause_loop, monkeypat
 async def test_a_repeated_stop_request_does_not_schedule_a_second_shutdown(
     pause_loop, monkeypatch
 ):
-    conn = pause_loop.connections["worker-a"]
     shutdowns = []
 
     async def fake_graceful(loop):
@@ -192,12 +275,54 @@ async def test_a_repeated_stop_request_does_not_schedule_a_second_shutdown(
 
     monkeypatch.setattr(pause_loop, "_graceful_shutdown_and_stop", fake_graceful)
     control.request_stop(pause_loop._config_dir)
-    await _run_connection_loop_briefly(pause_loop, conn)
+    await _run_control_loop_briefly(pause_loop, lambda: bool(shutdowns))
 
     control.request_stop(pause_loop._config_dir)
-    await _run_connection_loop_briefly(pause_loop, conn)
+    await _run_control_loop_briefly(pause_loop)
 
     assert len(shutdowns) == 1
+
+
+async def test_stopping_the_control_loop_clears_the_published_state(pause_loop):
+    """Final review M5: `loop.stop()` never resumes `run()`, so the cleanup
+    has to live where both shutdown paths reach it."""
+    await _run_control_loop_briefly(pause_loop)
+    assert control.read_state(pause_loop._config_dir) is not None
+
+    pause_loop._control_task = asyncio.create_task(pause_loop._control_loop())
+    await asyncio.sleep(0)
+    await pause_loop._stop_control_loop()
+
+    assert control.read_state(pause_loop._config_dir) is None
+    assert pause_loop._control_task is None
+
+
+async def test_a_connection_sends_an_immediate_beat_after_hello(pause_loop, monkeypatch):
+    """Final review H2: both platforms assume a freshly handshaked agent is
+    idle, so the true availability must not wait a whole heartbeat."""
+    monkeypatch.setattr(idle, "seconds_since_input", lambda: 1.0)
+    monkeypatch.setattr(hardware, "collect_hardware", lambda *a, **k: {})
+    monkeypatch.setattr(hardware, "detect_backend", lambda: ("cpu", "0"))
+    conn = pause_loop.connections["worker-a"]
+
+    async def _noop(*args, **kwargs):
+        return None
+
+    async def _stop_here(*args, **kwargs):
+        # The first thing `_run_platform` does after the immediate beat.
+        raise asyncio.CancelledError
+
+    conn.connect = _noop
+    conn.handshake = _noop
+    conn.send_hello = _noop
+    conn.close = _noop
+    conn.send_inventory = _stop_here
+
+    with pytest.raises(asyncio.CancelledError):
+        await pause_loop._run_platform(conn)
+
+    assert conn.heartbeats
+    assert conn.heartbeats[0]["state"] == "paused"
 
 
 async def test_run_clears_a_stale_stop_file_before_starting(pause_loop, monkeypatch):
