@@ -98,6 +98,30 @@ export function expectNoMessage(ws: WebSocket, timeoutMs = 250): Promise<void> {
   });
 }
 
+/** Polls `predicate` on a fixed interval until it returns a value other than
+ * `undefined`, then resolves with that value -- replaces "sleep a fixed
+ * amount and hope the DO/D1 write landed by then" synchronization with an
+ * explicit condition on the observable state the caller actually depends on
+ * (a job row's status, a receipt row, a worker row, etc.). `predicate`
+ * itself decides readiness: return the value once the condition holds,
+ * `undefined` to keep polling. Throws (naming `label`) if `timeoutMs`
+ * elapses first. */
+export async function waitFor<T>(
+  predicate: () => Promise<T | undefined>,
+  opts: { timeoutMs?: number; intervalMs?: number; label?: string } = {}
+): Promise<T> {
+  const { timeoutMs = 5000, intervalMs = 25, label = "condition" } = opts;
+  const deadline = Date.now() + timeoutMs;
+  for (;;) {
+    const result = await predicate();
+    if (result !== undefined) return result;
+    if (Date.now() >= deadline) {
+      throw new Error(`waitFor timed out after ${timeoutMs}ms waiting for: ${label}`);
+    }
+    await new Promise((r) => setTimeout(r, intervalMs));
+  }
+}
+
 export function waitForClose(ws: WebSocket, timeoutMs = 3000): Promise<{ code: number; reason: string }> {
   return new Promise((resolve, reject) => {
     const timer = setTimeout(() => {

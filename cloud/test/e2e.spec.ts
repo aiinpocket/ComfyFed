@@ -2,7 +2,7 @@ import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import worker from "../src/index";
 import { env, createExecutionContext, waitOnExecutionContext, runDurableObjectAlarm, runInDurableObject } from "cloudflare:test";
 import { call, db, SETUP_TOKEN } from "./helpers/http";
-import { connectAgent, connectPanel, collectMessages, expectNoMessage, hub, nextMessage } from "./helpers/ws";
+import { connectAgent, connectPanel, collectMessages, expectNoMessage, hub, nextMessage, waitFor } from "./helpers/ws";
 import { signRequest } from "../src/lib/signing";
 import { signHex, verifyHex, derivePublicKeyHexFromSeed } from "../src/lib/ed25519";
 import { bytesToHex } from "../src/lib/hex";
@@ -201,15 +201,22 @@ describe("cloud end-to-end", () => {
       );
       await helloNone;
 
-      const workerRow = await db()
-        .prepare("SELECT protocol, backend, node_classes, status FROM workers WHERE id = ?")
-        .bind(workerId)
-        .first<{ protocol: number; backend: string; node_classes: string; status: string }>();
-      expect(workerRow!.protocol).toBe(2);
-      expect(workerRow!.backend).toBe("cuda");
-      const nodeClasses = JSON.parse(workerRow!.node_classes) as string[];
+      // Poll until the hub has finished processing the hello and persisted
+      // the worker row (protocol 2 sends no reply frame to synchronize on).
+      const workerRow = await waitFor(
+        async () => {
+          const row = await db()
+            .prepare("SELECT protocol, backend, node_classes, status FROM workers WHERE id = ?")
+            .bind(workerId)
+            .first<{ protocol: number; backend: string; node_classes: string; status: string }>();
+          return row && row.protocol === 2 ? row : undefined;
+        },
+        { label: "worker row reflects hello (protocol 2)" }
+      );
+      expect(workerRow.backend).toBe("cuda");
+      const nodeClasses = JSON.parse(workerRow.node_classes) as string[];
       expect(nodeClasses).toEqual(expect.arrayContaining(["LoadImage", "SaveImage"]));
-      expect(workerRow!.status).toBe("online");
+      expect(workerRow.status).toBe("online");
 
       // -----------------------------------------------------------------
       // 5. Upload a small gzip object_info snapshot over the signed agent
@@ -373,11 +380,13 @@ describe("cloud end-to-end", () => {
       agent.send(JSON.stringify({ type: "receipt_ack", receipt_id: receipt.receipt_id, worker_sig: workerSig }));
       // receipt_ack has no reply frame -- poll the DB until the worker_sig
       // lands (a fixed sleep was load-flaky: 3 failures in 11 suite runs).
-      for (let i = 0; i < 100; i++) {
-        const rows = await getReceiptsForJob(db(), jobId);
-        if (rows[0]?.workerSig) break;
-        await new Promise((r) => setTimeout(r, 25));
-      }
+      await waitFor(
+        async () => {
+          const rows = await getReceiptsForJob(db(), jobId);
+          return rows[0]?.workerSig ? rows : undefined;
+        },
+        { label: "receipt row shows worker_sig after receipt_ack" }
+      );
 
       // -----------------------------------------------------------------
       // 14. Verify the receipt row directly.
@@ -424,6 +433,17 @@ describe("cloud end-to-end", () => {
       const idleNone = expectNoMessage(agent, 200);
       agent.send(JSON.stringify({ type: "heartbeat", state: "idle" }));
       await idleNone;
+
+      // Poll until the hub has applied the idle heartbeat (status flips back
+      // from "busy" to "online") -- the next dispatch alarm tick only ever
+      // dispatches to a worker it currently sees as idle.
+      await waitFor(
+        async () => {
+          const row = await db().prepare("SELECT status FROM workers WHERE id = ?").bind(workerId).first<{ status: string }>();
+          return row?.status === "online" ? true : undefined;
+        },
+        { label: "worker status flips back to online after idle heartbeat" }
+      );
 
       // -----------------------------------------------------------------
       // Second job queued (panel origin again, so the history-hide flow
@@ -607,11 +627,34 @@ describe("cloud end-to-end", () => {
       );
       await helloNone;
 
+      // Poll until the hub has persisted this hello's protocol/auto_fetch
+      // (needed by the dispatch tick's eligible_after_fetch check below).
+      await waitFor(
+        async () => {
+          const row = await db()
+            .prepare("SELECT protocol, auto_fetch FROM workers WHERE id = ?")
+            .bind(workerId)
+            .first<{ protocol: number; auto_fetch: number }>();
+          return row && row.protocol === 3 && row.auto_fetch === 1 ? true : undefined;
+        },
+        { label: "worker row reflects hello (protocol 3, auto_fetch)" }
+      );
+
       // Ample free disk (well over 1.2x the ~0.23 GB curated clip_l.safetensors)
       // so the disk-margin gate clears.
       const heartbeatIdleNone = expectNoMessage(agent, 200);
       agent.send(JSON.stringify({ type: "heartbeat", state: "idle", dynamic: { free_disk_gb: 50 } }));
       await heartbeatIdleNone;
+
+      // Poll until the hub has persisted the reported free disk (the
+      // dispatch tick's disk-margin gate reads it back from this column).
+      await waitFor(
+        async () => {
+          const row = await db().prepare("SELECT dynamic FROM workers WHERE id = ?").bind(workerId).first<{ dynamic: string }>();
+          return row?.dynamic && JSON.parse(row.dynamic).free_disk_gb === 50 ? true : undefined;
+        },
+        { label: "worker dynamic reflects reported free_disk_gb" }
+      );
 
       // -----------------------------------------------------------------
       // 3. Report inventory WITH clip_l.safetensors + sha256 -- the server
@@ -632,11 +675,19 @@ describe("cloud end-to-end", () => {
       );
       await inventoryWithModelNone;
 
-      const hashRow = await db()
-        .prepare("SELECT sha256 FROM model_hashes WHERE name = ? AND size_bytes = ?")
-        .bind(modelName, sizeBytes)
-        .first<{ sha256: string }>();
-      expect(hashRow?.sha256).toBe(sha256);
+      // Poll until the hub has learned + persisted the hash from this
+      // inventory report.
+      const hashRow = await waitFor(
+        async () => {
+          const row = await db()
+            .prepare("SELECT sha256 FROM model_hashes WHERE name = ? AND size_bytes = ?")
+            .bind(modelName, sizeBytes)
+            .first<{ sha256: string }>();
+          return row?.sha256 ? row : undefined;
+        },
+        { label: "model_hashes row learned from inventory" }
+      );
+      expect(hashRow.sha256).toBe(sha256);
 
       // -----------------------------------------------------------------
       // 4. A SECOND inventory report WITHOUT the model -- the fleet now sees
@@ -646,7 +697,15 @@ describe("cloud end-to-end", () => {
       agent.send(JSON.stringify({ type: "inventory", models: [] }));
       await inventoryEmptyNone;
 
-      const inventoryRow = await db().prepare("SELECT model_inventory FROM workers WHERE id = ?").bind(workerId).first<any>();
+      // Poll until the second (empty) inventory report has overwritten the
+      // worker's model_inventory column.
+      const inventoryRow = await waitFor(
+        async () => {
+          const row = await db().prepare("SELECT model_inventory FROM workers WHERE id = ?").bind(workerId).first<any>();
+          return row && JSON.parse(row.model_inventory).length === 0 ? row : undefined;
+        },
+        { label: "worker model_inventory cleared by empty inventory report" }
+      );
       expect(JSON.parse(inventoryRow.model_inventory)).toEqual([]);
 
       // -----------------------------------------------------------------
@@ -719,42 +778,56 @@ describe("cloud end-to-end", () => {
       );
       await fetchProgressAbsence;
 
+      // Poll GET /api/jobs/{id} until the fetching_models heartbeat above has
+      // been fully processed and its transient fields surfaced (a fixed
+      // 100ms sleep here was load-flaky).
+      const jobDetailDuringFetch = await waitFor(
+        async () => {
+          const detail = await call(`/api/jobs/${jobId}`, { method: "GET", cookie });
+          return detail.body.stage === "fetching_models" ? detail : undefined;
+        },
+        { label: "job detail reports fetching_models stage" }
+      );
+      expect(jobDetailDuringFetch.body.fetch_pct).toBe(0.42);
+      expect(jobDetailDuringFetch.body.fetch_model).toBe(modelName);
+
       // M1 fix: fetch wall time is not billable execution, so the
       // fetching_models stage must NOT start the job's clock -- it stays
-      // "assigned" (no startedAt) for the whole download phase.
-      await new Promise((r) => setTimeout(r, 100));
+      // "assigned" (no startedAt) for the whole download phase. Safe to
+      // assert now that the heartbeat above is confirmed processed.
       const stillAssignedJob = await getJobById(db(), jobId);
       expect(stillAssignedJob!.status).toBe("assigned");
       expect(stillAssignedJob!.startedAt).toBeNull();
-
-      // GET /api/jobs/{id} surfaces the transient fetch-progress fields.
-      const jobDetailDuringFetch = await call(`/api/jobs/${jobId}`, { method: "GET", cookie });
-      expect(jobDetailDuringFetch.body.stage).toBe("fetching_models");
-      expect(jobDetailDuringFetch.body.fetch_pct).toBe(0.42);
-      expect(jobDetailDuringFetch.body.fetch_model).toBe(modelName);
 
       // -----------------------------------------------------------------
       // 8. A plain busy heartbeat (fetch finished, now actually running)
       // clears the transient fetch-progress fields AND is the heartbeat that
       // finally starts the job's clock.
       agent.send(JSON.stringify({ type: "heartbeat", state: "busy", job_id: jobId, progress: 0.1 }));
-      for (let i = 0; i < 40; i++) {
-        const detail = await call(`/api/jobs/${jobId}`, { method: "GET", cookie });
-        if (detail.body.stage === undefined) break;
-        await new Promise((r) => setTimeout(r, 25));
-      }
-      const jobDetailAfterFetch = await call(`/api/jobs/${jobId}`, { method: "GET", cookie });
+      // Poll until the plain busy heartbeat has cleared the transient
+      // fetch-progress fields (replaces a bounded 25ms-interval loop with
+      // the shared waitFor helper).
+      const jobDetailAfterFetch = await waitFor(
+        async () => {
+          const detail = await call(`/api/jobs/${jobId}`, { method: "GET", cookie });
+          return detail.body.stage === undefined ? detail : undefined;
+        },
+        { label: "job detail clears fetching_models stage after plain busy heartbeat" }
+      );
       expect(jobDetailAfterFetch.body.stage).toBeUndefined();
       expect(jobDetailAfterFetch.body.fetch_pct).toBeUndefined();
       expect(jobDetailAfterFetch.body.fetch_model).toBeUndefined();
 
-      let runningJob = await getJobById(db(), jobId);
-      for (let i = 0; i < 40 && runningJob!.status !== "running"; i++) {
-        await new Promise((r) => setTimeout(r, 25));
-        runningJob = await getJobById(db(), jobId);
-      }
-      expect(runningJob!.status).toBe("running");
-      expect(runningJob!.startedAt).not.toBeNull();
+      // Poll until the job transitions to running (startedAt set) now that
+      // the fetch stage is over.
+      const runningJob = await waitFor(
+        async () => {
+          const job = await getJobById(db(), jobId);
+          return job?.status === "running" ? job : undefined;
+        },
+        { label: "job transitions to running after fetch completes" }
+      );
+      expect(runningJob.startedAt).not.toBeNull();
 
       // -----------------------------------------------------------------
       // 9. job_done completes normally.
