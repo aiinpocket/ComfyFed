@@ -7,10 +7,20 @@ import time
 
 import httpx
 import pytest
+from websockets.exceptions import ConnectionClosedError, ConnectionClosedOK
+from websockets.frames import Close
 
 from comfyfed_agent import comfy, fetcher, hardware, whitelist
 from comfyfed_agent.config import AgentConfig, PlatformEntry
-from comfyfed_agent.runner import AgentLoop, CleanupMode, PlatformConnection, _is_safe_relative_path, cleanup_job_files
+from comfyfed_agent.runner import (
+    AgentLoop,
+    AllRegistrationsRejected,
+    CleanupMode,
+    PlatformConnection,
+    _is_auth_rejected,
+    _is_safe_relative_path,
+    cleanup_job_files,
+)
 from comfyfed_agent import runner as runner_module
 
 _real_whitelist_check = whitelist.check
@@ -2155,3 +2165,128 @@ async def test_periodic_heartbeat_carries_fetch_stage_while_downloading(cancella
     finally:
         await loop._handle_message(conn_a, {"type": "job_cancelled", "job_id": "job-fetch-hb"})
         await asyncio.wait_for(task, timeout=10)
+
+
+# --- Task 3: 4401 dead-registration classification + give-up ----------------
+
+
+def test_is_auth_rejected_true_for_4401_received_close():
+    exc = ConnectionClosedError(Close(_4401(), "gone"), None)
+    assert _is_auth_rejected(exc) is True
+
+
+def test_is_auth_rejected_true_for_4401_sent_close():
+    exc = ConnectionClosedError(None, Close(_4401(), "gone"))
+    assert _is_auth_rejected(exc) is True
+
+
+def test_is_auth_rejected_true_for_4401_connection_closed_ok():
+    exc = ConnectionClosedOK(Close(_4401(), "gone"), None)
+    assert _is_auth_rejected(exc) is True
+
+
+def test_is_auth_rejected_false_for_1006_close():
+    exc = ConnectionClosedError(Close(1006, "abnormal"), None)
+    assert _is_auth_rejected(exc) is False
+
+
+def test_is_auth_rejected_false_for_plain_oserror():
+    assert _is_auth_rejected(OSError("connection refused")) is False
+
+
+def _4401() -> int:
+    return runner_module._AUTH_REJECTED_CLOSE_CODE
+
+
+async def _noop(*args, **kwargs):
+    return None
+
+
+@pytest.fixture()
+def one_platform_loop(monkeypatch, tmp_path):
+    """A single-platform loop with the connection-setup calls stubbed, so a
+    test can drive `_run_platform`'s connect/handshake retry loop directly and
+    only the handshake outcome matters. Backoff is zeroed so a retry path
+    doesn't actually sleep 5s between iterations."""
+    monkeypatch.setattr(hardware, "collect_hardware", lambda *a, **k: {})
+    monkeypatch.setattr(hardware, "detect_backend", lambda: ("cpu", "0"))
+    monkeypatch.setattr(hardware, "collect_dynamic", lambda *a, **k: {})
+    monkeypatch.setattr(whitelist, "allowed_classes", lambda *a, **k: {"KSampler"})
+    monkeypatch.setattr(runner_module, "_BACKOFF_START_SECONDS", 0)
+    monkeypatch.setattr(runner_module, "_BACKOFF_MAX_SECONDS", 0)
+
+    config = AgentConfig(platforms=[_entry("worker-a")], pause_when_active=False)
+    return AgentLoop(config, str(tmp_path / "agent.json"), connection_factory=FakeConnection)
+
+
+async def test_run_platform_gives_up_and_returns_on_4401(one_platform_loop):
+    """A 4401 handshake is permanent: `_run_platform` must RETURN (stop
+    retrying this entry) and record the give-up, not back off and loop."""
+    loop = one_platform_loop
+    conn = loop.connections["worker-a"]
+
+    calls = {"n": 0}
+
+    async def _handshake_4401():
+        calls["n"] += 1
+        raise ConnectionClosedError(Close(_4401(), "worker removed"), None)
+
+    conn.connect = _noop
+    conn.close = _noop
+    conn.handshake = _handshake_4401
+
+    # Returns rather than looping forever.
+    await asyncio.wait_for(loop._run_platform(conn), timeout=5)
+
+    assert calls["n"] == 1, "a 4401 entry must not be retried"
+    assert loop._auth_gave_up is True
+    assert loop._connected_ever is False
+
+
+async def test_run_platform_retries_on_1006(one_platform_loop):
+    """A 1006 (abnormal closure) is a transient blip: `_run_platform` must
+    back off and retry it, not give up like a 4401."""
+    loop = one_platform_loop
+    conn = loop.connections["worker-a"]
+
+    calls = {"n": 0}
+
+    async def _handshake_1006():
+        calls["n"] += 1
+        if calls["n"] >= 3:
+            # Break out of the otherwise-infinite retry loop; CancelledError
+            # is not caught by `except Exception`, so it propagates cleanly.
+            raise asyncio.CancelledError()
+        raise ConnectionClosedError(Close(1006, "blip"), None)
+
+    conn.connect = _noop
+    conn.close = _noop
+    conn.handshake = _handshake_1006
+
+    with pytest.raises(asyncio.CancelledError):
+        await asyncio.wait_for(loop._run_platform(conn), timeout=5)
+
+    assert calls["n"] >= 2, "a 1006 entry must be retried, not given up on"
+    assert loop._auth_gave_up is False
+
+
+async def test_run_raises_all_registrations_rejected_when_the_only_entry_is_4401(
+    one_platform_loop, monkeypatch
+):
+    """`run()` with a single 4401-dead entry: every `_run_platform` returns,
+    nothing ever connected, so `run()` raises `AllRegistrationsRejected`."""
+    loop = one_platform_loop
+    conn = loop.connections["worker-a"]
+
+    async def _handshake_4401():
+        raise ConnectionClosedError(Close(_4401(), "gone"), None)
+
+    conn.connect = _noop
+    conn.close = _noop
+    conn.handshake = _handshake_4401
+
+    monkeypatch.setattr(loop, "_start_peer_server", lambda: None)
+    monkeypatch.setattr(loop, "_install_signal_handlers", lambda event_loop: None)
+
+    with pytest.raises(AllRegistrationsRejected):
+        await asyncio.wait_for(loop.run(), timeout=5)

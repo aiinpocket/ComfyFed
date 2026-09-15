@@ -15,7 +15,7 @@ from datetime import datetime, timezone
 
 from . import __version__, control, detect, identity, update
 from .config import AgentConfig
-from .runner import AgentLoop
+from .runner import AgentLoop, AllRegistrationsRejected
 
 DEFAULT_CONFIG_PATH = os.path.join(os.path.expanduser("~"), ".comfyfed", "agent.json")
 
@@ -108,6 +108,19 @@ def _cmd_run(args: argparse.Namespace) -> None:
     agent_loop = AgentLoop(cfg, args.config)
     try:
         asyncio.run(agent_loop.run())
+    except AllRegistrationsRejected:
+        # Every configured registration was 4401-rejected and none ever
+        # connected -- a dead install (workers deleted, or credentials
+        # invalid). Say so loudly and exit non-zero so a foreground run and
+        # the log both make the problem obvious, rather than looking alive.
+        print(
+            "所有已註冊的平台都拒絕了本 agent（worker 可能已被移除或憑證失效），"
+            "沒有任何一個連線成功。請重新執行安裝指令以重新註冊。/ "
+            "Every registered platform rejected this agent (workers removed or "
+            "credentials invalid); none connected. Re-run the installer to re-register.",
+            file=sys.stderr,
+        )
+        sys.exit(4)
     except RuntimeError as exc:
         # `_graceful_shutdown_and_stop` calls `loop.stop()` from a task once
         # a console signal (Ctrl-C / CTRL_BREAK) has been handled and the job

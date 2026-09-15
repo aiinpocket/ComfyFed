@@ -18,6 +18,7 @@ from urllib.parse import urlsplit, urlunsplit
 
 import httpx
 import websockets
+from websockets.exceptions import ConnectionClosed
 from nacl.signing import SigningKey
 
 from . import comfy, control, fetcher, hardware, peerserve, signing, whitelist
@@ -62,6 +63,43 @@ _SIGNAL_SHUTDOWN_TIMEOUT_SECONDS = 10.0
 _AUTO_FETCH_DISABLED_MESSAGE = (
     "此 worker 未開啟自動下載 / this worker does not have auto-fetch enabled"
 )
+
+
+# WS close code the platform sends when it rejects a worker's auth: the
+# worker was removed server-side OR its credentials are invalid. Unlike a
+# deploy/network drop (1006/1011), 4401 is PERMANENT -- retrying it can never
+# succeed, so it is classified and handled categorically differently.
+_AUTH_REJECTED_CLOSE_CODE = 4401
+
+
+class AllRegistrationsRejected(Exception):
+    """Every configured platform rejected this agent's auth (4401) and none
+    ever stayed connected.
+
+    Raised out of `AgentLoop.run()` so `_cmd_run` can turn it into a loud,
+    actionable, non-zero exit -- the live incident's stacked dead entries
+    would otherwise have the process sit there looking alive while every
+    handshake bounced on 4401.
+    """
+
+
+def _is_auth_rejected(exc: BaseException) -> bool:
+    """True iff `exc` is a websockets `ConnectionClosed*` whose received OR
+    sent close code is 4401 (auth rejected).
+
+    4401 means the worker was removed or its credentials are invalid -- a
+    PERMANENT condition, never a transient blip (those close with 1006/1011).
+    Checks the `.rcvd`/`.sent` `Close` frames the exception carries, with a
+    defensive `"4401"` substring fallback on the string form for a frame-less
+    wrapper. Anything that is not a `ConnectionClosed*` (a plain OSError, a
+    timeout) is False.
+    """
+    if not isinstance(exc, ConnectionClosed):
+        return False
+    for frame in (getattr(exc, "rcvd", None), getattr(exc, "sent", None)):
+        if frame is not None and getattr(frame, "code", None) == _AUTH_REJECTED_CLOSE_CODE:
+            return True
+    return "4401" in str(exc)
 
 
 class PlatformUnavailable(Exception):
@@ -564,6 +602,14 @@ class AgentLoop:
         # recognised as "already shutting down" and forces an immediate exit
         # instead of layering a second wind-down on top of the first.
         self._shutdown_in_progress = False
+        # 4401 dead-registration tracking (see `_run_platform`/`run`).
+        # `_connected_ever` flips True the first time ANY connection completes
+        # its handshake; `_auth_gave_up` flips True when any `_run_platform`
+        # returns because its entry was 4401-rejected. If every platform task
+        # returns (gather completes) with a give-up and nothing ever
+        # connected, `run()` raises `AllRegistrationsRejected`.
+        self._connected_ever = False
+        self._auth_gave_up = False
         # Phase 3.1 P2P addendum (種子端): started in `run()` when
         # `peerserve.is_enabled(config)`, stopped in `shutdown()`. One
         # listener for the whole process, shared across every platform
@@ -1745,6 +1791,10 @@ class AgentLoop:
             try:
                 await conn.connect()
                 await conn.handshake()
+                # Past the handshake: this entry's credentials are accepted,
+                # so it is not a dead 4401 registration. Clears the "all
+                # rejected" verdict for the whole process.
+                self._connected_ever = True
 
                 hw = hardware.collect_hardware(self.config.comfy_url)
                 backend, torch_version = hardware.detect_backend()
@@ -1794,7 +1844,26 @@ class AgentLoop:
 
                 backoff = _BACKOFF_START_SECONDS
                 await self._connection_loop(conn)
-            except Exception:
+            except Exception as exc:
+                if _is_auth_rejected(exc):
+                    # 4401 is permanent: the worker was removed server-side or
+                    # its credentials are invalid, and every retry would bounce
+                    # exactly the same way (the live incident: stacked dead
+                    # entries spamming `received 4401` forever). Fail loud and
+                    # actionable, then STOP retrying this entry by returning
+                    # from the retry loop -- unlike every other disconnect.
+                    self._auth_gave_up = True
+                    logger.error(
+                        "該 worker（%s）已不被平台 %s接受（可能已被移除或憑證失效），"
+                        "不再重試此註冊。請重新執行安裝指令以重新註冊。 / "
+                        "Worker %s is no longer accepted by platform %s (removed or "
+                        "credentials invalid); giving up on this registration. "
+                        "Re-run the installer to re-register.",
+                        conn.entry.worker_id, conn.entry.platform_url,
+                        conn.entry.worker_id, conn.entry.platform_url,
+                    )
+                    # `finally` below still runs `conn.close()` on the way out.
+                    return
                 logger.exception("runner: connection to %s dropped, retrying in %ss", conn.entry.platform_url, backoff)
             finally:
                 await conn.close()
@@ -1831,6 +1900,15 @@ class AgentLoop:
         self._control_task = asyncio.create_task(self._control_loop(), name="comfyfed-control-loop")
         try:
             await asyncio.gather(*(self._run_platform(conn) for conn in self.connections.values()))
+            # Reaching here means every `_run_platform` RETURNED, and the only
+            # path out of that retry loop is a 4401 give-up. If nothing ever
+            # handshaked, every configured registration is dead -- surface it
+            # loudly (a healthy entry never returns, so a mixed fleet keeps
+            # running and never reaches this line).
+            if self._auth_gave_up and not self._connected_ever:
+                raise AllRegistrationsRejected(
+                    "every configured platform rejected this agent's registration (4401)"
+                )
         finally:
             # A signal already ran (and awaited) the full graceful shutdown
             # via `_graceful_shutdown_and_stop` before stopping the loop --

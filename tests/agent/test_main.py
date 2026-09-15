@@ -8,7 +8,7 @@ import pytest
 
 from comfyfed_agent import main as main_module
 from comfyfed_agent.config import AgentConfig, PlatformEntry
-from comfyfed_agent.runner import AgentLoop
+from comfyfed_agent.runner import AgentLoop, AllRegistrationsRejected
 from comfyfed_agent import update
 
 
@@ -79,3 +79,24 @@ def test_run_reraises_unrelated_runtimeerror_even_during_shutdown(monkeypatch, t
 
     with pytest.raises(RuntimeError, match="something else entirely broke"):
         main_module._cmd_run(_args(str(tmp_path / "agent.json")))
+
+
+def test_run_exits_4_with_a_bilingual_message_when_all_registrations_rejected(
+    monkeypatch, tmp_path, capsys
+):
+    """Every configured registration was 4401-rejected and none connected:
+    `run()` raises `AllRegistrationsRejected`, which `_cmd_run` turns into a
+    loud bilingual message on stderr and a non-zero exit (4)."""
+
+    async def _all_rejected(self):
+        raise AllRegistrationsRejected("all dead")
+
+    monkeypatch.setattr(AgentLoop, "run", _all_rejected)
+
+    with pytest.raises(SystemExit) as exc_info:
+        main_module._cmd_run(_args(str(tmp_path / "agent.json")))
+
+    assert exc_info.value.code == 4
+    err = capsys.readouterr().err
+    assert "所有已註冊的平台都拒絕了本 agent" in err
+    assert "Re-run the installer to re-register" in err
