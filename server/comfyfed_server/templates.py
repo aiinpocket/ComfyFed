@@ -76,6 +76,37 @@ has run it) into `<data_dir>/comfy_templates_official`:
 * Non-JSON files (thumbnails/media) -- packaged dir first, then official
   dir, same `_MEDIA_TYPES` mapping. No subpaths are ever allowed in
   `filename`, from either source.
+
+Phase 3.x adds a THIRD source, private to the requesting session: "我的範本 /
+My templates". There is no new upload UI and no new storage tree -- a user's
+personal templates are simply whatever `<name>.json` files live in their own
+userdata subfolder `workflows/templates/` (`comfyapi.userdata_dir(data_dir,
+uid)` + `MY_TEMPLATES_SUBDIR`), which the panel's ordinary "Save As" already
+writes to when the workflow name is `templates/<name>`, and which the
+existing `/comfy/api/userdata/...` routes already accept uploads for.
+
+* `index.json`/`index.<locale>.json` gain, FIRST in the list, a category
+  `{moduleName: "default", title: MY_TEMPLATES_TITLE, ...}` holding one entry
+  per personal template -- but only for the CURRENT SESSION USER, and only
+  when they have at least one (an empty folder produces no category rather
+  than an empty group). Every entry's `name` is `my_<stem>`, so a personal
+  template can never collide with a ComfyFed or official one, and the
+  ComfyFed/official categories are left exactly as they were.
+* `GET /comfy/templates/my_<rest>` serves `<rest>` out of the SESSION USER's
+  `workflows/templates/` -- their workflow JSON (raw, never download-metadata
+  stripped: it is the user's own graph, like our packaged ones) and their
+  optional `<stem>-1.<ext>` thumbnail. Another user's identical request 404s,
+  because the directory is resolved from *their* uid; there is no cross-user
+  view here, admin included, same policy as userdata itself.
+* `<rest>` must round-trip through `storage.sanitize_path_component`
+  unchanged -- exactly the same definition of "safe segment" the userdata
+  routes use -- so no traversal, no subpath, no Windows device name can be
+  reached, and a file whose name the userdata sanitizer would reject is
+  simply never listed either (it could not be fetched back).
+* A `my_`-prefixed name that has no match in the user's folder FALLS THROUGH
+  to the ordinary packaged/official lookup rather than 404ing outright, so a
+  (hypothetical) official template literally named `my_something` is not
+  shadowed by this namespace. Unknown on every source is still a 404.
 """
 
 from __future__ import annotations
@@ -87,10 +118,10 @@ import shutil
 from collections import OrderedDict
 from importlib import resources
 
-from fastapi import APIRouter, HTTPException
+from fastapi import APIRouter, Depends, HTTPException
 from fastapi.responses import FileResponse, JSONResponse
 
-from . import official_templates
+from . import auth, comfyapi, official_templates, storage
 
 logger = logging.getLogger(__name__)
 
@@ -321,6 +352,120 @@ def _cached_stripped_workflow(path: str) -> dict | None:
     return stripped
 
 
+# --- "我的範本 / My templates": the session user's own userdata -----------
+
+#: Subfolder of a user's userdata tree whose `<name>.json` files are that
+#: user's personal templates. `workflows/` is where the panel's workflow
+#: browser already saves, so "Save As `templates/<name>`" lands here with no
+#: new UI; `/comfy/api/userdata/workflows%2Ftemplates%2F<name>.json` is the
+#: upload path for everything else.
+MY_TEMPLATES_SUBDIR = "workflows/templates"
+
+#: Namespacing prefix for a personal template's `name` in `index.json` and
+#: therefore for its `/comfy/templates/...` URLs. Chosen so the flat template
+#: namespace stays collision-free against ComfyFed's `comfyfed-*` and the
+#: official library's names.
+MY_TEMPLATES_PREFIX = "my_"
+
+#: zh-TW first, English second -- the house style for every user-facing
+#: string. Doubles as the sidebar `category` group name so the category has a
+#: home, exactly like ComfyFed's own.
+MY_TEMPLATES_TITLE = "我的範本 / My templates"
+
+#: Thumbnail extensions probed for `<stem>-1.<ext>`, in preference order.
+#: Every one of them is in `_MEDIA_TYPES`, so the thumbnail route can always
+#: answer with a real image content-type.
+_MY_THUMBNAIL_EXTENSIONS = (".webp", ".png", ".jpg", ".jpeg")
+
+
+def my_templates_dir(data_dir: str, uid: str) -> str:
+    """Filesystem path of `uid`'s personal-template folder.
+
+    Built on `comfyapi.userdata_dir` (which sanitizes `uid` itself) so this
+    and the `/comfy/api/userdata/...` routes can never address different
+    trees.
+    """
+    return os.path.join(comfyapi.userdata_dir(data_dir, uid), *MY_TEMPLATES_SUBDIR.split("/"))
+
+
+def _round_trips(name: str) -> bool:
+    """True when `name` survives the userdata sanitizer unchanged.
+
+    The accepted charset for a personal template's filename is *defined* as
+    "whatever the userdata sanitizer accepts", rather than restated as a
+    regex here: a name that would not round-trip could never be fetched back
+    through `/comfy/templates/my_<name>` anyway, so it must not be listed in
+    the index either. One definition of "safe segment", same as everywhere
+    else in this codebase.
+    """
+    try:
+        return storage.sanitize_path_component(name) == name
+    except ValueError:
+        return False
+
+
+def my_template_entries(data_dir: str, uid: str) -> list[dict]:
+    """`index.json` entries for `uid`'s personal templates, sorted by name.
+
+    One entry per `<stem>.json` directly inside the folder (no recursion --
+    the frontend's template namespace is flat). `mediaType`/`mediaSubtype`
+    are emitted only when a sibling `<stem>-1.<ext>` thumbnail actually
+    exists; without one they are omitted entirely, since a stated
+    `mediaSubtype` is what makes the frontend build (and fail to load) a
+    thumbnail URL. A missing/unreadable folder is simply "no templates".
+    """
+    directory = my_templates_dir(data_dir, uid)
+    try:
+        names = os.listdir(directory)
+    except OSError:
+        return []
+
+    files = {name for name in names if os.path.isfile(os.path.join(directory, name))}
+
+    entries: list[dict] = []
+    for filename in sorted(files):
+        if not filename.endswith(".json") or not _round_trips(filename):
+            continue
+        stem = filename[: -len(".json")]
+        if not stem:
+            continue
+        entry = {
+            "name": MY_TEMPLATES_PREFIX + stem,
+            "title": stem,
+            "description": "",
+        }
+        for extension in _MY_THUMBNAIL_EXTENSIONS:
+            thumbnail = f"{stem}-1{extension}"
+            if thumbnail in files and _round_trips(thumbnail):
+                entry["mediaType"] = "image"
+                entry["mediaSubtype"] = extension[1:]
+                break
+        entries.append(entry)
+    return entries
+
+
+def my_templates_category(data_dir: str, uid: str) -> dict | None:
+    """The one category to put FIRST in the index, or None when this user
+    has no personal templates (an empty group is worse than no group)."""
+    entries = my_template_entries(data_dir, uid)
+    if not entries:
+        return None
+    return {
+        "moduleName": "default",
+        "title": MY_TEMPLATES_TITLE,
+        "type": "image",
+        "isEssential": True,
+        "category": MY_TEMPLATES_TITLE,
+        "templates": entries,
+    }
+
+
+def _with_my_templates(categories: list, data_dir: str, uid: str) -> list:
+    """`categories` with the session user's own category prepended."""
+    mine = my_templates_category(data_dir, uid)
+    return ([mine] if mine is not None else []) + list(categories)
+
+
 def _merged_index(data_dir: str, index_name: str) -> list | None:
     """ComfyFed's categories from `index_name` (packaged) followed by the
     official library's categories from the same-named file in `official_dir`,
@@ -350,7 +495,12 @@ def create_router(data_dir: str) -> APIRouter:
     r = APIRouter()
 
     @r.get("/comfy/templates/{filename}", include_in_schema=False)
-    def template_file(filename: str):
+    def template_file(filename: str, user: auth.SessionUser = Depends(auth.require_user)):
+        # The session is needed to resolve "我的範本" against the RIGHT user's
+        # userdata. Unauthenticated hits never reach here -- app.py's
+        # `/comfy` session gate is HTTP middleware, so it still answers them
+        # with the 302-to-login the panel's browser needs (this dependency
+        # would answer 401 JSON, which a page load cannot follow).
         # No subpaths: the frontend only ever asks for files directly under
         # `templates/`, so anything with a separator in it is a traversal
         # attempt rather than a legitimate request. `:` is rejected too --
@@ -381,7 +531,7 @@ def create_router(data_dir: str) -> APIRouter:
             merged = _merged_index(data_dir, filename)
             if merged is None:
                 raise HTTPException(status_code=404, detail="Not found")
-            return JSONResponse(merged)
+            return JSONResponse(_with_my_templates(merged, data_dir, user.uid))
 
         if filename.startswith("index.") and filename.endswith(".json") and filename != "index.json":
             official = _load_json_cached(os.path.join(official_dir, filename))
@@ -389,9 +539,23 @@ def create_router(data_dir: str) -> APIRouter:
                 raise HTTPException(status_code=404, detail="Not found")
             ours = _load_json_cached(os.path.join(templates_dir(), "index.json"))
             ours_list = ours if isinstance(ours, list) else []
-            return JSONResponse(ours_list + official)
+            return JSONResponse(_with_my_templates(ours_list + official, data_dir, user.uid))
 
         extension = os.path.splitext(filename)[1].lower()
+
+        # "我的範本": `my_<rest>` resolves inside the SESSION USER's own
+        # `workflows/templates/`, never anyone else's. A miss falls through
+        # to the packaged/official lookup below rather than 404ing here (see
+        # the module docstring) -- so an unknown name is still a 404, but a
+        # same-named official template would not be shadowed.
+        if filename.startswith(MY_TEMPLATES_PREFIX):
+            rest = filename[len(MY_TEMPLATES_PREFIX):]
+            if _round_trips(rest):
+                mine = os.path.join(my_templates_dir(data_dir, user.uid), rest)
+                if os.path.isfile(mine):
+                    return FileResponse(
+                        mine, media_type=_MEDIA_TYPES.get(extension, "application/octet-stream")
+                    )
 
         path = os.path.join(templates_dir(), filename)
         source = "packaged" if os.path.isfile(path) else None

@@ -66,6 +66,24 @@
  * `comfyfed_sample_clip.mp4` -- `templates_data/assets/` on the Python
  * side) are copied into R2 `staging/<name>` if not already present, so a
  * template's LoadImage/LoadVideo node resolves on the very first run.
+ * "我的範本 / My templates" (parity with `templates.py`'s section of the same
+ * name -- read that module's docstring for the full rules): the session
+ * user's own userdata subfolder `workflows/templates/` is a third,
+ * PRIVATE-to-that-user template source. Here that folder is the R2 prefix
+ * `userdata/<uid>/workflows/templates/` (`lib/store.ts`'s `userdataPrefix`),
+ * listed on every index request for the CURRENT session user and prepended
+ * as the FIRST category when it has at least one `<name>.json`; each entry's
+ * `name` is `my_<stem>`, and `GET /comfy/templates/my_<rest>` reads
+ * `userdataKey(uid, "workflows/templates/" + rest)` -- so one user's request
+ * can never reach another's file, admin included (same policy as userdata).
+ * `<rest>` must round-trip through `sanitizePathComponent` unchanged (one
+ * definition of "safe segment", so no traversal/subpath/device name), a miss
+ * falls through to the packaged/official lookup rather than 404ing on the
+ * spot, and the per-user category is deliberately computed OUTSIDE
+ * `mergedIndexCache` -- that cache is keyed on R2 etags and shared by every
+ * isolate's requests, so caching a uid-specific half in it would leak one
+ * user's template list to the next requester.
+ *
  * Memoized per isolate on a PER-ASSET basis (a module-level `Set`,
  * `seededAssets`) rather than one all-or-nothing flag: a name is only
  * memoized once its copy has actually succeeded (or was already present),
@@ -79,8 +97,8 @@
 
 import { Hono } from "hono";
 import type { Env } from "../env";
-import { requireUser } from "../lib/guard";
-import { stagingKey, SHARED_STAGING_UID } from "../lib/store";
+import { requireUser, SESSION_VAR } from "../lib/guard";
+import { stagingKey, SHARED_STAGING_UID, sanitizePathComponent, userdataKey, userdataPrefix } from "../lib/store";
 import { OFFICIAL_TEMPLATES_PREFIX } from "../core/model_guide";
 
 // Content types stated outright, exactly mirroring `templates.py`'s
@@ -319,6 +337,117 @@ async function localizedMergedIndex(env: Env, filename: string): Promise<unknown
 }
 
 // ---------------------------------------------------------------------------
+// "我的範本 / My templates" -- ports templates.py's section of the same name.
+
+/** Userdata subfolder whose `<name>.json` files are a user's personal
+ * templates. `workflows/` is where the panel's workflow browser already
+ * saves, so "Save As `templates/<name>`" lands here with no new UI. */
+export const MY_TEMPLATES_SUBDIR = "workflows/templates";
+
+/** Namespacing prefix for a personal template's `name` (and therefore its
+ * `/comfy/templates/...` URL), keeping the flat template namespace
+ * collision-free against `comfyfed-*` and the official library. */
+export const MY_TEMPLATES_PREFIX = "my_";
+
+/** zh-TW first, English second; doubles as the sidebar `category` group
+ * name so the category has a home, exactly like ComfyFed's own. */
+export const MY_TEMPLATES_TITLE = "我的範本 / My templates";
+
+/** Thumbnail extensions probed for `<stem>-1.<ext>`, in preference order --
+ * all of them present in `MEDIA_TYPES`. */
+const MY_THUMBNAIL_EXTENSIONS = [".webp", ".png", ".jpg", ".jpeg"];
+
+/** True when `name` survives `sanitizePathComponent` unchanged. The accepted
+ * charset for a personal template filename is *defined* as "whatever the
+ * userdata sanitizer accepts" rather than restated as a regex: a name that
+ * would not round-trip could never be fetched back through
+ * `/comfy/templates/my_<name>`, so it must not be listed in the index
+ * either. Ports `_round_trips`. */
+function roundTrips(name: string): boolean {
+  try {
+    return sanitizePathComponent(name) === name;
+  } catch {
+    return false;
+  }
+}
+
+/** `index.json` entries for `uid`'s personal templates, sorted by name --
+ * ports `my_template_entries`. One entry per `<stem>.json` directly inside
+ * the folder (no recursion: the frontend's template namespace is flat);
+ * `mediaType`/`mediaSubtype` only when a sibling `<stem>-1.<ext>` actually
+ * exists, since a stated `mediaSubtype` is what makes the frontend build
+ * (and fail to load) a thumbnail URL. */
+export async function myTemplateEntries(env: Env, uid: string): Promise<Record<string, unknown>[]> {
+  let prefix: string;
+  try {
+    prefix = userdataPrefix(uid, MY_TEMPLATES_SUBDIR);
+  } catch {
+    return [];
+  }
+
+  // R2 LIST is paginated; a user with many saved templates must still see
+  // all of them (same drain shape as comfyapi.ts's userdata listing).
+  const names = new Set<string>();
+  let cursor: string | undefined;
+  do {
+    const page = await env.STORE.list({ prefix, cursor });
+    for (const obj of page.objects) {
+      const rel = obj.key.slice(prefix.length);
+      // Flat only -- an object one level deeper is somebody's subfolder,
+      // not a template (Python's `os.path.isfile` check does the same).
+      if (rel && !rel.includes("/")) names.add(rel);
+    }
+    cursor = page.truncated ? page.cursor : undefined;
+  } while (cursor);
+
+  const entries: Record<string, unknown>[] = [];
+  for (const filename of [...names].sort()) {
+    if (!filename.endsWith(".json") || !roundTrips(filename)) continue;
+    const stem = filename.slice(0, -".json".length);
+    if (!stem) continue;
+
+    const entry: Record<string, unknown> = {
+      name: MY_TEMPLATES_PREFIX + stem,
+      title: stem,
+      description: "",
+    };
+    for (const extension of MY_THUMBNAIL_EXTENSIONS) {
+      const thumbnail = `${stem}-1${extension}`;
+      if (names.has(thumbnail) && roundTrips(thumbnail)) {
+        entry.mediaType = "image";
+        entry.mediaSubtype = extension.slice(1);
+        break;
+      }
+    }
+    entries.push(entry);
+  }
+  return entries;
+}
+
+/** The one category to put FIRST in the index, or `null` when this user has
+ * no personal templates (an empty group is worse than no group) -- ports
+ * `my_templates_category`. */
+async function myTemplatesCategory(env: Env, uid: string): Promise<Record<string, unknown> | null> {
+  const templates = await myTemplateEntries(env, uid);
+  if (templates.length === 0) return null;
+  return {
+    moduleName: "default",
+    title: MY_TEMPLATES_TITLE,
+    type: "image",
+    isEssential: true,
+    category: MY_TEMPLATES_TITLE,
+    templates,
+  };
+}
+
+/** `categories` with the session user's own category prepended -- ports
+ * `_with_my_templates`. Never cached: see this module's docstring. */
+async function withMyTemplates(env: Env, uid: string, categories: unknown[]): Promise<unknown[]> {
+  const mine = await myTemplatesCategory(env, uid);
+  return mine === null ? [...categories] : [mine, ...categories];
+}
+
+// ---------------------------------------------------------------------------
 // Staging seed -- ports `seed_staging`, sourced from the packaged assets
 // (ASSETS binding first, R2 `comfyfed_templates/assets/<name>` fallback,
 // same two-source lookup as everything else packaged in this file).
@@ -379,6 +508,9 @@ app.get("/comfy/templates/:filename", async (c) => {
 
   await seedStagingOnce(c.env);
 
+  // Needed to resolve "我的範本" against the RIGHT user's userdata prefix.
+  const uid = c.get(SESSION_VAR).user.uid;
+
   if (filename === "index_logo.json") {
     const logo = await loadOfficialJson(c.env.STORE, filename);
     if (logo === null) return c.body(null, 404);
@@ -388,16 +520,38 @@ app.get("/comfy/templates/:filename", async (c) => {
   if (filename === "index.json") {
     const merged = await mergedIndex(c.env);
     if (merged === null) return c.body(null, 404);
-    return c.json(merged as unknown[]);
+    return c.json(await withMyTemplates(c.env, uid, merged));
   }
 
   if (filename.startsWith("index.") && filename.endsWith(".json")) {
     const merged = await localizedMergedIndex(c.env, filename);
     if (merged === null) return c.body(null, 404);
-    return c.json(merged as unknown[]);
+    return c.json(await withMyTemplates(c.env, uid, merged));
   }
 
   const mediaType = MEDIA_TYPES[extOf(filename)] ?? "application/octet-stream";
+
+  // "我的範本": `my_<rest>` resolves inside the SESSION USER's own
+  // `workflows/templates/`, never anyone else's. A miss falls through to the
+  // packaged/official lookup below rather than 404ing on the spot -- so an
+  // unknown name is still a 404, but a same-named official template would
+  // not be shadowed. Served raw, never download-metadata stripped: it is the
+  // user's own graph, like ComfyFed's packaged ones.
+  if (filename.startsWith(MY_TEMPLATES_PREFIX)) {
+    const rest = filename.slice(MY_TEMPLATES_PREFIX.length);
+    if (roundTrips(rest)) {
+      let key: string | null = null;
+      try {
+        key = userdataKey(uid, `${MY_TEMPLATES_SUBDIR}/${rest}`);
+      } catch {
+        key = null;
+      }
+      const mine = key === null ? null : await c.env.STORE.get(key);
+      if (mine) {
+        return new Response(await mine.arrayBuffer(), { headers: { "content-type": mediaType } });
+      }
+    }
+  }
 
   const packaged = await fetchPackagedRaw(c.env, filename);
   if (packaged !== null) {

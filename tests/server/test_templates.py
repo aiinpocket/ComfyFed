@@ -1382,3 +1382,216 @@ def test_prompt_helper_templates_save_and_preview_the_generated_text():
         save_text = next(n for n in workflow["nodes"] if n["type"] == "SaveText")
         assert save_text["widgets_values"][0] == "comfyfed_prompt"
         assert save_text["widgets_values"][1] == "txt"
+
+
+# --- "我的範本 / My templates": per-user templates from userdata ----------
+
+
+_ALICE = ("alice", "alice-pw-123")
+_BOB = ("bob", "bob-pw-123")
+
+
+def _login_as(client, username, password):
+    r = client.post("/api/auth/login", json={"username": username, "password": password})
+    assert r.status_code == 200, r.text
+    return r.json()["csrf"]
+
+
+def _create_user(client, admin_csrf, username, password):
+    r = client.post(
+        "/api/users",
+        json={"username": username, "role": "user", "password": password},
+        headers={"X-CSRF": admin_csrf},
+    )
+    assert r.status_code == 200, r.text
+
+
+def _uid_of(username):
+    with db.get_session() as session:
+        return session.query(db.User).filter(db.User.username == username).one().id
+
+
+@pytest.fixture()
+def alice_and_bob(client):
+    """admin (bootstrap) + alice + bob, no session left active -- the
+    TestClient has one cookie jar, so each test logs in as who it needs."""
+    admin_csrf = _login_as(client, "admin", client.admin_password)
+    _create_user(client, admin_csrf, *_ALICE)
+    _create_user(client, admin_csrf, *_BOB)
+    return {"alice": _uid_of(_ALICE[0]), "bob": _uid_of(_BOB[0])}
+
+
+_MY_WORKFLOW = {"version": 0.4, "nodes": [], "links": [], "groups": []}
+
+
+def _write_my_template(data_dir, uid, name, *, thumbnail=None, workflow=None):
+    """Put `<name>.json` (+ an optional `<name>-1.<ext>` thumbnail) into
+    `uid`'s userdata `workflows/templates/`, exactly where the panel's
+    "Save As `templates/<name>`" writes it."""
+    directory = templates.my_templates_dir(data_dir, uid)
+    os.makedirs(directory, exist_ok=True)
+    with open(os.path.join(directory, f"{name}.json"), "w", encoding="utf-8") as f:
+        json.dump(workflow if workflow is not None else _MY_WORKFLOW, f)
+    if thumbnail is not None:
+        with open(os.path.join(directory, f"{name}-1{thumbnail}"), "wb") as f:
+            f.write(b"RIFF" + b"\x00" * 8 + b"WEBP")
+    return directory
+
+
+def _categories_by_title(index):
+    return {category["title"]: category for category in index}
+
+
+def test_my_templates_category_is_first_and_lists_only_my_own(client, alice_and_bob):
+    _write_my_template(client.data_dir, alice_and_bob["alice"], "my-wuxia-remix", thumbnail=".webp")
+    _write_my_template(client.data_dir, alice_and_bob["bob"], "bobs-secret")
+
+    _login_as(client, *_ALICE)
+    index = client.get("/comfy/templates/index.json").json()
+
+    mine = index[0]
+    assert mine["title"] == templates.MY_TEMPLATES_TITLE
+    # `moduleName == "default"` is what makes the frontend resolve the
+    # workflow/thumbnail through `/comfy/templates/...`; isEssential +
+    # category give the sidebar a home, same as ComfyFed's own category.
+    assert mine["moduleName"] == "default"
+    assert mine["isEssential"] is True
+    assert mine["category"] == templates.MY_TEMPLATES_TITLE
+    assert mine["type"]
+
+    assert [t["name"] for t in mine["templates"]] == ["my_my-wuxia-remix"]
+    entry = mine["templates"][0]
+    assert entry["title"] == "my-wuxia-remix"
+    assert entry["mediaType"] == "image"
+    assert entry["mediaSubtype"] == "webp"
+
+    # Bob's template is nowhere in Alice's index, under any name.
+    assert "bobs-secret" not in json.dumps(index)
+
+    # The ComfyFed category is untouched and still carries every packaged
+    # template, just no longer at position 0.
+    comfyfed = _categories_by_title(index)["ComfyFed"]
+    assert [t["name"] for t in comfyfed["templates"]] == list(templates.TEMPLATE_NAMES)
+
+
+def test_my_templates_category_absent_when_folder_is_empty(client, alice_and_bob):
+    _login_as(client, *_ALICE)
+    index = client.get("/comfy/templates/index.json").json()
+
+    # No empty group, and the ComfyFed category is exactly what it was.
+    assert templates.MY_TEMPLATES_TITLE not in _categories_by_title(index)
+    assert index[0]["title"] == "ComfyFed"
+
+    # An existing-but-empty folder is the same as no folder at all.
+    os.makedirs(templates.my_templates_dir(client.data_dir, alice_and_bob["alice"]), exist_ok=True)
+    index = client.get("/comfy/templates/index.json").json()
+    assert templates.MY_TEMPLATES_TITLE not in _categories_by_title(index)
+
+
+def test_my_templates_entry_omits_media_keys_without_a_thumbnail(client, alice_and_bob):
+    _write_my_template(client.data_dir, alice_and_bob["alice"], "no-thumb")
+
+    _login_as(client, *_ALICE)
+    entry = client.get("/comfy/templates/index.json").json()[0]["templates"][0]
+
+    # Stating a mediaSubtype is what makes the frontend build a thumbnail
+    # URL, so with no thumbnail on disk both keys are omitted entirely.
+    assert "mediaType" not in entry
+    assert "mediaSubtype" not in entry
+
+
+def test_my_templates_merge_into_the_official_index_too(client, alice_and_bob):
+    _seed_official_dir(client.data_dir)
+    _write_my_template(client.data_dir, alice_and_bob["alice"], "mine")
+
+    _login_as(client, *_ALICE)
+    titles = [c["title"] for c in client.get("/comfy/templates/index.json").json()]
+    assert titles == [templates.MY_TEMPLATES_TITLE, "ComfyFed", "Flux"]
+
+
+def test_my_templates_merge_into_the_localized_index_too(client, alice_and_bob):
+    localized = dict(_FLUX_CATEGORY, title="Flux (zh)")
+    _seed_official_dir(client.data_dir, localized=[localized])
+    _write_my_template(client.data_dir, alice_and_bob["alice"], "mine")
+
+    _login_as(client, *_ALICE)
+    titles = [c["title"] for c in client.get("/comfy/templates/index.zh.json").json()]
+    assert titles == [templates.MY_TEMPLATES_TITLE, "ComfyFed", "Flux (zh)"]
+
+
+def test_my_template_workflow_and_thumbnail_are_served_to_their_owner(client, alice_and_bob):
+    _write_my_template(client.data_dir, alice_and_bob["alice"], "mine", thumbnail=".webp")
+
+    _login_as(client, *_ALICE)
+    r = client.get("/comfy/templates/my_mine.json")
+    assert r.status_code == 200
+    assert r.headers["content-type"].startswith("application/json")
+    # The user's own graph, served as-is (no download-metadata strip).
+    assert r.json() == _MY_WORKFLOW
+
+    r = client.get("/comfy/templates/my_mine-1.webp")
+    assert r.status_code == 200
+    assert r.headers["content-type"] == "image/webp"
+
+
+def test_my_template_of_another_user_is_404_not_readable(client, alice_and_bob):
+    _write_my_template(client.data_dir, alice_and_bob["alice"], "mine", thumbnail=".webp")
+
+    _login_as(client, *_BOB)
+    assert client.get("/comfy/templates/my_mine.json").status_code == 404
+    assert client.get("/comfy/templates/my_mine-1.webp").status_code == 404
+
+    # Not even the admin gets a cross-user view -- same policy as userdata.
+    _login_as(client, "admin", client.admin_password)
+    assert client.get("/comfy/templates/my_mine.json").status_code == 404
+
+
+def test_my_template_traversal_and_unsanitizable_names_404(client, alice_and_bob):
+    _write_my_template(client.data_dir, alice_and_bob["alice"], "mine")
+    _login_as(client, *_ALICE)
+
+    for filename in (
+        "my_..%2F..%2Fcomfyfed.db",
+        "my_..%2Fmine.json",
+        "my_sub%2Fmine.json",
+        "my_C:mine.json",
+        "my_.",
+        "my_..",
+        "my_",
+        "my_nope.json",
+    ):
+        assert client.get(f"/comfy/templates/{filename}").status_code == 404, filename
+
+    # And the file really is still reachable under its legitimate name.
+    assert client.get("/comfy/templates/my_mine.json").status_code == 200
+
+
+def test_my_templates_index_never_lists_a_name_the_sanitizer_would_reject(client, alice_and_bob):
+    directory = templates.my_templates_dir(client.data_dir, alice_and_bob["alice"])
+    os.makedirs(directory, exist_ok=True)
+    # A reserved DOS device name: `sanitize_path_component` rejects it, so
+    # `/comfy/templates/my_nul.json` could never serve it -- listing it would
+    # only produce a broken entry.
+    with open(os.path.join(directory, "nul.json"), "w", encoding="utf-8") as f:
+        json.dump(_MY_WORKFLOW, f)
+    # A subdirectory is not a template either.
+    os.makedirs(os.path.join(directory, "nested.json"), exist_ok=True)
+
+    _login_as(client, *_ALICE)
+    index = client.get("/comfy/templates/index.json").json()
+    assert templates.MY_TEMPLATES_TITLE not in _categories_by_title(index)
+
+
+def test_my_prefix_miss_falls_through_to_the_official_library(client, alice_and_bob):
+    """A `my_`-prefixed name the user does not own is not a dead end -- it
+    still resolves against the packaged/official sources (and only 404s when
+    nobody has it)."""
+    official_dir = _seed_official_dir(client.data_dir)
+    with open(os.path.join(official_dir, "my_official.json"), "w", encoding="utf-8") as f:
+        json.dump(_FLUX_WORKFLOW, f)
+
+    _login_as(client, *_ALICE)
+    r = client.get("/comfy/templates/my_official.json")
+    assert r.status_code == 200
+    # Official source, so download metadata is still stripped.
+    assert "url" not in r.json()["nodes"][0]["properties"]["models"][0]

@@ -372,6 +372,15 @@ Ten templates (backed by `server/comfyfed_server/templates_data/index.json`):
 
 **Bundled assets**: templates that need a reference image or sample input (reference-to-video, image-to-prompt, image-upscale, etc.) seed the matching file into `<data-dir>/comfy_staging/` at startup, so the `LoadImage`/`LoadVideo` dropdown resolves out of the box. To use your own, upload it on the node (or drop the file onto the canvas) — uploads land in the same staging area and are copied into the job's inputs at submit time.
 
+**Custom templates (My templates)**: the **「我的範本 / My templates」** category at the very top of the template browser is **yours alone** — no other user sees it, not even an admin. There are two ways to fill it, neither of which needs any new UI:
+
+- in the editor, **Save As** the workflow under the name `templates/<name>` (the workflow browser already saves into userdata's `workflows/...`);
+- or upload straight to `workflows/templates/<name>.json` through the existing userdata API.
+
+For a thumbnail, drop a matching `<name>-1.webp` (`.png`/`.jpg` also work) beside it in the same folder; without one the card simply has no preview. Reload the template browser after saving and it is there — clicking it still **copies** the graph onto the canvas.
+
+Naming rules: a single filename only — no `/`, `\`, `:`, no leading `.`/`..`, no trailing dot or space, and no Windows reserved device name (`con`, `nul`, `com1`, …). These are exactly the rules every other userdata file follows; a file that breaks them is never listed. Each entry's name in the index is `my_<name>`, so a personal template can never collide with a ComfyFed or official one. **An empty folder produces no category at all** (no empty group is shown). To delete a template, delete its `.json` (and its thumbnail).
+
 **Upload limits and the storage quota**: every uploaded file has a **per-file ceiling** (default **50 MB**) and every user has a **storage quota** (default **5 GB**). The per-file cap applies to editor uploads, workflows saved through `/userdata`, and assets attached to a console job submit. The quota counts only a user's own two areas — staging uploads (`comfy_staging/<uid>/`) and saved panel files (`comfy_userdata/<uid>/`); **job results do not count toward it** (they are outputs, and reclaiming them is a separate concern). Exceeding either answers 413 with a message naming the amount used and the quota. An admin adjusts both under **Console → Settings → Upload limits** (1–1024 MB per file; 0.1–1024 GB quota); they are stored as the `upload_max_file_mb` and `upload_user_quota_gb` settings and take effect immediately, no restart. Each user sees their own usage and quota on the Settings page's "My uploads" card.
 
 ⚠ The models a template names must actually be installed **on a worker** for the dropdowns to offer them and for the job to be dispatchable. Otherwise the job is created but sits in the queue; the Jobs page's ineligibility reasons say what is missing. The six zero-model templates (video concat, image intro + video, video trim, etc.) run fine on a brand-new worker with no models at all.

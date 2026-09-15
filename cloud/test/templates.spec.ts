@@ -60,7 +60,7 @@ afterEach(async () => {
   await db().prepare("DELETE FROM settings").run();
   await db().prepare("DELETE FROM users").run();
   clearTemplatesCacheForTests();
-  for (const prefix of ["staging/", "official_templates/", "comfyfed_templates/"]) {
+  for (const prefix of ["staging/", "official_templates/", "comfyfed_templates/", "userdata/"]) {
     const listed = await store().list({ prefix });
     await Promise.all(listed.objects.map((o) => store().delete(o.key)));
   }
@@ -628,5 +628,219 @@ describe("staging seed (seed_staging parity)", () => {
     } finally {
       (store() as any).put = realPut;
     }
+  });
+});
+
+
+// ---------------------------------------------------------------------------
+// "我的範本 / My templates" -- parity with tests/server/test_templates.py's
+// section of the same name. A user's personal templates are just the
+// `<name>.json` objects under their own userdata prefix
+// `userdata/<uid>/workflows/templates/`; the index gains a FIRST category for
+// the session user only, and `my_<rest>` assets resolve inside that user's
+// prefix and nobody else's.
+
+const MY_SUBDIR = "workflows/templates";
+const MY_TITLE = "我的範本 / My templates";
+const MY_WORKFLOW = { version: 0.4, nodes: [], links: [], groups: [] };
+
+async function uidOf(username: string): Promise<string> {
+  const row = await db().prepare("SELECT id FROM users WHERE username = ?").bind(username).first<{ id: string }>();
+  expect(row).not.toBeNull();
+  return row!.id;
+}
+
+/** Write `<name>.json` (+ an optional `<name>-1.<ext>` thumbnail) into
+ * `uid`'s userdata `workflows/templates/` -- exactly where the panel's
+ * "Save As `templates/<name>`" writes it. */
+async function putMyTemplate(
+  uid: string,
+  name: string,
+  opts: { thumbnail?: string; workflow?: unknown } = {}
+): Promise<void> {
+  await store().put(`userdata/${uid}/${MY_SUBDIR}/${name}.json`, JSON.stringify(opts.workflow ?? MY_WORKFLOW));
+  if (opts.thumbnail) {
+    await store().put(
+      `userdata/${uid}/${MY_SUBDIR}/${name}-1${opts.thumbnail}`,
+      new TextEncoder().encode("RIFF\x00\x00\x00\x00WEBPmine")
+    );
+  }
+}
+
+function titlesOf(index: any): string[] {
+  return (index as any[]).map((c) => c.title);
+}
+
+/** Raw (non-JSON-parsing) fetch through the worker, for thumbnail bytes. */
+async function rawGet(path: string, cookie: string | null): Promise<Response> {
+  const request = new Request(`http://example.com${path}`, { headers: { Cookie: cookie ?? "" } });
+  const ctx = createExecutionContext();
+  const response = await worker.fetch(request, env as any, ctx);
+  await waitOnExecutionContext(ctx);
+  return response;
+}
+
+describe("我的範本 / My templates", () => {
+  it("lists the session user's own templates FIRST and never another user's", async () => {
+    await putPackagedJson("index.json", [COMFYFED_CATEGORY]);
+    const alice = await userSession("alice");
+    const bob = await userSession("bob");
+    await putMyTemplate(await uidOf("alice"), "my-wuxia-remix", { thumbnail: ".webp" });
+    await putMyTemplate(await uidOf("bob"), "bobs-secret");
+
+    const r = await call("/comfy/templates/index.json", { cookie: alice.cookie });
+    expect(r.status).toBe(200);
+    const index = r.body as any[];
+
+    const mine = index[0];
+    expect(mine.title).toBe(MY_TITLE);
+    // `moduleName === "default"` is what makes the frontend resolve the
+    // workflow/thumbnail through `/comfy/templates/...`; isEssential +
+    // category give the sidebar a home, same as ComfyFed's own category.
+    expect(mine.moduleName).toBe("default");
+    expect(mine.isEssential).toBe(true);
+    expect(mine.category).toBe(MY_TITLE);
+    expect(mine.type).toBeTruthy();
+    expect(mine.templates).toEqual([
+      { name: "my_my-wuxia-remix", title: "my-wuxia-remix", description: "", mediaType: "image", mediaSubtype: "webp" },
+    ]);
+
+    // Bob's template is nowhere in Alice's index, and the ComfyFed category
+    // is untouched (just no longer at position 0).
+    expect(JSON.stringify(index)).not.toContain("bobs-secret");
+    expect(index[1]).toEqual(COMFYFED_CATEGORY);
+
+    // ...and Bob's own index shows his, not hers.
+    const bobIndex = (await call("/comfy/templates/index.json", { cookie: bob.cookie })).body as any[];
+    expect(bobIndex[0].templates).toEqual([{ name: "my_bobs-secret", title: "bobs-secret", description: "" }]);
+    expect(JSON.stringify(bobIndex)).not.toContain("my-wuxia-remix");
+  });
+
+  it("adds no category at all when the user has no templates (no empty group)", async () => {
+    await putPackagedJson("index.json", [COMFYFED_CATEGORY]);
+    const alice = await userSession("alice");
+
+    const index = (await call("/comfy/templates/index.json", { cookie: alice.cookie })).body as any[];
+    expect(titlesOf(index)).toEqual(["ComfyFed"]);
+  });
+
+  it("omits mediaType/mediaSubtype when there is no thumbnail", async () => {
+    await putPackagedJson("index.json", [COMFYFED_CATEGORY]);
+    const alice = await userSession("alice");
+    await putMyTemplate(await uidOf("alice"), "no-thumb");
+
+    const index = (await call("/comfy/templates/index.json", { cookie: alice.cookie })).body as any[];
+    const entry = index[0].templates[0];
+    // Stating a mediaSubtype is what makes the frontend build a thumbnail
+    // URL, so with no thumbnail stored both keys are omitted entirely.
+    expect(entry).toEqual({ name: "my_no-thumb", title: "no-thumb", description: "" });
+  });
+
+  it("merges ahead of the ComfyFed + official categories, and into a localized index too", async () => {
+    await putPackagedJson("index.json", [COMFYFED_CATEGORY]);
+    await putOfficialJson("index.json", [FLUX_CATEGORY]);
+    await putOfficialJson("index.zh.json", [{ ...FLUX_CATEGORY, title: "Flux (zh)" }]);
+    const alice = await userSession("alice");
+    await putMyTemplate(await uidOf("alice"), "mine");
+
+    const index = (await call("/comfy/templates/index.json", { cookie: alice.cookie })).body as any[];
+    expect(titlesOf(index)).toEqual([MY_TITLE, "ComfyFed", "Flux"]);
+
+    const localized = (await call("/comfy/templates/index.zh.json", { cookie: alice.cookie })).body as any[];
+    expect(titlesOf(localized)).toEqual([MY_TITLE, "ComfyFed", "Flux (zh)"]);
+  });
+
+  it("never lets the shared index-merge cache leak one user's category to another", async () => {
+    // mergedIndexCache is keyed on R2 etags and shared across requests, so
+    // the per-user half must be computed outside it -- this is the
+    // regression test for that.
+    await putPackagedJson("index.json", [COMFYFED_CATEGORY]);
+    const alice = await userSession("alice");
+    const bob = await userSession("bob");
+    await putMyTemplate(await uidOf("alice"), "alices-only");
+
+    const first = (await call("/comfy/templates/index.json", { cookie: alice.cookie })).body as any[];
+    expect(titlesOf(first)).toEqual([MY_TITLE, "ComfyFed"]);
+
+    const second = (await call("/comfy/templates/index.json", { cookie: bob.cookie })).body as any[];
+    expect(titlesOf(second)).toEqual(["ComfyFed"]);
+    expect(JSON.stringify(second)).not.toContain("alices-only");
+  });
+
+  it("serves the owner's workflow raw and their thumbnail with the mapped content-type", async () => {
+    const alice = await userSession("alice");
+    await putMyTemplate(await uidOf("alice"), "mine", { thumbnail: ".webp" });
+
+    const r = await call("/comfy/templates/my_mine.json", { cookie: alice.cookie });
+    expect(r.status).toBe(200);
+    // The user's own graph, served as-is (no download-metadata strip).
+    expect(r.body).toEqual(MY_WORKFLOW);
+
+    const media = await rawGet("/comfy/templates/my_mine-1.webp", alice.cookie);
+    expect(media.status).toBe(200);
+    expect(media.headers.get("content-type")).toBe("image/webp");
+    expect(new TextDecoder().decode(await media.arrayBuffer())).toBe("RIFF\x00\x00\x00\x00WEBPmine");
+  });
+
+  it("404s another user's template -- admin included (same policy as userdata)", async () => {
+    const alice = await userSession("alice");
+    await putMyTemplate(await uidOf("alice"), "mine", { thumbnail: ".webp" });
+
+    const bob = await userSession("bob");
+    expect((await call("/comfy/templates/my_mine.json", { cookie: bob.cookie })).status).toBe(404);
+    expect((await call("/comfy/templates/my_mine-1.webp", { cookie: bob.cookie })).status).toBe(404);
+
+    const admin = await loginSession();
+    expect((await call("/comfy/templates/my_mine.json", { cookie: admin.cookie })).status).toBe(404);
+  });
+
+  it("404s traversal, subpath and unsanitizable names under the my_ prefix", async () => {
+    const alice = await userSession("alice");
+    await putMyTemplate(await uidOf("alice"), "mine");
+
+    for (const filename of [
+      "my_..%2F..%2Fcomfyfed.db",
+      "my_..%2Fmine.json",
+      "my_sub%2Fmine.json",
+      "my_C:mine.json",
+      "my_.",
+      "my_..",
+      "my_",
+      "my_nope.json",
+    ]) {
+      const r = await call(`/comfy/templates/${filename}`, { cookie: alice.cookie });
+      expect(r.status, filename).toBe(404);
+    }
+
+    // ...and the file really is still reachable under its legitimate name.
+    expect((await call("/comfy/templates/my_mine.json", { cookie: alice.cookie })).status).toBe(200);
+  });
+
+  it("never lists a stored name the sanitizer would reject, nor a nested object", async () => {
+    await putPackagedJson("index.json", [COMFYFED_CATEGORY]);
+    const alice = await userSession("alice");
+    const uid = await uidOf("alice");
+    // A reserved DOS device name: sanitizePathComponent rejects it, so
+    // `/comfy/templates/my_nul.json` could never serve it back -- listing it
+    // would only produce a broken entry.
+    await store().put(`userdata/${uid}/${MY_SUBDIR}/nul.json`, JSON.stringify(MY_WORKFLOW));
+    // One level deeper is somebody's subfolder, not a template.
+    await store().put(`userdata/${uid}/${MY_SUBDIR}/nested/deep.json`, JSON.stringify(MY_WORKFLOW));
+
+    const index = (await call("/comfy/templates/index.json", { cookie: alice.cookie })).body as any[];
+    expect(titlesOf(index)).toEqual(["ComfyFed"]);
+  });
+
+  it("falls through to the official library for a my_ name the user does not own", async () => {
+    await putOfficialJson("my_official.json", FLUX_WORKFLOW);
+    const alice = await userSession("alice");
+
+    const r = await call("/comfy/templates/my_official.json", { cookie: alice.cookie });
+    expect(r.status).toBe(200);
+    // Official source, so download metadata is still stripped.
+    expect(r.body.nodes[0].properties.models[0]).toEqual({
+      name: "flux1-dev.safetensors",
+      directory: "diffusion_models",
+    });
   });
 });
