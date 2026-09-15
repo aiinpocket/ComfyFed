@@ -2,11 +2,13 @@
 /**
  * Phase 3.0 Task 6: role-based navigation and route guards.
  *
- * A `user` role must not see the Workers nav item, and navigating straight
- * to /workers (deep link, back button) must redirect to /dashboard rather
- * than render the page -- which would otherwise fire `GET /api/workers` and
- * get a 403 (admin-only, see server/comfyfed_server/workers.py's
- * `list_workers`). An `admin` role sees the nav item and the route renders.
+ * Workers are shared infrastructure, so EVERY role sees the Workers nav item
+ * and /workers renders a read-only fleet view (`GET /api/workers` is
+ * `require_user` on both stacks). What separates the roles is the mutation
+ * UI: a `user` never gets the add-worker / disable / delete controls, whose
+ * endpoints stay admin-only (`require_csrf` chains off `require_admin`).
+ * /users remains admin-only: a `user` deep-linking there is redirected to
+ * /dashboard and its `GET /api/users` never fires.
  */
 import '@testing-library/jest-dom/vitest';
 
@@ -73,9 +75,8 @@ function stubFetch(role: 'admin' | 'user') {
       return jsonResponse([]);
     }
     if (url === '/api/workers' && method === 'GET') {
-      if (role !== 'admin') {
-        return jsonResponse({ error: { code: 'auth.forbidden', message: 'Admin role required.' } }, 403);
-      }
+      // require_user on both stacks: every role gets the fleet list. (The
+      // 403 that used to live here was the OLD admin-only policy.)
       return jsonResponse([]);
     }
     if (url === '/api/users' && method === 'GET') {
@@ -96,20 +97,24 @@ describe('App: role-based navigation and route guards', () => {
     vi.unstubAllGlobals();
   });
 
-  it('a "user" role has no Workers nav item and is redirected from /workers to /dashboard', async () => {
+  it('a "user" role sees the Workers nav item and /workers renders read-only (no admin controls)', async () => {
     const fetchMock = stubFetch('user');
     renderApp('/workers');
 
-    // Redirected: dashboard content renders, the Workers page's own heading
-    // ("Registered GPU workers...") does not.
-    expect(await screen.findByText('Dashboard')).toBeInTheDocument();
-    expect(screen.queryByText('Registered GPU workers in this federation.')).not.toBeInTheDocument();
+    // The read-only fleet page renders for a plain user -- no redirect.
+    expect(await screen.findByText('Registered GPU workers in this federation.')).toBeInTheDocument();
+    expect(screen.getByRole('link', { name: /Workers/i })).toBeInTheDocument();
 
-    // Nav hides the admin-only item entirely.
-    expect(screen.queryByRole('link', { name: /Workers/i })).not.toBeInTheDocument();
+    // The list fetch fires: GET /api/workers is require_user now, not admin-only.
+    expect(fetchMock).toHaveBeenCalledWith('/api/workers', expect.anything());
 
-    // The guard prevented the page (and its 403-prone fetch) from ever rendering.
-    expect(fetchMock).not.toHaveBeenCalledWith('/api/workers', expect.anything());
+    // What a user must NEVER get: the mutation controls whose endpoints 403
+    // for a non-admin. Not CSS-hidden -- not rendered at all. `queryAllByRole`
+    // so a stray second match can never mask this as a "multiple elements"
+    // throw instead of a clean assertion.
+    expect(screen.queryAllByRole('button', { name: /Add worker|新增 Worker/i })).toHaveLength(0);
+    expect(screen.queryAllByRole('button', { name: /^Disable$|停用/i })).toHaveLength(0);
+    expect(screen.queryAllByRole('button', { name: /^Delete$|刪除/i })).toHaveLength(0);
   });
 
   it('an "admin" role sees the Workers nav item and /workers renders the page', async () => {
@@ -118,6 +123,14 @@ describe('App: role-based navigation and route guards', () => {
 
     expect(await screen.findByText('Registered GPU workers in this federation.')).toBeInTheDocument();
     expect(screen.getByRole('link', { name: /Workers/i })).toBeInTheDocument();
+
+    // Positive counterpart to the user-role negatives above: the same query
+    // that must find NOTHING for a user finds the real control for an admin,
+    // proving those negative assertions are matching a control that exists.
+    // `getAllByRole`: "Add worker" renders twice on an empty fleet (the
+    // header button AND the empty-state CTA), which would make `getByRole`
+    // throw on multiple matches rather than pass.
+    expect(screen.getAllByRole('button', { name: /Add worker|新增 Worker/i }).length).toBeGreaterThan(0);
   });
 
   it('a "user" role has no Users nav item and is redirected from /users to /dashboard', async () => {
