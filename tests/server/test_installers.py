@@ -480,6 +480,23 @@ def test_ps1_autostart_never_aborts_and_falls_back_to_hkcu_run():
     assert "$autostartOk" in text
 
 
+def test_ps1_autostart_never_registers_both_mechanisms():
+    """Live-caught 2026-09-16 (POKAI-HOME): the machine had BOTH a scheduled
+    task (from an elevated run) and an HKCU Run key (from an earlier plain
+    run), so the agent started twice at logon. Whichever mechanism wins must
+    delete the other."""
+    text = open(_source_path("install.ps1"), encoding="utf-8").read()
+    autostart = text[text.index("Configuring auto-start on logon") : text.index("Starting now")]
+    task_branch, _, run_branch = autostart.partition("} else {")
+    # Scheduled task succeeded -> the stale per-user Run key goes.
+    assert "Remove-ItemProperty" in task_branch
+    assert "-Name 'ComfyFedAgent' -ErrorAction SilentlyContinue" in task_branch
+    # Fell back to the Run key -> any scheduled task from an elevated run goes.
+    assert "schtasks /Delete /F /TN ComfyFedAgent" in run_branch
+    # ...and it is still the warn-and-continue path: no aborting on cleanup.
+    assert "Fail-Step" not in autostart
+
+
 def test_installers_skip_registration_when_already_registered():
     """A register token is single-use; re-running the script (the natural
     recovery after any later step fails) must skip registration instead of

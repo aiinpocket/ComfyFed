@@ -178,6 +178,8 @@ comfyfed stop     # 請 agent 優雅結束：進行中的工作會被取消並�
 
 **偵測不到使用者活動時視為閒置，一律接單**：headless 機器（沒有實體螢幕/鍵盤滑鼠）或 Wayland 桌面若沒有裝 XWayland，agent 偵測不到活動訊號，這種情況一律當作「沒有人在用」，不會因為偵測失敗就把 worker 晾在一邊接不到工作。
 
+**Windows 重開機後 worker 顯示離線（0.1.11 起）**：agent 會在登入時自動啟動，但 ComfyUI Desktop 是由你手動開的，所以重開機後 agent 通常比 ComfyUI 早好幾分鐘就緒。這種情況 agent 會自己處理：它會先探測 ComfyUI，在探測不到之前**不會**連上平台，只印一行警告（不再刷整串 traceback），每 30 秒重試一次，等 ComfyUI 一啟動就自動上線。在那之前主控台只會把該 worker 列為離線，`comfyfed status` 會顯示 `paused` 並附上原因 `comfyui_unreachable`——不用修什麼，把 ComfyUI 打開即可。
+
 **Windows 找不到 `comfyfed` 指令**：剛裝完的那個終端機視窗看不到新加的 PATH，屬正常現象——關閉終端機重開一個新的即可。
 
 **macOS／Linux 找不到 `comfyfed` 指令**：安裝器把指令連到 `~/.local/bin`，但 macOS 預設的 PATH（`/etc/paths`）和精簡版 Linux 映像都不含這個目錄（安裝器偵測到時會提示）。加進去即可：

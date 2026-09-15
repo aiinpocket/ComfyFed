@@ -22,7 +22,7 @@ import websockets
 from websockets.exceptions import ConnectionClosed
 from nacl.signing import SigningKey
 
-from . import comfy, control, fetcher, hardware, peerserve, signing, whitelist
+from . import comfy, control, detect, fetcher, hardware, peerserve, signing, whitelist
 from .config import AgentConfig, PlatformEntry
 
 logger = logging.getLogger(__name__)
@@ -37,6 +37,26 @@ _RECV_POLL_TIMEOUT_SECONDS = 1.0
 _CONTROL_TICK_SECONDS = 5.0
 _BACKOFF_START_SECONDS = 5
 _BACKOFF_MAX_SECONDS = 60
+
+# ComfyUI-not-running wait (live incident 2026-09-16): the agent autostarts
+# at logon, ComfyUI (Desktop) is launched by a human and may be minutes --
+# or hours -- behind it. Re-probe this often, but only repeat the WARNING
+# every `_COMFY_WAIT_RELOG_SECONDS`, so a machine left without ComfyUI for a
+# weekend writes ~6 lines an hour instead of a traceback every 5 s.
+_COMFY_WAIT_POLL_SECONDS = 30
+_COMFY_WAIT_RELOG_SECONDS = 600
+# Published in `agent_state.json` as `reason` while that wait is in effect.
+_COMFY_UNREACHABLE_REASON = "comfyui_unreachable"
+# httpcore is httpx's transport and is always installed with it, but it is
+# an implementation detail -- imported defensively so a future httpx that
+# drops it cannot break the agent at import time.
+try:  # pragma: no cover - trivial import guard
+    import httpcore as _httpcore
+    _CONNECT_ERROR_TYPES: tuple[type[BaseException], ...] = (
+        httpx.ConnectError, _httpcore.ConnectError,
+    )
+except Exception:  # pragma: no cover
+    _CONNECT_ERROR_TYPES = (httpx.ConnectError,)
 
 # Backoff for re-reporting a finished job across a connection blip (see
 # `_report_completion`). Unbounded in total: the work is already done and
@@ -667,6 +687,38 @@ class _JobHandle:
         self.prompt_id = prompt_id
 
 
+def _comfy_connect_error(exc: BaseException, comfy_url: str) -> bool:
+    """True iff `exc` (or something in its `__cause__` chain) is a refused
+    connection to `comfy_url`.
+
+    Live incident 2026-09-16: with ComfyUI down, `_run_platform`'s
+    post-handshake `collect_hardware`/`allowed_classes` calls raise
+    `httpx.ConnectError`, which the generic drop handler logged with a full
+    40-line traceback every 5-60 s forever. The traceback says nothing the
+    one-line message does not, so this narrow, URL-checked recognition
+    downgrades exactly that case -- and nothing else -- to a WARNING.
+
+    `httpcore.ConnectError` is matched too because that is what httpx wraps
+    (`raise httpx.ConnectError(...) from httpcore_exc`); the request URL is
+    only ever attached to the httpx layer, so the whole chain is scanned for
+    both facts independently.
+    """
+    base = comfy_url.rstrip("/")
+    saw_connect_error = False
+    saw_comfy_request = False
+    seen: set[int] = set()
+    cur: Optional[BaseException] = exc
+    while cur is not None and id(cur) not in seen:
+        seen.add(id(cur))
+        if isinstance(cur, _CONNECT_ERROR_TYPES):
+            saw_connect_error = True
+        url = getattr(getattr(cur, "request", None), "url", None)
+        if url is not None and str(url).startswith(base):
+            saw_comfy_request = True
+        cur = cur.__cause__
+    return saw_connect_error and saw_comfy_request
+
+
 class AgentLoop:
     """Owns one `PlatformConnection` per configured platform and one global job lock."""
 
@@ -727,6 +779,11 @@ class AgentLoop:
         # The single platform-independent control task (see `_control_loop`),
         # started by `run()` and stopped on either shutdown path.
         self._control_task: Optional[asyncio.Task] = None
+        # Worker ids whose `_run_platform` is currently parked waiting for a
+        # ComfyUI that is not running (see `_wait_for_comfy`). A SET rather
+        # than a flag because every platform connection waits independently;
+        # the published state says "waiting" while ANY of them does.
+        self._comfy_waiting: set[str] = set()
 
     async def broadcast_heartbeat(
         self,
@@ -792,7 +849,9 @@ class AgentLoop:
             availability = control.availability(self.config, self._config_dir)
         return "idle" if availability == "available" else "paused"
 
-    def _aggregate_state(self, availability: Optional[str] = None) -> tuple[str, Optional[str]]:
+    def _aggregate_state(
+        self, availability: Optional[str] = None
+    ) -> tuple[str, Optional[str], Optional[str]]:
         """What this PROCESS is doing, for `agent_state.json` -- one verdict
         for the whole agent, not one per platform connection.
 
@@ -806,12 +865,19 @@ class AgentLoop:
         """
         for handle in self._jobs.values():
             if handle.running:
-                return "busy", handle.job_id
-        return self._effective_state("idle", availability), None
+                return "busy", handle.job_id, None
+        # Waiting for ComfyUI is a real, operator-visible reason to be
+        # unavailable, and it outranks the idle/pause verdict: nothing can be
+        # dispatched here until ComfyUI answers, no matter how idle the
+        # machine is. Reported as `paused` (an existing, understood state) so
+        # readers that predate `reason` keep working unchanged.
+        if self._comfy_waiting:
+            return "paused", None, _COMFY_UNREACHABLE_REASON
+        return self._effective_state("idle", availability), None, None
 
     def _publish_control_state(self, availability: Optional[str] = None) -> None:
-        state, job_id = self._aggregate_state(availability)
-        control.write_state(self._config_dir, state, job_id)
+        state, job_id, reason = self._aggregate_state(availability)
+        control.write_state(self._config_dir, state, job_id, reason=reason)
 
     def _apply_peer_upload_limit(self, availability: str) -> None:
         """依目前的閒置狀態，把分級上傳限速套到做種用的 peer server 上。
@@ -1977,10 +2043,75 @@ class AgentLoop:
                 await self.refresh_model_inventory(conn)
                 last_object_info = now
 
+    async def _wait_for_comfy(self, conn: PlatformConnection) -> None:
+        """Block this connection until ComfyUI answers -- quietly.
+
+        Live incident 2026-09-16 (POKAI-HOME): after a reboot the agent
+        autostarted from its scheduled task while ComfyUI Desktop, which a
+        human launches, did not. `_run_platform` connected and handshaked
+        anyway, then hit ComfyUI for `/object_info` -> `httpx.ConnectError`
+        -> a 40-line traceback every 5-60 s (agent.log reached 18k lines),
+        and the worker never appeared online.
+
+        Connecting to the platform before ComfyUI is up buys nothing: the
+        worker cannot render. So the probe happens FIRST, on every reconnect
+        iteration (ComfyUI can also die later), and the connect is simply
+        deferred -- one WARNING when the wait starts, a repeat only every
+        `_COMFY_WAIT_RELOG_SECONDS`, one INFO when it clears.
+
+        Nothing here blocks the event loop: the probe is a blocking HTTP call
+        and goes to a thread exactly like `collect_hardware` below, and the
+        wait is per-connection, so another platform's coroutine is untouched.
+        """
+
+        def _probe() -> bool:
+            with httpx.Client() as client:
+                return detect.probe_comfy(self.config.comfy_url, client)
+
+        if await asyncio.to_thread(_probe):
+            return
+
+        def _warn() -> None:
+            logger.warning(
+                "ComfyUI（%s）尚未啟動，agent 會每 %s 秒重試，啟動後自動上線。 / "
+                "ComfyUI at %s is not running; retrying every %s s and going "
+                "online once it is up.",
+                self.config.comfy_url, _COMFY_WAIT_POLL_SECONDS,
+                self.config.comfy_url, _COMFY_WAIT_POLL_SECONDS,
+            )
+
+        # Publishing the wait is what makes `comfyfed status` (and the state
+        # file behind it) say WHY the worker is unavailable instead of an
+        # unexplained `paused`. Removed in `finally` so a crash in the loop
+        # cannot leave the agent permanently "waiting".
+        self._comfy_waiting.add(conn.entry.worker_id)
+        try:
+            _warn()
+            last_log = time.monotonic()
+            while True:
+                await asyncio.sleep(_COMFY_WAIT_POLL_SECONDS)
+                if await asyncio.to_thread(_probe):
+                    break
+                now = time.monotonic()
+                if now - last_log >= _COMFY_WAIT_RELOG_SECONDS:
+                    _warn()
+                    last_log = now
+        finally:
+            self._comfy_waiting.discard(conn.entry.worker_id)
+        logger.info(
+            "ComfyUI 已可連線，開始連接平台。 / "
+            "ComfyUI reachable; connecting to the platform.",
+        )
+
     async def _run_platform(self, conn: PlatformConnection) -> None:
         backoff = _BACKOFF_START_SECONDS
         while True:
             try:
+                # BEFORE the socket: a worker with no ComfyUI behind it has
+                # nothing to offer the platform, and connecting anyway is
+                # what produced the endless post-handshake traceback loop.
+                # Per ITERATION, not once: ComfyUI can also go away later.
+                await self._wait_for_comfy(conn)
                 await conn.connect()
                 await conn.handshake()
                 # Past the handshake: this entry's credentials are accepted,
@@ -2128,10 +2259,22 @@ class AgentLoop:
                     # resets the consecutive-rejection counter: "consecutive"
                     # means consecutive 4401s, with nothing else in between.
                     conn.auth_rejections = 0
-                    logger.exception(
-                        "runner: connection to %s dropped, retrying in %ss",
-                        conn.entry.platform_url, backoff,
-                    )
+                    if _comfy_connect_error(exc, self.config.comfy_url):
+                        # ComfyUI died under a live connection (or never came
+                        # up between the probe and this call). Expected,
+                        # self-healing, and the traceback is pure noise -- the
+                        # next iteration's `_wait_for_comfy` parks quietly.
+                        logger.warning(
+                            "連線 ComfyUI 失敗（%s），%ss 後重試 / "
+                            "ComfyUI request failed (%s); retrying in %ss",
+                            self.config.comfy_url, backoff,
+                            self.config.comfy_url, backoff,
+                        )
+                    else:
+                        logger.exception(
+                            "runner: connection to %s dropped, retrying in %ss",
+                            conn.entry.platform_url, backoff,
+                        )
             finally:
                 await conn.close()
                 # A job task is NOT killed when its connection drops: a blip

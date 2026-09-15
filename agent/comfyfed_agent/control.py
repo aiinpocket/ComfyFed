@@ -70,9 +70,17 @@ def clear_stop(config_dir: str) -> None:
     _remove(config_dir, STOP_FILE)
 
 
-def write_state(config_dir: str, state: str, job_id: str | None) -> None:
+def write_state(
+    config_dir: str, state: str, job_id: str | None, reason: str | None = None
+) -> None:
     """Publish what the running agent is doing, atomically (`status` may read
-    it at any instant, and must never see a half-written file)."""
+    it at any instant, and must never see a half-written file).
+
+    `reason` is an OPTIONAL machine-readable explanation for a non-`busy`
+    state (currently only `"comfyui_unreachable"`). It is written only when
+    set, so every reader that predates it sees exactly the payload it always
+    saw -- an absent key, not a `null` to special-case.
+    """
     try:
         os.makedirs(config_dir, exist_ok=True)
         payload = {
@@ -81,6 +89,8 @@ def write_state(config_dir: str, state: str, job_id: str | None) -> None:
             "job_id": job_id,
             "updated_at": _now_iso(),
         }
+        if reason:
+            payload["reason"] = reason
         path = _path(config_dir, STATE_FILE)
         tmp_path = f"{path}.tmp-{os.getpid()}"
         with open(tmp_path, "w", encoding="utf-8") as f:

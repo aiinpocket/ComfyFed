@@ -314,6 +314,15 @@ def _cmd_status(args: argparse.Namespace) -> None:
         print(f"agent 執行中，狀態：{reported} / agent running, state: {reported}")
         if job_id:
             print(f"進行中的工作 / running job: {job_id}")
+        # Only the agent knows it is parked waiting for ComfyUI; without this
+        # the operator sees a bare `paused` and goes looking for a pause they
+        # never set (live incident 2026-09-16).
+        if state.get("reason") == "comfyui_unreachable":
+            print(
+                "原因：ComfyUI 尚未啟動，agent 會自動等待並在其啟動後上線。 / "
+                "reason: ComfyUI is not running; the agent waits and goes "
+                "online automatically once it is up."
+            )
 
     verdict = _availability_now(args, config_dir)
     if verdict is not None:

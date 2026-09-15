@@ -586,9 +586,18 @@ try {
     if ($LASTEXITCODE -eq 0) { $autostartOk = $true }
 } catch {}
 if ($autostartOk) {
+    # Live-caught 2026-09-16 (POKAI-HOME): an earlier non-admin run had left a
+    # HKCU Run key behind, and a later elevated run added the scheduled task
+    # on top -- so the agent launched TWICE at logon. Exactly one autostart
+    # mechanism must survive this section, so the other is always removed.
+    Remove-ItemProperty -Path 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Run' `
+        -Name 'ComfyFedAgent' -ErrorAction SilentlyContinue
     Write-Bilingual '已建立排程工作 ComfyFedAgent' 'Created scheduled task ComfyFedAgent'
 } else {
     try {
+        # Same rule in the other direction: a scheduled task from a previous
+        # elevated run would double up with this Run key.
+        schtasks /Delete /F /TN ComfyFedAgent 2>$null | Out-Null
         New-ItemProperty -Path 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Run' `
             -Name 'ComfyFedAgent' -Value $taskCmd -PropertyType String -Force | Out-Null
         $autostartOk = $true

@@ -11,7 +11,7 @@ import asyncio
 
 import pytest
 
-from comfyfed_agent import comfy, control, hardware, idle, whitelist
+from comfyfed_agent import comfy, control, detect, hardware, idle, whitelist
 from comfyfed_agent import runner as runner_module
 from comfyfed_agent.config import AgentConfig
 from comfyfed_agent.runner import AgentLoop
@@ -312,6 +312,8 @@ async def test_a_connection_sends_an_immediate_beat_after_hello(pause_loop, monk
         # The first thing `_run_platform` does after the immediate beat.
         raise asyncio.CancelledError
 
+    # ComfyUI is up: this test is about the immediate beat, not the wait.
+    monkeypatch.setattr(detect, "probe_comfy", lambda *a, **k: True)
     conn.connect = _noop
     conn.handshake = _noop
     conn.send_hello = _noop

@@ -11,7 +11,7 @@ import pytest
 from websockets.exceptions import ConnectionClosedError, ConnectionClosedOK
 from websockets.frames import Close
 
-from comfyfed_agent import comfy, fetcher, hardware, whitelist
+from comfyfed_agent import comfy, control, detect, fetcher, hardware, whitelist
 from comfyfed_agent.config import AgentConfig, PlatformEntry
 from comfyfed_agent.runner import (
     AgentLoop,
@@ -2282,6 +2282,10 @@ def one_platform_loop(monkeypatch, tmp_path):
     monkeypatch.setattr(hardware, "detect_backend", lambda: ("cpu", "0"))
     monkeypatch.setattr(hardware, "collect_dynamic", lambda *a, **k: {})
     monkeypatch.setattr(whitelist, "allowed_classes", lambda *a, **k: {"KSampler"})
+    # `_run_platform` now waits for ComfyUI BEFORE connecting; unless a
+    # test is specifically about that wait, ComfyUI is up and the probe is
+    # a no-op (otherwise every one of these would park on a real probe).
+    monkeypatch.setattr(detect, "probe_comfy", lambda *a, **k: True)
     monkeypatch.setattr(runner_module, "_BACKOFF_START_SECONDS", 0)
     monkeypatch.setattr(runner_module, "_BACKOFF_MAX_SECONDS", 0)
 
@@ -2385,6 +2389,10 @@ def prunable_loop(monkeypatch, tmp_path):
     monkeypatch.setattr(hardware, "detect_backend", lambda: ("cpu", "0"))
     monkeypatch.setattr(hardware, "collect_dynamic", lambda *a, **k: {})
     monkeypatch.setattr(whitelist, "allowed_classes", lambda *a, **k: {"KSampler"})
+    # `_run_platform` now waits for ComfyUI BEFORE connecting; unless a
+    # test is specifically about that wait, ComfyUI is up and the probe is
+    # a no-op (otherwise every one of these would park on a real probe).
+    monkeypatch.setattr(detect, "probe_comfy", lambda *a, **k: True)
     monkeypatch.setattr(runner_module, "_BACKOFF_START_SECONDS", 0)
     monkeypatch.setattr(runner_module, "_BACKOFF_MAX_SECONDS", 0)
 
@@ -2677,6 +2685,10 @@ async def test_hello_time_blocking_calls_go_through_to_thread(monkeypatch, tmp_p
     monkeypatch.setattr(hardware, "detect_backend", lambda: ("cpu", "0"))
     monkeypatch.setattr(hardware, "collect_dynamic", lambda *a, **k: {})
     monkeypatch.setattr(whitelist, "allowed_classes", lambda *a, **k: {"KSampler"})
+    # `_run_platform` now waits for ComfyUI BEFORE connecting; unless a
+    # test is specifically about that wait, ComfyUI is up and the probe is
+    # a no-op (otherwise every one of these would park on a real probe).
+    monkeypatch.setattr(detect, "probe_comfy", lambda *a, **k: True)
     monkeypatch.setattr(runner_module, "_BACKOFF_START_SECONDS", 0)
     monkeypatch.setattr(runner_module, "_BACKOFF_MAX_SECONDS", 0)
 
@@ -2728,6 +2740,10 @@ async def test_a_slow_collect_hardware_does_not_stall_another_platform(monkeypat
     monkeypatch.setattr(hardware, "detect_backend", lambda: ("cpu", "0"))
     monkeypatch.setattr(hardware, "collect_dynamic", lambda *a, **k: {})
     monkeypatch.setattr(whitelist, "allowed_classes", lambda *a, **k: {"KSampler"})
+    # `_run_platform` now waits for ComfyUI BEFORE connecting; unless a
+    # test is specifically about that wait, ComfyUI is up and the probe is
+    # a no-op (otherwise every one of these would park on a real probe).
+    monkeypatch.setattr(detect, "probe_comfy", lambda *a, **k: True)
     monkeypatch.setattr(runner_module, "_BACKOFF_START_SECONDS", 0)
     monkeypatch.setattr(runner_module, "_BACKOFF_MAX_SECONDS", 0)
 
@@ -2872,3 +2888,165 @@ async def test_a_failed_backup_cancels_the_prune(prunable_loop, tmp_path, monkey
     assert [p.worker_id for p in saved.platforms] == ["worker-dead", "worker-live"]
     assert [p.worker_id for p in loop.config.platforms] == ["worker-dead", "worker-live"]
     assert not (tmp_path / "agent.dead.json").exists()
+
+
+# ---------------------------------------------------------------------------
+# Waiting for ComfyUI instead of crash-looping (live incident 2026-09-16)
+# ---------------------------------------------------------------------------
+
+
+async def test_run_platform_waits_for_comfy_before_connecting(
+    one_platform_loop, monkeypatch, caplog
+):
+    """POKAI-HOME: the agent autostarts at logon, ComfyUI Desktop does not.
+    Connecting first is what produced the endless post-handshake traceback,
+    so `_run_platform` must probe ComfyUI BEFORE `connect()`, park quietly
+    while it is down (ONE warning, however many probes it takes), and then
+    announce it is reachable exactly once before proceeding."""
+    loop = one_platform_loop
+    conn = loop.connections["worker-a"]
+    monkeypatch.setattr(runner_module, "_COMFY_WAIT_POLL_SECONDS", 0)
+
+    probes = {"n": 0}
+
+    def _probe(url, client):
+        probes["n"] += 1
+        return probes["n"] > 3  # down for the first three probes
+
+    monkeypatch.setattr(detect, "probe_comfy", _probe)
+
+    connects = {"n": 0}
+
+    async def _connect(*args, **kwargs):
+        connects["n"] += 1
+        # No connect may have happened before ComfyUI answered.
+        assert probes["n"] == 4
+
+    async def _handshake(*args, **kwargs):
+        raise asyncio.CancelledError()
+
+    conn.connect = _connect
+    conn.close = _noop
+    conn.handshake = _handshake
+
+    with caplog.at_level(logging.INFO, logger="comfyfed_agent.runner"):
+        with pytest.raises(asyncio.CancelledError):
+            await asyncio.wait_for(loop._run_platform(conn), timeout=5)
+
+    assert connects["n"] == 1, "connect() must happen only once ComfyUI is up"
+
+    warnings = [
+        r for r in caplog.records
+        if r.levelno == logging.WARNING and "not running" in r.getMessage()
+    ]
+    assert len(warnings) == 1, "the wait must log ONCE, not once per probe"
+    infos = [
+        r for r in caplog.records
+        if r.levelno == logging.INFO and "ComfyUI reachable" in r.getMessage()
+    ]
+    assert len(infos) == 1
+
+
+async def test_waiting_for_comfy_publishes_paused_with_a_reason(
+    one_platform_loop, monkeypatch
+):
+    """`agent_state.json` must explain the unavailability: `paused` plus
+    `reason: comfyui_unreachable` while waiting, and NO `reason` key at all
+    otherwise (readers that predate the field must see what they always
+    saw)."""
+    loop = one_platform_loop
+
+    loop._publish_control_state()
+    state = control.read_state(loop._config_dir)
+    assert state["state"] == "idle"
+    assert "reason" not in state
+
+    loop._comfy_waiting.add("worker-a")
+    loop._publish_control_state()
+    state = control.read_state(loop._config_dir)
+    assert state["state"] == "paused"
+    assert state["reason"] == "comfyui_unreachable"
+
+    loop._comfy_waiting.discard("worker-a")
+    loop._publish_control_state()
+    assert "reason" not in control.read_state(loop._config_dir)
+
+
+def _comfy_connect_error(url: str) -> httpx.ConnectError:
+    """What httpx raises when ComfyUI is not listening, cause chain and all."""
+    request = httpx.Request("GET", url.rstrip("/") + "/object_info")
+    exc = httpx.ConnectError("All connection attempts failed", request=request)
+    return exc
+
+
+async def test_drop_handler_logs_a_comfy_connect_error_without_a_traceback(
+    one_platform_loop, monkeypatch, caplog
+):
+    """The 18k-line agent.log: a refused ComfyUI connection is expected and
+    self-healing, so it gets ONE warning line -- no `logger.exception`."""
+    loop = one_platform_loop
+    conn = loop.connections["worker-a"]
+
+    calls = {"n": 0}
+
+    async def _handshake(*args, **kwargs):
+        calls["n"] += 1
+        if calls["n"] >= 2:
+            raise asyncio.CancelledError()
+        raise _comfy_connect_error(loop.config.comfy_url)
+
+    conn.connect = _noop
+    conn.close = _noop
+    conn.handshake = _handshake
+
+    with caplog.at_level(logging.WARNING, logger="comfyfed_agent.runner"):
+        with pytest.raises(asyncio.CancelledError):
+            await asyncio.wait_for(loop._run_platform(conn), timeout=5)
+
+    records = [r for r in caplog.records if "ComfyUI request failed" in r.getMessage()]
+    assert len(records) == 1
+    assert records[0].levelno == logging.WARNING
+    assert records[0].exc_info is None
+    assert "Traceback" not in caplog.text
+
+
+async def test_drop_handler_still_logs_a_traceback_for_other_exceptions(
+    one_platform_loop, monkeypatch, caplog
+):
+    """The downgrade is narrow: anything that is not a refused ComfyUI
+    connection keeps its `logger.exception` traceback."""
+    loop = one_platform_loop
+    conn = loop.connections["worker-a"]
+
+    calls = {"n": 0}
+
+    async def _handshake(*args, **kwargs):
+        calls["n"] += 1
+        if calls["n"] >= 2:
+            raise asyncio.CancelledError()
+        raise RuntimeError("something else entirely")
+
+    conn.connect = _noop
+    conn.close = _noop
+    conn.handshake = _handshake
+
+    with caplog.at_level(logging.WARNING, logger="comfyfed_agent.runner"):
+        with pytest.raises(asyncio.CancelledError):
+            await asyncio.wait_for(loop._run_platform(conn), timeout=5)
+
+    dropped = [r for r in caplog.records if "dropped, retrying" in r.getMessage()]
+    assert len(dropped) == 1
+    assert dropped[0].exc_info is not None
+    assert "Traceback" in caplog.text
+
+
+async def test_a_connect_error_to_some_other_host_is_not_treated_as_comfy(
+    one_platform_loop,
+):
+    """The recognition is URL-checked, not type-checked: a ConnectError to
+    anything other than `comfy_url` must keep its traceback."""
+    loop = one_platform_loop
+    other = _comfy_connect_error("http://not-comfy.example:9999")
+    assert runner_module._comfy_connect_error(other, loop.config.comfy_url) is False
+    mine = _comfy_connect_error(loop.config.comfy_url)
+    assert runner_module._comfy_connect_error(mine, loop.config.comfy_url) is True

@@ -178,6 +178,8 @@ Idle-detection settings live in `agent.json`: `pause_when_active` (default `true
 
 **When activity can't be detected, the worker is always treated as idle and keeps accepting jobs**: headless machines (no display/keyboard/mouse) and Wayland desktops without XWayland give the agent no signal to read, so detection failure never makes a worker unschedulable — it just behaves as if pause-when-active is off.
 
+**Windows: the worker shows offline after a reboot (0.1.11+).** The agent starts automatically at logon, but ComfyUI Desktop is launched by you — so after a restart the agent is usually up minutes before ComfyUI is. It handles that on its own: it probes ComfyUI first, and while nothing answers it does **not** connect to the platform, logs one warning line instead of a traceback, re-probes every 30 s, and goes online by itself the moment ComfyUI is running. Until then the console simply lists the worker as offline and `comfyfed status` reports `paused` with the reason `comfyui_unreachable` — nothing needs fixing, just start ComfyUI.
+
 **Windows: can't find the `comfyfed` command?** The terminal window the installer ran in doesn't pick up the new PATH entry — that's expected. Close it and open a new terminal.
 
 **macOS / Linux: can't find the `comfyfed` command?** The installer links it into `~/.local/bin`, which is not on the default PATH on macOS (stock `/etc/paths`) or on minimal Linux images (the installer says so when it notices). Add it:
