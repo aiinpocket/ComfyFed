@@ -191,6 +191,48 @@ exec $SHELL -l
 
 Dispatch isn't a random pick among eligible workers: jobs that need zero models (pure post-processing work like video trimming or concatenation) are preferentially routed to workers with no dedicated GPU or weaker VRAM (Mac/CPU-only machines included), saving the model-heavy, VRAM-hungry rendering jobs for the real GPUs. That means a laptop can pull its weight in the federation instead of a 4090 getting stuck doing video-editing busywork.
 
+### Scheduling and batch splitting
+
+The server runs a dispatch tick every 5 seconds. It doesn't pick one job at a time for the biggest available card — instead it puts **every job currently queued** and **every idle worker** into a single cost table and solves for the overall cheapest matching in one shot (the Hungarian algorithm). The cost table factors in:
+
+- **How long this machine takes on this kind of graph.** Every submitted graph gets a "workflow signature" — a hash of the node composition, model list, total step count, resolution bucket, and batch size. Changing only the prompt text or the seed leaves the signature unchanged; changing resolution, steps, or models changes it. Every time a job finishes and the agent reports a valid GPU execution time, the platform folds it into an exponential moving average keyed by `(worker, signature)`. If this worker has never run this signature, the platform converts another worker's median for that signature using this worker's "speed index"; if there's no data for the signature at all, it falls back to the fleet-wide median; a brand-new install assumes 60 seconds.
+- **Whether a model needs reloading.** Each worker remembers which models the job it was last assigned needed. If the models this job needs are already warm, that costs nothing; if they're cold, the platform estimates load time at 1.5 seconds per GB. So "smaller VRAM but the model is already warm" regularly beats "bigger card but has to reload 22 GB."
+- **Whether a model needs downloading.** Candidates that need auto-fetch are estimated at 50 MB/s. The existing rule still holds: as soon as any worker already has every required model, the workers that would need to download are excluded from consideration entirely.
+- **Light jobs stay off the big cards.** Jobs that need no models at all (video editing, for instance) are still preferentially routed to weaker GPUs/Macs.
+- **Longer waits win.** Every second waited is worth one second less cost; a job that has waited more than 5 minutes is guaranteed to be dispatched this tick as long as any eligible worker exists.
+- **A verdict with warnings always ranks behind a clean one** (for example, needing to offload weights to system RAM).
+
+The job detail page shows what this dispatch decided (`dispatch_info`): the predicted execution time (`predicted_seconds`), where that prediction came from (`basis`: `signature` — this machine has run this signature before; `speed_index` — converted from another worker's data; `fleet_default` — fleet-wide median; `none` — the brand-new-install default), the predicted load/fetch time (`load_seconds`/`fetch_seconds`), and how many eligible workers there were at the time (`candidates`).
+
+#### Automatic batch splitting
+
+A graph with `batch_size >= 2` gets split into several sub-jobs that run at the same time, one per contiguous slice of the batch (e.g. 4 images split into 2+2), whenever there are multiple eligible idle workers available right now. The split is done by inserting one core node, `LatentFromBatch`, into each sub-job's workflow, telling it which slice of the full batch to compute — **the agent side does nothing special and needs nothing extra installed.**
+
+**Will the result be the same?** Same seed, same composition — but **not bit-for-bit**. When ComfyUI generates batch noise, as soon as the latent carries a `batch_index` (which `LatentFromBatch` sets), it generates the noise slice-by-slice and keeps only the requested slice; measured at the pure-noise layer this is bit-identical. After running end-to-end there's a tiny floating-point difference (measured on Flux dev, 512x512, 4 steps: mean pixel difference 0.47/255), coming from the different kernel paths taken by batch=2 versus batch=1 — the control group (a genuinely different image) measured 17.7/255. **This difference is the same order of magnitude as the difference you'd already get from running the same job on a different GPU.** If you need bit-level reproducibility, turn splitting off.
+
+Not every graph can be split. All of the following must hold:
+
+- The graph contains **exactly one** `EmptyLatentImage` or `EmptySD3LatentImage` node, and its `batch_size` is a literal integer >= 2.
+- **No other** node carries a `batch_size` input.
+- Every node in the graph is in the split-safety allowlist. **Custom nodes are never on the allowlist**, and neither are `ImageBatch`, `LatentBatch`, `RepeatLatentBatch`, `RebatchLatents`, or video nodes — these treat the whole batch as one unit, so splitting would produce the wrong result.
+- Every sampler's latent input can be traced back to that batch source (passing only through nodes that carry the batch structure through unchanged).
+- Every `SaveImage`/`PreviewImage` node can trace the batch source as an ancestor — otherwise a side branch unrelated to the batch (say, a standalone `LoadImage -> VAEEncode -> VAEDecode -> SaveImage`) would get rendered once per child and duplicated in the output.
+
+Other rules:
+
+- Splitting caps out at 8 sub-jobs, and never exceeds the number of eligible idle workers available right now.
+- Split sub-jobs are **invisible to the ComfyUI panel**: `/history`, the queue, and progress events all still show the one original job, and outputs come back merged and ordered the same way they would from a single full-batch run.
+- The console (`/jobs`) job list likewise still lists only the original job, with an extra "split x k" badge; the detail page can expand to show each sub-job (`children`) — which worker it landed on, how far it got, and how many GPU-seconds it used (this field is `null`, not 0, for a sub-job with no receipt yet) — plus the aggregated `gpu_seconds_total`. Pass `?include_children=1` on the API to list sub-jobs directly.
+- **Receipts are minted one per sub-job** (the parent job has no receipt of its own), so revenue-sharing and usage reports are completely unaffected — the seconds are still credited to whoever actually ran them.
+- If any sub-job fails, every other sub-job still in flight is cancelled, and the parent job is marked failed with a note of which slice failed. Cancelling the parent cancels every sub-job and notifies each still-running worker individually; cancelling any single sub-job cancels the whole group.
+- **A retry never re-splits**: the whole batch runs on one worker again, so two generations of sub-jobs never get mixed together.
+
+#### Turning splitting off
+
+The platform settings page has an "automatic batch splitting" toggle that turns it off fleet-wide (on by default). Once off, **newly submitted** jobs always run as a single unit on one worker; sub-jobs that were already split off are unaffected and run to completion normally.
+
+To turn it off for just one job, include `{"split": false}` in that job's `requirements`.
+
 ### Security model summary
 
 - **One-time registration token**: each bundle issued by the console can be used exactly once (the server claims it atomically, so two concurrent registrations can't both win).

@@ -103,7 +103,7 @@ legacy_tiebreak     = is_light ? free_vram_gb/1000 : (1000 - free_vram_gb)/1e6  
 2. 取 queued jobs（`created_at ASC`，**排除 `split_count > 0` 的父 job**，見 §3），最多取 `min(64, 8 × idle 數)` 件，另外把等待超過 `STARVE_SECONDS = 300` 的一律納入。
 3. 對每對 (j, w) 算 verdict 與 cost；不合格為 ∞。
 4. 目標函數：最小化 Σ `(cost(j, w) − AGE_WEIGHT(1.0) × wait_seconds(j) − BIG(1e9))` over 被指派的配對。`BIG` 讓「多派一件」永遠優於「少派」；`wait_seconds` 讓等得久的優先；等待超過 `STARVE_SECONDS` 的再減 `1e8`，確保只要有合格 worker 一定本 tick 派出。
-5. 以 Hungarian（Kuhn–Munkres，O(n³)，n = max(N, M)，方陣以 0 補齊）求解；∞ 的配對永不採用。
+5. 以 Hungarian（Kuhn–Munkres，O(n³)，n = max(N, M)，方陣以 0 補齊）求解；∞ 的配對永不採用。**（2026-09-16 實作修訂）** 「∞」在實作中不是寫死的哨兵常數，而是動態算出的禁用格值 `M = (n+1) × range + 1`（`range` 為本次成本矩陣中有限值的極差），確保它必然大於任何一條可行配對路徑的總成本，Hungarian 才不會被寫死的哨兵值在極端輸入下誤判為可行。
 6. 依結果逐一原子 claim（`WHERE status='queued'`，rowcount≠1 則跳過）；寫 `dispatch_info`、`workers.warm_models`。
 7. 推送 `job` frame 的流程（含 `fetch_models` 重算）不變。
 
@@ -140,6 +140,7 @@ ComfyUI `comfy/sample.py::prepare_noise` 對 batch 用單一 generator 一次產
    - 任何不在名單的節點（含所有自訂節點、`ImageBatch`、`LatentBatch`、`RepeatLatentBatch`、`RebatchLatents`、影片節點）→ 不可拆。
 4. 白名單以外的路徑不存在：所有 `KSampler*/SamplerCustom*` 的 latent 輸入沿 LATENT 邊往上追，最終都到達該批次來源（中間只允許白名單內會保留 latent dict 的節點）。
 5. job `requirements.split !== false`，且平台設定 `split_batches`（預設 `true`）為真。
+6. **（2026-09-16 實作修訂）** 圖中每一個 `SaveImage`／`PreviewImage` 節點都必須追得到該批次來源當祖先（沿所有 `inputs` 連結往上走，不限欄位、不限 slot，只避免循環）；否則視為不可拆。理由：條件 1-5 只約束「沿 latent 鏈能追到取樣器」的節點，擋不住一段完全由白名單節點組成、卻與批次來源無關的側支（例如單獨的 `LoadImage -> VAEEncode -> VAEDecode -> SaveImage`）——這種側支會在每個子任務裡各自渲染一次，造成輸出重複。
 
 `SplitPlan = {source_node_id: str, batch_size: int}`，存入 `jobs.split_plan`（TEXT JSON，NULL = 不可拆）。
 
@@ -168,6 +169,8 @@ ComfyUI `comfy/sample.py::prepare_noise` 對 batch 用單一 generator 一次產
 | 任一 failed | failed；`error` = 該子 error（前綴 `子任務 N/k：`）；其他未終止的子 job 以 `cancel_job(reason="sibling failed")` 取消 |
 | 任一 cancelled（非因 sibling failed） | cancelled；其他子 job 一併取消 |
 
+**（2026-09-16 實作修訂）** 串聯取消（不論由父 job 取消觸發、或由某個子 job failed/cancelled 觸發）對每個被牽連的子 job 寫入的欄位與直接呼叫 `cancel_job` 完全相同（`status`、`error`、`last_worker_id`、`worker_id`、`finished_at`），且 WS 層會對每一個受影響 job 目前的持有者各自推送一次 `job_cancelled`（不只推給觸發取消的那個 job 的 worker）。
+
 父 job 的 `result_files` 欄位保持 `[]`；對外輸出改由 `split.parent_outputs(parent)` 組出 `[(child_id, filename), ...]`，依 `split_index` 再依子 `result_files` 順序，因此與整批一次跑的輸出順序一致。
 
 ### 3.5 派工中的拆分決策（tick 第 2 步與第 3 步之間）
@@ -194,8 +197,8 @@ for j in queued（舊到新）:
 
 ### 3.6 取消、重試、失聯
 
-- 取消父 job（console、`/comfy/api/interrupt`、`/queue` delete）→ 對每個未終止的子 job 執行 `cancel_job` 並推送 `job_cancelled` 給持有者；父 job 為 cancelled。
-- 取消子 job（console 直接對子操作）→ 父與其他子一併取消。
+- 取消父 job（console、`/comfy/api/interrupt`、`/queue` delete）→ 對每個未終止的子 job 執行 `cancel_job` 並推送 `job_cancelled` 給持有者；父 job 為 cancelled。**（2026-09-16 實作修訂）** 這個「執行 `cancel_job`」對每個子 job 寫入的欄位與直接呼叫 `cancel_job` 完全相同（`status`/`error`/`last_worker_id`/`worker_id`/`finished_at`），WS 層對每一個受影響 job 目前的持有者各自推送一次 `job_cancelled`。
+- 取消子 job（console 直接對子操作）→ 父與其他子一併取消，寫入欄位與推送規則同上。
 - 子 job 的 worker 失聯 → 現行 `requeue_stale` 讓子 job 回 queued，父 job 依 §3.4 重算（可能從 running 退回 assigned/queued，面板收到 `job_requeued(parent)`）。
 - 重試（`retry`）父 job → 父 job 回 queued、`split_count = 0`、**`split_plan = NULL`**（重試一律不再拆，整包在一台 worker 跑，避免兩代子 job 混在一起）；舊子 job 不動（終止狀態，歷史保留），`parent_id` 仍指向父。所有以父 job 推導的函數（`refresh_parent`、`parent_outputs`、console 的 `children`）只在 `split_count > 0` 時看子 job；`split_count == 0` 的 job 一律當普通 job 處理（用自己的 `result_files`）。
 
