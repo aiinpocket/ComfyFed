@@ -29,7 +29,7 @@
     {
       "binding": "DB",
       "database_name": "comfyfed",
-      "database_id": "TBD-set-at-deploy",
+      "database_id": "537ebe4b-9913-46fb-99af-168eeb73cfc2",
       "migrations_dir": "migrations"
     }
   ],
