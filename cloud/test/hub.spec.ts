@@ -312,6 +312,26 @@ describe("hello", () => {
   });
 
   // Seeder upload cap -- ports agentws.py's _parse_peer_upload_min_mbps coverage.
+  // The hello is processed by the DO asynchronously after the frame lands;
+  // a fixed wait (the old `expectNoMessage(ws, 300)` doubled as the delay)
+  // is load-sensitive -- it failed once in a fresh-clone ci-build right
+  // after `npm ci`, and passed 3/3 in isolation. Poll the row instead.
+  async function waitForHardware(
+    workerId: string,
+    ready: (hardware: Record<string, unknown>) => boolean,
+    timeoutMs = 3000
+  ): Promise<Record<string, unknown>> {
+    const deadline = Date.now() + timeoutMs;
+    let last: Record<string, unknown> = {};
+    while (Date.now() < deadline) {
+      const row = await db().prepare("SELECT hardware FROM workers WHERE id = ?").bind(workerId).first<{ hardware: string }>();
+      last = row?.hardware ? (JSON.parse(row.hardware) as Record<string, unknown>) : {};
+      if (ready(last)) return last;
+      await new Promise((r) => setTimeout(r, 50));
+    }
+    return last; // let the caller's expect() report the actual final state
+  }
+
   it("stores a reported peer_upload_min_mbps inside the hardware JSON blob", async () => {
     const kp = KEYPAIRS[0]!;
     const workerId = await makeWorker({ pubkeyHex: kp.pubkey_hex });
@@ -325,10 +345,9 @@ describe("hello", () => {
         peer_upload_min_mbps: 5,
       })
     );
-    await none;
+    await none; // still asserts hello draws no reply frame
 
-    const row = await db().prepare("SELECT hardware FROM workers WHERE id = ?").bind(workerId).first<{ hardware: string }>();
-    const hardware = JSON.parse(row!.hardware);
+    const hardware = await waitForHardware(workerId, (h) => h.peer_upload_min_mbps !== undefined);
     expect(hardware.peer_upload_min_mbps).toBe(5);
     expect(hardware.vram_gb).toBe(24);
     ws.close();
@@ -344,13 +363,17 @@ describe("hello", () => {
       const workerId = await makeWorker({ pubkeyHex: kp.pubkey_hex });
       const ws = await connectAgent(workerId, kp.seed_hex);
       const none = expectNoMessage(ws, 200);
-      const msg: Record<string, unknown> = { type: "hello", protocol: 4, hardware: {} };
+      // `landed: 1` is a marker: the negative assertion below is only
+      // meaningful once THIS hello has been processed -- without it, an
+      // unprocessed hello leaves `{}` and "no property" passes vacuously.
+      const msg: Record<string, unknown> = { type: "hello", protocol: 4, hardware: { landed: 1 } };
       if (bad !== undefined) msg.peer_upload_min_mbps = bad;
       ws.send(JSON.stringify(msg));
       await none;
 
-      const row = await db().prepare("SELECT hardware FROM workers WHERE id = ?").bind(workerId).first<{ hardware: string }>();
-      expect(JSON.parse(row!.hardware)).not.toHaveProperty("peer_upload_min_mbps");
+      const hardware = await waitForHardware(workerId, (h) => h.landed === 1);
+      expect(hardware.landed).toBe(1);
+      expect(hardware).not.toHaveProperty("peer_upload_min_mbps");
       ws.close();
     }
   });
@@ -365,7 +388,12 @@ describe("hello", () => {
     ws.send(JSON.stringify({ type: "hello", protocol: 4, peer_url: "http://192.168.1.5:8850" }));
     await none;
 
-    const row = await db().prepare("SELECT peer_url, protocol FROM workers WHERE id = ?").bind(workerId).first<{ peer_url: string | null; protocol: number }>();
+    let row: { peer_url: string | null; protocol: number } | null = null;
+    for (const deadline = Date.now() + 3000; Date.now() < deadline; ) {
+      row = await db().prepare("SELECT peer_url, protocol FROM workers WHERE id = ?").bind(workerId).first<{ peer_url: string | null; protocol: number }>();
+      if (row?.peer_url) break;
+      await new Promise((r) => setTimeout(r, 50));
+    }
     expect(row!.peer_url).toBe("http://192.168.1.5:8850");
     expect(row!.protocol).toBe(4);
     ws.close();
