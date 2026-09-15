@@ -70,10 +70,21 @@ def check(entry: PlatformEntry, current: str, client: httpx.Client) -> UpdateDec
     sha256 = body.get("sha256")
     platform_sig = body.get("platform_sig")
 
-    if parse_version(current) < parse_version(min_supported):
-        action = "blocked"
-    elif parse_version(current) < parse_version(latest) and wheel_url:
+    # Precedence matters -- and the old order was a fleet-wide landmine. The
+    # platform's publish endpoint raises `min_supported` to `latest` on EVERY
+    # release, so with "blocked" checked first, every agent that merely
+    # RESTARTED after a publish (reboot, logon autostart, `comfyfed stop`)
+    # exited 3 with "please update" -- never reaching the self-update branch
+    # that had a signed wheel ready. "Below min_supported + a wheel to fetch"
+    # is therefore a MANDATORY update, not a dead end; "blocked" is reserved
+    # for the case where nothing can be fetched (auto_update off is handled
+    # by the caller, which then also refuses to start).
+    below_min = parse_version(current) < parse_version(min_supported)
+    below_latest = parse_version(current) < parse_version(latest)
+    if (below_min or below_latest) and wheel_url:
         action = "update"
+    elif below_min:
+        action = "blocked"
     else:
         action = "ok"
 

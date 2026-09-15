@@ -77,10 +77,35 @@ def test_check_update_when_newer_version_and_wheel_available():
 
 
 def test_check_blocked_when_current_below_min_supported():
+    # No wheel_url in the body: nothing can be fetched, so "blocked" is the
+    # only honest answer. (With a wheel present this must be "update" -- see
+    # the landmine test right below.)
     entry = _entry()
     client = _FakeClient(version_body={"latest": "0.3.0", "min_supported": "0.2.0"})
     decision = check(entry, "0.1.0", client)
     assert decision.action == "blocked"
+
+
+def test_check_below_min_supported_with_a_wheel_is_a_mandatory_update_not_blocked():
+    """The live landmine: the platform raises min_supported to latest on
+    EVERY publish, so with "blocked" taking precedence every agent that merely
+    restarted after a release exited 3 -- never reaching the self-update
+    branch that had a signed wheel waiting. Below-min + fetchable wheel must
+    be an UPDATE (auto-heal), so a reboot converges instead of dying."""
+    entry = _entry()
+    client = _FakeClient(
+        version_body={
+            "latest": "0.3.0",
+            "min_supported": "0.3.0",  # == latest, exactly what publish does
+            "wheel_url": "http://testplatform/api/agent/releases/agent-0.3.0.whl",
+            "sha256": "deadbeef",
+            "platform_sig": "abcd",
+        }
+    )
+    decision = check(entry, "0.1.0", client)
+    assert decision.action == "update"
+    assert decision.wheel_url == "http://testplatform/api/agent/releases/agent-0.3.0.whl"
+    assert decision.min_supported == "0.3.0"
 
 
 def test_check_network_error_is_ok_not_blocking():
