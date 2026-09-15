@@ -391,19 +391,144 @@ if ($alreadyRegistered) {
 # 4. ComfyUI check + optional install
 # ---------------------------------------------------------------------------
 
-$comfyManaged = $false
+function Split-WindowsCommandLine {
+    # Best-effort argv split of a Win32 command line. `command_line` is kept
+    # verbatim in the marker and is what the launcher actually runs, so this
+    # only has to be good enough for humans reading `args` (and for the
+    # main.py sniff that infers the working directory below).
+    param([string]$Line)
+    $tokens = @()
+    if (-not $Line) { return ,$tokens }
+    foreach ($m in [regex]::Matches($Line, '"([^"]*)"|(\S+)')) {
+        if ($m.Groups[1].Success) { $tokens += $m.Groups[1].Value }
+        else { $tokens += $m.Groups[2].Value }
+    }
+    return ,$tokens
+}
 
+function Save-DetectedComfyMarker {
+    # A ComfyUI we did NOT install (Comfy Desktop, a hand-rolled checkout)
+    # still has to come back after a reboot, or the agent autostarts, finds
+    # nothing on comfy_url and the worker sits offline until someone opens
+    # ComfyUI by hand (live-caught). Record how the RUNNING one was started,
+    # into the same marker the launcher already reads. Returns $true iff the
+    # marker was written; on any failure it writes NOTHING and returns $false
+    # so the caller can tell the operator to start ComfyUI themselves.
+    param([string]$ComfyUrl, [string]$MarkerPath)
+    $port = 0
+    try { $port = ([uri]$ComfyUrl).Port } catch { return $false }
+    if ($port -le 0) { return $false }
+
+    $owningPid = 0
+    try {
+        $conn = Get-NetTCPConnection -State Listen -LocalPort $port -ErrorAction Stop |
+            Select-Object -First 1
+        if ($null -ne $conn) { $owningPid = [int]$conn.OwningProcess }
+    } catch { return $false }
+    if ($owningPid -le 0) { return $false }
+
+    try {
+        $proc = Get-CimInstance -ClassName Win32_Process -Filter "ProcessId = $owningPid" -ErrorAction Stop
+    } catch { return $false }
+    if ($null -eq $proc) { return $false }
+    $procProps = $proc.PSObject.Properties.Name
+    $exe = ''
+    if ($procProps -contains 'ExecutablePath') { $exe = [string]$proc.ExecutablePath }
+    $commandLine = ''
+    if ($procProps -contains 'CommandLine') { $commandLine = [string]$proc.CommandLine }
+    if (-not $exe) { return $false }
+
+    $tokens = Split-WindowsCommandLine -Line $commandLine
+    $procArgs = @()
+    if ($tokens.Count -gt 1) { $procArgs = $tokens[1..($tokens.Count - 1)] }
+
+    # ExecutablePath resolves a venv python to its BASE interpreter -- live
+    # on POKAI-HOME, Comfy Desktop's
+    # `...\ComfyUI\.venv\Scripts\python.exe` reports as
+    # `...\standalone-env\python.exe`, which loses both the venv and the
+    # folder layout the working directory is inferred from. Prefer the
+    # command line's own argv[0] whenever it still exists on disk.
+    $startExe = $exe
+    if (($tokens.Count -gt 0) -and $tokens[0] -and (Test-Path -LiteralPath $tokens[0] -PathType Leaf)) {
+        $startExe = $tokens[0]
+    }
+
+    # Win32_Process does not expose the working directory, so infer it:
+    # Comfy Desktop runs `<root>\.venv\Scripts\python.exe main.py --port ...`
+    # FROM <root>, so a `main.py` argument plus a venv-shaped exe path pins
+    # the ComfyUI root (confirmed by main.py actually being there). Anything
+    # else falls back to the exe's own folder.
+    $cwd = Split-Path -Parent $startExe
+    $hasMainPy = $false
+    foreach ($a in $procArgs) { if ($a -match '(^|[\\/])main\.py$') { $hasMainPy = $true } }
+    if ($hasMainPy) {
+        $exeDir = Split-Path -Parent $startExe
+        $exeDirLeaf = Split-Path -Leaf $exeDir
+        $venvDir = Split-Path -Parent $exeDir
+        if ($venvDir -and ($exeDirLeaf -eq 'Scripts' -or $exeDirLeaf -eq 'bin')) {
+            $venvLeaf = Split-Path -Leaf $venvDir
+            if ($venvLeaf -match '^\.?venv$') {
+                $comfyRoot = Split-Path -Parent $venvDir
+                if ($comfyRoot -and (Test-Path -LiteralPath (Join-Path $comfyRoot 'main.py'))) {
+                    $cwd = $comfyRoot
+                }
+            }
+        }
+    }
+
+    $marker = [ordered]@{
+        start_exe = $startExe
+        args = @($procArgs)
+        command_line = $commandLine
+        cwd = $cwd
+        comfy_url = $ComfyUrl
+        detected = $true
+        autostart = $true
+    }
+    try {
+        [System.IO.File]::WriteAllText($MarkerPath, ($marker | ConvertTo-Json),
+            (New-Object System.Text.UTF8Encoding($false)))
+    } catch { return $false }
+    return $true
+}
+
+# A marker for a ComfyUI this installer INSTALLED means "managed, do not
+# reinstall". A marker for a DETECTED ComfyUI is only a recording of how that
+# ComfyUI starts -- it can go stale (Comfy Desktop upgraded, moved, or picked
+# another port), so a re-run must re-capture instead of skipping.
+$comfyManaged = $false
+$markerIsDetected = $false
 if (Test-Path $ManagedMarker) {
+    try {
+        $existingMarker = Get-Content $ManagedMarker -Raw | ConvertFrom-Json
+        $existingProps = $existingMarker.PSObject.Properties.Name
+        if (($existingProps -contains 'detected') -and $existingMarker.detected) {
+            $markerIsDetected = $true
+        }
+    } catch {}
+}
+
+if ((Test-Path $ManagedMarker) -and (-not $markerIsDetected)) {
     $comfyManaged = $true
     Write-Bilingual '已由本安裝器管理的 ComfyUI，略過重新安裝' `
         'ComfyUI already managed by this installer, skipping reinstall'
 } else {
     Write-Bilingual '偵測本機 ComfyUI...' 'Detecting local ComfyUI...'
-    & $venvPython $HelperScript check | Out-Null
+    $comfyUrl = (& $venvPython $HelperScript check | Select-Object -Last 1)
     $found = ($LASTEXITCODE -eq 0)
 
     if ($found) {
         Write-Bilingual '找到本機 ComfyUI' 'Found a local ComfyUI'
+        if (Save-DetectedComfyMarker -ComfyUrl ([string]$comfyUrl).Trim() -MarkerPath $ManagedMarker) {
+            $comfyManaged = $true
+            Write-Bilingual '已記錄現有 ComfyUI 的啟動方式，登入時會一併帶起' `
+                'Recorded how your existing ComfyUI is started; it will be started at logon too'
+        } else {
+            # Nothing written: an unreadable listener is not worth guessing at.
+            $comfyManaged = $markerIsDetected
+            Write-Bilingual '無法取得現有 ComfyUI 的啟動方式，重開機後請自行啟動 ComfyUI' `
+                'Could not capture how your existing ComfyUI is started; please start ComfyUI yourself after a reboot'
+        }
     } else {
         Write-Bilingual "找不到 ComfyUI，將安裝 $ComfyVersionPinned 版本" `
             "No ComfyUI found; installing version $ComfyVersionPinned"
@@ -535,14 +660,43 @@ $launcherSource = @"
 if (Test-Path `$ManagedMarker) {
     try {
         `$managed = Get-Content `$ManagedMarker -Raw | ConvertFrom-Json
-        Start-Process -FilePath `$managed.start_exe -ArgumentList `$managed.args -WindowStyle Hidden
-        `$deadline = (Get-Date).AddSeconds(180)
-        while ((Get-Date) -lt `$deadline) {
-            try {
-                `$resp = Invoke-WebRequest -Uri 'http://127.0.0.1:8188/system_stats' -UseBasicParsing -TimeoutSec 3
-                if (`$resp.StatusCode -eq 200) { break }
-            } catch {}
-            Start-Sleep -Seconds 3
+        `$managedProps = `$managed.PSObject.Properties.Name
+        `$comfyUrl = 'http://127.0.0.1:8188'
+        if ((`$managedProps -contains 'comfy_url') -and `$managed.comfy_url) {
+            `$comfyUrl = ([string]`$managed.comfy_url).TrimEnd('/')
+        }
+        `$startComfy = `$true
+        if ((`$managedProps -contains 'autostart') -and (-not `$managed.autostart)) {
+            `$startComfy = `$false
+        }
+        # Probe BEFORE starting: a ComfyUI that is already answering (Comfy
+        # Desktop opened by hand, or an earlier launcher run) must never be
+        # started a second time on the same port.
+        try {
+            `$resp = Invoke-WebRequest -Uri "`$comfyUrl/system_stats" -UseBasicParsing -TimeoutSec 3
+            if (`$resp.StatusCode -eq 200) { `$startComfy = `$false }
+        } catch {}
+        if (`$startComfy) {
+            `$comfyCwd = `$InstallDir
+            if ((`$managedProps -contains 'cwd') -and `$managed.cwd -and (Test-Path `$managed.cwd)) {
+                `$comfyCwd = `$managed.cwd
+            }
+            if ((`$managedProps -contains 'command_line') -and `$managed.command_line) {
+                # A detected ComfyUI is replayed through its verbatim command
+                # line, so quoting we did not author is never re-quoted.
+                `$comfyArgs = '/c ' + `$managed.command_line
+                Start-Process -FilePath 'cmd.exe' -ArgumentList `$comfyArgs -WorkingDirectory `$comfyCwd -WindowStyle Hidden
+            } else {
+                Start-Process -FilePath `$managed.start_exe -ArgumentList `$managed.args -WorkingDirectory `$comfyCwd -WindowStyle Hidden
+            }
+            `$deadline = (Get-Date).AddSeconds(180)
+            while ((Get-Date) -lt `$deadline) {
+                try {
+                    `$resp = Invoke-WebRequest -Uri "`$comfyUrl/system_stats" -UseBasicParsing -TimeoutSec 3
+                    if (`$resp.StatusCode -eq 200) { break }
+                } catch {}
+                Start-Sleep -Seconds 3
+            }
         }
     } catch {}
 }

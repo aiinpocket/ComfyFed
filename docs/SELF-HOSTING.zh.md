@@ -129,6 +129,11 @@ curl -fsSL "<你的平台網址>/install.sh?token=<一次性 token>" | bash
 
 這一行指令會自動完成整套安裝：缺 Python 會自動安裝——**三個 OS 都不需要 sudo／系統管理員**（Windows 走 python.org 的每使用者靜默安裝；macOS 與 Linux 從 Astral 的 python-build-standalone 下載可搬移的 CPython 3.12 到 `~/.comfyfed/python`，下載後比對腳本內釘死的 sha256 才安裝，跟 `uv` 用的是同一套預建；Linux 只有在這個下載失敗時才退回 apt/dnf。macOS 特別註記：Xcode 命令列工具附的 python3 是 3.9、低於 3.10 門檻，所以裝 Xcode 並不能解決，腳本也不會再建議你這麼做）；找不到本機 ComfyUI 就連 ComfyUI 一起裝（釘死 v0.35.0，依 GPU 自動選 CUDA／CPU／MPS）；裝完會用 token 自動完成 `register`，並把整組（ComfyUI + agent）設成開機自動啟動、在背景執行，不需要再手動下指令。重跑同一行指令是安全的（冪等）：已經裝過的機器會修好任務排程／服務並升級 agent，不會重灌 ComfyUI。
 
+**現成的 ComfyUI 現在也會幫你一起帶起來。** 安裝器若偵測到你本來就在跑的 ComfyUI（Comfy Desktop、自己 clone 的版本），會把*那個正在跑的行程是怎麼啟動的*——執行檔、參數、工作目錄、以及它服務的網址——記進 `comfyui_managed.json`（Windows 在 `%LOCALAPPDATA%\ComfyFed\`，Linux／macOS 在 `~/.comfyfed/app/`），並在每次登入／開機時、在 agent 之前先把它帶起來。在這之前只有安裝器*自己裝的* ComfyUI 重開機後會回來，所以在 Comfy Desktop 的機器上，agent 開機後背後沒有 ComfyUI，worker 就一直掛著離線，直到有人手動開 ComfyUI 為止。啟動一律先探測：該網址已經有人回應就不再啟動，不會出現兩份搶同一個埠。若安裝器讀不到那個 listening 行程（找不到、或權限不足），它**什麼都不寫**，並當場告訴你重開機後要自己啟動 ComfyUI。
+
+- **不想要這個行為**：在 `comfyui_managed.json` 裡設 `"autostart": false`，launcher 就不會碰 ComfyUI（agent 照常自啟，並自己等 ComfyUI 出現）。重跑安裝器會**重新擷取**這個檔案（偵測到的 ComfyUI 可能搬家、升級或換埠），所以重跑後要再設一次這個旗標。
+- **記下來的埠是安裝當下 ComfyUI 服務的那個埠。** 之後才另外開的 Comfy Desktop 會拿到另一個埠，而 agent 仍然用記錄下來的那個——所以請讓被記錄的那份跑在你要拿來貢獻算力的埠上。
+
 **解除安裝**：
 
 - **Windows**：`schtasks /Delete /TN ComfyFedAgent /F`（非系統管理員安裝則是 `reg delete "HKCU\Software\Microsoft\Windows\CurrentVersion\Run" /v ComfyFedAgent /f`），再刪除 `%LOCALAPPDATA%\ComfyFed` 資料夾。
@@ -178,7 +183,7 @@ comfyfed stop     # 請 agent 優雅結束：進行中的工作會被取消並�
 
 **偵測不到使用者活動時視為閒置，一律接單**：headless 機器（沒有實體螢幕/鍵盤滑鼠）或 Wayland 桌面若沒有裝 XWayland，agent 偵測不到活動訊號，這種情況一律當作「沒有人在用」，不會因為偵測失敗就把 worker 晾在一邊接不到工作。
 
-**Windows 重開機後 worker 顯示離線（0.1.11 起）**：agent 會在登入時自動啟動，但 ComfyUI Desktop 是由你手動開的，所以重開機後 agent 通常比 ComfyUI 早好幾分鐘就緒。這種情況 agent 會自己處理：它會先探測 ComfyUI，在探測不到之前**不會**連上平台，只印一行警告（不再刷整串 traceback），每 30 秒重試一次，等 ComfyUI 一啟動就自動上線。在那之前主控台只會把該 worker 列為離線，`comfyfed status` 會顯示 `paused` 並附上原因 `comfyui_unreachable`——不用修什麼，把 ComfyUI 打開即可。
+**Windows 重開機後 worker 顯示離線（0.1.11 起）**：agent 會在登入時自動啟動，但 ComfyUI Desktop 是由你手動開的，所以重開機後 agent 通常比 ComfyUI 早好幾分鐘就緒。這種情況 agent 會自己處理：它會先探測 ComfyUI，在探測不到之前**不會**連上平台，只印一行警告（不再刷整串 traceback），每 30 秒重試一次，等 ComfyUI 一啟動就自動上線。在那之前主控台只會把該 worker 列為離線，`comfyfed status` 會顯示 `paused` 並附上原因 `comfyui_unreachable`——不用修什麼，把 ComfyUI 打開即可。**這個功能上線後裝（或重跑）的機器幾乎不會再有這段空窗**：安裝器會記下你現有 ComfyUI 的啟動方式，登入時的 launcher 會先把它帶起再啟動 agent——詳見上方「新增一台 worker」。
 
 **Windows 找不到 `comfyfed` 指令**：剛裝完的那個終端機視窗看不到新加的 PATH，屬正常現象——關閉終端機重開一個新的即可。
 

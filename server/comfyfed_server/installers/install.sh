@@ -381,12 +381,77 @@ def cmd_apply(config_path):
         print(note)
 
 
+def cmd_capture(pid, comfy_url, marker_path):
+    """Record how the ALREADY-RUNNING ComfyUI on <pid> was started.
+
+    A ComfyUI we did not install still has to come back after a reboot, or
+    the agent autostarts, finds nothing on comfy_url and the worker sits
+    offline until someone opens ComfyUI by hand. Linux reads /proc; macOS
+    falls back to `ps` + `lsof`. Exits non-zero WITHOUT writing anything when
+    the process cannot be read, so the caller can tell the operator to start
+    ComfyUI themselves instead of shipping a marker that cannot work.
+    """
+    import json
+    import os
+    import shlex
+    import subprocess
+
+    pid = int(pid)
+    argv = []
+    cwd = ""
+    try:
+        with open("/proc/%d/cmdline" % pid, "rb") as fh:
+            argv = [part.decode("utf-8", "replace") for part in fh.read().split(b"\0") if part]
+        cwd = os.readlink("/proc/%d/cwd" % pid)
+    except OSError:
+        pass
+    if not argv:
+        try:
+            out = subprocess.run(
+                ["ps", "-o", "args=", "-p", str(pid)],
+                capture_output=True, text=True, check=True,
+            ).stdout.strip()
+            argv = shlex.split(out)
+        except Exception:
+            argv = []
+    if not cwd:
+        # lsof -Fn emits an `f<fd>` line then an `n<name>` line per record;
+        # the working directory is the record whose fd is the literal "cwd".
+        try:
+            out = subprocess.run(
+                ["lsof", "-a", "-d", "cwd", "-p", str(pid), "-Fn"],
+                capture_output=True, text=True,
+            ).stdout
+            for line in out.splitlines():
+                if line.startswith("n"):
+                    cwd = line[1:]
+                    break
+        except Exception:
+            cwd = ""
+    if not argv:
+        sys.exit(1)
+    if not cwd or not os.path.isdir(cwd):
+        cwd = os.path.dirname(os.path.abspath(argv[0]))
+    marker = {
+        "start_exe": argv[0],
+        "args": argv[1:],
+        "cwd": cwd,
+        "comfy_url": comfy_url,
+        "detected": True,
+        "autostart": True,
+    }
+    with open(marker_path, "w", encoding="utf-8") as fh:
+        json.dump(marker, fh)
+
+
 if __name__ == "__main__":
     command = sys.argv[1]
     if command == "check":
         cmd_check()
     elif command == "apply":
         cmd_apply(sys.argv[2])
+    elif command == "capture":
+        cmd_capture(sys.argv[2], sys.argv[3], sys.argv[4])
     else:
         print(f"unknown command: {command}", file=sys.stderr)
         sys.exit(2)
@@ -459,16 +524,69 @@ fi
 # 4. ComfyUI check + optional install
 # ---------------------------------------------------------------------------
 
+comfy_url_port() {
+    # http://127.0.0.1:8199 -> 8199 (prints nothing when the URL has no port)
+    printf '%s' "$1" | sed -n 's#^[A-Za-z][A-Za-z0-9+.-]*://[^/:]*:\([0-9]\{1,5\}\).*#\1#p'
+}
+
+listener_pid() {
+    # PID of whatever is LISTENing on port $1: lsof (both OSes), then ss.
+    _lp_pid=""
+    if command -v lsof >/dev/null 2>&1; then
+        _lp_pid="$(lsof -iTCP:"$1" -sTCP:LISTEN -Fp 2>/dev/null | sed -n 's/^p//p' | head -n 1)"
+    fi
+    if [ -z "$_lp_pid" ] && command -v ss >/dev/null 2>&1; then
+        _lp_pid="$(ss -ltnp 2>/dev/null | grep -E "[:.]$1[[:space:]]" \
+            | sed -n 's/.*pid=\([0-9][0-9]*\).*/\1/p' | head -n 1)"
+    fi
+    printf '%s' "$_lp_pid"
+}
+
 COMFY_MANAGED=0
 
-if [ -f "$MANAGED_MARKER" ]; then
+# A marker for a ComfyUI this installer INSTALLED means "managed, do not
+# reinstall". A marker for a DETECTED ComfyUI is only a recording of how that
+# ComfyUI starts -- it can go stale (moved, upgraded, or on another port), so
+# a re-run must re-capture it instead of skipping.
+MARKER_IS_DETECTED=0
+if [ -f "$MANAGED_MARKER" ] && "$VENV_PYTHON" -c "
+import json, sys
+try:
+    marker = json.load(open(sys.argv[1], encoding='utf-8'))
+except Exception:
+    sys.exit(1)
+sys.exit(0 if marker.get('detected') else 1)
+" "$MANAGED_MARKER" 2>/dev/null; then
+    MARKER_IS_DETECTED=1
+fi
+
+if [ -f "$MANAGED_MARKER" ] && [ "$MARKER_IS_DETECTED" -eq 0 ]; then
     COMFY_MANAGED=1
     bilingual "已由本安裝器管理的 ComfyUI，略過重新安裝" \
         "ComfyUI already managed by this installer, skipping reinstall"
 else
     bilingual "偵測本機 ComfyUI..." "Detecting local ComfyUI..."
-    if "$VENV_PYTHON" "$HELPER_SCRIPT" check >/dev/null; then
+    DETECTED_COMFY_URL=""
+    if DETECTED_COMFY_URL="$("$VENV_PYTHON" "$HELPER_SCRIPT" check)"; then
         bilingual "找到本機 ComfyUI" "Found a local ComfyUI"
+        # Capture how that ComfyUI was started, into the SAME marker the
+        # launcher reads -- otherwise a reboot brings the agent back without
+        # ComfyUI and the worker stays offline. On failure write nothing.
+        COMFY_MANAGED="$MARKER_IS_DETECTED"
+        COMFY_PORT="$(comfy_url_port "$DETECTED_COMFY_URL")"
+        COMFY_LISTEN_PID=""
+        if [ -n "$COMFY_PORT" ]; then
+            COMFY_LISTEN_PID="$(listener_pid "$COMFY_PORT")"
+        fi
+        if [ -n "$COMFY_LISTEN_PID" ] && "$VENV_PYTHON" "$HELPER_SCRIPT" capture \
+                "$COMFY_LISTEN_PID" "$DETECTED_COMFY_URL" "$MANAGED_MARKER"; then
+            COMFY_MANAGED=1
+            bilingual "已記錄現有 ComfyUI 的啟動方式，登入時會一併帶起" \
+                "Recorded how your existing ComfyUI is started; it will be started at login too"
+        else
+            bilingual "無法取得現有 ComfyUI 的啟動方式，重開機後請自行啟動 ComfyUI" \
+                "Could not capture how your existing ComfyUI is started; please start ComfyUI yourself after a reboot"
+        fi
     else
         bilingual "找不到 ComfyUI，將安裝 $COMFY_VERSION_PINNED 版本" \
             "No ComfyUI found; installing version $COMFY_VERSION_PINNED"
@@ -539,12 +657,61 @@ with open(sys.argv[3], 'w', encoding='utf-8') as f:
 fi
 
 # ---------------------------------------------------------------------------
+# 4b. ComfyUI launcher (used by the systemd unit / launchd plist below)
+# ---------------------------------------------------------------------------
+# Both the ComfyUI we installed and one we merely DETECTED are started from
+# the same marker file through this one script, so the probe-first rule and
+# the `"autostart": false` opt-out are evaluated at boot instead of being
+# baked into the unit at install time.
+COMFY_LAUNCHER="$APP_DIR/comfyui_launcher.sh"
+if [ "$COMFY_MANAGED" -eq 1 ]; then
+    cat > "$COMFY_LAUNCHER" <<LAUNCHEOF
+#!/usr/bin/env bash
+# Generated by the ComfyFed installer -- do not edit; re-run the installer.
+MARKER="$MANAGED_MARKER"
+MARKER_PYTHON="$VENV_PYTHON"
+LAUNCHEOF
+    cat >> "$COMFY_LAUNCHER" <<'LAUNCHEOF'
+set -u
+[ -f "$MARKER" ] || exit 0
+MARKER_FIELDS="$("$MARKER_PYTHON" - "$MARKER" <<'PYEOF'
+import json, shlex, sys
+
+try:
+    marker = json.load(open(sys.argv[1], encoding="utf-8"))
+except Exception:
+    sys.exit(1)
+if marker.get("autostart") is False:
+    print("AUTOSTART=0")
+    sys.exit(0)
+argv = [marker.get("start_exe") or ""] + [str(a) for a in (marker.get("args") or [])]
+argv = [a for a in argv if a]
+if not argv:
+    sys.exit(1)
+print("AUTOSTART=1")
+print("COMFY_URL=" + shlex.quote(marker.get("comfy_url") or "http://127.0.0.1:8188"))
+print("COMFY_CWD=" + shlex.quote(marker.get("cwd") or ""))
+print("COMFY_CMD=" + shlex.quote(" ".join(shlex.quote(a) for a in argv)))
+PYEOF
+)" || exit 0
+eval "$MARKER_FIELDS"
+[ "${AUTOSTART:-0}" = "1" ] || exit 0
+# Probe BEFORE starting: something already answering there (ComfyUI opened by
+# hand, or an earlier run of this unit) must never be started a second time.
+if curl -fsS "${COMFY_URL%/}/system_stats" >/dev/null 2>&1; then exit 0; fi
+if [ -n "${COMFY_CWD:-}" ] && [ -d "$COMFY_CWD" ]; then cd "$COMFY_CWD"; fi
+eval "exec $COMFY_CMD"
+LAUNCHEOF
+    chmod +x "$COMFY_LAUNCHER"
+fi
+
+# ---------------------------------------------------------------------------
 # 5. Autostart
 # ---------------------------------------------------------------------------
-# Units/plists below exec the ComfyUI venv python and the agent binary
-# directly (ExecStart / ProgramArguments) -- there used to be a
-# launcher.sh generated here for them to go through, but nothing ever
-# referenced it, so it was dead code. Removed.
+# The agent's unit/plist execs its binary directly; ComfyUI's goes through
+# the generated comfyui_launcher.sh above (probe, then start what the marker
+# recorded) -- there used to be a launcher.sh generated here for the agent
+# too, but nothing ever referenced it, so it was dead code. Removed.
 
 xml_escape() {
     # Escape a value for use as XML character data / attribute content in
@@ -566,7 +733,7 @@ Description=ComfyFed managed ComfyUI
 
 [Service]
 Type=simple
-ExecStart="$COMFY_VENV_DIR/bin/python" "$COMFY_DIR/main.py"
+ExecStart="$COMFY_LAUNCHER"
 Restart=on-failure
 
 [Install]
@@ -620,8 +787,11 @@ elif [ "$OS_KIND" = "darwin" ]; then
     mkdir -p "$LAUNCH_AGENTS_DIR"
 
     if [ "$COMFY_MANAGED" -eq 1 ]; then
-        COMFY_VENV_PYTHON_XML="$(xml_escape "$COMFY_VENV_DIR/bin/python")"
-        COMFY_MAIN_XML="$(xml_escape "$COMFY_DIR/main.py")"
+        COMFY_LAUNCHER_XML="$(xml_escape "$COMFY_LAUNCHER")"
+        # Same trap as the agent plist: `launchctl load -w` on an
+        # already-loaded job is a no-op, so an upgrade would keep running the
+        # OLD definition until the next logout.
+        launchctl unload -w "$LAUNCH_AGENTS_DIR/com.comfyfed.comfyui.plist" 2>/dev/null || true
         cat > "$LAUNCH_AGENTS_DIR/com.comfyfed.comfyui.plist" <<PLISTEOF
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
@@ -630,11 +800,16 @@ elif [ "$OS_KIND" = "darwin" ]; then
     <key>Label</key><string>com.comfyfed.comfyui</string>
     <key>ProgramArguments</key>
     <array>
-        <string>$COMFY_VENV_PYTHON_XML</string>
-        <string>$COMFY_MAIN_XML</string>
+        <string>$COMFY_LAUNCHER_XML</string>
     </array>
     <key>RunAtLoad</key><true/>
-    <key>KeepAlive</key><true/>
+    <!-- The launcher exits 0 on purpose when ComfyUI is already answering,
+         so a plain always-on KeepAlive would respawn it in a tight loop.
+         Restart only when it actually failed. -->
+    <key>KeepAlive</key>
+    <dict>
+        <key>SuccessfulExit</key><false/>
+    </dict>
 </dict>
 </plist>
 PLISTEOF

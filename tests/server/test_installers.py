@@ -372,7 +372,9 @@ def test_ps1_parses_via_powershell_tokenizer():
 def test_agent_plist_keeps_alive_only_on_failure():
     """Final review M3/L8: the agent's launchd job must NOT be resurrected
     after a clean `comfyfed stop` -- so its KeepAlive is the SuccessfulExit
-    dict, while ComfyUI's job keeps the plain always-on KeepAlive."""
+    dict. ComfyUI's job now runs comfyui_launcher.sh, which exits 0 ON
+    PURPOSE when ComfyUI is already answering, so a plain always-on KeepAlive
+    would respawn it in a tight loop: it takes the same dict."""
     text = open(_source_path("install.sh"), encoding="utf-8").read()
 
     def _heredoc(plist_name: str) -> str:
@@ -384,8 +386,8 @@ def test_agent_plist_keeps_alive_only_on_failure():
     assert "<key>SuccessfulExit</key><false/>" in agent_block
 
     comfyui_block = _heredoc("com.comfyfed.comfyui.plist")
-    assert "<key>KeepAlive</key><true/>" in comfyui_block
-    assert "SuccessfulExit" not in comfyui_block
+    assert "<key>KeepAlive</key><true/>" not in comfyui_block
+    assert "<key>SuccessfulExit</key><false/>" in comfyui_block
 
 
 def test_agent_plist_is_unloaded_before_it_is_rewritten():
@@ -606,3 +608,140 @@ def test_installers_save_the_wheel_under_a_pep427_filename():
     assert "$wheelName = [System.IO.Path]::GetFileName(([Uri]$wheelUrl).AbsolutePath)" in ps
     assert '$wheelName = "comfyfed-$latestVersion-py3-none-any.whl"' in ps
     assert "$wheelFile = Join-Path $env:TEMP $wheelName" in ps
+
+
+# ---------------------------------------------------------------------------
+# Autostarting a DETECTED ComfyUI (not just one this installer installed)
+# ---------------------------------------------------------------------------
+
+
+def _launcher_ps1_block(ps1_text: str) -> str:
+    """The launcher.ps1 here-string, exactly as install.ps1 stores it (so `$
+    escapes are still in place)."""
+    start = ps1_text.index('$launcherSource = @"')
+    return ps1_text[start : ps1_text.index('\n"@', start)]
+
+
+def _generated_comfyui_launcher(sh_text: str) -> str:
+    """Render the comfyui_launcher.sh install.sh writes: an interpolated
+    header heredoc followed by a literal body heredoc."""
+    head = sh_text.split('cat > "$COMFY_LAUNCHER" <<LAUNCHEOF\n', 1)[1].split("\nLAUNCHEOF\n", 1)[0]
+    body = sh_text.split('cat >> "$COMFY_LAUNCHER" <<\'LAUNCHEOF\'\n', 1)[1].split("\nLAUNCHEOF\n", 1)[0]
+    head = head.replace("$MANAGED_MARKER", "/home/u/.comfyfed/app/comfyui_managed.json")
+    head = head.replace("$VENV_PYTHON", "/home/u/.comfyfed/app/venv/bin/python")
+    return head + "\n" + body + "\n"
+
+
+def test_installers_record_how_a_detected_comfyui_starts():
+    """Live-caught 2026-09-16: the installers only recorded a ComfyUI they
+    had installed THEMSELVES, so on a machine running Comfy Desktop a reboot
+    brought the agent back with no ComfyUI behind it and the worker just sat
+    offline. The detected branch must write the same marker file, flagged
+    `detected`, carrying everything needed to start that ComfyUI again."""
+    ps1 = open(_source_path("install.ps1"), encoding="utf-8-sig").read()
+    assert "function Save-DetectedComfyMarker" in ps1
+    # port -> listening pid -> process image + command line.
+    assert "Get-NetTCPConnection -State Listen -LocalPort $port" in ps1
+    assert "Get-CimInstance -ClassName Win32_Process" in ps1
+    for field in (
+        "start_exe = $startExe",
+        "args = @($procArgs)",
+        "command_line = $commandLine",
+        "cwd = $cwd",
+        "detected = $true",
+        "autostart = $true",
+    ):
+        assert field in ps1, field
+    # No listener, or an unreadable one: write NOTHING and say so.
+    assert "Could not capture how your existing ComfyUI is started" in ps1
+
+    sh = open(_source_path("install.sh"), encoding="utf-8").read()
+    assert "def cmd_capture(" in sh
+    assert '"$HELPER_SCRIPT" capture' in sh
+    assert "lsof -iTCP:" in sh
+    assert "ss -ltnp" in sh
+    assert '"/proc/%d/cmdline" % pid' in sh
+    assert '"/proc/%d/cwd" % pid' in sh
+    assert '["ps", "-o", "args=", "-p", str(pid)]' in sh
+    for field in (
+        '"start_exe": argv[0]',
+        '"args": argv[1:]',
+        '"cwd": cwd,',
+        '"detected": True',
+        '"autostart": True',
+    ):
+        assert field in sh, field
+    assert "Could not capture how your existing ComfyUI is started" in sh
+
+
+def test_launchers_probe_comfyui_before_starting_it():
+    """A ComfyUI that is already answering (Comfy Desktop opened by hand, or
+    an earlier run of the same unit) must never be started a second time on
+    the same port -- so the launcher probes comfy_url FIRST and only starts
+    what the marker recorded when nothing answers."""
+    ps1 = open(_source_path("install.ps1"), encoding="utf-8-sig").read()
+    block = _launcher_ps1_block(ps1)
+    assert "if (`$resp.StatusCode -eq 200) { `$startComfy = `$false }" in block
+    assert "if (`$startComfy) {" in block
+    assert block.index("system_stats") < block.index("Start-Process -FilePath 'cmd.exe'")
+    # Started with the recorded working directory, hidden, and still waiting
+    # up to 180 s for readiness before the agent is launched.
+    assert "-WorkingDirectory `$comfyCwd -WindowStyle Hidden" in block
+    assert "`$deadline = (Get-Date).AddSeconds(180)" in block
+
+    sh = open(_source_path("install.sh"), encoding="utf-8").read()
+    launcher = _generated_comfyui_launcher(sh)
+    assert 'if curl -fsS "${COMFY_URL%/}/system_stats" >/dev/null 2>&1; then exit 0; fi' in launcher
+    assert launcher.index("system_stats") < launcher.index('eval "exec $COMFY_CMD"')
+    # Both the systemd unit and the launchd job go through that launcher.
+    assert 'ExecStart="$COMFY_LAUNCHER"' in sh
+    assert "<string>$COMFY_LAUNCHER_XML</string>" in sh
+
+
+def test_launchers_honour_the_autostart_opt_out():
+    """`"autostart": false` in comfyui_managed.json is the documented way to
+    keep starting ComfyUI by hand; the launcher must respect it on both
+    platforms."""
+    ps1 = open(_source_path("install.ps1"), encoding="utf-8-sig").read()
+    block = _launcher_ps1_block(ps1)
+    assert "(`$managedProps -contains 'autostart') -and (-not `$managed.autostart)" in block
+    assert "`$startComfy = `$false" in block
+
+    launcher = _generated_comfyui_launcher(
+        open(_source_path("install.sh"), encoding="utf-8").read()
+    )
+    assert 'if marker.get("autostart") is False:' in launcher
+    assert '[ "${AUTOSTART:-0}" = "1" ] || exit 0' in launcher
+
+
+def test_installers_recapture_a_detected_marker_on_rerun():
+    """A marker for an INSTALLED ComfyUI means "managed, skip the reinstall";
+    a marker for a DETECTED one is only a recording that goes stale when that
+    ComfyUI moves or changes port -- so a re-run re-captures it."""
+    ps1 = open(_source_path("install.ps1"), encoding="utf-8-sig").read()
+    assert "if ((Test-Path $ManagedMarker) -and (-not $markerIsDetected)) {" in ps1
+    assert "$markerIsDetected = $true" in ps1
+
+    sh = open(_source_path("install.sh"), encoding="utf-8").read()
+    assert 'if [ -f "$MANAGED_MARKER" ] && [ "$MARKER_IS_DETECTED" -eq 0 ]; then' in sh
+    assert "MARKER_IS_DETECTED=1" in sh
+
+
+def test_generated_comfyui_launcher_sh_syntax_checks():
+    """install.sh writes a SECOND bash script; `bash -n install.sh` never
+    looks inside a heredoc, so the generated file needs its own parse gate
+    (the same trap launcher.ps1 already has a test for)."""
+    bash = shutil.which("bash")
+    if bash is None:
+        pytest.skip("bash not available in this environment")
+    launcher = _generated_comfyui_launcher(
+        open(_source_path("install.sh"), encoding="utf-8").read()
+    )
+    import tempfile
+
+    with tempfile.TemporaryDirectory() as td:
+        path = os.path.join(td, "comfyui_launcher.sh")
+        with open(path, "w", encoding="utf-8", newline="\n") as f:
+            f.write(launcher)
+        result = subprocess.run([bash, "-n", path], capture_output=True, text=True)
+        assert result.returncode == 0, result.stderr
