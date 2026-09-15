@@ -50,6 +50,26 @@ class UpdateDecision:
     platform_sig: Optional[str] = None
 
 
+def _wheel_filename_for(wheel_url: str, version: str) -> str:
+    """The PEP 427 filename pip must see for the downloaded wheel.
+
+    pip validates the FILENAME, not just the bytes: anything that is not
+    `<dist>-<version>[-<build>]-<py>-<abi>-<plat>.whl` is refused with
+    "is not a valid wheel filename". Prefer the URL's own basename (the
+    platform publishes the wheel under its real name); when the URL carries
+    no usable name (a query-string download, a bare id) fall back to the
+    conventional pure-Python name for this distribution and version.
+    """
+    import re
+    from urllib.parse import unquote, urlsplit
+
+    pep427 = re.compile(r"^[A-Za-z0-9_.]+-[0-9][A-Za-z0-9_.!+]*(-[0-9][A-Za-z0-9_.]*)?-[^-]+-[^-]+-[^-]+\.whl$")
+    basename = unquote(os.path.basename(urlsplit(wheel_url).path))
+    if pep427.match(basename):
+        return basename
+    return f"comfyfed-{version}-py3-none-any.whl"
+
+
 def check(entry: PlatformEntry, current: str, client: httpx.Client) -> UpdateDecision:
     """Ask the platform for the latest/min-supported agent version and decide what to do.
 
@@ -167,9 +187,18 @@ def apply_update(
         logger.warning("Wheel platform signature invalid; refusing to update.")
         return False
 
-    fd, tmp_path = tempfile.mkstemp(suffix=".whl")
+    # pip refuses any wheel whose FILENAME is not PEP 427-shaped
+    # ("<dist>-<version>-<py>-<abi>-<plat>.whl") -- `mkstemp(suffix=".whl")`
+    # produced names like tmpeka2_2_0.whl and pip answered "is not a valid
+    # wheel filename", so no in-place self-update had ever installed
+    # (live-caught, the third masked layer after the precedence and
+    # relative-URL bugs). Write the bytes into a private temp DIRECTORY under
+    # the wheel's real name: the URL's basename when it is a valid wheel
+    # name, else a conventional pure-Python name built from the version.
+    tmp_dir = tempfile.mkdtemp(prefix="comfyfed-update-")
+    tmp_path = os.path.join(tmp_dir, _wheel_filename_for(wheel_url, decision.latest))
     try:
-        with os.fdopen(fd, "wb") as f:
+        with open(tmp_path, "wb") as f:
             f.write(wheel_bytes)
         try:
             pip_install(tmp_path)
@@ -179,6 +208,10 @@ def apply_update(
     finally:
         try:
             os.remove(tmp_path)
+        except OSError:
+            pass
+        try:
+            os.rmdir(tmp_dir)
         except OSError:
             pass
 

@@ -232,6 +232,63 @@ def test_apply_update_joins_a_relative_wheel_url_onto_the_platform_url():
     assert requested[0].startswith("http")
 
 
+def test_apply_update_hands_pip_a_pep427_named_wheel_from_the_url_basename():
+    """Live-caught: the wheel was written to mkstemp(suffix=".whl") -- a name
+    like tmpeka2_2_0.whl -- and pip refused it ("is not a valid wheel
+    filename"), so no self-update had ever installed. pip must receive a
+    path whose basename is the wheel's real PEP 427 name from the URL."""
+    signing_key = SigningKey.generate()
+    entry = _entry(platform_pubkey=bytes(signing_key.verify_key).hex())
+    wheel_bytes = b"fake wheel contents"
+    sha256 = hashlib.sha256(wheel_bytes).hexdigest()
+    good_sig = signing_key.sign(f"0.2.0|{sha256}".encode()).signature.hex()
+    decision = UpdateDecision(
+        action="update",
+        latest="0.2.0",
+        min_supported="0.1.0",
+        wheel_url="http://testplatform/api/agent/releases/comfyfed-0.2.0-py3-none-any.whl",
+        sha256=sha256,
+        platform_sig=good_sig,
+    )
+    seen: list[str] = []
+    ok = apply_update(
+        entry, decision, _FakeClient(wheel_bytes=wheel_bytes),
+        pip_install=lambda path: seen.append(path), restart=lambda: None,
+    )
+    assert ok is True
+    assert len(seen) == 1
+    import os as _os
+    import re as _re
+    name = _os.path.basename(seen[0])
+    assert name == "comfyfed-0.2.0-py3-none-any.whl"
+    assert _re.match(r"^[A-Za-z0-9_.]+-[0-9][A-Za-z0-9_.!+]*-[^-]+-[^-]+-[^-]+\.whl$", name)
+    # The temp directory holding it is cleaned up afterwards.
+    assert not _os.path.exists(_os.path.dirname(seen[0]))
+
+
+def test_apply_update_falls_back_to_a_conventional_wheel_name_when_the_url_has_none():
+    """A platform that serves the wheel from a path without a PEP 427
+    basename (e.g. /download?id=7) still gets a pip-acceptable name built
+    from the advertised version."""
+    signing_key = SigningKey.generate()
+    entry = _entry(platform_pubkey=bytes(signing_key.verify_key).hex())
+    wheel_bytes = b"fake wheel contents"
+    sha256 = hashlib.sha256(wheel_bytes).hexdigest()
+    good_sig = signing_key.sign(f"0.2.0|{sha256}".encode()).signature.hex()
+    decision = UpdateDecision(
+        action="update", latest="0.2.0", min_supported="0.1.0",
+        wheel_url="http://testplatform/download?id=7", sha256=sha256, platform_sig=good_sig,
+    )
+    seen: list[str] = []
+    ok = apply_update(
+        entry, decision, _FakeClient(wheel_bytes=wheel_bytes),
+        pip_install=lambda path: seen.append(path), restart=lambda: None,
+    )
+    assert ok is True
+    import os as _os
+    assert _os.path.basename(seen[0]) == "comfyfed-0.2.0-py3-none-any.whl"
+
+
 def test_apply_update_pip_install_raises_returns_false_and_no_restart():
     import subprocess
 
