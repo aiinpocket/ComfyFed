@@ -27,7 +27,8 @@ import { requireUser, requireCsrfUser, errorJson, SESSION_VAR } from "../lib/gua
 // single `staging/` constant -- a local copy of the prefix here would let
 // this listing and `stagingKey`'s delete silently address different
 // namespaces if that constant were ever renamed.
-import { stagingKey, stagingPrefix } from "../lib/store";
+import { stagingKey, stagingPrefix, userdataPrefix } from "../lib/store";
+import { prefixBytes, readLimits } from "../lib/limits";
 
 const app = new Hono<{ Bindings: Env }>();
 
@@ -53,9 +54,22 @@ app.get("/api/staging", requireUser, async (c) => {
     .filter((f) => f.name.length > 0)
     .sort((a, b) => (a.name < b.name ? -1 : a.name > b.name ? 1 : 0));
 
+  // Additive fields only -- `files`/`total_bytes` keep their meaning (this
+  // listing's own staging objects) so an older console still works.
+  // `userdata_bytes` is the OTHER half of what the quota counts, so the
+  // console can show "used (staging + userdata) of quota" without a second
+  // endpoint. Job artifacts/outputs are excluded from both: they are
+  // results, not the user's own kept files (see lib/limits.ts).
+  const [limits, userdataBytes] = await Promise.all([
+    readLimits(c.env.DB),
+    prefixBytes(c.env.STORE, userdataPrefix(uid)),
+  ]);
+
   return c.json({
     files,
     total_bytes: files.reduce((sum, f) => sum + f.size, 0),
+    quota_bytes: limits.quotaBytes,
+    userdata_bytes: userdataBytes,
   });
 });
 

@@ -133,7 +133,10 @@ def test_staging_is_isolated_per_user(client, two_users):
     assert _upload(client, "alice.png", b"AAA").status_code == 200
 
     bob_csrf = _login(client, *BOB)
-    assert client.get("/api/staging").json() == {"files": [], "total_bytes": 0}
+    listing = client.get("/api/staging").json()
+    assert listing["files"] == []
+    assert listing["total_bytes"] == 0
+    assert listing["userdata_bytes"] == 0
     # Bob cannot delete Alice's file even knowing its exact name.
     assert client.delete("/api/staging/alice.png", headers={"X-CSRF": bob_csrf}).status_code == 404
 
@@ -145,3 +148,128 @@ def test_staging_is_isolated_per_user(client, two_users):
     _login(client, *ALICE)
     assert [f["name"] for f in client.get("/api/staging").json()["files"]] == ["alice.png"]
     assert os.path.isfile(os.path.join(comfyapi.staging_dir(client.data_dir, _uid("alice")), "alice.png"))
+
+
+# --- upload limits + per-user storage quota ---------------------------------
+#
+# `upload_max_file_mb` (default 50) and `upload_user_quota_gb` (default 5) are
+# admin settings; this route had NO ceiling at all before, which made staging
+# the way around the `/userdata` cap. Parity twin: cloud/test/staging.spec.ts.
+
+
+def _set_limits(client, csrf, **values):
+    r = client.post("/api/settings", json=values, headers={"X-CSRF": csrf})
+    assert r.status_code == 200, r.text
+    return r.json()
+
+
+def test_staging_upload_is_capped_at_the_configured_file_size(client):
+    csrf = _login(client)
+    _set_limits(client, csrf, upload_max_file_mb=1)
+
+    too_big = _upload(client, "big.png", b"x" * (1024 * 1024 + 1))
+    assert too_big.status_code == 413, too_big.text
+    assert too_big.json()["error"]["code"] == "upload.too_large"
+    # zh first, then English -- both halves in one message.
+    assert "1 MB 單檔上限" in too_big.json()["error"]["message"]
+    assert "1 MB per-file upload limit" in too_big.json()["error"]["message"]
+    # Refused before any write.
+    assert client.get("/api/staging").json()["files"] == []
+
+    assert _upload(client, "ok.png", b"y" * (1024 * 1024)).status_code == 200
+
+
+def test_staging_upload_is_refused_when_it_would_exceed_the_quota(client):
+    csrf = _login(client)
+    # 0.1 GB quota; a 40 MB file fits twice but not three times.
+    _set_limits(client, csrf, upload_user_quota_gb=0.1, upload_max_file_mb=50)
+    chunk = b"z" * (40 * 1024 * 1024)
+
+    assert _upload(client, "a.png", chunk).status_code == 200
+    assert _upload(client, "b.png", chunk).status_code == 200
+
+    over = _upload(client, "c.png", chunk)
+    assert over.status_code == 413, over.text
+    assert over.json()["error"]["code"] == "quota_exceeded"
+    message = over.json()["error"]["message"]
+    assert "儲存空間不足（已用 80 MB / 配額 102.4 MB）" in message
+    assert "Storage quota exceeded (used 80 MB of 102.4 MB)" in message
+
+    # The refused upload wrote nothing.
+    assert sorted(f["name"] for f in client.get("/api/staging").json()["files"]) == [
+        "a.png",
+        "b.png",
+    ]
+
+
+def test_overwriting_a_staged_file_does_not_double_count_its_bytes(client):
+    """A re-upload of the SAME name frees the old bytes, so it must not be
+    refused at exactly 100% of quota."""
+    csrf = _login(client)
+    _set_limits(client, csrf, upload_user_quota_gb=0.1)
+    chunk = b"z" * (50 * 1024 * 1024)
+
+    assert _upload(client, "a.png", chunk).status_code == 200
+    assert _upload(client, "b.png", chunk).status_code == 200
+    # Full to the byte -- but replacing one of them is still allowed.
+    assert _upload(client, "a.png", chunk).status_code == 200
+
+
+def test_quota_counts_userdata_as_well_as_staging(client):
+    csrf = _login(client)
+    _set_limits(client, csrf, upload_user_quota_gb=0.1, upload_max_file_mb=50)
+    assert (
+        client.post("/comfy/api/userdata/workflows%2Fbig.json", content=b"u" * (50 * 1024 * 1024)).status_code
+        == 200
+    )
+    assert _upload(client, "a.png", b"z" * (50 * 1024 * 1024)).status_code == 200
+
+    # 100 MB of the 102.4 MB quota is already used, half of it in userdata --
+    # a 3 MB staging upload only overflows if BOTH namespaces are counted.
+    over = _upload(client, "b.png", b"z" * (3 * 1024 * 1024))
+    assert over.status_code == 413, over.text
+    assert over.json()["error"]["code"] == "quota_exceeded"
+    assert "已用 100 MB" in over.json()["error"]["message"]
+
+
+def test_job_artifacts_do_not_count_toward_the_quota(client):
+    """Artifacts are RESULTS, not files the user chose to keep -- a full
+    `artifacts/` tree must never block an upload (see limits.py)."""
+    from comfyfed_server import limits
+
+    csrf = _login(client)
+    _set_limits(client, csrf, upload_user_quota_gb=0.1)
+    artifacts = os.path.join(client.data_dir, "artifacts", "job-1")
+    os.makedirs(artifacts, exist_ok=True)
+    with open(os.path.join(artifacts, "out.png"), "wb") as f:
+        f.write(b"a" * (80 * 1024 * 1024))
+
+    uid = _uid("admin")
+    assert limits.usage_bytes(client.data_dir, uid) == 0
+    assert _upload(client, "ref.png", b"z" * (50 * 1024 * 1024)).status_code == 200
+
+
+def test_staging_listing_reports_usage_and_quota(client):
+    csrf = _login(client)
+    _set_limits(client, csrf, upload_user_quota_gb=2)
+    assert _upload(client, "ref.png", b"12345").status_code == 200
+    assert client.post("/comfy/api/userdata/w%2Fa.json", content=b"abc").status_code == 200
+
+    listing = client.get("/api/staging").json()
+    assert listing["total_bytes"] == 5
+    assert listing["userdata_bytes"] == 3
+    assert listing["quota_bytes"] == 2 * 1024 * 1024 * 1024
+    # Additive only: the pre-existing shape is untouched.
+    assert [f["name"] for f in listing["files"]] == ["ref.png"]
+
+
+def test_usage_math_matches_the_real_files_on_disk(client):
+    from comfyfed_server import limits
+
+    _login(client)
+    assert _upload(client, "a.png", b"x" * 700).status_code == 200
+    assert client.post("/comfy/api/userdata/w%2Fdeep%2Fb.json", content=b"y" * 300).status_code == 200
+
+    uid = _uid("admin")
+    assert limits.usage_bytes(client.data_dir, uid) == 1000
+    assert limits.dir_bytes(comfyapi.userdata_dir(client.data_dir, uid)) == 300

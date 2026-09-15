@@ -25,7 +25,13 @@ describe("GET /api/settings", () => {
     const { cookie } = await loginSession();
     const r = await call("/api/settings", { method: "GET", cookie });
     expect(r.status).toBe(200);
-    expect(r.body).toEqual({ platform_url: "", lang: "en", object_info_mode: "union" });
+    expect(r.body).toEqual({
+      platform_url: "",
+      lang: "en",
+      object_info_mode: "union",
+      upload_max_file_mb: 50,
+      upload_user_quota_gb: 5,
+    });
   });
 });
 
@@ -54,6 +60,8 @@ describe("POST /api/settings", () => {
       platform_url: "https://fed.example",
       lang: "zh-TW",
       object_info_mode: "union",
+      upload_max_file_mb: 50,
+      upload_user_quota_gb: 5,
     });
 
     const me = await call("/api/auth/me", { method: "GET", cookie });
@@ -115,5 +123,73 @@ describe("POST /api/settings", () => {
     expect(r.status).toBe(400);
     expect(r.body.error.code).toBe("settings.bad_object_info_mode");
     expect(r.body.error.message).toContain("必須是 union 或 intersection 其中之一");
+  });
+});
+
+// --- upload limits (`upload_max_file_mb` / `upload_user_quota_gb`) ----------
+//
+// Plain `settings` key-value rows (no migration), surfaced and updated
+// through the SAME admin endpoint as platform_url/lang. Parity twin:
+// tests/server/test_auth.py's upload-limit block.
+
+describe("upload limit settings", () => {
+  it("reports the defaults (50 MB / 5 GB) before any write", async () => {
+    const { cookie } = await loginSession();
+    const r = await call("/api/settings", { method: "GET", cookie });
+    expect(r.body.upload_max_file_mb).toBe(50);
+    expect(r.body.upload_user_quota_gb).toBe(5);
+  });
+
+  it("writes both limits, decimals included", async () => {
+    const { cookie, csrf } = await loginSession();
+    const r = await call("/api/settings", {
+      json: { upload_max_file_mb: 200, upload_user_quota_gb: 12.5 },
+      cookie,
+      headers: { "X-CSRF": csrf },
+    });
+    expect(r.status).toBe(200);
+    expect(r.body.upload_max_file_mb).toBe(200);
+    expect(r.body.upload_user_quota_gb).toBe(12.5);
+
+    const reread = await call("/api/settings", { method: "GET", cookie });
+    expect(reread.body.upload_max_file_mb).toBe(200);
+    expect(reread.body.upload_user_quota_gb).toBe(12.5);
+  });
+
+  it.each([0, -1, 1025, 12.5])("rejects upload_max_file_mb=%s", async (value) => {
+    const { cookie, csrf } = await loginSession();
+    const r = await call("/api/settings", {
+      json: { upload_max_file_mb: value },
+      cookie,
+      headers: { "X-CSRF": csrf },
+    });
+    expect(r.status).toBe(400);
+    expect(r.body.error.code).toBe("settings.bad_upload_max_file_mb");
+  });
+
+  it.each([0, 0.05, 2048])("rejects upload_user_quota_gb=%s", async (value) => {
+    const { cookie, csrf } = await loginSession();
+    const r = await call("/api/settings", {
+      json: { upload_user_quota_gb: value },
+      cookie,
+      headers: { "X-CSRF": csrf },
+    });
+    expect(r.status).toBe(400);
+    expect(r.body.error.code).toBe("settings.bad_upload_user_quota_gb");
+  });
+
+  it.each([
+    ["", ""],
+    ["not-a-number", "nonsense"],
+    ["0", "0"],
+    ["99999", "99999"],
+  ])("parses a bad stored row (%s / %s) back to the default", async (mb, gb) => {
+    const { cookie } = await loginSession();
+    await db().prepare("INSERT OR REPLACE INTO settings (key, value) VALUES (?, ?)").bind("upload_max_file_mb", mb).run();
+    await db().prepare("INSERT OR REPLACE INTO settings (key, value) VALUES (?, ?)").bind("upload_user_quota_gb", gb).run();
+
+    const r = await call("/api/settings", { method: "GET", cookie });
+    expect(r.body.upload_max_file_mb).toBe(50);
+    expect(r.body.upload_user_quota_gb).toBe(5);
   });
 });

@@ -197,14 +197,23 @@ def test_userdata_rejects_traversal(client, bad):
 
 
 def test_userdata_rejects_oversized_file(client):
-    _login(client)
-    big = b"x" * (5 * 1024 * 1024 + 1)
+    """The per-file cap is the CONFIGURED `upload_max_file_mb`, not a
+    hardcoded ceiling -- lowered to 1 MB here so the test does not have to
+    push 50 MB through the client to prove it."""
+    csrf = _login(client)
+    assert (
+        client.post(
+            "/api/settings", json={"upload_max_file_mb": 1}, headers={"X-CSRF": csrf}
+        ).status_code
+        == 200
+    )
+    big = b"x" * (1024 * 1024 + 1)
     r = client.post("/comfy/api/userdata/workflows%2Fbig.json", content=big)
     assert r.status_code == 413
     assert r.json()["error"]["code"] == "userdata.too_large"
-    assert "5 MB" in r.json()["error"]["message"]
+    assert "1 MB" in r.json()["error"]["message"]
     # Just under the limit still stores.
-    ok = client.post("/comfy/api/userdata/workflows%2Fok.json", content=b"y" * (5 * 1024 * 1024))
+    ok = client.post("/comfy/api/userdata/workflows%2Fok.json", content=b"y" * (1024 * 1024))
     assert ok.status_code == 200
 
 
@@ -345,3 +354,49 @@ def test_admin_has_no_userdata_override(client, two_users):
     assert client.get(
         "/comfy/api/userdata", params={"dir": "workflows", "recurse": "true", "full_info": "true"}
     ).json() == []
+
+
+def test_userdata_save_is_refused_when_it_would_exceed_the_quota(client):
+    """The per-user quota spans staging + userdata; a save that would cross it
+    is a typed, bilingual 413 and writes nothing."""
+    csrf = _login(client)
+    assert (
+        client.post(
+            "/api/settings",
+            json={"upload_user_quota_gb": 0.1, "upload_max_file_mb": 50},
+            headers={"X-CSRF": csrf},
+        ).status_code
+        == 200
+    )
+    assert (
+        client.post("/comfy/api/userdata/w%2Fa.json", content=b"a" * (50 * 1024 * 1024)).status_code
+        == 200
+    )
+    assert (
+        client.post("/comfy/api/userdata/w%2Fb.json", content=b"b" * (50 * 1024 * 1024)).status_code
+        == 200
+    )
+
+    over = client.post("/comfy/api/userdata/w%2Fc.json", content=b"c" * (3 * 1024 * 1024))
+    assert over.status_code == 413, over.text
+    assert over.json()["error"]["code"] == "quota_exceeded"
+    message = over.json()["error"]["message"]
+    assert "儲存空間不足（已用 100 MB / 配額 102.4 MB）" in message
+    assert "Storage quota exceeded (used 100 MB of 102.4 MB)" in message
+    # Nothing landed.
+    assert client.get("/comfy/api/userdata/w%2Fc.json").status_code == 404
+
+
+def test_resaving_the_same_userdata_file_at_full_quota_still_works(client):
+    csrf = _login(client)
+    assert (
+        client.post(
+            "/api/settings", json={"upload_user_quota_gb": 0.1}, headers={"X-CSRF": csrf}
+        ).status_code
+        == 200
+    )
+    body = b"a" * (50 * 1024 * 1024)
+    assert client.post("/comfy/api/userdata/w%2Fa.json", content=body).status_code == 200
+    assert client.post("/comfy/api/userdata/w%2Fb.json", content=body).status_code == 200
+    # Overwriting frees the bytes it replaces, so this must not 413.
+    assert client.post("/comfy/api/userdata/w%2Fa.json", content=body).status_code == 200

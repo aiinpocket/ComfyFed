@@ -1148,3 +1148,55 @@ def test_job_dict_omits_invalid_fetch_pct_and_model_rather_than_sending_null(cli
     assert job["stage"] == "fetching_models"
     assert "fetch_pct" not in job
     assert "fetch_model" not in job
+
+
+def test_submit_asset_over_the_configured_file_cap_is_413(client):
+    """Console job assets obey the same admin-configured per-file cap as the
+    panel's uploads (`upload_max_file_mb`), and are refused BEFORE the job row
+    is inserted. Their bytes land in `job_inputs/` and are deliberately
+    outside the per-user storage quota -- see limits.py."""
+    csrf = _login(client)
+    assert (
+        client.post(
+            "/api/settings", json={"upload_max_file_mb": 1}, headers={"X-CSRF": csrf}
+        ).status_code
+        == 200
+    )
+
+    workflow = {"1": {"class_type": "LoadImage", "inputs": {"image": "ref.png"}}}
+    big = [("assets", ("ref.png", io.BytesIO(b"x" * (1024 * 1024 + 1)), "image/png"))]
+    r = _submit(client, csrf, workflow=workflow, files=big)
+    assert r.status_code == 413, r.text
+    assert r.json()["error"]["code"] == "jobs.asset_too_large"
+    assert "1 MB 單檔上限" in r.json()["error"]["message"]
+    assert "1 MB per-file upload limit" in r.json()["error"]["message"]
+    # No job was created.
+    assert client.get("/api/jobs", headers={"X-CSRF": csrf}).json() == []
+
+    ok = [("assets", ("ref.png", io.BytesIO(b"x" * (1024 * 1024)), "image/png"))]
+    assert _submit(client, csrf, workflow=workflow, files=ok).status_code == 200
+
+
+def test_submit_assets_are_not_charged_against_the_storage_quota(client):
+    """`job_inputs/` is job-scoped result storage: a user at 100% of their
+    personal quota can still submit work."""
+    from comfyfed_server import comfyapi, limits
+
+    csrf = _login(client)
+    assert (
+        client.post(
+            "/api/settings", json={"upload_user_quota_gb": 0.1}, headers={"X-CSRF": csrf}
+        ).status_code
+        == 200
+    )
+    with db.get_session() as session:
+        uid = session.query(db.User).filter(db.User.username == "admin").one().id
+    staging = comfyapi.staging_dir(client.data_dir, uid)
+    os.makedirs(staging, exist_ok=True)
+    with open(os.path.join(staging, "full.bin"), "wb") as f:
+        f.write(b"z" * (100 * 1024 * 1024))
+    assert limits.usage_bytes(client.data_dir, uid) == 100 * 1024 * 1024
+
+    workflow = {"1": {"class_type": "LoadImage", "inputs": {"image": "ref.png"}}}
+    files = [("assets", ("ref.png", io.BytesIO(b"x" * 4096), "image/png"))]
+    assert _submit(client, csrf, workflow=workflow, files=files).status_code == 200

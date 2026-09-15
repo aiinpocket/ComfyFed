@@ -75,6 +75,8 @@ const PENDING_STATUSES = ["queued"];
 const HISTORY_STATUSES = ["done", "failed"];
 
 const OBJECT_INFO_DIR = "object_info";
+import { readLimits, tooLargeMessage, uploadRejection } from "../lib/limits";
+
 const OBJECT_INFO_MAX_BYTES = 32 * 1024 * 1024;
 
 const OBJECT_INFO_MODE_KEY = "object_info_mode";
@@ -589,7 +591,18 @@ app.post("/comfy/api/upload/image", async (c) => {
   }
 
   const content = await image.arrayBuffer();
-  await c.env.STORE.put(stagingKey(user.uid, filename), content);
+  const key = stagingKey(user.uid, filename);
+  // Same per-file cap and per-user quota the `/userdata` save enforces: this
+  // route had NO limit at all, so the staging namespace was the way around
+  // the other one. `head` gives the bytes an overwrite frees, which must not
+  // be charged twice.
+  const existing = await c.env.STORE.head(key);
+  const rejected = await uploadRejection(c, user.uid, content.byteLength, {
+    tooLargeCode: "upload.too_large",
+    replacingBytes: existing?.size ?? 0,
+  });
+  if (rejected) return rejected;
+  await c.env.STORE.put(key, content);
 
   return c.json({ name: filename, subfolder: "", type: "input" });
 });
@@ -862,10 +875,11 @@ app.get("/comfy/api/view", async (c) => {
 // `app.all("/comfy/api/*")` JSON 404 for unimplemented panel endpoints, and
 // only a route mounted before it wins.
 
-/** Per-file ceiling, mirroring Python's `_USERDATA_MAX_BYTES`. */
-const USERDATA_MAX_BYTES = 5 * 1024 * 1024;
-
-const USERDATA_TOO_LARGE_MESSAGE = "檔案超過 5 MB 上限，無法儲存。 / File exceeds the 5 MB userdata limit.";
+// The per-file ceiling and the per-user storage quota are no longer constants
+// here: both are admin-configurable platform settings (`upload_max_file_mb`,
+// default 50, and `upload_user_quota_gb`, default 5), read through
+// `readLimits` on every write. See lib/limits.ts for the parse, the bounds,
+// and why job artifacts/inputs sit outside the quota.
 const USERDATA_BAD_PATH_MESSAGE = "路徑不合法。 / Invalid path.";
 const USERDATA_NOT_FOUND_MESSAGE = "檔案不存在。 / File not found.";
 const USERDATA_EXISTS_MESSAGE = "檔案已存在。 / File already exists.";
@@ -999,11 +1013,15 @@ app.post("/comfy/api/userdata/:src{.+}/move/:dest{.+}", async (c) => {
   }
 
   // `source.size` comes free off the R2 object we already fetched, so the
-  // 5 MB per-file ceiling the plain POST enforces applies to a move too --
-  // without it a pre-existing oversized object would be materialised whole
-  // in the isolate by `arrayBuffer()` below.
-  if (source.size > USERDATA_MAX_BYTES) {
-    return userdataError(c, 413, "userdata.too_large", USERDATA_TOO_LARGE_MESSAGE);
+  // configured per-file ceiling the plain POST enforces applies to a move too
+  // -- without it a pre-existing oversized object would be materialised whole
+  // in the isolate by `arrayBuffer()` below. Only the CAP applies here, not
+  // the quota: a move is copy+delete of bytes the user is already charged
+  // for, so total usage is unchanged (and refusing it would strand a file a
+  // user at quota is trying to reorganise).
+  const moveLimits = await readLimits(c.env.DB);
+  if (source.size > moveLimits.maxFileBytes) {
+    return userdataError(c, 413, "userdata.too_large", tooLargeMessage(moveLimits));
   }
 
   // PARKED: this is a copy+delete, not an atomic rename (R2 has no rename,
@@ -1059,15 +1077,23 @@ app.post("/comfy/api/userdata/:path{.+}", async (c) => {
   // check below stays: a lying or absent `Content-Length` must never be a
   // way past the cap, so this is an extra, cheaper rejection and never a
   // substitute for measuring the real bytes.
+  const limits = await readLimits(c.env.DB);
   const declared = c.req.header("content-length");
-  if (declared && /^\d+$/.test(declared) && Number(declared) > USERDATA_MAX_BYTES) {
-    return userdataError(c, 413, "userdata.too_large", USERDATA_TOO_LARGE_MESSAGE);
+  if (declared && /^\d+$/.test(declared) && Number(declared) > limits.maxFileBytes) {
+    return userdataError(c, 413, "userdata.too_large", tooLargeMessage(limits));
   }
 
   const body = await c.req.arrayBuffer();
-  if (body.byteLength > USERDATA_MAX_BYTES) {
-    return userdataError(c, 413, "userdata.too_large", USERDATA_TOO_LARGE_MESSAGE);
-  }
+  // Overwriting an existing save frees its bytes, so they are not charged
+  // twice -- otherwise a plain re-save of an unchanged workflow would fail
+  // at exactly 100% of quota.
+  const replaced = await c.env.STORE.head(key);
+  const rejected = await uploadRejection(c, user.uid, body.byteLength, {
+    tooLargeCode: "userdata.too_large",
+    replacingBytes: replaced?.size ?? 0,
+    limits,
+  });
+  if (rejected) return rejected;
 
   // PARITY NOTE: no file-vs-directory collision is possible here -- R2 has no
   // directories, so `userdata/<uid>/workflows` and

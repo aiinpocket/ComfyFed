@@ -2,7 +2,7 @@ import pytest
 from fastapi.testclient import TestClient
 
 from comfyfed_server import app as app_module
-from comfyfed_server import bootstrap
+from comfyfed_server import bootstrap, db
 
 
 @pytest.fixture()
@@ -168,6 +168,8 @@ def test_update_settings_writes_platform_url_and_lang(client):
         "platform_url": "https://fed.example",
         "lang": "zh-TW",
         "object_info_mode": "union",
+        "upload_max_file_mb": 50,
+        "upload_user_quota_gb": 5.0,
     }
 
     me = client.get("/api/auth/me").json()
@@ -214,7 +216,13 @@ def test_get_settings_reports_defaults_before_any_write(client):
     _csrf(client)
     r = client.get("/api/settings")
     assert r.status_code == 200
-    assert r.json() == {"platform_url": "http://h", "lang": "en", "object_info_mode": "union"}
+    assert r.json() == {
+        "platform_url": "http://h",
+        "lang": "en",
+        "object_info_mode": "union",
+        "upload_max_file_mb": 50,
+        "upload_user_quota_gb": 5.0,
+    }
 
 
 def test_get_settings_requires_login(client):
@@ -444,3 +452,78 @@ def test_migration_backfills_admin_user_from_settings_hash():
             ).fetchone()
             assert setting_row is None
         engine.dispose()
+
+
+# --- upload limits (`upload_max_file_mb` / `upload_user_quota_gb`) ----------
+#
+# Both are plain `settings` key-value rows (no migration), surfaced and
+# updated through the SAME admin endpoint as platform_url/lang. Parity twin:
+# cloud/test/settings.spec.ts.
+
+
+def test_get_settings_reports_upload_limit_defaults(client):
+    _csrf(client)
+    body = client.get("/api/settings").json()
+    assert body["upload_max_file_mb"] == 50
+    assert body["upload_user_quota_gb"] == 5.0
+
+
+def test_update_settings_writes_upload_limits(client):
+    csrf = _csrf(client)
+    r = client.post(
+        "/api/settings",
+        json={"upload_max_file_mb": 200, "upload_user_quota_gb": 12.5},
+        headers={"X-CSRF": csrf},
+    )
+    assert r.status_code == 200, r.text
+    assert r.json()["upload_max_file_mb"] == 200
+    assert r.json()["upload_user_quota_gb"] == 12.5
+
+    reread = client.get("/api/settings").json()
+    assert reread["upload_max_file_mb"] == 200
+    assert reread["upload_user_quota_gb"] == 12.5
+
+
+def test_update_settings_allows_a_fractional_quota(client):
+    csrf = _csrf(client)
+    r = client.post("/api/settings", json={"upload_user_quota_gb": 0.5}, headers={"X-CSRF": csrf})
+    assert r.status_code == 200, r.text
+    assert r.json()["upload_user_quota_gb"] == 0.5
+
+
+@pytest.mark.parametrize("value", [0, -1, 1025, 12.5])
+def test_update_settings_rejects_a_bad_max_file_mb(client, value):
+    csrf = _csrf(client)
+    r = client.post("/api/settings", json={"upload_max_file_mb": value}, headers={"X-CSRF": csrf})
+    assert r.status_code == 400, r.text
+    assert r.json()["error"]["code"] == "settings.bad_upload_max_file_mb"
+
+
+@pytest.mark.parametrize("value", [0, 0.05, 2048])
+def test_update_settings_rejects_a_bad_user_quota_gb(client, value):
+    csrf = _csrf(client)
+    r = client.post("/api/settings", json={"upload_user_quota_gb": value}, headers={"X-CSRF": csrf})
+    assert r.status_code == 400, r.text
+    assert r.json()["error"]["code"] == "settings.bad_upload_user_quota_gb"
+
+
+@pytest.mark.parametrize(
+    "raw_mb, raw_gb",
+    [("", ""), ("not-a-number", "nonsense"), ("0", "0"), ("99999", "99999"), (None, None)],
+)
+def test_settings_parse_a_bad_stored_row_back_to_the_default(client, raw_mb, raw_gb):
+    """A settings row is hand-editable (and a future stack may write the other
+    one's shape): anything unparseable or out of range must READ as the
+    default rather than raising deep inside an upload route."""
+    from comfyfed_server import limits
+
+    _csrf(client)
+    if raw_mb is not None:
+        with db.get_session() as session:
+            session.merge(db.Setting(key=limits.UPLOAD_MAX_FILE_MB_KEY, value=raw_mb))
+            session.merge(db.Setting(key=limits.UPLOAD_USER_QUOTA_GB_KEY, value=raw_gb))
+            session.commit()
+
+    body = client.get("/api/settings").json()
+    assert body["upload_max_file_mb"] == 50
+    assert body["upload_user_quota_gb"] == 5.0

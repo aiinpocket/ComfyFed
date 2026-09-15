@@ -51,15 +51,23 @@ function jsonResponse(body: unknown, status = 200): Response {
   });
 }
 
-function renderSettings() {
+function renderSettings(role: 'admin' | 'user' = 'user') {
   return render(
     <MantineProvider theme={theme}>
       <MemoryRouter>
-        <Settings platformUrl="https://example.test" role="user" />
+        <Settings platformUrl="https://example.test" role={role} />
       </MemoryRouter>
     </MantineProvider>,
   );
 }
+
+const SETTINGS_STATE = {
+  platform_url: 'https://example.test',
+  lang: 'en',
+  object_info_mode: 'union',
+  upload_max_file_mb: 50,
+  upload_user_quota_gb: 5,
+};
 
 describe('Settings page: my uploads card', () => {
   afterEach(() => {
@@ -136,5 +144,91 @@ describe('Settings page: my uploads card', () => {
 
     await waitFor(() => expect(screen.queryByText('reference.png')).not.toBeInTheDocument());
     expect(screen.getByText('mask.png')).toBeInTheDocument();
+  });
+});
+
+describe('Settings page: admin upload limits', () => {
+  afterEach(() => {
+    cleanup();
+    vi.unstubAllGlobals();
+  });
+
+  it('renders both limit fields seeded from GET /api/settings and saves them', async () => {
+    const posted: unknown[] = [];
+    const fetchMock = vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+      const url = typeof input === 'string' ? input : input.toString();
+      const method = init?.method ?? 'GET';
+      if (url === '/api/settings' && method === 'GET') return jsonResponse(SETTINGS_STATE);
+      if (url === '/api/settings' && method === 'POST') {
+        posted.push(JSON.parse(String(init?.body)));
+        return jsonResponse({ ...SETTINGS_STATE, upload_max_file_mb: 120, upload_user_quota_gb: 5 });
+      }
+      if (url === '/api/staging') {
+        return jsonResponse({ files: [], total_bytes: 0, quota_bytes: 0, userdata_bytes: 0 });
+      }
+      return jsonResponse({ error: { code: 'http_error', message: 'not stubbed' } }, 404);
+    });
+    vi.stubGlobal('fetch', fetchMock);
+
+    renderSettings('admin');
+
+    const maxFile = (await screen.findByLabelText('Max file size (MB)')) as HTMLInputElement;
+    const quota = screen.getByLabelText('Per-user storage quota (GB)') as HTMLInputElement;
+    await waitFor(() => expect(maxFile.value).toBe('50'));
+    expect(quota.value).toBe('5');
+
+    fireEvent.change(maxFile, { target: { value: '120' } });
+    // The platform-URL card has its own "Save" -- scope to this card's form.
+    const limitsForm = maxFile.closest('form') as HTMLFormElement;
+    fireEvent.click(within(limitsForm).getByRole('button', { name: 'Save' }));
+
+    await waitFor(() =>
+      expect(posted).toContainEqual({ upload_max_file_mb: 120, upload_user_quota_gb: 5 }),
+    );
+  });
+
+  it('hides the limits card from a non-admin', async () => {
+    const fetchMock = vi.fn(async (input: RequestInfo | URL) => {
+      const url = typeof input === 'string' ? input : input.toString();
+      if (url === '/api/staging') {
+        return jsonResponse({ files: [], total_bytes: 0, quota_bytes: 0, userdata_bytes: 0 });
+      }
+      return jsonResponse({ error: { code: 'http_error', message: 'not stubbed' } }, 404);
+    });
+    vi.stubGlobal('fetch', fetchMock);
+
+    renderSettings('user');
+
+    await screen.findByText('You have not uploaded any files yet.');
+    expect(screen.queryByLabelText('Max file size (MB)')).not.toBeInTheDocument();
+  });
+});
+
+describe('Settings page: uploads quota line', () => {
+  afterEach(() => {
+    cleanup();
+    vi.unstubAllGlobals();
+  });
+
+  it('shows used-of-quota and a progress bar over staging + userdata', async () => {
+    const fetchMock = vi.fn(async (input: RequestInfo | URL) => {
+      const url = typeof input === 'string' ? input : input.toString();
+      if (url === '/api/staging') {
+        return jsonResponse({
+          files: [REF_PNG],
+          total_bytes: 2048,
+          userdata_bytes: 1024,
+          quota_bytes: 1024 * 1024 * 10,
+        });
+      }
+      return jsonResponse({ error: { code: 'http_error', message: 'not stubbed' } }, 404);
+    });
+    vi.stubGlobal('fetch', fetchMock);
+
+    renderSettings('user');
+
+    // 2 KB staging + 1 KB userdata against a 10 MB quota.
+    expect(await screen.findByText('Used 3 KB of 10 MB')).toBeInTheDocument();
+    expect(screen.getByLabelText('Storage usage')).toBeInTheDocument();
   });
 });

@@ -864,3 +864,55 @@ describe("Phase 3.0: two-user job ownership scoping", () => {
     expect(row.user_id).toBe(alice.uid);
   });
 });
+
+// ---------------------------------------------------------------------------
+// Console job assets vs the configured per-file cap. Parity twin:
+// tests/server/test_jobs.py's upload-limit block.
+
+describe("POST /api/jobs upload limits", () => {
+  it("413s an asset over the configured per-file cap, before creating the job", async () => {
+    const { cookie, csrf } = await adminSession();
+    const limitsSet = await call("/api/settings", {
+      json: { upload_max_file_mb: 1 },
+      cookie,
+      headers: { "X-CSRF": csrf },
+    });
+    expect(limitsSet.status).toBe(200);
+
+    const workflow = { "1": { class_type: "LoadImage", inputs: { image: "photo.png" } } };
+    const r = await submitJob(cookie, csrf, workflow, {
+      assets: [{ filename: "photo.png", content: "x".repeat(1024 * 1024 + 1) }],
+    });
+    expect(r.status).toBe(413);
+    expect(r.body.error.code).toBe("jobs.asset_too_large");
+    expect(r.body.error.message).toContain("1 MB 單檔上限");
+    expect(r.body.error.message).toContain("1 MB per-file upload limit");
+
+    const rows = await db().prepare("SELECT COUNT(*) AS n FROM jobs").first<any>();
+    expect(rows.n).toBe(0);
+
+    const ok = await submitJob(cookie, csrf, workflow, {
+      assets: [{ filename: "photo.png", content: "x".repeat(1024 * 1024) }],
+    });
+    expect(ok.status).toBe(200);
+  });
+
+  it("does not charge job assets against the per-user storage quota", async () => {
+    // `job_inputs/` is job-scoped result storage: a user at 100% of their
+    // personal quota can still submit work.
+    const { cookie, csrf } = await adminSession();
+    expect(
+      (await call("/api/settings", { json: { upload_user_quota_gb: 0.1 }, cookie, headers: { "X-CSRF": csrf } })).status
+    ).toBe(200);
+    const uid = (await db().prepare("SELECT id FROM users WHERE username = 'admin'").first<any>()).id;
+    const key = `staging/${uid}/full.bin`;
+    await (env as any).STORE.put(key, new Uint8Array(100 * 1024 * 1024).fill(122));
+    try {
+      const workflow = { "1": { class_type: "LoadImage", inputs: { image: "photo.png" } } };
+      const r = await submitJob(cookie, csrf, workflow, { assets: [{ filename: "photo.png", content: "pixels" }] });
+      expect(r.status).toBe(200);
+    } finally {
+      await (env as any).STORE.delete(key);
+    }
+  });
+});

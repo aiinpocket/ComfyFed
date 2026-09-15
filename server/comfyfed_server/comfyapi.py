@@ -72,7 +72,19 @@ from fastapi import (
 )
 from fastapi.responses import FileResponse, JSONResponse, Response
 
-from . import agentws, assess, auth, db, jobs, model_guide, model_manifest, panelws, storage, workers
+from . import (
+    agentws,
+    assess,
+    auth,
+    db,
+    jobs,
+    limits,
+    model_guide,
+    model_manifest,
+    panelws,
+    storage,
+    workers,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -138,11 +150,11 @@ _STAGING_DIRNAME = "comfy_staging"
 # another user's saved workflows.
 _USERDATA_DIRNAME = "comfy_userdata"
 
-# Per-file ceiling for anything written through `/userdata`. A workflow JSON
-# is a few hundred KB at the very worst; this is generous enough that no real
-# panel save is ever refused, while keeping the tree from becoming an
-# unbounded personal file host (nothing ever prunes it).
-_USERDATA_MAX_BYTES = 5 * 1024 * 1024
+# The per-file ceiling and the per-user storage quota are no longer constants
+# here: both are admin-configurable platform settings (`upload_max_file_mb`,
+# default 50, and `upload_user_quota_gb`, default 5), read through
+# `limits.read_limits` on every write. See limits.py for the parse, the
+# bounds, and why job artifacts/inputs are outside the quota.
 
 # Reserved pseudo-uid for the packaged template sample assets
 # (`templates.seed_staging`), namespaced alongside real per-user staging
@@ -246,6 +258,48 @@ def _safe_userdata_subdir(value: str) -> str:
 def _userdata_path(data_dir: str, uid: str, relpath: str) -> str:
     """Absolute filesystem path for an ALREADY-sanitized relative path."""
     return os.path.join(userdata_dir(data_dir, uid), *relpath.split("/")) if relpath else userdata_dir(data_dir, uid)
+
+
+def _limit_error(status: int, code: str, message: str) -> JSONResponse:
+    """ComfyFed's bilingual error envelope as a plain `JSONResponse`.
+
+    Module-level (not a closure inside `create_router`) because every upload
+    surface -- the ComfyUI-compatible `/upload/image` and `/userdata` routes
+    here, which must not raise `HTTPException` through the app-wide handler,
+    plus the guard below -- renders the same shape.
+    """
+    return JSONResponse(status_code=status, content={"error": {"code": code, "message": message}})
+
+
+def upload_rejection(
+    data_dir: str,
+    uid: str,
+    incoming_bytes: int,
+    *,
+    too_large_code: str,
+    replacing_bytes: int = 0,
+    upload_limits: Optional[limits.UploadLimits] = None,
+) -> Optional[JSONResponse]:
+    """The 413 to return for this write, or `None` if it may proceed.
+
+    ONE definition of "is this upload allowed", shared by every route that
+    accepts user bytes (panel userdata save, panel staging upload, console
+    job-asset upload) rather than re-implemented per route: first the
+    per-file cap, then the per-user quota over staging + userdata.
+
+    `too_large_code` is the only per-route difference -- each surface keeps
+    the error code its own clients already recognise; the quota refusal is
+    `limits.QUOTA_EXCEEDED_CODE` everywhere.
+    """
+    resolved = upload_limits if upload_limits is not None else limits.read_limits()
+    if limits.file_cap_exceeded(incoming_bytes, resolved):
+        return _limit_error(413, too_large_code, limits.too_large_message(resolved))
+    over = limits.quota_rejection(
+        data_dir, uid, incoming_bytes, resolved, replacing_bytes=replacing_bytes
+    )
+    if over is not None:
+        return _limit_error(413, limits.QUOTA_EXCEEDED_CODE, over)
+    return None
 
 
 def _userdata_info(path: str, rel: str) -> dict:
@@ -1029,9 +1083,25 @@ def create_router(
             return Response(status_code=400)
 
         staging = staging_dir(data_dir, user.uid)
-        os.makedirs(staging, exist_ok=True)
+        dest = os.path.join(staging, filename)
         content = await image.read()
-        with open(os.path.join(staging, filename), "wb") as f:
+        # Same per-file cap and per-user quota the `/userdata` save enforces:
+        # this route had NO limit at all, so the staging area was the way
+        # around the other one. No `Content-Length` short-circuit here --
+        # Starlette has already parsed the whole multipart body into
+        # `image` before this handler runs, so there is nothing left to
+        # avoid reading.
+        rejection = upload_rejection(
+            data_dir,
+            user.uid,
+            len(content),
+            too_large_code="upload.too_large",
+            replacing_bytes=limits.file_size(dest),
+        )
+        if rejection is not None:
+            return rejection
+        os.makedirs(staging, exist_ok=True)
+        with open(dest, "wb") as f:
             f.write(content)
 
         return JSONResponse(content={"name": filename, "subfolder": "", "type": "input"})
@@ -1378,11 +1448,7 @@ def create_router(
         # frontend snippets quoted above), so the body is free to be
         # ComfyFed's own bilingual error envelope -- which is what a human
         # reading a failed request in devtools actually needs.
-        return JSONResponse(status_code=status, content={"error": {"code": code, "message": message}})
-
-    _TOO_LARGE_MESSAGE = (
-        "檔案超過 5 MB 上限，無法儲存。 / File exceeds the 5 MB userdata limit."
-    )
+        return _limit_error(status, code, message)
 
     # A userdata path can name a FILE on one request and a DIRECTORY on the
     # next (`workflows` saved as a file, then `workflows/a.json`): on a real
@@ -1587,13 +1653,27 @@ def create_router(
         # lying or absent `Content-Length` must never be a way past the cap,
         # so the header check is an extra, cheaper rejection and never a
         # substitute for measuring the real bytes.
+        upload_limits = limits.read_limits()
         declared = request.headers.get("content-length")
-        if declared and declared.isdigit() and int(declared) > _USERDATA_MAX_BYTES:
-            return _userdata_error(413, "userdata.too_large", _TOO_LARGE_MESSAGE)
+        if declared and declared.isdigit() and int(declared) > upload_limits.max_file_bytes:
+            return _userdata_error(
+                413, "userdata.too_large", limits.too_large_message(upload_limits)
+            )
 
         body = await request.body()
-        if len(body) > _USERDATA_MAX_BYTES:
-            return _userdata_error(413, "userdata.too_large", _TOO_LARGE_MESSAGE)
+        # Overwriting an existing save frees its bytes, so they are not
+        # charged twice -- `replacing_bytes` keeps a plain re-save of an
+        # unchanged workflow from failing at exactly 100% of quota.
+        rejection = upload_rejection(
+            data_dir,
+            user.uid,
+            len(body),
+            too_large_code="userdata.too_large",
+            replacing_bytes=limits.file_size(path),
+            upload_limits=upload_limits,
+        )
+        if rejection is not None:
+            return rejection
 
         # Write to a sibling temp file and `os.replace` it into place (the
         # same idiom as `workers._write_object_info`): `open(path, "wb")`
@@ -1828,7 +1908,19 @@ def create_staging_router(data_dir: str) -> APIRouter:
                 continue
             files.append({"name": name, "size": stat.st_size, "modified": stat.st_mtime})
             total += stat.st_size
-        return {"files": files, "total_bytes": total}
+        # Additive fields only -- `files`/`total_bytes` keep their meaning
+        # (this listing's own staging files) so an older console still works.
+        # `userdata_bytes` is the OTHER half of what the quota counts, so the
+        # console can show "used (staging + userdata) of quota" without a
+        # second endpoint. Job artifacts/outputs are excluded from both: they
+        # are results, not the user's own kept files (see limits.py).
+        upload_limits = limits.read_limits()
+        return {
+            "files": files,
+            "total_bytes": total,
+            "quota_bytes": upload_limits.quota_bytes,
+            "userdata_bytes": limits.dir_bytes(userdata_dir(data_dir, user.uid)),
+        }
 
     @r.delete("/api/staging/{filename}")
     def delete_staging(

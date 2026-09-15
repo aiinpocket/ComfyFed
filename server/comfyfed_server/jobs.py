@@ -10,10 +10,30 @@ from typing import Optional
 from fastapi import APIRouter, Depends, File, Form, HTTPException, Request, UploadFile
 from fastapi.responses import FileResponse, JSONResponse
 
-from . import agentws, assess, auth, db, dispatch, model_guide, model_manifest, storage
+from . import agentws, assess, auth, db, dispatch, limits, model_guide, model_manifest, storage
 from .workers import verify_agent
 
 _JOB_INPUTS_DIRNAME = "job_inputs"
+
+
+def _upload_size(upload: UploadFile) -> int:
+    """Bytes in a multipart upload, without reading it into memory.
+
+    Starlette sets `UploadFile.size` from the multipart parser, but only on
+    versions that carry it -- the seek/tell fallback keeps the size check
+    honest (rather than silently passing) on any version that does not.
+    """
+    size = getattr(upload, "size", None)
+    if isinstance(size, int):
+        return size
+    try:
+        position = upload.file.tell()
+        upload.file.seek(0, os.SEEK_END)
+        measured = upload.file.tell()
+        upload.file.seek(position)
+        return measured
+    except (OSError, ValueError, AttributeError):
+        return 0
 
 
 def _error(status_code: int, code: str, message: str = "") -> HTTPException:
@@ -248,6 +268,14 @@ def create_router(data_dir: str) -> APIRouter:
                 raise _error(400, "jobs.invalid_workflow", "requirements is not valid JSON.")
 
         uploaded_names = []
+        # Same admin-configured per-file cap the panel's uploads obey
+        # (`upload_max_file_mb`, default 50) -- an asset submitted with a job
+        # is user bytes like any other, and this route had no ceiling at all.
+        # Checked BEFORE the job row is inserted, so a refused submit leaves
+        # nothing behind. The per-user QUOTA deliberately does not apply here:
+        # these bytes land in `job_inputs/<job_id>/`, which (like artifacts)
+        # is job-scoped result storage outside the quota -- see limits.py.
+        upload_limits = limits.read_limits()
         for upload in assets:
             try:
                 filename = storage.sanitize_path_component(
@@ -255,6 +283,10 @@ def create_router(data_dir: str) -> APIRouter:
                 )
             except ValueError:
                 raise _error(400, "jobs.bad_asset_name", f"Invalid asset filename: {upload.filename!r}")
+            if limits.file_cap_exceeded(_upload_size(upload), upload_limits):
+                raise _error(
+                    413, "jobs.asset_too_large", limits.too_large_message(upload_limits)
+                )
             uploaded_names.append(filename)
 
         needs = assess.extract(workflow)

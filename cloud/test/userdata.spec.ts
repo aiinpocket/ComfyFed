@@ -16,7 +16,8 @@ afterEach(async () => {
   await db().prepare("DELETE FROM settings").run();
   await db().prepare("DELETE FROM users").run();
   await db().prepare("DELETE FROM login_attempts").run();
-  for (const prefix of ["userdata/"]) {
+  // `staging/` too: the quota tests below prove both namespaces are counted.
+  for (const prefix of ["userdata/", "staging/"]) {
     const listed = await store().list({ prefix });
     await Promise.all(listed.objects.map((o) => store().delete(o.key)));
   }
@@ -42,6 +43,20 @@ async function userSession(
   });
   const login = await call("/api/auth/login", { json: { username, password } });
   return { cookie: login.setCookie, csrf: login.body.csrf };
+}
+
+/** Admin-set upload limits (`upload_max_file_mb` / `upload_user_quota_gb`),
+ * the settings the cap and the quota are read from on every write. */
+async function setLimits(
+  admin: { cookie: string | null; csrf: string },
+  values: Record<string, number>
+): Promise<void> {
+  const r = await call("/api/settings", {
+    json: values,
+    cookie: admin.cookie,
+    headers: { "X-CSRF": admin.csrf },
+  });
+  expect(r.status).toBe(200);
 }
 
 const WORKFLOW = { "1": { class_type: "KSampler", inputs: { seed: 1 } } };
@@ -171,21 +186,24 @@ describe("/comfy/api/userdata", () => {
     expect(badDir.status).toBe(400);
   });
 
-  it("rejects a userdata file over 5 MB", async () => {
+  it("rejects a userdata file over the configured per-file cap", async () => {
+    // The cap is the CONFIGURED `upload_max_file_mb`, not a hardcoded
+    // ceiling -- lowered to 1 MB here so the test need not push 50 MB.
     const admin = await loginSession();
+    await setLimits(admin, { upload_max_file_mb: 1 });
     const big = await call("/comfy/api/userdata/workflows%2Fbig.json", {
       method: "POST",
       cookie: admin.cookie,
-      rawBody: new Uint8Array(5 * 1024 * 1024 + 1).fill(120),
+      rawBody: new Uint8Array(1024 * 1024 + 1).fill(120),
     });
     expect(big.status).toBe(413);
     expect(big.body.error.code).toBe("userdata.too_large");
-    expect(big.body.error.message).toContain("5 MB");
+    expect(big.body.error.message).toContain("1 MB");
 
     const ok = await call("/comfy/api/userdata/workflows%2Fok.json", {
       method: "POST",
       cookie: admin.cookie,
-      rawBody: new Uint8Array(5 * 1024 * 1024).fill(121),
+      rawBody: new Uint8Array(1024 * 1024).fill(121),
     });
     expect(ok.status).toBe(200);
   });
@@ -318,5 +336,62 @@ describe("/comfy/api/userdata", () => {
 
     // ... and an admin gets no override view either.
     expect((await call("/comfy/api/userdata/workflows%2Fsecret.json", { method: "GET", cookie: admin.cookie })).status).toBe(404);
+  });
+});
+
+// --- per-user storage quota --------------------------------------------------
+//
+// Parity twin: tests/server/test_userdata.py's quota block.
+
+describe("userdata and the per-user storage quota", () => {
+  it("refuses a save that would exceed the quota, bilingually", async () => {
+    const admin = await loginSession();
+    await setLimits(admin, { upload_user_quota_gb: 0.1, upload_max_file_mb: 50 });
+    const half = new Uint8Array(50 * 1024 * 1024).fill(97);
+    for (const name of ["w%2Fa.json", "w%2Fb.json"]) {
+      const r = await call(`/comfy/api/userdata/${name}`, { method: "POST", cookie: admin.cookie, rawBody: half });
+      expect(r.status).toBe(200);
+    }
+
+    const over = await call("/comfy/api/userdata/w%2Fc.json", {
+      method: "POST",
+      cookie: admin.cookie,
+      rawBody: new Uint8Array(3 * 1024 * 1024).fill(99),
+    });
+    expect(over.status).toBe(413);
+    expect(over.body.error.code).toBe("quota_exceeded");
+    expect(over.body.error.message).toContain("儲存空間不足（已用 100 MB / 配額 102.4 MB）");
+    expect(over.body.error.message).toContain("Storage quota exceeded (used 100 MB of 102.4 MB)");
+
+    // Nothing landed.
+    const gone = await call("/comfy/api/userdata/w%2Fc.json", { method: "GET", cookie: admin.cookie });
+    expect(gone.status).toBe(404);
+  });
+
+  it("lets a re-save of the same path through at full quota", async () => {
+    const admin = await loginSession();
+    await setLimits(admin, { upload_user_quota_gb: 0.1 });
+    const half = new Uint8Array(50 * 1024 * 1024).fill(97);
+    expect((await call("/comfy/api/userdata/w%2Fa.json", { method: "POST", cookie: admin.cookie, rawBody: half })).status).toBe(200);
+    expect((await call("/comfy/api/userdata/w%2Fb.json", { method: "POST", cookie: admin.cookie, rawBody: half })).status).toBe(200);
+    // Overwriting frees the bytes it replaces, so this must not 413.
+    expect((await call("/comfy/api/userdata/w%2Fa.json", { method: "POST", cookie: admin.cookie, rawBody: half })).status).toBe(200);
+  });
+
+  it("applies the configured cap to a move as well as a save", async () => {
+    const admin = await loginSession();
+    await setLimits(admin, { upload_max_file_mb: 2 });
+    const body = new Uint8Array(1536 * 1024).fill(98); // 1.5 MB
+    expect((await call("/comfy/api/userdata/w%2Fbig.json", { method: "POST", cookie: admin.cookie, rawBody: body })).status).toBe(200);
+
+    // Lower the cap under the stored object, then try to move it.
+    await setLimits(admin, { upload_max_file_mb: 1 });
+    const moved = await call("/comfy/api/userdata/w%2Fbig.json/move/w%2Fbigger.json", {
+      method: "POST",
+      cookie: admin.cookie,
+    });
+    expect(moved.status).toBe(413);
+    expect(moved.body.error.code).toBe("userdata.too_large");
+    expect(moved.body.error.message).toContain("1 MB");
   });
 });

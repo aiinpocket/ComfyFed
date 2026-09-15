@@ -19,7 +19,7 @@ from fastapi import APIRouter, Cookie, Depends, Header, HTTPException, Response
 from itsdangerous import BadSignature, SignatureExpired, URLSafeTimedSerializer
 from pydantic import BaseModel
 
-from . import db, panelws, security
+from . import db, limits, panelws, security
 
 _SESSION_SECRET_KEY = "session_secret"
 _LANG_KEY = "lang"
@@ -403,16 +403,27 @@ class SettingsBody(BaseModel):
     platform_url: Optional[str] = None
     lang: Optional[str] = None
     object_info_mode: Optional[str] = None
+    # Accepted as `float` for both so a JSON `50.0` (what a number input may
+    # serialise) is not a 422 before the route's own range check can answer
+    # the bilingual 400 -- `upload_max_file_mb` is then narrowed to an int.
+    upload_max_file_mb: Optional[float] = None
+    upload_user_quota_gb: Optional[float] = None
 
 
 settings_router = APIRouter()
 
 
 def _current_settings(db_session) -> dict:
+    # Both upload limits go through `limits.read_limits`'s DEFENSIVE parse
+    # rather than being read raw: a hand-edited or out-of-range row must
+    # report (and be enforced as) the default, never as itself.
+    upload_limits = limits.read_limits(db_session)
     return {
         "platform_url": _get_setting(db_session, _PLATFORM_URL_KEY) or "",
         "lang": _get_setting(db_session, _LANG_KEY) or "en",
         "object_info_mode": _get_setting(db_session, _OBJECT_INFO_MODE_KEY) or _DEFAULT_OBJECT_INFO_MODE,
+        "upload_max_file_mb": upload_limits.max_file_mb,
+        "upload_user_quota_gb": upload_limits.quota_gb,
     }
 
 
@@ -473,6 +484,40 @@ def update_settings(
                 "object_info_mode 必須是 union 或 intersection 其中之一。",
             )
         updates[_OBJECT_INFO_MODE_KEY] = body.object_info_mode
+
+    # The two upload limits are validated STRICTLY here (an admin typing an
+    # out-of-range number deserves to be told) even though every read of them
+    # parses defensively -- the lenient parse exists for rows that were not
+    # written through this endpoint.
+    if body.upload_max_file_mb is not None:
+        mb = int(body.upload_max_file_mb)
+        if (
+            mb != body.upload_max_file_mb
+            or mb < limits.MIN_UPLOAD_MAX_FILE_MB
+            or mb > limits.MAX_UPLOAD_MAX_FILE_MB
+        ):
+            raise _error(
+                400,
+                "settings.bad_upload_max_file_mb",
+                f"單檔上限必須是 {limits.MIN_UPLOAD_MAX_FILE_MB}–{limits.MAX_UPLOAD_MAX_FILE_MB} 之間的整數 MB。"
+                f" / Max file size must be a whole number of MB between "
+                f"{limits.MIN_UPLOAD_MAX_FILE_MB} and {limits.MAX_UPLOAD_MAX_FILE_MB}.",
+            )
+        updates[limits.UPLOAD_MAX_FILE_MB_KEY] = str(mb)
+
+    if body.upload_user_quota_gb is not None:
+        gb = float(body.upload_user_quota_gb)
+        if gb != gb or gb < limits.MIN_UPLOAD_USER_QUOTA_GB or gb > limits.MAX_UPLOAD_USER_QUOTA_GB:
+            raise _error(
+                400,
+                "settings.bad_upload_user_quota_gb",
+                f"每人儲存配額必須介於 {limits.MIN_UPLOAD_USER_QUOTA_GB} 與 {limits.MAX_UPLOAD_USER_QUOTA_GB} GB 之間。"
+                f" / Per-user storage quota must be between "
+                f"{limits.MIN_UPLOAD_USER_QUOTA_GB} and {limits.MAX_UPLOAD_USER_QUOTA_GB} GB.",
+            )
+        # Stored as a plain decimal string; both stacks' parsers accept
+        # whatever the other writes ("5" and "5.0" alike).
+        updates[limits.UPLOAD_USER_QUOTA_GB_KEY] = repr(gb)
 
     with db.get_session() as db_session:
         for key, value in updates.items():

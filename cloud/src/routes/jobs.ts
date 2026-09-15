@@ -40,6 +40,7 @@ import type { Job, Receipt } from "../db/queries";
 import { extract, estimateVram, needsFromJob, verdict, fleetWideGaps, partitionFleetFetchable, type JobNeeds, type FetchableModels } from "../core/assess";
 import { peerOnlyNames } from "../core/model_manifest";
 import { sanitizePathComponentOrThrow, artifactKey, jobInputKey } from "../lib/store";
+import { fileCapExceeded, readLimits, tooLargeMessage } from "../lib/limits";
 import { verifyAgentRequest, type VerifyAgentResult } from "../lib/verify_agent";
 import { requireUser, requireCsrfUser, errorJson, SESSION_VAR } from "../lib/guard";
 import { bytesToBase64Url } from "../lib/base64";
@@ -289,11 +290,22 @@ app.post("/api/jobs", requireCsrfUser, async (c) => {
       : [];
 
   const uploadedNames: string[] = [];
+  // Same admin-configured per-file cap the panel's uploads obey
+  // (`upload_max_file_mb`, default 50) -- an asset submitted with a job is
+  // user bytes like any other, and this route had no ceiling at all. Checked
+  // BEFORE the job row is inserted, so a refused submit leaves nothing
+  // behind. The per-user QUOTA deliberately does not apply here: these bytes
+  // land in `job_inputs/<job_id>/`, job-scoped result storage outside the
+  // quota, exactly like artifacts (see lib/limits.ts).
+  const uploadLimits = await readLimits(c.env.DB);
   for (const file of assetFiles) {
     try {
       uploadedNames.push(sanitizePathComponentOrThrow(file.name || "", "asset filename"));
     } catch {
       return errorJson(c, 400, "jobs.bad_asset_name", `Invalid asset filename: ${JSON.stringify(file.name ?? "")}`);
+    }
+    if (fileCapExceeded(file.size, uploadLimits)) {
+      return errorJson(c, 413, "jobs.asset_too_large", tooLargeMessage(uploadLimits));
     }
   }
 

@@ -339,12 +339,18 @@ export interface SettingsUpdate {
   platform_url?: string;
   lang?: string;
   object_info_mode?: ObjectInfoMode;
+  /** Admin-only: per-file upload ceiling in MB (integer, 1-1024). */
+  upload_max_file_mb?: number;
+  /** Admin-only: per-user storage quota in GB (decimals allowed, 0.1-1024). */
+  upload_user_quota_gb?: number;
 }
 
 export interface SettingsState {
   platform_url: string;
   lang: string;
   object_info_mode: ObjectInfoMode | string;
+  upload_max_file_mb: number;
+  upload_user_quota_gb: number;
 }
 
 /** One file the caller uploaded into their own panel staging area
@@ -357,7 +363,13 @@ export interface StagingFile {
 
 export interface StagingListing {
   files: StagingFile[];
+  /** Bytes in the caller's staging namespace (the `files` above). */
   total_bytes: number;
+  /** The configured per-user storage quota, in bytes. */
+  quota_bytes: number;
+  /** The OTHER half of what the quota counts: the caller's saved panel files
+   * (workflows, presets). Job artifacts/outputs count toward neither. */
+  userdata_bytes: number;
 }
 
 /* -------------------------------------------------------------- endpoints */

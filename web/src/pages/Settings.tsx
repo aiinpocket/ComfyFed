@@ -5,7 +5,9 @@ import {
   CopyButton,
   Group,
   Modal,
+  NumberInput,
   PasswordInput,
+  Progress,
   SegmentedControl,
   SimpleGrid,
   Stack,
@@ -20,6 +22,7 @@ import {
   IconCopy,
   IconDeviceFloppy,
   IconKey,
+  IconDatabase,
   IconPhoto,
   IconRefresh,
   IconTrash,
@@ -64,6 +67,13 @@ export function Settings({ platformUrl, role }: SettingsProps) {
   const [objectInfoMode, setObjectInfoMode] = useState<ObjectInfoMode | null>(null);
   const [savingObjectInfoMode, setSavingObjectInfoMode] = useState(false);
 
+  // Admin-configurable upload limits. Same GET /api/settings read as
+  // `object_info_mode` above -- kept as strings while editing so a
+  // half-typed "1." does not snap back under the admin's cursor.
+  const [maxFileMb, setMaxFileMb] = useState<string | number>('');
+  const [quotaGb, setQuotaGb] = useState<string | number>('');
+  const [savingUploadLimits, setSavingUploadLimits] = useState(false);
+
   useEffect(() => {
     setSavedUrl(platformUrl);
     setUrlDraft(platformUrl);
@@ -75,7 +85,10 @@ export function Settings({ platformUrl, role }: SettingsProps) {
     api
       .getSettings()
       .then((settings) => {
-        if (!cancelled) setObjectInfoMode(settings.object_info_mode as ObjectInfoMode);
+        if (cancelled) return;
+        setObjectInfoMode(settings.object_info_mode as ObjectInfoMode);
+        setMaxFileMb(settings.upload_max_file_mb);
+        setQuotaGb(settings.upload_user_quota_gb);
       })
       .catch(() => {
         /* left null; the segmented control below just won't render yet */
@@ -90,6 +103,10 @@ export function Settings({ platformUrl, role }: SettingsProps) {
   // cross-user view of anyone's uploads on either stack.
   const [uploads, setUploads] = useState<StagingFile[]>([]);
   const [uploadsTotal, setUploadsTotal] = useState(0);
+  // Usage vs quota. `total_bytes` is staging alone; the quota counts the
+  // caller's saved panel files too, so the bar shows their sum.
+  const [uploadsUserdata, setUploadsUserdata] = useState(0);
+  const [uploadsQuota, setUploadsQuota] = useState(0);
   const [uploadsLoaded, setUploadsLoaded] = useState(false);
   const [uploadsBusy, setUploadsBusy] = useState(false);
   const [deleteTarget, setDeleteTarget] = useState<StagingFile | null>(null);
@@ -116,6 +133,8 @@ export function Settings({ platformUrl, role }: SettingsProps) {
         const listing = await api.listStaging();
         setUploads(listing.files);
         setUploadsTotal(listing.total_bytes);
+        setUploadsUserdata(listing.userdata_bytes ?? 0);
+        setUploadsQuota(listing.quota_bytes ?? 0);
         setUploadsLoaded(true);
       } catch (caught) {
         if (notifyOnFailure) notifyFailure(t('settings.uploads_load_failed'), caught);
@@ -186,6 +205,36 @@ export function Settings({ platformUrl, role }: SettingsProps) {
       notifyFailure(t('settings.language_save_failed'), caught);
     } finally {
       setSavingLang(false);
+    }
+  };
+
+  const saveUploadLimits = async (event: React.FormEvent) => {
+    event.preventDefault();
+    if (savingUploadLimits) return;
+    const mb = Number(maxFileMb);
+    const gb = Number(quotaGb);
+    if (!Number.isFinite(mb) || !Number.isFinite(gb)) return;
+    setSavingUploadLimits(true);
+    try {
+      const result = await api.updateSettings({
+        upload_max_file_mb: mb,
+        upload_user_quota_gb: gb,
+      });
+      setMaxFileMb(result.upload_max_file_mb);
+      setQuotaGb(result.upload_user_quota_gb);
+      notifications.show({
+        color: 'teal',
+        icon: <IconCheck size={16} />,
+        title: t('settings.upload_limits_saved'),
+        message: t('settings.upload_limits_saved_hint'),
+      });
+      // The uploads card below quotes the quota -- refresh it so the bar and
+      // the new ceiling agree immediately.
+      await loadUploads(false);
+    } catch (caught) {
+      notifyFailure(t('settings.upload_limits_save_failed'), caught);
+    } finally {
+      setSavingUploadLimits(false);
     }
   };
 
@@ -364,6 +413,54 @@ export function Settings({ platformUrl, role }: SettingsProps) {
           </Card>
           )}
 
+          {isAdmin && (
+          <Card style={cardStyle}>
+            <form onSubmit={saveUploadLimits}>
+              <Stack gap="sm">
+                <Group gap="xs">
+                  <IconDatabase size={17} />
+                  <Text fw={600}>{t('settings.upload_limits_heading')}</Text>
+                </Group>
+                <Text size="sm" c="dimmed">
+                  {t('settings.upload_limits_hint')}
+                </Text>
+                <NumberInput
+                  label={t('settings.upload_max_file_mb')}
+                  description={t('settings.upload_max_file_mb_hint')}
+                  value={maxFileMb}
+                  onChange={setMaxFileMb}
+                  min={1}
+                  max={1024}
+                  step={1}
+                  allowDecimal={false}
+                  allowNegative={false}
+                />
+                <NumberInput
+                  label={t('settings.upload_user_quota_gb')}
+                  description={t('settings.upload_user_quota_gb_hint')}
+                  value={quotaGb}
+                  onChange={setQuotaGb}
+                  min={0.1}
+                  max={1024}
+                  step={0.5}
+                  decimalScale={2}
+                  allowNegative={false}
+                />
+                <Group justify="flex-end">
+                  <Button
+                    type="submit"
+                    size="compact-sm"
+                    leftSection={<IconDeviceFloppy size={15} />}
+                    loading={savingUploadLimits}
+                  >
+                    {t('common.save')}
+                  </Button>
+                </Group>
+              </Stack>
+            </form>
+          </Card>
+          )}
+
           <Card style={cardStyle}>
             <Stack gap="sm">
               <Text fw={600}>{t('settings.language_heading')}</Text>
@@ -404,6 +501,33 @@ export function Settings({ platformUrl, role }: SettingsProps) {
               <Text size="sm" c="dimmed">
                 {t('settings.uploads_hint')}
               </Text>
+
+              {uploadsQuota > 0 && (
+                <Stack gap={4}>
+                  <Group justify="space-between" gap="xs">
+                    <Text size="xs" c="dimmed">
+                      {t('settings.uploads_quota', {
+                        used: formatBytes(uploadsTotal + uploadsUserdata),
+                        quota: formatBytes(uploadsQuota),
+                      })}
+                    </Text>
+                    <Text size="xs" c="dimmed">
+                      {Math.min(
+                        100,
+                        Math.round(((uploadsTotal + uploadsUserdata) / uploadsQuota) * 100),
+                      )}
+                      %
+                    </Text>
+                  </Group>
+                  <Progress
+                    aria-label={t('settings.uploads_quota_bar')}
+                    value={Math.min(100, ((uploadsTotal + uploadsUserdata) / uploadsQuota) * 100)}
+                    color={
+                      (uploadsTotal + uploadsUserdata) / uploadsQuota >= 0.9 ? 'red' : undefined
+                    }
+                  />
+                </Stack>
+              )}
 
               {uploadsLoaded && uploads.length === 0 && (
                 <Text size="sm" c="dimmed">
