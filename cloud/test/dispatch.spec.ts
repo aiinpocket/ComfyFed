@@ -672,6 +672,28 @@ describe("Phase 3.3 scheduler semantics", () => {
     expect(assignments.map((a) => a.job.id)).toEqual([old]);
   });
 
+  it("still dispatches when the warm_models write fails", async () => {
+    // claim 已經 commit 了，所以 warm_models 寫失敗絕不能讓 job 卡在
+    // `assigned` 卻沒人收到 `job` frame（只能等 90 秒後的 requeueStale），
+    // 也不能吃掉本 tick 剩下的配對。把欄位改名讓那個 UPDATE 真的丟例外 --
+    // 比 mock 掉 queries 模組更貼近真實失敗。
+    const workerId = await makeWorker("w1", { dynamic: { free_vram_gb: 24 } });
+    const jobId = await makeSignedJob(uniqueId("j"));
+
+    await db().prepare("ALTER TABLE workers RENAME COLUMN warm_models TO warm_models_broken").run();
+    let assignments: dispatch.Assignment[];
+    try {
+      assignments = await dispatch.assignJobs(db(), [workerId]);
+    } finally {
+      await db().prepare("ALTER TABLE workers RENAME COLUMN warm_models_broken TO warm_models").run();
+    }
+
+    expect(assignments.map((a) => [a.workerId, a.job.id])).toEqual([[workerId, jobId]]);
+    const job = await getJobRow(jobId);
+    expect(job.status).toBe("assigned");
+    expect(job.worker_id).toBe(workerId);
+  });
+
   it("never dispatches a parent job", async () => {
     const workerId = await makeWorker("w1", { dynamic: { free_vram_gb: 24 } });
     await makeSignedJob(uniqueId("j_parent"), { splitCount: 2 });

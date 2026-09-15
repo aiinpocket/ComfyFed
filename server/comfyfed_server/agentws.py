@@ -1200,10 +1200,9 @@ def _record_job_stats(
         with db.get_session() as session:
             job = session.get(db.Job, job_id)
             signature = job.signature if job is not None else None
+        stats.record_completion(worker_id, signature, exec_seconds)
     except Exception:
-        logger.exception("agentws: failed to read signature for job %s", job_id)
-        return
-    stats.record_completion(worker_id, signature, exec_seconds)
+        logger.exception("agentws: failed to record stats for job %s", job_id)
 
 
 async def _create_and_push_receipt(

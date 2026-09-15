@@ -179,7 +179,18 @@ export async function assignJobs(
     if (!claimed) continue;
 
     // §2.2：熱快取在「被指派」當下就成立，不等 job 完成。
-    await queries.setWorkerWarmModels(db, worker.id, jobCandidate.requiredModels);
+    //
+    // 包 try/catch 是必要的，不是保險：claim 已經 commit 了（D1 沒有讓我們把
+    // 兩個 UPDATE 綁在一個交易裡的 seam，Python 端則是同一個 session 交易，
+    // 寫失敗會連 claim 一起 rollback）。這裡讓例外逃出去的話，job 會卡在
+    // `assigned` 卻沒有人收到 `job` frame -- 要等 90 秒後的 requeueStale 才
+    // 救得回來 -- 而且本 tick 剩下的配對全部一起丟掉。熱快取親和只是最佳化，
+    // 絕不值得賠上一次派工。
+    try {
+      await queries.setWorkerWarmModels(db, worker.id, jobCandidate.requiredModels);
+    } catch (err) {
+      console.warn(`dispatch: setWorkerWarmModels failed for worker ${worker.id}`, err);
+    }
 
     const updatedJob = await queries.getJobById(db, job.id);
     if (!updatedJob) continue; // defensive: cannot happen once claimed
