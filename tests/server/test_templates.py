@@ -1566,20 +1566,104 @@ def test_my_template_traversal_and_unsanitizable_names_404(client, alice_and_bob
     assert client.get("/comfy/templates/my_mine.json").status_code == 200
 
 
-def test_my_templates_index_never_lists_a_name_the_sanitizer_would_reject(client, alice_and_bob):
+def test_my_templates_index_ignores_a_subdirectory(client, alice_and_bob):
+    """A folder under `workflows/templates/` is not a template, even when it
+    is named like one. Real fixture -- a directory materialises on every
+    host."""
     directory = templates.my_templates_dir(client.data_dir, alice_and_bob["alice"])
-    os.makedirs(directory, exist_ok=True)
-    # A reserved DOS device name: `sanitize_path_component` rejects it, so
-    # `/comfy/templates/my_nul.json` could never serve it -- listing it would
-    # only produce a broken entry.
-    with open(os.path.join(directory, "nul.json"), "w", encoding="utf-8") as f:
-        json.dump(_MY_WORKFLOW, f)
-    # A subdirectory is not a template either.
-    os.makedirs(os.path.join(directory, "nested.json"), exist_ok=True)
+    os.makedirs(os.path.join(directory, "nested.json", "deep"), exist_ok=True)
 
     _login_as(client, *_ALICE)
     index = client.get("/comfy/templates/index.json").json()
     assert templates.MY_TEMPLATES_TITLE not in _categories_by_title(index)
+
+
+def test_my_template_entries_skip_names_the_sanitizer_would_reject(
+    client, alice_and_bob, monkeypatch
+):
+    """The listing drops any filename that would not round-trip the userdata
+    sanitizer -- it could never be fetched back through
+    `/comfy/templates/my_<name>`, so listing it would only produce a broken
+    card.
+
+    The rejected fixtures are INJECTED into the directory listing rather than
+    written to disk, deliberately: `nul.json`/`con.json` are reserved DOS
+    device names, so on Windows -- the host this repo is developed on --
+    `open(".../nul.json", "w")` writes to the NUL device and creates no file
+    at all. A written fixture would make this assertion pass for the wrong
+    reason on exactly the platform whose hazard it exists to cover (fix round
+    1, NIT-3). Injecting the name runs the real `_round_trips` check against
+    it on every host instead.
+    """
+    uid = alice_and_bob["alice"]
+    directory = templates.my_templates_dir(client.data_dir, uid)
+    # One legitimate template, so a failure to reject shows up as an EXTRA
+    # entry rather than as a category that merely stayed absent.
+    _write_my_template(client.data_dir, uid, "keeper")
+
+    rejected = ("nul.json", "con.json", "trailing.json ", "sub/one.json")
+    for name in rejected:
+        assert not templates._round_trips(name), name
+
+    real_listdir = os.listdir
+    real_isfile = os.path.isfile
+    normalized = os.path.normcase(os.path.abspath(directory))
+
+    def fake_listdir(path):
+        names = real_listdir(path)
+        if os.path.normcase(os.path.abspath(path)) == normalized:
+            return names + list(rejected)
+        return names
+
+    def fake_isfile(path):
+        if os.path.basename(path) in rejected:
+            return True
+        return real_isfile(path)
+
+    monkeypatch.setattr(os, "listdir", fake_listdir)
+    monkeypatch.setattr(os.path, "isfile", fake_isfile)
+
+    entries = templates.my_template_entries(client.data_dir, uid)
+    assert [e["name"] for e in entries] == ["my_keeper"]
+
+
+def test_my_template_shadows_a_same_named_official_template_for_its_owner(
+    client, alice_and_bob
+):
+    """Precedence, stated outright: the user's own folder is tried FIRST.
+
+    So a packaged/official template literally named `my_<x>` is reachable
+    only while this user has no `<x>.json` of their own -- once they do,
+    theirs wins, FOR THEM ALONE (fix round 1, SHOULD-FIX-1: the earlier
+    "can never collide" wording had this backwards).
+    """
+    official_dir = _seed_official_dir(client.data_dir)
+    with open(os.path.join(official_dir, "my_official.json"), "w", encoding="utf-8") as f:
+        json.dump(_FLUX_WORKFLOW, f)
+    _write_my_template(client.data_dir, alice_and_bob["alice"], "official")
+
+    # Alice owns `official.json`, so `my_official.json` is HERS.
+    _login_as(client, *_ALICE)
+    assert client.get("/comfy/templates/my_official.json").json() == _MY_WORKFLOW
+
+    # Bob owns nothing of that stem, so he still gets the official one --
+    # the shadow is self-only, never cross-user.
+    _login_as(client, *_BOB)
+    body = client.get("/comfy/templates/my_official.json").json()
+    assert body["id"] == "flux_dev"
+
+
+def test_my_templates_index_is_not_shared_cacheable(client, alice_and_bob):
+    """`index.json` stopped being the same bytes for every user, so it must
+    never sit in a shared cache (fix round 1, NIT-4)."""
+    _seed_official_dir(client.data_dir, localized=[_FLUX_CATEGORY])
+    _write_my_template(client.data_dir, alice_and_bob["alice"], "mine")
+    _login_as(client, *_ALICE)
+
+    for path in ("/comfy/templates/index.json", "/comfy/templates/index.zh.json"):
+        r = client.get(path)
+        assert r.status_code == 200, path
+        assert r.headers["cache-control"] == "private, no-store", path
 
 
 def test_my_prefix_miss_falls_through_to_the_official_library(client, alice_and_bob):

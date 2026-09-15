@@ -820,15 +820,23 @@ describe("我的範本 / My templates", () => {
     await putPackagedJson("index.json", [COMFYFED_CATEGORY]);
     const alice = await userSession("alice");
     const uid = await uidOf("alice");
+    // One legitimate template, so a failure to reject the others shows up as
+    // an EXTRA entry rather than as a category that merely stayed absent.
+    await putMyTemplate(uid, "keeper");
     // A reserved DOS device name: sanitizePathComponent rejects it, so
     // `/comfy/templates/my_nul.json` could never serve it back -- listing it
     // would only produce a broken entry.
     await store().put(`userdata/${uid}/${MY_SUBDIR}/nul.json`, JSON.stringify(MY_WORKFLOW));
-    // One level deeper is somebody's subfolder, not a template.
-    await store().put(`userdata/${uid}/${MY_SUBDIR}/nested/deep.json`, JSON.stringify(MY_WORKFLOW));
+    // One level deeper is somebody's subfolder, not a template -- and with
+    // `delimiter: "/"` on the LIST it is not even transferred (fix round 1,
+    // SHOULD-FIX-3); this asserts the observable half of that.
+    await store().put(`userdata/${uid}/${MY_SUBDIR}/sub/x.json`, JSON.stringify(MY_WORKFLOW));
+    await store().put(`userdata/${uid}/${MY_SUBDIR}/sub/deeper/y.json`, JSON.stringify(MY_WORKFLOW));
 
     const index = (await call("/comfy/templates/index.json", { cookie: alice.cookie })).body as any[];
-    expect(titlesOf(index)).toEqual(["ComfyFed"]);
+    expect(index[0].templates.map((t: any) => t.name)).toEqual(["my_keeper"]);
+    expect(JSON.stringify(index)).not.toContain("my_nul");
+    expect(JSON.stringify(index)).not.toContain("my_sub");
   });
 
   it("falls through to the official library for a my_ name the user does not own", async () => {
@@ -842,5 +850,66 @@ describe("我的範本 / My templates", () => {
       name: "flux1-dev.safetensors",
       directory: "diffusion_models",
     });
+  });
+
+  it("shadows a same-named official template for its owner only", async () => {
+    // Precedence, stated outright: the user's own folder is tried FIRST, so
+    // an official `my_<x>` is reachable only while this user has no
+    // `<x>.json` of their own (fix round 1, SHOULD-FIX-1 -- the earlier "can
+    // never collide" wording had this backwards).
+    await putOfficialJson("my_official.json", FLUX_WORKFLOW);
+    const alice = await userSession("alice");
+    await putMyTemplate(await uidOf("alice"), "official");
+
+    const hers = await call("/comfy/templates/my_official.json", { cookie: alice.cookie });
+    expect(hers.body).toEqual(MY_WORKFLOW);
+
+    // Bob owns nothing of that stem, so he still gets the official one --
+    // the shadow is self-only, never cross-user.
+    const bob = await userSession("bob");
+    const his = await call("/comfy/templates/my_official.json", { cookie: bob.cookie });
+    expect(his.body.id).toBe("flux_dev");
+  });
+
+  it("degrades to no personal category (not a 500) when the R2 list fails", async () => {
+    // Parity with Python's `except OSError: return []` around os.listdir: a
+    // transient R2 error must drop ONE category, never take down the whole
+    // index (fix round 1, SHOULD-FIX-2).
+    await putPackagedJson("index.json", [COMFYFED_CATEGORY]);
+    const alice = await userSession("alice");
+    await putMyTemplate(await uidOf("alice"), "mine");
+
+    const realList = store().list.bind(store());
+    (store() as any).list = (opts: any) => {
+      if (typeof opts?.prefix === "string" && opts.prefix.startsWith("userdata/")) {
+        throw new Error("simulated transient R2 failure");
+      }
+      return (realList as any)(opts);
+    };
+
+    try {
+      const r = await call("/comfy/templates/index.json", { cookie: alice.cookie });
+      expect(r.status).toBe(200);
+      expect(titlesOf(r.body)).toEqual(["ComfyFed"]);
+    } finally {
+      (store() as any).list = realList;
+    }
+
+    // ...and it recovers on the next request, with no memoized give-up.
+    const after = await call("/comfy/templates/index.json", { cookie: alice.cookie });
+    expect(titlesOf(after.body)).toEqual([MY_TITLE, "ComfyFed"]);
+  });
+
+  it("marks the index responses private, no-store (they are per-user now)", async () => {
+    await putPackagedJson("index.json", [COMFYFED_CATEGORY]);
+    await putOfficialJson("index.zh.json", [FLUX_CATEGORY]);
+    const alice = await userSession("alice");
+    await putMyTemplate(await uidOf("alice"), "mine");
+
+    for (const path of ["/comfy/templates/index.json", "/comfy/templates/index.zh.json"]) {
+      const response = await rawGet(path, alice.cookie);
+      expect(response.status, path).toBe(200);
+      expect(response.headers.get("cache-control"), path).toBe("private, no-store");
+    }
   });
 });

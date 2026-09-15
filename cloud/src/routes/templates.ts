@@ -77,9 +77,15 @@
  * `userdataKey(uid, "workflows/templates/" + rest)` -- so one user's request
  * can never reach another's file, admin included (same policy as userdata).
  * `<rest>` must round-trip through `sanitizePathComponent` unchanged (one
- * definition of "safe segment", so no traversal/subpath/device name), a miss
- * falls through to the packaged/official lookup rather than 404ing on the
- * spot, and the per-user category is deliberately computed OUTSIDE
+ * definition of "safe segment", so no traversal/subpath/device name).
+ * PRECEDENCE, stated precisely: the user's own folder is tried FIRST and only
+ * a MISS falls through to the packaged/official lookup, so a hypothetical
+ * packaged/official template literally named `my_<x>` is reachable exactly
+ * when this user has no `<x>.json` of their own -- if they do, THEIR file
+ * wins, for them alone (a self-shadow, never a cross-user one), and the flat
+ * index namespace can then carry two `my_<x>` entries. With `comfyfed-*` and
+ * today's official library that cannot happen, and it would be cosmetic if it
+ * ever did. The per-user category is deliberately computed OUTSIDE
  * `mergedIndexCache` -- that cache is keyed on R2 etags and shared by every
  * isolate's requests, so caching a uid-specific half in it would leak one
  * user's template list to the next requester.
@@ -387,18 +393,35 @@ export async function myTemplateEntries(env: Env, uid: string): Promise<Record<s
 
   // R2 LIST is paginated; a user with many saved templates must still see
   // all of them (same drain shape as comfyapi.ts's userdata listing).
+  //
+  // `delimiter: "/"` keeps a deep tree under `workflows/templates/` from
+  // being transferred and then discarded: R2 collapses everything below the
+  // flat level into `delimitedPrefixes`, which we never read, so only the
+  // level that can actually hold a template is paid for. The client-side
+  // `rel.includes("/")` filter below stays as belt-and-braces -- it is also
+  // the twin of Python's `os.path.isfile` check.
+  //
+  // The whole drain is wrapped: a transient R2 failure must degrade to "this
+  // user has no personal templates" (dropping one category) rather than 500
+  // the entire index -- exactly what Python's `except OSError: return []`
+  // around `os.listdir` does.
   const names = new Set<string>();
-  let cursor: string | undefined;
-  do {
-    const page = await env.STORE.list({ prefix, cursor });
-    for (const obj of page.objects) {
-      const rel = obj.key.slice(prefix.length);
-      // Flat only -- an object one level deeper is somebody's subfolder,
-      // not a template (Python's `os.path.isfile` check does the same).
-      if (rel && !rel.includes("/")) names.add(rel);
-    }
-    cursor = page.truncated ? page.cursor : undefined;
-  } while (cursor);
+  try {
+    let cursor: string | undefined;
+    do {
+      const page = await env.STORE.list({ prefix, cursor, delimiter: "/" });
+      for (const obj of page.objects) {
+        const rel = obj.key.slice(prefix.length);
+        // Flat only -- an object one level deeper is somebody's subfolder,
+        // not a template (Python's `os.path.isfile` check does the same).
+        if (rel && !rel.includes("/")) names.add(rel);
+      }
+      cursor = page.truncated ? page.cursor : undefined;
+    } while (cursor);
+  } catch (err) {
+    console.warn("templates: could not list personal templates", err);
+    return [];
+  }
 
   const entries: Record<string, unknown>[] = [];
   for (const filename of [...names].sort()) {
@@ -439,6 +462,14 @@ async function myTemplatesCategory(env: Env, uid: string): Promise<Record<string
     templates,
   };
 }
+
+/** `index.json` and `index.<locale>.json` stopped being the same bytes for
+ * every user the moment "我的範本" was merged into them, so they must never be
+ * held in a shared cache. Worker responses are not edge-cached by default,
+ * but an operator adding a "Cache Everything" rule (or any intermediary)
+ * would otherwise be able to hand one user's category to another. Ports
+ * `templates.py`'s `_INDEX_CACHE_HEADERS`. */
+const INDEX_CACHE_CONTROL = "private, no-store";
 
 /** `categories` with the session user's own category prepended -- ports
  * `_with_my_templates`. Never cached: see this module's docstring. */
@@ -520,23 +551,27 @@ app.get("/comfy/templates/:filename", async (c) => {
   if (filename === "index.json") {
     const merged = await mergedIndex(c.env);
     if (merged === null) return c.body(null, 404);
+    c.header("Cache-Control", INDEX_CACHE_CONTROL);
     return c.json(await withMyTemplates(c.env, uid, merged));
   }
 
   if (filename.startsWith("index.") && filename.endsWith(".json")) {
     const merged = await localizedMergedIndex(c.env, filename);
     if (merged === null) return c.body(null, 404);
+    c.header("Cache-Control", INDEX_CACHE_CONTROL);
     return c.json(await withMyTemplates(c.env, uid, merged));
   }
 
   const mediaType = MEDIA_TYPES[extOf(filename)] ?? "application/octet-stream";
 
   // "我的範本": `my_<rest>` resolves inside the SESSION USER's own
-  // `workflows/templates/`, never anyone else's. A miss falls through to the
-  // packaged/official lookup below rather than 404ing on the spot -- so an
-  // unknown name is still a 404, but a same-named official template would
-  // not be shadowed. Served raw, never download-metadata stripped: it is the
-  // user's own graph, like ComfyFed's packaged ones.
+  // `workflows/templates/` FIRST, never anyone else's. Only on a miss does it
+  // fall through to the packaged/official lookup below (see this module's
+  // precedence note) -- so an unknown name is still a 404, and a
+  // packaged/official `my_<x>` stays reachable unless this user happens to
+  // own `<x>.json`, in which case theirs wins for them. Served raw, never
+  // download-metadata stripped: it is the user's own graph, like ComfyFed's
+  // packaged ones.
   if (filename.startsWith(MY_TEMPLATES_PREFIX)) {
     const rest = filename.slice(MY_TEMPLATES_PREFIX.length);
     if (roundTrips(rest)) {

@@ -89,9 +89,11 @@ existing `/comfy/api/userdata/...` routes already accept uploads for.
   `{moduleName: "default", title: MY_TEMPLATES_TITLE, ...}` holding one entry
   per personal template -- but only for the CURRENT SESSION USER, and only
   when they have at least one (an empty folder produces no category rather
-  than an empty group). Every entry's `name` is `my_<stem>`, so a personal
-  template can never collide with a ComfyFed or official one, and the
-  ComfyFed/official categories are left exactly as they were.
+  than an empty group). Every entry's `name` is `my_<stem>`, which keeps
+  personal templates out of the way of ComfyFed's `comfyfed-*` names and of
+  every official name in practice; the ComfyFed/official categories are left
+  exactly as they were. It is NOT an absolute guarantee -- see the
+  precedence note below.
 * `GET /comfy/templates/my_<rest>` serves `<rest>` out of the SESSION USER's
   `workflows/templates/` -- their workflow JSON (raw, never download-metadata
   stripped: it is the user's own graph, like our packaged ones) and their
@@ -103,10 +105,17 @@ existing `/comfy/api/userdata/...` routes already accept uploads for.
   routes use -- so no traversal, no subpath, no Windows device name can be
   reached, and a file whose name the userdata sanitizer would reject is
   simply never listed either (it could not be fetched back).
-* A `my_`-prefixed name that has no match in the user's folder FALLS THROUGH
-  to the ordinary packaged/official lookup rather than 404ing outright, so a
-  (hypothetical) official template literally named `my_something` is not
-  shadowed by this namespace. Unknown on every source is still a 404.
+* PRECEDENCE, stated precisely: the user's own folder is tried FIRST, and
+  only on a MISS does a `my_`-prefixed name fall through to the ordinary
+  packaged/official lookup (rather than 404ing outright). So a hypothetical
+  packaged/official template literally named `my_<x>` is reachable exactly
+  when this user has no `<x>.json` of their own; if they do, THEIR file wins
+  -- for them alone. Nobody else's view changes, so this is a self-shadow,
+  not a cross-user one. The same case can put two entries named `my_<x>` in
+  the flat index namespace (the user's, in "我的範本", and the official one in
+  its own category); with `comfyfed-*` and today's official library that
+  cannot happen, and it would be cosmetic if it ever did. Unknown on every
+  source is still a 404.
 """
 
 from __future__ import annotations
@@ -460,6 +469,15 @@ def my_templates_category(data_dir: str, uid: str) -> dict | None:
     }
 
 
+#: `index.json` and `index.<locale>.json` stopped being the same bytes for
+#: every user the moment "我的範本" was merged into them, so they must never be
+#: held in a shared cache. Worker/proxy responses are not edge-cached by
+#: default, but an operator adding a "Cache Everything" rule (or any
+#: intermediary) would otherwise be able to hand one user's category to
+#: another. Stated on the response rather than relied upon by convention.
+_INDEX_CACHE_HEADERS = {"Cache-Control": "private, no-store"}
+
+
 def _with_my_templates(categories: list, data_dir: str, uid: str) -> list:
     """`categories` with the session user's own category prepended."""
     mine = my_templates_category(data_dir, uid)
@@ -531,7 +549,9 @@ def create_router(data_dir: str) -> APIRouter:
             merged = _merged_index(data_dir, filename)
             if merged is None:
                 raise HTTPException(status_code=404, detail="Not found")
-            return JSONResponse(_with_my_templates(merged, data_dir, user.uid))
+            return JSONResponse(
+                _with_my_templates(merged, data_dir, user.uid), headers=_INDEX_CACHE_HEADERS
+            )
 
         if filename.startswith("index.") and filename.endswith(".json") and filename != "index.json":
             official = _load_json_cached(os.path.join(official_dir, filename))
@@ -539,15 +559,19 @@ def create_router(data_dir: str) -> APIRouter:
                 raise HTTPException(status_code=404, detail="Not found")
             ours = _load_json_cached(os.path.join(templates_dir(), "index.json"))
             ours_list = ours if isinstance(ours, list) else []
-            return JSONResponse(_with_my_templates(ours_list + official, data_dir, user.uid))
+            return JSONResponse(
+                _with_my_templates(ours_list + official, data_dir, user.uid),
+                headers=_INDEX_CACHE_HEADERS,
+            )
 
         extension = os.path.splitext(filename)[1].lower()
 
         # "我的範本": `my_<rest>` resolves inside the SESSION USER's own
-        # `workflows/templates/`, never anyone else's. A miss falls through
-        # to the packaged/official lookup below rather than 404ing here (see
-        # the module docstring) -- so an unknown name is still a 404, but a
-        # same-named official template would not be shadowed.
+        # `workflows/templates/` FIRST, never anyone else's. Only on a miss
+        # does it fall through to the packaged/official lookup below (see the
+        # module docstring's precedence note) -- so an unknown name is still
+        # a 404, and a packaged/official `my_<x>` stays reachable unless this
+        # user happens to own `<x>.json`, in which case theirs wins for them.
         if filename.startswith(MY_TEMPLATES_PREFIX):
             rest = filename[len(MY_TEMPLATES_PREFIX):]
             if _round_trips(rest):
