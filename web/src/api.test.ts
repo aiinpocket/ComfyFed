@@ -58,3 +58,44 @@ describe('api.changePassword', () => {
     expect(headers['X-CSRF']).toBe('new-csrf-token');
   });
 });
+
+describe('api request csrf recovery', () => {
+  afterEach(() => {
+    vi.unstubAllGlobals();
+    setCsrf(null);
+  });
+
+  it('recovers a stale/missing csrf by refetching /api/auth/me and retries the request once', async () => {
+    setCsrf('stale-csrf-token');
+
+    let postCount = 0;
+    const fetchMock = vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+      const url = typeof input === 'string' ? input : input.toString();
+      const method = init?.method ?? 'GET';
+      if (url === '/api/jobs/job-1/cancel' && method === 'POST') {
+        postCount += 1;
+        if (postCount === 1) {
+          return jsonResponse({ error: { code: 'auth.csrf', message: 'bad csrf' } }, 403);
+        }
+        return jsonResponse({ status: 'cancelled' });
+      }
+      if (url === '/api/auth/me' && method === 'GET') {
+        return jsonResponse({ authenticated: true, lang: 'en', csrf: 'fresh' });
+      }
+      return jsonResponse({ error: { code: 'http_error', message: 'not stubbed' } }, 404);
+    });
+    vi.stubGlobal('fetch', fetchMock);
+
+    const result = await api.cancelJob('job-1');
+
+    expect(result).toEqual({ status: 'cancelled' });
+    expect(fetchMock).toHaveBeenCalledTimes(3);
+    expect(getCsrf()).toBe('fresh');
+
+    const secondPostCall = fetchMock.mock.calls[2];
+    const secondPostUrl = typeof secondPostCall[0] === 'string' ? secondPostCall[0] : secondPostCall[0].toString();
+    expect(secondPostUrl).toBe('/api/jobs/job-1/cancel');
+    const headers = secondPostCall[1]?.headers as Record<string, string>;
+    expect(headers['X-CSRF']).toBe('fresh');
+  });
+});

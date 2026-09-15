@@ -182,7 +182,24 @@ describe("GET /api/auth/me", () => {
     await setup();
     const loginRes = await login();
     const r = await call("/api/auth/me", { method: "GET", cookie: loginRes.setCookie });
-    expect(r.body).toEqual({ authenticated: true, username: "admin", role: "admin", lang: "en", platform_url: "" });
+    expect(r.body).toEqual({
+      authenticated: true,
+      username: "admin",
+      role: "admin",
+      lang: "en",
+      platform_url: "",
+      csrf: loginRes.body.csrf,
+    });
+  });
+
+  it("includes the csrf token matching the login response, and omits it when anonymous", async () => {
+    await setup();
+    const loginRes = await login();
+    const r = await call("/api/auth/me", { method: "GET", cookie: loginRes.setCookie });
+    expect(r.body.csrf).toBe(loginRes.body.csrf);
+
+    const anon = await call("/api/auth/me", { method: "GET" });
+    expect(anon.body).not.toHaveProperty("csrf");
   });
 
   it("does not write a session_secret settings row for an anonymous request (no cookie)", async () => {

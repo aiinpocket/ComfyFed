@@ -11,12 +11,13 @@
 import '@testing-library/jest-dom/vitest';
 
 import { MantineProvider } from '@mantine/core';
-import { cleanup, fireEvent, render, screen } from '@testing-library/react';
+import { cleanup, fireEvent, render, screen, waitFor } from '@testing-library/react';
 import { MemoryRouter } from 'react-router-dom';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 
 import './i18n';
 import { App } from './App';
+import { getCsrf, setCsrf } from './api';
 import { theme } from './theme';
 
 if (!window.matchMedia) {
@@ -192,5 +193,44 @@ describe('App bootstrap: first-run setup gate', () => {
 
     expect(await screen.findByText('Invalid setup token.')).toBeInTheDocument();
     expect(screen.getByLabelText('Setup token')).toBeInTheDocument();
+  });
+});
+
+describe('App bootstrap: CSRF recovery from /api/auth/me', () => {
+  afterEach(() => {
+    cleanup();
+    vi.unstubAllGlobals();
+    setCsrf(null);
+  });
+
+  it('adopts the csrf token returned by an authenticated /api/auth/me (new-tab recovery)', async () => {
+    setCsrf(null);
+    const fetchMock = vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+      const url = typeof input === 'string' ? input : input.toString();
+      const method = init?.method ?? 'GET';
+      if (url === '/api/setup/status' && method === 'GET') {
+        return jsonResponse({ error: { code: 'http_error', message: 'not found' } }, 404);
+      }
+      if (url === '/api/auth/me' && method === 'GET') {
+        return jsonResponse({
+          authenticated: true,
+          username: 'admin',
+          role: 'admin',
+          lang: 'en',
+          csrf: 'recovered-token',
+        });
+      }
+      return jsonResponse({ error: { code: 'http_error', message: 'not stubbed' } }, 404);
+    });
+    vi.stubGlobal('fetch', fetchMock);
+
+    renderApp();
+
+    await waitFor(() => {
+      expect(fetchMock).toHaveBeenCalledWith('/api/auth/me', expect.anything());
+    });
+    await waitFor(() => {
+      expect(getCsrf()).toBe('recovered-token');
+    });
   });
 });

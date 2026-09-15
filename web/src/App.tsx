@@ -38,6 +38,7 @@ export function App() {
       const me = await api.me();
       setPlatformUrl(me.platform_url ?? '');
       if (me.authenticated) {
+        if (me.csrf) setCsrf(me.csrf);
         setUser({ username: me.username ?? '', role: me.role === 'admin' ? 'admin' : 'user' });
         setAuth('authenticated');
       } else {

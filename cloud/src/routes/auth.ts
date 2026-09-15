@@ -263,6 +263,7 @@ app.get("/api/auth/me", async (c) => {
     role: user.role,
     lang,
     platform_url: platformUrl,
+    csrf: payload?.csrf,
   });
 });
 

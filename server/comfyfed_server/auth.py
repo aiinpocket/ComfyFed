@@ -350,6 +350,7 @@ def me(cf_session: Optional[str] = Cookie(default=None)):
         "role": user.role,
         "lang": lang,
         "platform_url": platform_url,
+        "csrf": payload.get("csrf") if payload else None,
     }
 
 

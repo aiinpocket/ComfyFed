@@ -76,6 +76,7 @@ async function request<T>(
   path: string,
   body?: BodyInit | null,
   headers: Record<string, string> = {},
+  _isCsrfRetry = false,
 ): Promise<T> {
   const finalHeaders: Record<string, string> = { ...headers };
   const csrf = getCsrf();
@@ -94,6 +95,26 @@ async function request<T>(
     // than trigger a redirect loop.
     if (!path.endsWith('/api/auth/login')) unauthorizedHandler?.();
     throw await parseError(response);
+  }
+  if (response.status === 403 && !_isCsrfRetry) {
+    const err = await parseError(response);
+    if (err.code === 'auth.csrf') {
+      // A new tab (or a session that outlived this tab) has a valid cookie
+      // but never learned its CSRF token -- refetch it from /auth/me and
+      // retry the original request once before giving up.
+      let freshCsrf: string | undefined;
+      try {
+        const me = await getJson<MeResponse>('/api/auth/me');
+        if (me.authenticated && me.csrf) freshCsrf = me.csrf;
+      } catch {
+        /* fall through to the original error */
+      }
+      if (freshCsrf) {
+        setCsrf(freshCsrf);
+        return request<T>(method, path, body, headers, true);
+      }
+    }
+    throw err;
   }
   if (!response.ok) throw await parseError(response);
 
@@ -145,6 +166,7 @@ export interface MeResponse {
   role?: Role | string;
   lang: string;
   platform_url?: string;
+  csrf?: string;
 }
 
 export interface WorkerHardware {

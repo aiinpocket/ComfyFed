@@ -51,6 +51,21 @@ def test_me_unauthenticated_without_session(client):
     assert "platform_url" in body
 
 
+def test_me_includes_csrf_matching_login(client):
+    login = client.post("/api/auth/login", json={"username": "admin", "password": client.admin_password})
+    login_csrf = login.json()["csrf"]
+
+    me = client.get("/api/auth/me")
+    assert me.status_code == 200
+    assert me.json()["csrf"] == login_csrf
+
+
+def test_me_anonymous_has_no_csrf_key(client):
+    r = client.get("/api/auth/me")
+    assert r.status_code == 200
+    assert "csrf" not in r.json()
+
+
 def test_change_password_requires_csrf(client):
     login = client.post("/api/auth/login", json={"username": "admin", "password": client.admin_password})
     assert login.status_code == 200
