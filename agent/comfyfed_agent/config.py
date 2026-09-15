@@ -123,13 +123,15 @@ class AgentConfig:
     comfy_output_dir: str | None = None
     comfy_input_dir: str | None = None
     # Phase 2.1 model auto-distribution groundwork (protocol 3). `hash_models`
-    # gates scan_models' lazy sha256 hashing entirely; `auto_fetch_models` is
-    # only advertised in `hello` here -- the platform-driven fetch itself is
-    # Tasks 2-4. `max_fetch_gb` bounds how much this worker is willing to pull
-    # down automatically once that lands.
+    # gates scan_models' lazy sha256 hashing entirely. 2026-09-16 directive:
+    # `auto_fetch_models` now defaults to `true` -- worker sovereignty is
+    # expressed by the `max_fetch_gb` budget (default 20 GB) rather than by
+    # opting in at all. Smaller models are fetched automatically; anything
+    # that would exceed the budget stays a manual step. Set `false` to opt
+    # out of auto-fetch entirely.
     hash_models: bool = True
-    auto_fetch_models: bool = False
-    max_fetch_gb: float = 30
+    auto_fetch_models: bool = True
+    max_fetch_gb: float = 20
     # Phase 3.1 P2P addendum (種子端): this worker serves model bytes to other
     # agents holding a platform-issued Grant (agent/comfyfed_agent/peerserve.py).
     # Peer serving is enabled iff BOTH `peer_serve` is true AND

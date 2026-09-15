@@ -186,7 +186,7 @@ describe("verdict eligible_after_fetch", () => {
     expect(v.kind).toBe("eligible_after_fetch");
   });
 
-  it("defaults a missing hardware.max_fetch_gb to 30, same as the agent's own default", () => {
+  it("defaults a missing hardware.max_fetch_gb to 20, same as the agent's own default", () => {
     const worker = fetchReadyWorker("w1", { hardware: {}, dynamic: { free_disk_gb: 1000.0 } });
     const v = verdict(worker, needs(["big.safetensors"]), {}, [worker], { "big.safetensors": 31 * GB });
     expect(v.kind).toBe("ineligible");

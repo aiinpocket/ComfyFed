@@ -1705,7 +1705,7 @@ class _RecordingWS:
 
 
 @pytest.mark.asyncio
-async def test_send_hello_declares_protocol_4_and_auto_fetch_false_by_default():
+async def test_send_hello_declares_protocol_4_and_auto_fetch_true_by_default():
     entry = PlatformEntry(
         platform_url="http://p",
         platform_pubkey="aa",
@@ -1722,8 +1722,8 @@ async def test_send_hello_declares_protocol_4_and_auto_fetch_false_by_default():
     payload = json.loads(conn.ws.sent[0])
     assert payload["type"] == "hello"
     assert payload["protocol"] == 4
-    assert payload["auto_fetch"] is False
-    assert payload["max_fetch_gb"] == 30
+    assert payload["auto_fetch"] is True
+    assert payload["max_fetch_gb"] == 20
     assert payload["hardware"]["platform"] == "Windows"
     assert "peer_url" not in payload
 
@@ -1977,12 +1977,12 @@ def _fetch_job_message(job_id: str, fetch_models: list[dict]) -> dict:
 
 
 async def test_fetch_models_disabled_auto_fetch_fails_job_without_running(two_platform_loop, monkeypatch):
-    """A `fetch_models` push reaching a worker with auto_fetch_models still
-    False is always a race or a server bug -- politely job_failed, and
-    run_workflow must never be reached."""
+    """A `fetch_models` push reaching a worker with auto_fetch_models
+    explicitly turned off (opted out) is always a race or a server bug --
+    politely job_failed, and run_workflow must never be reached."""
     loop = two_platform_loop
     conn_a = loop.connections["worker-a"]
-    assert loop.config.auto_fetch_models is False  # the default
+    loop.config.auto_fetch_models = False  # explicit opt-out; no longer the default
 
     def _must_not_run(*args, **kwargs):
         raise AssertionError("run_workflow must not be called when auto-fetch is disabled")

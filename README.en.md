@@ -45,6 +45,8 @@ Every finished job produces a receipt **signed by both sides** — you (the work
 
 Members can also hand model files to each other directly, so nobody has to re-download the same thing from the outside world — a new machine joining in gets missing models faster and with less bandwidth, as long as someone in the circle is online and already has them.
 
+When a job needs a model a worker doesn't have, the worker fills the gap itself: models the platform vouches for are downloaded automatically, up to 20 GB per job by default (`max_fetch_gb`). Larger model sets are a manual step — raise the budget or copy the files in yourself. Set `auto_fetch_models` to `false` to turn auto-fetch off entirely.
+
 ### Safety and trust
 
 ComfyFed is designed for people who know each other, not the open internet:

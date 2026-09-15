@@ -303,8 +303,8 @@ def test_config_hash_models_and_fetch_defaults(tmp_path):
 
     loaded = AgentConfig.load(str(path))
     assert loaded.hash_models is True
-    assert loaded.auto_fetch_models is False
-    assert loaded.max_fetch_gb == 30
+    assert loaded.auto_fetch_models is True
+    assert loaded.max_fetch_gb == 20
 
 
 def test_config_hash_models_and_fetch_round_trip(tmp_path):
@@ -617,7 +617,7 @@ def test_config_max_fetch_gb_coercion(tmp_path):
     import json as _json
 
     path = tmp_path / "agent.json"
-    for raw, expected in [("30", 30.0), (12.5, 12.5), ("junk", 30.0), (-5, 30.0), (None, 30.0)]:
+    for raw, expected in [("30", 30.0), (12.5, 12.5), ("junk", 20.0), (-5, 20.0), (None, 20.0)]:
         path.write_text(_json.dumps({"max_fetch_gb": raw}), encoding="utf-8")
         assert AgentConfig.load(str(path)).max_fetch_gb == expected
 

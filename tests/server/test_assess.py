@@ -332,9 +332,9 @@ def test_verdict_eligible_after_fetch_when_worker_max_fetch_gb_budget_covers_it(
     assert v.kind == "eligible_after_fetch"
 
 
-def test_verdict_missing_max_fetch_gb_defaults_to_30_like_the_agent():
+def test_verdict_missing_max_fetch_gb_defaults_to_20_like_the_agent():
     """No hello.max_fetch_gb reported at all (old/legacy agent) degrades to
-    the same default the agent itself applies -- 30 GB is NOT enough for a
+    the same default the agent itself applies -- 20 GB is NOT enough for a
     31 GiB set."""
     worker = _fetch_ready_worker(
         "w1", model_inventory=[], hardware={}, dynamic={"free_disk_gb": 1000.0}
@@ -892,7 +892,7 @@ def test_a_warning_survives_an_eligible_after_fetch_verdict():
     worker = _fetch_ready_worker(
         "w",
         node_classes=["KSampler"],
-        hardware={"vram_gb": 8.0, "ram_gb": 64.0},
+        hardware={"vram_gb": 8.0, "ram_gb": 64.0, "max_fetch_gb": 30},
         dynamic={"free_disk_gb": 500.0},
     )
     needs = assess.JobNeeds(

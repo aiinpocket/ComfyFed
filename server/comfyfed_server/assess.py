@@ -60,7 +60,7 @@ _MIN_AUTO_FETCH_PROTOCOL = 3
 # agent's own default (agent/comfyfed_agent/config.py AgentConfig.max_fetch_gb)
 # so a fleet of agents that never customized the setting behaves identically
 # whether the server knows about the field or not.
-_DEFAULT_MAX_FETCH_GB = 30.0
+_DEFAULT_MAX_FETCH_GB = 20.0
 
 # hello.protocol below which an agent cannot pull from a peer seeder at all
 # (Phase 3.1 P2P -- mirrors peer._MIN_PEER_PROTOCOL, the same floor the

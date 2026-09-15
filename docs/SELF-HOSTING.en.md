@@ -231,25 +231,27 @@ With these set, the agent deletes a job's files ONLY once that job succeeded AND
 
 ### Auto-fetch models (optional)
 
-The platform can dispatch a job together with the models it needs that this worker is missing, and the agent downloads them itself before running the job instead of the job simply being ruled `ineligible`. **Off by default** — opt in via `agent.json`:
+The platform can dispatch a job together with the models it needs that this worker is missing, and the agent downloads them itself before running the job instead of the job simply being ruled `ineligible`. **On by default** (as of 2026-09-16), bounded by `max_fetch_gb`; opt out in `agent.json` if you don't want it:
 
 ```json
 {
   "auto_fetch_models": true,
-  "max_fetch_gb": 30,
+  "max_fetch_gb": 20,
   "hash_models": true
 }
 ```
 
-- `auto_fetch_models` (default `false`): while off, this worker is never dispatched a job carrying `fetch_models` — identical to pre-2.1 behavior.
-- `max_fetch_gb` (default `30`): the most this worker will download for a single job, in GB. Over budget or insufficient free disk both refuse the whole batch up front — never a half-downloaded failure.
+> Note: an existing `agent.json` written by an earlier agent version that already contains an explicit `"auto_fetch_models": false` keeps that value across the upgrade — operators of existing workers edit the file to opt in to the new default.
+
+- `auto_fetch_models` (default `true`): while off, this worker is never dispatched a job carrying `fetch_models` — identical to pre-2.1 behavior; set `false` to opt out.
+- `max_fetch_gb` (default `20`): the most this worker will download for a single job, in GB. Over budget or insufficient free disk both refuse the whole batch up front — never a half-downloaded failure.
 - `hash_models` (default `true`): turning this off stops the agent from scanning/hashing local models at all, which also means the server can never learn this worker's models well enough to offer them to others — and, as a side effect, this worker can no longer auto-fetch models either.
 
 **Curated models auto-download even with zero holders fleet-wide**: the 11 curated models in the platform's built-in download list (see the "Model downloads" table below) each carry an operator-vouched official sha256/size, so they don't need any worker to have actually held the file and reported a hash first — every other model still needs at least one worker in the federation to have held it and reported a hash, with agreement across reporters ("consensus"), before it can enter the manifest; once a real consensus hash does show up, consensus always wins over the built-in value. As long as some worker has `auto_fetch_models` on and enough free disk, a curated model with zero current holders still gets dispatched for download — it never gets stuck just because nobody has it yet — and once the download completes it's reported the same way as any other, so the rest of the fleet immediately sees "this worker has it too." Which worker gets picked for the download is still just disk headroom and smallest download size (existing logic) — **bandwidth is not measured**, and there's no bandwidth-based selection.
 
 **Trust model**: the platform Ed25519-signs the fetch manifest; the agent verifies that signature before downloading anything, then verifies each file's sha256 after it lands. Both checks must pass before the file is moved into place under `models_dir`'s matching subfolder — a bad signature or hash mismatch rejects the whole batch, leaving no partial files behind. Downloads always land under `models_dir`; the agent sanitizes every path so a manifest entry can never write outside it.
 
-**A worker's own download budget also gates queueing**: hello reports the agent's configured `max_fetch_gb` (see above) to the platform, and a worker whose budget can't cover a job's whole missing-model set is not counted fetch-capable for it — the same way a worker without enough free disk isn't. So a fresh federation with one auto-fetch worker at the default 30 GB budget gets an actionable 400 at submission time (naming the models) for a curated set bigger than that — e.g. the FLUX.1-dev workflows' ~32 GB set or the MiniMax-H3 pipeline's ~40 GB set — rather than a job that dispatches and then fails mid-download. Raise `max_fetch_gb` on at least one online, opted-in worker to clear it.
+**A worker's own download budget also gates queueing**: hello reports the agent's configured `max_fetch_gb` (see above) to the platform, and a worker whose budget can't cover a job's whole missing-model set is not counted fetch-capable for it — the same way a worker without enough free disk isn't. So a fresh federation with one auto-fetch worker at the default 20 GB budget gets an actionable 400 at submission time (naming the models) for a curated set bigger than that — e.g. the FLUX.1-dev workflows' ~32 GB set or the MiniMax-H3 pipeline's ~40 GB set, both of which exceed the default budget — rather than a job that dispatches and then fails mid-download. Either raise `max_fetch_gb` on at least one online, opted-in worker, or place the files manually under `models_dir`, to clear it.
 
 **What happens if upstream re-uploads a curated file (stale guide hash)**: the agent always verifies the downloaded bytes against the SIGNED hash, so a stale guide value can never land the wrong file — the failure is clean, just repeated: every job that needs the model re-downloads it, verification fails, and the job fails, until either (a) the platform's curated registry (`model_guide.py`/`model_guide.ts`'s `SOURCES`) is updated to the new official hash, or (b) any one worker actually downloads/holds the real current file and reports its hash through the normal inventory scan — that worker's reported hash becomes a learned consensus row, which always takes precedence over the built-in guide value from then on (see "Curated models auto-download..." above), and every worker in the federation can fetch from it immediately. Recovery needs only ONE worker to get the correct file by any means (manual download, an old backup, etc.) and let it scan/report normally — nothing is permanently broken.
 

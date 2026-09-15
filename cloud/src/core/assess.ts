@@ -256,7 +256,7 @@ const BYTES_PER_GB = 1024 ** 3;
  * (`agent/comfyfed_agent/config.py`'s `AgentConfig.max_fetch_gb`) so a fleet
  * that never customized the setting behaves identically whether the server
  * knows about the field or not. Ports assess.py's `_DEFAULT_MAX_FETCH_GB`. */
-const DEFAULT_MAX_FETCH_GB = 30.0;
+const DEFAULT_MAX_FETCH_GB = 20.0;
 
 /** This worker's configured auto-fetch budget (hello's optional
  * `max_fetch_gb`), stashed into the `hardware` JSON blob by `hub.ts`'s
