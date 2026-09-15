@@ -194,6 +194,33 @@ describe("solve (Hungarian)", () => {
     ]);
   });
 
+  it("picks the cheaper rival when the feasible graph is deficient", () => {
+    // job 0 / job 1 只配得上 worker 0，job 2 三台都行 -- 方陣但可行圖有缺口。
+    const matrix = [
+      [-1e9 + 10, Infinity, Infinity],
+      [-1e9 + 30, Infinity, Infinity],
+      [-1e9 + 20, -1e9 + 50, -1e9 + 60],
+    ];
+    const pairs = scheduler.solve(matrix);
+    expect(pairs).toHaveLength(2);
+    // job 2 拿它獨佔的其中一台，不跟人搶 worker 0。
+    expect([1, 2]).toContain(pairs.find(([r]) => r === 2)![1]);
+    // worker 0 給比較便宜的 job 0。
+    expect(pairs).toEqual([
+      [0, 0],
+      [2, 1],
+    ]);
+  });
+
+  it("does not quantise costs when a row is all forbidden", () => {
+    // 固定哨兵 1e18 的 ulp 是 128，這兩列只差 121 -- 舊寫法會選到較貴的 [0, 1]。
+    const matrix = [
+      [Infinity, -1098999874.906086],
+      [Infinity, -1098999996.121946],
+    ];
+    expect(scheduler.solve(matrix)).toEqual([[1, 1]]);
+  });
+
   it("is deterministic on ties", () => {
     const matrix = [[1, 1], [1, 1]];
     expect(scheduler.solve(matrix)).toEqual(scheduler.solve(matrix));

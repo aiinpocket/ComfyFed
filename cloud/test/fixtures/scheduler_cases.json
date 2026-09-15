@@ -210,6 +210,55 @@
           1
         ]
       ]
+    },
+    {
+      "name": "deficient square graph (jobs 0 and 1 share the only feasible worker)",
+      "matrix": [
+        [
+          -999999990.0,
+          null,
+          null
+        ],
+        [
+          -999999970.0,
+          null,
+          null
+        ],
+        [
+          -999999980.0,
+          -999999950.0,
+          -999999940.0
+        ]
+      ],
+      "expected_pairs": [
+        [
+          0,
+          0
+        ],
+        [
+          2,
+          1
+        ]
+      ]
+    },
+    {
+      "name": "all-forbidden row must not quantise the surviving costs",
+      "matrix": [
+        [
+          null,
+          -1098999874.906086
+        ],
+        [
+          null,
+          -1098999996.121946
+        ]
+      ],
+      "expected_pairs": [
+        [
+          1,
+          1
+        ]
+      ]
     }
   ],
   "cost_cases": [

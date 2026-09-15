@@ -31,12 +31,6 @@ LIGHT_VRAM_WEIGHT = 5.0
 
 _WEAK_BACKENDS = ("mps", "cpu")
 
-# Hungarian 內部用的「禁止」哨兵。演算法裡會做 `a[i][j] - u[i] - v[j]` 這種
-# 減法，真的塞 `inf` 會冒出 `inf - inf = NaN` 把整個 potential 弄壞，所以禁止
-# 的格子換成一個大到絕不會被選中、但仍是有限值的數；選出來之後再回頭對照
-# 原始矩陣把禁止格剔掉。
-_FORBIDDEN_SENTINEL = 1e18
-
 
 @dataclass(frozen=True)
 class JobCandidate:
@@ -218,9 +212,21 @@ def build_matrix(
 def solve(matrix: list[list[float]]) -> list[tuple[int, int]]:
     """最小成本配對（Kuhn–Munkres / Hungarian，O(n³)）。
 
-    長方形輸入會內部補 0 成方陣。非有限值（`inf`、`-inf`、`NaN`）視為禁止，
-    最後回傳時剔除；有限負值完全合法（目標函數刻意是負的）。回傳依 row 排序
-    的 `(row, col)`，不含補零的行列。
+    非有限值（`inf`、`-inf`、`NaN`）視為禁止，最後回傳時剔除；有限負值完全
+    合法（目標函數刻意是負的）。回傳依 row 排序的 `(row, col)`，不含補位的
+    行列。
+
+    **值域正規化**：長方形要補成方陣、禁止格又不能塞 `inf`（`a[i][j] - u[i]
+    - v[j]` 會冒出 `inf - inf = NaN` 把 potential 弄壞），但也不能塞一個固定
+    的巨大哨兵：`ulp(1e18) = 128`，當可行圖有缺口（某個 job 一個 worker 都配
+    不到）時哨兵級的 delta 會進到 potential，之後每一次減法都被量化成 ~128
+    的倍數，整個 §2.4 成本模型連同兩分鐘的 `wait_seconds` 全被抹平。
+
+    所以改成隨輸入縮放：先把所有有限格平移成 `v - min_v`（落在
+    `[0, range]`），禁止格與補位格一律填 `M = (n + 1) * range + 1`。任何「真
+    實配對總成本」的差距最多 `n * range < M`，所以最小化總成本會先最大化真
+    實（有限）配對數、再最小化真實成本 -- 不依賴 `BIG` 的量級，值也全落在
+    `[0, (n + 1) * range]`，精度不會被吃掉。
 
     決定性：在固定的輸入順序下，內層挑 `delta` 用的是嚴格小於，所以平手時
     永遠選欄位索引最小的那個；TS 版逐行相同，因此兩棧同一個矩陣得到同一組
@@ -233,14 +239,31 @@ def solve(matrix: list[list[float]]) -> list[tuple[int, int]]:
     if n == 0:
         return []
 
+    min_v = math.inf
+    max_v = -math.inf
+    for row in matrix:
+        for value in row:
+            if not _finite(value):
+                continue
+            value = float(value)
+            if value < min_v:
+                min_v = value
+            if value > max_v:
+                max_v = value
+    if not _finite(min_v):
+        return []
+    value_range = max(max_v - min_v, 1.0)
+    big_cell = (n + 1) * value_range + 1.0
+
     # 1-indexed 工作矩陣。
     a = [[0.0] * (n + 1) for _ in range(n + 1)]
     for i in range(n):
         for j in range(n):
-            value = 0.0
+            value = big_cell
             if i < rows_n and j < len(matrix[i]):
                 raw = matrix[i][j]
-                value = float(raw) if _finite(raw) else _FORBIDDEN_SENTINEL
+                if _finite(raw):
+                    value = float(raw) - min_v
             a[i + 1][j + 1] = value
 
     inf = math.inf

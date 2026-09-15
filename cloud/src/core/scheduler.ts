@@ -22,10 +22,6 @@ export const LIGHT_VRAM_WEIGHT = 5.0;
 
 const WEAK_BACKENDS = ["mps", "cpu"];
 
-/** Hungarian 內部用的「禁止」哨兵 -- 見 scheduler.py 的 `_FORBIDDEN_SENTINEL`
- * 註解：真的塞 Infinity 會在 `a[i][j] - u[i] - v[j]` 冒出 NaN。 */
-const FORBIDDEN_SENTINEL = 1e18;
-
 export interface JobCandidate {
   jobId: string;
   signature: string | null;
@@ -157,8 +153,14 @@ export function buildMatrix(
 
 /**
  * 最小成本配對（Kuhn–Munkres / Hungarian，O(n³)）-- ports `scheduler.solve`
- * 逐行。長方形輸入內部補 0 成方陣；非有限值（Infinity / -Infinity / NaN）
- * 視為禁止並在回傳前剔除；有限負值完全合法（目標函數刻意是負的）。
+ * 逐行。非有限值（Infinity / -Infinity / NaN）視為禁止並在回傳前剔除；
+ * 有限負值完全合法（目標函數刻意是負的）。
+ *
+ * 值域正規化：有限格平移成 `v - minV`，禁止格與補位格一律填
+ * `M = (n + 1) * range + 1`。真實配對的總成本差距最多 `n * range < M`，所以
+ * 最小化總成本會先最大化真實配對數、再最小化真實成本。不能用固定哨兵
+ * （`ulp(1e18) = 128`）：可行圖有缺口時哨兵級的 delta 會進 potential，把整個
+ * 成本模型量化掉 -- 見 scheduler.py 的 docstring。
  *
  * 決定性：挑 `delta` 用嚴格小於，平手時永遠選欄位索引最小的那個，和 Python
  * 版一致。呼叫端要先把 jobs 依 `(createdAt, jobId)`、workers 依
@@ -170,14 +172,27 @@ export function solve(matrix: number[][]): [number, number][] {
   const n = Math.max(rowsN, colsN);
   if (n === 0) return [];
 
+  let minV = Infinity;
+  let maxV = -Infinity;
+  for (const row of matrix) {
+    for (const value of row) {
+      if (!finite(value)) continue;
+      if (value < minV) minV = value;
+      if (value > maxV) maxV = value;
+    }
+  }
+  if (!finite(minV)) return [];
+  const valueRange = Math.max(maxV - minV, 1);
+  const bigCell = (n + 1) * valueRange + 1;
+
   // 1-indexed 工作矩陣。
   const a: number[][] = Array.from({ length: n + 1 }, () => new Array<number>(n + 1).fill(0));
   for (let i = 0; i < n; i++) {
     for (let j = 0; j < n; j++) {
-      let value = 0;
+      let value = bigCell;
       if (i < rowsN && j < matrix[i]!.length) {
         const raw = matrix[i]![j]!;
-        value = finite(raw) ? raw : FORBIDDEN_SENTINEL;
+        if (finite(raw)) value = raw - minV;
       }
       a[i + 1]![j + 1] = value;
     }

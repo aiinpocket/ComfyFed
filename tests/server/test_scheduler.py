@@ -225,6 +225,33 @@ def test_solve_accepts_finite_negative_costs():
     assert scheduler.solve(matrix) == [(0, 0), (1, 1)]
 
 
+def test_solve_picks_the_cheaper_rival_when_the_feasible_graph_is_deficient():
+    # job 0 / job 1 只配得上 worker 0，job 2 三台都行 -- 方陣但可行圖有缺口，
+    # 一定有一列配不到真實格子，正是固定哨兵會把成本量化掉的情境。
+    inf = math.inf
+    matrix = [
+        [-1e9 + 10.0, inf, inf],
+        [-1e9 + 30.0, inf, inf],
+        [-1e9 + 20.0, -1e9 + 50.0, -1e9 + 60.0],
+    ]
+    pairs = scheduler.solve(matrix)
+
+    assert len(pairs) == 2
+    # job 2 拿得到它獨佔的其中一台（1 或 2），不會去跟人搶 worker 0。
+    assert [col for row, col in pairs if row == 2][0] in (1, 2)
+    # worker 0 給的是 job 0（-1e9+10）而不是比較貴的 job 1（-1e9+30）。
+    assert (0, 0) in pairs
+    assert pairs == [(0, 0), (2, 1)]
+
+
+def test_solve_does_not_quantise_costs_when_a_row_is_all_forbidden():
+    # 固定哨兵 1e18 的 ulp 是 128，這兩列的成本只差 121 -- 舊寫法會把差距抹平
+    # 而選到比較貴的 (0, 1)。
+    inf = math.inf
+    matrix = [[inf, -1098999874.906086], [inf, -1098999996.121946]]
+    assert scheduler.solve(matrix) == [(1, 1)]
+
+
 def test_solve_is_deterministic_on_ties():
     matrix = [[1.0, 1.0], [1.0, 1.0]]
     first = scheduler.solve(matrix)
