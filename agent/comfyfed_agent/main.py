@@ -15,7 +15,7 @@ from datetime import datetime, timezone
 
 from . import __version__, control, detect, identity, update
 from .config import AgentConfig
-from .runner import AgentLoop, AllRegistrationsRejected
+from .runner import AgentLoop, AllRegistrationsRejected, PlatformConnection, _is_auth_rejected
 
 DEFAULT_CONFIG_PATH = os.path.join(os.path.expanduser("~"), ".comfyfed", "agent.json")
 
@@ -133,6 +133,69 @@ def _cmd_run(args: argparse.Namespace) -> None:
         if agent_loop.shutdown_in_progress and "Event loop stopped before Future completed" in str(exc):
             sys.exit(0)
         raise
+
+
+# Per-entry timeout for `check-registration`'s live WS probe. Short on
+# purpose: the installer runs this synchronously before deciding whether to
+# re-register, so it must answer fast and never hang on an unreachable host.
+_CHECK_REGISTRATION_TIMEOUT_SECONDS = 5.0
+
+
+async def _probe_registration(entry, config: AgentConfig, timeout: float) -> str:
+    """Attempt a real WS connect + handshake for one pinned platform entry,
+    reusing `PlatformConnection` so this exercises the exact auth path the
+    running agent does. Returns one of:
+
+    - `"ok"`     -- connected and completed the handshake (registration live).
+    - `"rejected"` -- the platform closed with 4401 (worker removed or
+      credentials invalid): a DEFINITIVE dead registration.
+    - `"unknown"` -- anything else (network error, timeout, unexpected reply):
+      cannot tell, so the installer must NOT re-register on this alone.
+    """
+    conn = PlatformConnection(entry, config)
+    try:
+        await asyncio.wait_for(conn.connect(), timeout)
+        await asyncio.wait_for(conn.handshake(), timeout)
+        return "ok"
+    except Exception as exc:
+        return "rejected" if _is_auth_rejected(exc) else "unknown"
+    finally:
+        try:
+            await conn.close()
+        except Exception:
+            pass
+
+
+async def _check_all_registrations(cfg: AgentConfig, timeout: float) -> list[str]:
+    return [await _probe_registration(entry, cfg, timeout) for entry in cfg.platforms]
+
+
+def _cmd_check_registration(args: argparse.Namespace) -> None:
+    """Probe every pinned platform's live auth and exit with a code the
+    installer keys off (0 live / 2 dead-4401 / 3 undetermined / 1 none)."""
+    cfg = AgentConfig.load(args.config)
+    if not cfg.platforms:
+        print("尚未設定任何平台 / No platforms configured")
+        sys.exit(1)
+
+    results = asyncio.run(
+        _check_all_registrations(cfg, _CHECK_REGISTRATION_TIMEOUT_SECONDS)
+    )
+
+    if any(r == "ok" for r in results):
+        print("註冊有效：至少一個平台接受本 agent / Registration live: at least one platform accepts this agent")
+        sys.exit(0)
+    if any(r == "rejected" for r in results):
+        print(
+            "註冊已失效：平台以 4401 拒絕本 agent（worker 可能已被移除或憑證失效）/ "
+            "Registration dead: platform rejected this agent with 4401 (worker removed or credentials invalid)"
+        )
+        sys.exit(2)
+    print(
+        "無法確認註冊狀態（連線失敗或逾時，未見 4401）/ "
+        "Could not determine registration status (connection failed or timed out, no 4401)"
+    )
+    sys.exit(3)
 
 
 def _config_dir(args: argparse.Namespace) -> str:
@@ -257,6 +320,13 @@ def cli() -> None:
     runp = sub.add_parser("run", help="Connect to all registered platforms and process jobs.")
     runp.add_argument("--config", default=DEFAULT_CONFIG_PATH, help="Path to the agent config file.")
     runp.set_defaults(func=_cmd_run)
+
+    chk = sub.add_parser(
+        "check-registration",
+        help="檢查已註冊平台是否仍接受本 agent / Check whether the registered platform(s) still accept this agent (exit 0 live, 2 dead-4401, 3 undetermined, 1 none).",
+    )
+    chk.add_argument("--config", default=DEFAULT_CONFIG_PATH, help="Path to the agent config file.")
+    chk.set_defaults(func=_cmd_check_registration)
 
     for name, help_text, handler in (
         ("pause", "暫停接收新工作 / Stop accepting new jobs (the running job finishes).", _cmd_pause),

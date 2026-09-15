@@ -321,6 +321,22 @@ if ((Test-Path $AgentConfigPath)) {
     } catch {}
 }
 
+# Self-heal a dead registration: if this platform is already pinned AND a
+# fresh token was supplied, probe whether the platform still accepts us. A
+# definitive 4401 (check-registration exit 2) means the worker was removed
+# server-side, so we fall through to re-register -- register now REPLACES the
+# dead entry rather than stacking a second. Exit 0 (live), 3 (undetermined:
+# network/timeout) or 1 (none) keep the skip: never burn the single-use token
+# on a transient outage. PS 5.1: read $LASTEXITCODE after the native call.
+if ($alreadyRegistered -and $RegisterToken -ne '') {
+    & $venvAgent check-registration
+    $checkRc = $LASTEXITCODE
+    if ($checkRc -eq 2) {
+        Write-Bilingual '偵測到註冊已失效（4401），將重新註冊' 'Detected a dead registration (4401); re-registering'
+        $alreadyRegistered = $false
+    }
+}
+
 if ($alreadyRegistered) {
     Write-Bilingual '此機器已註冊過本平台，跳過註冊步驟' 'Already registered with this platform; skipping registration'
 } elseif ($RegisterToken -ne '') {

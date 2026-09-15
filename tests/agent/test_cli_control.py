@@ -6,9 +6,12 @@ import json
 from datetime import datetime, timedelta, timezone
 
 import pytest
+from websockets.exceptions import ConnectionClosedError
+from websockets.frames import Close
 
 from comfyfed_agent import control, idle
 from comfyfed_agent import main as main_module
+from comfyfed_agent.config import AgentConfig, PlatformEntry
 
 
 def _args(tmp_path) -> argparse.Namespace:
@@ -166,6 +169,92 @@ def test_status_availability_says_paused_active_while_the_user_is_typing(
     out = capsys.readouterr().out
     assert "availability now: paused-active" in out
     assert "偵測到有人在用這台電腦" in out
+
+
+# --- check-registration (Task 4) -------------------------------------------
+
+
+def _configured(tmp_path) -> argparse.Namespace:
+    cfg = AgentConfig(
+        platforms=[
+            PlatformEntry(
+                platform_url="http://p.example",
+                platform_pubkey="pp",
+                worker_id="w1",
+                certificate="cert",
+                signing_key_hex="11" * 32,
+            )
+        ]
+    )
+    path = tmp_path / "agent.json"
+    cfg.save(str(path))
+    return argparse.Namespace(config=str(path))
+
+
+async def _ok(self):
+    return None
+
+
+def _run_check(args) -> int:
+    with pytest.raises(SystemExit) as exc_info:
+        main_module._cmd_check_registration(args)
+    return exc_info.value.code
+
+
+def test_check_registration_exits_1_when_no_platforms(tmp_path, capsys):
+    args = argparse.Namespace(config=str(tmp_path / "missing.json"))
+
+    assert _run_check(args) == 1
+    out = capsys.readouterr().out
+    assert "尚未設定任何平台" in out
+    assert "No platforms configured" in out
+
+
+def test_check_registration_exits_0_when_handshake_succeeds(tmp_path, capsys, monkeypatch):
+    monkeypatch.setattr(main_module.PlatformConnection, "connect", _ok)
+    monkeypatch.setattr(main_module.PlatformConnection, "handshake", _ok)
+    monkeypatch.setattr(main_module.PlatformConnection, "close", _ok)
+
+    assert _run_check(_configured(tmp_path)) == 0
+    assert "Registration live" in capsys.readouterr().out
+
+
+def test_check_registration_exits_2_on_a_4401_rejection(tmp_path, capsys, monkeypatch):
+    async def _reject(self):
+        raise ConnectionClosedError(Close(4401, "worker removed"), None)
+
+    monkeypatch.setattr(main_module.PlatformConnection, "connect", _ok)
+    monkeypatch.setattr(main_module.PlatformConnection, "handshake", _reject)
+    monkeypatch.setattr(main_module.PlatformConnection, "close", _ok)
+
+    assert _run_check(_configured(tmp_path)) == 2
+    out = capsys.readouterr().out
+    assert "註冊已失效" in out
+    assert "4401" in out
+
+
+def test_check_registration_exits_3_when_tcp_refused(tmp_path, capsys, monkeypatch):
+    async def _refuse(self):
+        raise OSError("connection refused")
+
+    monkeypatch.setattr(main_module.PlatformConnection, "connect", _refuse)
+    monkeypatch.setattr(main_module.PlatformConnection, "close", _ok)
+
+    assert _run_check(_configured(tmp_path)) == 3
+    assert "Could not determine" in capsys.readouterr().out
+
+
+def test_cli_wires_check_registration_to_its_handler(monkeypatch, tmp_path):
+    monkeypatch.setattr(
+        main_module.sys, "argv",
+        ["comfyfed", "check-registration", "--config", str(tmp_path / "agent.json")],
+    )
+    called = []
+    monkeypatch.setattr(main_module, "_cmd_check_registration", lambda args: called.append(args.config))
+
+    main_module.cli()
+
+    assert called == [str(tmp_path / "agent.json")]
 
 
 @pytest.mark.parametrize("command", ["pause", "resume", "status", "stop"])
