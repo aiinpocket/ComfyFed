@@ -6,7 +6,7 @@ import { connectAgent, connectPanel, collectMessages, expectNoMessage, hub, next
 import { signRequest } from "../src/lib/signing";
 import { signHex, verifyHex, derivePublicKeyHexFromSeed } from "../src/lib/ed25519";
 import { bytesToHex } from "../src/lib/hex";
-import { getJobById, getReceiptsForJob, resolvePlatformSeed } from "../src/db/queries";
+import { getJobById, getReceiptsForJob, resolvePlatformSeed, toSqliteTimestamp } from "../src/db/queries";
 import golden from "./fixtures/golden.json";
 
 // ---------------------------------------------------------------------------
@@ -844,5 +844,512 @@ describe("cloud end-to-end", () => {
       panel.close();
     },
     20000
+  );
+
+  // ===========================================================================
+  // Phase 3.3 Task 10: batch-split end-to-end across TWO workers.
+  //
+  // Parity twin: `tests/server/test_agent_ws.py`'s
+  // `test_batch_split_across_two_workers_end_to_end` +
+  // `test_split_batches_false_keeps_the_prompt_whole` +
+  // `test_cancelling_a_running_split_parent_stops_both_workers`.
+  //
+  // split.spec.ts / dispatch.spec.ts own the per-function edge cases; these
+  // two `it`s only prove the whole chain wired together: a PANEL prompt with
+  // `EmptySD3LatentImage batch_size=4` -> one real dispatch tick splitting it
+  // into two children on two different workers -> each worker uploading two
+  // DELIBERATELY identically named files -> the parent collecting all four in
+  // batch order with the owning child as the `/view` subfolder -> the console
+  // surfaces -> one receipt per worker and none on the parent.
+
+  const SPLIT_NODE_CLASSES = [
+    "EmptySD3LatentImage",
+    "KSampler",
+    "VAEDecode",
+    "SaveImage",
+    // The extra node every child workflow carries. A worker that doesn't
+    // declare it fails the §2.3 required-nodes check for the CHILD (see
+    // split.ts's `createChildren`, which unions it into `requiredNodes`).
+    "LatentFromBatch",
+  ];
+
+  // All six §3.2 conditions hold: a single batch source with a literal
+  // batch_size >= 2, no other `batch_size` input, every class allowlisted,
+  // the KSampler's latent reaching the source along slot 0, and the
+  // SaveImage descending from the source.
+  const SPLIT_WORKFLOW = {
+    "1": { class_type: "EmptySD3LatentImage", inputs: { width: 512, height: 512, batch_size: 4 } },
+    "2": { class_type: "KSampler", inputs: { latent_image: ["1", 0], steps: 4, seed: 424242 } },
+    "3": { class_type: "VAEDecode", inputs: { samples: ["2", 0] } },
+    "4": { class_type: "SaveImage", inputs: { images: ["3", 0] } },
+  };
+
+  // Both workers report the SAME two filenames: ComfyUI numbers outputs from
+  // each machine's own counter, so a collision across children of one parent
+  // is the normal case, not an edge case. The `subfolder` (= the owning
+  // child's id) is what keeps the four apart.
+  const COLLIDING_FILES = ["ComfyUI_00001_.png", "ComfyUI_00002_.png"];
+
+  interface SplitAgent {
+    workerId: string;
+    seedHex: string;
+    ws: WebSocket;
+  }
+
+  /** setup + login, returning the console session. */
+  async function loginAdmin(): Promise<{ cookie: string; csrf: string }> {
+    const setupRes = await call("/api/setup", { json: { token: SETUP_TOKEN, password: ADMIN_PASSWORD } });
+    expect(setupRes.status).toBe(200);
+    const loginRes = await call("/api/auth/login", { json: { username: "admin", password: ADMIN_PASSWORD } });
+    expect(loginRes.status).toBe(200);
+    return { cookie: loginRes.setCookie!, csrf: loginRes.body.csrf as string };
+  }
+
+  /** Registers a worker, opens its agent WS, declares protocol 2 with the
+   * split node classes, and reports idle -- polling the worker row each time
+   * so the next dispatch tick really sees an idle, node-capable worker. */
+  async function connectIdleSplitWorker(
+    cookie: string,
+    csrf: string,
+    name: string,
+    keypairIndex: number
+  ): Promise<SplitAgent> {
+    const tokenRes = await call("/api/workers/tokens", { json: { name }, cookie, headers: { "X-CSRF": csrf } });
+    expect(tokenRes.status).toBe(200);
+    const kp = golden.keypairs[keypairIndex]!;
+    const registerRes = await call("/api/agent/register", {
+      json: { token: tokenRes.body.bundle.register_token, pubkey: kp.pubkey_hex },
+    });
+    expect(registerRes.status).toBe(200);
+    const workerId = registerRes.body.worker_id as string;
+    const ws = await connectAgent(workerId, kp.seed_hex);
+
+    const helloNone = expectNoMessage(ws, 250);
+    ws.send(
+      JSON.stringify({
+        type: "hello",
+        protocol: 2,
+        backend: "cuda",
+        torch_version: "2.4.0",
+        platform: "Linux",
+        hardware: { vram_gb: 24, gpu_name: "RTX4090" },
+        node_classes: SPLIT_NODE_CLASSES,
+      })
+    );
+    await helloNone;
+    await waitFor(
+      async () => {
+        const row = await db()
+          .prepare("SELECT protocol, node_classes FROM workers WHERE id = ?")
+          .bind(workerId)
+          .first<{ protocol: number; node_classes: string }>();
+        return row && row.protocol === 2 ? row : undefined;
+      },
+      { label: `worker ${name} row reflects hello` }
+    );
+
+    const idleNone = expectNoMessage(ws, 200);
+    ws.send(JSON.stringify({ type: "heartbeat", state: "idle" }));
+    await idleNone;
+    await waitFor(
+      async () => {
+        const row = await db().prepare("SELECT status FROM workers WHERE id = ?").bind(workerId).first<{ status: string }>();
+        return row?.status === "online" ? true : undefined;
+      },
+      { label: `worker ${name} is idle/online` }
+    );
+
+    return { workerId, seedHex: kp.seed_hex, ws };
+  }
+
+  interface ChildRow {
+    id: string;
+    split_index: number;
+    worker_id: string | null;
+    workflow_json: string;
+    signature: string | null;
+  }
+
+  async function childRows(parentId: string): Promise<ChildRow[]> {
+    const { results } = await db()
+      .prepare(
+        "SELECT id, split_index, worker_id, workflow_json, signature FROM jobs WHERE parent_id = ? ORDER BY split_index ASC"
+      )
+      .bind(parentId)
+      .all<ChildRow>();
+    return results;
+  }
+
+  /** Uploads one artifact through the presign + raw-PUT direct-mode flow --
+   * the same two calls the main chain's step 11 proved. */
+  async function uploadArtifact(agent: SplitAgent, jobId: string, filename: string, text: string): Promise<void> {
+    const bytes = new TextEncoder().encode(text);
+    const sha = await sha256Hex(bytes);
+    const presignBody = new TextEncoder().encode(JSON.stringify({ filename, sha256: sha, size: bytes.length }));
+    const presignRes = await signedCall(
+      agent.workerId,
+      agent.seedHex,
+      "POST",
+      `/api/agent/jobs/${jobId}/artifacts/presign`,
+      presignBody
+    );
+    expect(presignRes.status).toBe(200);
+    const putRes = await raw(presignRes.body.url, { method: "PUT", body: bytes });
+    expect(putRes.status).toBe(200);
+    expect(putRes.body.sha256).toBe(sha);
+  }
+
+  /** Pushes a job's `started_at` an hour into the past so the wall-clock cap
+   * in `createAndPushReceipt` (gpuSeconds = min(exec, wall)) can't shave the
+   * reported exec_seconds down to a fast test run's near-zero span. */
+  async function backdateStartedAt(jobId: string): Promise<void> {
+    const hourAgo = toSqliteTimestamp(new Date(Date.now() - 3600_000));
+    await db().prepare("UPDATE jobs SET started_at = ? WHERE id = ?").bind(hourAgo, jobId).run();
+  }
+
+  it(
+    "splits a batch_size=4 panel prompt across two workers, merges the four outputs, and keeps the prompt whole once split_batches is off",
+    async () => {
+      const { cookie, csrf } = await loginAdmin();
+      const agentA = await connectIdleSplitWorker(cookie, csrf, "gpu-split-0", 0);
+      const agentB = await connectIdleSplitWorker(cookie, csrf, "gpu-split-1", 1);
+      const agentByWorker = new Map<string, SplitAgent>([
+        [agentA.workerId, agentA],
+        [agentB.workerId, agentB],
+      ]);
+
+      // -----------------------------------------------------------------
+      // 1. Panel submit. The split plan is computed and stored AT SUBMIT
+      // TIME (`split.planForJob` in routes/comfyapi.ts), before any tick.
+      const promptRes = await call("/comfy/api/prompt", { json: { prompt: SPLIT_WORKFLOW }, cookie });
+      expect(promptRes.status).toBe(200);
+      const parentId = promptRes.body.prompt_id as string;
+
+      const parentAtSubmit = await db()
+        .prepare("SELECT split_plan, split_count FROM jobs WHERE id = ?")
+        .bind(parentId)
+        .first<{ split_plan: string; split_count: number }>();
+      expect(JSON.parse(parentAtSubmit!.split_plan)).toEqual({ source_node_id: "1", batch_size: 4 });
+      expect(parentAtSubmit!.split_count).toBe(0);
+
+      // -----------------------------------------------------------------
+      // 2. ONE dispatch tick: split into two children and push one to each
+      // worker. Listeners attached before the alarm (see helpers/ws.ts).
+      const pushA = nextMessage(agentA.ws);
+      const pushB = nextMessage(agentB.ws);
+      expect(await runDurableObjectAlarm(hub())).toBe(true);
+      const pushed = [await pushA, await pushB];
+      expect(pushed.map((p) => p.type)).toEqual(["job", "job"]);
+
+      const children = await childRows(parentId);
+      expect(children.map((c) => c.split_index)).toEqual([0, 1]);
+      expect(new Set(children.map((c) => c.worker_id))).toEqual(new Set([agentA.workerId, agentB.workerId]));
+      expect(JSON.parse(children[0]!.workflow_json)["cfsplit"].inputs).toEqual({
+        samples: ["1", 0],
+        batch_index: 0,
+        length: 2,
+      });
+      expect(JSON.parse(children[1]!.workflow_json)["cfsplit"].inputs).toEqual({
+        samples: ["1", 0],
+        batch_index: 2,
+        length: 2,
+      });
+      // The child's KSampler now eats the split node, not the batch source.
+      expect(JSON.parse(children[0]!.workflow_json)["2"].inputs.latent_image).toEqual(["cfsplit", 0]);
+
+      // Each connection got ITS OWN child's range on the wire.
+      const frameByJob = new Map(pushed.map((p) => [p.job_id as string, p]));
+      expect(new Set(frameByJob.keys())).toEqual(new Set(children.map((c) => c.id)));
+      for (const child of children) {
+        const wf = JSON.parse(frameByJob.get(child.id)!.workflow_json);
+        expect(wf["cfsplit"].inputs.batch_index).toBe(child.split_index * 2);
+        expect(wf["cfsplit"].inputs.length).toBe(2);
+      }
+
+      const parentAfterDispatch = await getJobById(db(), parentId);
+      expect(parentAfterDispatch!.splitCount).toBe(2);
+      // Claiming a child does NOT re-derive the parent: `assignJobs`'s atomic
+      // claim never calls `split.childStatusChanged` (only markRunning /
+      // markDone / markFailed / cancelJob / requeueStale do, plus hub.ts's
+      // own three handlers), so the parent is still `queued` at this instant
+      // even though both children are assigned. Same on the Python stack --
+      // recorded as a deviation from the brief, which expected "assigned".
+      expect(parentAfterDispatch!.status).toBe("queued");
+      expect(parentAfterDispatch!.workerId).toBeNull();
+
+      // The panel's queue only ever shows the parent.
+      const queueMid = await call("/comfy/api/queue", { method: "GET", cookie });
+      const queuedIds = [...queueMid.body.queue_running, ...queueMid.body.queue_pending].map((e: any) => e[1]);
+      expect(queuedIds).toEqual([parentId]);
+
+      // -----------------------------------------------------------------
+      // 3. Both children start running -> the parent is derived running with
+      // the mean of their progress.
+      for (const child of children) {
+        const agent = agentByWorker.get(child.worker_id!)!;
+        const none = expectNoMessage(agent.ws, 150);
+        agent.ws.send(JSON.stringify({ type: "heartbeat", state: "busy", job_id: child.id, progress: 0.5 }));
+        await none;
+      }
+      const runningParent = await waitFor(
+        async () => {
+          const job = await getJobById(db(), parentId);
+          return job?.status === "running" && job.progress === 0.5 ? job : undefined;
+        },
+        { label: "parent derived running with the children's mean progress" }
+      );
+      expect(runningParent.workerId).toBeNull();
+
+      // -----------------------------------------------------------------
+      // 4. Each child uploads its two (identically named!) files and reports
+      // job_done with exec_seconds; each earns exactly one receipt frame.
+      for (const child of children) {
+        const agent = agentByWorker.get(child.worker_id!)!;
+        await backdateStartedAt(child.id);
+        for (const name of COLLIDING_FILES) {
+          await uploadArtifact(agent, child.id, name, `c${child.split_index}-${name}`);
+        }
+        const receiptPromise = nextMessage(agent.ws);
+        agent.ws.send(
+          JSON.stringify({
+            type: "job_done",
+            job_id: child.id,
+            result_files: COLLIDING_FILES,
+            exec_seconds: 12.5,
+          })
+        );
+        const receipt = await receiptPromise;
+        expect(receipt.type).toBe("receipt");
+        expect(receipt.kind).toBe("completed");
+        expect(receipt.billable).toBe(true);
+        expect(receipt.payload).toBe(`${child.id}|${agent.workerId}|12.5`);
+      }
+
+      await waitFor(
+        async () => {
+          const job = await getJobById(db(), parentId);
+          return job?.status === "done" ? job : undefined;
+        },
+        { label: "parent reaches done once both children finish" }
+      );
+      const doneParent = await getJobById(db(), parentId);
+      expect(doneParent!.resultFiles).toEqual([]); // the parent owns no bytes
+
+      // -----------------------------------------------------------------
+      // 5. Panel history: only the parent, four images in batch order, each
+      // carrying the id of the child that actually holds the bytes.
+      const historyRes = await call("/comfy/api/history", { method: "GET", cookie });
+      expect(Object.keys(historyRes.body)).toEqual([parentId]);
+      const images = Object.values(historyRes.body[parentId].outputs).flatMap((o: any) => o.images ?? []);
+      expect(images.map((i: any) => i.filename)).toEqual([...COLLIDING_FILES, ...COLLIDING_FILES]);
+      expect(images.map((i: any) => i.subfolder)).toEqual([
+        children[0]!.id,
+        children[0]!.id,
+        children[1]!.id,
+        children[1]!.id,
+      ]);
+
+      // A child's own history entry is empty -- it isn't a panel job.
+      const childHistory = await call(`/comfy/api/history/${children[0]!.id}`, { method: "GET", cookie });
+      expect(childHistory.body).toEqual({});
+
+      // -----------------------------------------------------------------
+      // 6. /view resolves a COLLIDING filename by subfolder, serving each
+      // child's own bytes.
+      for (const child of children) {
+        for (const name of COLLIDING_FILES) {
+          const viewRes = await raw(
+            `/comfy/api/view?filename=${encodeURIComponent(name)}&subfolder=${child.id}&type=output`,
+            { cookie }
+          );
+          expect(viewRes.status).toBe(200);
+          expect(viewRes.body).toBe(`c${child.split_index}-${name}`);
+        }
+      }
+
+      // -----------------------------------------------------------------
+      // 7. Console: the list hides children by default, `?include_children=1`
+      // opts into all three rows.
+      const listRes = await call("/api/jobs", { method: "GET", cookie });
+      expect(listRes.body.map((j: any) => j.id)).toEqual([parentId]);
+      expect(listRes.body[0].split_count).toBe(2);
+      const listAllRes = await call("/api/jobs?include_children=1", { method: "GET", cookie });
+      expect(new Set(listAllRes.body.map((j: any) => j.id))).toEqual(
+        new Set([parentId, children[0]!.id, children[1]!.id])
+      );
+      expect(new Set(listAllRes.body.map((j: any) => j.parent_id))).toEqual(new Set([null, parentId]));
+
+      // Parent detail: no receipt of its own, a child summary with per-child
+      // gpu_seconds, the summed total, and the merged (child, file) outputs.
+      const detailRes = await call(`/api/jobs/${parentId}`, { method: "GET", cookie });
+      expect(detailRes.body.receipt).toBeNull();
+      expect(detailRes.body.split_count).toBe(2);
+      expect(detailRes.body.children.map((c: any) => c.split_index)).toEqual([0, 1]);
+      expect(detailRes.body.children.map((c: any) => c.gpu_seconds)).toEqual([12.5, 12.5]);
+      expect(detailRes.body.gpu_seconds_total).toBe(25);
+      expect(detailRes.body.outputs).toEqual([
+        { job_id: children[0]!.id, filename: COLLIDING_FILES[0] },
+        { job_id: children[0]!.id, filename: COLLIDING_FILES[1] },
+        { job_id: children[1]!.id, filename: COLLIDING_FILES[0] },
+        { job_id: children[1]!.id, filename: COLLIDING_FILES[1] },
+      ]);
+
+      // -----------------------------------------------------------------
+      // 8. Exactly two receipts, one per worker; none on the parent. And
+      // §2.3: each worker recorded a speed sample for the CHILD signature.
+      expect(await getReceiptsForJob(db(), parentId)).toHaveLength(0);
+      for (const child of children) {
+        const receipts = await getReceiptsForJob(db(), child.id);
+        expect(receipts).toHaveLength(1);
+        expect(receipts[0]!.kind).toBe("completed");
+        expect(receipts[0]!.billable).toBe(true);
+        expect(receipts[0]!.gpuSeconds).toBe(12.5);
+        expect(receipts[0]!.workerId).toBe(child.worker_id);
+      }
+
+      const signature = children[0]!.signature;
+      expect(children[1]!.signature).toBe(signature);
+      for (const agent of [agentA, agentB]) {
+        const statRow = await db()
+          .prepare("SELECT ewma_seconds, samples FROM worker_job_stats WHERE worker_id = ? AND signature = ?")
+          .bind(agent.workerId, signature)
+          .first<{ ewma_seconds: number; samples: number }>();
+        expect(statRow).not.toBeNull();
+        expect(statRow!.ewma_seconds).toBeCloseTo(12.5, 6);
+        expect(statRow!.samples).toBe(1);
+      }
+
+      // =====================================================================
+      // 9. split_batches = false: the SAME prompt stays whole and goes to a
+      // single worker.
+      // =====================================================================
+      const settingsRes = await call("/api/settings", {
+        json: { split_batches: false },
+        cookie,
+        headers: { "X-CSRF": csrf },
+      });
+      expect(settingsRes.status).toBe(200);
+      expect(settingsRes.body.split_batches).toBe(false);
+
+      // Both workers back to idle so the next tick has somewhere to send it.
+      for (const agent of [agentA, agentB]) {
+        const none = expectNoMessage(agent.ws, 150);
+        agent.ws.send(JSON.stringify({ type: "heartbeat", state: "idle" }));
+        await none;
+        await waitFor(
+          async () => {
+            const row = await db()
+              .prepare("SELECT status FROM workers WHERE id = ?")
+              .bind(agent.workerId)
+              .first<{ status: string }>();
+            return row?.status === "online" ? true : undefined;
+          },
+          { label: "worker back to idle before the no-split tick" }
+        );
+      }
+
+      const prompt2Res = await call("/comfy/api/prompt", { json: { prompt: SPLIT_WORKFLOW }, cookie });
+      expect(prompt2Res.status).toBe(200);
+      const parent2 = prompt2Res.body.prompt_id as string;
+      const parent2AtSubmit = await db()
+        .prepare("SELECT split_plan FROM jobs WHERE id = ?")
+        .bind(parent2)
+        .first<{ split_plan: string | null }>();
+      expect(parent2AtSubmit!.split_plan).toBeNull();
+
+      const push2A = nextMessage(agentA.ws);
+      const push2B = nextMessage(agentB.ws);
+      expect(await runDurableObjectAlarm(hub())).toBe(true);
+      const pushed2 = await Promise.race([push2A, push2B]);
+      expect(pushed2.type).toBe("job");
+      expect(pushed2.job_id).toBe(parent2);
+      expect(JSON.parse(pushed2.workflow_json)["cfsplit"]).toBeUndefined();
+
+      expect(await childRows(parent2)).toHaveLength(0);
+      const parent2Row = await getJobById(db(), parent2);
+      expect(parent2Row!.splitCount).toBe(0);
+      expect(parent2Row!.status).toBe("assigned");
+      expect([agentA.workerId, agentB.workerId]).toContain(parent2Row!.workerId);
+
+      agentA.ws.close();
+      agentB.ws.close();
+    },
+    30_000
+  );
+
+  it(
+    "cancels a running split parent and tells BOTH children's workers",
+    async () => {
+      const { cookie, csrf } = await loginAdmin();
+      const agentA = await connectIdleSplitWorker(cookie, csrf, "gpu-cancel-0", 0);
+      const agentB = await connectIdleSplitWorker(cookie, csrf, "gpu-cancel-1", 1);
+      const agentByWorker = new Map<string, SplitAgent>([
+        [agentA.workerId, agentA],
+        [agentB.workerId, agentB],
+      ]);
+
+      const promptRes = await call("/comfy/api/prompt", { json: { prompt: SPLIT_WORKFLOW }, cookie });
+      const parentId = promptRes.body.prompt_id as string;
+
+      const pushA = nextMessage(agentA.ws);
+      const pushB = nextMessage(agentB.ws);
+      expect(await runDurableObjectAlarm(hub())).toBe(true);
+      await Promise.all([pushA, pushB]);
+
+      const children = await childRows(parentId);
+      expect(children).toHaveLength(2);
+      for (const child of children) {
+        const agent = agentByWorker.get(child.worker_id!)!;
+        const none = expectNoMessage(agent.ws, 150);
+        agent.ws.send(JSON.stringify({ type: "heartbeat", state: "busy", job_id: child.id, progress: 0.1 }));
+        await none;
+      }
+      await waitFor(
+        async () => {
+          const job = await getJobById(db(), parentId);
+          return job?.status === "running" ? job : undefined;
+        },
+        { label: "parent running with both children running" }
+      );
+
+      // Console cancel of the PARENT. Each child's worker must hear about its
+      // OWN child -- not just whichever one the cascade happened to visit
+      // first (the Task 6 fix-round-1 bug).
+      const cancelA = nextMessage(agentA.ws);
+      const cancelB = nextMessage(agentB.ws);
+      const cancelRes = await call(`/api/jobs/${parentId}/cancel`, {
+        method: "POST",
+        cookie,
+        headers: { "X-CSRF": csrf },
+      });
+      expect(cancelRes.status).toBe(200);
+      expect(cancelRes.body.status).toBe("cancelled");
+
+      const cancelFrames = [await cancelA, await cancelB];
+      const childIdByWorker = new Map(children.map((c) => [c.worker_id!, c.id]));
+      // No `receipt` frame precedes these: cancelling the PARENT only mints a
+      // cancelled receipt for the job named in the request, and the parent was
+      // never running on a worker of its own -- the children, which really
+      // were burning GPU, get none. Known open concern carried from Task 6/7;
+      // pinned here so it surfaces as a deliberate change if it's ever fixed.
+      expect(cancelFrames[0]).toEqual({ type: "job_cancelled", job_id: childIdByWorker.get(agentA.workerId) });
+      expect(cancelFrames[1]).toEqual({ type: "job_cancelled", job_id: childIdByWorker.get(agentB.workerId) });
+
+      const parentRow = await getJobById(db(), parentId);
+      expect(parentRow!.status).toBe("cancelled");
+      for (const child of children) {
+        const row = await getJobById(db(), child.id);
+        expect(row!.status).toBe("cancelled");
+        expect(row!.error).toBe("cancelled by admin");
+        expect(row!.workerId).toBeNull();
+        expect(row!.lastWorkerId).toBe(child.worker_id);
+        expect(await getReceiptsForJob(db(), child.id)).toHaveLength(0);
+      }
+      expect(await getReceiptsForJob(db(), parentId)).toHaveLength(0);
+
+      agentA.ws.close();
+      agentB.ws.close();
+    },
+    30_000
   );
 });

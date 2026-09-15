@@ -3,8 +3,11 @@ import hashlib
 import json
 import logging
 import math
+import secrets
+import time
 from datetime import datetime, timedelta, timezone
 
+import httpx
 import pytest
 from fastapi.testclient import TestClient
 from nacl.signing import SigningKey
@@ -3171,3 +3174,375 @@ def test_child_heartbeat_progress_drives_the_parent_progress(client):
     with db.get_session() as session:
         parent = session.get(db.Job, "p_prog")
     assert parent.progress == pytest.approx(0.4)
+
+
+# --- Phase 3.3 Task 10：端到端批次拆分（兩台假 worker，走面板送件路徑）------
+#
+# 上面那三個 §3.6 測試是直接寫 DB 造出一個已經拆好的家族（刻意的：它們釘的是
+# 取消／串聯本身）。這一段相反 -- 從 `POST /comfy/api/prompt` 開始，讓**真的**
+# dispatch tick 去拆、去派工，然後把兩台 worker 的輸出合回父 job，一路驗到
+# 面板的 `/history` + `/view`、console 的 `/api/jobs`、收據與 `worker_job_stats`。
+# 兩棧對照：`cloud/test/e2e.spec.ts` 的 "splits a batch_size=4 panel prompt..."。
+
+_SPLIT_NODE_CLASSES = [
+    "EmptySD3LatentImage",
+    "KSampler",
+    "VAEDecode",
+    "SaveImage",
+    # 子 workflow 多出來的那一個 -- 沒宣告的 worker 會被 §2.3 的 required_nodes
+    # 判定擋在子 job 之外（見 split.create_children 的 child_nodes）。
+    "LatentFromBatch",
+]
+
+# §3.2 的六個條件全部成立：唯一的批次來源（batch_size=4）、沒有別的 batch_size、
+# 每個節點都在白名單裡、KSampler 的 latent 沿 slot 0 追得到來源、SaveImage 以
+# 來源為祖先。
+_SPLIT_WORKFLOW = {
+    "1": {"class_type": "EmptySD3LatentImage", "inputs": {"width": 512, "height": 512, "batch_size": 4}},
+    "2": {"class_type": "KSampler", "inputs": {"latent_image": ["1", 0], "steps": 4, "seed": 424242}},
+    "3": {"class_type": "VAEDecode", "inputs": {"samples": ["2", 0]}},
+    "4": {"class_type": "SaveImage", "inputs": {"images": ["3", 0]}},
+}
+
+# 兩台 worker 刻意回報**一模一樣**的檔名：ComfyUI 的輸出前綴計數器是每台機器
+# 自己的，所以同一個父 job 的兩個子 job 產生同名檔案是常態。history 的
+# `subfolder`（= 持有檔案的子 job id）就是用來讓 `/view` 分得出兩份的。
+_COLLIDING_FILES = ["ComfyUI_00001_.png", "ComfyUI_00002_.png"]
+
+
+def _send_split_hello(ws):
+    """`_send_hello_v2` 但帶著拆分需要的節點清單（那個 helper 送空清單，而空
+    清單在 assess.py 是「不知道」而不是「都不支援」-- 這裡要真的宣告）。"""
+    ws.send_json(
+        {
+            "type": "hello",
+            "hardware": {"vram_gb": 24},
+            "backend": "cuda",
+            "torch_version": "2.4.0",
+            "node_classes": _SPLIT_NODE_CLASSES,
+            "protocol": 2,
+        }
+    )
+
+
+def _connect_idle_split_worker(client, csrf, name):
+    """註冊 + 連線 + hello + 一次 idle 心跳，並用一次 `dispatch_once` 把那個
+    心跳同步掉（和 test_paused_worker_excluded_from_dispatch... 同樣的作法）。"""
+    worker_id, sk = _register_worker(client, csrf, name)
+    ws = _connect(client, worker_id, sk)
+    _send_split_hello(ws)
+    ws.send_json({"type": "heartbeat", "state": "idle", "progress": 0.0, "job_id": None, "dynamic": {}})
+    agentws.dispatch_once(worker_id)
+    return worker_id, sk, ws
+
+
+def _signed_artifact_upload(client, job_id, worker_id, signing_key, filename, content):
+    """簽名的 multipart artifact 上傳（和 test_receipts.py 的
+    `_signed_post_multipart` 同一個樣板，那個檔案沒有 export 給別人用）。"""
+    path = f"/api/agent/jobs/{job_id}/artifacts"
+    req = httpx.Request(
+        "POST",
+        "http://testserver" + path,
+        files={"file": (filename, content, "application/octet-stream")},
+    )
+    body = req.read()
+    ts = str(int(time.time()))
+    nonce = secrets.token_hex(8)
+    message = f"POST\n{path}\n{ts}\n{nonce}\n".encode() + body
+    sig = signing_key.sign(message).signature.hex()
+    return client.post(
+        path,
+        content=body,
+        headers={
+            "Content-Type": req.headers["content-type"],
+            "X-Worker-Id": worker_id,
+            "X-Ts": ts,
+            "X-Nonce": nonce,
+            "X-Sig": sig,
+        },
+    )
+
+
+def _split_children(parent_id):
+    with db.get_session() as session:
+        return (
+            session.query(db.Job)
+            .filter(db.Job.parent_id == parent_id)
+            .order_by(db.Job.split_index.asc())
+            .all()
+        )
+
+
+def test_batch_split_across_two_workers_end_to_end(client):
+    """兩台 idle worker + 一張 batch_size=4 的面板送件 -> 2 個子 job 各 2 張，
+    父 job 依序拿到 4 個輸出、面板只看得到父、收據一台一張。"""
+    csrf = _login(client)
+    worker_a, sk_a, ws_a = _connect_idle_split_worker(client, csrf, "gpu-split-0")
+    worker_b, sk_b, ws_b = _connect_idle_split_worker(client, csrf, "gpu-split-1")
+    by_worker = {worker_a: (sk_a, ws_a), worker_b: (sk_b, ws_b)}
+
+    try:
+        parent_id = _submit_panel(client, _SPLIT_WORKFLOW)
+
+        with db.get_session() as session:
+            parent = session.get(db.Job, parent_id)
+            assert json.loads(parent.split_plan) == {"source_node_id": "1", "batch_size": 4}
+            assert parent.split_count == 0  # 還沒 tick，還沒拆
+
+        # 一次 tick：拆成 2 個子 job 並各派一台 worker。
+        agentws.dispatch_once(worker_a)
+
+        children = _split_children(parent_id)
+        assert [c.split_index for c in children] == [0, 1]
+        assert {c.worker_id for c in children} == {worker_a, worker_b}
+        assert json.loads(children[0].workflow_json)["cfsplit"]["inputs"] == {
+            "samples": ["1", 0],
+            "batch_index": 0,
+            "length": 2,
+        }
+        assert json.loads(children[1].workflow_json)["cfsplit"]["inputs"] == {
+            "samples": ["1", 0],
+            "batch_index": 2,
+            "length": 2,
+        }
+        # 子 workflow 的 KSampler 改吃 cfsplit 的輸出，不再直接吃批次來源。
+        assert json.loads(children[0].workflow_json)["2"]["inputs"]["latent_image"] == ["cfsplit", 0]
+
+        with db.get_session() as session:
+            parent = session.get(db.Job, parent_id)
+            assert parent.split_count == 2
+            # 派工本身**不**推導父 job：`dispatch.assign_jobs` 的原子 claim 沒有
+            # 呼叫 `split.child_status_changed`（只有 mark_running / mark_done /
+            # mark_failed / cancel_job / requeue_stale 有），所以子 job 已經
+            # assigned 的這一刻，父 job 還停在 queued。§3.4 表格的
+            # `[assigned] -> assigned` 那一列因此在正常派工流程上看不到，要等第
+            # 一個子 job 的 busy 心跳才會一路跳到 running（見下）。兩棧一致，
+            # 記在報告的疑慮裡。
+            assert parent.status == "queued"
+            assert parent.worker_id is None  # 父 job 從來沒有自己的 worker
+
+        # 每條連線各收到自己那個子 job 的 push，frame 裡的 workflow 帶著自己
+        # 那一段 batch 範圍。
+        pushed = {}
+        for child in children:
+            _sk, ws = by_worker[child.worker_id]
+            frame = ws.receive_json()
+            assert frame["type"] == "job"
+            pushed[frame["job_id"]] = frame
+        assert set(pushed) == {c.id for c in children}
+        for child in children:
+            frame_workflow = json.loads(pushed[child.id]["workflow_json"])
+            assert frame_workflow["cfsplit"]["inputs"]["batch_index"] == child.split_index * 2
+            assert frame_workflow["cfsplit"]["inputs"]["length"] == 2
+
+        # 這時面板的 /queue 只看得到父 job -- 子 job 是拆分的實作細節。
+        queue_mid = client.get("/comfy/api/queue").json()
+        queued_ids = [entry[1] for entry in queue_mid["queue_running"] + queue_mid["queue_pending"]]
+        assert queued_ids == [parent_id]
+
+        # 兩台都開始跑 -> 父 job 被推導成 running，進度是子 job 的平均。
+        for child in children:
+            _sk, ws = by_worker[child.worker_id]
+            ws.send_json(
+                {"type": "heartbeat", "state": "busy", "progress": 0.5, "job_id": child.id, "dynamic": {}}
+            )
+            agentws.dispatch_once(child.worker_id)
+        with db.get_session() as session:
+            parent = session.get(db.Job, parent_id)
+            assert parent.status == "running"
+            assert parent.progress == pytest.approx(0.5)
+
+        # 兩個子 job 各跑完 2 張（檔名故意相同），各回報 12.5 秒。
+        for child in children:
+            sk, ws = by_worker[child.worker_id]
+            # exec_seconds 會被 wall clock 夾住，所以把開始時間推到一小時前，
+            # 讓 gpu_seconds 就是回報的 12.5（見 _backdate_started_at）。
+            _backdate_started_at(child.id, hours=1)
+            for name in _COLLIDING_FILES:
+                res = _signed_artifact_upload(
+                    client, child.id, child.worker_id, sk, name,
+                    f"c{child.split_index}-{name}".encode(),
+                )
+                assert res.status_code == 200
+            ws.send_json(
+                {
+                    "type": "job_done",
+                    "job_id": child.id,
+                    "result_files": list(_COLLIDING_FILES),
+                    "exec_seconds": 12.5,
+                }
+            )
+            agentws.dispatch_once(child.worker_id)
+            assert ws.receive_json()["type"] == "receipt"
+
+        with db.get_session() as session:
+            parent = session.get(db.Job, parent_id)
+            assert parent.status == "done"
+            assert json.loads(parent.result_files or "[]") == []  # 父 job 自己沒有檔案
+
+        # ---- 面板：history 只有父 job，4 張圖依批次順序，subfolder 是持有者
+        history = client.get("/comfy/api/history").json()
+        assert list(history.keys()) == [parent_id]
+        images = [
+            image
+            for payload in history[parent_id]["outputs"].values()
+            for image in payload.get("images", [])
+        ]
+        assert [i["filename"] for i in images] == _COLLIDING_FILES + _COLLIDING_FILES
+        assert [i["subfolder"] for i in images] == [
+            children[0].id, children[0].id, children[1].id, children[1].id
+        ]
+
+        # 子 job 自己的 history 是空的。
+        assert client.get(f"/comfy/api/history/{children[0].id}").json() == {}
+
+        # ---- /view：同名檔案靠 subfolder 分得出來，各自拿到自己的位元組
+        for child in children:
+            for name in _COLLIDING_FILES:
+                res = client.get(
+                    "/comfy/api/view",
+                    params={"filename": name, "subfolder": child.id, "type": "output"},
+                )
+                assert res.status_code == 200
+                assert res.content == f"c{child.split_index}-{name}".encode()
+
+        # ---- console：列表預設只有父 job，?include_children=1 才看得到三筆
+        listed = client.get("/api/jobs", headers={"X-CSRF": csrf}).json()
+        assert [j["id"] for j in listed] == [parent_id]
+        assert listed[0]["split_count"] == 2
+        listed_all = client.get(
+            "/api/jobs", params={"include_children": 1}, headers={"X-CSRF": csrf}
+        ).json()
+        assert {j["id"] for j in listed_all} == {parent_id, children[0].id, children[1].id}
+        assert {j["parent_id"] for j in listed_all} == {None, parent_id}
+
+        # ---- console 詳細頁：父 job 沒有收據，改看 children / gpu_seconds_total
+        detail = client.get(f"/api/jobs/{parent_id}", headers={"X-CSRF": csrf}).json()
+        assert detail["receipt"] is None
+        assert detail["split_count"] == 2
+        assert [c["split_index"] for c in detail["children"]] == [0, 1]
+        assert [c["gpu_seconds"] for c in detail["children"]] == [12.5, 12.5]
+        assert detail["gpu_seconds_total"] == pytest.approx(25.0)
+        assert detail["outputs"] == [
+            {"job_id": children[0].id, "filename": _COLLIDING_FILES[0]},
+            {"job_id": children[0].id, "filename": _COLLIDING_FILES[1]},
+            {"job_id": children[1].id, "filename": _COLLIDING_FILES[0]},
+            {"job_id": children[1].id, "filename": _COLLIDING_FILES[1]},
+        ]
+
+        # ---- 收據：一個子 job 一張，父 job 沒有；每台 worker 各一張
+        with db.get_session() as session:
+            receipts = session.query(db.Receipt).all()
+            parent_receipts = [r for r in receipts if r.job_id == parent_id]
+            assert parent_receipts == []
+            assert len(receipts) == 2
+            assert sorted(r.worker_id for r in receipts) == sorted([worker_a, worker_b])
+            assert {r.job_id for r in receipts} == {children[0].id, children[1].id}
+            assert all(r.kind == "completed" and r.billable for r in receipts)
+            assert all(r.gpu_seconds == 12.5 for r in receipts)
+
+            # ---- §2.3：兩台 worker 各為「子 job 的簽章」留下一筆速度樣本
+            signature = children[0].signature
+            assert children[1].signature == signature
+            for worker_id in (worker_a, worker_b):
+                row = session.get(db.WorkerJobStats, (worker_id, signature))
+                assert row is not None
+                assert row.ewma_seconds == pytest.approx(12.5)
+                assert row.samples == 1
+    finally:
+        ws_a.close()
+        ws_b.close()
+
+
+def test_split_batches_false_keeps_the_prompt_whole(client):
+    """平台設定關掉之後，同一張圖整包派給單一 worker，一個子 job 都不長。"""
+    csrf = _login(client)
+    r = client.post("/api/settings", json={"split_batches": False}, headers={"X-CSRF": csrf})
+    assert r.status_code == 200
+    assert r.json()["split_batches"] is False
+
+    worker_a, sk_a, ws_a = _connect_idle_split_worker(client, csrf, "gpu-whole-0")
+    worker_b, sk_b, ws_b = _connect_idle_split_worker(client, csrf, "gpu-whole-1")
+    try:
+        parent_id = _submit_panel(client, _SPLIT_WORKFLOW)
+
+        # 送件時就已經不記計畫了（`split.plan_for_job` 讀的是同一個設定）。
+        with db.get_session() as session:
+            assert session.get(db.Job, parent_id).split_plan is None
+
+        agentws.dispatch_once(worker_a)
+
+        assert _split_children(parent_id) == []
+        with db.get_session() as session:
+            job = session.get(db.Job, parent_id)
+            assert job.split_count == 0
+            assert job.status == "assigned"
+            assert job.worker_id in (worker_a, worker_b)
+            owner = job.worker_id
+
+        ws = ws_a if owner == worker_a else ws_b
+        frame = ws.receive_json()
+        assert frame["type"] == "job"
+        assert frame["job_id"] == parent_id
+        # 整包 -- 沒有 LatentFromBatch 被插進去。
+        assert "cfsplit" not in json.loads(frame["workflow_json"])
+    finally:
+        ws_a.close()
+        ws_b.close()
+
+
+def test_cancelling_a_running_split_parent_stops_both_workers(client):
+    """§3.6：父 job 在兩個子 job 都在跑的時候被取消 -> 兩台 worker 都收到
+    自己那個子 job 的 `job_cancelled`，父 job 與兩個子 job 都 cancelled。
+
+    和上面 `test_cancelling_a_split_parent_notifies_every_child_worker` 的差別
+    是這個從真的送件 + 真的 tick 拆分開始（那個直接寫 DB 造家族）。
+    """
+    csrf = _login(client)
+    worker_a, sk_a, ws_a = _connect_idle_split_worker(client, csrf, "gpu-cancel-0")
+    worker_b, sk_b, ws_b = _connect_idle_split_worker(client, csrf, "gpu-cancel-1")
+    by_worker = {worker_a: ws_a, worker_b: ws_b}
+
+    try:
+        parent_id = _submit_panel(client, _SPLIT_WORKFLOW)
+        agentws.dispatch_once(worker_a)
+
+        children = _split_children(parent_id)
+        assert len(children) == 2
+        for child in children:
+            ws = by_worker[child.worker_id]
+            assert ws.receive_json()["type"] == "job"
+            ws.send_json(
+                {"type": "heartbeat", "state": "busy", "progress": 0.1, "job_id": child.id, "dynamic": {}}
+            )
+            agentws.dispatch_once(child.worker_id)
+
+        with db.get_session() as session:
+            assert session.get(db.Job, parent_id).status == "running"
+
+        assert client.post(f"/api/jobs/{parent_id}/cancel", headers={"X-CSRF": csrf}).status_code == 200
+
+        # 非阻塞斷言在前（迴歸時立刻失敗而不是卡在 receive_json 上）。
+        for child in children:
+            assert child.id in agentws._connections[child.worker_id].cancelled_jobs_sent
+        for child in children:
+            ws = by_worker[child.worker_id]
+            # 只有 `job_cancelled`，**沒有** cancelled 收據：取消父 job 時
+            # `cancel_and_notify` 只對 `job_id` 自己判斷 was_running 並 mint，
+            # 真正在燒 GPU 的子 job 一張都沒有（Task 6/7 報告列著的開放疑慮）。
+            # 這裡把現狀釘住：哪天補上了，這個測試會紅，是提醒而不是迴歸。
+            assert ws.receive_json() == {"type": "job_cancelled", "job_id": child.id}
+    finally:
+        ws_a.close()
+        ws_b.close()
+
+    with db.get_session() as session:
+        parent = session.get(db.Job, parent_id)
+        rows = [session.get(db.Job, c.id) for c in children]
+        receipts = session.query(db.Receipt).all()
+    assert parent.status == "cancelled"
+    assert [c.status for c in rows] == ["cancelled", "cancelled"]
+    assert all(c.worker_id is None for c in rows)
+    assert [c.error for c in rows] == ["cancelled by admin", "cancelled by admin"]
+    # 現狀：整個家族一張收據都沒有（見上面的註解）。
+    assert receipts == []
