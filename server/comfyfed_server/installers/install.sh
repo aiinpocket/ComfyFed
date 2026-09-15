@@ -287,8 +287,20 @@ esac
 # `X` and creates an extension-less file, and pip refuses to install a
 # wheel whose filename doesn't end in `.whl`. Make a temp *directory*
 # (portable across GNU/BSD mktemp) and give the wheel a fixed name inside it.
+# pip also validates the FILENAME, not just the bytes: anything that is not
+# PEP 427 `<dist>-<version>[-<build>]-<py>-<abi>-<plat>.whl` is refused with
+# "is not a valid wheel filename" (a fixed `agent.whl` broke every macOS
+# install). Use the URL's own basename -- the platform publishes the wheel
+# under its real name -- and fall back to the conventional pure-Python name
+# for this version when the URL carries no usable one.
+LATEST_VERSION="$("$VENV_PYTHON" -c "import json,sys; print(json.loads(sys.argv[1]).get('latest') or '')" "$VERSION_JSON")"
+WHEEL_NAME="$(basename "${WHEEL_URL%%\?*}")"
+case "$WHEEL_NAME" in
+    *-*-*-*.whl) ;;
+    *) WHEEL_NAME="comfyfed-${LATEST_VERSION:-0}-py3-none-any.whl" ;;
+esac
 WHEEL_TMPDIR="$(mktemp -d)"
-WHEEL_FILE="$WHEEL_TMPDIR/agent.whl"
+WHEEL_FILE="$WHEEL_TMPDIR/$WHEEL_NAME"
 bilingual "下載 agent wheel..." "Downloading agent wheel..."
 curl -fsSL "$WHEEL_URL" -o "$WHEEL_FILE" || fail_step "下載 agent wheel" "downloading the agent wheel" \
     "請確認網路連線後重跑本腳本" "please check your network connection then re-run this script"

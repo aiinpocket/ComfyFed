@@ -571,3 +571,21 @@ def test_sh_auto_installs_a_relocatable_python_without_sudo():
     assert "xcode-select --install" not in sh
     assert "if install_standalone_python; then" in sh
     assert "automatic Python install failed" in sh
+
+
+def test_installers_save_the_wheel_under_a_pep427_filename():
+    """jessie's Mac: python auto-install succeeded, then pip refused
+    `agent.whl` -- "is not a valid wheel filename". pip validates the
+    FILENAME against PEP 427, so the installers must keep the platform's
+    real name (`comfyfed-<ver>-py3-none-any.whl`) and, when the URL has no
+    usable basename, fall back to the conventional pure-Python name."""
+    sh = open(_source_path("install.sh"), encoding="utf-8").read()
+    assert 'WHEEL_FILE="$WHEEL_TMPDIR/agent.whl"' not in sh
+    assert 'WHEEL_NAME="$(basename "${WHEEL_URL%%\\?*}")"' in sh
+    assert "*-*-*-*.whl) ;;" in sh
+    assert 'WHEEL_NAME="comfyfed-${LATEST_VERSION:-0}-py3-none-any.whl"' in sh
+    assert 'WHEEL_FILE="$WHEEL_TMPDIR/$WHEEL_NAME"' in sh
+    ps = open(_source_path("install.ps1"), encoding="utf-8-sig").read()
+    assert "$wheelName = [System.IO.Path]::GetFileName(([Uri]$wheelUrl).AbsolutePath)" in ps
+    assert '$wheelName = "comfyfed-$latestVersion-py3-none-any.whl"' in ps
+    assert "$wheelFile = Join-Path $env:TEMP $wheelName" in ps

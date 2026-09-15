@@ -166,7 +166,16 @@ $wheelUrl = $wheelUrlProp.Value
 if ($wheelUrl -notmatch '^https?://') {
     $wheelUrl = "$PlatformUrl$wheelUrl"
 }
-$wheelFile = Join-Path $env:TEMP ([System.IO.Path]::GetFileName(([Uri]$wheelUrl).AbsolutePath))
+# pip validates the wheel FILENAME (PEP 427), not just the bytes, so keep the
+# platform's real name and fall back to the conventional pure-Python name
+# when the URL carries no usable one (parity with install.sh).
+$wheelName = [System.IO.Path]::GetFileName(([Uri]$wheelUrl).AbsolutePath)
+if ($wheelName -notmatch '^[^-]+-[^-]+(-[^-]+)?-[^-]+-[^-]+-[^-]+\.whl$') {
+    $latestProp = $versionInfo.PSObject.Properties['latest']
+    $latestVersion = if ($null -ne $latestProp -and $latestProp.Value) { $latestProp.Value } else { '0' }
+    $wheelName = "comfyfed-$latestVersion-py3-none-any.whl"
+}
+$wheelFile = Join-Path $env:TEMP $wheelName
 
 Write-Bilingual '下載 agent wheel...' 'Downloading agent wheel...'
 try {
