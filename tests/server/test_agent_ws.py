@@ -3147,6 +3147,67 @@ def test_a_failed_child_cancels_its_sibling_and_tells_that_worker(client):
     assert sibling.worker_id is None
 
 
+def test_a_failed_childs_cascaded_sibling_gets_a_cancelled_receipt(client):
+    """一致性裁決：被**失敗**連坐取消的兄弟，如果取消當下正在跑，也要拿到一張
+    non-billable 的 `cancelled` 收據 —— 和取消父 job 那條路徑同一個 helper、
+    同一個 wall-clock 基準。失敗的那一個自己照舊拿 `failed` 收據。
+    """
+    csrf = _login(client)
+    worker_a, sk_a = _register_worker(client, csrf, "wa")
+    worker_b, sk_b = _register_worker(client, csrf, "wb")
+    child_ids = _make_split_family("p_fail_rcpt", [worker_a, worker_b])
+    # `_make_split_family` 直接寫 DB，沒有 `started_at`；沒有它兩邊都不算
+    # 「真的燒過 GPU」，收據語意就不成立。
+    for child_id in child_ids:
+        _backdate_started_at(child_id, hours=1)
+
+    ws_a = _connect(client, worker_a, sk_a)
+    ws_b = _connect(client, worker_b, sk_b)
+    try:
+        _send_hello_v2(ws_a)
+        _send_hello_v2(ws_b)
+        ws_a.send_json(
+            {"type": "job_failed", "job_id": child_ids[0], "error": "CUDA OOM", "exec_seconds": 3.0}
+        )
+        assert client.get("/api/jobs/p_fail_rcpt", headers={"X-CSRF": csrf}).status_code == 200
+
+        # 非阻塞斷言在前：兄弟那張收據已經寫下去了嗎？迴歸時這裡立刻失敗，
+        # 而不是卡在下面那個永遠不會來的 frame 上（Task 6 報告的同一個教訓）。
+        # 只看兄弟那一張：失敗者自己的 `failed` 收據是在 panel 通知**之後**
+        # 才 mint 的，這個 HTTP 屏障不保證它已經落地（整個檔案一起跑時會race）
+        # —— 它由下面的 frame 與收尾的 DB 斷言負責。
+        with db.get_session() as session:
+            minted = {r.job_id: (r.kind, r.worker_id) for r in session.query(db.Receipt).all()}
+        assert minted.get(child_ids[1]) == ("cancelled", worker_b)
+
+        # 兄弟：先 job_cancelled，再它自己那張 cancelled 收據。
+        assert ws_b.receive_json() == {"type": "job_cancelled", "job_id": child_ids[1]}
+        sibling_frame = ws_b.receive_json()
+        assert sibling_frame["type"] == "receipt"
+        assert sibling_frame["kind"] == "cancelled"
+        assert sibling_frame["billable"] is False
+        assert sibling_frame["basis"] == "wall"
+        # 失敗的那一個：照舊是 failed 收據，一行都沒變。
+        failed_frame = ws_a.receive_json()
+        assert failed_frame["type"] == "receipt"
+        assert failed_frame["kind"] == "failed"
+        assert failed_frame["billable"] is False
+    finally:
+        ws_a.close()
+        ws_b.close()
+
+    with db.get_session() as session:
+        receipts = session.query(db.Receipt).all()
+    by_job = {r.job_id: r for r in receipts}
+    assert set(by_job) == set(child_ids)  # 父 job 零張
+    assert by_job[child_ids[0]].kind == "failed"
+    assert by_job[child_ids[0]].worker_id == worker_a
+    assert by_job[child_ids[1]].kind == "cancelled"
+    assert by_job[child_ids[1]].billable is False
+    assert by_job[child_ids[1]].worker_id == worker_b
+    assert by_job[child_ids[1]].gpu_seconds > 0
+
+
 def test_child_heartbeat_progress_drives_the_parent_progress(client):
     """§3.4：父 job 的 progress 是子 job 的平均，靠子 job 的心跳推動。"""
     csrf = _login(client)

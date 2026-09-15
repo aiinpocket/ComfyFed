@@ -511,6 +511,9 @@ async def _handle_message(worker_id: str, conn: _Connection, message: dict) -> N
                 cancelled_owners=cascade_cancelled,
             ):
                 await _push_cascade_cancellations(cascade_cancelled)
+                # 一致性：被失敗連坐取消的兄弟和被 admin 取消的子 job 一樣真的
+                # 燒過 GPU，所以取消當下在跑的那些照樣拿一張 cancelled 收據。
+                await _mint_cascade_cancelled_receipts(cascade_cancelled)
                 _clear_fetch_progress(job_id)
                 await panelws.job_failed(job_id, error)
                 exec_seconds = message.get("exec_seconds")

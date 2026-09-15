@@ -2,7 +2,7 @@ import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import { env, runDurableObjectAlarm, runInDurableObject } from "cloudflare:test";
 import { toSqliteTimestamp, getJobById, getReceiptsForJob, getWorkerById } from "../src/db/queries";
 import { signHex } from "../src/lib/ed25519";
-import { connectAgent, expectNoMessage, hub, nextMessage, openAgentWs, waitForClose } from "./helpers/ws";
+import { collectMessages, connectAgent, expectNoMessage, hub, nextMessage, openAgentWs, waitForClose } from "./helpers/ws";
 import * as split from "../src/core/split";
 import golden from "./fixtures/golden.json";
 
@@ -987,6 +987,63 @@ describe("split families (§3.4/§3.6)", () => {
     expect(sibling.error).toBe("sibling failed");
     expect(sibling.workerId).toBeNull();
     expect(sibling.lastWorkerId).toBe(workerB);
+  });
+
+  it("a failed child's cascade-cancelled sibling gets a cancelled receipt", async () => {
+    // 一致性裁決：被**失敗**連坐取消的兄弟，如果取消當下正在跑，也要拿到一張
+    // non-billable 的 `cancelled` 收據 —— 和取消父 job 那條路徑同一個 helper、
+    // 同一個 wall-clock 基準。失敗的那一個自己照舊拿 `failed` 收據。
+    const [kpA, kpB] = [KEYPAIRS[0]!, KEYPAIRS[1]!];
+    const workerA = await makeWorker({ pubkeyHex: kpA.pubkey_hex });
+    const workerB = await makeWorker({ pubkeyHex: kpB.pubkey_hex });
+    const { parentId, childIds } = await makeSplitFamily([workerA, workerB]);
+    // makeSplitFamily 直接寫 DB，沒有 started_at；沒有它兩邊都不算「真的燒過
+    // GPU」，收據語意就不成立。
+    const startedAt = toSqliteTimestamp(new Date(Date.now() - 3_600_000));
+    for (const childId of childIds) {
+      await db().prepare("UPDATE jobs SET started_at = ? WHERE id = ?").bind(startedAt, childId).run();
+    }
+
+    const wsB = await connectAgent(workerB, kpB.seed_hex);
+    const wsA = await connectAgent(workerA, kpA.seed_hex);
+    wsA.send(JSON.stringify({ type: "hello", protocol: 2 }));
+    wsB.send(JSON.stringify({ type: "hello", protocol: 2 }));
+    try {
+      // 兩個 frame（job_cancelled 然後 receipt）要用同一個 listener 收，
+      // 連續兩次 nextMessage 會把空隙裡到達的那個弄丟（見 helpers/ws.ts）。
+      const gotB = collectMessages(wsB, 2);
+      const gotA = nextMessage(wsA);
+      wsA.send(JSON.stringify({ type: "job_failed", job_id: childIds[0], error: "CUDA OOM" }));
+
+      const framesB = await gotB;
+      expect(framesB[0]).toEqual({ type: "job_cancelled", job_id: childIds[1] });
+      expect(framesB[1].type).toBe("receipt");
+      expect(framesB[1].kind).toBe("cancelled");
+      expect(framesB[1].billable).toBe(false);
+      expect(framesB[1].basis).toBe("wall");
+      // 失敗的那一個：照舊是 failed 收據，一行都沒變。
+      const frameA = await gotA;
+      expect(frameA.type).toBe("receipt");
+      expect(frameA.kind).toBe("failed");
+      expect(frameA.billable).toBe(false);
+    } finally {
+      wsA.close();
+      wsB.close();
+    }
+
+    const failedReceipts = await getReceiptsForJob(db(), childIds[0]!);
+    expect(failedReceipts).toHaveLength(1);
+    expect(failedReceipts[0]!.kind).toBe("failed");
+    expect(failedReceipts[0]!.workerId).toBe(workerA);
+
+    const siblingReceipts = await getReceiptsForJob(db(), childIds[1]!);
+    expect(siblingReceipts).toHaveLength(1);
+    expect(siblingReceipts[0]!.kind).toBe("cancelled");
+    expect(siblingReceipts[0]!.billable).toBe(false);
+    expect(siblingReceipts[0]!.workerId).toBe(workerB);
+    expect(siblingReceipts[0]!.gpuSeconds).toBeGreaterThan(0);
+    // 父 job 自己從來沒有 started_at -> 零張。
+    expect(await getReceiptsForJob(db(), parentId)).toHaveLength(0);
   });
 
   it("a child's heartbeat progress drives the parent's progress (§3.4 mean)", async () => {

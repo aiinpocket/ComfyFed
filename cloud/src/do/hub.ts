@@ -1348,6 +1348,9 @@ export class Hub extends DurableObject<Env> {
 
     if (applied) {
       await this.pushCascadeCancellations(cascadeCancelled);
+      // 一致性：被失敗連坐取消的兄弟和被 admin 取消的子 job 一樣真的燒過 GPU，
+      // 所以取消當下在跑的那些照樣拿一張 cancelled 收據。
+      await this.mintCascadeCancelledReceipts(cascadeCancelled, now);
       this.fetchProgress.delete(jobId!);
       await this.panelJobFailed(jobId!, error);
       const execSeconds = isValidExecSeconds(msg.exec_seconds) ? msg.exec_seconds : null;
