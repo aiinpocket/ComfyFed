@@ -398,7 +398,7 @@ def create_router(data_dir: str) -> APIRouter:
         return {"ok": True}
 
     @r.get("/api/workers")
-    def list_workers(_payload: dict = Depends(auth.require_admin)):
+    def list_workers(_user: auth.SessionUser = Depends(auth.require_user)):
         with db.get_session() as session:
             # Soft-deleted workers are gone as far as every user-visible
             # surface is concerned (see `db.Worker.deleted`); only the
@@ -421,8 +421,12 @@ def create_router(data_dir: str) -> APIRouter:
                     "model_count": len(_json_or(w.model_inventory, [])),
                     # Phase 3.1 P2P: set from the agent's `hello.peer_url`
                     # when it opts into serving chunks to other workers (see
-                    # agentws._parse_peer_url). Admin-only page, so exposing
-                    # a LAN address here is not a privacy concern.
+                    # agentws._parse_peer_url). Readable by any logged-in user
+                    # now (see require_user above): workers are SHARED
+                    # infrastructure, so a peer address is fleet metadata every
+                    # user's own workflows already resolve chunks against, not
+                    # per-user private data. Mutations (token issue, disable,
+                    # delete) stay admin-only on their own routes.
                     "peer_url": w.peer_url,
                 }
                 for w in workers

@@ -59,7 +59,7 @@ import { boundedGunzip, ObjectInfoTooLarge, InvalidGzip } from "../lib/gzip";
 import { sha256Hex } from "../lib/hex";
 import { bytesToBase64Url } from "../lib/base64";
 import { verifyAgentRequest, type VerifyAgentResult } from "../lib/verify_agent";
-import { requireAdmin, requireCsrf, errorJson } from "../lib/guard";
+import { requireAdmin, requireCsrf, requireUser, errorJson } from "../lib/guard";
 import * as modelManifest from "../core/model_manifest";
 
 const PLATFORM_URL_KEY = "platform_url";
@@ -253,7 +253,7 @@ app.post("/api/agent/object_info", async (c) => {
 
 // --- GET /api/workers ---------------------------------------------------------
 
-app.get("/api/workers", requireAdmin, async (c) => {
+app.get("/api/workers", requireUser, async (c) => {
   const workers = await getAllWorkers(c.env.DB);
   const rows = await Promise.all(
     workers.map(async (w) => ({
@@ -269,8 +269,10 @@ app.get("/api/workers", requireAdmin, async (c) => {
       model_count: w.modelInventory.length,
       // Phase 3.1 P2P: set from the agent's `hello.peer_url` when peer_serve
       // is enabled and advertise_host is configured (see do/hub.ts's
-      // handleHello / parsePeerUrl). Admin-only page, so exposing it here is
-      // fine.
+      // handleHello / parsePeerUrl). Readable by any logged-in user now (see
+      // requireUser above): workers are SHARED infrastructure, so a peer
+      // address is fleet metadata, not per-user private data. Mutations
+      // (token issue, disable, delete) stay admin-only on their own routes.
       peer_url: w.peerUrl,
     }))
   );

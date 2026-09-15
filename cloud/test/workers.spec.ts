@@ -33,6 +33,20 @@ async function adminSession(): Promise<{ cookie: string | null; csrf: string }> 
   return { cookie: login.setCookie, csrf: login.body.csrf };
 }
 
+/** Create a non-admin `user` account (via the admin) and log it in, returning
+ * its session cookie + CSRF -- the same pattern the DELETE non-admin test uses,
+ * hoisted here so the read-vs-mutate role split can reuse it. */
+async function userSession(username = "bob"): Promise<{ cookie: string | null; csrf: string }> {
+  const { cookie, csrf } = await adminSession();
+  await call("/api/users", {
+    json: { username, role: "user", password: "a-long-password1" },
+    cookie,
+    headers: { "X-CSRF": csrf },
+  });
+  const login = await call("/api/auth/login", { json: { username, password: "a-long-password1" } });
+  return { cookie: login.setCookie, csrf: login.body.csrf };
+}
+
 async function issueToken(name = "gpu-box"): Promise<{ token: string; platformPubkey: string }> {
   const { cookie, csrf } = await adminSession();
   const r = await call("/api/workers/tokens", { json: { name }, cookie, headers: { "X-CSRF": csrf } });
@@ -124,6 +138,12 @@ describe("POST /api/workers/tokens", () => {
     const r1 = await call("/api/workers/tokens", { json: { name: "a" }, cookie, headers: { "X-CSRF": csrf } });
     const r2 = await call("/api/workers/tokens", { json: { name: "b" }, cookie, headers: { "X-CSRF": csrf } });
     expect(r1.body.bundle.platform_pubkey).toBe(r2.body.bundle.platform_pubkey);
+  });
+
+  it("403s for a logged-in non-admin (token issuance stays admin-only)", async () => {
+    const { cookie, csrf } = await userSession();
+    const r = await call("/api/workers/tokens", { json: { name: "x" }, cookie, headers: { "X-CSRF": csrf } });
+    expect(r.status).toBe(403);
   });
 });
 
@@ -507,6 +527,14 @@ describe("GET /api/workers", () => {
     expect(r.body[0].last_seen).toBeNull();
   });
 
+  it("lets a logged-in non-admin user list the fleet (read-only, shared infra)", async () => {
+    const worker = await registerWorker("shared-box");
+    const { cookie } = await userSession();
+    const r = await call("/api/workers", { method: "GET", cookie });
+    expect(r.status).toBe(200);
+    expect(r.body.map((x: any) => x.id)).toContain(worker.workerId);
+  });
+
   it("reports peer_url when the worker advertises one, and null otherwise (Phase 3.1 P2P)", async () => {
     const seeding = await registerWorker("seeding-box");
     await db().prepare("UPDATE workers SET peer_url = ? WHERE id = ?").bind("http://192.168.1.5:8850", seeding.workerId).run();
@@ -553,6 +581,17 @@ describe("POST /api/workers/:id/disable", () => {
     const worker = await registerWorker();
     const { cookie } = await adminSession();
     const r = await call(`/api/workers/${worker.workerId}/disable`, { method: "POST", cookie });
+    expect(r.status).toBe(403);
+  });
+
+  it("403s for a logged-in non-admin (disable stays admin-only)", async () => {
+    const worker = await registerWorker();
+    const { cookie, csrf } = await userSession();
+    const r = await call(`/api/workers/${worker.workerId}/disable`, {
+      method: "POST",
+      cookie,
+      headers: { "X-CSRF": csrf },
+    });
     expect(r.status).toBe(403);
   });
 

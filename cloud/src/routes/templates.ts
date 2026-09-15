@@ -79,7 +79,7 @@
 
 import { Hono } from "hono";
 import type { Env } from "../env";
-import { requireAdmin } from "../lib/guard";
+import { requireUser } from "../lib/guard";
 import { stagingKey, SHARED_STAGING_UID } from "../lib/store";
 import { OFFICIAL_TEMPLATES_PREFIX } from "../core/model_guide";
 
@@ -365,7 +365,11 @@ async function seedStagingOnce(env: Env): Promise<void> {
 
 const app = new Hono<{ Bindings: Env }>();
 
-app.use("/comfy/templates/*", requireAdmin);
+// Any logged-in user may load templates, matching the Python stack (whose
+// template route carries no gate of its own and relies on the /comfy session
+// gate, which admits any authenticated user). Was requireAdmin, which both
+// blocked users from templates entirely and diverged from the Python twin.
+app.use("/comfy/templates/*", requireUser);
 
 app.get("/comfy/templates/:filename", async (c) => {
   const filename = c.req.param("filename");

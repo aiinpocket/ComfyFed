@@ -126,8 +126,9 @@ def test_list_workers_shows_registered_worker(client):
 
 def test_list_workers_exposes_peer_url(client):
     """Task 7: `/api/workers` serialization gains `peer_url` (null until the
-    agent's `hello.peer_url` sets it -- see agentws._parse_peer_url).
-    Admin-only page, so no privacy concern surfacing it here."""
+    agent's `hello.peer_url` sets it -- see agentws._parse_peer_url). Readable
+    by any logged-in user now (require_user); workers are shared infrastructure,
+    so a peer address is fleet metadata, not per-user private data."""
     csrf = _login(client)
     r = client.post(
         "/api/workers/tokens",
@@ -153,6 +154,59 @@ def test_list_workers_exposes_peer_url(client):
     listed_after = client.get("/api/workers", headers={"X-CSRF": csrf}).json()
     worker_after = next(w for w in listed_after if w["id"] == worker_id)
     assert worker_after["peer_url"] == "http://192.168.1.5:8850"
+
+
+def _login_as_new_user(client, admin_csrf, username):
+    """Create a non-admin `user` (as the current admin) then log in as them.
+
+    The TestClient shares one cookie jar, so this REPLACES the admin session
+    with the new user's -- do any admin-only setup (worker registration) BEFORE
+    calling this."""
+    created = client.post(
+        "/api/users",
+        json={"username": username, "role": "user", "password": "s3cret-password"},
+        headers={"X-CSRF": admin_csrf},
+    )
+    assert created.status_code == 200
+    client.post("/api/auth/logout", headers={"X-CSRF": admin_csrf})
+    login = client.post(
+        "/api/auth/login", json={"username": username, "password": "s3cret-password"}
+    )
+    assert login.status_code == 200
+    return login.json()["csrf"]
+
+
+def test_list_workers_allows_non_admin_user(client):
+    """`GET /api/workers` is a read-only fleet listing any logged-in user may
+    load (workers are shared infrastructure) -- changed from require_admin to
+    require_user. Register a worker as admin, then read the list as a plain
+    user: 200 with the worker present. The mutation routes stay admin-only
+    (see the 403 tests below)."""
+    csrf = _login(client)
+    worker_id = _register(client, csrf, "shared-box", "11" * 32)
+    _login_as_new_user(client, csrf, "reader")
+
+    listed = client.get("/api/workers")
+    assert listed.status_code == 200
+    assert any(w["id"] == worker_id for w in listed.json())
+
+
+def test_issue_token_requires_admin_role(client):
+    """Token issuance stays admin-only: a logged-in non-admin with a valid CSRF
+    still gets 403 (route hangs off require_csrf -> require_admin)."""
+    csrf = _login(client)
+    user_csrf = _login_as_new_user(client, csrf, "reader-token")
+    r = client.post("/api/workers/tokens", json={"name": "x"}, headers={"X-CSRF": user_csrf})
+    assert r.status_code == 403
+
+
+def test_disable_worker_requires_admin_role(client):
+    """Disable stays admin-only for a logged-in non-admin with a valid CSRF."""
+    csrf = _login(client)
+    worker_id = _register(client, csrf, "worker-dis-role", "22" * 32)
+    user_csrf = _login_as_new_user(client, csrf, "reader-disable")
+    r = client.post(f"/api/workers/{worker_id}/disable", headers={"X-CSRF": user_csrf})
+    assert r.status_code == 403
 
 
 def test_disable_worker(client):

@@ -22,6 +22,20 @@ async function loginSession(): Promise<{ cookie: string | null; csrf: string }> 
   return { cookie: login.setCookie, csrf: login.body.csrf };
 }
 
+/** Create a non-admin `user` account (via the admin) and log it in. Templates
+ * are now open to any logged-in user (requireUser), matching the Python stack;
+ * this drives the non-admin path that used to 403 under requireAdmin. */
+async function userSession(username = "bob"): Promise<{ cookie: string | null; csrf: string }> {
+  const { cookie, csrf } = await loginSession();
+  await call("/api/users", {
+    json: { username, role: "user", password: "a-long-password1" },
+    cookie,
+    headers: { "X-CSRF": csrf },
+  });
+  const login = await call("/api/auth/login", { json: { username, password: "a-long-password1" } });
+  return { cookie: login.setCookie, csrf: login.body.csrf };
+}
+
 function store(): R2Bucket {
   return (env as any).STORE as R2Bucket;
 }
@@ -192,16 +206,17 @@ describe("recursive strip parity (stripDownloadMetadata)", () => {
 
 // ---------------------------------------------------------------------------
 
-describe("auth gating -- requireAdmin covers every /comfy/templates/* shape (review round 1, m2)", () => {
+describe("auth gating -- session gate covers every /comfy/templates/* shape (review round 1, m2)", () => {
   // Task 11 added a global `/comfy/*` session gate (src/lib/gate.ts,
   // mirroring app.py's `_comfy_session_gate`) that now runs BEFORE these
   // routes: `/comfy/templates/*` is not under `/comfy/api/*`, so an
   // unauthenticated request is redirected (302) by the gate itself, the
   // same as any other non-API `/comfy` path -- exact parity with Python,
   // where this route sits behind the same middleware. This route's own
-  // `requireAdmin` (below) is still real and still exercised once
-  // authenticated; it's just no longer the FIRST thing an unauthenticated
-  // request hits.
+  // `requireUser` (below) is still real and still exercised once
+  // authenticated (ANY logged-in user, matching the Python stack -- see the
+  // "non-admin template access" block); it's just no longer the FIRST thing
+  // an unauthenticated request hits.
   it("redirects (gate) a media path with no session", async () => {
     // Seeded (unauthenticated) so a 200 would be possible if some gate were
     // missing -- proves the 302 is a real gate, not just a 404.
@@ -282,6 +297,24 @@ describe("ASSETS-served packaged path (test/fixtures/assets/comfyfed_templates/)
     const { cookie } = await loginSession();
     const r = await call("/comfy/templates/comfyfed-nonexistent-fixture.json", { cookie });
     expect(r.status).toBe(404);
+  });
+});
+
+describe("non-admin template access (users get templates too, parity with Python)", () => {
+  it("serves a workflow template to a logged-in non-admin (was 403 under requireAdmin)", async () => {
+    await putPackagedJson("comfyfed-wuxia-t2i.json", FLUX_WORKFLOW);
+    const { cookie } = await userSession();
+    const r = await call("/comfy/templates/comfyfed-wuxia-t2i.json", { cookie });
+    expect(r.status).toBe(200);
+    expect(r.body).toEqual(FLUX_WORKFLOW);
+  });
+
+  it("serves the merged index.json to a logged-in non-admin", async () => {
+    await putPackagedJson("index.json", [COMFYFED_CATEGORY]);
+    const { cookie } = await userSession();
+    const r = await call("/comfy/templates/index.json", { cookie });
+    expect(r.status).toBe(200);
+    expect(r.body).toEqual([COMFYFED_CATEGORY]);
   });
 });
 
