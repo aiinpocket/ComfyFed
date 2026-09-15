@@ -59,6 +59,23 @@ def test_publish_agent_honours_explicit_version_bounds(data_dir, wheel):
     assert published["agent_min_supported"] == "0.2.0"
 
 
+def test_agent_version_serves_wheel_url_as_an_absolute_url(data_dir, wheel):
+    """publish_agent stores the wheel path RELATIVE to the platform
+    ("/api/agent/releases/<file>"); GET /api/agent/version must serve it
+    ABSOLUTE (prefixed with the configured platform_url -- "http://h" from
+    the fixture's bootstrap). The agent's self-updater hands wheel_url
+    straight to its HTTP client, and a bare path is unfetchable: that is
+    exactly why every in-place update against a relative-serving platform
+    failed with "Failed to download wheel" (live-caught on the cloud twin)."""
+    published = main.publish_agent(data_dir, wheel)
+    assert published["agent_wheel_url"].startswith("/api/agent/releases/")  # stored: still relative
+
+    server = TestClient(app_module.create_app(data_dir))
+    body = server.get("/api/agent/version").json()
+    assert body["wheel_url"] == "http://h" + published["agent_wheel_url"]
+    assert body["wheel_url"].startswith("http://h/api/agent/releases/")
+
+
 def test_publish_agent_keeps_min_supported_on_a_later_publish(data_dir, wheel):
     """Owner policy: min_supported must not ratchet up automatically just
     because a newer `latest` was published."""

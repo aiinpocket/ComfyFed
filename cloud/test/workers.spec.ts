@@ -649,6 +649,22 @@ describe("agent releases (cloud publish-agent parity)", () => {
     return { cookie, csrf, body: r.body, status: r.status };
   }
 
+  it("GET /api/agent/version serves wheel_url as an ABSOLUTE URL prefixed with platform_url", async () => {
+    const { cookie, csrf } = await publish();
+    await call("/api/settings", {
+      json: { platform_url: "https://fed.example" },
+      cookie,
+      headers: { "X-CSRF": csrf },
+    });
+    const version = await call("/api/agent/version", { method: "GET" });
+    expect(version.status).toBe(200);
+    expect(version.body.wheel_url).toBe(`https://fed.example/api/agent/releases/${FILENAME}`);
+    // The stored setting itself stays relative -- only the served value is
+    // absolutised, so a later platform_url change is reflected immediately.
+    const stored = await db().prepare("SELECT value FROM settings WHERE key = 'agent_wheel_url'").first<{ value: string }>();
+    expect(stored!.value).toBe(`/api/agent/releases/${FILENAME}`);
+  });
+
   /** Same as `publish()` but with a caller-chosen filename/query string, for
    * the min_supported-policy cases below (they need distinct `latest`
    * versions across calls, e.g. "0.1.0" then "0.2.0"). */
@@ -683,7 +699,10 @@ describe("agent releases (cloud publish-agent parity)", () => {
 
     const version = await call("/api/agent/version");
     expect(version.body.latest).toBe("9.9.9");
-    expect(version.body.wheel_url).toBe(`/api/agent/releases/${FILENAME}`);
+    // Absolute, never the bare stored path: a bare path is not something an
+    // agent can GET (live-caught -- every self-update failed on it). With no
+    // platform_url configured the endpoint prefixes the request's own origin.
+    expect(version.body.wheel_url).toMatch(new RegExp(`^https?://[^/]+/api/agent/releases/${FILENAME}$`));
     expect(version.body.sha256).toBe(body.agent_wheel_sha256);
   });
 

@@ -440,10 +440,25 @@ def create_router(data_dir: str) -> APIRouter:
                 row = session.get(db.Setting, key)
                 return row.value if row is not None else default
 
+            # A stored RELATIVE wheel path ("/api/agent/releases/<file>") is
+            # not something an agent can GET: its self-updater hands
+            # `wheel_url` straight to its HTTP client, so every in-place
+            # update failed with "Failed to download wheel" and the old build
+            # kept running (live-caught on the cloud twin, which stores a
+            # relative path). Serve an ABSOLUTE URL by prefixing the
+            # configured platform_url; older agents -- the very ones that
+            # must be able to update -- cannot join the path themselves, so
+            # this is the platform's job. Left untouched only when
+            # platform_url is unset (nothing sane to prefix).
+            wheel_url = _setting(_AGENT_WHEEL_URL_KEY, None)
+            if wheel_url and not wheel_url.lower().startswith(("http://", "https://")):
+                platform_url = (_setting(_PLATFORM_URL_KEY, "") or "").rstrip("/")
+                if platform_url:
+                    wheel_url = platform_url + ("" if wheel_url.startswith("/") else "/") + wheel_url
             return {
                 "latest": _setting(_AGENT_LATEST_KEY, _AGENT_VERSION_DEFAULT),
                 "min_supported": _setting(_AGENT_MIN_SUPPORTED_KEY, _AGENT_VERSION_DEFAULT),
-                "wheel_url": _setting(_AGENT_WHEEL_URL_KEY, None),
+                "wheel_url": wheel_url,
                 "sha256": _setting(_AGENT_WHEEL_SHA256_KEY, None),
                 "platform_sig": _setting(_AGENT_WHEEL_SIG_KEY, None),
             }

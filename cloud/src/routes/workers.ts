@@ -283,10 +283,25 @@ app.get("/api/workers", requireUser, async (c) => {
 
 app.get("/api/agent/version", async (c) => {
   const setting = async (key: string, fallback: string | null) => (await getSetting(c.env.DB, key)) ?? fallback;
+  // The publish route stores a RELATIVE wheel path ("/api/agent/releases/
+  // <file>"). The agent's self-updater hands `wheel_url` straight to its
+  // HTTP client, and a bare path is not a fetchable URL -- so every
+  // in-place update ever attempted against this stack failed with
+  // "Failed to download wheel" and the agent kept running its old build
+  // (live-caught). Serve an ABSOLUTE URL: prefix the configured
+  // platform_url, else this request's own origin. Older agents (whose
+  // updater cannot join a relative path itself) are exactly the ones that
+  // must be able to update, so this is the platform's job, not theirs.
+  const storedWheelUrl = await setting(AGENT_WHEEL_URL_KEY, null);
+  let wheelUrl: string | null = storedWheelUrl;
+  if (wheelUrl && !/^https?:\/\//i.test(wheelUrl)) {
+    const platformUrl = ((await setting("platform_url", null)) ?? new URL(c.req.url).origin).replace(/\/+$/, "");
+    wheelUrl = platformUrl + (wheelUrl.startsWith("/") ? "" : "/") + wheelUrl;
+  }
   return c.json({
     latest: await setting(AGENT_LATEST_KEY, AGENT_VERSION_DEFAULT),
     min_supported: await setting(AGENT_MIN_SUPPORTED_KEY, AGENT_VERSION_DEFAULT),
-    wheel_url: await setting(AGENT_WHEEL_URL_KEY, null),
+    wheel_url: wheelUrl,
     sha256: await setting(AGENT_WHEEL_SHA256_KEY, null),
     platform_sig: await setting(AGENT_WHEEL_SIG_KEY, null),
   });

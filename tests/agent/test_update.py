@@ -189,6 +189,49 @@ def test_apply_update_good_signature_installs_and_restarts():
     assert restart_calls == [True]
 
 
+def test_apply_update_joins_a_relative_wheel_url_onto_the_platform_url():
+    """Live-caught: the cloud platform advertises the wheel as a path
+    relative to itself ("/api/agent/releases/<file>"), and apply_update
+    handed that bare path straight to the HTTP client -- an unfetchable URL,
+    so every self-update silently failed with "Failed to download wheel"
+    and the old build kept running. A relative wheel_url must be joined
+    onto the entry's pinned platform_url; an absolute one passes through."""
+    signing_key = SigningKey.generate()
+    entry = _entry(platform_pubkey=bytes(signing_key.verify_key).hex())
+
+    wheel_bytes = b"fake wheel contents"
+    sha256 = hashlib.sha256(wheel_bytes).hexdigest()
+    good_sig = signing_key.sign(f"0.2.0|{sha256}".encode()).signature.hex()
+
+    decision = UpdateDecision(
+        action="update",
+        latest="0.2.0",
+        min_supported="0.1.0",
+        wheel_url="/api/agent/releases/agent-0.2.0.whl",  # RELATIVE, as the cloud serves it
+        sha256=sha256,
+        platform_sig=good_sig,
+    )
+
+    requested: list[str] = []
+
+    class _RecordingClient:
+        def get(self, url):
+            requested.append(url)
+            return _FakeResponse(content=wheel_bytes)
+
+    ok = apply_update(
+        entry,
+        decision,
+        _RecordingClient(),
+        pip_install=lambda path: None,
+        restart=lambda: None,
+    )
+
+    assert ok is True
+    assert requested == [entry.platform_url.rstrip("/") + "/api/agent/releases/agent-0.2.0.whl"]
+    assert requested[0].startswith("http")
+
+
 def test_apply_update_pip_install_raises_returns_false_and_no_restart():
     import subprocess
 

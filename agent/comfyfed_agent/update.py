@@ -138,12 +138,20 @@ def apply_update(
         logger.warning("Update decision missing wheel_url/sha256/platform_sig; refusing to update.")
         return False
 
+    # The platform may advertise the wheel as a path relative to itself
+    # ("/api/agent/releases/<file>"); a bare path is not a fetchable URL and
+    # was silently failing every self-update against such a platform
+    # (live-caught). Join it onto the pinned platform_url; an absolute URL
+    # passes through untouched.
+    wheel_url = decision.wheel_url
+    if not wheel_url.lower().startswith(("http://", "https://")):
+        wheel_url = entry.platform_url.rstrip("/") + ("" if wheel_url.startswith("/") else "/") + wheel_url
     try:
-        resp = client.get(decision.wheel_url)
+        resp = client.get(wheel_url)
         resp.raise_for_status()
         wheel_bytes = resp.content
     except Exception:
-        logger.warning("Failed to download wheel from %s.", decision.wheel_url)
+        logger.warning("Failed to download wheel from %s.", wheel_url)
         return False
 
     digest = hashlib.sha256(wheel_bytes).hexdigest()
