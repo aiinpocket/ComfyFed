@@ -58,6 +58,7 @@ import * as dispatch from "../core/dispatch";
 import * as assess from "../core/assess";
 import type { FetchableModels } from "../core/assess";
 import * as modelManifest from "../core/model_manifest";
+import * as stats from "../core/stats";
 import { toSqliteTimestamp, resolvePlatformSeed } from "../db/queries";
 import { buildReceiptPayload, signReceipt, verifyHex } from "../lib/signing";
 import { bytesToHex } from "../lib/hex";
@@ -404,6 +405,10 @@ export class Hub extends DurableObject<Env> {
     string,
     { stage: string; fetchPct: number | null; fetchModel: string | null }
   >();
+
+  /** Phase 3.3 §2.6: 這個 DO instance 是否已經嘗試過統計回填。旗標本身存在
+   * D1（`stats.BACKFILL_SETTING_KEY`），這只是省掉每個 tick 一次讀取。 */
+  private statsBackfillDone = false;
 
   // -- fetch: HTTP entrypoints (WS upgrade + /internal/*) ------------------
 
@@ -1207,6 +1212,9 @@ export class Hub extends DurableObject<Env> {
       if (freshJob) await this.panelJobDone(freshJob);
 
       const execSeconds = isValidExecSeconds(msg.exec_seconds) ? msg.exec_seconds : null;
+      // Phase 3.3 §2.3：只有真的完成、且 exec_seconds 有效才進統計。放在收據
+      // 之前，因為 recordCompletion 自己吞例外 -- 統計壞掉絕不能少發一張收據。
+      await stats.recordCompletion(db, workerId, freshJob?.signature ?? null, execSeconds, now);
       await this.createAndPushReceipt(ws, attachment, jobId!, execSeconds, now);
     }
   }
@@ -1545,6 +1553,18 @@ export class Hub extends DurableObject<Env> {
     const db = this.env.DB;
     const now = new Date();
 
+    // Phase 3.3 §2.6：第一次 tick 時把 worker_job_stats 從最近 500 筆完成
+    // 收據補起來（`stats_backfilled` 旗標，跨 DO 重啟只會做一次）。
+    // `statsBackfillDone` 是 per-instance 的短路，避免每個 tick 都去讀旗標。
+    if (!this.statsBackfillDone) {
+      this.statsBackfillDone = true;
+      try {
+        await stats.backfillIfNeeded(db);
+      } catch (err) {
+        console.error("hub: stats backfill failed", err);
+      }
+    }
+
     let requeued: string[] = [];
     try {
       requeued = await dispatch.requeueStale(db, now);
@@ -1590,7 +1610,7 @@ export class Hub extends DurableObject<Env> {
     let fetchableModels: FetchableModels = {};
     let manifestByName = new Map<string, modelManifest.ManifestEntry>();
     let peerOnlyModels: ReadonlySet<string> = new Set();
-    const hasQueuedWork = idleWorkerIds.length > 0 && (await queries.getQueuedJobsOrderedByCreatedAt(db)).length > 0;
+    const hasQueuedWork = idleWorkerIds.length > 0 && (await queries.getQueuedJobsForDispatch(db)).length > 0;
     if (hasQueuedWork) {
       try {
         const seed = await resolvePlatformSeed(db, this.env.PLATFORM_ED25519_SEED);
@@ -1610,7 +1630,7 @@ export class Hub extends DurableObject<Env> {
 
     let assignments: dispatch.Assignment[] = [];
     try {
-      assignments = await dispatch.assignJobs(db, idleWorkerIds, fetchableModels, peerOnlyModels);
+      assignments = await dispatch.assignJobs(db, idleWorkerIds, fetchableModels, peerOnlyModels, now);
     } catch (err) {
       console.error("hub: assignJobs failed", err);
     }

@@ -111,7 +111,7 @@ from fastapi import APIRouter, WebSocket, WebSocketDisconnect
 from nacl.exceptions import BadSignatureError
 from nacl.signing import SigningKey, VerifyKey
 
-from . import assess, db, dispatch, metrics, model_manifest, panelws, security, workers
+from . import assess, db, dispatch, metrics, model_manifest, panelws, security, stats, workers
 
 logger = logging.getLogger(__name__)
 
@@ -704,6 +704,9 @@ async def _handle_job_done(worker_id: str, conn: "_Connection", message: dict) -
         exec_seconds = message.get("exec_seconds")
         if not _is_valid_exec_seconds(exec_seconds):
             exec_seconds = None
+        # Phase 3.3 §2.3：只有真的完成、且 exec_seconds 有效才進統計。
+        # 放在收據之前，因為它自己吞例外 -- 統計壞掉絕不能少發一張收據。
+        _record_job_stats(worker_id, job_id, exec_seconds)
         await _create_and_push_receipt(worker_id, conn, job_id, exec_seconds)
 
 
@@ -1180,6 +1183,27 @@ async def _push_receipt_frame(
         asyncio.run_coroutine_threadsafe(
             _send_receipt_frame(target, receipt_id, frame), target.loop
         ).result(timeout=5)
+
+
+def _record_job_stats(
+    worker_id: str, job_id: Optional[str], exec_seconds: Optional[float]
+) -> None:
+    """Phase 3.3 §2.3：把這次完成的執行秒數餵給 `stats.record_completion`。
+
+    只讀一次 job 拿 `signature`（`record_completion` 自己不認得 job）。整段
+    包在 try 裡，且 `record_completion` 內部也吞例外 -- 統計是附帶效果，
+    job_done 的主流程（面板事件、收據）絕不能因為它失敗。
+    """
+    if not job_id or not stats.is_valid_exec_seconds(exec_seconds):
+        return
+    try:
+        with db.get_session() as session:
+            job = session.get(db.Job, job_id)
+            signature = job.signature if job is not None else None
+    except Exception:
+        logger.exception("agentws: failed to read signature for job %s", job_id)
+        return
+    stats.record_completion(worker_id, signature, exec_seconds)
 
 
 async def _create_and_push_receipt(

@@ -863,6 +863,72 @@ def test_job_done_bills_exec_seconds_when_present_even_if_wall_clock_is_large(cl
         assert receipt_msg["payload"] == f"{job_id}|{worker_id}|2.0"
 
 
+def _job_signature(job_id):
+    with db.get_session() as session:
+        return session.get(db.Job, job_id).signature
+
+
+def test_job_done_records_worker_job_stats(client):
+    """Phase 3.3 §2.3: job_done 帶有效 exec_seconds 時，`worker_job_stats`
+    要長出一列（第一筆樣本的 EWMA 就是 exec_seconds 本身）。"""
+    csrf = _login(client)
+    worker_id, sk = _register_worker(client, csrf, "w1")
+    job_id = _submit(client, csrf)
+
+    with client.websocket_connect("/api/agent/ws") as ws:
+        challenge = ws.receive_json()
+        sig = sk.sign(challenge["nonce"].encode()).signature.hex()
+        ws.send_json({"type": "auth", "worker_id": worker_id, "sig": sig})
+        assert ws.receive_json()["type"] == "ready"
+
+        ws.send_json({"type": "heartbeat", "state": "idle", "progress": 0.0, "job_id": None, "dynamic": {}})
+        agentws.dispatch_once(worker_id)
+        assert ws.receive_json()["type"] == "job"
+
+        ws.send_json({"type": "heartbeat", "state": "busy", "progress": 0.0, "job_id": job_id, "dynamic": {}})
+        agentws.dispatch_once(worker_id)
+
+        ws.send_json(
+            {"type": "job_done", "job_id": job_id, "result_files": ["out.png"], "exec_seconds": 42.0}
+        )
+        agentws.dispatch_once(worker_id)
+        assert ws.receive_json()["type"] == "receipt"
+
+    with db.get_session() as session:
+        row = session.get(db.WorkerJobStats, (worker_id, _job_signature(job_id)))
+        assert row is not None
+        assert row.ewma_seconds == pytest.approx(42.0)
+        assert row.samples == 1
+
+
+def test_job_failed_does_not_record_stats(client):
+    """只有真的完成才進統計 -- 一次失敗的執行不是這個簽章的速度樣本。"""
+    csrf = _login(client)
+    worker_id, sk = _register_worker(client, csrf, "w1")
+    job_id = _submit(client, csrf)
+
+    with client.websocket_connect("/api/agent/ws") as ws:
+        challenge = ws.receive_json()
+        sig = sk.sign(challenge["nonce"].encode()).signature.hex()
+        ws.send_json({"type": "auth", "worker_id": worker_id, "sig": sig})
+        assert ws.receive_json()["type"] == "ready"
+
+        ws.send_json({"type": "heartbeat", "state": "idle", "progress": 0.0, "job_id": None, "dynamic": {}})
+        agentws.dispatch_once(worker_id)
+        assert ws.receive_json()["type"] == "job"
+
+        ws.send_json({"type": "heartbeat", "state": "busy", "progress": 0.0, "job_id": job_id, "dynamic": {}})
+        agentws.dispatch_once(worker_id)
+
+        ws.send_json(
+            {"type": "job_failed", "job_id": job_id, "error": "boom", "exec_seconds": 42.0}
+        )
+        agentws.dispatch_once(worker_id)
+
+    with db.get_session() as session:
+        assert session.query(db.WorkerJobStats).count() == 0
+
+
 def test_job_done_without_exec_seconds_falls_back_to_wall_clock(client, caplog):
     """Deliverable 3: a missing/invalid `exec_seconds` (older agent, or a
     ComfyUI whose /queue was unreachable) must fall back to the wall clock,

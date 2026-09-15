@@ -748,25 +748,46 @@ export async function retryFailedJob(db: D1Database, jobId: string): Promise<boo
   return (result.meta.changes ?? 0) === 1;
 }
 
-export async function getQueuedJobsOrderedByCreatedAt(db: D1Database): Promise<Job[]> {
+/** 派工專用的 queued 清單：排除 `split_count > 0` 的父 job -- 它的工作由子
+ * job 執行，父 job 本身永遠不該被指派給 worker（Phase 3.3 §2.5 第 2 步）。 */
+export async function getQueuedJobsForDispatch(db: D1Database): Promise<Job[]> {
   const { results } = await db
-    .prepare("SELECT * FROM jobs WHERE status = 'queued' ORDER BY created_at ASC, id ASC")
+    .prepare("SELECT * FROM jobs WHERE status = 'queued' AND split_count = 0 ORDER BY created_at ASC, id ASC")
     .all<JobRow>();
   return results.map(rowToJob);
 }
 
-/** Atomic claim: only flips `queued` -> `assigned` (and sets `worker_id`)
- * if the job is still queued at the moment the UPDATE runs. Returns whether
- * the claim succeeded (`meta.changes === 1`), mirroring
- * `dispatch.assign_jobs`'s `UPDATE ... WHERE status == "queued"` rowcount
- * check -- a job someone else claimed a moment ago is reported as a miss
- * rather than double-assigned. */
-export async function claimJob(db: D1Database, jobId: string, workerId: string): Promise<boolean> {
-  const result = await db
-    .prepare("UPDATE jobs SET status = 'assigned', worker_id = ? WHERE id = ? AND status = 'queued'")
-    .bind(workerId, jobId)
-    .run();
+/** Atomic claim: only flips `queued` -> `assigned` (and sets `worker_id`, plus
+ * Phase 3.3's `dispatch_info` when given) if the job is still queued at the
+ * moment the UPDATE runs. Returns whether the claim succeeded
+ * (`meta.changes === 1`), mirroring `dispatch.assign_jobs`'s
+ * `UPDATE ... WHERE status == "queued"` rowcount check -- a job someone else
+ * claimed a moment ago is reported as a miss rather than double-assigned. */
+export async function claimJob(
+  db: D1Database,
+  jobId: string,
+  workerId: string,
+  dispatchInfo?: string
+): Promise<boolean> {
+  const result =
+    dispatchInfo === undefined
+      ? await db
+          .prepare("UPDATE jobs SET status = 'assigned', worker_id = ? WHERE id = ? AND status = 'queued'")
+          .bind(workerId, jobId)
+          .run()
+      : await db
+          .prepare(
+            "UPDATE jobs SET status = 'assigned', worker_id = ?, dispatch_info = ? WHERE id = ? AND status = 'queued'"
+          )
+          .bind(workerId, dispatchInfo, jobId)
+          .run();
   return (result.meta.changes ?? 0) === 1;
+}
+
+/** Phase 3.3 §2.2: 記住這台 worker 最近一次被指派的 job 的 required_models，
+ * 供下一輪的熱快取親和使用。claim 成功當下就寫，不等 job 完成。 */
+export async function setWorkerWarmModels(db: D1Database, workerId: string, models: string[]): Promise<void> {
+  await db.prepare("UPDATE workers SET warm_models = ? WHERE id = ?").bind(JSON.stringify(models), workerId).run();
 }
 
 /** Atomic re-adoption claim: only flips `queued` -> `assigned` for

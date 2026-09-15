@@ -16,6 +16,8 @@ import * as queries from "../db/queries";
 import type { Job } from "../db/queries";
 import { toSqliteTimestamp } from "../db/queries";
 import { freeVramGb, needsFromJob, verdict, type FetchableModels } from "./assess";
+import * as scheduler from "./scheduler";
+import * as stats from "./stats";
 
 const STALE_SECONDS = 90;
 
@@ -40,49 +42,47 @@ export interface Assignment {
   job: Job;
 }
 
-/** Lexicographic tuple comparison over comparable primitives (numbers,
- * strings, or 0/1 for booleans) -- the TS stand-in for Python's tuple
- * `.sort()`, used to reproduce `assign_jobs`' ranking keys exactly. */
-function compareTuples(a: readonly (number | string)[], b: readonly (number | string)[]): number {
-  const len = Math.min(a.length, b.length);
-  for (let i = 0; i < len; i++) {
-    const av = a[i]!;
-    const bv = b[i]!;
-    if (av < bv) return -1;
-    if (av > bv) return 1;
-  }
-  return a.length - b.length;
+/** 一個 tick 最多評估這麼多件 queued job（外加所有已餓死的）。 */
+const MAX_JOBS_PER_TICK = 64;
+const JOBS_PER_IDLE_WORKER = 8;
+
+function dispatchInfoJson(
+  predictedSeconds: number,
+  basis: string,
+  loadSeconds: number,
+  fetchSeconds: number,
+  candidates: number
+): string {
+  const round3 = (v: number) => Math.round(v * 1000) / 1000;
+  return JSON.stringify({
+    predicted_seconds: round3(predictedSeconds),
+    basis,
+    load_seconds: round3(loadSeconds),
+    fetch_seconds: round3(fetchSeconds),
+    candidates,
+  });
 }
 
-/** Rank idle workers per queued job and atomically claim the best pair, one
- * job at a time, oldest job first. Ports `dispatch.assign_jobs` -- see its
- * docstring for the full ranking rationale, in two tiers:
+/**
+ * Phase 3.3 §2.5：整體配對。Ports `dispatch.assign_jobs` -- 見該 docstring 的
+ * 完整理由。流程：取 queued job（排除 `split_count > 0` 的父 job，最多
+ * `min(64, 8 x idle)` 件外加所有餓死的）-> 每對算 verdict + `stats.predict`
+ * -> `scheduler.match` -> 逐一原子 claim 並寫 `dispatch_info` /
+ * `warm_models`。
  *
- * 1. Directly eligible (`verdict.kind === "eligible"`) candidates: clean
- *    beats warned, then the Phase 1.9 light-job preference for zero-model
- *    jobs (weak backend, then smallest free VRAM), else heavy-job biggest-
- *    free-VRAM, with worker name/id as deterministic tie-breaks.
- * 2. Only when tier 1 has NO candidates at all: `eligible_after_fetch`
- *    candidates, ranked by (hasWarnings, totalFetchBytes ASC, same job-class
- *    VRAM key, name/id) -- a worker that already has everything always wins
- *    over one that would have to download something first.
+ * 保留的既有語意（見 `scheduler.cost`）：乾淨贏過警告、已經有模型的贏過要
+ * 下載的（tier 1 存在時 tier 2 一律 Infinity）、輕工作留大卡。
  *
- * `fetchableModels` is passed straight through to `assess.verdict` -- see
- * that function's docstring; undefined/null (the default) means "nothing
- * fetchable", so a caller that doesn't compile it gets tier 1 only,
- * unchanged. `peerOnlyModels` (Phase 3.1 P2P) is likewise passed straight
- * through -- see `assess.verdict`'s docstring.
- *
- * Each worker is claimed for at most one job per call. The claim itself is
- * atomic via `queries.claimJob`'s `WHERE status = 'queued'` re-check, so a
- * job claimed by a concurrent tick a moment ago is skipped rather than
- * double-assigned.
+ * 決定性：jobs 依 `(created_at, id)`（SQL 已排好）、workers 依 `(name, id)`
+ * 排序後才進矩陣，Hungarian 平手取最小索引，所以和 Python 端同一組輸入得到
+ * 同一個配對。
  */
 export async function assignJobs(
   db: D1Database,
   idleWorkerIds: string[],
   fetchableModels?: FetchableModels | null,
-  peerOnlyModels?: ReadonlySet<string> | null
+  peerOnlyModels?: ReadonlySet<string> | null,
+  now: Date = new Date()
 ): Promise<Assignment[]> {
   if (idleWorkerIds.length === 0) return [];
 
@@ -94,75 +94,96 @@ export async function assignJobs(
   // drops it too. Mirrors dispatch.py's `deleted == False` filters.
   const idleWorkers = (await queries.getWorkersByIds(db, idleWorkerIds)).filter((w) => !w.deleted);
   if (idleWorkers.length === 0) return [];
-  const workersById = new Map(idleWorkers.map((w) => [w.id, w] as const));
+  idleWorkers.sort((a, b) => (a.name < b.name ? -1 : a.name > b.name ? 1 : a.id < b.id ? -1 : a.id > b.id ? 1 : 0));
 
   const allWorkers = await queries.getAllWorkers(db);
-  const queuedJobs = await queries.getQueuedJobsOrderedByCreatedAt(db);
+  const queuedJobs = await queries.getQueuedJobsForDispatch(db);
 
-  const availableWorkerIds = new Set(workersById.keys());
-  const assignments: Assignment[] = [];
+  const limit = Math.min(MAX_JOBS_PER_TICK, JOBS_PER_IDLE_WORKER * idleWorkers.length);
+  const starveCutoffMs = now.getTime() - scheduler.STARVE_SECONDS * 1000;
+  const head = queuedJobs.slice(0, limit);
+  const headIds = new Set(head.map((j) => j.id));
+  const starved = queuedJobs
+    .slice(limit)
+    .filter((j) => new Date(`${j.createdAt}Z`).getTime() <= starveCutoffMs && !headIds.has(j.id));
+  const selectedJobs = [...head, ...starved];
+  if (selectedJobs.length === 0) return [];
 
-  for (const job of queuedJobs) {
-    if (availableWorkerIds.size === 0) break;
+  const statRows = await stats.loadRows(db);
+  const speedIndex = new Map(allWorkers.map((w) => [w.id, w.speedIndex] as const));
 
+  const workerCandidates: scheduler.WorkerCandidate[] = idleWorkers.map((w) => ({
+    workerId: w.id,
+    name: w.name,
+    backend: w.backend,
+    freeVramGb: freeVramGb(w),
+    warmModels: w.warmModels,
+    inventory: w.modelInventory,
+  }));
+
+  const jobCandidates: scheduler.JobCandidate[] = [];
+  const pairs = new Map<string, scheduler.PairVerdict>();
+  const predictions = new Map<string, number>();
+  const bases = new Map<string, string>();
+
+  for (const job of selectedJobs) {
     const needs = needsFromJob(job);
     const isLight = needs.models.size === 0 && !needs.estVramGb;
+    jobCandidates.push({
+      jobId: job.id,
+      signature: job.signature,
+      createdAt: new Date(`${job.createdAt}Z`),
+      isLight,
+      requiredModels: [...needs.models].sort(),
+    });
 
-    const candidates: { workerId: string; keys: (number | string)[] }[] = [];
-    const fetchCandidates: { workerId: string; keys: (number | string)[] }[] = [];
-
-    for (const candidateId of availableWorkerIds) {
-      const worker = workersById.get(candidateId);
-      if (!worker) continue;
+    for (const worker of idleWorkers) {
       const v = verdict(worker, needs, job.requirements, allWorkers, fetchableModels, peerOnlyModels);
-      if (v.kind !== "eligible" && v.kind !== "eligible_after_fetch") continue;
-
-      const hasWarnings = v.warnings.length > 0 ? 1 : 0;
-      const jobClassKey: (number | string)[] = isLight
-        ? [
-            // Zero-model work needs no GPU at all: a weak-backend
-            // (mps/cpu) worker beats a real GPU, then SMALLEST free VRAM
-            // first, so the biggest cards stay free for jobs that need
-            // them.
-            worker.backend !== "mps" && worker.backend !== "cpu" ? 1 : 0,
-            freeVramGb(worker),
-          ]
-        : [
-            // Heavy job: largest free VRAM first (negated so ascending sort
-            // puts it first).
-            -freeVramGb(worker),
-          ];
-
-      if (v.kind === "eligible") {
-        candidates.push({ workerId: candidateId, keys: [hasWarnings, ...jobClassKey, worker.name, candidateId] });
-      } else {
-        // eligible_after_fetch: only ever consulted when NO worker is
-        // directly eligible -- ranked clean-before-warned same as tier 1,
-        // then SMALLEST total download size first, then the same job-class
-        // VRAM key, then name.
-        const totalFetchBytes = v.missingModels.reduce((sum, name) => sum + (fetchableModels?.[name] ?? 0), 0);
-        fetchCandidates.push({
-          workerId: candidateId,
-          keys: [hasWarnings, totalFetchBytes, ...jobClassKey, worker.name, candidateId],
-        });
-      }
+      const totalFetchBytes =
+        v.kind === "eligible_after_fetch"
+          ? v.missingModels.reduce((sum, name) => sum + (fetchableModels?.[name] ?? 0), 0)
+          : 0;
+      const key = scheduler.pairKey(job.id, worker.id);
+      pairs.set(key, { kind: v.kind, hasWarnings: v.warnings.length > 0, totalFetchBytes });
+      const { seconds, basis } = stats.predict(statRows, speedIndex, job.signature, worker.id);
+      predictions.set(key, seconds);
+      bases.set(key, basis);
     }
+  }
 
-    // Tier 2 (fetch-then-run) is only ever considered when tier 1 (already
-    // has everything) is completely empty.
-    const activeCandidates = candidates.length > 0 ? candidates : fetchCandidates;
-    if (activeCandidates.length === 0) continue;
+  const matched = scheduler.match(jobCandidates, workerCandidates, pairs, predictions, now);
 
-    activeCandidates.sort((a, b) => compareTuples(a.keys, b.keys));
-    const best = activeCandidates[0]!;
+  const assignments: Assignment[] = [];
+  for (const [jobIndex, workerIndex] of matched) {
+    const job = selectedJobs[jobIndex]!;
+    const worker = idleWorkers[workerIndex]!;
+    const jobCandidate = jobCandidates[jobIndex]!;
+    const workerCandidate = workerCandidates[workerIndex]!;
+    const key = scheduler.pairKey(job.id, worker.id);
+    const pair = pairs.get(key)!;
 
-    const claimed = await queries.claimJob(db, job.id, best.workerId);
+    const candidateCount = idleWorkers.filter((w) => {
+      const kind = pairs.get(scheduler.pairKey(job.id, w.id))!.kind;
+      return kind === "eligible" || kind === "eligible_after_fetch";
+    }).length;
+
+    const info = dispatchInfoJson(
+      predictions.get(key)!,
+      bases.get(key)!,
+      scheduler.loadSeconds(jobCandidate, workerCandidate),
+      scheduler.fetchSeconds(pair),
+      candidateCount
+    );
+
+    const claimed = await queries.claimJob(db, job.id, worker.id, info);
     if (!claimed) continue;
+
+    // §2.2：熱快取在「被指派」當下就成立，不等 job 完成。
+    await queries.setWorkerWarmModels(db, worker.id, jobCandidate.requiredModels);
 
     const updatedJob = await queries.getJobById(db, job.id);
     if (!updatedJob) continue; // defensive: cannot happen once claimed
-    assignments.push({ workerId: best.workerId, job: updatedJob });
-    availableWorkerIds.delete(best.workerId);
+    assignments.push({ workerId: worker.id, job: updatedJob });
   }
 
   return assignments;

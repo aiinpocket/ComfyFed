@@ -14,7 +14,7 @@ from alembic import command
 from alembic.config import Config
 from sqlalchemy import update
 
-from comfyfed_server import db, dispatch, metrics
+from comfyfed_server import db, dispatch, metrics, scheduler
 
 
 @pytest.fixture()
@@ -787,6 +787,135 @@ def test_assign_jobs_fetch_tier_still_prefers_clean_over_warned(_db):
     assert len(assignments) == 1
     assigned_worker_id, job = assignments[0]
     assert assigned_worker_id == clean
+
+
+# --- Phase 3.3 Task 4: 排程器語意 -----------------------------------------
+
+
+def _set_stats(worker_id, signature, ewma_seconds, samples=3):
+    with db.get_session() as session:
+        session.add(
+            db.WorkerJobStats(
+                worker_id=worker_id,
+                signature=signature,
+                ewma_seconds=ewma_seconds,
+                samples=samples,
+            )
+        )
+        session.commit()
+
+
+def _make_signed_job(job_id="j1", signature="sig", models=(), est_vram_gb=None, created_at=None):
+    with db.get_session() as session:
+        session.add(
+            db.Job(
+                id=job_id,
+                workflow_json="{}",
+                status="queued",
+                signature=signature,
+                required_models=json.dumps(list(models)),
+                est_vram_gb=est_vram_gb,
+                **({"created_at": created_at} if created_at is not None else {}),
+            )
+        )
+        session.commit()
+    return job_id
+
+
+def test_assign_jobs_prefers_a_warm_cache_over_a_bigger_but_cold_card(_db):
+    """熱快取親和贏過 VRAM 較大但要重載（spec §6）。"""
+    inventory = [{"name": "diffusion_models/flux1-dev.safetensors", "size": 22.0}]
+    warm = _make_worker("w_warm", dynamic={"free_vram_gb": 16}, model_inventory=inventory)
+    cold = _make_worker("w_cold", dynamic={"free_vram_gb": 48}, model_inventory=inventory)
+    with db.get_session() as session:
+        session.get(db.Worker, warm).warm_models = json.dumps(["flux1-dev.safetensors"])
+        session.commit()
+
+    job_id = _make_signed_job(models=("flux1-dev.safetensors",))
+
+    assignments = dispatch.assign_jobs([warm, cold])
+
+    assert [(w, j.id) for w, j in assignments] == [(warm, job_id)]
+
+
+def test_assign_jobs_prefers_the_historically_faster_worker(_db):
+    """歷史速度快者贏（spec §6）：兩台硬體看起來一樣，但一台跑這個簽章
+    只要 30 秒、另一台要 90 秒。"""
+    slow = _make_worker("w_slow", dynamic={"free_vram_gb": 24})
+    fast = _make_worker("w_fast", dynamic={"free_vram_gb": 24})
+    _set_stats(slow, "sig", 90.0)
+    _set_stats(fast, "sig", 30.0)
+    job_id = _make_signed_job()
+
+    assignments = dispatch.assign_jobs([slow, fast])
+
+    assert [(w, j.id) for w, j in assignments] == [(fast, job_id)]
+
+
+def test_assign_jobs_spreads_two_heavy_jobs_across_two_cards(_db):
+    """兩件重工作兩台卡各派一件而非同一台（spec §6）-- 舊的逐 job 貪婪演算法
+    也做得到「一台一件」，這個測試真正釘住的是兩件都在同一個 tick 派出去，
+    而且分別落在不同的卡上。"""
+    big = _make_worker("w_big", dynamic={"free_vram_gb": 48})
+    small = _make_worker("w_small", dynamic={"free_vram_gb": 24})
+    now = _utcnow()
+    _make_signed_job("j1", est_vram_gb=10, created_at=now - timedelta(seconds=10))
+    _make_signed_job("j2", est_vram_gb=10, created_at=now)
+
+    assignments = dispatch.assign_jobs([big, small])
+
+    assert len(assignments) == 2
+    assert {w for w, _j in assignments} == {big, small}
+    assert {j.id for _w, j in assignments} == {"j1", "j2"}
+
+
+def test_assign_jobs_writes_dispatch_info_and_warm_models(_db):
+    # 這台 worker 必須真的有這個模型才會 eligible（沒有 fetchable_models 就
+    # 沒有 tier 2）；inventory 條目刻意不帶 size，`assess.find_model` 回
+    # `(True, None)`，所以 load_seconds 是 0 -- 這個測試釘的是 dispatch_info
+    # 的欄位有沒有寫進去，成本項本身由 test_scheduler.py 負責。
+    worker_id = _make_worker(
+        "w1",
+        dynamic={"free_vram_gb": 24},
+        model_inventory=[{"name": "diffusion_models/flux1-dev.safetensors"}],
+    )
+    _set_stats(worker_id, "sig", 41.2)
+    job_id = _make_signed_job(models=("flux1-dev.safetensors",))
+
+    dispatch.assign_jobs([worker_id])
+
+    with db.get_session() as session:
+        info = json.loads(session.get(db.Job, job_id).dispatch_info)
+        warm = json.loads(session.get(db.Worker, worker_id).warm_models)
+    assert info["basis"] == "signature"
+    assert info["predicted_seconds"] == pytest.approx(41.2)
+    assert info["load_seconds"] == pytest.approx(0.0)
+    assert info["fetch_seconds"] == pytest.approx(0.0)
+    assert info["candidates"] == 1
+    assert warm == ["flux1-dev.safetensors"]
+
+
+def test_assign_jobs_dispatches_a_starved_job_even_behind_newer_ones(_db):
+    """等待超過 STARVE_SECONDS 的 job，只要有合格 worker 一定本 tick 派出。"""
+    worker_id = _make_worker("w1", dynamic={"free_vram_gb": 24})
+    now = _utcnow()
+    _make_signed_job("j_old", created_at=now - timedelta(seconds=scheduler.STARVE_SECONDS + 60))
+    _make_signed_job("j_new", created_at=now)
+
+    assignments = dispatch.assign_jobs([worker_id])
+
+    assert [j.id for _w, j in assignments] == ["j_old"]
+
+
+def test_assign_jobs_never_dispatches_a_parent_job(_db):
+    """split_count > 0 的父 job 從派工清單排除（§2.5 第 2 步）。"""
+    worker_id = _make_worker("w1", dynamic={"free_vram_gb": 24})
+    job_id = _make_signed_job("j_parent")
+    with db.get_session() as session:
+        session.get(db.Job, job_id).split_count = 2
+        session.commit()
+
+    assert dispatch.assign_jobs([worker_id]) == []
 
 
 def test_cancel_job_clears_worker_id_and_records_last_worker_id(_db):

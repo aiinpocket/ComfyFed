@@ -9,7 +9,7 @@ from typing import Optional
 
 from sqlalchemy import update
 
-from . import assess, db, metrics
+from . import assess, db, metrics, scheduler, stats
 
 logger = logging.getLogger(__name__)
 
@@ -43,93 +43,136 @@ def _free_vram_gb(worker: db.Worker) -> float:
     return float(free_vram)
 
 
+def _json_list(raw) -> list:
+    """JSON 陣列欄位的防禦式解析；壞掉就當空陣列，不要讓一個 tick 因為一列
+    壞資料整個炸掉。"""
+    try:
+        value = json.loads(raw or "[]")
+    except (TypeError, ValueError):
+        return []
+    return value if isinstance(value, list) else []
+
+
+# §2.5 第 2 步：一個 tick 最多評估這麼多件 queued job（外加所有已餓死的），
+# 免得一個塞了幾千件的佇列把 O(n^3) 的配對拖垮。
+_MAX_JOBS_PER_TICK = 64
+_JOBS_PER_IDLE_WORKER = 8
+
+
+def _dispatch_info(
+    predicted_seconds: float,
+    basis: str,
+    load_seconds: float,
+    fetch_seconds: float,
+    candidates: int,
+) -> str:
+    return json.dumps(
+        {
+            "predicted_seconds": round(predicted_seconds, 3),
+            "basis": basis,
+            "load_seconds": round(load_seconds, 3),
+            "fetch_seconds": round(fetch_seconds, 3),
+            "candidates": candidates,
+        }
+    )
+
+
 def assign_jobs(
     idle_worker_ids: list[str],
     fetchable_models: Optional[dict[str, int]] = None,
     peer_only_models: Optional[frozenset[str]] = None,
 ) -> list[tuple[str, db.Job]]:
-    """Rank idle workers per queued job and atomically claim the best pair.
+    """Phase 3.3 §2.5：一次把整批 queued job 和整批 idle worker 做整體配對。
 
-    For each queued job, oldest first, every still-unassigned idle worker's
-    `assess.verdict` is evaluated and the best eligible one picked, in two
-    tiers:
+    取代 Phase 2.1 的逐 job 貪婪排序。流程：
 
-    1. Directly eligible (`verdict.kind == "eligible"`) candidates, ranked
-       exactly as before Phase 2.1 Task 4:
-       a. eligible with no warnings beats eligible-with-warnings (e.g. the
-          `vram_offload` note) -- a clean run beats one that will offload.
-       b. tie-break by largest free VRAM, from the worker's `dynamic`
-          heartbeat snapshot (see `_free_vram_gb`) -- or, for a "light" job
-          (see below), by the light-job preference instead.
-       c. stable tie-break by worker name, so results are deterministic when
-          ranking is otherwise a wash.
-    2. Only when tier 1 has NO candidates at all: `eligible_after_fetch`
-       candidates, ranked by (has_warnings, total_fetch_bytes ASC -- smallest
-       download first, then the SAME job-class VRAM key tier 1 uses, then
-       name). A worker that already has everything always wins over one that
-       would have to download something first, however big or small; fetch
-       ranking only decides among candidates where NOBODY already has it.
+    1. 取 queued job（`created_at ASC`，排除 `split_count > 0` 的父 job），
+       最多 `min(64, 8 x idle 數)` 件，另外把等待超過 `STARVE_SECONDS` 的
+       一律納入 -- 餓死防護不能被上限吃掉。
+    2. 對每對 (job, worker) 算 `assess.verdict`，壓成 `scheduler.PairVerdict`；
+       同時用 `stats.predict` 取這對的預估執行秒數與依據。
+    3. `scheduler.match` 求最小成本配對（Hungarian，∞ 的配對永不採用）。
+    4. 依結果逐一原子 claim（`WHERE status='queued'`，rowcount != 1 就跳過），
+       並寫入 `jobs.dispatch_info` 與 `workers.warm_models`。
 
-    `fetchable_models` is passed straight through to `assess.verdict` (name
-    -> size_bytes from the signed manifest, `model_manifest.entries()`'s
-    shape) -- None (the default) means "nothing fetchable", the exact
-    pre-Task-4 behavior, so any other caller (tests) that doesn't pass it
-    gets tier 1 only, unchanged. `peer_only_models` (Phase 3.1 P2P,
-    `model_manifest.peer_only_names`'s shape) is likewise passed straight
-    through -- see `assess.verdict`'s protocol>=4-for-peer-only gate.
+    保留的既有語意（見 `scheduler.cost`）：乾淨贏過警告（warn penalty 1e6）、
+    已經有模型的贏過要下載的（tier 1 存在時 tier 2 一律 ∞）、輕工作留大卡
+    （light penalty）。
 
-    The winning candidate's `fetch_models` push payload (the manifest entries
-    for its missing models) is deliberately NOT part of this function's
-    return value -- `assign_jobs` keeps its original `(worker_id, job)` tuple
-    shape (a lot of existing tests unpack it that way) and `agentws.
-    dispatch_tick` recomputes the verdict for the one (worker, job) pair it
-    actually pushes to, right before sending the frame. See dispatch_tick's
-    docstring for that seam.
+    決定性：jobs 先依 `(created_at, id)`、workers 先依 `(name, id)` 排序，
+    Hungarian 本身在平手時取索引最小者，所以同一組輸入兩棧得到同一個配對。
 
-    Each worker is claimed for at most one job per call: once a worker wins a
-    job it drops out of the candidate pool for every later job this tick.
-    The claim itself is atomic: the `WHERE status == "queued"` re-check in
-    the same UPDATE statement means
-    a job someone else claimed a moment ago (rowcount 0) is skipped rather
-    than double-assigned.
-
-    Returns the (worker_id, job) pairs actually claimed, for the caller
-    (`agentws.dispatch_tick`) to push over each worker's connection.
+    `fetchable_models` / `peer_only_models` 一如既往直接傳給 `assess.verdict`；
+    `None`（預設）代表「沒有東西可下載」。回傳實際 claim 成功的
+    `(worker_id, job)`，供 `agentws.dispatch_tick` 推送。
     """
     if not idle_worker_ids:
         return []
 
+    now = _utcnow()
+
     with db.get_session() as session:
-        # `deleted == False` on both queries: a soft-deleted worker is never
-        # eligible for dispatch and never counts as a peer seeder, even if a
-        # live connection is still being torn down when this tick runs (see
-        # `db.Worker.deleted` / `agentws.kick_worker`).
-        workers = {
-            w.id: w
-            for w in session.query(db.Worker)
+        # `deleted == False`：admin 刪掉的 worker 永遠不該被派工，即使它的
+        # socket 還在拆除中（見 `db.Worker.deleted` / `agentws.kick_worker`）。
+        workers = (
+            session.query(db.Worker)
             .filter(db.Worker.id.in_(idle_worker_ids), db.Worker.deleted == False)  # noqa: E712
             .all()
-        }
+        )
         if not workers:
             return []
 
         all_workers = session.query(db.Worker).filter(db.Worker.deleted == False).all()  # noqa: E712
 
+        # 父 job（split_count > 0）不進配對：它的工作由子 job 執行。
         queued_jobs = (
             session.query(db.Job)
-            .filter(db.Job.status == "queued")
-            .order_by(db.Job.created_at.asc())
+            .filter(db.Job.status == "queued", db.Job.split_count == 0)
+            .order_by(db.Job.created_at.asc(), db.Job.id.asc())
             .all()
         )
 
-        available_worker_ids = set(workers.keys())
-        assignments: list[tuple[str, db.Job]] = []
+        limit = min(_MAX_JOBS_PER_TICK, _JOBS_PER_IDLE_WORKER * len(workers))
+        starve_cutoff = now - timedelta(seconds=scheduler.STARVE_SECONDS)
+        head = queued_jobs[:limit]
+        head_ids = {job.id for job in head}
+        starved = [
+            job
+            for job in queued_jobs[limit:]
+            if job.created_at is not None and job.created_at <= starve_cutoff
+        ]
+        selected_jobs = head + [job for job in starved if job.id not in head_ids]
 
-        for job in queued_jobs:
-            if not available_worker_ids:
-                break
+        if not selected_jobs:
+            return []
 
-            requirements_override = {}
+        workers.sort(key=lambda w: (w.name or "", w.id))
+
+        stat_rows = stats.load_rows()
+        speed_index = {
+            w.id: (w.speed_index if isinstance(w.speed_index, (int, float)) else 1.0)
+            for w in all_workers
+        }
+
+        job_candidates: list[scheduler.JobCandidate] = []
+        worker_candidates: list[scheduler.WorkerCandidate] = []
+        pairs: dict[tuple[str, str], scheduler.PairVerdict] = {}
+        predictions: dict[tuple[str, str], float] = {}
+        bases: dict[tuple[str, str], str] = {}
+
+        for worker in workers:
+            worker_candidates.append(
+                scheduler.WorkerCandidate(
+                    worker_id=worker.id,
+                    name=worker.name or "",
+                    backend=worker.backend or "",
+                    free_vram_gb=_free_vram_gb(worker),
+                    warm_models=tuple(_json_list(worker.warm_models)),
+                    inventory=tuple(assess.model_inventory(worker)),
+                )
+            )
+
+        for job in selected_jobs:
             try:
                 requirements_override = json.loads(job.requirements or "{}")
             except (TypeError, ValueError):
@@ -137,73 +180,82 @@ def assign_jobs(
 
             needs = assess.needs_from_job(job)
             is_light = not needs.models and not (needs.est_vram_gb or 0)
-
-            candidates = []
-            fetch_candidates = []
-            for candidate_id in available_worker_ids:
-                worker = workers[candidate_id]
-                v = assess.verdict(
-                    worker, needs, requirements_override, all_workers, fetchable_models, peer_only_models
+            job_candidates.append(
+                scheduler.JobCandidate(
+                    job_id=job.id,
+                    signature=job.signature,
+                    created_at=job.created_at or now,
+                    is_light=is_light,
+                    required_models=tuple(sorted(needs.models)),
                 )
-                if v.kind not in ("eligible", "eligible_after_fetch"):
-                    continue
-                if is_light:
-                    # Zero-model work (e.g. stitching finished clips into a
-                    # video) needs no GPU at all -- 合併影片這類零模型工作交給
-                    # 弱 GPU／Mac，把大卡留給模型任務. Clean beats warned as
-                    # always, then a weak-backend (mps/cpu) worker beats a
-                    # real GPU, then SMALLEST free VRAM first (weakest GPU
-                    # among the rest), so the biggest cards stay free for
-                    # jobs that actually need them.
-                    job_class_key = (
-                        worker.backend not in ("mps", "cpu"),
-                        _free_vram_gb(worker),
-                    )
-                else:
-                    # (-free_vram,): sorts largest free VRAM first.
-                    job_class_key = (-_free_vram_gb(worker),)
+            )
 
-                if v.kind == "eligible":
-                    candidates.append((bool(v.warnings), *job_class_key, worker.name, candidate_id))
-                else:
-                    # eligible_after_fetch: only ever consulted when NO worker
-                    # is directly eligible (see below) -- ranked clean-before-
-                    # warned same as tier 1, then SMALLEST total download size
-                    # first, then the same job-class VRAM key, then name.
+            for worker in workers:
+                v = assess.verdict(
+                    worker,
+                    needs,
+                    requirements_override,
+                    all_workers,
+                    fetchable_models,
+                    peer_only_models,
+                )
+                total_fetch_bytes = 0
+                if v.kind == "eligible_after_fetch":
                     total_fetch_bytes = sum(
                         (fetchable_models or {}).get(name, 0) for name in v.missing_models
                     )
-                    fetch_candidates.append(
-                        (bool(v.warnings), total_fetch_bytes, *job_class_key, worker.name, candidate_id)
-                    )
+                pairs[(job.id, worker.id)] = scheduler.PairVerdict(
+                    kind=v.kind,
+                    has_warnings=bool(v.warnings),
+                    total_fetch_bytes=total_fetch_bytes,
+                )
+                seconds, basis = stats.predict(stat_rows, speed_index, job.signature, worker.id)
+                predictions[(job.id, worker.id)] = seconds
+                bases[(job.id, worker.id)] = basis
 
-            # Tier 2 (fetch-then-run) is only ever considered when tier 1
-            # (already has everything) is completely empty -- a worker that
-            # can run right now always beats one that must download first.
-            active_candidates = candidates or fetch_candidates
-            if not active_candidates:
-                continue
+        matched = scheduler.match(job_candidates, worker_candidates, pairs, predictions, now)
 
-            active_candidates.sort()
-            best_worker_id = active_candidates[0][-1]
+        assignments: list[tuple[str, db.Job]] = []
+        for job_index, worker_index in matched:
+            job = selected_jobs[job_index]
+            worker = workers[worker_index]
+            job_candidate = job_candidates[job_index]
+            worker_candidate = worker_candidates[worker_index]
+            pair = pairs[(job.id, worker.id)]
 
-            # Atomic claim: only succeeds if the job is still queued. If
-            # another process/thread beat us to it, rowcount is 0 and we
-            # move on to the next job rather than assigning one that's no
-            # longer actually up for grabs.
+            candidate_count = sum(
+                1
+                for w in workers
+                if pairs[(job.id, w.id)].kind in ("eligible", "eligible_after_fetch")
+            )
+            info = _dispatch_info(
+                predictions[(job.id, worker.id)],
+                bases[(job.id, worker.id)],
+                scheduler.load_seconds(job_candidate, worker_candidate),
+                scheduler.fetch_seconds(pair),
+                candidate_count,
+            )
+
+            # 原子 claim：只有在 job 仍然 queued 的時候才成立。別的行程／執行緒
+            # 搶先一步就 rowcount == 0，跳過而不是重複指派。
             result = session.execute(
                 update(db.Job)
                 .where(db.Job.id == job.id, db.Job.status == "queued")
-                .values(status="assigned", worker_id=best_worker_id)
+                .values(status="assigned", worker_id=worker.id, dispatch_info=info)
             )
             if result.rowcount != 1:
                 session.rollback()
                 continue
 
+            # §2.2：熱快取在「被指派」當下就成立（載入發生在開始執行時），
+            # 所以這裡就寫，不等 job 完成。
+            worker_row = session.get(db.Worker, worker.id)
+            if worker_row is not None:
+                worker_row.warm_models = json.dumps(list(job_candidate.required_models))
+
             session.commit()
             session.refresh(job)
-            assignments.append((best_worker_id, job))
-            available_worker_ids.discard(best_worker_id)
+            assignments.append((worker.id, job))
 
         return assignments
 

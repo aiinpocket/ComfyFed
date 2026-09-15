@@ -214,6 +214,8 @@ export async function backfillIfNeeded(db: D1Database): Promise<boolean> {
         signature = await computeSignature(wf, extract(wf));
         await db.prepare("UPDATE jobs SET signature = ? WHERE id = ?").bind(signature, row.job_id).run();
       }
+      // `gpu_seconds` 是回填唯一能拿到的執行秒數代理值（收據沒存原始
+      // exec_seconds；它本身就是 min(exec_seconds, wall)）。
       await recordCompletion(db, row.worker_id, signature, row.gpu_seconds, new Date(`${row.created_at}Z`));
     }
 

@@ -280,6 +280,8 @@ def backfill_if_needed() -> bool:
                         continue
                     signature = assess.signature(workflow, assess.needs_from_job(job))
                     job.signature = signature
+                # `gpu_seconds` 是回填唯一能拿到的執行秒數代理值（收據沒存
+                # 原始 exec_seconds；它本身就是 min(exec_seconds, wall)）。
                 pending.append((receipt.worker_id, signature, receipt.gpu_seconds))
 
             session.commit()

@@ -1,6 +1,7 @@
 import { afterEach, describe, expect, it } from "vitest";
 import { env } from "cloudflare:test";
 import * as dispatch from "../src/core/dispatch";
+import * as scheduler from "../src/core/scheduler";
 import { toSqliteTimestamp } from "../src/db/queries";
 
 // Ports the pure-dispatch-logic assertions of tests/server/test_dispatch.py
@@ -24,6 +25,7 @@ afterEach(async () => {
   await db().prepare("DELETE FROM jobs").run();
   await db().prepare("DELETE FROM workers").run();
   await db().prepare("DELETE FROM receipts").run();
+  await db().prepare("DELETE FROM worker_job_stats").run();
 });
 
 function now(): Date {
@@ -549,5 +551,131 @@ describe("owned-job transitions", () => {
 
     const result = await dispatch.resolveOwnedJob(db(), jobId, workerId, ["assigned", "running"]);
     expect(result).toEqual({ ok: false, reason: "wrong_status_terminal" });
+  });
+});
+
+describe("Phase 3.3 scheduler semantics", () => {
+  async function makeSignedJob(
+    id: string,
+    opts: {
+      signature?: string | null;
+      models?: string[];
+      estVramGb?: number | null;
+      createdAt?: Date;
+      splitCount?: number;
+    } = {}
+  ): Promise<string> {
+    await db()
+      .prepare(
+        `INSERT INTO jobs (id, workflow_json, status, created_at, signature, required_models, est_vram_gb, split_count)
+         VALUES (?, '{}', 'queued', ?, ?, ?, ?, ?)`
+      )
+      .bind(
+        id,
+        toSqliteTimestamp(opts.createdAt ?? new Date()),
+        opts.signature ?? "sig",
+        JSON.stringify(opts.models ?? []),
+        opts.estVramGb ?? null,
+        opts.splitCount ?? 0
+      )
+      .run();
+    return id;
+  }
+
+  async function setStats(workerId: string, signature: string, ewma: number): Promise<void> {
+    await db()
+      .prepare(
+        "INSERT INTO worker_job_stats (worker_id, signature, ewma_seconds, samples, updated_at) VALUES (?, ?, ?, 3, ?)"
+      )
+      .bind(workerId, signature, ewma, toSqliteTimestamp(new Date()))
+      .run();
+  }
+
+  it("prefers a warm cache over a bigger but cold card", async () => {
+    const inventory = [{ name: "diffusion_models/flux1-dev.safetensors", size: 22 }];
+    const warm = await makeWorker("w_warm", { dynamic: { free_vram_gb: 16 }, modelInventory: inventory });
+    const cold = await makeWorker("w_cold", { dynamic: { free_vram_gb: 48 }, modelInventory: inventory });
+    await db()
+      .prepare("UPDATE workers SET warm_models = ? WHERE id = ?")
+      .bind(JSON.stringify(["flux1-dev.safetensors"]), warm)
+      .run();
+    const jobId = await makeSignedJob(uniqueId("j"), { models: ["flux1-dev.safetensors"] });
+
+    const assignments = await dispatch.assignJobs(db(), [warm, cold]);
+    expect(assignments.map((a) => [a.workerId, a.job.id])).toEqual([[warm, jobId]]);
+  });
+
+  it("prefers the historically faster worker", async () => {
+    const slow = await makeWorker("w_slow", { dynamic: { free_vram_gb: 24 } });
+    const fast = await makeWorker("w_fast", { dynamic: { free_vram_gb: 24 } });
+    await setStats(slow, "sig", 90);
+    await setStats(fast, "sig", 30);
+    const jobId = await makeSignedJob(uniqueId("j"));
+
+    const assignments = await dispatch.assignJobs(db(), [slow, fast]);
+    expect(assignments.map((a) => [a.workerId, a.job.id])).toEqual([[fast, jobId]]);
+  });
+
+  it("spreads two heavy jobs across two cards", async () => {
+    const big = await makeWorker("w_big", { dynamic: { free_vram_gb: 48 } });
+    const small = await makeWorker("w_small", { dynamic: { free_vram_gb: 24 } });
+    const start = new Date();
+    const j1 = await makeSignedJob(uniqueId("j"), { estVramGb: 10, createdAt: new Date(start.getTime() - 10_000) });
+    const j2 = await makeSignedJob(uniqueId("j"), { estVramGb: 10, createdAt: start });
+
+    const assignments = await dispatch.assignJobs(db(), [big, small]);
+    expect(assignments).toHaveLength(2);
+    expect(new Set(assignments.map((a) => a.workerId))).toEqual(new Set([big, small]));
+    expect(new Set(assignments.map((a) => a.job.id))).toEqual(new Set([j1, j2]));
+  });
+
+  it("writes dispatch_info and warm_models on claim", async () => {
+    // 這台 worker 必須真的有這個模型才會 eligible（沒有 fetchableModels 就沒有
+    // tier 2）；inventory 條目刻意不帶 size，`findModel` 回 [true, null]，所以
+    // loadSeconds 是 0 -- 這個測試釘的是 dispatch_info 的欄位有沒有寫進去。
+    const workerId = await makeWorker("w1", {
+      dynamic: { free_vram_gb: 24 },
+      modelInventory: [{ name: "diffusion_models/flux1-dev.safetensors" }],
+    });
+    await setStats(workerId, "sig", 41.2);
+    const jobId = await makeSignedJob(uniqueId("j"), { models: ["flux1-dev.safetensors"] });
+
+    await dispatch.assignJobs(db(), [workerId]);
+
+    const jobRow = await db()
+      .prepare("SELECT dispatch_info FROM jobs WHERE id = ?")
+      .bind(jobId)
+      .first<{ dispatch_info: string }>();
+    const info = JSON.parse(jobRow!.dispatch_info);
+    expect(info.basis).toBe("signature");
+    expect(info.predicted_seconds).toBeCloseTo(41.2, 6);
+    expect(info.load_seconds).toBeCloseTo(0, 6);
+    expect(info.fetch_seconds).toBeCloseTo(0, 6);
+    expect(info.candidates).toBe(1);
+
+    const workerRow = await db()
+      .prepare("SELECT warm_models FROM workers WHERE id = ?")
+      .bind(workerId)
+      .first<{ warm_models: string }>();
+    expect(JSON.parse(workerRow!.warm_models)).toEqual(["flux1-dev.safetensors"]);
+  });
+
+  it("dispatches a starved job ahead of newer ones", async () => {
+    const workerId = await makeWorker("w1", { dynamic: { free_vram_gb: 24 } });
+    const start = new Date();
+    const old = await makeSignedJob(uniqueId("j_old"), {
+      createdAt: new Date(start.getTime() - (scheduler.STARVE_SECONDS + 60) * 1000),
+    });
+    await makeSignedJob(uniqueId("j_new"), { createdAt: start });
+
+    const assignments = await dispatch.assignJobs(db(), [workerId], null, null, start);
+    expect(assignments.map((a) => a.job.id)).toEqual([old]);
+  });
+
+  it("never dispatches a parent job", async () => {
+    const workerId = await makeWorker("w1", { dynamic: { free_vram_gb: 24 } });
+    await makeSignedJob(uniqueId("j_parent"), { splitCount: 2 });
+
+    expect(await dispatch.assignJobs(db(), [workerId])).toEqual([]);
   });
 });
