@@ -45,6 +45,7 @@
  */
 
 import { Hono } from "hono";
+import type { Context } from "hono";
 import type { Env } from "../env";
 import * as queries from "../db/queries";
 import type { Job } from "../db/queries";
@@ -57,9 +58,12 @@ import * as modelManifest from "../core/model_manifest";
 import {
   sanitizePathComponent,
   sanitizePathComponentOrThrow,
+  sanitizeRelativePathOrThrow,
   artifactKey,
   jobInputKey,
   stagingKey,
+  userdataKey,
+  userdataPrefix,
   SHARED_STAGING_UID,
 } from "../lib/store";
 import { boundedGunzip } from "../lib/gzip";
@@ -758,6 +762,11 @@ function guessMediaType(filename: string): string {
     ".mkv": "video/x-matroska",
     ".avi": "video/x-msvideo",
     ".txt": "text/plain",
+    // Userdata files are almost all JSON (workflows, keybinding presets,
+    // node templates, the bookmark index); the panel calls `.json()` on
+    // them regardless of the header, but sending the honest type keeps a
+    // hand-opened URL readable in the browser.
+    ".json": "application/json",
   };
   return map[ext] ?? "application/octet-stream";
 }
@@ -835,6 +844,186 @@ app.get("/comfy/api/view", async (c) => {
   if (!obj) return c.body(null, 404);
 
   return new Response(obj.body, { headers: { "content-type": guessMediaType(safeName) } });
+});
+
+// --- userdata (panel-side saved files) ----------------------------------------
+//
+// Ports comfyapi.py's `/userdata` section -- see that module for the pinned
+// frontend's exact call shapes (`listUserDataFullInfo`, `getUserData`,
+// `storeUserData`, `deleteUserData`, `moveUserData`) this answers, and for
+// why a listing's `path` is relative to the REQUESTED `dir` rather than to
+// the user root. Storage is R2 `userdata/<uid>/<relative path>`
+// (`lib/store.ts`'s `userdataKey`), the twin of Python's
+// `<data_dir>/comfy_userdata/<uid>/` tree, namespaced per uid so one user can
+// never reach another's saved workflows.
+//
+// These routes MUST be registered here (in the comfyapi router mounted by
+// index.ts) rather than anywhere later: `index.ts` has a catch-all
+// `app.all("/comfy/api/*")` JSON 404 for unimplemented panel endpoints, and
+// only a route mounted before it wins.
+
+/** Per-file ceiling, mirroring Python's `_USERDATA_MAX_BYTES`. */
+const USERDATA_MAX_BYTES = 5 * 1024 * 1024;
+
+const USERDATA_TOO_LARGE_MESSAGE = "檔案超過 5 MB 上限，無法儲存。 / File exceeds the 5 MB userdata limit.";
+const USERDATA_BAD_PATH_MESSAGE = "路徑不合法。 / Invalid path.";
+const USERDATA_NOT_FOUND_MESSAGE = "檔案不存在。 / File not found.";
+const USERDATA_EXISTS_MESSAGE = "檔案已存在。 / File already exists.";
+
+function qbool(value: string | undefined, fallback = false): boolean {
+  if (value === undefined) return fallback;
+  return ["1", "true", "yes", "on"].includes(value.trim().toLowerCase());
+}
+
+/** Same bilingual envelope shape Python's userdata routes answer with. */
+function userdataError(c: Context<{ Bindings: Env }>, status: number, code: string, message: string): Response {
+  return c.json({ error: { code, message } }, status as any);
+}
+
+/** `{path, size, modified}` -- `modified` is unix SECONDS (a float in
+ * Python; R2 only records whole-millisecond upload times, so this is
+ * `uploaded / 1000`), matching what the pinned frontend's `UserFile.save()`
+ * normalizes. */
+function userdataInfo(path: string, size: number, uploaded: Date | undefined): Record<string, unknown> {
+  return { path, size, modified: (uploaded ? uploaded.getTime() : Date.now()) / 1000 };
+}
+
+app.get("/comfy/api/userdata", async (c) => {
+  const user = c.get(SESSION_VAR).user;
+  const dir = c.req.query("dir") ?? "";
+  let prefix: string;
+  try {
+    prefix = userdataPrefix(user.uid, dir);
+  } catch {
+    return userdataError(c, 400, "userdata.bad_path", USERDATA_BAD_PATH_MESSAGE);
+  }
+
+  const recurse = qbool(c.req.query("recurse"));
+  const fullInfo = qbool(c.req.query("full_info"));
+  const split = qbool(c.req.query("split"));
+
+  // R2 LIST is paginated (1000 keys per page by default); a user with a lot
+  // of saved workflows must still see all of them.
+  const objects: R2Object[] = [];
+  let cursor: string | undefined;
+  do {
+    const page = await c.env.STORE.list({ prefix, cursor });
+    objects.push(...page.objects);
+    cursor = page.truncated ? page.cursor : undefined;
+  } while (cursor);
+
+  const rels = objects
+    .map((o) => o.key.slice(prefix.length))
+    .filter((rel) => rel.length > 0 && (recurse || !rel.includes("/")));
+  const byRel = new Map(objects.map((o) => [o.key.slice(prefix.length), o]));
+  rels.sort();
+
+  // A missing "directory" is simply an empty prefix in R2 -- an empty array,
+  // 200, same as Python's missing-dir answer.
+  if (fullInfo) {
+    return c.json(rels.map((rel) => userdataInfo(rel, byRel.get(rel)!.size, byRel.get(rel)!.uploaded)));
+  }
+  if (split) {
+    return c.json(rels.map((rel) => [rel, ...rel.split("/")]));
+  }
+  return c.json(rels);
+});
+
+// Registered BEFORE the plain `POST /comfy/api/userdata/:path` below: the
+// `{.+}` params match slashes, so a move URL would otherwise be swallowed by
+// that route with the whole `<src>/move/<dest>` as its path.
+app.post("/comfy/api/userdata/:src{.+}/move/:dest{.+}", async (c) => {
+  const user = c.get(SESSION_VAR).user;
+  let srcKey: string;
+  let destKey: string;
+  let destRel: string;
+  try {
+    srcKey = userdataKey(user.uid, c.req.param("src"));
+    destRel = sanitizeRelativePathOrThrow(c.req.param("dest"), "userdata path");
+    destKey = userdataKey(user.uid, destRel);
+  } catch {
+    return userdataError(c, 400, "userdata.bad_path", USERDATA_BAD_PATH_MESSAGE);
+  }
+
+  const source = await c.env.STORE.get(srcKey);
+  if (!source) {
+    return userdataError(c, 404, "userdata.not_found", "來源檔案不存在。 / Source file not found.");
+  }
+  // `overwrite` defaults to FALSE here (upstream's default, and what the
+  // pinned frontend's rename flow sends) -- the opposite of the plain POST
+  // below, where a re-save is the normal case.
+  if (destKey !== srcKey && !qbool(c.req.query("overwrite"), false)) {
+    const existing = await c.env.STORE.head(destKey);
+    if (existing) {
+      return userdataError(c, 409, "userdata.exists", "目標檔案已存在。 / Destination already exists.");
+    }
+  }
+
+  const bytes = await source.arrayBuffer();
+  const written = await c.env.STORE.put(destKey, bytes);
+  if (destKey !== srcKey) await c.env.STORE.delete(srcKey);
+  return c.json(userdataInfo(destRel, bytes.byteLength, written?.uploaded));
+});
+
+app.get("/comfy/api/userdata/:path{.+}", async (c) => {
+  const user = c.get(SESSION_VAR).user;
+  let key: string;
+  let rel: string;
+  try {
+    rel = sanitizeRelativePathOrThrow(c.req.param("path"), "userdata path");
+    key = userdataKey(user.uid, rel);
+  } catch {
+    return userdataError(c, 400, "userdata.bad_path", USERDATA_BAD_PATH_MESSAGE);
+  }
+  const obj = await c.env.STORE.get(key);
+  if (!obj) return userdataError(c, 404, "userdata.not_found", USERDATA_NOT_FOUND_MESSAGE);
+  return new Response(obj.body, { headers: { "content-type": guessMediaType(rel) } });
+});
+
+app.post("/comfy/api/userdata/:path{.+}", async (c) => {
+  const user = c.get(SESSION_VAR).user;
+  let key: string;
+  let rel: string;
+  try {
+    rel = sanitizeRelativePathOrThrow(c.req.param("path"), "userdata path");
+    key = userdataKey(user.uid, rel);
+  } catch {
+    return userdataError(c, 400, "userdata.bad_path", USERDATA_BAD_PATH_MESSAGE);
+  }
+
+  // `overwrite` defaults to TRUE, matching upstream and the pinned
+  // frontend's own default -- a plain workflow re-save sends
+  // `overwrite=true`, "Save as" sends `overwrite=false` and relies on this
+  // 409 to warn about clobbering.
+  if (!qbool(c.req.query("overwrite"), true)) {
+    const existing = await c.env.STORE.head(key);
+    if (existing) return userdataError(c, 409, "userdata.exists", USERDATA_EXISTS_MESSAGE);
+  }
+
+  const body = await c.req.arrayBuffer();
+  if (body.byteLength > USERDATA_MAX_BYTES) {
+    return userdataError(c, 413, "userdata.too_large", USERDATA_TOO_LARGE_MESSAGE);
+  }
+
+  const written = await c.env.STORE.put(key, body);
+  // Always the full_info entry, whatever `full_info` said -- the pinned
+  // frontend guards its read with `typeof body === "object"` and only ever
+  // pulls `size`/`modified` out of it.
+  return c.json(userdataInfo(rel, body.byteLength, written?.uploaded));
+});
+
+app.delete("/comfy/api/userdata/:path{.+}", async (c) => {
+  const user = c.get(SESSION_VAR).user;
+  let key: string;
+  try {
+    key = userdataKey(user.uid, c.req.param("path"));
+  } catch {
+    return userdataError(c, 400, "userdata.bad_path", USERDATA_BAD_PATH_MESSAGE);
+  }
+  const existing = await c.env.STORE.head(key);
+  if (!existing) return userdataError(c, 404, "userdata.not_found", USERDATA_NOT_FOUND_MESSAGE);
+  await c.env.STORE.delete(key);
+  return c.body(null, 204);
 });
 
 // --- panel bootstrap ----------------------------------------------------------

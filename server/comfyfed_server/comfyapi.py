@@ -118,6 +118,21 @@ _data_dir: Optional[str] = None
 # up automatically -- Phase 1.5 leaves that to the admin.
 _STAGING_DIRNAME = "comfy_staging"
 
+# Per-user `userdata` tree for the panel's own saved files -- workflows,
+# keybinding presets, node templates, the workflow bookmark index. Upstream
+# ComfyUI keeps these in `user/<username>/...`; ComfyFed's equivalent is
+# `<data_dir>/comfy_userdata/<uid>/<relative path>`, namespaced by the
+# session's uid for exactly the same reason staging is (final review finding
+# #1): one user must never be able to list, read, overwrite, move or delete
+# another user's saved workflows.
+_USERDATA_DIRNAME = "comfy_userdata"
+
+# Per-file ceiling for anything written through `/userdata`. A workflow JSON
+# is a few hundred KB at the very worst; this is generous enough that no real
+# panel save is ever refused, while keeping the tree from becoming an
+# unbounded personal file host (nothing ever prunes it).
+_USERDATA_MAX_BYTES = 5 * 1024 * 1024
+
 # Reserved pseudo-uid for the packaged template sample assets
 # (`templates.seed_staging`), namespaced alongside real per-user staging
 # directories but readable by EVERY user -- these are platform-shipped
@@ -167,6 +182,71 @@ def staging_dir(data_dir: str, uid: str) -> str:
     """
     safe_uid = storage.sanitize_path_component(uid, what="user id")
     return os.path.join(data_dir, _STAGING_DIRNAME, safe_uid)
+
+
+def userdata_dir(data_dir: str, uid: str) -> str:
+    """Per-user userdata root: `<data_dir>/comfy_userdata/<uid>/`.
+
+    Same isolation rule (and the same defense-in-depth `uid` sanitize) as
+    `staging_dir`, but unlike staging this tree HAS subdirectories:
+    the panel saves `workflows/<name>.json`, `workflows/subdir/<name>.json`,
+    `keybindings/<preset>.json`, `comfy.templates.json`, ... So the
+    per-SEGMENT sanitize lives in `_safe_userdata_relpath` below rather than
+    a single `sanitize_path_component` on the whole value.
+    """
+    safe_uid = storage.sanitize_path_component(uid, what="user id")
+    return os.path.join(data_dir, _USERDATA_DIRNAME, safe_uid)
+
+
+def _safe_userdata_relpath(value: str, *, what: str = "userdata path") -> str:
+    """Normalize a client-supplied userdata path to a safe relative path, or
+    raise ValueError.
+
+    Multi-segment paths ARE legal here (`workflows/sub/x.json`) -- that is
+    the whole difference from `storage.sanitize_path_component`, which this
+    still applies to EVERY segment so exactly one definition of "safe
+    segment" exists across the codebase (no `..`, no `.`, no empty segment,
+    no Windows device name, no trailing dot/space).
+
+    Backslashes are normalized to `/` first (a Windows client, or a name
+    round-tripped through a Windows worker, may send either) and an absolute
+    path is rejected outright. Returns the `/`-joined relative path; callers
+    turn it into a filesystem path with `_userdata_path`.
+    """
+    raw = (value or "").replace("\\", "/")
+    if not raw or raw.startswith("/"):
+        raise ValueError(f"Invalid {what}: {value!r}")
+    segments = raw.split("/")
+    # A trailing/duplicate slash produces an empty segment;
+    # `sanitize_path_component` rejects those (and `.`/`..`) for us.
+    for segment in segments:
+        storage.sanitize_path_component(segment, what=f"{what} segment")
+    return "/".join(segments)
+
+
+def _safe_userdata_subdir(value: str) -> str:
+    """Like `_safe_userdata_relpath` but `""` (the user's own root) is legal
+    -- `GET /userdata?dir=` with no dir lists the whole tree."""
+    if not value:
+        return ""
+    return _safe_userdata_relpath(value, what="userdata dir")
+
+
+def _userdata_path(data_dir: str, uid: str, relpath: str) -> str:
+    """Absolute filesystem path for an ALREADY-sanitized relative path."""
+    return os.path.join(userdata_dir(data_dir, uid), *relpath.split("/")) if relpath else userdata_dir(data_dir, uid)
+
+
+def _userdata_info(path: str, rel: str) -> dict:
+    """The `full_info` entry ComfyUI's frontend expects for one file.
+
+    `modified` is unix seconds as a float -- `UserFile.save()` in the pinned
+    frontend feeds it straight to `new Date(...)`-style normalization and
+    only ever reads `size`/`modified`, so extra precision is harmless and a
+    missing field is not.
+    """
+    stat = os.stat(path)
+    return {"path": rel, "size": stat.st_size, "modified": stat.st_mtime}
 
 
 def _legacy_settings_path(data_dir: str) -> str:
@@ -1249,6 +1329,195 @@ def create_router(
 
         media_type = mimetypes.guess_type(safe_name)[0] or "application/octet-stream"
         return FileResponse(path, media_type=media_type, filename=safe_name)
+
+    # --- userdata (panel-side saved files) ------------------------------
+    #
+    # Upstream ComfyUI's `/userdata` API, which is how the panel saves and
+    # loads WORKFLOWS (plus keybinding presets, node templates and the
+    # bookmark index). Verified against the pinned frontend's `api.ts`
+    # bundle rather than guessed:
+    #
+    #   listUserDataFullInfo(dir) -> GET  /userdata?dir=<dir>&recurse=true
+    #                                     &split=false&full_info=true
+    #   getUserData(path)         -> GET  /userdata/<encoded path>
+    #   storeUserData(path, body) -> POST /userdata/<encoded path>
+    #                                     ?overwrite=<bool>&full_info=<bool>
+    #   deleteUserData(path)      -> DELETE /userdata/<encoded path>   (204)
+    #   moveUserData(src, dest)   -> POST /userdata/<src>/move/<dest>
+    #                                     ?overwrite=<bool>
+    #
+    # The path segment arrives percent-encoded (`workflows%2Fname.json`), so
+    # every route below takes a `{...:path}` converter and treats the decoded
+    # value as a RELATIVE path inside this session's own
+    # `comfy_userdata/<uid>/` tree.
+    #
+    # `path` in a listing is relative to the REQUESTED `dir`, not to the user
+    # root -- that is upstream's contract and the pinned frontend depends on
+    # it: `syncEntities` re-prefixes the queried dir onto every returned
+    # `path`, so a root-relative `workflows/x.json` from `dir=workflows`
+    # would surface as `workflows/workflows/x.json` in the workflow browser.
+
+    def _qbool(value: Optional[str], default: bool = False) -> bool:
+        if value is None:
+            return default
+        return value.strip().lower() in ("1", "true", "yes", "on")
+
+    def _userdata_error(status: int, code: str, message: str) -> JSONResponse:
+        # The panel only ever looks at the STATUS of these calls (see the
+        # frontend snippets quoted above), so the body is free to be
+        # ComfyFed's own bilingual error envelope -- which is what a human
+        # reading a failed request in devtools actually needs.
+        return JSONResponse(status_code=status, content={"error": {"code": code, "message": message}})
+
+    _TOO_LARGE_MESSAGE = (
+        "檔案超過 5 MB 上限，無法儲存。 / File exceeds the 5 MB userdata limit."
+    )
+
+    @r.get("/userdata")
+    def list_userdata(
+        dir: str = "",
+        recurse: Optional[str] = None,
+        split: Optional[str] = None,
+        full_info: Optional[str] = None,
+        user: auth.SessionUser = Depends(auth.require_user),
+    ) -> Response:
+        try:
+            subdir = _safe_userdata_subdir(dir)
+        except ValueError:
+            return _userdata_error(400, "userdata.bad_path", "路徑不合法。 / Invalid path.")
+
+        root = _userdata_path(data_dir, user.uid, subdir)
+        if not os.path.isdir(root):
+            # Upstream 404s here and the frontend maps that to "no files";
+            # an empty list is the same answer without the error noise, and
+            # is what a brand-new account hits on its very first page load.
+            return JSONResponse(content=[])
+
+        want_recurse = _qbool(recurse)
+        want_full_info = _qbool(full_info)
+        want_split = _qbool(split)
+
+        rels: list[str] = []
+        if want_recurse:
+            for dirpath, _dirnames, filenames in os.walk(root):
+                for name in filenames:
+                    absolute = os.path.join(dirpath, name)
+                    rels.append(os.path.relpath(absolute, root).replace(os.sep, "/"))
+        else:
+            for name in os.listdir(root):
+                if os.path.isfile(os.path.join(root, name)):
+                    rels.append(name)
+        rels.sort()
+
+        if want_full_info:
+            entries: list = []
+            for rel in rels:
+                try:
+                    entries.append(_userdata_info(os.path.join(root, *rel.split("/")), rel))
+                except OSError:
+                    # Vanished between listing and stat -- skip it rather
+                    # than failing the whole listing.
+                    continue
+            return JSONResponse(content=entries)
+
+        if want_split:
+            # Upstream's split shape: the path itself followed by its
+            # components. The pinned frontend never asks for it (it always
+            # sends split=false), so this exists for compatibility only.
+            return JSONResponse(content=[[rel, *rel.split("/")] for rel in rels])
+
+        return JSONResponse(content=rels)
+
+    @r.get("/userdata/{file_path:path}")
+    def get_userdata(
+        file_path: str, user: auth.SessionUser = Depends(auth.require_user)
+    ) -> Response:
+        try:
+            rel = _safe_userdata_relpath(file_path)
+        except ValueError:
+            return _userdata_error(400, "userdata.bad_path", "路徑不合法。 / Invalid path.")
+        path = _userdata_path(data_dir, user.uid, rel)
+        if not os.path.isfile(path):
+            return _userdata_error(404, "userdata.not_found", "檔案不存在。 / File not found.")
+        media_type = mimetypes.guess_type(rel)[0] or "application/octet-stream"
+        return FileResponse(path, media_type=media_type)
+
+    @r.post("/userdata/{file_path:path}/move/{dest_path:path}")
+    async def move_userdata(
+        file_path: str,
+        dest_path: str,
+        overwrite: Optional[str] = None,
+        user: auth.SessionUser = Depends(auth.require_user),
+    ) -> Response:
+        # Registered BEFORE the plain `POST /userdata/{file:path}` below:
+        # `{...:path}` matches slashes, so a move URL would otherwise be
+        # swallowed by that route with `file_path == "<src>/move/<dest>"`.
+        try:
+            src_rel = _safe_userdata_relpath(file_path)
+            dest_rel = _safe_userdata_relpath(dest_path)
+        except ValueError:
+            return _userdata_error(400, "userdata.bad_path", "路徑不合法。 / Invalid path.")
+
+        src = _userdata_path(data_dir, user.uid, src_rel)
+        dest = _userdata_path(data_dir, user.uid, dest_rel)
+        if not os.path.isfile(src):
+            return _userdata_error(404, "userdata.not_found", "來源檔案不存在。 / Source file not found.")
+        # `overwrite` defaults to FALSE here (upstream's default, and what
+        # the pinned frontend's rename flow sends) -- the opposite of the
+        # plain POST below, where a re-save is the normal case.
+        if os.path.exists(dest) and os.path.abspath(dest) != os.path.abspath(src) and not _qbool(overwrite, False):
+            return _userdata_error(409, "userdata.exists", "目標檔案已存在。 / Destination already exists.")
+
+        os.makedirs(os.path.dirname(dest), exist_ok=True)
+        os.replace(src, dest)
+        return JSONResponse(content=_userdata_info(dest, dest_rel))
+
+    @r.post("/userdata/{file_path:path}")
+    async def post_userdata(
+        file_path: str,
+        request: Request,
+        overwrite: Optional[str] = None,
+        user: auth.SessionUser = Depends(auth.require_user),
+    ) -> Response:
+        try:
+            rel = _safe_userdata_relpath(file_path)
+        except ValueError:
+            return _userdata_error(400, "userdata.bad_path", "路徑不合法。 / Invalid path.")
+
+        path = _userdata_path(data_dir, user.uid, rel)
+        # `overwrite` defaults to TRUE, matching upstream and the pinned
+        # frontend's own default -- a plain workflow re-save sends
+        # `overwrite=true`, "Save as" sends `overwrite=false` and relies on
+        # the 409 below to warn about clobbering.
+        if os.path.exists(path) and not _qbool(overwrite, True):
+            return _userdata_error(409, "userdata.exists", "檔案已存在。 / File already exists.")
+
+        body = await request.body()
+        if len(body) > _USERDATA_MAX_BYTES:
+            return _userdata_error(413, "userdata.too_large", _TOO_LARGE_MESSAGE)
+
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        with open(path, "wb") as f:
+            f.write(body)
+        # Always the full_info entry, whatever `full_info` said: the pinned
+        # frontend guards its read with `typeof body === "object"` and only
+        # ever pulls `size`/`modified` out of it, so the richer shape is
+        # safe for both callers and strictly more useful.
+        return JSONResponse(content=_userdata_info(path, rel))
+
+    @r.delete("/userdata/{file_path:path}")
+    def delete_userdata(
+        file_path: str, user: auth.SessionUser = Depends(auth.require_user)
+    ) -> Response:
+        try:
+            rel = _safe_userdata_relpath(file_path)
+        except ValueError:
+            return _userdata_error(400, "userdata.bad_path", "路徑不合法。 / Invalid path.")
+        path = _userdata_path(data_dir, user.uid, rel)
+        if not os.path.isfile(path):
+            return _userdata_error(404, "userdata.not_found", "檔案不存在。 / File not found.")
+        os.remove(path)
+        return Response(status_code=204)
 
     # --- panel bootstrap ------------------------------------------------
     #

@@ -5,8 +5,11 @@
  * <job_id>/<filename>` on local disk; this cloud port keeps the exact same
  * two-segment key shape against the `STORE` R2 binding instead --
  * `artifacts/<job_id>/<filename>` and `job_inputs/<job_id>/<filename>` --
- * plus a `staging/<filename>` prefix with no equivalent in Phase 1 (used by
- * Task 9/10's template-asset staging flow, not by anything in this file).
+ * plus a `staging/<uid>/<filename>` prefix with no equivalent in Phase 1
+ * (used by Task 9/10's template-asset staging flow, not by anything in this
+ * file) and a `userdata/<uid>/<relative path>` prefix for the panel's own
+ * saved files (workflows, keybinding presets, node templates), the twin of
+ * Python's `<data_dir>/comfy_userdata/<uid>/` tree.
  *
  * `sanitizePathComponent` matches storage.py's function of the same name in
  * every case Python actually rejects (empty, `.`/`..`, a value whose
@@ -99,6 +102,47 @@ export const SHARED_STAGING_UID = "_shared";
  * in depth costs nothing here. */
 export function stagingKey(uid: string, filename: string): string {
   return `${STAGING_PREFIX}/${sanitizePathComponent(uid, "user id")}/${sanitizePathComponent(filename, "staging filename")}`;
+}
+
+const USERDATA_PREFIX = "userdata";
+
+/** Reduce a client-supplied RELATIVE path to a safe `/`-joined key suffix, or
+ * throw `InvalidPathComponent`. Mirrors comfyapi.py's
+ * `_safe_userdata_relpath`: multi-segment paths are legal
+ * (`workflows/sub/x.json` -- the panel really does save into subdirectories),
+ * but every segment still goes through `sanitizePathComponent`, so there is
+ * exactly one definition of "safe segment" here as in the Python source.
+ * Backslashes are normalized to `/` first and an absolute path is rejected
+ * outright. */
+export function sanitizeRelativePathOrThrow(value: string, what = "path"): string {
+  const raw = (value ?? "").replace(/\\/g, "/");
+  if (!raw || raw.startsWith("/")) {
+    throw new InvalidPathComponent(`Invalid ${what}: ${JSON.stringify(value)}`);
+  }
+  // An empty segment (trailing or doubled slash), `.` and `..` are all
+  // rejected by `sanitizePathComponentOrThrow`.
+  return raw
+    .split("/")
+    .map((segment) => sanitizePathComponentOrThrow(segment, `${what} segment`))
+    .join("/");
+}
+
+/** Per-user userdata key: `userdata/<uid>/<relative path>` -- the cloud twin
+ * of comfyapi.py's `<data_dir>/comfy_userdata/<uid>/` tree, holding the
+ * panel's own saved files (workflows, keybinding presets, node templates,
+ * the bookmark index). Namespaced by uid for the same reason `stagingKey` is:
+ * one user must never be able to list, read, overwrite, move or delete
+ * another user's saved workflows. */
+export function userdataKey(uid: string, path: string): string {
+  return `${USERDATA_PREFIX}/${sanitizePathComponent(uid, "user id")}/${sanitizeRelativePathOrThrow(path, "userdata path")}`;
+}
+
+/** The R2 prefix every one of `uid`'s userdata objects sits under (trailing
+ * slash included), for LIST. `subdir` may be `""` (the whole tree). */
+export function userdataPrefix(uid: string, subdir = ""): string {
+  const base = `${USERDATA_PREFIX}/${sanitizePathComponent(uid, "user id")}/`;
+  if (!subdir) return base;
+  return `${base}${sanitizeRelativePathOrThrow(subdir, "userdata dir")}/`;
 }
 
 /** Ports `LocalStore.url` -- the API path clients fetch a stored artifact
