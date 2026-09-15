@@ -537,3 +537,37 @@ def test_generated_launcher_supervises_the_agent_restart_code():
     assert "} while (`$agentCode -eq `$restartCode)" in block
     # Loop only on the restart code: no unconditional restart, no 'while ($true)'.
     assert "while ($true)" not in block and "while (`$true)" not in block
+
+
+def test_sh_auto_installs_a_relocatable_python_without_sudo():
+    """Owner directive: the one-liner installs everything that is missing,
+    starting with Python -- on every OS. macOS used to bail out with a
+    manual hint (and the hint was wrong: the Xcode CLT python3 is 3.9, below
+    the >=3.10 floor). install.sh now fetches Astral's python-build-standalone
+    install_only tarball into ~/.comfyfed/python -- no sudo, no Xcode, no
+    package manager -- verified against sha256 digests PINNED in the script
+    for the default release, and prefers that python on re-runs."""
+    sh = open(_source_path("install.sh"), encoding="utf-8").read()
+    # The mechanism.
+    assert "install_standalone_python()" in sh
+    assert 'PY_STANDALONE_DIR="$HOME/.comfyfed/python"' in sh
+    assert "python-build-standalone/releases/download" in sh
+    assert "install_only.tar.gz" in sh
+    # GitHub encodes the '+' in the asset name as %2B -- the raw name 404s.
+    assert '${fname//+/%2B}' in sh
+    # Pinned digests for all four targets of the default release.
+    assert 'PY_STANDALONE_TAG="${COMFYFED_PYTHON_RELEASE:-20260901}"' in sh
+    assert 'PY_STANDALONE_VER="${COMFYFED_PYTHON_VERSION:-3.12.14}"' in sh
+    for target in ("aarch64-apple-darwin", "x86_64-apple-darwin", "x86_64-unknown-linux-gnu", "aarch64-unknown-linux-gnu"):
+        assert f"{target})" in sh, target
+    assert sh.count("echo \"") >= 4 and "3ee3ee547cedfeb7c2b16b2b7156039f7b470bb8f857e226fd3d2eb11db83c76" in sh
+    # Mismatch refuses to install; the tarball's single top-level dir is stripped.
+    assert "sha256 mismatch" in sh and "refusing to install" in sh
+    assert "--strip-components=1" in sh
+    # Re-runs prefer the python we installed (deterministic, never regresses).
+    assert 'if [ -x "$PY_STANDALONE_DIR/bin/python3" ] && python_version_ok "$PY_STANDALONE_DIR/bin/python3"' in sh
+    # The darwin branch no longer sends people to xcode-select; standalone is
+    # tried first on BOTH OSes, apt/dnf (sudo) is Linux-only fallback.
+    assert "xcode-select --install" not in sh
+    assert "if install_standalone_python; then" in sh
+    assert "automatic Python install failed" in sh

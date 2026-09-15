@@ -127,7 +127,7 @@ curl -fsSL "<你的平台網址>/install.sh?token=<一次性 token>" | bash
 
 （實際指令請直接從主控台複製，網址與 token 已經幫你填好。）
 
-這一行指令會自動完成整套安裝：缺 Python 會自動安裝（Windows 走官方安裝器、Linux 依發行版用 apt/dnf、macOS 引導 Xcode CLT／官方 pkg）；找不到本機 ComfyUI 就連 ComfyUI 一起裝（釘死 v0.35.0，依 GPU 自動選 CUDA／CPU／MPS）；裝完會用 token 自動完成 `register`，並把整組（ComfyUI + agent）設成開機自動啟動、在背景執行，不需要再手動下指令。重跑同一行指令是安全的（冪等）：已經裝過的機器會修好任務排程／服務並升級 agent，不會重灌 ComfyUI。
+這一行指令會自動完成整套安裝：缺 Python 會自動安裝——**三個 OS 都不需要 sudo／系統管理員**（Windows 走 python.org 的每使用者靜默安裝；macOS 與 Linux 從 Astral 的 python-build-standalone 下載可搬移的 CPython 3.12 到 `~/.comfyfed/python`，下載後比對腳本內釘死的 sha256 才安裝，跟 `uv` 用的是同一套預建；Linux 只有在這個下載失敗時才退回 apt/dnf。macOS 特別註記：Xcode 命令列工具附的 python3 是 3.9、低於 3.10 門檻，所以裝 Xcode 並不能解決，腳本也不會再建議你這麼做）；找不到本機 ComfyUI 就連 ComfyUI 一起裝（釘死 v0.35.0，依 GPU 自動選 CUDA／CPU／MPS）；裝完會用 token 自動完成 `register`，並把整組（ComfyUI + agent）設成開機自動啟動、在背景執行，不需要再手動下指令。重跑同一行指令是安全的（冪等）：已經裝過的機器會修好任務排程／服務並升級 agent，不會重灌 ComfyUI。
 
 **解除安裝**：
 

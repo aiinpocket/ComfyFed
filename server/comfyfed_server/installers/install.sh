@@ -81,7 +81,16 @@ python_version_ok() {
     return 1
 }
 
+# A relocatable CPython we may have installed ourselves on a previous run
+# (see install_standalone_python) wins over whatever the system offers, so
+# re-runs are deterministic and never regress to an older system python3.
+PY_STANDALONE_DIR="$HOME/.comfyfed/python"
+
 resolve_python() {
+    if [ -x "$PY_STANDALONE_DIR/bin/python3" ] && python_version_ok "$PY_STANDALONE_DIR/bin/python3"; then
+        echo "$PY_STANDALONE_DIR/bin/python3"
+        return 0
+    fi
     for exe in python3.12 python3 python; do
         if python_version_ok "$exe"; then
             echo "$exe"
@@ -91,13 +100,101 @@ resolve_python() {
     return 1
 }
 
+# ---------------------------------------------------------------------------
+# Relocatable CPython (no sudo, no Xcode, no package manager), from Astral's
+# python-build-standalone -- the same builds `uv` installs. macOS ships no
+# usable Python (the Xcode CLT one is 3.9, below our >=3.10 floor) and Linux
+# package managers need sudo; a per-user tarball under ~/.comfyfed/python
+# needs neither. The default release is pinned WITH its sha256 digests below,
+# so the download is verified offline; overriding the release via
+# COMFYFED_PYTHON_RELEASE / COMFYFED_PYTHON_VERSION verifies against that
+# release's published SHA256SUMS instead (trusting GitHub's release file).
+# ---------------------------------------------------------------------------
+PY_STANDALONE_TAG="${COMFYFED_PYTHON_RELEASE:-20260901}"
+PY_STANDALONE_VER="${COMFYFED_PYTHON_VERSION:-3.12.14}"
+PY_STANDALONE_BASE="${COMFYFED_PYTHON_MIRROR:-https://github.com/astral-sh/python-build-standalone/releases/download}"
+
+standalone_target() {
+    local arch
+    arch="$(uname -m)"
+    case "$OS_KIND/$arch" in
+        darwin/arm64|darwin/aarch64) echo "aarch64-apple-darwin" ;;
+        darwin/x86_64) echo "x86_64-apple-darwin" ;;
+        linux/x86_64|linux/amd64) echo "x86_64-unknown-linux-gnu" ;;
+        linux/aarch64|linux/arm64) echo "aarch64-unknown-linux-gnu" ;;
+        *) return 1 ;;
+    esac
+}
+
+# sha256 of the pinned default release's install_only tarballs (from that
+# release's SHA256SUMS). Anything else -> empty -> verified online instead.
+pinned_standalone_sha256() {
+    [ "$PY_STANDALONE_TAG" = "20260901" ] && [ "$PY_STANDALONE_VER" = "3.12.14" ] || return 0
+    case "$1" in
+        aarch64-apple-darwin) echo "3ee3ee547cedfeb7c2b16b2b7156039f7b470bb8f857e226fd3d2eb11db83c76" ;;
+        x86_64-apple-darwin) echo "2e31b23f3f1319f707d0e620b48847a0046577541d357276821f9f1b5492e0ba" ;;
+        x86_64-unknown-linux-gnu) echo "936c246dfdbbfa7cb22dd01814a21f582a892689fae96b06071a5e433baffa22" ;;
+        aarch64-unknown-linux-gnu) echo "b61b856c3e1a4fc65b8f6e6b0495ef975dd0924f90c59f3ea61b38a079173b84" ;;
+    esac
+}
+
+file_sha256() {
+    if command -v sha256sum >/dev/null 2>&1; then
+        sha256sum "$1" | cut -d' ' -f1
+    else
+        shasum -a 256 "$1" | cut -d' ' -f1
+    fi
+}
+
+install_standalone_python() {
+    local target fname url tmp expected actual
+    target="$(standalone_target)" || {
+        echo "不支援的 CPU/OS 組合: $OS_KIND/$(uname -m) / Unsupported CPU/OS combination: $OS_KIND/$(uname -m)" >&2
+        return 1
+    }
+    fname="cpython-${PY_STANDALONE_VER}+${PY_STANDALONE_TAG}-${target}-install_only.tar.gz"
+    url="${PY_STANDALONE_BASE}/${PY_STANDALONE_TAG}/${fname//+/%2B}"   # GitHub encodes '+' as %2B
+    bilingual "下載可搬移的 Python ${PY_STANDALONE_VER}（python-build-standalone，不需要 sudo，約 25–110 MB）..." \
+        "Downloading relocatable Python ${PY_STANDALONE_VER} (python-build-standalone, no sudo, ~25-110 MB)..."
+    tmp="$(mktemp -d)"
+    if ! curl -fsSL "$url" -o "$tmp/$fname"; then
+        echo "下載失敗: $url / download failed: $url" >&2
+        rm -rf "$tmp"; return 1
+    fi
+    expected="$(pinned_standalone_sha256 "$target")"
+    if [ -z "$expected" ]; then
+        expected="$( (curl -fsSL "${PY_STANDALONE_BASE}/${PY_STANDALONE_TAG}/SHA256SUMS" 2>/dev/null || true) | grep -E "  ${fname}\$" | awk '{print $1}' || true)"
+    fi
+    actual="$(file_sha256 "$tmp/$fname")"
+    if [ -z "$expected" ] || [ "$actual" != "$expected" ]; then
+        echo "Python 壓縮包 sha256 不符（預期 ${expected:-<無>}，實際 ${actual}），拒絕安裝 / Python tarball sha256 mismatch (expected ${expected:-<none>}, got ${actual}); refusing to install" >&2
+        rm -rf "$tmp"; return 1
+    fi
+    rm -rf "$PY_STANDALONE_DIR"
+    mkdir -p "$PY_STANDALONE_DIR"
+    # install_only tarballs unpack to a single top-level "python/" directory.
+    if ! tar -xzf "$tmp/$fname" -C "$PY_STANDALONE_DIR" --strip-components=1; then
+        echo "解壓失敗 / extraction failed" >&2
+        rm -rf "$tmp" "$PY_STANDALONE_DIR"; return 1
+    fi
+    rm -rf "$tmp"
+    [ -x "$PY_STANDALONE_DIR/bin/python3" ] || { echo "解壓後找不到 bin/python3 / bin/python3 missing after extraction" >&2; return 1; }
+    bilingual "已安裝 Python 到 $PY_STANDALONE_DIR" "Installed Python into $PY_STANDALONE_DIR"
+    return 0
+}
+
 bilingual "尋找 Python (>=3.10)..." "Looking for Python (>=3.10)..."
 PYTHON_BIN=""
 if PYTHON_BIN="$(resolve_python)"; then
     :
 else
-    bilingual "未找到合適的 Python" "No suitable Python found"
-    if [ "$OS_KIND" = "linux" ]; then
+    bilingual "未找到合適的 Python，自動安裝中..." "No suitable Python found; installing one automatically..."
+    # First choice on BOTH macOS and Linux: a per-user relocatable CPython --
+    # no sudo, no Xcode, no distro package manager. Only if that download
+    # fails does Linux fall back to apt/dnf (which needs sudo).
+    if install_standalone_python; then
+        :
+    elif [ "$OS_KIND" = "linux" ]; then
         if sudo -n true 2>/dev/null; then
             bilingual "以 sudo 安裝 python3-venv python3-pip..." "Installing python3-venv python3-pip via sudo..."
             if command -v apt-get >/dev/null 2>&1; then
@@ -129,10 +226,12 @@ else
             fi
         fi
     else
-        # darwin
-        fail_step "找不到 Python" "Python not found" \
-            "請先執行 'xcode-select --install'，或至 https://www.python.org/downloads/macos/ 安裝 Python 3.12（靜默安裝: installer pkg 可用 'sudo installer -pkg <pkg> -target /'），再重跑本腳本" \
-            "please run 'xcode-select --install' first, or install Python 3.12 from https://www.python.org/downloads/macos/ (silent install: 'sudo installer -pkg <pkg> -target /'), then re-run this script"
+        # darwin: the standalone download failed (network / unsupported CPU).
+        # The Xcode CLT python3 is 3.9 -- below our floor -- so it is NOT a
+        # fix; point at python.org instead.
+        fail_step "自動安裝 Python 失敗" "automatic Python install failed" \
+            "請確認網路可連到 github.com 後重跑本腳本；或至 https://www.python.org/downloads/macos/ 安裝 Python 3.12 再重跑" \
+            "please make sure github.com is reachable and re-run this script; or install Python 3.12 from https://www.python.org/downloads/macos/ and re-run"
     fi
 
     if ! PYTHON_BIN="$(resolve_python)"; then
