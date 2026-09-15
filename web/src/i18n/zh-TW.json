@@ -392,7 +392,17 @@
     "object_info_hint": "決定內嵌編輯器（/comfy/api/object_info）看到的節點清單，如何合併所有在線 Worker 已安裝的節點。",
     "object_info_union": "聯集",
     "object_info_intersection": "交集",
-    "object_info_save_failed": "無法儲存節點清單合併模式"
+    "object_info_save_failed": "無法儲存節點清單合併模式",
+    "uploads_heading": "我的上傳檔案",
+    "uploads_hint": "你在編輯器裡上傳的參考圖／素材，只有你自己看得到。刪除後不影響已送出的工作。",
+    "uploads_empty": "還沒有上傳任何檔案。",
+    "uploads_total": "共 {{count}} 個檔案，{{size}}",
+    "uploads_refresh": "重新整理",
+    "uploads_delete": "刪除",
+    "uploads_confirm": "確定要刪除「{{name}}」嗎？此動作無法復原。",
+    "uploads_deleted": "檔案已刪除",
+    "uploads_delete_failed": "無法刪除檔案",
+    "uploads_load_failed": "無法載入上傳檔案清單"
   },
   "errors": {
     "auth.required": "密碼錯誤。",

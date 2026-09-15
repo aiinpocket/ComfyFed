@@ -1,8 +1,10 @@
 import {
+  ActionIcon,
   Button,
   Card,
   CopyButton,
   Group,
+  Modal,
   PasswordInput,
   SegmentedControl,
   SimpleGrid,
@@ -18,15 +20,19 @@ import {
   IconCopy,
   IconDeviceFloppy,
   IconKey,
+  IconPhoto,
+  IconRefresh,
+  IconTrash,
   IconWorldBolt,
   IconX,
 } from '@tabler/icons-react';
-import { useEffect, useState } from 'react';
+import { useCallback, useEffect, useState } from 'react';
 import { useTranslation } from 'react-i18next';
 
-import { ApiError, api, type ObjectInfoMode, type Role } from '../api';
+import { ApiError, api, type ObjectInfoMode, type Role, type StagingFile } from '../api';
 import { Mono, SectionHeader } from '../components/Primitives';
 import { persistLang, type Lang } from '../i18n';
+import { formatBytes } from '../lib/format';
 
 interface SettingsProps {
   platformUrl: string;
@@ -79,6 +85,16 @@ export function Settings({ platformUrl, role }: SettingsProps) {
     };
   }, [isAdmin]);
 
+  // The caller's OWN staged uploads (`GET /api/staging`). Any role sees this
+  // card -- it is personal storage, and there is deliberately no admin
+  // cross-user view of anyone's uploads on either stack.
+  const [uploads, setUploads] = useState<StagingFile[]>([]);
+  const [uploadsTotal, setUploadsTotal] = useState(0);
+  const [uploadsLoaded, setUploadsLoaded] = useState(false);
+  const [uploadsBusy, setUploadsBusy] = useState(false);
+  const [deleteTarget, setDeleteTarget] = useState<StagingFile | null>(null);
+  const [deleting, setDeleting] = useState(false);
+
   const urlValid = urlDraft.startsWith('http://') || urlDraft.startsWith('https://');
   const urlDirty = urlDraft !== savedUrl;
 
@@ -92,6 +108,50 @@ export function Settings({ platformUrl, role }: SettingsProps) {
           ? t(`errors.${caught.code}`, { defaultValue: caught.message })
           : t('errors.network'),
     });
+
+  const loadUploads = useCallback(
+    async (notifyOnFailure = true) => {
+      setUploadsBusy(true);
+      try {
+        const listing = await api.listStaging();
+        setUploads(listing.files);
+        setUploadsTotal(listing.total_bytes);
+        setUploadsLoaded(true);
+      } catch (caught) {
+        if (notifyOnFailure) notifyFailure(t('settings.uploads_load_failed'), caught);
+      } finally {
+        setUploadsBusy(false);
+      }
+    },
+    // `notifyFailure` closes over `t` only; re-creating this on a language
+    // switch is harmless and keeps the effect below honest.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+    [t],
+  );
+
+  useEffect(() => {
+    void loadUploads(false);
+  }, [loadUploads]);
+
+  const confirmDeleteUpload = async () => {
+    if (!deleteTarget) return;
+    setDeleting(true);
+    try {
+      await api.deleteStagingFile(deleteTarget.name);
+      notifications.show({
+        color: 'teal',
+        icon: <IconCheck size={16} />,
+        title: t('settings.uploads_deleted'),
+        message: deleteTarget.name,
+      });
+      setDeleteTarget(null);
+      await loadUploads();
+    } catch (caught) {
+      notifyFailure(t('settings.uploads_delete_failed'), caught);
+    } finally {
+      setDeleting(false);
+    }
+  };
 
   const savePlatformUrl = async (event: React.FormEvent) => {
     event.preventDefault();
@@ -323,6 +383,81 @@ export function Settings({ platformUrl, role }: SettingsProps) {
             </Stack>
           </Card>
 
+          <Card style={cardStyle}>
+            <Stack gap="sm">
+              <Group justify="space-between" wrap="nowrap">
+                <Group gap="xs">
+                  <IconPhoto size={17} />
+                  <Text fw={600}>{t('settings.uploads_heading')}</Text>
+                </Group>
+                <Button
+                  size="compact-sm"
+                  variant="subtle"
+                  color="gray"
+                  leftSection={<IconRefresh size={14} />}
+                  loading={uploadsBusy}
+                  onClick={() => void loadUploads()}
+                >
+                  {t('settings.uploads_refresh')}
+                </Button>
+              </Group>
+              <Text size="sm" c="dimmed">
+                {t('settings.uploads_hint')}
+              </Text>
+
+              {uploadsLoaded && uploads.length === 0 && (
+                <Text size="sm" c="dimmed">
+                  {t('settings.uploads_empty')}
+                </Text>
+              )}
+
+              {uploads.length > 0 && (
+                <Stack gap="xs">
+                  {uploads.map((file) => (
+                    <Group
+                      key={file.name}
+                      justify="space-between"
+                      gap="sm"
+                      wrap="nowrap"
+                      p="xs"
+                      style={{
+                        background: theme.other.surfaces.raised,
+                        border: `1px solid ${theme.other.surfaces.border}`,
+                        borderRadius: theme.radius.md,
+                      }}
+                    >
+                      <Stack gap={2} style={{ minWidth: 0 }}>
+                        <Mono c="" size="sm">
+                          {file.name}
+                        </Mono>
+                        <Text size="xs" c="dimmed">
+                          {formatBytes(file.size)} ·{' '}
+                          {new Date(file.modified * 1000).toLocaleString()}
+                        </Text>
+                      </Stack>
+                      <Tooltip label={t('settings.uploads_delete')}>
+                        <ActionIcon
+                          variant="subtle"
+                          color="red"
+                          aria-label={`${t('settings.uploads_delete')} ${file.name}`}
+                          onClick={() => setDeleteTarget(file)}
+                        >
+                          <IconTrash size={16} />
+                        </ActionIcon>
+                      </Tooltip>
+                    </Group>
+                  ))}
+                  <Text size="xs" c="dimmed">
+                    {t('settings.uploads_total', {
+                      count: uploads.length,
+                      size: formatBytes(uploadsTotal),
+                    })}
+                  </Text>
+                </Stack>
+              )}
+            </Stack>
+          </Card>
+
           {objectInfoMode && (
             <Card style={cardStyle}>
               <Stack gap="sm">
@@ -345,6 +480,26 @@ export function Settings({ platformUrl, role }: SettingsProps) {
           )}
         </Stack>
       </SimpleGrid>
+
+      <Modal
+        opened={deleteTarget !== null}
+        onClose={() => setDeleteTarget(null)}
+        title={t('settings.uploads_delete')}
+      >
+        <Stack gap="md">
+          <Text size="sm">
+            {t('settings.uploads_confirm', { name: deleteTarget?.name ?? '' })}
+          </Text>
+          <Group justify="flex-end" gap="sm">
+            <Button variant="default" onClick={() => setDeleteTarget(null)}>
+              {t('common.cancel')}
+            </Button>
+            <Button color="red" loading={deleting} onClick={() => void confirmDeleteUpload()}>
+              {t('settings.uploads_delete')}
+            </Button>
+          </Group>
+        </Stack>
+      </Modal>
     </Stack>
   );
 }

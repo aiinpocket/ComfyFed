@@ -172,6 +172,7 @@ def create_app(data_dir: str) -> FastAPI:
     app.include_router(model_manifest.create_router(data_dir))
     app.include_router(peer.create_router(data_dir))
     app.include_router(comfyapi.create_router(data_dir))
+    app.include_router(comfyapi.create_staging_router(data_dir))
     app.include_router(comfyapi.create_ws_router())
     app.include_router(templates.create_router(data_dir))
     app.include_router(installer_routes.create_router(data_dir))

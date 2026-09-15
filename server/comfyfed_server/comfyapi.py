@@ -58,7 +58,17 @@ from collections import OrderedDict
 from importlib import resources
 from typing import Callable, Optional
 
-from fastapi import APIRouter, Depends, File, Form, Request, UploadFile, WebSocket, WebSocketDisconnect
+from fastapi import (
+    APIRouter,
+    Depends,
+    File,
+    Form,
+    HTTPException,
+    Request,
+    UploadFile,
+    WebSocket,
+    WebSocketDisconnect,
+)
 from fastapi.responses import FileResponse, JSONResponse, Response
 
 from . import agentws, assess, auth, db, jobs, model_guide, model_manifest, panelws, storage, workers
@@ -1664,6 +1674,73 @@ def create_router(
         settings[setting_id] = value
         _save_settings(data_dir, user.uid, settings)
         return Response(status_code=200)
+
+    return r
+
+
+def create_staging_router(data_dir: str) -> APIRouter:
+    """Build the CONSOLE-side `/api/staging` router: list and delete the
+    caller's own uploaded reference files.
+
+    Deliberately NOT part of `create_router`'s `/comfy/api` surface: this is
+    ComfyFed's own console API (standard error envelope, `X-CSRF` on the
+    mutation), not a ComfyUI-compatible endpoint. What it manages is the
+    same per-user staging directory `/comfy/api/upload/image` writes to
+    (`staging_dir`), which until now nothing could ever list or clean up --
+    an upload was permanent and invisible, so a user's storage only ever
+    grew.
+
+    Scope is the caller's OWN uid, with NO admin override: staging holds a
+    person's own reference images, and "admins can see everyone's uploads"
+    is a privacy regression, not a feature (the same ruling as the panel's
+    per-user queue/history scoping). The shared, platform-shipped template
+    samples (`SHARED_STAGING_UID`) are likewise not listed -- they are not
+    the user's uploads and they must not be deletable from here.
+    """
+    r = APIRouter()
+
+    @r.get("/api/staging")
+    def list_staging(user: auth.SessionUser = Depends(auth.require_user)):
+        directory = staging_dir(data_dir, user.uid)
+        files = []
+        total = 0
+        for name in sorted(_dir_file_names(directory)):
+            try:
+                stat = os.stat(os.path.join(directory, name))
+            except OSError:
+                continue
+            files.append({"name": name, "size": stat.st_size, "modified": stat.st_mtime})
+            total += stat.st_size
+        return {"files": files, "total_bytes": total}
+
+    @r.delete("/api/staging/{filename}")
+    def delete_staging(
+        filename: str, user: auth.SessionUser = Depends(auth.require_csrf_user)
+    ):
+        try:
+            safe_name = storage.sanitize_path_component(filename, what="staging filename")
+        except ValueError:
+            raise HTTPException(
+                status_code=400,
+                detail={"code": "staging.bad_name", "message": "檔名不合法。 / Invalid filename."},
+            )
+        path = os.path.join(staging_dir(data_dir, user.uid), safe_name)
+        if not os.path.isfile(path):
+            # Also the answer for "that file exists, but in SOMEBODY ELSE's
+            # staging directory" -- the caller's own namespace is the only
+            # thing this route can even address, so another user's file is
+            # indistinguishable from a nonexistent one.
+            raise HTTPException(
+                status_code=404,
+                detail={"code": "staging.not_found", "message": "檔案不存在。 / File not found."},
+            )
+        os.remove(path)
+        # Staging files are standalone bytes -- `/comfy/api/upload/image`
+        # writes exactly one file per upload and `/prompt` COPIES it into
+        # the job's own inputs at submit time, so there is no sidecar,
+        # thumbnail or derived object to clean up alongside it, and jobs
+        # already submitted keep their own copy.
+        return {"ok": True}
 
     return r
 

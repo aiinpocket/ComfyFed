@@ -11,6 +11,7 @@ import metricsRoutes from "./routes/metrics";
 import usersRoutes from "./routes/users";
 import peerRoutes from "./routes/peer";
 import installerRoutes from "./routes/installer";
+import stagingRoutes from "./routes/staging";
 import { comfySessionGate, serveComfyAsset } from "./lib/gate";
 
 export { Hub } from "./do/hub";
@@ -132,6 +133,7 @@ app.route("/", metricsRoutes);
 app.route("/", usersRoutes);
 app.route("/", peerRoutes);
 app.route("/", installerRoutes);
+app.route("/", stagingRoutes);
 
 // Any `/comfy/api/*` path no route above claimed is an API endpoint this
 // Worker does not implement -- it must 404 as JSON, NEVER fall through to

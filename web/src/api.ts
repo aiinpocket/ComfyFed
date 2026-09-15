@@ -347,6 +347,19 @@ export interface SettingsState {
   object_info_mode: ObjectInfoMode | string;
 }
 
+/** One file the caller uploaded into their own panel staging area
+ * (`GET /api/staging`). `modified` is unix seconds. */
+export interface StagingFile {
+  name: string;
+  size: number;
+  modified: number;
+}
+
+export interface StagingListing {
+  files: StagingFile[];
+  total_bytes: number;
+}
+
 /* -------------------------------------------------------------- endpoints */
 
 export const api = {
@@ -524,6 +537,21 @@ export const api = {
 
   patchUser(userId: string, update: { role?: Role; disabled?: boolean }): Promise<AppUser> {
     return patchJson<AppUser>(`/api/users/${encodeURIComponent(userId)}`, update);
+  },
+
+  /** GET /api/staging (any signed-in user): the caller's OWN uploaded
+   * reference files. There is no cross-user or admin view -- staging is
+   * personal, so this always answers with just the caller's own uploads. */
+  listStaging(): Promise<StagingListing> {
+    return getJson<StagingListing>('/api/staging');
+  },
+
+  /** DELETE /api/staging/{filename}: removes one of the caller's own staged
+   * uploads. 404 for an unknown name (including another user's file, which
+   * this route cannot address at all). Jobs already submitted keep their own
+   * copy of the asset. */
+  deleteStagingFile(name: string): Promise<{ ok: boolean }> {
+    return deleteJson(`/api/staging/${encodeURIComponent(name)}`);
   },
 };
 

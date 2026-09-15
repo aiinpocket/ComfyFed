@@ -392,7 +392,17 @@
     "object_info_hint": "Controls how the embedded editor's node list (/comfy/api/object_info) merges what every online worker has installed.",
     "object_info_union": "Union",
     "object_info_intersection": "Intersection",
-    "object_info_save_failed": "Could not save the node list merge mode"
+    "object_info_save_failed": "Could not save the node list merge mode",
+    "uploads_heading": "My uploads",
+    "uploads_hint": "Reference images and assets you uploaded in the editor. Only you can see them; deleting one does not affect jobs you already submitted.",
+    "uploads_empty": "You have not uploaded any files yet.",
+    "uploads_total": "{{count}} file(s), {{size}}",
+    "uploads_refresh": "Refresh",
+    "uploads_delete": "Delete",
+    "uploads_confirm": "Delete “{{name}}”? This cannot be undone.",
+    "uploads_deleted": "File deleted",
+    "uploads_delete_failed": "Could not delete the file",
+    "uploads_load_failed": "Could not load your uploads"
   },
   "errors": {
     "auth.required": "Wrong password.",
