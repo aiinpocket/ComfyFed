@@ -116,6 +116,11 @@ _LATENT_PASSTHROUGH_CLASSES = frozenset(
 # （KSampler 是 latent_image，LatentUpscale/VAEDecode 是 samples）。
 _LATENT_INPUT_FIELDS = ("latent_image", "samples")
 
+# §3.2 條件 6：輸出節點。每一個都必須以批次來源為祖先，否則一條跟批次無關
+# 的側支線（例如 LoadImage -> VAEEncode -> VAEDecode -> SaveImage）會在每個
+# 子 workflow 都跑一次，輸出在父 job 被複製 k 份。
+_OUTPUT_CLASSES = frozenset({"SaveImage", "PreviewImage"})
+
 _SPLIT_NODE_ID = "cfsplit"
 
 
@@ -140,15 +145,39 @@ def _nodes(workflow) -> list[tuple[str, str, dict]]:
 
 
 def _literal_int(inputs: dict, field: str) -> Optional[int]:
+    """字面整數。JSON 沒有 int/float 之分，`4.0` 這種整數值的 float 也要收
+    （TS 那邊 JS 數字本來就沒有這個區分，兩棧才會對齊）；`bool` 是 `int` 的
+    子類別，要先排除。"""
     value = inputs.get(field)
-    if isinstance(value, bool) or not isinstance(value, int):
+    if isinstance(value, bool):
         return None
-    return value
+    if isinstance(value, int):
+        return value
+    if isinstance(value, float) and value.is_integer():
+        return int(value)
+    return None
 
 
 def _link_target(value) -> Optional[str]:
-    """ComfyUI API 格式的接線是 `[node_id, slot]`；回傳來源 node_id 字串。"""
+    """ComfyUI API 格式的接線是 `[node_id, slot]`；回傳來源 node_id 字串，
+    不論 slot 是多少。用於條件 6 的祖先追溯（那邊刻意忽略 slot）。"""
     if isinstance(value, list) and len(value) >= 1 and isinstance(value[0], (str, int)):
+        return str(value[0])
+    return None
+
+
+def _link_target_slot0(value) -> Optional[str]:
+    """跟 `_link_target` 一樣，但只有接線指向 slot 0 才算數。條件 4 的 latent
+    追溯要用這個 -- 接到 `[source, 1]`（來源節點的第二個輸出）不算追到批次
+    來源，因為那不是 `LatentFromBatch` 會重寫的那個輸出槽。"""
+    if (
+        isinstance(value, list)
+        and len(value) >= 2
+        and isinstance(value[0], (str, int))
+        and isinstance(value[1], int)
+        and not isinstance(value[1], bool)
+        and value[1] == 0
+    ):
         return str(value[0])
     return None
 
@@ -156,7 +185,8 @@ def _link_target(value) -> Optional[str]:
 def _reaches_batch_source(
     node_id: Optional[str], source_node_id: str, by_id: dict[str, tuple[str, dict]], seen: set
 ) -> bool:
-    """沿 LATENT 邊往上追，看看這條 latent 最終是不是那個批次來源。"""
+    """沿 LATENT 邊往上追（只走 slot 0），看看這條 latent 最終是不是那個批次
+    來源。"""
     if node_id is None or node_id in seen:
         return False
     seen.add(node_id)
@@ -170,7 +200,31 @@ def _reaches_batch_source(
         return False
     for field in _LATENT_INPUT_FIELDS:
         if field in inputs:
-            return _reaches_batch_source(_link_target(inputs[field]), source_node_id, by_id, seen)
+            return _reaches_batch_source(
+                _link_target_slot0(inputs[field]), source_node_id, by_id, seen
+            )
+    return False
+
+
+def _has_ancestor(
+    node_id: Optional[str], source_node_id: str, by_id: dict[str, tuple[str, dict]], seen: set
+) -> bool:
+    """條件 6：由 `node_id` 沿著它的**所有** inputs 接線往上走（忽略 slot，
+    不限 LATENT 欄位），看看走不走得到 `source_node_id`。用來確認輸出節點
+    真的是批次來源的下游，而不是一條跟批次無關的側支線。"""
+    if node_id is None or node_id in seen:
+        return False
+    seen.add(node_id)
+    if node_id == source_node_id:
+        return True
+    entry = by_id.get(node_id)
+    if entry is None:
+        return False
+    _class_type, inputs = entry
+    for value in inputs.values():
+        parent_id = _link_target(value)
+        if parent_id is not None and _has_ancestor(parent_id, source_node_id, by_id, seen):
+            return True
     return False
 
 
@@ -179,7 +233,7 @@ def split_plan(
     requirements: Optional[dict] = None,
     split_batches: bool = True,
 ) -> Optional[SplitPlan]:
-    """§3.2：全部五個條件都成立才回傳 `SplitPlan`，否則 `None`。
+    """§3.2：全部六個條件都成立才回傳 `SplitPlan`，否則 `None`。
 
     `requirements` 是 job 的 `requirements` dict（`split` 為 `False` 時關閉
     這一件的拆分）；`split_batches` 是平台設定（預設開）。兩個都帶預設值，
@@ -227,8 +281,15 @@ def split_plan(
             # KSamplerSelect 之類根本不吃 latent 的節點：不是 latent 消費者。
             continue
         if not _reaches_batch_source(
-            _link_target(inputs[latent_field]), source_node_id, by_id, set()
+            _link_target_slot0(inputs[latent_field]), source_node_id, by_id, set()
         ):
+            return None
+
+    # 條件 6：每個輸出節點都要以批次來源為祖先。
+    for node_id, class_type, _inputs in nodes:
+        if class_type not in _OUTPUT_CLASSES:
+            continue
+        if not _has_ancestor(node_id, source_node_id, by_id, set()):
             return None
 
     return SplitPlan(source_node_id=source_node_id, batch_size=batch_size)
@@ -266,12 +327,7 @@ def child_workflow(
         if not isinstance(inputs, dict):
             continue
         for field, value in list(inputs.items()):
-            if (
-                isinstance(value, list)
-                and len(value) >= 2
-                and _link_target(value) == plan.source_node_id
-                and value[1] == 0
-            ):
+            if _link_target_slot0(value) == plan.source_node_id:
                 inputs[field] = [split_node_id, 0]
                 rewired += 1
 

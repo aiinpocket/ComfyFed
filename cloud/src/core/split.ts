@@ -95,6 +95,12 @@ const LATENT_PASSTHROUGH_CLASSES: ReadonlySet<string> = new Set([
 ]);
 
 const LATENT_INPUT_FIELDS = ["latent_image", "samples"];
+
+/** §3.2 條件 6：輸出節點。每一個都必須以批次來源為祖先，否則一條跟批次無關
+ * 的側支線（例如 LoadImage -> VAEEncode -> VAEDecode -> SaveImage）會在每個
+ * 子 workflow 都跑一次，輸出在父 job 被複製 k 份。 */
+const OUTPUT_CLASSES: ReadonlySet<string> = new Set(["SaveImage", "PreviewImage"]);
+
 const SPLIT_NODE_ID = "cfsplit";
 
 export interface SplitPlan {
@@ -126,9 +132,26 @@ function literalInt(inputs: Record<string, unknown>, field: string): number | nu
   return value;
 }
 
-/** ComfyUI API 格式的接線是 `[node_id, slot]`；回傳來源 node_id 字串。 */
+/** ComfyUI API 格式的接線是 `[node_id, slot]`；回傳來源 node_id 字串，不論
+ * slot 是多少。用於條件 6 的祖先追溯（那邊刻意忽略 slot）。 */
 function linkTarget(value: unknown): string | null {
   if (Array.isArray(value) && value.length >= 1 && (typeof value[0] === "string" || typeof value[0] === "number")) {
+    return String(value[0]);
+  }
+  return null;
+}
+
+/** 跟 `linkTarget` 一樣，但只有接線指向 slot 0 才算數。條件 4 的 latent 追溯
+ * 要用這個 -- 接到 `[source, 1]`（來源節點的第二個輸出）不算追到批次來源，
+ * 因為那不是 `LatentFromBatch` 會重寫的那個輸出槽。 */
+function linkTargetSlot0(value: unknown): string | null {
+  if (
+    Array.isArray(value) &&
+    value.length >= 2 &&
+    (typeof value[0] === "string" || typeof value[0] === "number") &&
+    typeof value[1] === "number" &&
+    value[1] === 0
+  ) {
     return String(value[0]);
   }
   return null;
@@ -148,13 +171,31 @@ function reachesBatchSource(
   if (!LATENT_PASSTHROUGH_CLASSES.has(entry.classType)) return false;
   for (const field of LATENT_INPUT_FIELDS) {
     if (field in entry.inputs) {
-      return reachesBatchSource(linkTarget(entry.inputs[field]), sourceNodeId, byId, seen);
+      return reachesBatchSource(linkTargetSlot0(entry.inputs[field]), sourceNodeId, byId, seen);
     }
   }
   return false;
 }
 
-/** §3.2 -- ports `split.split_plan`：五個條件全部成立才回傳計畫。 */
+function hasAncestor(
+  nodeId: string | null,
+  sourceNodeId: string,
+  byId: Map<string, NodeEntry>,
+  seen: Set<string>
+): boolean {
+  if (nodeId === null || seen.has(nodeId)) return false;
+  seen.add(nodeId);
+  if (nodeId === sourceNodeId) return true;
+  const entry = byId.get(nodeId);
+  if (!entry) return false;
+  for (const value of Object.values(entry.inputs)) {
+    const parentId = linkTarget(value);
+    if (parentId !== null && hasAncestor(parentId, sourceNodeId, byId, seen)) return true;
+  }
+  return false;
+}
+
+/** §3.2 -- ports `split.split_plan`：六個條件全部成立才回傳計畫。 */
 export function splitPlan(
   workflow: Record<string, unknown>,
   requirements?: Record<string, unknown> | null,
@@ -190,9 +231,15 @@ export function splitPlan(
     if (!(entry.classType.startsWith("KSampler") || entry.classType.startsWith("SamplerCustom"))) continue;
     const latentField = LATENT_INPUT_FIELDS.find((f) => f in entry.inputs);
     if (latentField === undefined) continue; // KSamplerSelect 之類不吃 latent
-    if (!reachesBatchSource(linkTarget(entry.inputs[latentField]), sourceNodeId, byId, new Set())) {
+    if (!reachesBatchSource(linkTargetSlot0(entry.inputs[latentField]), sourceNodeId, byId, new Set())) {
       return null;
     }
+  }
+
+  // 條件 6
+  for (const entry of entries) {
+    if (!OUTPUT_CLASSES.has(entry.classType)) continue;
+    if (!hasAncestor(entry.nodeId, sourceNodeId, byId, new Set())) return null;
   }
 
   return { sourceNodeId, batchSize };
@@ -223,7 +270,7 @@ export function childWorkflow(
     if (typeof inputs !== "object" || inputs === null) continue;
     const inputRecord = inputs as Record<string, unknown>;
     for (const [field, value] of Object.entries(inputRecord)) {
-      if (Array.isArray(value) && value.length >= 2 && linkTarget(value) === plan.sourceNodeId && value[1] === 0) {
+      if (linkTargetSlot0(value) === plan.sourceNodeId) {
         inputRecord[field] = [splitNodeId, 0];
         rewired += 1;
       }

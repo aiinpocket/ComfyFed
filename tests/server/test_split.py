@@ -117,6 +117,31 @@ def test_split_plan_ignores_ksampler_select_which_has_no_latent_input():
     assert split.split_plan(workflow) == split.SplitPlan(source_node_id="4", batch_size=4)
 
 
+def test_split_plan_accepts_an_integral_float_batch_size():
+    workflow = _batch_workflow()
+    workflow["4"]["inputs"]["batch_size"] = 4.0
+    assert split.split_plan(workflow) == split.SplitPlan(source_node_id="4", batch_size=4)
+
+
+def test_split_plan_vetoes_a_sampler_wired_to_a_non_zero_slot_of_the_batch_source():
+    workflow = _batch_workflow()
+    workflow["5"]["inputs"]["latent_image"] = ["4", 1]
+    assert split.split_plan(workflow) is None
+
+
+def test_split_plan_vetoes_a_side_branch_that_reaches_an_output_node_without_the_batch_source_as_ancestor():
+    workflow = _batch_workflow()
+    workflow["8"] = {"class_type": "LoadImage", "inputs": {"image": "x.png"}}
+    workflow["9"] = {"class_type": "VAEEncode", "inputs": {"pixels": ["8", 0], "vae": ["1", 2]}}
+    workflow["10"] = {"class_type": "VAEDecode", "inputs": {"samples": ["9", 0], "vae": ["1", 2]}}
+    workflow["11"] = {"class_type": "SaveImage", "inputs": {"images": ["10", 0]}}
+    assert split.split_plan(workflow) is None
+
+
+def test_split_plan_still_accepts_the_standard_graph_without_a_side_branch():
+    assert split.split_plan(_batch_workflow()) == split.SplitPlan(source_node_id="4", batch_size=4)
+
+
 def test_split_plan_vetoes_when_requirements_say_no():
     assert split.split_plan(_batch_workflow(), requirements={"split": False}) is None
     assert split.split_plan(_batch_workflow(), requirements={"split": True}) is not None

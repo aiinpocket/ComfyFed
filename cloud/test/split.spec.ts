@@ -85,6 +85,31 @@ describe("splitPlan (§3.2 veto conditions)", () => {
     expect(split.splitPlan(wf)).toEqual({ sourceNodeId: "4", batchSize: 4 });
   });
 
+  it("accepts an integral 4.0 batch_size (JS numbers have no float/int distinction)", () => {
+    const wf = batchWorkflow();
+    wf["4"].inputs.batch_size = 4.0;
+    expect(split.splitPlan(wf)).toEqual({ sourceNodeId: "4", batchSize: 4 });
+  });
+
+  it("vetoes a sampler wired to a non-zero slot of the batch source", () => {
+    const wf = batchWorkflow();
+    wf["5"].inputs.latent_image = ["4", 1];
+    expect(split.splitPlan(wf)).toBeNull();
+  });
+
+  it("vetoes a side branch that reaches an output node without the batch source as ancestor", () => {
+    const wf = batchWorkflow();
+    wf["8"] = { class_type: "LoadImage", inputs: { image: "x.png" } };
+    wf["9"] = { class_type: "VAEEncode", inputs: { pixels: ["8", 0], vae: ["1", 2] } };
+    wf["10"] = { class_type: "VAEDecode", inputs: { samples: ["9", 0], vae: ["1", 2] } };
+    wf["11"] = { class_type: "SaveImage", inputs: { images: ["10", 0] } };
+    expect(split.splitPlan(wf)).toBeNull();
+  });
+
+  it("still accepts the standard graph without a side branch", () => {
+    expect(split.splitPlan(batchWorkflow())).toEqual({ sourceNodeId: "4", batchSize: 4 });
+  });
+
   it("vetoes when requirements say no", () => {
     expect(split.splitPlan(batchWorkflow(), { split: false })).toBeNull();
     expect(split.splitPlan(batchWorkflow(), { split: true })).not.toBeNull();
