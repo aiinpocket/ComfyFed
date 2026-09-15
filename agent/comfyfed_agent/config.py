@@ -253,13 +253,18 @@ class AgentConfig:
         tmp_path = f"{path}.tmp-{os.getpid()}"
         with open(tmp_path, "w", encoding="utf-8") as f:
             json.dump(data, f, indent=2, ensure_ascii=False)
-        os.replace(tmp_path, path)
 
         # This file holds every platform's Ed25519 signing key in the clear,
-        # so it must not be world- or group-readable. Best-effort: chmod is a
-        # no-op for permissions on Windows and can fail on exotic filesystems,
-        # and neither case is worth failing a config write over.
+        # so it must not be world- or group-readable. L1 final-review fix: the
+        # chmod happens on the TEMP file, BEFORE `os.replace` publishes it --
+        # doing it afterwards leaves a window in which the key file is
+        # readable at whatever the umask allows (commonly 0644) by any other
+        # local user. Best-effort: chmod is a no-op for permissions on Windows
+        # and can fail on exotic filesystems, and neither case is worth
+        # failing a config write over. Same treatment in
+        # `runner.AgentLoop._append_dead_registration` (agent.dead.json).
         try:
-            os.chmod(path, 0o600)
+            os.chmod(tmp_path, 0o600)
         except OSError:
             pass
+        os.replace(tmp_path, path)

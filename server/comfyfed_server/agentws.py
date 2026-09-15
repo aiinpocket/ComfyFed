@@ -117,11 +117,40 @@ logger = logging.getLogger(__name__)
 
 _AUTH_TIMEOUT_SECONDS = 10
 _TICK_INTERVAL_SECONDS = 5
+
+# 三個握手關閉碼語意不同，agent 端據此決定「重試 / 慢速重試 / 放棄並清掉註冊」：
+# The handshake uses THREE distinct close codes, because the agent acts very
+# differently on each (see `comfyfed_agent.runner._is_auth_rejected` /
+# `_is_disabled`). Keep the cloud port (`cloud/src/do/hub.ts`) in step.
+#
+#   4401 AUTH REJECTED -- PERMANENT: unknown worker id, soft-deleted worker,
+#        or a bad signature. Nothing the agent retries can fix it, so the
+#        agent gives up on that registration (and, after a SECOND consecutive
+#        4401, prunes it out of agent.json into agent.dead.json).
 _CLOSE_UNAUTHORIZED = 4401
-# An admin soft-deleted this worker while it was connected (see
-# `workers.delete_worker` / `kick_worker`). Distinct from 4401 so an agent's
-# log says why it was dropped; the agent treats any 4xxx close the same way.
-_CLOSE_WORKER_DELETED = 4403
+#   4403 WORKER DISABLED -- REVERSIBLE: an admin disabled this worker (and it
+#        is NOT deleted). An admin can re-enable it, so the agent must keep
+#        retrying slowly and must NEVER prune the registration. Also used for
+#        the live-socket kick of a soft-deleted worker (`_close_deleted`):
+#        that agent's NEXT handshake gets the definitive 4401 anyway.
+_CLOSE_WORKER_DISABLED = 4403
+#   4408 HANDSHAKE TIMEOUT -- TRANSIENT: the auth frame never arrived in
+#        `_AUTH_TIMEOUT_SECONDS` (a loaded/sleeping agent, a slow link), or
+#        it was malformed. Ordinary retry; never a prune. Before this split
+#        these closed with 4401, which is exactly why the agent needs TWO
+#        consecutive 4401s before it treats one as permanent.
+_CLOSE_AUTH_TIMEOUT = 4408
+
+# Accepted range for hello's `peer_upload_min_mbps` (M2 final-review fix).
+# Below 0.1 Mbps a "cap" is not a real uplink configuration, it is a typo or
+# an attack on the grant TTL divisor; above 100 Gbps it is not an uplink
+# either. Out-of-range is treated as absent on BOTH stacks -- keep
+# `cloud/src/do/hub.ts`'s `parsePeerUploadMinMbps` in step.
+_MIN_PEER_UPLOAD_MBPS = 0.1
+_MAX_PEER_UPLOAD_MBPS = 100000.0
+
+_DISABLED_REASON = "worker 已停用 / worker disabled"
+_AUTH_TIMEOUT_REASON = "握手逾時 / handshake timeout"
 
 # Minimum `hello.protocol` that guarantees exec_seconds on job_done/job_failed
 # (when the run started) and understands `job_cancelled` pushes. Below this,
@@ -313,34 +342,45 @@ def _record_reconnect(worker_id: str) -> None:
 
 async def _handshake(websocket: WebSocket) -> Optional[str]:
     """Challenge/response handshake. Returns the verified worker id, or None
-    (having already closed the socket with code 4401) on any failure."""
+    having already closed the socket with one of the three handshake close
+    codes: 4401 (auth rejected: unknown/deleted worker, bad signature),
+    4403 (worker disabled by an admin -- reversible), or 4408 (handshake
+    timeout or a malformed auth frame -- transient). See the constants."""
     nonce = secrets.token_hex(16)
     await websocket.send_json({"type": "challenge", "nonce": nonce})
 
     try:
         auth_message = await asyncio.wait_for(websocket.receive_json(), timeout=_AUTH_TIMEOUT_SECONDS)
     except (asyncio.TimeoutError, WebSocketDisconnect, ValueError):
-        await _close_unauthorized(websocket)
+        # TRANSIENT: the agent may simply have been too busy/slow to answer
+        # in time. Never 4401 -- that would make the agent treat a loaded
+        # laptop as a deleted worker.
+        await _close_auth_timeout(websocket)
         return None
 
     if not isinstance(auth_message, dict) or auth_message.get("type") != "auth":
-        await _close_unauthorized(websocket)
+        await _close_auth_timeout(websocket)
         return None
 
     worker_id = auth_message.get("worker_id")
     sig = auth_message.get("sig")
     if not isinstance(worker_id, str) or not isinstance(sig, str):
-        await _close_unauthorized(websocket)
+        await _close_auth_timeout(websocket)
         return None
 
     with db.get_session() as session:
         worker = session.get(db.Worker, worker_id)
-        # `deleted` is checked alongside `disabled` (a soft-deleted worker is
-        # always disabled too, but the flag is the authoritative one -- see
-        # `db.Worker.deleted`): a deleted worker must never get a live socket
-        # back, no matter how valid its certificate still is.
-        if worker is None or worker.disabled or worker.deleted:
+        # ORDER MATTERS: a soft-deleted worker has BOTH `deleted` and
+        # `disabled` set (see `workers.delete_worker`), and `deleted` is the
+        # authoritative one -- it must be classified as 4401 (permanent,
+        # prunable), not as the reversible 4403. So unknown/deleted is tested
+        # FIRST, and 4403 is reached only by a worker that is disabled and
+        # NOT deleted.
+        if worker is None or worker.deleted:
             await _close_unauthorized(websocket)
+            return None
+        if worker.disabled:
+            await _close_disabled(websocket)
             return None
 
         try:
@@ -359,9 +399,28 @@ async def _close_unauthorized(websocket: WebSocket) -> None:
         pass
 
 
+async def _close_disabled(websocket: WebSocket) -> None:
+    try:
+        await websocket.close(code=_CLOSE_WORKER_DISABLED, reason=_DISABLED_REASON)
+    except Exception:
+        pass
+
+
+async def _close_auth_timeout(websocket: WebSocket) -> None:
+    try:
+        await websocket.close(code=_CLOSE_AUTH_TIMEOUT, reason=_AUTH_TIMEOUT_REASON)
+    except Exception:
+        pass
+
+
 async def _close_deleted(conn: "_Connection") -> None:
     try:
-        await conn.ws.close(code=_CLOSE_WORKER_DELETED)
+        # 4403 here means "stop using this socket", not "give up": the agent's
+        # next handshake hits the `worker.deleted` gate above and gets the
+        # definitive 4401. Closing a live socket with 4401 directly would make
+        # a kick count towards the agent's repeated-rejection prune counter on
+        # its own, without the agent ever having been re-auth'd.
+        await conn.ws.close(code=_CLOSE_WORKER_DISABLED)
     except Exception:
         logger.exception("agentws: failed to close socket for deleted worker %s", conn.worker_id)
 
@@ -719,11 +778,20 @@ def _parse_peer_upload_min_mbps(message: dict) -> Optional[float]:
     finite number, else `None` (missing, null because both caps are
     unlimited, wrong type, or non-positive). `None` means the caller omits it
     and `peer.grant_ttl_seconds` falls back to its default rate assumption --
-    i.e. today's behavior, unchanged."""
+    i.e. today's behavior, unchanged.
+
+    M2 final-review fix: the value must also lie within
+    [`_MIN_PEER_UPLOAD_MBPS`, `_MAX_PEER_UPLOAD_MBPS`]. A worker is an
+    authenticated but low-privilege actor and this number is used verbatim as
+    the TTL divisor: `1e-300` would otherwise mint a grant whose `expires_at`
+    is ~1e304, i.e. one that never expires. Out of range is treated exactly
+    like absent. Keep in step with hub.ts's `parsePeerUploadMinMbps`."""
     value = message.get("peer_upload_min_mbps")
     if not isinstance(value, (int, float)) or isinstance(value, bool):
         return None
     if not math.isfinite(value) or value <= 0:
+        return None
+    if value < _MIN_PEER_UPLOAD_MBPS or value > _MAX_PEER_UPLOAD_MBPS:
         return None
     return float(value)
 

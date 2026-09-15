@@ -190,6 +190,32 @@ describe("POST /api/agent/peer-grant", () => {
     );
   });
 
+  it("seederRateBytesPerSec ignores an out-of-range reported cap (M2, parity with peer.py)", () => {
+    // A worker is authenticated but low-privilege, and this value is the TTL
+    // DIVISOR: 1e-300 would otherwise mint an expires_at far past 2^63,
+    // which D1 then fails to bind for every later puller of that seeder.
+    for (const value of [1e-300, 0.09, 1e300, 100001, Number.NaN, Number.POSITIVE_INFINITY, -1]) {
+      expect(peer.seederRateBytesPerSec({ hardware: { peer_upload_min_mbps: value } } as any)).toBe(
+        peer.MIN_ASSUMED_RATE_BYTES_PER_SEC
+      );
+    }
+    // ...and the boundary itself is still accepted.
+    expect(
+      peer.seederRateBytesPerSec({
+        hardware: { peer_upload_min_mbps: peer.MIN_PEER_UPLOAD_MBPS },
+      } as any)
+    ).toBe((peer.MIN_PEER_UPLOAD_MBPS * 1_000_000) / 8);
+  });
+
+  it("grantTtlSeconds never exceeds the seven-day ceiling (M2, parity with peer.py)", () => {
+    expect(peer.MAX_GRANT_TTL_SECONDS).toBe(604800);
+    expect(peer.grantTtlSeconds(1e15, (peer.MIN_PEER_UPLOAD_MBPS * 1_000_000) / 8)).toBe(
+      peer.MAX_GRANT_TTL_SECONDS
+    );
+    // A rate that slipped past every other guard can't blow past it either.
+    expect(peer.grantTtlSeconds(1e9, 1e-300)).toBe(peer.MAX_GRANT_TTL_SECONDS);
+  });
+
   it("grantTtlSeconds for a slow seeder is proportionally longer (parity with peer.py)", () => {
     // A 5 Mbps seeder moves a 6.5 GB model 4x slower than the 20 Mbps
     // default the flat assumption was built for.

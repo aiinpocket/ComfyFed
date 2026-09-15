@@ -26,6 +26,20 @@ export const GRANT_TTL_SECONDS = 600;
  * second, see `agent/comfyfed_agent/peerserve.py`). Keep the two in step. */
 export const MIN_ASSUMED_RATE_BYTES_PER_SEC = 2_500_000;
 
+/** M2 final-review fix: the accepted range for a seeder-reported
+ * `peer_upload_min_mbps`, re-applied here when the value is read back out of
+ * the stored `hardware` blob (a row written by an older build must not be
+ * able to reintroduce the absurd-TTL case). Parity: peer.py's
+ * `MIN_PEER_UPLOAD_MBPS`/`MAX_PEER_UPLOAD_MBPS` and hub.ts's parse. */
+export const MIN_PEER_UPLOAD_MBPS = 0.1;
+export const MAX_PEER_UPLOAD_MBPS = 100_000;
+
+/** M2 final-review fix: hard ceiling on a computed grant TTL -- 7 days. The
+ * divisor is worker-reported, so this is what stops an absurd `expires_at`
+ * (past 2^63, i.e. a D1 bind failure for every later puller) from ever being
+ * signed into a grant. Parity: peer.py's `MAX_GRANT_TTL_SECONDS`. */
+export const MAX_GRANT_TTL_SECONDS = 604_800;
+
 /** The rate a grant served by `worker` should be sized for -- ports peer.py's
  * `_seeder_rate_bytes_per_sec`.
  *
@@ -39,6 +53,9 @@ export const MIN_ASSUMED_RATE_BYTES_PER_SEC = 2_500_000;
 export function seederRateBytesPerSec(worker: Worker): number {
   const value = worker.hardware?.["peer_upload_min_mbps"];
   if (typeof value !== "number" || !Number.isFinite(value) || value <= 0) {
+    return MIN_ASSUMED_RATE_BYTES_PER_SEC;
+  }
+  if (value < MIN_PEER_UPLOAD_MBPS || value > MAX_PEER_UPLOAD_MBPS) {
     return MIN_ASSUMED_RATE_BYTES_PER_SEC;
   }
   return (value * 1_000_000) / 8;
@@ -63,7 +80,10 @@ export function grantTtlSeconds(sizeBytes: number, rateBytesPerSec?: number): nu
       ? rateBytesPerSec
       : MIN_ASSUMED_RATE_BYTES_PER_SEC;
   const transfer = Math.ceil(size / rate);
-  return Math.floor(Math.max(GRANT_TTL_SECONDS, transfer * 1.5 + GRANT_TTL_SECONDS));
+  // ...and never longer than `MAX_GRANT_TTL_SECONDS` (M2) -- see that constant.
+  return Math.floor(
+    Math.min(MAX_GRANT_TTL_SECONDS, Math.max(GRANT_TTL_SECONDS, transfer * 1.5 + GRANT_TTL_SECONDS))
+  );
 }
 
 /** Global Constraints: agent protocol becomes 4 for P2P; older agents never

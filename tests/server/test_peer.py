@@ -14,7 +14,7 @@ from fastapi.testclient import TestClient
 from nacl.signing import SigningKey, VerifyKey
 
 from comfyfed_server import app as app_module
-from comfyfed_server import bootstrap, db, model_manifest, peer, security
+from comfyfed_server import agentws, bootstrap, db, model_manifest, peer, security
 
 
 def _sha(label: str) -> str:
@@ -824,3 +824,46 @@ def test_peer_grant_expiry_uses_the_seeders_reported_cap(client):
     ttl = peer.grant_ttl_seconds(size, 5 * 1_000_000 / 8)
     assert ttl > peer.grant_ttl_seconds(size)
     assert before + ttl <= expires_at <= after + ttl
+
+
+# --- M2: the reported cap is clamped, and the TTL has a ceiling -------------
+
+
+def test_seeder_rate_ignores_an_out_of_range_reported_cap():
+    """A worker is authenticated but low-privilege and this value is the TTL
+    DIVISOR: a denormal like 1e-300 would otherwise mint a grant whose
+    expires_at is ~1e304, i.e. one that never expires. Out of range (and NaN
+    /inf) is treated exactly like absent."""
+    for value in (1e-300, 0.09, 1e300, 100001, float("nan"), float("inf"), -1):
+        assert (
+            peer._seeder_rate_bytes_per_sec(
+                _FakeWorker(json.dumps({"peer_upload_min_mbps": value}))
+            )
+            == peer.MIN_ASSUMED_RATE_BYTES_PER_SEC
+        ), value
+
+    # ...and the range boundaries themselves are still accepted.
+    assert peer._seeder_rate_bytes_per_sec(
+        _FakeWorker(json.dumps({"peer_upload_min_mbps": peer.MIN_PEER_UPLOAD_MBPS}))
+    ) == peer.MIN_PEER_UPLOAD_MBPS * 1_000_000 / 8
+
+
+def test_hello_rejects_an_out_of_range_peer_upload_min_mbps():
+    """Parity with the read-back clamp above: the value never even reaches
+    the `hardware` blob (parity: hub.ts's `parsePeerUploadMinMbps`)."""
+    for value in (1e-300, 1e300, float("nan"), float("inf"), -1, 0, "5", True, None):
+        assert agentws._parse_peer_upload_min_mbps({"peer_upload_min_mbps": value}) is None, value
+    assert agentws._parse_peer_upload_min_mbps({"peer_upload_min_mbps": 5}) == 5.0
+
+
+def test_grant_ttl_never_exceeds_the_seven_day_ceiling():
+    """Whatever rate/size arithmetic produced it, `expires_at` stays a sane
+    integer -- 7 days is the hard ceiling."""
+    assert peer.MAX_GRANT_TTL_SECONDS == 604800
+    # A huge file at the slowest ACCEPTED rate still can't exceed the cap.
+    assert (
+        peer.grant_ttl_seconds(10 ** 15, peer.MIN_PEER_UPLOAD_MBPS * 1_000_000 / 8)
+        == peer.MAX_GRANT_TTL_SECONDS
+    )
+    # ...and a rate that slipped past every other guard can't either.
+    assert peer.grant_ttl_seconds(10 ** 9, 1e-300) == peer.MAX_GRANT_TTL_SECONDS

@@ -98,6 +98,75 @@ def test_handshake_with_unregistered_signature_closes_4401(client):
         assert exc_info.value.code == 4401
 
 
+def test_handshake_of_a_soft_deleted_worker_closes_4401(client):
+    """A soft-deleted worker has BOTH `deleted` and `disabled` set, and
+    `deleted` is the authoritative one: it must get the PERMANENT 4401 (which
+    the agent may eventually prune on), never the reversible 4403."""
+    csrf = _login(client)
+    worker_id, sk = _register_worker(client, csrf, "w1")
+    with db.get_session() as session:
+        worker = session.get(db.Worker, worker_id)
+        worker.deleted = True
+        worker.disabled = True
+        session.commit()
+
+    with client.websocket_connect("/api/agent/ws") as ws:
+        challenge = ws.receive_json()
+        sig = sk.sign(challenge["nonce"].encode()).signature.hex()
+        ws.send_json({"type": "auth", "worker_id": worker_id, "sig": sig})
+
+        with pytest.raises(WebSocketDisconnect) as exc_info:
+            ws.receive_json()
+        assert exc_info.value.code == 4401
+
+
+def test_handshake_of_a_disabled_worker_closes_4403(client):
+    """Merely DISABLED (not deleted) is reversible -- an admin can re-enable
+    it -- so the agent must be told 4403 and keep its registration."""
+    csrf = _login(client)
+    worker_id, sk = _register_worker(client, csrf, "w1")
+    with db.get_session() as session:
+        worker = session.get(db.Worker, worker_id)
+        worker.disabled = True
+        assert not worker.deleted
+        session.commit()
+
+    with client.websocket_connect("/api/agent/ws") as ws:
+        challenge = ws.receive_json()
+        sig = sk.sign(challenge["nonce"].encode()).signature.hex()
+        ws.send_json({"type": "auth", "worker_id": worker_id, "sig": sig})
+
+        with pytest.raises(WebSocketDisconnect) as exc_info:
+            ws.receive_json()
+        assert exc_info.value.code == 4403
+
+
+def test_handshake_timeout_closes_4408_not_4401(client, monkeypatch):
+    """A handshake that never answers is TRANSIENT (slow box, sleeping
+    laptop). Before the split this closed 4401, which made the agent treat a
+    busy machine as a deleted worker -- it must be 4408."""
+    monkeypatch.setattr(agentws, "_AUTH_TIMEOUT_SECONDS", 0.05)
+
+    with client.websocket_connect("/api/agent/ws") as ws:
+        assert ws.receive_json()["type"] == "challenge"
+        # ...and deliberately never send the auth frame.
+        with pytest.raises(WebSocketDisconnect) as exc_info:
+            ws.receive_json()
+        assert exc_info.value.code == 4408
+
+
+def test_malformed_auth_frame_closes_4408(client):
+    """A frame that isn't an auth message at all is also not an auth
+    DECISION: transient/protocol noise, never a permanent rejection."""
+    with client.websocket_connect("/api/agent/ws") as ws:
+        assert ws.receive_json()["type"] == "challenge"
+        ws.send_json({"type": "hello"})
+
+        with pytest.raises(WebSocketDisconnect) as exc_info:
+            ws.receive_json()
+        assert exc_info.value.code == 4408
+
+
 def test_good_handshake_gets_ready(client):
     csrf = _login(client)
     worker_id, sk = _register_worker(client, csrf, "w1")

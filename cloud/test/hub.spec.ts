@@ -131,7 +131,10 @@ describe("handshake", () => {
     expect(result.code).toBe(4401);
   });
 
-  it("rejects a disabled worker with 4401", async () => {
+  it("rejects a merely DISABLED worker with 4403, not 4401", async () => {
+    // Disabling is reversible, so the agent is told 4403: it keeps retrying
+    // and never prunes the registration. Parity: test_agent_ws.py's
+    // test_handshake_of_a_disabled_worker_closes_4403.
     const kp = KEYPAIRS[0]!;
     const workerId = await makeWorker({ pubkeyHex: kp.pubkey_hex, disabled: true });
     const ws = await openAgentWs();
@@ -140,7 +143,7 @@ describe("handshake", () => {
     const sig = await signHex(kp.seed_hex, new TextEncoder().encode(challenge.nonce));
     ws.send(JSON.stringify({ type: "auth", worker_id: workerId, sig }));
     const result = await closed;
-    expect(result.code).toBe(4401);
+    expect(result.code).toBe(4403);
   });
 
   it("rejects a soft-deleted worker with 4401", async () => {
@@ -156,6 +159,37 @@ describe("handshake", () => {
     ws.send(JSON.stringify({ type: "auth", worker_id: workerId, sig }));
     const result = await closed;
     expect(result.code).toBe(4401);
+  });
+
+  it("rejects a soft-deleted worker that is ALSO disabled with 4401", async () => {
+    // The real shape of a soft delete (`DELETE /api/workers/:id` sets both
+    // flags). `deleted` must win: 4401 (permanent, prunable), never the
+    // reversible 4403 -- the whole dead-registration prune keys off this.
+    const kp = KEYPAIRS[0]!;
+    const workerId = await makeWorker({
+      pubkeyHex: kp.pubkey_hex,
+      deleted: true,
+      disabled: true,
+    });
+    const ws = await openAgentWs();
+    const challenge = await nextMessage(ws);
+    const closed = waitForClose(ws);
+    const sig = await signHex(kp.seed_hex, new TextEncoder().encode(challenge.nonce));
+    ws.send(JSON.stringify({ type: "auth", worker_id: workerId, sig }));
+    const result = await closed;
+    expect(result.code).toBe(4401);
+  });
+
+  it("rejects a malformed auth frame with 4408, not 4401", async () => {
+    // Not an auth DECISION: transient/protocol noise. 4401 here would feed
+    // the agent's give-up counter for a registration that is perfectly fine.
+    const ws = await openAgentWs();
+    const challenge = await nextMessage(ws);
+    expect(challenge.type).toBe("challenge");
+    const closed = waitForClose(ws);
+    ws.send("not json at all");
+    const result = await closed;
+    expect(result.code).toBe(4408);
   });
 
   it("supersedes an older connection from the same worker, and pushes target the new one", async () => {
@@ -301,7 +335,11 @@ describe("hello", () => {
   });
 
   it("omits peer_upload_min_mbps when hello reports null (both caps unlimited) or garbage", async () => {
-    for (const bad of [undefined, null, -5, "20", 0, true]) {
+    // M2: out-of-range values (a denormal, an absurd rate, NaN/Infinity) are
+    // treated exactly like absent -- they never reach the hardware blob and
+    // so can never become a TTL divisor. Parity: agentws.py's
+    // `_parse_peer_upload_min_mbps` range check.
+    for (const bad of [undefined, null, -5, "20", 0, true, 1e-300, 0.09, 1e300, 100001, Number.NaN]) {
       const kp = KEYPAIRS[0]!;
       const workerId = await makeWorker({ pubkeyHex: kp.pubkey_hex });
       const ws = await connectAgent(workerId, kp.seed_hex);

@@ -344,6 +344,32 @@ def test_config_save_is_not_group_or_world_readable(tmp_path):
         assert mode & stat.S_IRUSR
 
 
+def test_config_save_chmods_before_publishing_the_file(tmp_path, monkeypatch):
+    """L1: the 0600 must land on the TEMP file, BEFORE `os.replace`. Doing it
+    afterwards leaves a window in which a file holding every platform's
+    Ed25519 signing key is readable at whatever the umask allows."""
+    path = tmp_path / "agent.json"
+    seen: list[str] = []
+    real_chmod = os.chmod
+    real_replace = os.replace
+
+    def _record_chmod(target, mode):
+        seen.append(f"chmod:{os.path.basename(target)}")
+        return real_chmod(target, mode)
+
+    def _record_replace(src, dst):
+        seen.append("replace")
+        return real_replace(src, dst)
+
+    monkeypatch.setattr(os, "chmod", _record_chmod)
+    monkeypatch.setattr(os, "replace", _record_replace)
+
+    AgentConfig().save(str(path))
+
+    assert [s.split(":")[0] for s in seen] == ["chmod", "replace"]
+    assert ".tmp-" in seen[0], "the chmod must target the temp file, not the published one"
+
+
 def test_scan_models_skips_part_files(tmp_path):
     """final-review m2: an in-progress auto-fetch download (`*.part`,
     fetcher._PART_SUFFIX) must never enter the inventory or become a hash

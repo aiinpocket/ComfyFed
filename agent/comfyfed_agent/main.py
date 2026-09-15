@@ -156,10 +156,18 @@ async def _probe_registration(entry, config: AgentConfig, timeout: float) -> str
     running agent does. Returns one of:
 
     - `"ok"`     -- connected and completed the handshake (registration live).
-    - `"rejected"` -- the platform closed with 4401 (worker removed or
-      credentials invalid): a DEFINITIVE dead registration.
+    - `"rejected"` -- the platform closed with 4401 (unknown/deleted worker or
+      a bad signature): a DEFINITIVE dead registration. A newer platform
+      answers a handshake timeout with 4408 and an admin-disabled worker with
+      4403, so neither lands here -- both fall into `"unknown"`, i.e. the
+      installer never re-registers over a transient or reversible condition.
     - `"unknown"` -- anything else (network error, timeout, unexpected reply):
       cannot tell, so the installer must NOT re-register on this alone.
+
+    One probe, one verdict: unlike the long-running agent (which requires two
+    consecutive 4401s before pruning), this is an explicit operator/installer
+    check whose only action is to re-register, so a single definitive 4401 is
+    enough here.
     """
     conn = PlatformConnection(entry, config)
     try:
@@ -342,7 +350,9 @@ def cli() -> None:
 
     chk = sub.add_parser(
         "check-registration",
-        help="檢查已註冊平台是否仍接受本 agent / Check whether the registered platform(s) still accept this agent (exit 0 live, 2 dead-4401, 3 undetermined, 1 none).",
+        # Exit codes must match `_CHECK_REGISTRATION_DEAD_EXIT` (10, NOT 2 --
+        # argparse itself uses 2; see that constant's docstring).
+        help="檢查已註冊平台是否仍接受本 agent / Check whether the registered platform(s) still accept this agent (exit 0 live, 10 dead-4401, 3 undetermined, 1 none).",
     )
     chk.add_argument("--config", default=DEFAULT_CONFIG_PATH, help="Path to the agent config file.")
     chk.set_defaults(func=_cmd_check_registration)

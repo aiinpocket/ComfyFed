@@ -54,6 +54,19 @@ GRANT_TTL_SECONDS = 600
 # sized by this constant stops covering a whole transfer again.
 MIN_ASSUMED_RATE_BYTES_PER_SEC = 2_500_000
 
+# M2 final-review fix: the same accepted range `agentws._parse_peer_upload_min_mbps`
+# enforces at hello time, re-applied when the value is read back out of the
+# stored `hardware` blob -- a row written by an older build (or edited in the
+# DB) must not be able to reintroduce the absurd-TTL case.
+MIN_PEER_UPLOAD_MBPS = 0.1
+MAX_PEER_UPLOAD_MBPS = 100000.0
+
+# M2 final-review fix: hard ceiling on a computed grant TTL -- 7 days. Even a
+# legitimately slow seeder never needs longer than this for one file, and the
+# cap keeps `expires_at` a sane integer no matter what rate/size arithmetic
+# produced it. Parity: `cloud/src/core/peer.ts`'s `MAX_GRANT_TTL_SECONDS`.
+MAX_GRANT_TTL_SECONDS = 604800
+
 
 def _seeder_rate_bytes_per_sec(worker) -> float:
     """The rate a grant served by `worker` should be sized for.
@@ -75,6 +88,8 @@ def _seeder_rate_bytes_per_sec(worker) -> float:
     if not isinstance(value, (int, float)) or isinstance(value, bool) or value <= 0:
         return MIN_ASSUMED_RATE_BYTES_PER_SEC
     if not math.isfinite(value):
+        return MIN_ASSUMED_RATE_BYTES_PER_SEC
+    if value < MIN_PEER_UPLOAD_MBPS or value > MAX_PEER_UPLOAD_MBPS:
         return MIN_ASSUMED_RATE_BYTES_PER_SEC
     return float(value) * 1_000_000 / 8
 
@@ -102,8 +117,23 @@ def grant_ttl_seconds(size_bytes: int, rate_bytes_per_sec: float | None = None) 
     rate = rate_bytes_per_sec
     if not isinstance(rate, (int, float)) or isinstance(rate, bool) or rate <= 0:
         rate = MIN_ASSUMED_RATE_BYTES_PER_SEC
-    transfer = math.ceil(size / rate)
-    return int(max(GRANT_TTL_SECONDS, transfer * 1.5 + GRANT_TTL_SECONDS))
+    transfer = size / rate
+    if not math.isfinite(transfer):
+        # A rate small enough to overflow the division straight to infinity
+        # (`math.ceil` would raise OverflowError). Nothing to compute: the
+        # ceiling below is the answer. JS's `Math.ceil(Infinity)` flows into
+        # the same `Math.min` naturally, so the two stacks still agree.
+        return MAX_GRANT_TTL_SECONDS
+    transfer = math.ceil(transfer)
+    # ...and never longer than `MAX_GRANT_TTL_SECONDS` (M2): the divisor comes
+    # from a worker-reported value, so the ceiling is what stops an absurd
+    # `expires_at` from reaching the signed grant at all.
+    return int(
+        min(
+            MAX_GRANT_TTL_SECONDS,
+            max(GRANT_TTL_SECONDS, transfer * 1.5 + GRANT_TTL_SECONDS),
+        )
+    )
 
 # M4 final-review fix: a grant whose transfer is still active when its TTL
 # elapses must still be able to book its bandwidth -- the seeder's

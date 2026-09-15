@@ -67,10 +67,33 @@ _AUTO_FETCH_DISABLED_MESSAGE = (
 
 
 # WS close code the platform sends when it rejects a worker's auth: the
-# worker was removed server-side OR its credentials are invalid. Unlike a
-# deploy/network drop (1006/1011), 4401 is PERMANENT -- retrying it can never
-# succeed, so it is classified and handled categorically differently.
+# worker is unknown/soft-deleted server-side OR its signature is invalid.
+# Unlike a deploy/network drop (1006/1011), 4401 is meant to be PERMANENT, so
+# it is classified and handled categorically differently.
+#
+# ...with one caveat that shapes the whole give-up path: platforms OLDER than
+# this split also sent 4401 for a plain handshake TIMEOUT, which is entirely
+# transient (a loaded box, a laptop waking from sleep). So ONE 4401 is not
+# proof of a dead registration -- see `_AUTH_REJECTIONS_BEFORE_GIVING_UP`.
 _AUTH_REJECTED_CLOSE_CODE = 4401
+
+# The platform closed because an admin DISABLED this worker. Reversible (the
+# admin can re-enable it), so this must never give up and never prune -- the
+# agent just keeps retrying at the capped backoff until the worker is back.
+_WORKER_DISABLED_CLOSE_CODE = 4403
+
+# The platform's handshake timer fired (or the auth frame was malformed) --
+# purely transient, retried like any other drop. Newer platforms send this
+# instead of 4401 for that case; see server/comfyfed_server/agentws.py.
+_AUTH_TIMEOUT_CLOSE_CODE = 4408
+
+# How many CONSECUTIVE 4401 rejections one entry must collect, within this
+# process, before the agent treats it as definitively dead (gives up and
+# prunes). Two, not one: an older platform still answers a handshake timeout
+# with 4401, and a single one of those must never delete a live registration.
+# A successful handshake resets the counter (see `_run_platform`), so only a
+# genuinely unauthenticatable entry can ever reach the threshold.
+_AUTH_REJECTIONS_BEFORE_GIVING_UP = 2
 
 # Where a 4401-pruned registration is parked (see
 # `AgentLoop._prune_dead_registration`), always beside `agent.json` itself.
@@ -112,10 +135,28 @@ def _is_auth_rejected(exc: BaseException) -> bool:
     rejection and make a healthy agent give up forever. Anything that is not
     a `ConnectionClosed*` (a plain OSError, a timeout) is False.
     """
+    return _has_close_code(exc, _AUTH_REJECTED_CLOSE_CODE)
+
+
+def _is_disabled(exc: BaseException) -> bool:
+    """True iff `exc` is a websockets `ConnectionClosed*` carrying 4403, i.e.
+    "an admin disabled this worker".
+
+    REVERSIBLE, and that is the whole point of telling it apart from 4401:
+    the admin can re-enable the worker at any time, so the agent must keep
+    retrying (slowly) and must NEVER prune the registration -- a pruned entry
+    would not come back when the worker does.
+    """
+    return _has_close_code(exc, _WORKER_DISABLED_CLOSE_CODE)
+
+
+def _has_close_code(exc: BaseException, code: int) -> bool:
+    """Shared frame-code test for `_is_auth_rejected`/`_is_disabled`: decided
+    SOLELY on the `.rcvd`/`.sent` `Close` frames, never on `str(exc)`."""
     if not isinstance(exc, ConnectionClosed):
         return False
     for frame in (getattr(exc, "rcvd", None), getattr(exc, "sent", None)):
-        if frame is not None and getattr(frame, "code", None) == _AUTH_REJECTED_CLOSE_CODE:
+        if frame is not None and getattr(frame, "code", None) == code:
             return True
     return False
 
@@ -180,6 +221,14 @@ class PlatformConnection:
         # list the platform already has at the same sha256 -- only the first
         # report after connect, or a file (re)hashed since, carries it.
         self.chunks_sent: dict[str, str] = {}
+        # Consecutive 4401 handshake rejections seen on THIS entry in THIS
+        # process; reset to 0 by any successful handshake. Only when it
+        # reaches `_AUTH_REJECTIONS_BEFORE_GIVING_UP` does `_run_platform`
+        # treat the registration as definitively dead -- see that constant.
+        self.auth_rejections: int = 0
+        # Set once the 4403 "this worker is disabled" notice has been logged,
+        # so a worker left disabled for a week doesn't log it every backoff.
+        self.disabled_logged: bool = False
 
     def _ws_url(self) -> str:
         parsed = urlsplit(self.entry.platform_url)
@@ -658,6 +707,12 @@ class AgentLoop:
         # connected, `run()` raises `AllRegistrationsRejected`.
         self._connected_ever = False
         self._auth_gave_up = False
+        # M4 final-review fix: serialises `_prune_dead_registration`'s
+        # load->back up->save of agent.json. Two platforms can give up in the
+        # same tick; without this, a future async step anywhere in that
+        # sequence would silently reintroduce a lost update (one removal
+        # overwriting the other's).
+        self._prune_lock = asyncio.Lock()
         # Phase 3.1 P2P addendum (種子端): started in `run()` when
         # `peerserve.is_enabled(config)`, stopped in `shutdown()`. One
         # listener for the whole process, shared across every platform
@@ -1930,10 +1985,21 @@ class AgentLoop:
                 await conn.handshake()
                 # Past the handshake: this entry's credentials are accepted,
                 # so it is not a dead 4401 registration. Clears the "all
-                # rejected" verdict for the whole process.
+                # rejected" verdict for the whole process AND this entry's
+                # consecutive-rejection counter -- a 4401 that a successful
+                # handshake follows was, by definition, not permanent.
                 self._connected_ever = True
+                conn.auth_rejections = 0
+                conn.disabled_logged = False
 
-                hw = hardware.collect_hardware(self.config.comfy_url)
+                # BLOCKING (an HTTP call to ComfyUI), so it goes to a thread
+                # exactly like `whitelist.allowed_classes` below. On the event
+                # loop it stalls EVERY other platform's coroutine, and a
+                # platform whose challenge is left unanswered for 10 s closes
+                # the handshake -- which is how a healthy registration used to
+                # collect a spurious rejection while another platform was
+                # merely slow to answer.
+                hw = await asyncio.to_thread(hardware.collect_hardware, self.config.comfy_url)
                 backend, torch_version = hardware.detect_backend()
                 # Blocking (HTTP to ComfyUI) -- see handle_job.
                 allowed = await asyncio.to_thread(
@@ -1961,8 +2027,15 @@ class AgentLoop:
                     object_info_hash=conn.object_info_hash or None,
                 )
 
+                # Also BLOCKING, and far worse: with `hash_models` on and a
+                # real model directory this is minutes of sha256 on the event
+                # loop. Same `to_thread` treatment, same reason.
                 models = (
-                    hardware.scan_models(self.config.models_dir, hash_models=self.config.hash_models)
+                    await asyncio.to_thread(
+                        hardware.scan_models,
+                        self.config.models_dir,
+                        hash_models=self.config.hash_models,
+                    )
                     if self.config.models_dir
                     else []
                 )
@@ -1982,32 +2055,83 @@ class AgentLoop:
                 backoff = _BACKOFF_START_SECONDS
                 await self._connection_loop(conn)
             except Exception as exc:
-                if _is_auth_rejected(exc):
-                    # 4401 is permanent: the worker was removed server-side or
-                    # its credentials are invalid, and every retry would bounce
-                    # exactly the same way (the live incident: stacked dead
-                    # entries spamming `received 4401` forever). Fail loud and
-                    # actionable, then STOP retrying this entry by returning
-                    # from the retry loop -- unlike every other disconnect.
-                    self._auth_gave_up = True
-                    logger.error(
-                        "該 worker（%s）已不被平台 %s接受（可能已被移除或憑證失效），"
-                        "不再重試此註冊。請重新執行安裝指令以重新註冊。 / "
-                        "Worker %s is no longer accepted by platform %s (removed or "
-                        "credentials invalid); giving up on this registration. "
-                        "Re-run the installer to re-register.",
-                        conn.entry.worker_id, conn.entry.platform_url,
-                        conn.entry.worker_id, conn.entry.platform_url,
+                if _is_disabled(exc):
+                    # 4403: an admin disabled this worker. REVERSIBLE, so this
+                    # is NOT a give-up and emphatically NOT a prune -- the
+                    # registration has to still be here when the admin
+                    # re-enables the worker. Logged once per disabled spell so
+                    # the operator sees why nothing is happening, then handled
+                    # by the ordinary backoff loop (capped at
+                    # `_BACKOFF_MAX_SECONDS`, i.e. a slow, quiet retry).
+                    conn.auth_rejections = 0
+                    if not getattr(conn, "disabled_logged", False):
+                        conn.disabled_logged = True
+                        logger.error(
+                            "此 worker（%s）已被平台 %s 的管理員停用，將持續以慢速重試；"
+                            "管理員重新啟用後會自動恢復。 / "
+                            "Worker %s has been disabled by the platform admin at %s; "
+                            "will keep retrying slowly and reconnect automatically once "
+                            "it is re-enabled.",
+                            conn.entry.worker_id, conn.entry.platform_url,
+                            conn.entry.worker_id, conn.entry.platform_url,
+                        )
+                elif _is_auth_rejected(exc):
+                    # `getattr`: every real `PlatformConnection` initialises
+                    # this, but the attribute is read defensively so a
+                    # duck-typed connection can never turn a rejection into
+                    # an AttributeError raised *inside* this except block.
+                    conn.auth_rejections = getattr(conn, "auth_rejections", 0) + 1
+                    if conn.auth_rejections < _AUTH_REJECTIONS_BEFORE_GIVING_UP:
+                        # ONE 4401 is not proof: a platform older than the
+                        # 4401/4403/4408 split answers a handshake TIMEOUT
+                        # with 4401 too, and a timeout is transient. Retry
+                        # like any other drop and see whether it repeats.
+                        logger.warning(
+                            "平台 %s 以 4401 拒絕 worker %s；先重試一次以排除逾時等暫時狀況。 / "
+                            "Platform %s rejected worker %s with 4401; retrying once more "
+                            "before treating it as permanent (an older platform also sends "
+                            "4401 on a transient handshake timeout).",
+                            conn.entry.platform_url, conn.entry.worker_id,
+                            conn.entry.platform_url, conn.entry.worker_id,
+                        )
+                    else:
+                        # Repeated, consecutive 4401s: the worker really was
+                        # removed server-side or its credentials are invalid,
+                        # and every retry bounces the same way (the live
+                        # incident: stacked dead entries spamming `received
+                        # 4401` forever). Fail loud and actionable, then STOP
+                        # retrying this entry by returning -- unlike every
+                        # other disconnect.
+                        self._auth_gave_up = True
+                        logger.error(
+                            "該 worker（%s）連續 %s 次被平台 %s 以 4401 拒絕（可能已被移除或憑證失效），"
+                            "不再重試此註冊。請重新執行安裝指令以重新註冊。 / "
+                            "Worker %s was rejected %s times in a row by platform %s "
+                            "(removed or credentials invalid); giving up on this "
+                            "registration after repeated rejections. Re-run the installer "
+                            "to re-register.",
+                            conn.entry.worker_id, conn.auth_rejections, conn.entry.platform_url,
+                            conn.entry.worker_id, conn.auth_rejections, conn.entry.platform_url,
+                        )
+                        # ...and take the dead entry OUT of agent.json, so the
+                        # next start doesn't re-attempt (and re-log) it
+                        # forever. Only ever reached from THIS definitive
+                        # per-entry give-up -- never from a transient drop
+                        # (1006/1011/4408), never from 4403, and never from
+                        # `run()`'s `AllRegistrationsRejected` aggregation.
+                        await self._prune_dead_registration(conn.entry)
+                        # `finally` below still runs `conn.close()` on the way out.
+                        return
+                else:
+                    # Everything else -- 1006/1011, 4408 (handshake timeout),
+                    # DNS, refused TCP -- is an ordinary transient retry, and
+                    # resets the consecutive-rejection counter: "consecutive"
+                    # means consecutive 4401s, with nothing else in between.
+                    conn.auth_rejections = 0
+                    logger.exception(
+                        "runner: connection to %s dropped, retrying in %ss",
+                        conn.entry.platform_url, backoff,
                     )
-                    # ...and take the dead entry OUT of agent.json, so the
-                    # next start doesn't re-attempt (and re-log) it forever.
-                    # Only ever reached from THIS definitive per-entry 4401
-                    # give-up -- never from a transient drop, and never from
-                    # `run()`'s `AllRegistrationsRejected` aggregation.
-                    self._prune_dead_registration(conn.entry)
-                    # `finally` below still runs `conn.close()` on the way out.
-                    return
-                logger.exception("runner: connection to %s dropped, retrying in %ss", conn.entry.platform_url, backoff)
             finally:
                 await conn.close()
                 # A job task is NOT killed when its connection drops: a blip
@@ -2043,6 +2167,7 @@ class AgentLoop:
         path = self._dead_registrations_path()
         records: list = []
         if os.path.exists(path):
+            unreadable = False
             try:
                 # utf-8-sig for the same reason config.load uses it: a
                 # hand-edited file on Windows often carries a BOM.
@@ -2051,12 +2176,22 @@ class AgentLoop:
                 if isinstance(loaded, list):
                     records = loaded
                 else:
-                    logger.warning(
-                        "runner: %s is not a JSON list, starting a fresh backup list", path
-                    )
+                    unreadable = True
             except (OSError, ValueError):
+                unreadable = True
+            if unreadable:
+                # M3 final-review fix: a corrupt/unreadable backup file is
+                # RENAMED ASIDE, never overwritten. Whatever is in there is
+                # the only copy of earlier registrations' Ed25519 signing
+                # keys -- destroying it is exactly the loss this whole
+                # feature exists to prevent -- while refusing the prune would
+                # bring the 4401 spam back. Renaming is neither.
+                corrupt_path = f"{path}.corrupt-{datetime.now(timezone.utc).strftime('%Y%m%dT%H%M%SZ')}"
+                os.replace(path, corrupt_path)
                 logger.warning(
-                    "runner: could not read %s, starting a fresh backup list", path
+                    "runner: %s 無法解析，已改名保留為 %s，改用全新的備份清單。 / "
+                    "could not parse %s; preserved it as %s and started a fresh backup list.",
+                    path, corrupt_path, path, corrupt_path,
                 )
 
         records.append(
@@ -2073,29 +2208,69 @@ class AgentLoop:
         tmp_path = f"{path}.tmp-{os.getpid()}"
         with open(tmp_path, "w", encoding="utf-8") as f:
             json.dump(records, f, indent=2, ensure_ascii=False)
-        os.replace(tmp_path, path)
+        # L1 final-review fix: chmod the TEMP file, BEFORE it is published.
+        # Doing it after `os.replace` leaves a window in which a file holding
+        # an Ed25519 signing key is readable at whatever the umask allows
+        # (commonly 0644) by any other local user. Best-effort: chmod is a
+        # no-op for permissions on Windows and can fail on exotic
+        # filesystems, neither of which is worth failing the backup over.
         try:
-            os.chmod(path, 0o600)
+            os.chmod(tmp_path, 0o600)
         except OSError:
             pass
+        os.replace(tmp_path, path)
 
-    def _prune_dead_registration(self, entry: PlatformEntry) -> None:
-        """Remove a definitively 4401-dead `entry` from the persisted config.
+    async def _prune_dead_registration(self, entry: PlatformEntry) -> None:
+        """Remove a definitively auth-rejected `entry` from the persisted config.
 
-        Called ONLY from `_run_platform`'s per-entry give-up. Deliberately
-        synchronous: it runs to completion within one event-loop step, so two
-        platforms giving up in the same tick can't interleave a read-modify-
-        write of `agent.json`. It re-reads the config from disk rather than
-        serialising `self.config`, so an unrelated hand edit made while the
-        agent was running is not silently reverted by this prune, and it does
-        NOT touch `self.connections` -- the other platforms' `_run_platform`
-        tasks are still iterating over their own connections.
+        Called ONLY from `_run_platform`'s per-entry give-up (two consecutive
+        4401s). The whole load -> back up -> save -> update-memory sequence runs
+        under `self._prune_lock` and contains no `await` of its own, so two
+        platforms giving up at the same time cannot interleave a read-modify-
+        write of `agent.json` and lose one another's removal -- and a later
+        refactor that makes any step async still can't, because the lock
+        (not the accident of being synchronous) is what enforces it.
+
+        It re-reads the config from disk rather than serialising
+        `self.config`, so an unrelated hand edit made while the agent was
+        running is not silently reverted -- but only for keys
+        `AgentConfig.load`/`save` know about: the round-trip DROPS any
+        unknown/hand-added key and COERCES a malformed value back to its
+        default (see config.py, e.g. a hand-typed `"max_fetch_gb": "abc"`
+        becomes 30). It does NOT touch `self.connections` -- the other
+        platforms' `_run_platform` tasks are still iterating over their own
+        connections.
+
+        NOT guarded against another PROCESS (review L2, parked): a
+        `comfyfed-agent register` (or the installer) run WHILE the agent is
+        up does its own load->modify->save in `identity.register`, and
+        nothing coordinates the two. The window is sub-millisecond on both
+        sides and re-registering is an installer-time action, so this is
+        accepted rather than solved with a file lock.
         """
+        async with self._prune_lock:
+            self._prune_dead_registration_locked(entry)
+
+    def _prune_dead_registration_locked(self, entry: PlatformEntry) -> None:
+        """The body of `_prune_dead_registration`, run under `_prune_lock`.
+        Synchronous by design: nothing in here may await, or the lock would
+        stop serialising the read-modify-write it exists to serialise."""
         try:
             cfg = AgentConfig.load(self.cfg_path)
-        except (OSError, ValueError):
+        except Exception:
+            # M1 final-review fix: `Exception`, not `(OSError, ValueError)`.
+            # This re-read exists to tolerate a hand edit made while the agent
+            # runs, and a hand edit is exactly what produces the other cases:
+            # an extra key inside a `platforms` entry raises TypeError from
+            # `PlatformEntry(**p)`, a top-level JSON array raises
+            # AttributeError. This runs INSIDE `_run_platform`'s `except`
+            # block, so anything escaping here propagates through
+            # `asyncio.gather` and kills every healthy platform with it.
             logger.exception(
-                "runner: could not read %s to prune the dead registration", self.cfg_path
+                "runner: 無法讀取 %s，略過這次清除（該註冊留在原處）。 / "
+                "could not read %s to prune the dead registration; skipping the "
+                "prune and leaving the entry in place.",
+                self.cfg_path, self.cfg_path,
             )
             return
 
@@ -2112,7 +2287,10 @@ class AgentLoop:
 
         try:
             self._append_dead_registration(entry)
-        except OSError:
+        except Exception:
+            # M1: `Exception` here too -- `json.dump` can raise TypeError and
+            # `os.makedirs` ValueError on a hand-broken path, and neither may
+            # escape into `_run_platform`'s except block (see above).
             # The backup is the whole point: without it the signing key would
             # be unrecoverable, so a failed backup CANCELS the prune. The
             # entry stays in agent.json and is simply re-attempted next start

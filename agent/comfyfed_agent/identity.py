@@ -57,6 +57,13 @@ def register(bundle: dict, name: str, cfg_path: str, client: httpx.Client) -> Pl
     # for OTHER platform_urls are untouched -- multi-platform stays legal.
     cfg.platforms = [p for p in cfg.platforms if p.platform_url != platform_url]
     cfg.platforms.append(entry)
+    # PARKED (review L2): this load->modify->save is NOT guarded against a
+    # RUNNING agent doing its own (see `runner.AgentLoop._prune_dead_
+    # registration`, which is guarded only within its own process). If an
+    # operator registers while the agent is up, the two could interleave and
+    # lose one write. Accepted: registering is an installer-time action, the
+    # window is sub-millisecond on both sides, and a file lock here would be
+    # the only fix worth having. Stop the agent before re-registering.
     cfg.save(cfg_path)
 
     return entry

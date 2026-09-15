@@ -65,17 +65,37 @@ import { readSessionCookie } from "../lib/cookies";
 import { getOrCreateSessionSecret } from "../db/queries";
 import { sessionUserFromPayload } from "../lib/guard";
 import { jobOutputs, FALLBACK_OUTPUT_KEY, type JobOutputsInput } from "../core/outputs";
+// Single source of truth for the accepted `peer_upload_min_mbps` range, so
+// the hello-time gate and the grant-time read-back can never drift apart.
+import { MIN_PEER_UPLOAD_MBPS, MAX_PEER_UPLOAD_MBPS } from "../core/peer";
 
 // ---------------------------------------------------------------------------
 // Constants (parity: agentws.py module-level constants)
 
 const AUTH_TIMEOUT_MS = 10_000;
 const TICK_INTERVAL_MS = 5_000;
+/** 三個握手關閉碼語意不同 -- the handshake uses THREE distinct close codes,
+ * parity with agentws.py's `_CLOSE_UNAUTHORIZED` / `_CLOSE_WORKER_DISABLED` /
+ * `_CLOSE_AUTH_TIMEOUT`. The agent acts differently on each (see the agent's
+ * `_is_auth_rejected` / `_is_disabled`):
+ *
+ * 4401 AUTH REJECTED -- PERMANENT: unknown worker id (a soft-deleted worker
+ * is filtered out by `getWorkerById`, so it lands here) or a bad signature.
+ * The agent gives up on that registration, and prunes it out of agent.json
+ * after a SECOND consecutive 4401. */
 const CLOSE_UNAUTHORIZED = 4401;
-/** An admin soft-deleted this worker while it was connected -- parity with
- * agentws.py's `_CLOSE_WORKER_DELETED`, pushed here through
- * `/internal/kick_worker` (see `handleInternalKickWorker`). */
-const CLOSE_WORKER_DELETED = 4403;
+/** 4403 WORKER DISABLED -- REVERSIBLE: an admin disabled this (non-deleted)
+ * worker. The agent keeps retrying slowly and NEVER prunes. Also carries the
+ * live-socket kick of a soft-deleted worker through `/internal/kick_worker`
+ * (see `handleInternalKickWorker`): that agent's next handshake gets the
+ * definitive 4401 from the unknown-worker path anyway. */
+const CLOSE_WORKER_DISABLED = 4403;
+/** 4408 HANDSHAKE TIMEOUT -- TRANSIENT: the auth frame never arrived within
+ * `AUTH_TIMEOUT_MS`, or it was malformed. Ordinary retry, never a prune. */
+const CLOSE_AUTH_TIMEOUT = 4408;
+
+const DISABLED_REASON = "worker 已停用 / worker disabled";
+const AUTH_TIMEOUT_REASON = "握手逾時 / handshake timeout";
 
 /** Minimum `hello.protocol` that guarantees exec_seconds and understands
  * `job_cancelled` pushes -- see agentws.py's `_CURRENT_PROTOCOL`. */
@@ -261,9 +281,16 @@ function parseMaxFetchGb(value: unknown): number | null {
  * positive finite number, else `null` (missing, null because both caps are
  * unlimited, wrong type, or non-positive). `null` means the caller omits it
  * and `peer.grantTtlSeconds` keeps its default rate assumption -- today's
- * behavior, unchanged. Ports agentws.py's `_parse_peer_upload_min_mbps`. */
+ * behavior, unchanged. Ports agentws.py's `_parse_peer_upload_min_mbps`.
+ *
+ * M2 final-review fix: the value must also lie within
+ * [`MIN_PEER_UPLOAD_MBPS`, `MAX_PEER_UPLOAD_MBPS`]. A worker is an
+ * authenticated but low-privilege actor and this number is the TTL divisor:
+ * `1e-300` would otherwise mint an `expires_at` far past 2^63, which D1 then
+ * fails to bind for every later puller of that seeder. */
 function parsePeerUploadMinMbps(value: unknown): number | null {
   if (typeof value !== "number" || !Number.isFinite(value) || value <= 0) return null;
+  if (value < MIN_PEER_UPLOAD_MBPS || value > MAX_PEER_UPLOAD_MBPS) return null;
   return value;
 }
 
@@ -454,7 +481,10 @@ export class Hub extends DurableObject<Env> {
       this.handshakeTimers.delete(server);
       const current = server.deserializeAttachment() as AgentAttachment | null;
       if (current && current.phase === "handshake") {
-        this.closeUnauthorized(server);
+        // TRANSIENT (parity: agentws.py's `_close_auth_timeout`): a slow or
+        // loaded agent must not be told 4401, which the agent counts towards
+        // giving up on (and pruning) the registration.
+        this.closeAuthTimeout(server);
       }
     }, AUTH_TIMEOUT_MS);
     this.handshakeTimers.set(server, timer);
@@ -644,7 +674,10 @@ export class Hub extends DurableObject<Env> {
     }
     this.ephemeral.delete(ws);
     try {
-      ws.close(CLOSE_WORKER_DELETED, "worker deleted");
+      // 4403, not 4401: this only tells the agent to stop using THIS socket.
+      // Its next handshake finds the row filtered out by `getWorkerById` and
+      // gets the definitive 4401 (parity: agentws.py's `_close_deleted`).
+      ws.close(CLOSE_WORKER_DISABLED, "worker deleted");
     } catch (err) {
       // Best-effort, exactly like the supersede-close in the handshake: the
       // row is already flagged deleted, so a socket that is already closing
@@ -763,23 +796,34 @@ export class Hub extends DurableObject<Env> {
       const text = typeof raw === "string" ? raw : new TextDecoder().decode(raw);
       parsed = JSON.parse(text);
     } catch {
-      this.closeUnauthorized(ws);
+      // Malformed auth frame -> TRANSIENT (4408), parity with agentws.py.
+      this.closeAuthTimeout(ws);
       return;
     }
 
     if (typeof parsed !== "object" || parsed === null) {
-      this.closeUnauthorized(ws);
+      this.closeAuthTimeout(ws);
       return;
     }
     const auth = parsed as Record<string, unknown>;
     if (auth.type !== "auth" || typeof auth.worker_id !== "string" || typeof auth.sig !== "string") {
-      this.closeUnauthorized(ws);
+      this.closeAuthTimeout(ws);
       return;
     }
 
+    // ORDER MATTERS (parity: agentws.py's `_handshake`). `getWorkerById`
+    // already filters `deleted = 0`, so a soft-deleted worker -- which has
+    // BOTH deleted AND disabled set -- arrives here as `!worker` and is
+    // classified 4401 (permanent, prunable). Only a disabled-and-NOT-deleted
+    // worker can reach the 4403 branch, so this must not be reordered into
+    // consulting `worker.disabled` first.
     const worker = await queries.getWorkerById(this.env.DB, auth.worker_id);
-    if (!worker || worker.disabled) {
+    if (!worker) {
       this.closeUnauthorized(ws);
+      return;
+    }
+    if (worker.disabled) {
+      this.closeDisabled(ws);
       return;
     }
 
@@ -841,6 +885,30 @@ export class Hub extends DurableObject<Env> {
       ws.close(CLOSE_UNAUTHORIZED);
     } catch {
       // agentws.py's `_close_unauthorized` swallows close failures too.
+    }
+  }
+
+  /** 4403: an admin disabled this worker -- reversible, so the agent keeps
+   * retrying and never prunes. Parity with agentws.py's `_close_disabled`. */
+  private closeDisabled(ws: WebSocket): void {
+    this.clearHandshakeTimer(ws);
+    this.ephemeral.delete(ws);
+    try {
+      ws.close(CLOSE_WORKER_DISABLED, DISABLED_REASON);
+    } catch {
+      // Best-effort, exactly like `closeUnauthorized`.
+    }
+  }
+
+  /** 4408: the handshake timed out or the auth frame was malformed --
+   * transient. Parity with agentws.py's `_close_auth_timeout`. */
+  private closeAuthTimeout(ws: WebSocket): void {
+    this.clearHandshakeTimer(ws);
+    this.ephemeral.delete(ws);
+    try {
+      ws.close(CLOSE_AUTH_TIMEOUT, AUTH_TIMEOUT_REASON);
+    } catch {
+      // Best-effort, exactly like `closeUnauthorized`.
     }
   }
 

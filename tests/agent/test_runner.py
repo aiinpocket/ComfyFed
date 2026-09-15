@@ -1,6 +1,7 @@
 import asyncio
 import hashlib
 import json
+import logging
 import os
 import threading
 import time
@@ -65,6 +66,10 @@ class FakeConnection:
         self.model_inventory_hash = ""
         self.chunks_sent: dict[str, str] = {}
         self.inventories: list[list[dict]] = []
+        # Mirrors the real `PlatformConnection`: consecutive 4401s seen on
+        # this entry, and whether the 4403 "disabled" notice was logged.
+        self.auth_rejections = 0
+        self.disabled_logged = False
         # A live socket, as far as the reporting retry is concerned; a test
         # simulates a blip by setting it to None (what `close()` does).
         self.ws = object()
@@ -2284,9 +2289,10 @@ def one_platform_loop(monkeypatch, tmp_path):
     return AgentLoop(config, str(tmp_path / "agent.json"), connection_factory=FakeConnection)
 
 
-async def test_run_platform_gives_up_and_returns_on_4401(one_platform_loop):
-    """A 4401 handshake is permanent: `_run_platform` must RETURN (stop
-    retrying this entry) and record the give-up, not back off and loop."""
+async def test_run_platform_gives_up_and_returns_on_repeated_4401(one_platform_loop):
+    """Two CONSECUTIVE 4401 handshakes are definitive: `_run_platform` must
+    RETURN (stop retrying this entry) and record the give-up -- but only on
+    the second, since an older platform sends 4401 on a mere timeout too."""
     loop = one_platform_loop
     conn = loop.connections["worker-a"]
 
@@ -2303,7 +2309,7 @@ async def test_run_platform_gives_up_and_returns_on_4401(one_platform_loop):
     # Returns rather than looping forever.
     await asyncio.wait_for(loop._run_platform(conn), timeout=5)
 
-    assert calls["n"] == 1, "a 4401 entry must not be retried"
+    assert calls["n"] == 2, "the FIRST 4401 must be retried, the second gives up"
     assert loop._auth_gave_up is True
     assert loop._connected_ever is False
 
@@ -2520,8 +2526,349 @@ async def test_prune_of_an_already_absent_entry_is_a_no_op(prunable_loop, tmp_pa
     loop = prunable_loop
     stranger = _entry_at("worker-gone", "http://gone.example")
 
-    loop._prune_dead_registration(stranger)
+    await loop._prune_dead_registration(stranger)
 
     saved = AgentConfig.load(loop.cfg_path)
     assert [p.worker_id for p in saved.platforms] == ["worker-dead", "worker-live"]
+    assert not (tmp_path / "agent.dead.json").exists()
+
+
+# --- H1/L4: 4403 (disabled) and 4408 (timeout) are NOT a dead registration --
+
+
+def _close_exc(code: int, reason: str = "x") -> ConnectionClosedError:
+    return ConnectionClosedError(Close(code, reason), None)
+
+
+async def test_4403_disabled_keeps_retrying_and_prunes_nothing(prunable_loop, tmp_path, caplog):
+    """An admin DISABLING a worker is reversible: the agent must keep
+    retrying (so it reconnects by itself once the worker is re-enabled) and
+    must never give up or prune -- a pruned entry would not come back."""
+    loop = prunable_loop
+    conn = loop.connections["worker-dead"]
+
+    calls = {"n": 0}
+
+    async def _handshake_4403():
+        calls["n"] += 1
+        if calls["n"] >= 4:
+            raise asyncio.CancelledError()
+        raise _close_exc(runner_module._WORKER_DISABLED_CLOSE_CODE, "worker disabled")
+
+    conn.connect = _noop
+    conn.close = _noop
+    conn.handshake = _handshake_4403
+
+    with caplog.at_level(logging.ERROR, logger="comfyfed_agent.runner"):
+        with pytest.raises(asyncio.CancelledError):
+            await asyncio.wait_for(loop._run_platform(conn), timeout=5)
+
+    assert calls["n"] >= 3, "a disabled worker must keep being retried"
+    assert loop._auth_gave_up is False
+    # Nothing pruned, nothing backed up.
+    saved = AgentConfig.load(loop.cfg_path)
+    assert [p.worker_id for p in saved.platforms] == ["worker-dead", "worker-live"]
+    assert not (tmp_path / "agent.dead.json").exists()
+    # ...and the bilingual notice was logged exactly ONCE, not per retry.
+    disabled_logs = [r for r in caplog.records if "已被平台" in r.getMessage()]
+    assert len(disabled_logs) == 1
+    assert "disabled by the platform admin" in disabled_logs[0].getMessage()
+
+
+async def test_4408_handshake_timeout_prunes_nothing(prunable_loop, tmp_path):
+    """4408 is the platform saying "you didn't answer in time" -- as
+    transient as a 1006, so it is retried and never pruned."""
+    loop = prunable_loop
+    conn = loop.connections["worker-dead"]
+
+    calls = {"n": 0}
+
+    async def _handshake_4408():
+        calls["n"] += 1
+        if calls["n"] >= 4:
+            raise asyncio.CancelledError()
+        raise _close_exc(runner_module._AUTH_TIMEOUT_CLOSE_CODE, "handshake timeout")
+
+    conn.connect = _noop
+    conn.close = _noop
+    conn.handshake = _handshake_4408
+
+    with pytest.raises(asyncio.CancelledError):
+        await asyncio.wait_for(loop._run_platform(conn), timeout=5)
+
+    assert calls["n"] >= 3
+    assert loop._auth_gave_up is False
+    saved = AgentConfig.load(loop.cfg_path)
+    assert [p.worker_id for p in saved.platforms] == ["worker-dead", "worker-live"]
+    assert not (tmp_path / "agent.dead.json").exists()
+
+
+async def test_a_single_4401_followed_by_a_good_handshake_prunes_nothing(
+    prunable_loop, tmp_path
+):
+    """The false positive this rule exists to stop: one 4401 (an old platform
+    answering a handshake TIMEOUT) followed by a successful handshake must
+    leave the registration exactly where it was, counter reset."""
+    loop = prunable_loop
+    conn = loop.connections["worker-dead"]
+
+    calls = {"n": 0}
+
+    async def _handshake_once_4401():
+        calls["n"] += 1
+        if calls["n"] == 1:
+            raise _close_exc(runner_module._AUTH_REJECTED_CLOSE_CODE, "timeout, really")
+        return None
+
+    async def _stop_after_hello(*args, **kwargs):
+        # Break out right after the handshake succeeded; CancelledError is
+        # not caught by `except Exception`, so it propagates cleanly.
+        raise asyncio.CancelledError()
+
+    conn.connect = _noop
+    conn.close = _noop
+    conn.handshake = _handshake_once_4401
+    conn.send_hello = _stop_after_hello
+
+    with pytest.raises(asyncio.CancelledError):
+        await asyncio.wait_for(loop._run_platform(conn), timeout=5)
+
+    assert calls["n"] == 2
+    assert conn.auth_rejections == 0, "a successful handshake resets the counter"
+    assert loop._auth_gave_up is False
+    saved = AgentConfig.load(loop.cfg_path)
+    assert [p.worker_id for p in saved.platforms] == ["worker-dead", "worker-live"]
+    assert not (tmp_path / "agent.dead.json").exists()
+
+
+async def test_two_consecutive_4401_prune_the_entry(prunable_loop, tmp_path):
+    """...and the second consecutive 4401 does prune it, backup and all."""
+    loop = prunable_loop
+    conn = loop.connections["worker-dead"]
+
+    async def _handshake_4401():
+        raise _close_exc(runner_module._AUTH_REJECTED_CLOSE_CODE, "worker removed")
+
+    conn.connect = _noop
+    conn.close = _noop
+    conn.handshake = _handshake_4401
+
+    await asyncio.wait_for(loop._run_platform(conn), timeout=5)
+
+    assert conn.auth_rejections == runner_module._AUTH_REJECTIONS_BEFORE_GIVING_UP
+    assert [p.worker_id for p in AgentConfig.load(loop.cfg_path).platforms] == ["worker-live"]
+    assert [r["worker_id"] for r in _dead_records(tmp_path)] == ["worker-dead"]
+
+
+# --- H1(c): the blocking hello-time calls must not stall the event loop -----
+
+
+async def test_hello_time_blocking_calls_go_through_to_thread(monkeypatch, tmp_path):
+    """`collect_hardware`/`scan_models` block (an HTTP call; minutes of
+    sha256 with `hash_models`). On the event loop they stall every OTHER
+    platform's coroutine past the platform's 10 s handshake timer -- which is
+    exactly how a healthy registration used to collect a spurious rejection.
+    They must be dispatched via `asyncio.to_thread`, like
+    `whitelist.allowed_classes` beside them."""
+    models_dir = tmp_path / "models"
+    models_dir.mkdir()
+    monkeypatch.setattr(hardware, "collect_hardware", lambda *a, **k: {})
+    monkeypatch.setattr(hardware, "scan_models", lambda *a, **k: [])
+    monkeypatch.setattr(hardware, "detect_backend", lambda: ("cpu", "0"))
+    monkeypatch.setattr(hardware, "collect_dynamic", lambda *a, **k: {})
+    monkeypatch.setattr(whitelist, "allowed_classes", lambda *a, **k: {"KSampler"})
+    monkeypatch.setattr(runner_module, "_BACKOFF_START_SECONDS", 0)
+    monkeypatch.setattr(runner_module, "_BACKOFF_MAX_SECONDS", 0)
+
+    dispatched = []
+    real_to_thread = asyncio.to_thread
+
+    async def _recording_to_thread(func, *args, **kwargs):
+        dispatched.append(func)
+        return await real_to_thread(func, *args, **kwargs)
+
+    monkeypatch.setattr(asyncio, "to_thread", _recording_to_thread)
+
+    config = AgentConfig(
+        platforms=[_entry("worker-a")],
+        pause_when_active=False,
+        models_dir=str(models_dir),
+    )
+    loop = AgentLoop(config, str(tmp_path / "agent.json"), connection_factory=FakeConnection)
+    conn = loop.connections["worker-a"]
+
+    async def _stop_at_inventory(*args, **kwargs):
+        raise asyncio.CancelledError()
+
+    conn.connect = _noop
+    conn.close = _noop
+    conn.handshake = _noop
+    conn.send_hello = _noop
+    conn.send_inventory = _stop_at_inventory
+
+    with pytest.raises(asyncio.CancelledError):
+        await asyncio.wait_for(loop._run_platform(conn), timeout=5)
+
+    assert hardware.collect_hardware in dispatched
+    assert hardware.scan_models in dispatched
+
+
+async def test_a_slow_collect_hardware_does_not_stall_another_platform(monkeypatch, tmp_path):
+    """The concrete starvation: platform A's blocking hello-time work must
+    not delay platform B's handshake. B's handshake completes WHILE A is
+    still inside its 0.3 s `collect_hardware`."""
+    order: list[str] = []
+
+    def _slow_collect(*args, **kwargs):
+        time.sleep(0.3)
+        order.append("a-collect-done")
+        return {}
+
+    monkeypatch.setattr(hardware, "collect_hardware", _slow_collect)
+    monkeypatch.setattr(hardware, "detect_backend", lambda: ("cpu", "0"))
+    monkeypatch.setattr(hardware, "collect_dynamic", lambda *a, **k: {})
+    monkeypatch.setattr(whitelist, "allowed_classes", lambda *a, **k: {"KSampler"})
+    monkeypatch.setattr(runner_module, "_BACKOFF_START_SECONDS", 0)
+    monkeypatch.setattr(runner_module, "_BACKOFF_MAX_SECONDS", 0)
+
+    config = AgentConfig(
+        platforms=[
+            _entry_at("worker-a", "http://a.example"),
+            _entry_at("worker-b", "http://b.example"),
+        ],
+        pause_when_active=False,
+    )
+    loop = AgentLoop(config, str(tmp_path / "agent.json"), connection_factory=FakeConnection)
+    conn_a = loop.connections["worker-a"]
+    conn_b = loop.connections["worker-b"]
+
+    async def _stop(*args, **kwargs):
+        raise asyncio.CancelledError()
+
+    conn_a.connect = _noop
+    conn_a.close = _noop
+    conn_a.handshake = _noop
+    conn_a.send_hello = _stop
+
+    async def _b_handshake():
+        # B only gets here if A's blocking call is off the event loop.
+        await asyncio.sleep(0.05)
+        order.append("b-handshake-done")
+        raise asyncio.CancelledError()
+
+    conn_b.connect = _noop
+    conn_b.close = _noop
+    conn_b.handshake = _b_handshake
+
+    results = await asyncio.wait_for(
+        asyncio.gather(
+            loop._run_platform(conn_a),
+            loop._run_platform(conn_b),
+            return_exceptions=True,
+        ),
+        timeout=5,
+    )
+    assert all(isinstance(r, asyncio.CancelledError) for r in results)
+    assert order == ["b-handshake-done", "a-collect-done"]
+
+
+# --- M1: a hand-edited agent.json must never escape and kill the agent ------
+
+
+async def test_prune_skips_when_the_config_cannot_be_reparsed(prunable_loop, tmp_path, caplog):
+    """`PlatformEntry(**p)` raises TypeError on an unknown key, and the prune
+    runs INSIDE `_run_platform`'s except block -- an escape there propagates
+    through `asyncio.gather` and takes every healthy platform down with it."""
+    loop = prunable_loop
+    conn = loop.connections["worker-dead"]
+
+    raw = json.loads((tmp_path / "agent.json").read_text(encoding="utf-8"))
+    raw["platforms"][0]["totally_unknown_key"] = "hand edited"
+    (tmp_path / "agent.json").write_text(json.dumps(raw), encoding="utf-8")
+
+    async def _handshake_4401():
+        raise _close_exc(runner_module._AUTH_REJECTED_CLOSE_CODE, "gone")
+
+    conn.connect = _noop
+    conn.close = _noop
+    conn.handshake = _handshake_4401
+
+    with caplog.at_level(logging.ERROR, logger="comfyfed_agent.runner"):
+        # Does NOT raise: the agent keeps running, the prune is skipped.
+        await asyncio.wait_for(loop._run_platform(conn), timeout=5)
+
+    assert json.loads((tmp_path / "agent.json").read_text(encoding="utf-8")) == raw
+    assert not (tmp_path / "agent.dead.json").exists()
+    assert any("略過這次清除" in r.getMessage() for r in caplog.records)
+
+
+# --- M3: a corrupt agent.dead.json is preserved, never overwritten ----------
+
+
+async def test_a_corrupt_dead_file_is_renamed_aside_not_overwritten(prunable_loop, tmp_path):
+    """Whatever is in there is the only copy of earlier registrations'
+    signing keys, so it is renamed to `.corrupt-<utc>` and a fresh list is
+    started -- the prune still proceeds."""
+    loop = prunable_loop
+    conn = loop.connections["worker-dead"]
+    dead_path = tmp_path / "agent.dead.json"
+    corrupt_payload = '{"not": "a list"'
+    dead_path.write_text(corrupt_payload, encoding="utf-8")
+
+    async def _handshake_4401():
+        raise _close_exc(runner_module._AUTH_REJECTED_CLOSE_CODE, "gone")
+
+    conn.connect = _noop
+    conn.close = _noop
+    conn.handshake = _handshake_4401
+
+    await asyncio.wait_for(loop._run_platform(conn), timeout=5)
+
+    preserved = [p for p in tmp_path.iterdir() if ".corrupt-" in p.name]
+    assert len(preserved) == 1
+    assert preserved[0].read_text(encoding="utf-8") == corrupt_payload
+    # The prune proceeded, and the new file holds exactly the new record.
+    assert [r["worker_id"] for r in _dead_records(tmp_path)] == ["worker-dead"]
+    assert [p.worker_id for p in AgentConfig.load(loop.cfg_path).platforms] == ["worker-live"]
+
+
+# --- M4: the prune is locked, and a failed backup cancels it ----------------
+
+
+async def test_two_concurrent_prunes_do_not_lose_an_update(prunable_loop, tmp_path):
+    """Two platforms giving up at the same time: both entries must leave
+    agent.json and both must be backed up -- neither removal may be lost to
+    the other's read-modify-write."""
+    loop = prunable_loop
+    dead = _entry_at("worker-dead", "http://dead.example")
+    live = _entry_at("worker-live", "http://live.example")
+
+    await asyncio.gather(
+        loop._prune_dead_registration(dead),
+        loop._prune_dead_registration(live),
+    )
+
+    assert AgentConfig.load(loop.cfg_path).platforms == []
+    assert sorted(r["worker_id"] for r in _dead_records(tmp_path)) == [
+        "worker-dead",
+        "worker-live",
+    ]
+
+
+async def test_a_failed_backup_cancels_the_prune(prunable_loop, tmp_path, monkeypatch):
+    """The single most important safety property: without the backup the
+    signing key would be unrecoverable, so a backup failure must leave
+    agent.json exactly as it was (the entry is simply retried next start)."""
+    loop = prunable_loop
+
+    def _boom(entry):
+        raise OSError("disk full")
+
+    monkeypatch.setattr(loop, "_append_dead_registration", _boom)
+
+    await loop._prune_dead_registration(_entry_at("worker-dead", "http://dead.example"))
+
+    saved = AgentConfig.load(loop.cfg_path)
+    assert [p.worker_id for p in saved.platforms] == ["worker-dead", "worker-live"]
+    assert [p.worker_id for p in loop.config.platforms] == ["worker-dead", "worker-live"]
     assert not (tmp_path / "agent.dead.json").exists()
