@@ -177,7 +177,9 @@
     "cancel_confirm_body": "任務 {{id}} 會立即停止，取消的任務不會產生費用紀錄。",
     "cancel_confirm_action": "確定取消任務",
     "cancel_success": "任務已取消",
-    "cancel_failed": "無法取消這個任務"
+    "cancel_failed": "無法取消這個任務",
+    "split_badge": "拆分 ×{{count}}",
+    "split_badge_tooltip": "這個任務被拆成 {{count}} 份，同時交給多台 worker 跑。"
   },
   "job_detail": {
     "back": "回到任務列表",
@@ -217,6 +219,24 @@
     "receipt_kind_cancelled": "已取消",
     "receipt_basis_exec": "實測 GPU 執行時間",
     "receipt_basis_wall": "以牆鐘時間估算",
+    "section_children": "子任務",
+    "children_hint": "這個任務被拆成多份同時跑；每一份各自有收據，下面的 GPU 秒數是各自的。",
+    "child_index": "序號",
+    "child_worker": "Worker",
+    "child_status": "狀態",
+    "child_progress": "進度",
+    "child_gpu_seconds": "GPU 秒數",
+    "gpu_seconds_total": "GPU 秒數合計",
+    "section_dispatch": "派工依據",
+    "dispatch_predicted": "預估執行時間",
+    "dispatch_basis": "依據",
+    "dispatch_basis_signature": "這台機器跑過同樣的圖",
+    "dispatch_basis_speed_index": "別台跑過同樣的圖，依這台的速度換算",
+    "dispatch_basis_fleet_default": "還沒跑過這種圖，用整體平均換算",
+    "dispatch_basis_none": "還沒有任何歷史資料，用預設值",
+    "dispatch_load_seconds": "預估模型載入",
+    "dispatch_fetch_seconds": "預估模型下載",
+    "dispatch_candidates": "當時合格的 worker 數",
     "yes": "是",
     "no": "否"
   },
@@ -413,7 +433,10 @@
     "uploads_confirm": "確定要刪除「{{name}}」嗎？此動作無法復原。",
     "uploads_deleted": "檔案已刪除",
     "uploads_delete_failed": "無法刪除檔案",
-    "uploads_load_failed": "無法載入上傳檔案清單"
+    "uploads_load_failed": "無法載入上傳檔案清單",
+    "split_batches": "自動拆分批次",
+    "split_batches_hint": "一張 batch_size ≥ 2 的圖，在有多台 worker 閒置時自動拆成多份同時跑。同 seed 同構圖，但不是逐位元一致（差異等同於同一張圖落在不同機器上）。關掉之後新送出的任務一律整包跑在一台上。",
+    "split_batches_save_failed": "無法儲存拆分設定"
   },
   "errors": {
     "auth.required": "密碼錯誤。",

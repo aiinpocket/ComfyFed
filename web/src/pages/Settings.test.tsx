@@ -67,6 +67,7 @@ const SETTINGS_STATE = {
   object_info_mode: 'union',
   upload_max_file_mb: 50,
   upload_user_quota_gb: 5,
+  split_batches: true,
 };
 
 describe('Settings page: my uploads card', () => {
@@ -230,5 +231,54 @@ describe('Settings page: uploads quota line', () => {
     // 2 KB staging + 1 KB userdata against a 10 MB quota.
     expect(await screen.findByText('Used 3 KB of 10 MB')).toBeInTheDocument();
     expect(screen.getByLabelText('Storage usage')).toBeInTheDocument();
+  });
+});
+
+describe('Settings page: split_batches switch (Phase 3.3 Task 8)', () => {
+  afterEach(() => {
+    cleanup();
+    vi.unstubAllGlobals();
+  });
+
+  it('toggles split_batches and persists it', async () => {
+    const posted: unknown[] = [];
+    const fetchMock = vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+      const url = typeof input === 'string' ? input : input.toString();
+      const method = init?.method ?? 'GET';
+      if (url === '/api/settings' && method === 'GET') return jsonResponse(SETTINGS_STATE);
+      if (url === '/api/settings' && method === 'POST') {
+        const body = JSON.parse(String(init?.body));
+        posted.push(body);
+        return jsonResponse({ ...SETTINGS_STATE, ...body });
+      }
+      if (url === '/api/staging') {
+        return jsonResponse({ files: [], total_bytes: 0, quota_bytes: 0, userdata_bytes: 0 });
+      }
+      return jsonResponse({ error: { code: 'http_error', message: 'not stubbed' } }, 404);
+    });
+    vi.stubGlobal('fetch', fetchMock);
+
+    renderSettings('admin');
+
+    const toggle = await screen.findByLabelText(/Split batches automatically/);
+    fireEvent.click(toggle);
+
+    await waitFor(() => expect(posted).toContainEqual({ split_batches: false }));
+  });
+
+  it('does not show the split_batches switch for a non-admin', async () => {
+    const fetchMock = vi.fn(async (input: RequestInfo | URL) => {
+      const url = typeof input === 'string' ? input : input.toString();
+      if (url === '/api/staging') {
+        return jsonResponse({ files: [], total_bytes: 0, quota_bytes: 0, userdata_bytes: 0 });
+      }
+      return jsonResponse({ error: { code: 'http_error', message: 'not stubbed' } }, 404);
+    });
+    vi.stubGlobal('fetch', fetchMock);
+
+    renderSettings('user');
+
+    await screen.findByText('You have not uploaded any files yet.');
+    expect(screen.queryByLabelText(/Split batches automatically/)).not.toBeInTheDocument();
   });
 });

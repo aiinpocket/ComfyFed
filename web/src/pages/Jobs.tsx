@@ -682,6 +682,13 @@ function JobsTable({
                   <Table.Td>
                     <Group gap={6} wrap="nowrap">
                       <JobStatusBadge status={job.status} />
+                      {job.split_count > 0 && (
+                        <Tooltip label={t('jobs.split_badge_tooltip', { count: job.split_count })}>
+                          <Badge size="sm" variant="light" color="grape">
+                            {t('jobs.split_badge', { count: job.split_count })}
+                          </Badge>
+                        </Tooltip>
+                      )}
                       {job.error && (
                         <Tooltip label={job.error} multiline maw={320}>
                           <ThemeIcon variant="subtle" color="red" size="sm">

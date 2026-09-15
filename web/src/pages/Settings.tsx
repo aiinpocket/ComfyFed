@@ -11,6 +11,7 @@ import {
   SegmentedControl,
   SimpleGrid,
   Stack,
+  Switch,
   Text,
   TextInput,
   Tooltip,
@@ -67,6 +68,10 @@ export function Settings({ platformUrl, role }: SettingsProps) {
   const [objectInfoMode, setObjectInfoMode] = useState<ObjectInfoMode | null>(null);
   const [savingObjectInfoMode, setSavingObjectInfoMode] = useState(false);
 
+  // Phase 3.3 §3.7: same GET /api/settings read as `object_info_mode` above.
+  const [splitBatches, setSplitBatches] = useState(true);
+  const [savingSplitBatches, setSavingSplitBatches] = useState(false);
+
   // Admin-configurable upload limits. Same GET /api/settings read as
   // `object_info_mode` above -- kept as strings while editing so a
   // half-typed "1." does not snap back under the admin's cursor.
@@ -89,6 +94,7 @@ export function Settings({ platformUrl, role }: SettingsProps) {
         setObjectInfoMode(settings.object_info_mode as ObjectInfoMode);
         setMaxFileMb(settings.upload_max_file_mb);
         setQuotaGb(settings.upload_user_quota_gb);
+        setSplitBatches(settings.split_batches);
       })
       .catch(() => {
         /* left null; the segmented control below just won't render yet */
@@ -253,6 +259,20 @@ export function Settings({ platformUrl, role }: SettingsProps) {
       notifyFailure(t('settings.object_info_save_failed'), caught);
     } finally {
       setSavingObjectInfoMode(false);
+    }
+  };
+
+  const changeSplitBatches = async (value: boolean) => {
+    const previous = splitBatches;
+    setSplitBatches(value);
+    setSavingSplitBatches(true);
+    try {
+      await api.updateSettings({ split_batches: value });
+    } catch (caught) {
+      setSplitBatches(previous);
+      notifyFailure(t('settings.split_batches_save_failed'), caught);
+    } finally {
+      setSavingSplitBatches(false);
     }
   };
 
@@ -601,6 +621,13 @@ export function Settings({ platformUrl, role }: SettingsProps) {
                     { value: 'intersection', label: t('settings.object_info_intersection') },
                   ]}
                   styles={{ root: { background: theme.other.surfaces.raised } }}
+                />
+                <Switch
+                  label={t('settings.split_batches')}
+                  description={t('settings.split_batches_hint')}
+                  checked={splitBatches}
+                  disabled={savingSplitBatches}
+                  onChange={(event) => void changeSplitBatches(event.currentTarget.checked)}
                 />
               </Stack>
             </Card>

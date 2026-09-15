@@ -55,6 +55,8 @@ const RUNNING_JOB: Job = {
   result_files: [],
   input_assets: [],
   est_vram_gb: null,
+  split_count: 0,
+  dispatch_info: {},
 };
 
 const DONE_JOB: Job = {
@@ -68,6 +70,8 @@ const DONE_JOB: Job = {
   result_files: [],
   input_assets: [],
   est_vram_gb: null,
+  split_count: 0,
+  dispatch_info: {},
 };
 
 const CANCELLED_JOB: Job = {
@@ -81,6 +85,8 @@ const CANCELLED_JOB: Job = {
   result_files: [],
   input_assets: [],
   est_vram_gb: null,
+  split_count: 0,
+  dispatch_info: {},
 };
 
 const WORKER: Worker = {
@@ -161,6 +167,8 @@ const FETCHING_JOB: Job = {
   stage: 'fetching_models',
   fetch_pct: 42,
   fetch_model: 'sd_xl_base_1.0.safetensors',
+  split_count: 0,
+  dispatch_info: {},
 };
 
 describe('Jobs page: model auto-fetch progress', () => {
@@ -298,5 +306,27 @@ describe('Jobs page: 使用者 column (Task 8)', () => {
     await screen.findByText('Running');
     expect(screen.queryByText('Username')).not.toBeInTheDocument();
     expect(screen.queryByText('alice')).not.toBeInTheDocument();
+  });
+});
+
+describe('Jobs page: split badge (Phase 3.3 Task 8)', () => {
+  afterEach(() => {
+    cleanup();
+    vi.unstubAllGlobals();
+  });
+
+  it('shows a split badge with the child count on a parent job', async () => {
+    stubFetch([[{ ...RUNNING_JOB, id: 'job-parent-0006', split_count: 3 }]]);
+    renderJobs();
+
+    expect(await screen.findByText('Split ×3')).toBeInTheDocument();
+  });
+
+  it('shows no split badge on a plain job', async () => {
+    stubFetch([[{ ...RUNNING_JOB, split_count: 0 }]]);
+    renderJobs();
+
+    await screen.findByText('Running');
+    expect(screen.queryByText(/Split ×/)).not.toBeInTheDocument();
   });
 });

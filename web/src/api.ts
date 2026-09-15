@@ -217,6 +217,31 @@ export type JobStatus = 'queued' | 'assigned' | 'running' | 'done' | 'failed' | 
 /** Who submitted the job: the console's own `/api/jobs`, or the ComfyUI-compatible panel surface. */
 export type JobOrigin = 'panel' | 'console';
 
+/** `jobs.dispatch_info`: the scheduler's own note of why it claimed a job onto
+ * a given worker (Phase 3.3 §2.2). An empty object means the job has not
+ * been claimed yet (or predates the upgrade). */
+export interface DispatchInfo {
+  predicted_seconds?: number;
+  /** Where the prediction came from -- picks which explanatory sentence the
+   * detail page shows. */
+  basis?: 'signature' | 'speed_index' | 'fleet_default' | 'none' | string;
+  load_seconds?: number;
+  fetch_seconds?: number;
+  candidates?: number;
+}
+
+/** One child job's summary row, as listed in a split parent's `GET
+ * /api/jobs/{id}` under `children`. */
+export interface JobChild {
+  id: string;
+  split_index: number;
+  status: JobStatus | string;
+  worker_id: string | null;
+  progress: number;
+  gpu_seconds: number | null;
+  error: string | null;
+}
+
 export interface Job {
   id: string;
   status: JobStatus | string;
@@ -228,6 +253,18 @@ export interface Job {
   result_files: string[];
   input_assets: string[];
   est_vram_gb: number | null;
+  /**
+   * Phase 3.3 batch splitting: how many children this job was split into (0
+   * = an ordinary job, not split). The list only shows parents/ordinary jobs
+   * by default, so a non-zero count here means there are children underneath.
+   */
+  split_count: number;
+  /**
+   * Phase 3.3 dispatch rationale: the scheduler's reasoning at claim time.
+   * An empty object means this job has not been claimed yet (or is old data
+   * from before the upgrade).
+   */
+  dispatch_info: DispatchInfo;
   /**
    * Who submitted the job (Phase 3.0 multi-user). Admins get every job's
    * `username`; a plain user's own `GET /api/jobs` always echoes their own
@@ -261,7 +298,20 @@ export interface JobDetail extends Job {
   required_models: string[];
   started_at: string | null;
   finished_at: string | null;
+  /** Always null for a split parent (each child mints its own receipt instead). */
   receipt: JobReceipt | null;
+  /** This job's children; always `[]` for an ordinary (non-split) job. */
+  children: JobChild[];
+  /** A parent = the sum of its children's billable receipts; an ordinary job
+   * = its own receipt's `gpu_seconds` (0 with no receipt yet). */
+  gpu_seconds_total: number;
+  /**
+   * `(child job id, filename)` pairs for a split parent's merged outputs, so
+   * the console can link each one at `/api/jobs/<job_id>/artifacts/<filename>`
+   * -- a parent's own `result_files` is always empty. Only present on a
+   * parent (`split_count > 0`); absent on an ordinary job.
+   */
+  outputs?: { job_id: string; filename: string }[];
 }
 
 export type VerdictKind = 'eligible' | 'eligible_after_fetch' | 'ineligible';
@@ -365,6 +415,9 @@ export interface SettingsUpdate {
   upload_max_file_mb?: number;
   /** Admin-only: per-user storage quota in GB (decimals allowed, 0.1-1024). */
   upload_user_quota_gb?: number;
+  /** Admin-only: Phase 3.3 batch splitting toggle -- off means every new job
+   * runs whole on a single worker regardless of its batch_size. */
+  split_batches?: boolean;
 }
 
 export interface SettingsState {
@@ -373,6 +426,7 @@ export interface SettingsState {
   object_info_mode: ObjectInfoMode | string;
   upload_max_file_mb: number;
   upload_user_quota_gb: number;
+  split_batches: boolean;
 }
 
 /** One file the caller uploaded into their own panel staging area

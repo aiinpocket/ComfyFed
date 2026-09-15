@@ -177,7 +177,9 @@
     "cancel_confirm_body": "Job {{id}} will stop immediately. No charge is recorded for a cancelled job.",
     "cancel_confirm_action": "Cancel job",
     "cancel_success": "Job cancelled",
-    "cancel_failed": "Could not cancel this job"
+    "cancel_failed": "Could not cancel this job",
+    "split_badge": "Split ×{{count}}",
+    "split_badge_tooltip": "This job was split into {{count}} parts running on different workers at the same time."
   },
   "job_detail": {
     "back": "Back to jobs",
@@ -217,6 +219,24 @@
     "receipt_kind_cancelled": "Cancelled",
     "receipt_basis_exec": "Measured GPU time",
     "receipt_basis_wall": "Wall-clock fallback",
+    "section_children": "Sub-jobs",
+    "children_hint": "This job was split into parts that ran at the same time; each part has its own receipt, and the GPU seconds below are per part.",
+    "child_index": "#",
+    "child_worker": "Worker",
+    "child_status": "Status",
+    "child_progress": "Progress",
+    "child_gpu_seconds": "GPU seconds",
+    "gpu_seconds_total": "Total GPU seconds",
+    "section_dispatch": "Why this worker",
+    "dispatch_predicted": "Predicted run time",
+    "dispatch_basis": "Based on",
+    "dispatch_basis_signature": "This worker has run this exact workflow before",
+    "dispatch_basis_speed_index": "Another worker has, scaled by this one's speed",
+    "dispatch_basis_fleet_default": "Nobody has run this workflow yet; scaled from the fleet average",
+    "dispatch_basis_none": "No history at all yet; using the default",
+    "dispatch_load_seconds": "Predicted model load",
+    "dispatch_fetch_seconds": "Predicted model download",
+    "dispatch_candidates": "Eligible workers at the time",
     "yes": "Yes",
     "no": "No"
   },
@@ -413,7 +433,10 @@
     "uploads_confirm": "Delete “{{name}}”? This cannot be undone.",
     "uploads_deleted": "File deleted",
     "uploads_delete_failed": "Could not delete the file",
-    "uploads_load_failed": "Could not load your uploads"
+    "uploads_load_failed": "Could not load your uploads",
+    "split_batches": "Split batches automatically",
+    "split_batches_hint": "A workflow with batch_size ≥ 2 is split across idle workers and run in parallel. Same seed, same composition — but not bit-for-bit identical (the difference is the same as running one job on a different machine). Turn this off and new jobs always run whole on a single worker.",
+    "split_batches_save_failed": "Could not save the split setting"
   },
   "errors": {
     "auth.required": "Wrong password.",

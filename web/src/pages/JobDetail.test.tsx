@@ -68,6 +68,10 @@ const BASE_JOB: JobDetailType = {
   started_at: '2026-09-13T00:00:01Z',
   finished_at: '2026-09-13T00:00:05Z',
   receipt: null,
+  split_count: 0,
+  dispatch_info: {},
+  children: [],
+  gpu_seconds_total: 0,
 };
 
 const WORKER: Worker = {
@@ -269,5 +273,96 @@ describe('JobDetail', () => {
 
     expect(await screen.findByText(LONG_ERROR)).toBeInTheDocument();
     expect(screen.queryByText('Could not load this job.')).not.toBeInTheDocument();
+  });
+});
+
+describe('JobDetail: split parent (Phase 3.3 Task 8)', () => {
+  afterEach(() => {
+    cleanup();
+    vi.unstubAllGlobals();
+  });
+
+  it('lists the children of a split parent with their GPU seconds', async () => {
+    const parentJob: JobDetailType = {
+      ...BASE_JOB,
+      id: 'job-parent-0006',
+      status: 'done',
+      error: null,
+      split_count: 2,
+      receipt: null,
+      gpu_seconds_total: 30,
+      children: [
+        { id: 'child-c0', split_index: 0, status: 'done', worker_id: 'w0', progress: 1, gpu_seconds: 10, error: null },
+        { id: 'child-c1', split_index: 1, status: 'done', worker_id: 'w1', progress: 1, gpu_seconds: 20, error: null },
+      ],
+      outputs: [],
+    };
+    stubFetch(parentJob);
+    renderDetail(parentJob.id);
+
+    expect(await screen.findByText('Sub-jobs')).toBeInTheDocument();
+    expect(screen.getByText('child-c0')).toBeInTheDocument();
+    expect(screen.getByText('child-c1')).toBeInTheDocument();
+    expect(screen.getByText('30s')).toBeInTheDocument();
+  });
+
+  it('shows no children card on a plain job', async () => {
+    const plainJob: JobDetailType = { ...BASE_JOB, split_count: 0, children: [] };
+    stubFetch(plainJob);
+    renderDetail(plainJob.id);
+
+    await screen.findByText(LONG_ERROR);
+    expect(screen.queryByText('Sub-jobs')).not.toBeInTheDocument();
+  });
+
+  it('links a parent job\'s outputs to the owning child\'s artifact route', async () => {
+    const parentJob: JobDetailType = {
+      ...BASE_JOB,
+      id: 'job-parent-0007',
+      status: 'done',
+      error: null,
+      split_count: 2,
+      receipt: null,
+      gpu_seconds_total: 5,
+      result_files: [],
+      children: [
+        { id: 'child-c0', split_index: 0, status: 'done', worker_id: 'w0', progress: 1, gpu_seconds: 5, error: null },
+      ],
+      outputs: [{ job_id: 'child-c0', filename: 'out.png' }],
+    };
+    stubFetch(parentJob, { artifacts: { 'out.png': 'irrelevant' } });
+    renderDetail(parentJob.id);
+
+    await screen.findByText('out.png');
+    const link = screen.getByRole('link', { name: /Download/ });
+    expect(link.getAttribute('href')).toBe('/api/jobs/child-c0/artifacts/out.png');
+  });
+});
+
+describe('JobDetail: dispatch reasoning (Phase 3.3 Task 8)', () => {
+  afterEach(() => {
+    cleanup();
+    vi.unstubAllGlobals();
+  });
+
+  it('shows the dispatch reasoning when dispatch_info is present', async () => {
+    const jobWithDispatch: JobDetailType = {
+      ...BASE_JOB,
+      dispatch_info: { predicted_seconds: 41.2, basis: 'signature', load_seconds: 0, fetch_seconds: 0, candidates: 3 },
+    };
+    stubFetch(jobWithDispatch);
+    renderDetail(jobWithDispatch.id);
+
+    expect(await screen.findByText('Why this worker')).toBeInTheDocument();
+    expect(screen.getByText('This worker has run this exact workflow before')).toBeInTheDocument();
+  });
+
+  it('shows no dispatch card when dispatch_info is empty', async () => {
+    const jobWithoutDispatch: JobDetailType = { ...BASE_JOB, dispatch_info: {} };
+    stubFetch(jobWithoutDispatch);
+    renderDetail(jobWithoutDispatch.id);
+
+    await screen.findByText(LONG_ERROR);
+    expect(screen.queryByText('Why this worker')).not.toBeInTheDocument();
   });
 });

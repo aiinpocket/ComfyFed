@@ -14,6 +14,7 @@ import {
   SimpleGrid,
   Skeleton,
   Stack,
+  Table,
   Text,
   ThemeIcon,
   useMantineTheme,
@@ -335,7 +336,23 @@ export function JobDetail({ role }: JobDetailProps) {
           <Card style={cardStyle}>
             <Stack gap="sm">
               <Text fw={600}>{t('job_detail.section_outputs')}</Text>
-              {job.result_files.length === 0 ? (
+              {job.outputs ? (
+                job.outputs.length === 0 ? (
+                  <Text size="sm" c="dimmed">
+                    {t('job_detail.no_outputs')}
+                  </Text>
+                ) : (
+                  <Stack gap="md">
+                    {job.outputs.map((output) => (
+                      <OutputArtifact
+                        key={`${output.job_id}:${output.filename}`}
+                        jobId={output.job_id}
+                        filename={output.filename}
+                      />
+                    ))}
+                  </Stack>
+                )
+              ) : job.result_files.length === 0 ? (
                 <Text size="sm" c="dimmed">
                   {t('job_detail.no_outputs')}
                 </Text>
@@ -348,6 +365,105 @@ export function JobDetail({ role }: JobDetailProps) {
               )}
             </Stack>
           </Card>
+
+          {job.children.length > 0 && (
+            <Card style={cardStyle}>
+              <Stack gap="sm">
+                <Text fw={600}>{t('job_detail.section_children')}</Text>
+                <Text size="xs" c="dimmed">
+                  {t('job_detail.children_hint')}
+                </Text>
+                <Table.ScrollContainer minWidth={520}>
+                  <Table verticalSpacing="xs" horizontalSpacing="md">
+                    <Table.Thead>
+                      <Table.Tr>
+                        <Table.Th>{t('job_detail.child_index')}</Table.Th>
+                        <Table.Th>{t('job_detail.child_worker')}</Table.Th>
+                        <Table.Th>{t('job_detail.child_status')}</Table.Th>
+                        <Table.Th>{t('job_detail.child_progress')}</Table.Th>
+                        <Table.Th>{t('job_detail.child_gpu_seconds')}</Table.Th>
+                      </Table.Tr>
+                    </Table.Thead>
+                    <Table.Tbody>
+                      {job.children.map((child) => (
+                        <Table.Tr key={child.id}>
+                          <Table.Td>
+                            <Text size="sm" ff="monospace">
+                              {child.id}
+                            </Text>
+                            <Text size="xs" c="dimmed">
+                              {child.split_index + 1} / {job.children.length}
+                            </Text>
+                          </Table.Td>
+                          <Table.Td>{child.worker_id ?? '—'}</Table.Td>
+                          <Table.Td>
+                            <JobStatusBadge status={child.status} />
+                            {child.error && (
+                              <Text size="xs" c="red">
+                                {child.error}
+                              </Text>
+                            )}
+                          </Table.Td>
+                          <Table.Td>{Math.round(child.progress * 100)}%</Table.Td>
+                          <Table.Td>
+                            {child.gpu_seconds === null ? '—' : formatGpuSeconds(child.gpu_seconds)}
+                          </Table.Td>
+                        </Table.Tr>
+                      ))}
+                    </Table.Tbody>
+                  </Table>
+                </Table.ScrollContainer>
+                <Group justify="space-between">
+                  <Text size="sm" c="dimmed">
+                    {t('job_detail.gpu_seconds_total')}
+                  </Text>
+                  <Text size="sm">{formatGpuSeconds(job.gpu_seconds_total)}</Text>
+                </Group>
+              </Stack>
+            </Card>
+          )}
+
+          {typeof job.dispatch_info.basis === 'string' && (
+            <Card style={cardStyle}>
+              <Stack gap="sm">
+                <Text fw={600}>{t('job_detail.section_dispatch')}</Text>
+                <Group justify="space-between">
+                  <Text size="sm" c="dimmed">
+                    {t('job_detail.dispatch_predicted')}
+                  </Text>
+                  <Text size="sm">{formatGpuSeconds(job.dispatch_info.predicted_seconds ?? 0)}</Text>
+                </Group>
+                <Group justify="space-between">
+                  <Text size="sm" c="dimmed">
+                    {t('job_detail.dispatch_basis')}
+                  </Text>
+                  <Text size="sm">
+                    {t(`job_detail.dispatch_basis_${job.dispatch_info.basis}`, {
+                      defaultValue: job.dispatch_info.basis,
+                    })}
+                  </Text>
+                </Group>
+                <Group justify="space-between">
+                  <Text size="sm" c="dimmed">
+                    {t('job_detail.dispatch_load_seconds')}
+                  </Text>
+                  <Text size="sm">{formatGpuSeconds(job.dispatch_info.load_seconds ?? 0)}</Text>
+                </Group>
+                <Group justify="space-between">
+                  <Text size="sm" c="dimmed">
+                    {t('job_detail.dispatch_fetch_seconds')}
+                  </Text>
+                  <Text size="sm">{formatGpuSeconds(job.dispatch_info.fetch_seconds ?? 0)}</Text>
+                </Group>
+                <Group justify="space-between">
+                  <Text size="sm" c="dimmed">
+                    {t('job_detail.dispatch_candidates')}
+                  </Text>
+                  <Text size="sm">{job.dispatch_info.candidates ?? 0}</Text>
+                </Group>
+              </Stack>
+            </Card>
+          )}
 
           <Card style={cardStyle}>
             <Stack gap="sm">
