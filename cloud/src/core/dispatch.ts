@@ -205,6 +205,23 @@ export async function assignJobs(
     const updatedJob = await queries.getJobById(db, job.id);
     if (!updatedJob) continue; // defensive: cannot happen once claimed
     assignments.push({ workerId: worker.id, job: updatedJob });
+
+    // §3.4：子 job 被 claim 成 `assigned` 的那一刻，父 job 也要跟著從 `queued`
+    // 變成 `assigned`。少了這一步，父 job 會一路停在 `queued` 直到第一個子 job
+    // 的 busy 心跳把它推成 `running` —— console／面板在「worker 已經在拿圖了」
+    // 的整段區間裡顯示的都是錯的狀態，而且 §3.4 表格的
+    // `[... assigned] -> assigned` 那一列在正常派工流程上永遠走不到。
+    //
+    // try/catch 的理由和上面的熱快取一樣：claim 已經 commit 了，讓例外逃出去
+    // 會連本 tick 剩下的配對一起丟掉。父 job 的顯示狀態絕不值得賠上一次派工，
+    // 而且下一次子 job 轉移時會自己補算回來。
+    if (updatedJob.parentId) {
+      try {
+        await split.childStatusChanged(db, updatedJob.id, now);
+      } catch (err) {
+        console.warn(`dispatch: childStatusChanged failed for child ${updatedJob.id}`, err);
+      }
+    }
   }
 
   return assignments;
@@ -249,8 +266,9 @@ export async function requeueStale(db: D1Database, now: Date): Promise<string[]>
  * Phase 3.3 §3.6: cancelling a CHILD cancels the whole family -- the parent
  * moves to `cancelled` and the surviving siblings with it (see
  * `split.refreshParent`). `cancelledOwners`, when given, collects
- * `[childId, workerId]` for each sibling that still had a live owner so the
- * caller can push `job_cancelled` to those workers too; the return value
+ * `[childId, workerId, startedAtIfRunning]` for each sibling that still had a
+ * live owner so the caller can push `job_cancelled` to those workers too (and
+ * mint a cancelled receipt for the ones that were really running); the return value
  * stays exactly what it always was (the worker that owned `jobId` itself).
  * Cancelling a PARENT does not cascade from here -- it has no `parentId` --
  * `hub.handleInternalCancel` walks its children explicitly instead. */
@@ -259,7 +277,7 @@ export async function cancelJob(
   jobId: string,
   reason: string,
   now: Date,
-  cancelledOwners?: [string, string][]
+  cancelledOwners?: split.CascadeCancelled[]
 ): Promise<string | null> {
   const job = await queries.getJobById(db, jobId);
   if (job === null || !CANCELLABLE_STATUSES.includes(job.status)) return null;
@@ -379,15 +397,16 @@ export async function markDone(
  *
  * Phase 3.3 §3.4/§3.6: failing a CHILD also fails its parent and
  * cascade-cancels the surviving siblings. `cancelledOwners`, when given,
- * collects `[childId, workerId]` for each sibling that still had a live
- * owner, so the Hub can push `job_cancelled` to those workers. */
+ * collects `[childId, workerId, startedAtIfRunning]` for each sibling that
+ * still had a live owner, so the Hub can push `job_cancelled` to those
+ * workers. */
 export async function markFailed(
   db: D1Database,
   jobId: string,
   workerId: string,
   error: string,
   now: Date,
-  cancelledOwners?: [string, string][]
+  cancelledOwners?: split.CascadeCancelled[]
 ): Promise<boolean> {
   const result = await resolveOwnedJob(db, jobId, workerId, OWNED_STATUSES);
   if (!result.ok) return false;

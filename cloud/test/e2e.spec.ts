@@ -1068,13 +1068,14 @@ describe("cloud end-to-end", () => {
 
       const parentAfterDispatch = await getJobById(db(), parentId);
       expect(parentAfterDispatch!.splitCount).toBe(2);
-      // Claiming a child does NOT re-derive the parent: `assignJobs`'s atomic
-      // claim never calls `split.childStatusChanged` (only markRunning /
-      // markDone / markFailed / cancelJob / requeueStale do, plus hub.ts's
-      // own three handlers), so the parent is still `queued` at this instant
-      // even though both children are assigned. Same on the Python stack --
-      // recorded as a deviation from the brief, which expected "assigned".
-      expect(parentAfterDispatch!.status).toBe("queued");
+      // Claiming a child re-derives the parent in the SAME tick: `assignJobs`
+      // calls `split.childStatusChanged` after every successful claim of a job
+      // that has a `parent_id`, so the moment both children are `assigned` the
+      // parent is `assigned` too (§3.4's `[... assigned] -> assigned` row).
+      // Without it the parent would sit at `queued` until the first child's
+      // busy heartbeat -- a whole window where the console shows `queued`
+      // while two workers are already fetching. Same on the Python stack.
+      expect(parentAfterDispatch!.status).toBe("assigned");
       expect(parentAfterDispatch!.workerId).toBeNull();
 
       // The panel's queue only ever shows the parent.
@@ -1315,8 +1316,12 @@ describe("cloud end-to-end", () => {
       // Console cancel of the PARENT. Each child's worker must hear about its
       // OWN child -- not just whichever one the cascade happened to visit
       // first (the Task 6 fix-round-1 bug).
-      const cancelA = nextMessage(agentA.ws);
-      const cancelB = nextMessage(agentB.ws);
+      // TWO frames per worker now (`job_cancelled`, then its cancelled
+      // receipt), so a single listener has to collect both -- awaiting
+      // `nextMessage` twice in a row would drop whichever arrives in the gap
+      // (see helpers/ws.ts).
+      const framesA = collectMessages(agentA.ws, 2);
+      const framesB = collectMessages(agentB.ws, 2);
       const cancelRes = await call(`/api/jobs/${parentId}/cancel`, {
         method: "POST",
         cookie,
@@ -1325,15 +1330,21 @@ describe("cloud end-to-end", () => {
       expect(cancelRes.status).toBe(200);
       expect(cancelRes.body.status).toBe("cancelled");
 
-      const cancelFrames = [await cancelA, await cancelB];
+      const [collectedA, collectedB] = [await framesA, await framesB];
       const childIdByWorker = new Map(children.map((c) => [c.worker_id!, c.id]));
-      // No `receipt` frame precedes these: cancelling the PARENT only mints a
-      // cancelled receipt for the job named in the request, and the parent was
-      // never running on a worker of its own -- the children, which really
-      // were burning GPU, get none. Known open concern carried from Task 6/7;
-      // pinned here so it surfaces as a deliberate change if it's ever fixed.
-      expect(cancelFrames[0]).toEqual({ type: "job_cancelled", job_id: childIdByWorker.get(agentA.workerId) });
-      expect(cancelFrames[1]).toEqual({ type: "job_cancelled", job_id: childIdByWorker.get(agentB.workerId) });
+      expect(collectedA[0]).toEqual({ type: "job_cancelled", job_id: childIdByWorker.get(agentA.workerId) });
+      expect(collectedB[0]).toEqual({ type: "job_cancelled", job_id: childIdByWorker.get(agentB.workerId) });
+
+      // ...and THEN each worker is handed its cancelled receipt: the children
+      // are what actually burned GPU, so every cascaded child that was running
+      // at cancel time gets the same non-billable `cancelled` receipt the
+      // single-job cancel path mints.
+      for (const frame of [collectedA[1], collectedB[1]]) {
+        expect(frame.type).toBe("receipt");
+        expect(frame.kind).toBe("cancelled");
+        expect(frame.billable).toBe(false);
+        expect(frame.basis).toBe("wall");
+      }
 
       const parentRow = await getJobById(db(), parentId);
       expect(parentRow!.status).toBe("cancelled");
@@ -1343,7 +1354,14 @@ describe("cloud end-to-end", () => {
         expect(row!.error).toBe("cancelled by admin");
         expect(row!.workerId).toBeNull();
         expect(row!.lastWorkerId).toBe(child.worker_id);
-        expect(await getReceiptsForJob(db(), child.id)).toHaveLength(0);
+        // Exactly one cancelled, non-billable receipt per child -- one per
+        // worker, booked against the CHILD (the parent never had a
+        // `started_at` of its own, so it stays receipt-free).
+        const childReceipts = await getReceiptsForJob(db(), child.id);
+        expect(childReceipts).toHaveLength(1);
+        expect(childReceipts[0]!.kind).toBe("cancelled");
+        expect(childReceipts[0]!.billable).toBe(false);
+        expect(childReceipts[0]!.workerId).toBe(child.worker_id);
       }
       expect(await getReceiptsForJob(db(), parentId)).toHaveLength(0);
 

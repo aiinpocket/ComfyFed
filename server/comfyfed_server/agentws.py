@@ -626,7 +626,7 @@ async def _push_cascade_cancellations(cancelled_owners: list) -> None:
     next message anyway (see `dispatch.cancel_job`).
     """
     seen: set = set()
-    for child_id, owner in cancelled_owners:
+    for child_id, owner, _was_running in cancelled_owners:
         # 同一個 (child, owner) 可能從兩條路徑各被收集一次（呼叫端自己拿到的
         # 回傳值 + refresh_parent 的串聯）。`_send_job_cancelled` 本身就有每條
         # 連線每個 job 的去重，這裡再擋一層是為了連 log 都不要重複。
@@ -638,6 +638,39 @@ async def _push_cascade_cancellations(cancelled_owners: list) -> None:
         except Exception:
             logger.warning(
                 "agentws: failed to push job_cancelled for split sibling %s owner %s",
+                child_id,
+                owner,
+                exc_info=True,
+            )
+
+
+async def _mint_cascade_cancelled_receipts(cancelled_owners: list) -> None:
+    """Mint a cancelled receipt for every cascaded child that was RUNNING.
+
+    Phase 3.3 §3.6: the single-job cancel path mints a non-billable
+    `kind="cancelled"` receipt when the job it cancelled was genuinely
+    running, because that worker really did burn GPU time before being told
+    to stop. A split parent has no `started_at` of its own -- the GPU time
+    lives entirely on its children -- so without this the whole family comes
+    out receipt-free and those seconds never reach `gpu_seconds_total` or
+    `/api/reports/contributions`'s `unbilled_gpu_seconds`.
+
+    Runs AFTER `_push_cascade_cancellations`, so a worker is told to stop
+    before it is handed the receipt for having stopped; each mint is isolated
+    (a failure here must not cost the other worker its receipt) and uses the
+    same `_mint_cancelled_receipt` helper and the same wall-clock basis
+    (`started_at` -> `finished_at`) the single-job path uses.
+    """
+    seen: set = set()
+    for child_id, owner, was_running in cancelled_owners:
+        if not was_running or child_id in seen:
+            continue
+        seen.add(child_id)
+        try:
+            await _mint_cancelled_receipt(owner, child_id)
+        except Exception:
+            logger.warning(
+                "agentws: failed to mint cancelled receipt for split child %s owner %s",
                 child_id,
                 owner,
                 exc_info=True,
@@ -714,12 +747,16 @@ async def cancel_and_notify(job_id: str, *, reason: str) -> bool:
             # 只會出現在收集器裡，而後續的迴圈圈次看到的它們已經是 cancelled，
             # `cancel_job` 回 None。早期版本只推 `child_owner`，所以一個被拆成
             # k 份的 job 被取消時，只有一台 worker 收得到 `job_cancelled`。
+            # `child` 是取消**之前**讀到的那一列，所以 status/started_at 還是
+            # 取消當下的快照 —— 和 `split._cancel_sibling` 收的是同一種東西。
+            child_was_running = child.status == "running" and child.started_at is not None
             child_owner = dispatch.cancel_job(
                 child.id, reason=reason, cancelled_owners=cascade_cancelled
             )
             if child_owner is not None:
-                cascade_cancelled.append((child.id, child_owner))
+                cascade_cancelled.append((child.id, child_owner, child_was_running))
     await _push_cascade_cancellations(cascade_cancelled)
+    await _mint_cascade_cancelled_receipts(cascade_cancelled)
 
     try:
         await panelws.job_cancelled(job_id)

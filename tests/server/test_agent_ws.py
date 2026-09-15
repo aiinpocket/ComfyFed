@@ -3311,14 +3311,13 @@ def test_batch_split_across_two_workers_end_to_end(client):
         with db.get_session() as session:
             parent = session.get(db.Job, parent_id)
             assert parent.split_count == 2
-            # 派工本身**不**推導父 job：`dispatch.assign_jobs` 的原子 claim 沒有
-            # 呼叫 `split.child_status_changed`（只有 mark_running / mark_done /
-            # mark_failed / cancel_job / requeue_stale 有），所以子 job 已經
-            # assigned 的這一刻，父 job 還停在 queued。§3.4 表格的
-            # `[assigned] -> assigned` 那一列因此在正常派工流程上看不到，要等第
-            # 一個子 job 的 busy 心跳才會一路跳到 running（見下）。兩棧一致，
-            # 記在報告的疑慮裡。
-            assert parent.status == "queued"
+            # 派工也推導父 job：`dispatch.assign_jobs` 的原子 claim 成功之後會
+            # 對每個有 `parent_id` 的 job 叫一次 `split.child_status_changed`，
+            # 所以子 job 變成 assigned 的同一個 tick 裡，父 job 就從 queued 變成
+            # assigned（§3.4 表格的 `[assigned] -> assigned` 那一列）。少了這個
+            # 推導，console／面板會在「兩台 worker 已經在拿圖了」的整段區間裡
+            # 顯示 queued，直到第一個子 job 的 busy 心跳才跳成 running。
+            assert parent.status == "assigned"
             assert parent.worker_id is None  # 父 job 從來沒有自己的 worker
 
         # 每條連線各收到自己那個子 job 的 push，frame 裡的 workflow 帶著自己
@@ -3527,11 +3526,15 @@ def test_cancelling_a_running_split_parent_stops_both_workers(client):
             assert child.id in agentws._connections[child.worker_id].cancelled_jobs_sent
         for child in children:
             ws = by_worker[child.worker_id]
-            # 只有 `job_cancelled`，**沒有** cancelled 收據：取消父 job 時
-            # `cancel_and_notify` 只對 `job_id` 自己判斷 was_running 並 mint，
-            # 真正在燒 GPU 的子 job 一張都沒有（Task 6/7 報告列著的開放疑慮）。
-            # 這裡把現狀釘住：哪天補上了，這個測試會紅，是提醒而不是迴歸。
+            # 先 `job_cancelled`（串聯 flush），再一張 cancelled 收據 —— 真正在
+            # 燒 GPU 的是子 job，所以每個「取消當下正在 running 的子 job」都要
+            # 像單一 job 取消那樣 mint 一張 non-billable 的 cancelled 收據。
             assert ws.receive_json() == {"type": "job_cancelled", "job_id": child.id}
+            frame = ws.receive_json()
+            assert frame["type"] == "receipt"
+            assert frame["kind"] == "cancelled"
+            assert frame["billable"] is False
+            assert frame["basis"] == "wall"
     finally:
         ws_a.close()
         ws_b.close()
@@ -3544,5 +3547,10 @@ def test_cancelling_a_running_split_parent_stops_both_workers(client):
     assert [c.status for c in rows] == ["cancelled", "cancelled"]
     assert all(c.worker_id is None for c in rows)
     assert [c.error for c in rows] == ["cancelled by admin", "cancelled by admin"]
-    # 現狀：整個家族一張收據都沒有（見上面的註解）。
-    assert receipts == []
+    # 剛好兩張 cancelled 收據，一台 worker 一張、開在子 job 上（父 job 自己
+    # 從來沒有 started_at，所以不該有收據）。
+    assert len(receipts) == 2
+    assert {r.kind for r in receipts} == {"cancelled"}
+    assert all(r.billable is False for r in receipts)
+    assert {r.worker_id for r in receipts} == {worker_a, worker_b}
+    assert {r.job_id for r in receipts} == {c.id for c in children}

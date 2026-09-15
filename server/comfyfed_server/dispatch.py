@@ -110,6 +110,8 @@ def assign_jobs(
         return []
 
     now = _utcnow()
+    # Phase 3.3 §3.4：這一輪 claim 成功、而且有父 job 的子 job（見迴圈尾端）。
+    assigned_children: list[str] = []
 
     with db.get_session() as session:
         # `deleted == False`：admin 刪掉的 worker 永遠不該被派工，即使它的
@@ -269,8 +271,23 @@ def assign_jobs(
             session.commit()
             session.refresh(job)
             assignments.append((worker.id, job))
+            if job.parent_id:
+                assigned_children.append(job.id)
 
-        return assignments
+    # §3.4：子 job 被 claim 成 `assigned` 的那一刻，父 job 也要跟著從 `queued`
+    # 變成 `assigned`。少了這一步，父 job 會一路停在 `queued` 直到第一個子 job
+    # 的 busy 心跳把它推成 `running` —— console／面板在「兩台 worker 已經在拿
+    # 圖了」的整段區間裡顯示的都是錯的狀態，而且 §3.4 表格的
+    # `[... assigned] -> assigned` 那一列在正常派工流程上永遠走不到。
+    #
+    # 刻意放在 `with` 區塊**外面**：`child_status_changed` 會自己開一個 session，
+    # 在還握著外層那個交易的時候再開一個去寫同一張表是自找死鎖
+    # （`agentws` 對 `split.refresh_parent_progress` 也是同樣的理由）。同一個
+    # tick 之內，所以 `dispatch_tick` 推完 job frame 時父 job 已經是 assigned。
+    for child_id in assigned_children:
+        split.child_status_changed(child_id)
+
+    return assignments
 
 
 def requeue_stale(now: datetime) -> list[str]:

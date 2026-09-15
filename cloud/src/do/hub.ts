@@ -564,7 +564,7 @@ export class Hub extends DurableObject<Env> {
    * is where they get told. Each push is isolated: one dead socket must not
    * stop the rest, and a missed push self-heals on that worker's next
    * message anyway (see `dispatch.cancelJob`). */
-  private async pushCascadeCancellations(cancelledOwners: [string, string][]): Promise<void> {
+  private async pushCascadeCancellations(cancelledOwners: split.CascadeCancelled[]): Promise<void> {
     const seen = new Set<string>();
     for (const [childId, owner] of cancelledOwners) {
       // 同一個 (child, owner) 可能從兩條路徑各被收集一次（呼叫端自己拿到的回傳
@@ -579,6 +579,44 @@ export class Hub extends DurableObject<Env> {
         await this.sendJobCancelled(ws, att, this.ephemeralFor(ws), childId);
       } catch (err) {
         console.warn(`hub: failed to push job_cancelled for split sibling ${childId} owner ${owner}`, err);
+      }
+    }
+  }
+
+  /** Mint a cancelled receipt for every cascaded child that was RUNNING.
+   *
+   * Phase 3.3 §3.6: the single-job cancel path mints a non-billable
+   * `kind="cancelled"` receipt when the job it cancelled was genuinely
+   * running, because that worker really did burn GPU time before being told
+   * to stop. A split parent has no `started_at` of its own -- the GPU time
+   * lives entirely on its children -- so without this the whole family comes
+   * out receipt-free and those seconds never reach `gpu_seconds_total` or the
+   * contributions report's `unbilled_gpu_seconds`.
+   *
+   * Runs AFTER `pushCascadeCancellations`, so a worker is told to stop before
+   * it is handed the receipt for having stopped; each mint is isolated (a
+   * failure here must not cost the other worker its receipt) and uses the
+   * same `mintCancelledReceipt` helper and the same wall-clock basis
+   * (`started_at` -> now) the single-job path uses. Ports agentws.py's
+   * `_mint_cascade_cancelled_receipts`. */
+  private async mintCascadeCancelledReceipts(
+    cancelledOwners: split.CascadeCancelled[],
+    now: Date
+  ): Promise<void> {
+    const seen = new Set<string>();
+    for (const [childId, owner, startedAt] of cancelledOwners) {
+      if (!startedAt || seen.has(childId)) continue;
+      seen.add(childId);
+      try {
+        const { receiptId, payload, platformSig } = await this.mintCancelledReceipt(
+          owner,
+          childId,
+          startedAt,
+          now
+        );
+        this.pushReceiptFrame(owner, receiptId, payload, platformSig, "cancelled", false, "wall");
+      } catch (err) {
+        console.warn(`hub: failed to mint cancelled receipt for split child ${childId} owner ${owner}`, err);
       }
     }
   }
@@ -608,7 +646,7 @@ export class Hub extends DurableObject<Env> {
     // Phase 3.3 §3.6: cancelling a CHILD cascades up (parent + siblings)
     // inside `cancelJob`; `cascadeCancelled` carries back the siblings whose
     // workers still need telling.
-    const cascadeCancelled: [string, string][] = [];
+    const cascadeCancelled: split.CascadeCancelled[] = [];
     const owner = await dispatch.cancelJob(db, jobId, reason, now, cascadeCancelled);
     this.fetchProgress.delete(jobId);
 
@@ -645,11 +683,15 @@ export class Hub extends DurableObject<Env> {
         // 收集器裡，而後續的迴圈圈次看到的它們已經是 cancelled，`cancelJob` 回
         // null。早期版本只推 `childOwner`，所以一個被拆成 k 份的 job 被取消時，
         // 只有一台 worker 收得到 `job_cancelled`。
+        // `child` 是取消**之前**讀到的那一列，所以 status/startedAt 還是取消
+        // 當下的快照 —— 和 `split.refreshParent` 的串聯收的是同一種東西。
+        const childStartedAt = child.status === "running" ? child.startedAt : null;
         const childOwner = await dispatch.cancelJob(db, child.id, reason, now, cascadeCancelled);
-        if (childOwner) cascadeCancelled.push([child.id, childOwner]);
+        if (childOwner) cascadeCancelled.push([child.id, childOwner, childStartedAt]);
       }
     }
     await this.pushCascadeCancellations(cascadeCancelled);
+    await this.mintCascadeCancelledReceipts(cascadeCancelled, now);
 
     // Ports agentws.py's `cancel_and_notify`: the panel gets told regardless
     // of whether anyone owned the job yet -- unlike the agent push above
@@ -1298,7 +1340,7 @@ export class Hub extends DurableObject<Env> {
     // Phase 3.3 §3.6：這件 job 如果是子 job，它的失敗會連坐取消還在跑的兄弟；
     // 那些 worker 要立刻收到 `job_cancelled`，否則得等到下一次心跳落在
     // not-owned 路徑才停下來。
-    const cascadeCancelled: [string, string][] = [];
+    const cascadeCancelled: split.CascadeCancelled[] = [];
     const applied = await this.applyOwnedTransition(db, jobId, workerId, OWNED_STATUSES, ephemeral, async () => {
       await queries.updateJobFailed(db, jobId!, error, toSqliteTimestamp(now));
       await split.childStatusChanged(db, jobId!, now, cascadeCancelled);

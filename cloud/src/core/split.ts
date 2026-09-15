@@ -489,6 +489,14 @@ export async function createChildrenForTick(
   return splitAny;
 }
 
+/** 一次串聯取消收回來的東西：`[childId, ownerWorkerId, startedAt]`，其中
+ * `startedAt` 只有在**取消當下**那個子 job 真的是 `running` 且有 `started_at`
+ * 時才是非 null —— 寫完之後 status 已經是 cancelled，Hub 再也分不出「本來在
+ * 跑」和「本來只是 assigned」，而只有前者該 mint 一張 cancelled 收據（也只有
+ * 它能提供收據要用的 wall-clock 起點）。Ports Python 端的
+ * `(child_id, worker_id, was_running)`。 */
+export type CascadeCancelled = [string, string, string | null];
+
 /** §3.4 -- ports `split.refresh_parent`；回傳 `{ changed, status }`。
  *
  * `splitCount === 0`（不是父 job，或重試後被重設）一律回
@@ -496,13 +504,14 @@ export async function createChildrenForTick(
  * 點：所有以父 job 推導的函數都只在 `splitCount > 0` 時看子 job。
  *
  * `cancelledOwners`，給了的話，會被 push 上這一次串聯取消掉的
- * `[childId, workerId]`（只收取消當下真的有 owner 的那些），讓呼叫端（Hub）
- * 對那台 worker 推一次 `job_cancelled`。 */
+ * `[childId, workerId, startedAtIfRunning]`（只收取消當下真的有 owner 的那
+ * 些），讓呼叫端（Hub）對那台 worker 推一次 `job_cancelled`，並對真的在跑的
+ * 那些 mint 一張 cancelled 收據。 */
 export async function refreshParent(
   db: D1Database,
   parentId: string,
   now: Date,
-  cancelledOwners?: [string, string][]
+  cancelledOwners?: CascadeCancelled[]
 ): Promise<{ changed: boolean; status: string | null }> {
   const parent = await queries.getJobById(db, parentId);
   if (!parent || parent.splitCount <= 0) return { changed: false, status: null };
@@ -584,7 +593,13 @@ export async function refreshParent(
   // `dispatch.cancelJob` 的 docstring。
   for (const child of cascade) {
     await queries.updateJobCancelled(db, child.id, cascadeReason, nowStamp, child.workerId);
-    if (child.workerId && cancelledOwners) cancelledOwners.push([child.id, child.workerId]);
+    if (child.workerId && cancelledOwners) {
+      cancelledOwners.push([
+        child.id,
+        child.workerId,
+        child.status === "running" ? child.startedAt : null,
+      ]);
+    }
   }
 
   return { changed, status: patch.status };
@@ -596,7 +611,7 @@ export async function childStatusChanged(
   db: D1Database,
   jobId: string,
   now: Date,
-  cancelledOwners?: [string, string][]
+  cancelledOwners?: CascadeCancelled[]
 ): Promise<string | null> {
   const job = await queries.getJobById(db, jobId);
   if (!job || !job.parentId) return null;

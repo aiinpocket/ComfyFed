@@ -604,7 +604,7 @@ def create_children_for_tick(
 
 
 def refresh_parent(
-    parent_id: str, cancelled_owners: Optional[list[tuple[str, str]]] = None
+    parent_id: str, cancelled_owners: Optional[list[tuple[str, str, bool]]] = None
 ) -> tuple[bool, Optional[str]]:
     """§3.4：由子 job 推導父 job 的狀態，回傳 `(有沒有變, 新狀態)`。
 
@@ -613,7 +613,8 @@ def refresh_parent(
     `split_count > 0` 時看子 job。
 
     `cancelled_owners`，給了的話，會被 append 上這一次串聯取消掉的
-    `(child_id, worker_id)` -- 只收取消當下真的有 owner 的那些，讓呼叫端
+    `(child_id, worker_id, was_running)` -- 只收取消當下真的有 owner 的那些，
+    `was_running` 是取消當下那一列的快照（見 `_cancel_sibling`），讓呼叫端
     （WS 層）可以對那台 worker 推一次 `job_cancelled`。給 None（預設）代表
     呼叫端不打算推，取消照樣發生。
     """
@@ -699,16 +700,22 @@ def refresh_parent(
         session.commit()
 
     for child_id in cascade_cancel_ids:
-        owner = _cancel_sibling(child_id, cascade_reason)
-        if owner is not None and cancelled_owners is not None:
-            cancelled_owners.append((child_id, owner))
+        cancelled_info = _cancel_sibling(child_id, cascade_reason)
+        if cancelled_info is not None and cancelled_owners is not None:
+            owner, was_running = cancelled_info
+            cancelled_owners.append((child_id, owner, was_running))
 
     return changed, new_status
 
 
-def _cancel_sibling(child_id: str, reason: str) -> Optional[str]:
-    """取消一個還沒終止的兄弟子 job；回傳取消當下持有它的 worker id（沒有人
-    持有就是 None）。
+def _cancel_sibling(child_id: str, reason: str) -> Optional[tuple[str, bool]]:
+    """取消一個還沒終止的兄弟子 job；回傳取消當下持有它的
+    `(worker_id, was_running)`（沒有人持有就是 None）。
+
+    `was_running` 是**取消當下**那一列的快照（`status == "running"` 且
+    `started_at` 有值），和 `agentws.cancel_and_notify` 對單一 job 的判斷一模
+    一樣：寫完之後 status 已經是 cancelled，WS 層再也分不出「本來在跑」和
+    「本來只是 assigned」，而只有前者該 mint 一張 cancelled 收據。
 
     刻意**不**走 `dispatch.cancel_job`：那個函式尾端會呼叫
     `child_status_changed` -> `refresh_parent`，而我們正是從 `refresh_parent`
@@ -726,6 +733,7 @@ def _cancel_sibling(child_id: str, reason: str) -> Optional[str]:
         if child is None or child.status not in _LIVE_STATUSES:
             return None
         owning_worker_id = child.worker_id
+        was_running = child.status == "running" and child.started_at is not None
         child.status = "cancelled"
         child.error = reason
         child.finished_at = _utcnow()
@@ -733,11 +741,13 @@ def _cancel_sibling(child_id: str, reason: str) -> Optional[str]:
             child.last_worker_id = owning_worker_id
             child.worker_id = None
         session.commit()
-    return owning_worker_id
+    if owning_worker_id is None:
+        return None
+    return owning_worker_id, was_running
 
 
 def child_status_changed(
-    job_id: str, cancelled_owners: Optional[list[tuple[str, str]]] = None
+    job_id: str, cancelled_owners: Optional[list[tuple[str, str, bool]]] = None
 ) -> Optional[str]:
     """子 job 狀態／進度變動後的統一入口。
 

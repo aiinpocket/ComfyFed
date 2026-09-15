@@ -986,13 +986,30 @@ def test_cancelling_a_child_cancels_the_parent_and_siblings(_db):
 
 
 def test_cancelling_a_child_hands_back_the_surviving_siblings_owners(_db):
-    """裁決：串聯取消的 owner 要回到呼叫端，WS 層才推得出 `job_cancelled`。"""
+    """裁決：串聯取消的 owner 要回到呼叫端，WS 層才推得出 `job_cancelled`。
+
+    第三個元素是「取消當下這個子 job 正在 running 嗎」—— WS 層用它決定要不要
+    像單一 job 取消那樣 mint 一張 cancelled 收據（只有真的燒過 GPU 的才有）。
+    """
     _make_split_family(child_statuses=("queued", "running"), worker_ids=(None, "w7"))
+    with db.get_session() as session:
+        session.get(db.Job, "c1").started_at = _utcnow() - timedelta(seconds=30)
+        session.commit()
     owners: list = []
 
     dispatch.cancel_job("c0", reason="cancelled by admin", cancelled_owners=owners)
 
-    assert owners == [("c1", "w7")]
+    assert owners == [("c1", "w7", True)]
+
+
+def test_a_cascade_cancelled_sibling_that_never_started_is_not_flagged_running(_db):
+    """只是 assigned（沒有 `started_at`）的兄弟不算 running -> 不該有收據。"""
+    _make_split_family(child_statuses=("queued", "assigned"), worker_ids=(None, "w7"))
+    owners: list = []
+
+    dispatch.cancel_job("c0", reason="cancelled by admin", cancelled_owners=owners)
+
+    assert owners == [("c1", "w7", False)]
 
 
 def test_marking_a_child_running_moves_the_parent_to_running(_db):
@@ -1006,6 +1023,9 @@ def test_marking_a_child_running_moves_the_parent_to_running(_db):
 
 def test_a_failed_child_fails_the_parent_and_cancels_the_siblings(_db):
     parent_id = _make_split_family(child_statuses=("running", "running"), worker_ids=("w1", "w2"))
+    with db.get_session() as session:
+        session.get(db.Job, "c1").started_at = _utcnow() - timedelta(seconds=30)
+        session.commit()
     owners: list = []
 
     assert dispatch.mark_failed("c0", "w1", "CUDA OOM", cancelled_owners=owners) is True
@@ -1018,7 +1038,7 @@ def test_a_failed_child_fails_the_parent_and_cancels_the_siblings(_db):
     assert sibling.status == "cancelled"
     assert sibling.worker_id is None
     assert sibling.last_worker_id == "w2"
-    assert owners == [("c1", "w2")]
+    assert owners == [("c1", "w2", True)]
 
 
 def test_the_parent_is_done_only_once_every_child_is_done(_db):
@@ -1111,6 +1131,26 @@ def test_assign_jobs_splits_a_batch_across_the_idle_fleet(_db):
     assert parent.split_count == 3
     # 父 job 自己從沒被指派出去。
     assert parent.worker_id is None
+
+
+def test_assign_jobs_moves_the_parent_to_assigned_in_the_same_tick(_db):
+    """§3.4：claim 一個子 job 成功的那一刻，父 job 也要跟著變成 `assigned`。
+
+    少了這個推導，父 job 會一路停在 `queued` 直到第一個子 job 的 busy 心跳把
+    它推成 `running` —— console／面板在「worker 已經在拿圖了」的整段區間裡
+    顯示的都是錯的狀態。父 job 自己永遠沒有 worker。
+    """
+    workers = [_make_worker(f"w{i}", dynamic={"free_vram_gb": 24}) for i in range(3)]
+    parent_id = _make_splittable_job()
+
+    assignments = dispatch.assign_jobs(workers)
+
+    assert len(assignments) == 3
+    assert [c.status for c in split.children_of(parent_id)] == ["assigned"] * 3
+    with db.get_session() as session:
+        parent = session.get(db.Job, parent_id)
+        assert parent.status == "assigned"
+        assert parent.worker_id is None
 
 
 def test_assign_jobs_does_not_split_for_a_single_idle_worker(_db):

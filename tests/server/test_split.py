@@ -429,12 +429,14 @@ def test_refresh_parent_cascade_releases_ownership_like_cancel_job(_db):
     split.create_children(parent_id, 2)
     children = split.children_of(parent_id)
     _set_child(children[0].id, status="failed", error="boom")
-    _set_child(children[1].id, status="running", worker_id="w9")
+    _set_child(children[1].id, status="running", worker_id="w9", started_at=_utcnow())
 
     owners: list = []
     split.refresh_parent(parent_id, cancelled_owners=owners)
 
-    assert owners == [(children[1].id, "w9")]
+    # 第三個元素 = 「取消當下正在 running 嗎」，WS 層拿它決定要不要 mint 一張
+    # cancelled 收據（只有真的燒過 GPU 的子 job 才有）。
+    assert owners == [(children[1].id, "w9", True)]
     with db.get_session() as session:
         sibling = session.get(db.Job, children[1].id)
     assert sibling.status == "cancelled"

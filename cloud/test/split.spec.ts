@@ -414,12 +414,15 @@ describe("refreshParent (§3.4)", () => {
     await split.createChildren(db(), parentId, 2);
     const children = await split.childrenOf(db(), parentId);
     await setRow(children[0]!.id, { status: "failed", error: "boom" });
-    await setRow(children[1]!.id, { status: "running", worker_id: "w9" });
+    const startedAt = toSqliteTimestamp(new Date(Date.now() - 30_000));
+    await setRow(children[1]!.id, { status: "running", worker_id: "w9", started_at: startedAt });
 
-    const owners: [string, string][] = [];
+    const owners: split.CascadeCancelled[] = [];
     await split.refreshParent(db(), parentId, new Date(), owners);
 
-    expect(owners).toEqual([[children[1]!.id, "w9"]]);
+    // 第三個元素 = 取消當下的 `started_at`（只有真的在 running 的才有），Hub
+    // 拿它決定要不要 mint 一張 cancelled 收據以及收據的 wall-clock 起點。
+    expect(owners).toEqual([[children[1]!.id, "w9", startedAt]]);
     const sibling = await readRow(children[1]!.id);
     expect(sibling.status).toBe("cancelled");
     expect(sibling.worker_id).toBeNull();

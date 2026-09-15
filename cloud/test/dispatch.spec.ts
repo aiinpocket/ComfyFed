@@ -2,6 +2,7 @@ import { afterEach, describe, expect, it } from "vitest";
 import { env } from "cloudflare:test";
 import * as dispatch from "../src/core/dispatch";
 import * as scheduler from "../src/core/scheduler";
+import * as split from "../src/core/split";
 import { toSqliteTimestamp } from "../src/db/queries";
 
 // Ports the pure-dispatch-logic assertions of tests/server/test_dispatch.py
@@ -760,6 +761,30 @@ describe("assignJobs 的拆分步驟 (§3.5)", () => {
     expect(parent.worker_id).toBeNull();
   });
 
+  it("moves the parent to assigned in the same tick as the children's claim", async () => {
+    // §3.4：claim 一個子 job 成功的那一刻，父 job 也要跟著變成 `assigned`。
+    // 少了這個推導，父 job 會一路停在 `queued` 直到第一個子 job 的 busy 心跳
+    // 才把它推成 `running` —— console／面板在「worker 已經在拿圖了」的整段
+    // 區間裡顯示的都是錯的狀態。父 job 自己永遠沒有 worker。
+    const workers = [
+      await makeWorker("ws-pa0", { dynamic: { free_vram_gb: 24 } }),
+      await makeWorker("ws-pa1", { dynamic: { free_vram_gb: 24 } }),
+      await makeWorker("ws-pa2", { dynamic: { free_vram_gb: 24 } }),
+    ];
+    const parentId = await makeSplittableJob("j_parent_assigned");
+
+    const assignments = await dispatch.assignJobs(db(), workers);
+
+    expect(assignments).toHaveLength(3);
+    const children = await childrenOf(parentId);
+    for (const child of children) {
+      expect((await getJobRow((child as any).id)).status).toBe("assigned");
+    }
+    const parent = await getJobRow(parentId);
+    expect(parent.status).toBe("assigned");
+    expect(parent.worker_id).toBeNull();
+  });
+
   it("does not split for a single idle worker", async () => {
     const workerId = await makeWorker("ws-solo", { dynamic: { free_vram_gb: 24 } });
     const parentId = await makeSplittableJob();
@@ -842,14 +867,28 @@ describe("子 job 動了就推導父 job (§3.4/§3.6)", () => {
 
   it("cancelling a child cancels the parent and the siblings", async () => {
     const { parentId, childIds } = await makeSplitFamily("p-cancel", ["queued", "running"], [null, "w7"]);
-    const owners: [string, string][] = [];
+    const startedAt = toSqliteTimestamp(new Date(Date.now() - 30_000));
+    await db().prepare("UPDATE jobs SET started_at = ? WHERE id = ?").bind(startedAt, childIds[1]!).run();
+    const owners: split.CascadeCancelled[] = [];
 
     await dispatch.cancelJob(db(), childIds[0]!, "cancelled by admin", now(), owners);
 
     expect((await getJobRow(parentId)).status).toBe("cancelled");
     expect((await getJobRow(childIds[1]!)).status).toBe("cancelled");
-    // 裁決：串聯取消的 owner 要回到呼叫端，Hub 才推得出 `job_cancelled`。
-    expect(owners).toEqual([[childIds[1]!, "w7"]]);
+    // 裁決：串聯取消的 owner 要回到呼叫端，Hub 才推得出 `job_cancelled`。第三個
+    // 元素是取消當下的 `started_at`（只有真的在 running 的才有），Hub 拿它
+    // mint 那張 cancelled 收據。
+    expect(owners).toEqual([[childIds[1]!, "w7", startedAt]]);
+  });
+
+  it("does not flag a cascade-cancelled sibling that never started as running", async () => {
+    // 只是 assigned（沒有 `started_at`）的兄弟不算 running -> 不該有收據。
+    const { childIds } = await makeSplitFamily("p-cancel-idle", ["queued", "assigned"], [null, "w7"]);
+    const owners: split.CascadeCancelled[] = [];
+
+    await dispatch.cancelJob(db(), childIds[0]!, "cancelled by admin", now(), owners);
+
+    expect(owners).toEqual([[childIds[1]!, "w7", null]]);
   });
 
   it("marking a child running moves the parent to running", async () => {
@@ -862,7 +901,9 @@ describe("子 job 動了就推導父 job (§3.4/§3.6)", () => {
 
   it("a failed child fails the parent and cancels the siblings", async () => {
     const { parentId, childIds } = await makeSplitFamily("p-fail", ["running", "running"], ["w1", "w2"]);
-    const owners: [string, string][] = [];
+    const startedAt = toSqliteTimestamp(new Date(Date.now() - 30_000));
+    await db().prepare("UPDATE jobs SET started_at = ? WHERE id = ?").bind(startedAt, childIds[1]!).run();
+    const owners: split.CascadeCancelled[] = [];
 
     expect(await dispatch.markFailed(db(), childIds[0]!, "w1", "CUDA OOM", now(), owners)).toBe(true);
 
@@ -873,7 +914,7 @@ describe("子 job 動了就推導父 job (§3.4/§3.6)", () => {
     expect(sibling.status).toBe("cancelled");
     expect(sibling.worker_id).toBeNull();
     expect(sibling.last_worker_id).toBe("w2");
-    expect(owners).toEqual([[childIds[1]!, "w2"]]);
+    expect(owners).toEqual([[childIds[1]!, "w2", startedAt]]);
   });
 
   it("the parent is done only once every child is done", async () => {
