@@ -62,5 +62,243 @@
       },
       "expected": "eba78a4f5b0f1ffc"
     }
+  ],
+  "hungarian_cases": [
+    {
+      "name": "known optimal 4x4",
+      "matrix": [
+        [
+          82,
+          83,
+          69,
+          92
+        ],
+        [
+          77,
+          37,
+          49,
+          92
+        ],
+        [
+          11,
+          69,
+          5,
+          86
+        ],
+        [
+          8,
+          9,
+          98,
+          23
+        ]
+      ],
+      "expected_pairs": [
+        [
+          0,
+          2
+        ],
+        [
+          1,
+          1
+        ],
+        [
+          2,
+          0
+        ],
+        [
+          3,
+          3
+        ]
+      ]
+    },
+    {
+      "name": "3 jobs x 5 workers with forbidden cells",
+      "matrix": [
+        [
+          10,
+          null,
+          30,
+          40,
+          50
+        ],
+        [
+          null,
+          20,
+          35,
+          45,
+          55
+        ],
+        [
+          60,
+          70,
+          15,
+          80,
+          90
+        ]
+      ],
+      "expected_pairs": [
+        [
+          0,
+          0
+        ],
+        [
+          1,
+          1
+        ],
+        [
+          2,
+          2
+        ]
+      ]
+    },
+    {
+      "name": "all forbidden",
+      "matrix": [
+        [
+          null,
+          null
+        ],
+        [
+          null,
+          null
+        ]
+      ],
+      "expected_pairs": []
+    },
+    {
+      "name": "negative objective values (cost minus BIG)",
+      "matrix": [
+        [
+          -999999995.0,
+          -999999950.0
+        ],
+        [
+          -999999960.0,
+          -999999990.0
+        ]
+      ],
+      "expected_pairs": [
+        [
+          0,
+          0
+        ],
+        [
+          1,
+          1
+        ]
+      ]
+    },
+    {
+      "name": "all ties",
+      "matrix": [
+        [
+          1,
+          1
+        ],
+        [
+          1,
+          1
+        ]
+      ],
+      "expected_pairs": [
+        [
+          0,
+          0
+        ],
+        [
+          1,
+          1
+        ]
+      ]
+    }
+  ],
+  "cost_cases": [
+    {
+      "name": "heavy job, one cold 6 GB model, 24 GB free",
+      "job": {
+        "job_id": "j1",
+        "signature": "sig",
+        "created_at": "2026-09-15T12:00:00",
+        "is_light": false,
+        "required_models": [
+          "flux1-dev.safetensors"
+        ]
+      },
+      "worker": {
+        "worker_id": "w1",
+        "name": "w1",
+        "backend": "cuda",
+        "free_vram_gb": 24.0,
+        "warm_models": [],
+        "inventory": [
+          {
+            "name": "unet/flux1-dev.safetensors",
+            "size": 6.0
+          }
+        ]
+      },
+      "pair": {
+        "kind": "eligible",
+        "has_warnings": false,
+        "total_fetch_bytes": 0
+      },
+      "predicted_seconds": 40.0,
+      "tier1_exists": true,
+      "expected_cost": 49.000976
+    },
+    {
+      "name": "light job on a big cuda card",
+      "job": {
+        "job_id": "j2",
+        "signature": null,
+        "created_at": "2026-09-15T12:00:00",
+        "is_light": true,
+        "required_models": []
+      },
+      "worker": {
+        "worker_id": "w2",
+        "name": "w2",
+        "backend": "cuda",
+        "free_vram_gb": 32.0,
+        "warm_models": [],
+        "inventory": []
+      },
+      "pair": {
+        "kind": "eligible",
+        "has_warnings": false,
+        "total_fetch_bytes": 0
+      },
+      "predicted_seconds": 12.0,
+      "tier1_exists": true,
+      "expected_cost": 232.032
+    },
+    {
+      "name": "warned fetch candidate with no tier-1 rival",
+      "job": {
+        "job_id": "j3",
+        "signature": "sig",
+        "created_at": "2026-09-15T12:00:00",
+        "is_light": false,
+        "required_models": [
+          "big.safetensors"
+        ]
+      },
+      "worker": {
+        "worker_id": "w3",
+        "name": "w3",
+        "backend": "cuda",
+        "free_vram_gb": 8.0,
+        "warm_models": [],
+        "inventory": []
+      },
+      "pair": {
+        "kind": "eligible_after_fetch",
+        "has_warnings": true,
+        "total_fetch_bytes": 500000000
+      },
+      "predicted_seconds": 60.0,
+      "tier1_exists": false,
+      "expected_cost": 1000070.000992
+    }
   ]
 }
