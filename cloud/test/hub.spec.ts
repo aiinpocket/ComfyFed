@@ -277,6 +277,46 @@ describe("hello", () => {
     }
   });
 
+  // Seeder upload cap -- ports agentws.py's _parse_peer_upload_min_mbps coverage.
+  it("stores a reported peer_upload_min_mbps inside the hardware JSON blob", async () => {
+    const kp = KEYPAIRS[0]!;
+    const workerId = await makeWorker({ pubkeyHex: kp.pubkey_hex });
+    const ws = await connectAgent(workerId, kp.seed_hex);
+    const none = expectNoMessage(ws, 300);
+    ws.send(
+      JSON.stringify({
+        type: "hello",
+        protocol: 4,
+        hardware: { vram_gb: 24 },
+        peer_upload_min_mbps: 5,
+      })
+    );
+    await none;
+
+    const row = await db().prepare("SELECT hardware FROM workers WHERE id = ?").bind(workerId).first<{ hardware: string }>();
+    const hardware = JSON.parse(row!.hardware);
+    expect(hardware.peer_upload_min_mbps).toBe(5);
+    expect(hardware.vram_gb).toBe(24);
+    ws.close();
+  });
+
+  it("omits peer_upload_min_mbps when hello reports null (both caps unlimited) or garbage", async () => {
+    for (const bad of [undefined, null, -5, "20", 0, true]) {
+      const kp = KEYPAIRS[0]!;
+      const workerId = await makeWorker({ pubkeyHex: kp.pubkey_hex });
+      const ws = await connectAgent(workerId, kp.seed_hex);
+      const none = expectNoMessage(ws, 200);
+      const msg: Record<string, unknown> = { type: "hello", protocol: 4, hardware: {} };
+      if (bad !== undefined) msg.peer_upload_min_mbps = bad;
+      ws.send(JSON.stringify(msg));
+      await none;
+
+      const row = await db().prepare("SELECT hardware FROM workers WHERE id = ?").bind(workerId).first<{ hardware: string }>();
+      expect(JSON.parse(row!.hardware)).not.toHaveProperty("peer_upload_min_mbps");
+      ws.close();
+    }
+  });
+
   // Phase 3.1 P2P seeder advertisement -- ports agentws.py's _parse_peer_url
   // test coverage.
   it("stores a valid http(s) peer_url", async () => {

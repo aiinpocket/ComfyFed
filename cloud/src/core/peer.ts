@@ -26,18 +26,43 @@ export const GRANT_TTL_SECONDS = 600;
  * second, see `agent/comfyfed_agent/peerserve.py`). Keep the two in step. */
 export const MIN_ASSUMED_RATE_BYTES_PER_SEC = 2_500_000;
 
+/** The rate a grant served by `worker` should be sized for -- ports peer.py's
+ * `_seeder_rate_bytes_per_sec`.
+ *
+ * The seeder reports its own slowest configured P2P upload cap in hello
+ * (`peer_upload_min_mbps`, stashed into the `hardware` JSON blob by hub.ts's
+ * hello handler). A user who capped their uplink BELOW the 20 Mbps default
+ * would otherwise be under-TTL'd by default/actual -- a 5 Mbps seeder needs
+ * 4x the TTL a 20 Mbps one does. Missing/non-numeric/non-positive (an old
+ * agent, both caps unlimited, or a malformed value) degrades to
+ * `MIN_ASSUMED_RATE_BYTES_PER_SEC`, i.e. exactly the previous behavior. */
+export function seederRateBytesPerSec(worker: Worker): number {
+  const value = worker.hardware?.["peer_upload_min_mbps"];
+  if (typeof value !== "number" || !Number.isFinite(value) || value <= 0) {
+    return MIN_ASSUMED_RATE_BYTES_PER_SEC;
+  }
+  return (value * 1_000_000) / 8;
+}
+
 /** How long a grant for a `sizeBytes` file must live -- ports peer.py's
  * `grant_ttl_seconds`, same formula, same constants.
  *
  * At the agent's default active upload cap a 6.5 GB model takes ~43 minutes,
  * ~4x the flat 600 s TTL: bytes served past expiry went unaccounted and any
  * resume after expiry was refused. So the TTL scales with the file: the
- * estimated transfer time at `MIN_ASSUMED_RATE_BYTES_PER_SEC`, times 1.5 for
- * slack, plus the flat `GRANT_TTL_SECONDS` of headroom -- never below the
- * 600 s floor. */
-export function grantTtlSeconds(sizeBytes: number): number {
+ * estimated transfer time at `rateBytesPerSec`, times 1.5 for slack, plus
+ * the flat `GRANT_TTL_SECONDS` of headroom -- never below the 600 s floor.
+ *
+ * `rateBytesPerSec` is the CHOSEN SEEDER's own reported cap when it has one
+ * (`seederRateBytesPerSec`); omitted/invalid it falls back to
+ * `MIN_ASSUMED_RATE_BYTES_PER_SEC`, the 20 Mbps agent default. */
+export function grantTtlSeconds(sizeBytes: number, rateBytesPerSec?: number): number {
   const size = Number.isFinite(sizeBytes) && sizeBytes > 0 ? Math.floor(sizeBytes) : 0;
-  const transfer = Math.ceil(size / MIN_ASSUMED_RATE_BYTES_PER_SEC);
+  const rate =
+    typeof rateBytesPerSec === "number" && Number.isFinite(rateBytesPerSec) && rateBytesPerSec > 0
+      ? rateBytesPerSec
+      : MIN_ASSUMED_RATE_BYTES_PER_SEC;
+  const transfer = Math.ceil(size / rate);
   return Math.floor(Math.max(GRANT_TTL_SECONDS, transfer * 1.5 + GRANT_TTL_SECONDS));
 }
 

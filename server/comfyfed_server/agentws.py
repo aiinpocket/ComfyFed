@@ -713,10 +713,26 @@ def _parse_max_fetch_gb(message: dict) -> Optional[float]:
     return float(value)
 
 
+def _parse_peer_upload_min_mbps(message: dict) -> Optional[float]:
+    """Validate hello's optional `peer_upload_min_mbps` (the seeder's slowest
+    configured P2P upload cap, see runner._peer_upload_min_mbps): a positive
+    finite number, else `None` (missing, null because both caps are
+    unlimited, wrong type, or non-positive). `None` means the caller omits it
+    and `peer.grant_ttl_seconds` falls back to its default rate assumption --
+    i.e. today's behavior, unchanged."""
+    value = message.get("peer_upload_min_mbps")
+    if not isinstance(value, (int, float)) or isinstance(value, bool):
+        return None
+    if not math.isfinite(value) or value <= 0:
+        return None
+    return float(value)
+
+
 async def _handle_hello(worker_id: str, conn: "_Connection", message: dict) -> None:
     protocol = _parse_protocol(message)
     peer_url = _parse_peer_url(message, worker_id)
     max_fetch_gb = _parse_max_fetch_gb(message)
+    peer_upload_min_mbps = _parse_peer_upload_min_mbps(message)
     with db.get_session() as session:
         worker = session.get(db.Worker, worker_id)
         if worker is None:
@@ -730,6 +746,12 @@ async def _handle_hello(worker_id: str, conn: "_Connection", message: dict) -> N
         hardware_blob = dict(message.get("hardware") or {})
         if max_fetch_gb is not None:
             hardware_blob["max_fetch_gb"] = max_fetch_gb
+        # Same no-migration trick for the seeder's slowest P2P upload cap,
+        # read back by `peer._seeder_rate_bytes_per_sec` when sizing a
+        # grant's TTL. Omitted when hello didn't report a usable value, so a
+        # stale cap from a PREVIOUS hello can't survive a reconnect.
+        if peer_upload_min_mbps is not None:
+            hardware_blob["peer_upload_min_mbps"] = peer_upload_min_mbps
         worker.hardware = json.dumps(hardware_blob)
         worker.backend = message.get("backend") or ""
         worker.torch_version = message.get("torch_version") or ""

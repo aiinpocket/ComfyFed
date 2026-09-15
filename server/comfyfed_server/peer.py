@@ -55,7 +55,31 @@ GRANT_TTL_SECONDS = 600
 MIN_ASSUMED_RATE_BYTES_PER_SEC = 2_500_000
 
 
-def grant_ttl_seconds(size_bytes: int) -> int:
+def _seeder_rate_bytes_per_sec(worker) -> float:
+    """The rate a grant served by `worker` should be sized for.
+
+    The seeder reports its own slowest configured P2P upload cap in hello
+    (`peer_upload_min_mbps`, stashed into the `hardware` JSON blob by
+    `agentws._handle_hello`). A user who capped their uplink BELOW the
+    20 Mbps default would otherwise be under-TTL'd by a factor of
+    default/actual -- a 5 Mbps seeder needs 4x the TTL a 20 Mbps one does.
+    Missing/non-numeric/non-positive (an old agent, both caps unlimited, or
+    a malformed value) degrades to `MIN_ASSUMED_RATE_BYTES_PER_SEC`, i.e.
+    exactly the pre-existing behavior.
+    """
+    try:
+        hardware = json.loads(getattr(worker, "hardware", None) or "{}")
+    except (TypeError, ValueError):
+        hardware = {}
+    value = hardware.get("peer_upload_min_mbps") if isinstance(hardware, dict) else None
+    if not isinstance(value, (int, float)) or isinstance(value, bool) or value <= 0:
+        return MIN_ASSUMED_RATE_BYTES_PER_SEC
+    if not math.isfinite(value):
+        return MIN_ASSUMED_RATE_BYTES_PER_SEC
+    return float(value) * 1_000_000 / 8
+
+
+def grant_ttl_seconds(size_bytes: int, rate_bytes_per_sec: float | None = None) -> int:
     """How long a grant for a `size_bytes` file must live.
 
     At the agent's default active upload cap (20 Mbps = 2.5 MB/s) a 6.5 GB
@@ -63,15 +87,22 @@ def grant_ttl_seconds(size_bytes: int) -> int:
     after expiry went unaccounted (the seeder reports a grant once, at
     expiry) and any resume/retry after expiry was refused outright. So the
     TTL scales with the file: the estimated transfer time at
-    `MIN_ASSUMED_RATE_BYTES_PER_SEC`, times 1.5 for slack, plus the flat
+    `rate_bytes_per_sec`, times 1.5 for slack, plus the flat
     `GRANT_TTL_SECONDS` of setup/retry headroom -- never below the 600 s
     floor, so small files are unchanged in practice.
+
+    `rate_bytes_per_sec` is the CHOSEN SEEDER's own reported cap when it has
+    one (`_seeder_rate_bytes_per_sec`); omitted/invalid it falls back to
+    `MIN_ASSUMED_RATE_BYTES_PER_SEC`, the 20 Mbps agent default.
     """
     try:
         size = max(0, int(size_bytes))
     except (TypeError, ValueError):
         size = 0
-    transfer = math.ceil(size / MIN_ASSUMED_RATE_BYTES_PER_SEC)
+    rate = rate_bytes_per_sec
+    if not isinstance(rate, (int, float)) or isinstance(rate, bool) or rate <= 0:
+        rate = MIN_ASSUMED_RATE_BYTES_PER_SEC
+    transfer = math.ceil(size / rate)
     return int(max(GRANT_TTL_SECONDS, transfer * 1.5 + GRANT_TTL_SECONDS))
 
 # M4 final-review fix: a grant whose transfer is still active when its TTL
@@ -317,7 +348,11 @@ def create_router(data_dir: str) -> APIRouter:
             seeder = min(seeders, key=lambda w: (_active_grant_count(w.id, now), w.name))
 
             grant_id = uuid.uuid4().hex
-            expires_at = int(now) + grant_ttl_seconds(body.size_bytes)
+            # TTL is sized for THIS seeder's own reported upload cap (parity:
+            # cloud/src/routes/peer.ts does the same with `seederRateBytesPerSec`).
+            expires_at = int(now) + grant_ttl_seconds(
+                body.size_bytes, _seeder_rate_bytes_per_sec(seeder)
+            )
             grant = {
                 "grant_id": grant_id,
                 "name": body.name,

@@ -172,6 +172,10 @@ comfyfed stop     # 請 agent 優雅結束：進行中的工作會被取消並�
 
 **暫停只擋新工作，不會停止做種（P2P 分享模型檔）**：分享模型檔給其他 worker 只吃 CPU 跟網路、不占 GPU，所以你在用電腦的時候它照常跑——但會降速讓出頻寬。使用者活動中或手動暫停時，上傳受 `peer_upload_limit_mbps` 限制（預設 `20`，單位 Mbps）；機器閒置時改用 `peer_upload_limit_idle_mbps`（預設 `0` = 不限速）。兩個參數都寫在 `agent.json`，改完要重啟 agent 才會生效。這個上限是整個 agent 行程共用的：同時有多個人在抓，是全部加起來受限，不是每人各拿一份。**老實說一句**：閒置時預設不限速，意思是單一個下載端就有可能把你家的上行塞滿（影響視訊會議、線上遊戲之類）；如果你在意，把 `peer_upload_limit_idle_mbps` 也設一個數字（例如上行頻寬的一半）。
 
+**做種端會把自己的上限回報給平台，授權單活多久就照這個算**：agent 在 `hello` 裡會附上「這台機器做種時最慢會用的上傳上限」（`peer_upload_limit_mbps` 與 `peer_upload_limit_idle_mbps` 中不為 `0` 的最小值；兩個都設 `0`＝不限速時就不回報）。平台簽發 P2P 授權單時，會拿這個數字去推「整個檔案要傳多久」，而不是一律假設 20 Mbps——所以你刻意把上行壓到例如 5 Mbps 時，授權單的有效時間會跟著拉長約 4 倍，不會傳到一半就過期。舊版平台看不懂這個欄位會直接忽略，行為跟以前一樣。
+
+**失效的註冊會自動搬到 `agent.dead.json`**：平台若以 4401 拒絕某組註冊（worker 被刪掉、或憑證失效），agent 除了停止重試，還會把那筆 `platforms` 條目從 `agent.json` 移出、完整備份到同一個資料夾下的 `agent.dead.json`（JSON 陣列，會累積附加，並額外記下 `removed_at` 與 `reason`），下次啟動就不會再嘗試、也不會再洗一次錯誤訊息。**這個備份含有簽章私鑰，請比照 `agent.json` 保管**。要還原的話：把該筆記錄裡的欄位（`platform_url`、`platform_pubkey`、`worker_id`、`certificate`、`signing_key_hex`）複製回 `agent.json` 的 `platforms` 陣列即可（`removed_at`／`reason` 兩個欄位不用複製），然後重啟 agent。平常的情況直接重新執行安裝指令重新註冊就好。
+
 **偵測不到使用者活動時視為閒置，一律接單**：headless 機器（沒有實體螢幕/鍵盤滑鼠）或 Wayland 桌面若沒有裝 XWayland，agent 偵測不到活動訊號，這種情況一律當作「沒有人在用」，不會因為偵測失敗就把 worker 晾在一邊接不到工作。
 
 **Windows 找不到 `comfyfed` 指令**：剛裝完的那個終端機視窗看不到新加的 PATH，屬正常現象——關閉終端機重開一個新的即可。

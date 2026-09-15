@@ -2416,6 +2416,68 @@ def test_hello_with_invalid_max_fetch_gb_is_ignored(client):
         ws.close()
 
 
+def test_hello_stores_reported_peer_upload_min_mbps_in_hardware_blob(client):
+    """The seeder's slowest configured P2P upload cap rides in the same
+    `hardware` JSON blob (no new column/migration), read back by
+    peer._seeder_rate_bytes_per_sec when sizing a grant's TTL."""
+    csrf = _login(client)
+    worker_id, sk = _register_worker(client, csrf, "w1")
+
+    ws = _connect(client, worker_id, sk)
+    try:
+        ws.send_json(
+            {
+                "type": "hello",
+                "hardware": {"cpu": "x"},
+                "backend": "cuda",
+                "torch_version": "2.0",
+                "node_classes": [],
+                "protocol": 4,
+                "peer_upload_min_mbps": 5,
+            }
+        )
+        agentws.dispatch_once(worker_id)
+
+        with db.get_session() as session:
+            worker = session.get(db.Worker, worker_id)
+            hardware = json.loads(worker.hardware)
+            assert hardware["peer_upload_min_mbps"] == 5
+            assert hardware["cpu"] == "x"
+    finally:
+        ws.close()
+
+
+@pytest.mark.parametrize("bad", [None, "5", 0, -5, True, float("inf"), float("nan")])
+def test_hello_with_a_missing_or_garbage_peer_upload_min_mbps_is_ignored(client, bad):
+    """Missing, `null` (both caps unlimited), or garbage must never be stored
+    -- grant TTL then keeps its default rate assumption, today's behavior."""
+    csrf = _login(client)
+    worker_id, sk = _register_worker(client, csrf, "w1")
+
+    ws = _connect(client, worker_id, sk)
+    try:
+        message = {
+            "type": "hello",
+            "hardware": {"cpu": "x"},
+            "backend": "cuda",
+            "torch_version": "2.0",
+            "node_classes": [],
+            "protocol": 4,
+        }
+        if bad is not None:
+            message["peer_upload_min_mbps"] = bad
+        else:
+            message["peer_upload_min_mbps"] = None
+        ws.send_json(message)
+        agentws.dispatch_once(worker_id)
+
+        with db.get_session() as session:
+            worker = session.get(db.Worker, worker_id)
+            assert "peer_upload_min_mbps" not in json.loads(worker.hardware)
+    finally:
+        ws.close()
+
+
 def test_hello_without_auto_fetch_field_defaults_to_false(client):
     """An old (pre-Task-1) agent's hello has no `auto_fetch` key at all --
     must never be read as consent to auto-download models."""

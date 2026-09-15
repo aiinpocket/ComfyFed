@@ -1780,6 +1780,62 @@ async def test_send_hello_reports_configured_max_fetch_gb():
     assert payload["max_fetch_gb"] == 5
 
 
+async def _hello_payload(config: AgentConfig) -> dict:
+    entry = PlatformEntry(
+        platform_url="http://p",
+        platform_pubkey="aa",
+        worker_id="w1",
+        certificate="cert",
+        signing_key_hex="00" * 32,
+    )
+    conn = PlatformConnection(entry, config)
+    conn.ws = _RecordingWS()
+    await conn.send_hello({"cpu": "x", "platform": "Windows"}, "cuda", "2.0", ["KSampler"])
+    return json.loads(conn.ws.sent[0])
+
+
+@pytest.mark.asyncio
+async def test_send_hello_reports_the_default_upload_cap_as_peer_upload_min_mbps():
+    """The stock config caps ACTIVE uploads at 20 Mbps and leaves idle
+    unlimited (0) -- the slowest rate this seeder will ever serve at is
+    therefore 20, and 0 is not a candidate for "slowest"."""
+    payload = await _hello_payload(AgentConfig())
+    assert payload["peer_upload_min_mbps"] == 20
+
+
+@pytest.mark.asyncio
+async def test_send_hello_reports_the_lower_of_the_two_upload_caps():
+    payload = await _hello_payload(
+        AgentConfig(peer_upload_limit_mbps=20, peer_upload_limit_idle_mbps=50)
+    )
+    assert payload["peer_upload_min_mbps"] == 20
+
+    payload = await _hello_payload(
+        AgentConfig(peer_upload_limit_mbps=50, peer_upload_limit_idle_mbps=5)
+    )
+    assert payload["peer_upload_min_mbps"] == 5
+
+
+@pytest.mark.asyncio
+async def test_send_hello_reports_null_when_both_upload_caps_are_unlimited():
+    """`0` means UNLIMITED, so both-zero has no floor to report at all -- the
+    platform then falls back to its own default rate assumption."""
+    payload = await _hello_payload(
+        AgentConfig(peer_upload_limit_mbps=0, peer_upload_limit_idle_mbps=0)
+    )
+    assert payload["peer_upload_min_mbps"] is None
+
+
+@pytest.mark.asyncio
+async def test_send_hello_skips_an_unlimited_cap_rather_than_reporting_zero():
+    """Active unlimited + idle capped: the reported floor is the idle cap,
+    NOT 0 (which the platform would read as "no value")."""
+    payload = await _hello_payload(
+        AgentConfig(peer_upload_limit_mbps=0, peer_upload_limit_idle_mbps=8)
+    )
+    assert payload["peer_upload_min_mbps"] == 8
+
+
 # --- Console-signal (Ctrl-C / Ctrl-Break) shutdown --------------------------
 #
 # T3m9: the agent had no console-signal handling at all, so Ctrl-C (or

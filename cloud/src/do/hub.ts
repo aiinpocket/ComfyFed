@@ -256,6 +256,17 @@ function parseMaxFetchGb(value: unknown): number | null {
   return value;
 }
 
+/** Validate hello's optional `peer_upload_min_mbps` (the seeder's slowest
+ * configured P2P upload cap, see the agent's `_peer_upload_min_mbps`): a
+ * positive finite number, else `null` (missing, null because both caps are
+ * unlimited, wrong type, or non-positive). `null` means the caller omits it
+ * and `peer.grantTtlSeconds` keeps its default rate assumption -- today's
+ * behavior, unchanged. Ports agentws.py's `_parse_peer_upload_min_mbps`. */
+function parsePeerUploadMinMbps(value: unknown): number | null {
+  if (typeof value !== "number" || !Number.isFinite(value) || value <= 0) return null;
+  return value;
+}
+
 /** Ports agentws.py's `_is_valid_exec_seconds`. */
 function isValidExecSeconds(value: unknown): value is number {
   return typeof value === "number" && Number.isFinite(value) && value >= 0;
@@ -875,6 +886,14 @@ export class Hub extends DurableObject<Env> {
     const maxFetchGb = parseMaxFetchGb(msg.max_fetch_gb);
     if (maxFetchGb !== null) {
       hardware["max_fetch_gb"] = maxFetchGb;
+    }
+    // Same no-migration trick for the seeder's slowest P2P upload cap, read
+    // back by `peer.seederRateBytesPerSec` when sizing a grant's TTL.
+    // Omitted when hello didn't report a usable value, so a stale cap from a
+    // PREVIOUS hello can't survive a reconnect.
+    const peerUploadMinMbps = parsePeerUploadMinMbps(msg.peer_upload_min_mbps);
+    if (peerUploadMinMbps !== null) {
+      hardware["peer_upload_min_mbps"] = peerUploadMinMbps;
     }
 
     await queries.updateWorkerHello(this.env.DB, workerId, {

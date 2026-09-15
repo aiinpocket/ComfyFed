@@ -95,7 +95,11 @@ app.post("/api/agent/peer-grant", async (c) => {
   const seeder = await peer.pickSeeder(db, seeders, now);
 
   const grantId = crypto.randomUUID().replace(/-/g, "");
-  const expiresAt = Math.floor(now) + peer.grantTtlSeconds(sizeBytes);
+  // TTL is sized for THIS seeder's own reported upload cap (parity:
+  // server/comfyfed_server/peer.py does the same with
+  // `_seeder_rate_bytes_per_sec`).
+  const expiresAt =
+    Math.floor(now) + peer.grantTtlSeconds(sizeBytes, peer.seederRateBytesPerSec(seeder));
   const grant: peer.Grant = {
     grant_id: grantId,
     name,

@@ -173,6 +173,63 @@ describe("POST /api/agent/peer-grant", () => {
     expect(r.body.grant.expires_at).toBeLessThanOrEqual(after + ttl);
   });
 
+  it("seederRateBytesPerSec falls back to the default assumption (parity with peer.py)", () => {
+    for (const hardware of [
+      {},
+      { peer_upload_min_mbps: null },
+      { peer_upload_min_mbps: "20" },
+      { peer_upload_min_mbps: 0 },
+      { peer_upload_min_mbps: -5 },
+      { peer_upload_min_mbps: Number.NaN },
+      { peer_upload_min_mbps: Number.POSITIVE_INFINITY },
+    ]) {
+      expect(peer.seederRateBytesPerSec({ hardware } as any)).toBe(peer.MIN_ASSUMED_RATE_BYTES_PER_SEC);
+    }
+    expect(peer.seederRateBytesPerSec({ hardware: { peer_upload_min_mbps: 5 } } as any)).toBe(
+      (5 * 1_000_000) / 8
+    );
+  });
+
+  it("grantTtlSeconds for a slow seeder is proportionally longer (parity with peer.py)", () => {
+    // A 5 Mbps seeder moves a 6.5 GB model 4x slower than the 20 Mbps
+    // default the flat assumption was built for.
+    const size = Math.round(6.5 * 1000 ** 3);
+    const defaultTtl = peer.grantTtlSeconds(size);
+    const slowTtl = peer.grantTtlSeconds(size, (5 * 1_000_000) / 8);
+    const scaledDefault = defaultTtl - peer.GRANT_TTL_SECONDS;
+    const scaledSlow = slowTtl - peer.GRANT_TTL_SECONDS;
+    expect(scaledSlow / scaledDefault).toBeGreaterThanOrEqual(3.9);
+    expect(scaledSlow / scaledDefault).toBeLessThanOrEqual(4.1);
+
+    // An absent/invalid rate is exactly the pre-existing default.
+    expect(peer.grantTtlSeconds(size, undefined)).toBe(defaultTtl);
+    expect(peer.grantTtlSeconds(size, 0)).toBe(defaultTtl);
+    expect(peer.grantTtlSeconds(size, -1)).toBe(defaultTtl);
+  });
+
+  it("expires_at uses the seeder's own reported upload cap", async () => {
+    const puller = await registerWorker("puller", 0);
+    const seeder = await registerWorker("seeder", 1);
+    const sha = await shaHex("model-a");
+    const sizeBytes = bytesFor(1.0);
+    await modelManifest.recordHash(db(), "some-worker", "loras/a.safetensors", sizeBytes, sha);
+    await makeSeeder(seeder, [{ name: "loras/a.safetensors", size_bytes: sizeBytes, sha256: sha }]);
+    await db()
+      .prepare("UPDATE workers SET hardware = ? WHERE id = ?")
+      .bind(JSON.stringify({ vram_gb: 24, peer_upload_min_mbps: 5 }), seeder.workerId)
+      .run();
+
+    const before = Math.floor(Date.now() / 1000);
+    const r = await signedPost(puller, "/api/agent/peer-grant", { name: "loras/a.safetensors", size_bytes: sizeBytes });
+    const after = Math.floor(Date.now() / 1000);
+    expect(r.status).toBe(200);
+
+    const ttl = peer.grantTtlSeconds(sizeBytes, (5 * 1_000_000) / 8);
+    expect(ttl).toBeGreaterThan(peer.grantTtlSeconds(sizeBytes));
+    expect(r.body.grant.expires_at).toBeGreaterThanOrEqual(before + ttl);
+    expect(r.body.grant.expires_at).toBeLessThanOrEqual(after + ttl);
+  });
+
   it("chunk_sha256s is null in the response when no chunk list was ever established", async () => {
     const puller = await registerWorker("puller", 0);
     const seeder = await registerWorker("seeder", 1);

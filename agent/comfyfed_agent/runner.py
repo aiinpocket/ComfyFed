@@ -120,6 +120,30 @@ def _is_auth_rejected(exc: BaseException) -> bool:
     return False
 
 
+def _peer_upload_min_mbps(config: AgentConfig) -> Optional[float]:
+    """做種時這台機器最慢會用的上傳上限（Mbps），`None` = 兩檔都不限速。
+
+    The lowest cap this worker's peer server will ever throttle an upload to:
+    the smaller of the active cap (`peer_upload_limit_mbps`) and the idle cap
+    (`peer_upload_limit_idle_mbps`), skipping either one that is `0` --
+    `0` means UNLIMITED here (see AgentConfig), so it is not a candidate for
+    "slowest". Both unlimited -> `None`, i.e. "no floor to report".
+
+    The platform sizes a P2P grant's TTL from this (peer.py's
+    `grant_ttl_seconds`), so a user who deliberately caps their uplink below
+    the 20 Mbps default gets a grant that actually covers the whole transfer
+    instead of expiring mid-file. Reported regardless of whether peer serving
+    is currently enabled: it is harmless (a non-seeder is never picked as a
+    seeder) and keeps hello's shape stable across a `peer_serve` toggle.
+    """
+    caps = [
+        cap
+        for cap in (config.peer_upload_limit_mbps, config.peer_upload_limit_idle_mbps)
+        if cap and cap > 0
+    ]
+    return min(caps) if caps else None
+
+
 class PlatformUnavailable(Exception):
     """The platform could not be reached -- as opposed to answering and
     saying no.
@@ -224,6 +248,12 @@ class PlatformConnection:
             # (assess._worker_fetch_capacity_ok) instead of assuming this
             # worker can absorb an unbounded download.
             "max_fetch_gb": self.config.max_fetch_gb,
+            # Optional: the SLOWEST upload cap this worker will ever serve
+            # peer bytes at, so the platform can size a P2P grant's TTL to
+            # this seeder instead of assuming the 20 Mbps default (see
+            # server/comfyfed_server/peer.py's grant_ttl_seconds). No
+            # protocol bump -- an older platform just ignores the key.
+            "peer_upload_min_mbps": _peer_upload_min_mbps(self.config),
         }
         if peer_url:
             message["peer_url"] = peer_url

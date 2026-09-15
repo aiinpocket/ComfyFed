@@ -746,3 +746,81 @@ def test_record_hash_conflicting_whole_file_hash_does_not_store_chunks(client):
         row = session.get(db.ModelHash, ("checkpoints/a.safetensors", _bytes(1.0)))
         assert row.conflict is True
         assert row.chunk_sha256s is None
+
+
+# --- Grant TTL sized from the seeder's own reported upload cap --------------
+
+
+class _FakeWorker:
+    def __init__(self, hardware):
+        self.hardware = hardware
+
+
+def test_seeder_rate_falls_back_to_the_default_assumption():
+    """No reported cap (old agent, both caps unlimited, malformed value) ->
+    the 20 Mbps default, i.e. behavior unchanged."""
+    for hardware in (
+        None,
+        "{}",
+        "not json",
+        json.dumps({"peer_upload_min_mbps": None}),
+        json.dumps({"peer_upload_min_mbps": "20"}),
+        json.dumps({"peer_upload_min_mbps": 0}),
+        json.dumps({"peer_upload_min_mbps": -5}),
+        json.dumps({"peer_upload_min_mbps": True}),
+    ):
+        assert (
+            peer._seeder_rate_bytes_per_sec(_FakeWorker(hardware))
+            == peer.MIN_ASSUMED_RATE_BYTES_PER_SEC
+        )
+
+
+def test_seeder_rate_uses_a_reported_cap():
+    worker = _FakeWorker(json.dumps({"peer_upload_min_mbps": 5}))
+    assert peer._seeder_rate_bytes_per_sec(worker) == 5 * 1_000_000 / 8
+
+
+def test_grant_ttl_for_a_slow_seeder_is_proportionally_longer():
+    """A 5 Mbps seeder moves a 6.5 GB model 4x slower than the 20 Mbps
+    default the flat assumption was built for, so its grant must live ~4x as
+    long or the transfer expires mid-file."""
+    size = round(6.5 * 1000 ** 3)
+    default_ttl = peer.grant_ttl_seconds(size)
+    slow_ttl = peer.grant_ttl_seconds(size, 5 * 1_000_000 / 8)
+
+    # Both carry the same flat 600 s of setup headroom; the size-scaled part
+    # is what quadruples.
+    scaled_default = default_ttl - peer.GRANT_TTL_SECONDS
+    scaled_slow = slow_ttl - peer.GRANT_TTL_SECONDS
+    assert 3.9 <= scaled_slow / scaled_default <= 4.1
+
+    # An absent/invalid rate is exactly the pre-existing default.
+    assert peer.grant_ttl_seconds(size, None) == default_ttl
+    assert peer.grant_ttl_seconds(size, 0) == default_ttl
+    assert peer.grant_ttl_seconds(size, -1) == default_ttl
+
+
+def test_peer_grant_expiry_uses_the_seeders_reported_cap(client):
+    """End to end: a seeder whose hello reported a 5 Mbps floor gets a
+    proportionally longer grant than the default assumption would give."""
+    csrf = _login(client)
+    sha = _sha("model")
+    size = _bytes(1.0)
+    seeder_id, _ = _make_online_seeder(client, csrf, "seeder", sha256=sha, size_bytes=size)
+    with db.get_session() as session:
+        worker = session.get(db.Worker, seeder_id)
+        worker.hardware = json.dumps({"cpu": "x", "peer_upload_min_mbps": 5})
+        session.commit()
+
+    puller_id, puller_sk = _register_worker(client, csrf, "puller")
+    before = int(time.time())
+    r = _agent_post(
+        client, puller_id, puller_sk, "/api/agent/peer-grant",
+        {"name": "checkpoints/model.safetensors", "size_bytes": size},
+    )
+    after = int(time.time())
+
+    expires_at = r.json()["grant"]["expires_at"]
+    ttl = peer.grant_ttl_seconds(size, 5 * 1_000_000 / 8)
+    assert ttl > peer.grant_ttl_seconds(size)
+    assert before + ttl <= expires_at <= after + ttl
