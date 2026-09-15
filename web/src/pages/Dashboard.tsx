@@ -78,12 +78,15 @@ export function Dashboard({ role }: DashboardProps) {
   const jobs = data?.jobs ?? [];
 
   const active = workers.filter((w) => !w.disabled);
-  // `paused` counts as online: the worker is connected and healthy, it has
-  // just stopped taking NEW jobs while someone uses the machine. Excluding
-  // it made an evening dashboard read "0 online" with five live workers
-  // attached (final review M9).
-  const onlineCount = active.filter((w) => w.status === 'online' || w.status === 'paused').length;
-  const busyCount = active.filter((w) => w.status === 'busy').length;
+  // Every connected worker lands in exactly ONE tile, and the tiles agree
+  // with the row badge: `online` = idle and dispatchable -> 上線; `busy`
+  // (rendering) and `paused` (a human is using the machine, badge reads
+  // "worker 繁忙") -> 忙碌. A paused worker is neither hidden (the old M9
+  // worry -- an evening fleet must not read as "0 workers") nor mislabelled
+  // as available: the list said 繁忙 while these numbers said 上線, and the
+  // owner rightly asked why the counters never moved.
+  const onlineCount = active.filter((w) => w.status === 'online').length;
+  const busyCount = active.filter((w) => w.status === 'busy' || w.status === 'paused').length;
   const queuedCount = jobs.filter((j) => j.status === 'queued').length;
   const runningCount = jobs.filter((j) => j.status === 'running' || j.status === 'assigned').length;
 
