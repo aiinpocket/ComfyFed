@@ -619,6 +619,11 @@ class AgentLoop:
         # connection (see peerserve.PeerHTTPServer's docstring).
         self._peer_server: Optional["peerserve.PeerHTTPServer"] = None
         self._peer_advertised_url: Optional[str] = None
+        # 分級 P2P 上傳限速：最後一次真的套用下去的上限（Mbps），只用來讓
+        # tier 切換的 log 一次只印一行，而不是每 5 秒 tick 都印。
+        # Last upload cap actually applied (Mbps); only used so the tier-switch
+        # log fires ONCE per change instead of on every 5 s tick.
+        self._peer_upload_limit_applied: Optional[float] = None
         # The single platform-independent control task (see `_control_loop`),
         # started by `run()` and stopped on either shutdown path.
         self._control_task: Optional[asyncio.Task] = None
@@ -701,6 +706,48 @@ class AgentLoop:
         state, job_id = self._aggregate_state()
         control.write_state(self._config_dir, state, job_id)
 
+    def _apply_peer_upload_limit(self, availability: Optional[str] = None) -> None:
+        """依目前的閒置狀態，把分級上傳限速套到做種用的 peer server 上。
+
+        做種跟派工不一樣：使用者在用電腦時「不」停止上傳（只吃 CPU 跟網路），
+        而是降速讓出頻寬。`availability == "available"`（閒置）套
+        `peer_upload_limit_idle_mbps`（預設 0 = 不限速），其餘情況（使用者
+        活動中、手動暫停）套 `peer_upload_limit_mbps`（預設 20 Mbps）。
+
+        Seeding is throttled, never stopped, while a human uses the machine.
+        Called once per control tick and once right after the peer server
+        starts, so the first seconds are not unlimited-by-omission.
+        """
+        server = self._peer_server
+        if server is None:
+            return
+        if availability is None:
+            availability = control.availability(self.config, self._config_dir)
+        idle_tier = availability == "available"
+        limit = (
+            self.config.peer_upload_limit_idle_mbps
+            if idle_tier
+            else self.config.peer_upload_limit_mbps
+        )
+        try:
+            server.set_upload_limit_mbps(limit)
+        except Exception:
+            logger.exception("runner: failed to apply the P2P upload limit")
+            return
+        if limit != self._peer_upload_limit_applied:
+            self._peer_upload_limit_applied = limit
+            shown = "不限速 / unlimited" if not limit else f"{limit:g} Mbps"
+            reason_zh = "閒置中" if idle_tier else (
+                "手動暫停" if availability == "paused-manual" else "使用者活動中"
+            )
+            reason_en = "idle" if idle_tier else (
+                "manually paused" if availability == "paused-manual" else "user active"
+            )
+            logger.info(
+                "P2P 上傳限速 -> %s（%s）/ P2P upload cap -> %s (%s)",
+                shown, reason_zh, shown, reason_en,
+            )
+
     async def _control_loop(self) -> None:
         """Publish the agent's state and honour `comfyfed stop`, independently
         of every platform connection.
@@ -716,6 +763,10 @@ class AgentLoop:
             try:
                 self._publish_control_state()
                 self._poll_stop_request()
+                # 做種不隨暫停停止，只降速：同一個 tick 算出來的 availability
+                # 直接決定這一輪的上傳上限。
+                # Seeding keeps running while paused -- it is only throttled.
+                self._apply_peer_upload_limit()
             except Exception:
                 # Local control is a convenience layer; a surprise here must
                 # never take down a working agent. The next tick retries.
@@ -1592,6 +1643,7 @@ class AgentLoop:
                 logger.exception("runner: failed to stop peer HTTP server cleanly")
             self._peer_server = None
             self._peer_advertised_url = None
+            self._peer_upload_limit_applied = None
 
     def _start_peer_server(self) -> None:
         """Start the peer HTTP server when `peer_serve`/`peer_listen_port`
@@ -1617,6 +1669,10 @@ class AgentLoop:
                 bind_host=self.config.peer_bind_host,
             )
             self._peer_server.start()
+            # 開機第一秒就要有上限，不能等到第一次 control tick 才套。
+            # Apply a tier immediately so the first seconds are not
+            # unlimited-by-omission before the first control tick.
+            self._apply_peer_upload_limit()
             self._peer_advertised_url = peerserve.advertised_url(self.config)
             logger.info(
                 "runner: peer HTTP server listening on port %s, advertising %s",

@@ -61,6 +61,7 @@ from __future__ import annotations
 import base64
 import json
 import logging
+import math
 import ntpath
 import os
 import re
@@ -99,7 +100,6 @@ _MAX_REPORT_ATTEMPTS = 5
 _GRANT_FIELDS = ("grant_id", "name", "size_bytes", "sha256", "seeder_id", "puller_id", "expires_at")
 
 _RANGE_RE = re.compile(r"^bytes=(\d*)-(\d*)$")
-
 
 def is_enabled(config: AgentConfig) -> bool:
     """Peer serving is on iff both a `peer_serve` opt-in AND a port to bind
@@ -256,6 +256,116 @@ def _parse_range(range_header: str, size_bytes: int) -> Optional[tuple[int, int]
         return None
     end = min(end, size_bytes - 1)
     return start, end
+
+
+class UploadThrottle:
+    """行程層級、全體共用的 token bucket 上傳限速器。
+
+    所有並行的傳輸共用同一個桶子：N 個下載端加起來受同一個上限約束，而不是
+    每人各拿一份上限（N x cap）。桶子會依 monotonic 時鐘連續補充，並且封頂在
+    「1 秒的速率」或「一個 chunk」兩者取大——長時間沒人下載之後，第一個連線
+    也不會一口氣爆出一大串 burst 把使用者的上行塞滿。
+
+    A process-global, shared token bucket. Every concurrent transfer draws
+    from the SAME bucket, so N pullers are jointly bounded by the cap rather
+    than getting N x cap. The bucket refills continuously from a monotonic
+    clock and is capped at one second of rate (or one chunk, whichever is
+    larger) so a long idle gap cannot grant a huge burst.
+
+    `now` / `sleep` are injectable so tests can drive it with a fake clock
+    instead of real wall time. This class deliberately knows nothing about
+    idle detection or config -- the runner drives it (see
+    `PeerHTTPServer.set_upload_limit_mbps`).
+    """
+
+    def __init__(
+        self,
+        rate_bytes_per_sec: float | None = None,
+        *,
+        now: Callable[[], float] = time.monotonic,
+        sleep: Callable[[float], None] = time.sleep,
+    ):
+        self._lock = threading.Lock()
+        self._now = now
+        self._sleep = sleep
+        self._rate: float | None = None
+        self._capacity = 0.0
+        self._tokens = 0.0
+        self._last = now()
+        self.set_rate(rate_bytes_per_sec)
+
+    def set_rate(self, bytes_per_sec: float | None) -> None:
+        """Set the shared cap. `None` or `0` (or anything non-positive /
+        non-finite) means UNLIMITED -- `consume` then never sleeps."""
+        if bytes_per_sec is None:
+            rate: float | None = None
+        else:
+            try:
+                value = float(bytes_per_sec)
+            except (TypeError, ValueError):
+                value = 0.0
+            rate = value if math.isfinite(value) and value > 0 else None
+        with self._lock:
+            self._rate = rate
+            if rate is None:
+                self._capacity = 0.0
+                self._tokens = 0.0
+            else:
+                self._capacity = max(rate, float(_CHUNK_SIZE))
+                # A rate change starts from an empty-ish bucket rather than
+                # carrying over tokens minted under the previous (possibly
+                # unlimited) tier -- switching 0 -> 20 Mbps must take effect
+                # immediately, not after a stale burst drains.
+                self._tokens = min(self._tokens, self._capacity)
+            self._last = self._now()
+
+    @property
+    def rate_bytes_per_sec(self) -> float | None:
+        with self._lock:
+            return self._rate
+
+    def _refill_locked(self) -> None:
+        now = self._now()
+        elapsed = now - self._last
+        self._last = now
+        if elapsed > 0 and self._rate is not None:
+            self._tokens = min(self._capacity, self._tokens + elapsed * self._rate)
+
+    def consume(self, nbytes: int) -> None:
+        """Block (in small sleeps) until `nbytes` worth of tokens are
+        available, then spend them. Returns immediately when unlimited."""
+        if nbytes <= 0:
+            return
+        remaining = nbytes
+        while remaining > 0:
+            with self._lock:
+                rate = self._rate
+                if rate is None:
+                    return
+                self._refill_locked()
+                # A request larger than the whole bucket is paid for in
+                # bucket-sized bites rather than waited for in one go -- it
+                # could never be satisfied outright, and spending it as one
+                # negative balance would let an oversized write through
+                # unpaced.
+                take = min(remaining, self._capacity)
+                if self._tokens >= take:
+                    self._tokens -= take
+                    remaining -= take
+                    continue
+                deficit = take - self._tokens
+                wait = deficit / rate
+            # Capped so a rate change (or a stop) is picked up promptly
+            # instead of being stuck inside one long sleep.
+            self._sleep(min(wait, 0.5))
+
+
+# 全行程共用的上傳限速桶：一個 agent 行程只有一個 listener，所有並行傳輸共用
+# 這一個上限（N 個下載端合計受限，不是每人一份）。預設不限速，由 runner 每次
+# control tick 依閒置狀態呼叫 `PeerHTTPServer.set_upload_limit_mbps` 調整。
+# The ONE process-global upload bucket shared by every concurrent transfer.
+# Unlimited until the runner sets a tier.
+_UPLOAD_THROTTLE = UploadThrottle(None)
 
 
 class _ModelIndex:
@@ -510,6 +620,11 @@ def _make_handler_class(server_state: "_ServerState") -> type:
                     chunk = fh.read(min(_CHUNK_SIZE, remaining))
                     if not chunk:
                         break
+                    # 先扣 token 再寫：限速在「寫上線路之前」生效，所以使用者
+                    # 在用電腦時，做種不會先一口氣灌滿 socket buffer。
+                    # Pay before writing, so the cap actually shapes what goes
+                    # on the wire instead of trailing behind a full buffer.
+                    _UPLOAD_THROTTLE.consume(len(chunk))
                     self.wfile.write(chunk)
                     remaining -= len(chunk)
                     server_state.tracker.add_bytes(grant_id, len(chunk))
@@ -592,6 +707,23 @@ class PeerHTTPServer:
             self._serve_thread.join(timeout=timeout)
         if self._reporter_thread.is_alive():
             self._reporter_thread.join(timeout=timeout)
+
+    def set_upload_limit_mbps(self, mbps: float) -> None:
+        """設定做種上傳上限（Mbps，百萬位元/秒）；`0`（或負數／非數字）= 不限速。
+
+        Set the shared seeding cap in megabits per second; `0` (or anything
+        non-positive/unparseable) means unlimited. This module stays free of
+        any idle/control dependency -- the runner decides WHICH tier applies
+        and calls this once per control tick (see `runner._control_loop`).
+        """
+        try:
+            value = float(mbps)
+        except (TypeError, ValueError):
+            value = 0.0
+        if not math.isfinite(value) or value <= 0:
+            _UPLOAD_THROTTLE.set_rate(None)
+            return
+        _UPLOAD_THROTTLE.set_rate(value * 1_000_000 / 8)
 
     def pop_served(self) -> dict:
         """Snapshot + zero every grant's served-bytes counter (test hook and

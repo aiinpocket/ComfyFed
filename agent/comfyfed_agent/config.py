@@ -80,6 +80,25 @@ def _coerce_str(value, default: str) -> str:
     return default
 
 
+def _coerce_non_negative_float(value, default: float) -> float:
+    """`peer_upload_limit_mbps` / `peer_upload_limit_idle_mbps` from
+    agent.json，防禦式解析：跟 `_coerce_positive_float` 同樣的姿態，唯一差別
+    是 **0 是合法值**（代表「不限速」），所以只有負數、非數字、NaN/inf 才退回
+    預設值。
+
+    Same posture as `_coerce_positive_float`, except `0` is a MEANINGFUL
+    value here (= unlimited), so only negative, non-numeric and non-finite
+    inputs fall back to `default`.
+    """
+    try:
+        result = float(value)
+    except (TypeError, ValueError):
+        return default
+    if not math.isfinite(result) or result < 0:  # NaN, +/-inf or negative
+        return default
+    return result
+
+
 @dataclass
 class PlatformEntry:
     platform_url: str
@@ -137,6 +156,22 @@ class AgentConfig:
     # treated as always idle -- see idle.seconds_since_input.
     pause_when_active: bool = True
     idle_minutes: float = 15.0
+    # 分級 P2P 上傳限速（2026-09-15 directive）：做種（peerserve）跟派工不同，
+    # 使用者在用電腦時仍然照常上傳——只吃 CPU 跟網路、不占 GPU——但要「有禮貌」
+    # 地讓出頻寬。`peer_upload_limit_mbps` 是 availability != "available"
+    # （使用者活動中或手動暫停）時套用的上限，單位 Mbps（百萬位元/秒）。
+    # 預設 20 Mbps：在常見 >= 100 Mbps 的上行上仍留 >= 80% 餘裕給人用，卻還是
+    # 能在大約 40 分鐘內送完一個 6.5 GB 的模型檔。
+    # `peer_upload_limit_idle_mbps` 是機器閒置時的上限，`0` = 不限速（預設）。
+    #
+    # Tiered P2P upload cap. Seeding deliberately keeps running while the
+    # human uses the machine (CPU + network only, no GPU), so it is throttled
+    # instead of stopped. `peer_upload_limit_mbps` (megabits/sec) applies
+    # whenever availability != "available"; 20 Mbps leaves >= 80% headroom on
+    # a typical >= 100 Mbps uplink yet still moves 6.5 GB in ~40 minutes.
+    # `peer_upload_limit_idle_mbps` applies while idle; `0` means UNLIMITED.
+    peer_upload_limit_mbps: float = 20.0
+    peer_upload_limit_idle_mbps: float = 0.0
 
     @classmethod
     def load(cls, path: str) -> "AgentConfig":
@@ -179,6 +214,12 @@ class AgentConfig:
             idle_minutes=_coerce_positive_float(
                 data.get("idle_minutes"), cls.idle_minutes
             ),
+            peer_upload_limit_mbps=_coerce_non_negative_float(
+                data.get("peer_upload_limit_mbps"), cls.peer_upload_limit_mbps
+            ),
+            peer_upload_limit_idle_mbps=_coerce_non_negative_float(
+                data.get("peer_upload_limit_idle_mbps"), cls.peer_upload_limit_idle_mbps
+            ),
         )
 
     def save(self, path: str) -> None:
@@ -205,6 +246,8 @@ class AgentConfig:
             "peer_bind_host": self.peer_bind_host,
             "pause_when_active": self.pause_when_active,
             "idle_minutes": self.idle_minutes,
+            "peer_upload_limit_mbps": self.peer_upload_limit_mbps,
+            "peer_upload_limit_idle_mbps": self.peer_upload_limit_idle_mbps,
         }
 
         tmp_path = f"{path}.tmp-{os.getpid()}"

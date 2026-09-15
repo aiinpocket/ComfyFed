@@ -421,3 +421,118 @@ def test_peer_bind_host_config_can_be_overridden():
 
     cfg = AgentConfig(peer_serve=True, peer_listen_port=8850, peer_bind_host="127.0.0.1")
     assert cfg.peer_bind_host == "127.0.0.1"
+
+
+# --- 分級上傳限速 / tiered upload throttle -------------------------------
+
+
+class _FakeClock:
+    """Deterministic monotonic clock + sleep for the throttle tests: `sleep`
+    just advances the clock, so a "3 MB at 1 MB/s" case costs no wall time."""
+
+    def __init__(self):
+        self.t = 0.0
+
+    def now(self) -> float:
+        return self.t
+
+    def sleep(self, seconds: float) -> None:
+        # Mirror real sleep's behavior for a non-positive request.
+        if seconds > 0:
+            self.t += seconds
+
+
+def _throttle(rate, clock):
+    return peerserve.UploadThrottle(rate, now=clock.now, sleep=clock.sleep)
+
+
+def test_throttle_paces_consumption_at_the_configured_rate():
+    clock = _FakeClock()
+    th = _throttle(1_000_000, clock)  # 1 MB/s
+
+    for _ in range(3):
+        th.consume(1_000_000)
+
+    # Three megabytes at a megabyte a second: generous lower bound (the
+    # bucket starts empty, so the true figure is ~3 s).
+    assert clock.t >= 2.5
+
+
+def test_throttle_unlimited_consumes_instantly():
+    clock = _FakeClock()
+    for rate in (None, 0):
+        th = _throttle(rate, clock)
+        th.consume(50_000_000)
+        assert th.rate_bytes_per_sec is None
+    assert clock.t == 0.0
+
+
+def test_throttle_rate_change_applies_to_later_consumes():
+    clock = _FakeClock()
+    th = _throttle(None, clock)
+    th.consume(10_000_000)
+    assert clock.t == 0.0
+
+    th.set_rate(1_000_000)
+    th.consume(2_000_000)
+    assert clock.t >= 1.5
+
+    before = clock.t
+    th.set_rate(None)
+    th.consume(10_000_000)
+    assert clock.t == before
+
+
+def test_throttle_burst_is_capped_after_a_long_idle_gap():
+    """A long quiet stretch must not mint an unbounded burst: the bucket
+    holds at most one second of rate (or one chunk, whichever is larger)."""
+    clock = _FakeClock()
+    th = _throttle(2_000_000, clock)  # 2 MB/s -> 2 MB bucket
+    clock.t += 3600.0  # an hour with nobody pulling
+
+    th.consume(2_000_000)  # covered by the (capped) bucket
+    assert clock.t == 3600.0
+    th.consume(2_000_000)  # must be paid for at the real rate
+    assert clock.t >= 3600.5
+
+
+def test_throttle_is_shared_by_concurrent_consumers():
+    """Two threads pulling at once are JOINTLY bounded by one cap, never
+    2 x cap -- the whole point of a single process-global bucket."""
+    import threading as _threading
+
+    rate = 4_000_000  # 4 MB/s, real time: ~0.5 s of test
+    th = peerserve.UploadThrottle(rate)
+    per_thread = 1_000_000
+    rounds = 2  # ~1 s of real time in total, deliberately small
+
+    def _worker():
+        for _ in range(rounds):
+            th.consume(per_thread)
+
+    started = time.monotonic()
+    threads = [_threading.Thread(target=_worker) for _ in range(2)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join(timeout=30)
+    elapsed = max(time.monotonic() - started, 1e-6)
+
+    total = per_thread * rounds * 2
+    assert total / elapsed <= rate * 1.3
+
+
+def test_set_upload_limit_mbps_converts_and_treats_zero_as_unlimited(server):
+    srv, *_ = server
+    try:
+        srv.set_upload_limit_mbps(20)
+        assert peerserve._UPLOAD_THROTTLE.rate_bytes_per_sec == 20 * 1_000_000 / 8
+
+        srv.set_upload_limit_mbps(0)
+        assert peerserve._UPLOAD_THROTTLE.rate_bytes_per_sec is None
+
+        srv.set_upload_limit_mbps(-1)
+        assert peerserve._UPLOAD_THROTTLE.rate_bytes_per_sec is None
+    finally:
+        # The bucket is process-global: leave it unlimited for other tests.
+        peerserve._UPLOAD_THROTTLE.set_rate(None)

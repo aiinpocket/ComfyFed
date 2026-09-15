@@ -340,3 +340,92 @@ async def test_run_clears_a_stale_stop_file_before_starting(pause_loop, monkeypa
         await pause_loop.run()
 
     assert control.is_stop_requested(pause_loop._config_dir) is False
+
+
+# --- 分級 P2P 上傳限速 / tiered P2P upload cap ---------------------------
+
+
+class _FakePeerServer:
+    """Records every `set_upload_limit_mbps` call the runner makes."""
+
+    def __init__(self, *a, **kw):
+        self.limits = []
+
+    def set_upload_limit_mbps(self, mbps):
+        self.limits.append(mbps)
+
+    def start(self):
+        pass
+
+    def stop(self, timeout=5.0):
+        pass
+
+
+async def test_control_tick_applies_the_idle_upload_limit(pause_loop):
+    """Idle machine -> the idle tier (default 0 = unlimited)."""
+    peer = _FakePeerServer()
+    pause_loop._peer_server = peer
+
+    await _run_control_loop_briefly(pause_loop)
+
+    assert peer.limits == [pause_loop.config.peer_upload_limit_idle_mbps]
+
+
+async def test_control_tick_applies_the_active_upload_limit(pause_loop, monkeypatch):
+    """User at the keyboard -> the polite tier (default 20 Mbps). Seeding is
+    throttled, NOT stopped."""
+    monkeypatch.setattr(idle, "seconds_since_input", lambda: 1.0)
+    peer = _FakePeerServer()
+    pause_loop._peer_server = peer
+
+    await _run_control_loop_briefly(pause_loop)
+
+    assert peer.limits == [pause_loop.config.peer_upload_limit_mbps]
+    assert pause_loop.config.peer_upload_limit_mbps == 20.0
+
+
+async def test_control_tick_applies_the_active_limit_when_manually_paused(pause_loop):
+    control.request_pause(pause_loop._config_dir)
+    peer = _FakePeerServer()
+    pause_loop._peer_server = peer
+
+    await _run_control_loop_briefly(pause_loop)
+
+    assert peer.limits == [pause_loop.config.peer_upload_limit_mbps]
+
+
+async def test_upload_limit_is_applied_once_the_peer_server_starts(pause_loop, monkeypatch, tmp_path):
+    """The first seconds must not be unlimited-by-omission, waiting for the
+    first control tick."""
+    monkeypatch.setattr(idle, "seconds_since_input", lambda: 1.0)
+    monkeypatch.setattr(runner_module.peerserve, "PeerHTTPServer", _FakePeerServer)
+    monkeypatch.setattr(runner_module.peerserve, "advertised_url", lambda cfg: "http://127.0.0.1:8850")
+    pause_loop.config.peer_serve = True
+    pause_loop.config.peer_listen_port = 8850
+    pause_loop.config.models_dir = str(tmp_path / "models")
+
+    pause_loop._start_peer_server()
+
+    assert pause_loop._peer_server.limits == [20.0]
+
+
+async def test_upload_limit_tier_switch_logs_once_per_change(pause_loop, monkeypatch, caplog):
+    active = {"seconds": 9999.0}
+    monkeypatch.setattr(idle, "seconds_since_input", lambda: active["seconds"])
+    pause_loop._peer_server = _FakePeerServer()
+
+    with caplog.at_level("INFO", logger=runner_module.logger.name):
+        pause_loop._apply_peer_upload_limit()
+        pause_loop._apply_peer_upload_limit()  # same tier: no second line
+        active["seconds"] = 1.0
+        pause_loop._apply_peer_upload_limit()
+        pause_loop._apply_peer_upload_limit()  # same tier again
+
+    lines = [r.getMessage() for r in caplog.records if "upload cap" in r.getMessage()]
+    assert len(lines) == 2
+    assert "unlimited" in lines[0]
+    assert "20 Mbps" in lines[1]
+    assert "上傳限速" in lines[1]
+    # Four calls, four applications -- only the LOG is deduped, the cap is
+    # re-asserted every tick (cheap, and self-healing if it ever drifts).
+    assert pause_loop._peer_server.limits == [0.0, 0.0, 20.0, 20.0]

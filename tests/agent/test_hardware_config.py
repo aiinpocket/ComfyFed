@@ -640,6 +640,50 @@ def test_config_peer_serve_coercion(tmp_path):
         assert AgentConfig.load(str(path)).peer_advertise_host == expected
 
 
+def test_config_peer_upload_limit_defaults_and_round_trip(tmp_path):
+    """Tiered P2P upload cap: 20 Mbps while the user is active / manually
+    paused, unlimited (0) while idle -- and both survive a save/load."""
+    path = tmp_path / "agent.json"
+    AgentConfig().save(str(path))
+
+    loaded = AgentConfig.load(str(path))
+    assert loaded.peer_upload_limit_mbps == 20.0
+    assert loaded.peer_upload_limit_idle_mbps == 0.0
+
+    AgentConfig(peer_upload_limit_mbps=5.5, peer_upload_limit_idle_mbps=100).save(str(path))
+    loaded = AgentConfig.load(str(path))
+    assert loaded.peer_upload_limit_mbps == 5.5
+    assert loaded.peer_upload_limit_idle_mbps == 100.0
+
+
+def test_config_peer_upload_limit_coercion(tmp_path):
+    """Same defensive posture as max_fetch_gb, except `0` is MEANINGFUL here
+    (= unlimited) and must survive coercion instead of falling back."""
+    import json as _json
+
+    path = tmp_path / "agent.json"
+    cases = [
+        ("30", 30.0),
+        (12.5, 12.5),
+        ("0", 0.0),
+        (0, 0.0),
+        ("abc", 20.0),
+        (-5, 20.0),
+        (float("inf"), 20.0),
+        (None, 20.0),
+    ]
+    for raw, expected in cases:
+        # json.dumps writes bare `Infinity`, which json.load accepts back --
+        # exactly the "1e999 in a hand-edited file" case the coercer guards.
+        path.write_text(_json.dumps({"peer_upload_limit_mbps": raw}), encoding="utf-8")
+        assert AgentConfig.load(str(path)).peer_upload_limit_mbps == expected
+
+    idle_cases = [("0", 0.0), (25, 25.0), ("abc", 0.0), (-5, 0.0), (float("inf"), 0.0)]
+    for raw, expected in idle_cases:
+        path.write_text(_json.dumps({"peer_upload_limit_idle_mbps": raw}), encoding="utf-8")
+        assert AgentConfig.load(str(path)).peer_upload_limit_idle_mbps == expected
+
+
 def test_config_load_tolerates_a_utf8_bom(tmp_path):
     """Windows tooling (PS 5.1 `Set-Content -Encoding UTF8`, Notepad) writes
     JSON with a UTF-8 BOM; strict utf-8 json.load rejects the very first
