@@ -513,3 +513,61 @@ describe("planForJob / splitBatchesEnabled (§3.2)", () => {
     expect(await split.splitBatchesEnabled(db())).toBe(false);
   });
 });
+
+describe("fix round 1: terminal parents and heartbeat-driven progress", () => {
+  it("never moves a parent that is already terminal", async () => {
+    const parentId = await makeParent("p-terminal");
+    await split.createChildren(db(), parentId, 2);
+    const children = await split.childrenOf(db(), parentId);
+    for (const child of children) await setRow(child.id, { status: "cancelled", error: "cancelled by admin" });
+    await split.refreshParent(db(), parentId, new Date());
+    expect((await readRow(parentId)).status).toBe("cancelled");
+
+    // 被取消的 worker 還是把 job_done 送了上來。
+    for (const child of children) await setRow(child.id, { status: "done", result_files: JSON.stringify(["late.png"]) });
+
+    expect(await split.refreshParent(db(), parentId, new Date())).toEqual({ changed: false, status: null });
+    expect((await readRow(parentId)).status).toBe("cancelled");
+  });
+
+  it("cascades the cancellation reason, not a generic one", async () => {
+    const parentId = await makeParent("p-reason");
+    await split.createChildren(db(), parentId, 2);
+    const children = await split.childrenOf(db(), parentId);
+    await setRow(children[0]!.id, { status: "cancelled", error: "cancelled by admin" });
+
+    await split.refreshParent(db(), parentId, new Date());
+
+    expect((await readRow(children[1]!.id)).error).toBe("cancelled by admin");
+  });
+
+  it("refreshParentProgress is the mean over the children", async () => {
+    const parentId = await makeParent("p-mean");
+    await split.createChildren(db(), parentId, 2);
+    const children = await split.childrenOf(db(), parentId);
+    await setRow(children[0]!.id, { status: "running", progress: 0.2 });
+    await setRow(children[1]!.id, { status: "running", progress: 0.6 });
+
+    expect(await split.refreshParentProgress(db(), children[0]!.id)).toBeCloseTo(0.4, 10);
+    expect((await readRow(parentId)).progress).toBeCloseTo(0.4, 10);
+  });
+
+  it("refreshParentProgress is a no-op for a plain job and for a terminal parent", async () => {
+    await db()
+      .prepare("INSERT INTO jobs (id, workflow_json, status, created_at) VALUES ('plain-prog', '{}', 'running', ?)")
+      .bind(toSqliteTimestamp(new Date()))
+      .run();
+    expect(await split.refreshParentProgress(db(), "plain-prog")).toBeNull();
+
+    const parentId = await makeParent("p-done-prog");
+    await split.createChildren(db(), parentId, 2);
+    const children = await split.childrenOf(db(), parentId);
+    for (const child of children) await setRow(child.id, { status: "done", progress: 1 });
+    await split.refreshParent(db(), parentId, new Date());
+
+    // 遲到的心跳不能把 done 父 job 的 progress 從 1.0 拉回去。
+    await setRow(children[0]!.id, { progress: 0.2 });
+    expect(await split.refreshParentProgress(db(), children[0]!.id)).toBeNull();
+    expect((await readRow(parentId)).progress).toBe(1);
+  });
+});

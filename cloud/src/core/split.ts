@@ -321,6 +321,11 @@ const SIBLING_CANCELLED_REASON = "sibling cancelled";
 /** 還沒終止、因此會被串聯取消掃到的狀態。 */
 const LIVE_STATUSES: readonly string[] = ["queued", "assigned", "running"];
 
+/** 父 job 一旦落在這些狀態就不再由子 job 推導（見 `refreshParent`）。和
+ * `dispatch.TERMINAL_STATUSES` 同一組，這裡重寫一份而不是 import dispatch --
+ * dispatch 已經 import 了 split，反過來會成為循環。 */
+const TERMINAL_STATUSES: readonly string[] = ["done", "failed", "cancelled"];
+
 /** 平台設定 `split_batches`（預設 true）。任何非 "0" 的值都算開啟，和其他
  * boolean 設定的寬鬆讀法一致 -- ports `split.split_batches_enabled`. */
 export async function splitBatchesEnabled(db: D1Database): Promise<boolean> {
@@ -501,6 +506,11 @@ export async function refreshParent(
 ): Promise<{ changed: boolean; status: string | null }> {
   const parent = await queries.getJobById(db, parentId);
   if (!parent || parent.splitCount <= 0) return { changed: false, status: null };
+  // 父 job 一旦終止就不再由子 job 推導：一個遲到的子 job 回報（被取消的 worker
+  // 還是把 job_done 送上來了、或是取消之後才落地的 markFailed）絕不能把已經
+  // cancelled/failed/done 的父 job 又搬回去。這也讓整個推導是冪等的 -- 第二個
+  // 子 job 失敗時不會再串聯取消一次。
+  if (TERMINAL_STATUSES.includes(parent.status)) return { changed: false, status: null };
 
   const children = await queries.getChildJobs(db, parentId);
   if (children.length === 0) return { changed: false, status: null };
@@ -531,7 +541,10 @@ export async function refreshParent(
     patch.status = "cancelled";
     patch.error = cancelled.error;
     patch.finishedAt = patch.finishedAt ?? nowStamp;
-    cascadeReason = SIBLING_CANCELLED_REASON;
+    // 兄弟收到的理由就是這一次取消的理由（admin 的「cancelled by admin」、
+    // 面板的「interrupted from panel」…），不是一句沒有資訊的「sibling
+    // cancelled」-- 面板上每個子 job 顯示的都該是同一個原因。
+    cascadeReason = cancelled.error || SIBLING_CANCELLED_REASON;
     cascade = children.filter(live);
   } else if (children.every((c) => c.status === "done")) {
     patch.status = "done";
@@ -589,6 +602,28 @@ export async function childStatusChanged(
   if (!job || !job.parentId) return null;
   const { status } = await refreshParent(db, job.parentId, now, cancelledOwners);
   return status;
+}
+
+/** §3.4 -- ports `split.refresh_parent_progress`：子 job 回報進度之後，把父
+ * job 的 `progress` 更新成子 job 的平均。回傳父 job 的新 progress，或 null。
+ *
+ * 和 `refreshParent` 分開的原因是呼叫頻率：進度來自心跳（每個子 job 每 30 秒
+ * 一次，跑的時候更密），而狀態推導要跑串聯取消、要寫五六個欄位。這裡只做一次
+ * 子 job 查詢加一次 UPDATE，狀態一個字都不碰，也刻意不發面板事件（Task 7）。 */
+export async function refreshParentProgress(db: D1Database, jobId: string): Promise<number | null> {
+  const job = await queries.getJobById(db, jobId);
+  if (!job || !job.parentId) return null;
+
+  const parent = await queries.getJobById(db, job.parentId);
+  // 遲到的心跳不該把一個已經終止的父 job 的 progress 從 1.0 拉回去。
+  if (!parent || parent.splitCount <= 0 || TERMINAL_STATUSES.includes(parent.status)) return null;
+
+  const children = await queries.getChildJobs(db, job.parentId);
+  if (children.length === 0) return null;
+
+  const progress = children.reduce((sum, c) => sum + (c.progress || 0), 0) / children.length;
+  if (progress !== parent.progress) await queries.updateJobProgress(db, parent.id, progress);
+  return progress;
 }
 
 /** §3.4 -- ports `split.parent_outputs`：`[[childId, filename], ...]`，依

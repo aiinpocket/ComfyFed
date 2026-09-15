@@ -564,7 +564,13 @@ export class Hub extends DurableObject<Env> {
    * stop the rest, and a missed push self-heals on that worker's next
    * message anyway (see `dispatch.cancelJob`). */
   private async pushCascadeCancellations(cancelledOwners: [string, string][]): Promise<void> {
+    const seen = new Set<string>();
     for (const [childId, owner] of cancelledOwners) {
+      // 同一個 (child, owner) 可能從兩條路徑各被收集一次（呼叫端自己拿到的回傳
+      // 值 + refreshParent 的串聯）。`sendJobCancelled` 本身就有每條連線每個 job
+      // 的去重，這裡再擋一層是為了連 log 都不要重複。
+      if (seen.has(JSON.stringify([childId, owner]))) continue;
+      seen.add(JSON.stringify([childId, owner]));
       try {
         const ws = this.findWsForWorker(owner);
         if (!ws) continue;
@@ -633,8 +639,13 @@ export class Hub extends DurableObject<Env> {
     // 收攤，這裡只剩下把那些兄弟的 owner 通知掉。
     for (const child of await split.childrenOf(db, jobId)) {
       if (child.status === "queued" || child.status === "assigned" || child.status === "running") {
-        const childOwner = await dispatch.cancelJob(db, child.id, reason, now);
-        if (childOwner) await this.pushCascadeCancellations([[child.id, childOwner]]);
+        // 共用同一個收集器，而且**不要**在這裡推。cancelling 第一個子 job 可能
+        // 會透過 refreshParent 把其餘兄弟一起收掉；那些兄弟的 owner 只會出現在
+        // 收集器裡，而後續的迴圈圈次看到的它們已經是 cancelled，`cancelJob` 回
+        // null。早期版本只推 `childOwner`，所以一個被拆成 k 份的 job 被取消時，
+        // 只有一台 worker 收得到 `job_cancelled`。
+        const childOwner = await dispatch.cancelJob(db, child.id, reason, now, cascadeCancelled);
+        if (childOwner) cascadeCancelled.push([child.id, childOwner]);
       }
     }
     await this.pushCascadeCancellations(cascadeCancelled);
@@ -1077,6 +1088,10 @@ export class Hub extends DurableObject<Env> {
         if (progressReported) {
           currentProgress = progress as number;
           await queries.updateJobProgress(db, jobId, currentProgress);
+          // Phase 3.3 §3.4：父 job 的進度是子 job 的平均，所以每次子 job 回報
+          // 進度都要重算一次（不是子 job 的話是 no-op）。只動 progress，不碰
+          // 狀態、也不發面板事件（那是 Task 7）。
+          await split.refreshParentProgress(db, jobId);
         }
 
         // Phase 2.1: an agent downloading a missing model before it can run

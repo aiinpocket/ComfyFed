@@ -625,7 +625,14 @@ async def _push_cascade_cancellations(cancelled_owners: list) -> None:
     must not stop the rest, and a missed push self-heals on that worker's
     next message anyway (see `dispatch.cancel_job`).
     """
+    seen: set = set()
     for child_id, owner in cancelled_owners:
+        # 同一個 (child, owner) 可能從兩條路徑各被收集一次（呼叫端自己拿到的
+        # 回傳值 + refresh_parent 的串聯）。`_send_job_cancelled` 本身就有每條
+        # 連線每個 job 的去重，這裡再擋一層是為了連 log 都不要重複。
+        if (child_id, owner) in seen:
+            continue
+        seen.add((child_id, owner))
         try:
             await push_job_cancelled(owner, child_id)
         except Exception:
@@ -702,17 +709,16 @@ async def cancel_and_notify(job_id: str, *, reason: str) -> bool:
     # 收攤，這裡只剩下把那些兄弟的 owner 通知掉。
     for child in split.children_of(job_id):
         if child.status in ("queued", "assigned", "running"):
-            child_owner = dispatch.cancel_job(child.id, reason=reason)
+            # 共用同一個收集器，而且**不要**在這裡推。cancelling 第一個子 job
+            # 可能會透過 refresh_parent 把其餘兄弟一起收掉；那些兄弟的 owner
+            # 只會出現在收集器裡，而後續的迴圈圈次看到的它們已經是 cancelled，
+            # `cancel_job` 回 None。早期版本只推 `child_owner`，所以一個被拆成
+            # k 份的 job 被取消時，只有一台 worker 收得到 `job_cancelled`。
+            child_owner = dispatch.cancel_job(
+                child.id, reason=reason, cancelled_owners=cascade_cancelled
+            )
             if child_owner is not None:
-                try:
-                    await push_job_cancelled(child_owner, child.id)
-                except Exception:
-                    logger.warning(
-                        "agentws: failed to push job_cancelled for split child %s owner %s",
-                        child.id,
-                        child_owner,
-                        exc_info=True,
-                    )
+                cascade_cancelled.append((child.id, child_owner))
     await _push_cascade_cancellations(cascade_cancelled)
 
     try:
@@ -923,6 +929,7 @@ async def _handle_heartbeat(worker_id: str, conn: _Connection, message: dict) ->
     dynamic = message.get("dynamic") or {}
     job_id = message.get("job_id")
     job_not_owned = False
+    progress_written = False
     with db.get_session() as session:
         worker = session.get(db.Worker, worker_id)
         if worker is None:
@@ -947,6 +954,7 @@ async def _handle_heartbeat(worker_id: str, conn: _Connection, message: dict) ->
                 if progress_reported:
                     job.progress = float(progress)
                     session.commit()
+                    progress_written = True
 
                 # Phase 2.1 Task 4/5: an agent downloading a missing model
                 # before it can run the job reports stage="fetching_models"
@@ -986,6 +994,13 @@ async def _handle_heartbeat(worker_id: str, conn: _Connection, message: dict) ->
     # a run that will never be accepted.
     if job_not_owned:
         await _send_job_cancelled(conn, job_id)
+
+    # Phase 3.3 §3.4：父 job 的進度是子 job 的平均，所以每次子 job 回報進度都
+    # 要重算一次（不是子 job 的話是 no-op）。只動 progress，不碰狀態、也不發
+    # 面板事件（那是 Task 7）。放在 session 區塊**外面**，免得在還握著上面那個
+    # session 的時候再開一個去寫同一張表。
+    if progress_written:
+        split.refresh_parent_progress(job_id)
 
     # The agent broadcasts a busy heartbeat carrying the job_id the moment it
     # picks the job up (see agent runner.handle_job), and that is the only

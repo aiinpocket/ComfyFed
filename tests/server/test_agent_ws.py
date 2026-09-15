@@ -3086,10 +3086,14 @@ def test_cancelling_a_split_parent_notifies_every_child_worker(client):
 
         assert client.post("/api/jobs/p_cancel/cancel", headers={"X-CSRF": csrf}).status_code == 200
 
-        # 兩條連線都收得到自己那個子 job 的 job_cancelled。
+        # 先用每條連線的去重集合斷言「推過了」-- 這是非阻塞的，迴歸時會立刻
+        # 失敗而不是卡在下面的 receive_json 上等一個永遠不會來的 frame。
+        for worker, child_id in ((worker_a, child_ids[0]), (worker_b, child_ids[1])):
+            assert child_id in agentws._connections[worker].cancelled_jobs_sent
+
+        # 再確認 frame 本身真的在線上。
         for ws, child_id in ((ws_a, child_ids[0]), (ws_b, child_ids[1])):
-            frame = ws.receive_json()
-            assert frame == {"type": "job_cancelled", "job_id": child_id}
+            assert ws.receive_json() == {"type": "job_cancelled", "job_id": child_id}
     finally:
         ws_a.close()
         ws_b.close()
@@ -3120,9 +3124,12 @@ def test_a_failed_child_cancels_its_sibling_and_tells_that_worker(client):
         _send_hello_v2(ws_a)
         _send_hello_v2(ws_b)
         ws_a.send_json({"type": "job_failed", "job_id": child_ids[0], "error": "CUDA OOM"})
+        # 同步一次，確保上面那個 fire-and-forget 的 frame 已經處理完。
+        assert client.get("/api/jobs/p_fail", headers={"X-CSRF": csrf}).status_code == 200
 
-        frame = ws_b.receive_json()
-        assert frame == {"type": "job_cancelled", "job_id": child_ids[1]}
+        # 非阻塞斷言在前（見上一個測試的說明），frame 驗證在後。
+        assert child_ids[1] in agentws._connections[worker_b].cancelled_jobs_sent
+        assert ws_b.receive_json() == {"type": "job_cancelled", "job_id": child_ids[1]}
     finally:
         ws_a.close()
         ws_b.close()

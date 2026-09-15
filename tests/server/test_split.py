@@ -528,3 +528,76 @@ def test_split_batches_setting_off_disables_planning(_db):
         session.commit()
     assert split.split_batches_enabled() is False
     assert split.plan_for_job(_batch_workflow(4), {}) is None
+
+
+# --- Fix round 1：終止的父 job 不再被推導、進度跟著子 job 的心跳走 --------
+
+
+def test_refresh_parent_never_moves_a_terminal_parent(_db):
+    """遲到的子 job 回報不能把已經取消的父 job 搬回 done（review fix 4）。"""
+    parent_id = _make_parent()
+    split.create_children(parent_id, 2)
+    children = split.children_of(parent_id)
+    for child in children:
+        _set_child(child.id, status="cancelled", error="cancelled by admin")
+    split.refresh_parent(parent_id)
+    with db.get_session() as session:
+        assert session.get(db.Job, parent_id).status == "cancelled"
+
+    # 被取消的 worker 還是把 job_done 送了上來。
+    for child in children:
+        _set_child(child.id, status="done", result_files=json.dumps(["late.png"]))
+
+    changed, status = split.refresh_parent(parent_id)
+
+    assert (changed, status) == (False, None)
+    with db.get_session() as session:
+        assert session.get(db.Job, parent_id).status == "cancelled"
+
+
+def test_refresh_parent_cascade_carries_the_cancellation_reason(_db):
+    """兄弟拿到的理由是這次取消的理由，不是「sibling cancelled」。"""
+    parent_id = _make_parent()
+    split.create_children(parent_id, 2)
+    children = split.children_of(parent_id)
+    _set_child(children[0].id, status="cancelled", error="cancelled by admin")
+
+    split.refresh_parent(parent_id)
+
+    with db.get_session() as session:
+        assert session.get(db.Job, children[1].id).error == "cancelled by admin"
+
+
+def test_refresh_parent_progress_is_the_mean_of_the_children(_db):
+    parent_id = _make_parent()
+    split.create_children(parent_id, 2)
+    children = split.children_of(parent_id)
+    _set_child(children[0].id, status="running", progress=0.2)
+    _set_child(children[1].id, status="running", progress=0.6)
+
+    assert split.refresh_parent_progress(children[0].id) == pytest.approx(0.4)
+
+    with db.get_session() as session:
+        assert session.get(db.Job, parent_id).progress == pytest.approx(0.4)
+
+
+def test_refresh_parent_progress_is_a_no_op_for_a_plain_job(_db):
+    with db.get_session() as session:
+        session.add(db.Job(id="plain_p", workflow_json="{}", status="running"))
+        session.commit()
+    assert split.refresh_parent_progress("plain_p") is None
+
+
+def test_refresh_parent_progress_leaves_a_terminal_parent_alone(_db):
+    """遲到的心跳不能把 done 父 job 的 progress 從 1.0 拉回去。"""
+    parent_id = _make_parent()
+    split.create_children(parent_id, 2)
+    children = split.children_of(parent_id)
+    for child in children:
+        _set_child(child.id, status="done", progress=1.0)
+    split.refresh_parent(parent_id)
+
+    _set_child(children[0].id, progress=0.2)
+    assert split.refresh_parent_progress(children[0].id) is None
+    with db.get_session() as session:
+        assert session.get(db.Job, parent_id).progress == pytest.approx(1.0)

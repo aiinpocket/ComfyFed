@@ -383,6 +383,11 @@ _SIBLING_CANCELLED_REASON = "sibling cancelled"
 # 還沒終止、因此會被串聯取消掃到的狀態。
 _LIVE_STATUSES = ("queued", "assigned", "running")
 
+# 父 job 一旦落在這些狀態就不再由子 job 推導（見 `refresh_parent`）。和
+# `dispatch._TERMINAL_STATUSES` 同一組，這裡重寫一份而不是 import dispatch --
+# dispatch 已經 import 了 split，反過來會成為循環。
+_TERMINAL_STATUSES = ("done", "failed", "cancelled")
+
 
 def _utcnow() -> datetime:
     return datetime.now(timezone.utc).replace(tzinfo=None)
@@ -616,6 +621,12 @@ def refresh_parent(
         parent = session.get(db.Job, parent_id)
         if parent is None or parent.split_count <= 0:
             return False, None
+        # 父 job 一旦終止就不再由子 job 推導：一個遲到的子 job 回報（被取消的
+        # worker 還是把 job_done 送上來了、或是取消之後才落地的 mark_failed）
+        # 絕不能把已經 cancelled/failed/done 的父 job 又搬回去。這也讓整個推導
+        # 是冪等的 -- 第二個子 job 失敗時不會再串聯取消一次。
+        if parent.status in _TERMINAL_STATUSES:
+            return False, None
 
         children = (
             session.query(db.Job)
@@ -651,7 +662,10 @@ def refresh_parent(
             parent.status = "cancelled"
             parent.error = cancelled.error
             parent.finished_at = parent.finished_at or _utcnow()
-            cascade_reason = _SIBLING_CANCELLED_REASON
+            # 兄弟收到的理由就是這一次取消的理由（admin 的「cancelled by
+            # admin」、面板的「interrupted from panel」…），不是一句沒有資訊的
+            # 「sibling cancelled」-- 面板上每個子 job 顯示的都該是同一個原因。
+            cascade_reason = cancelled.error or _SIBLING_CANCELLED_REASON
             cascade_cancel_ids = [c.id for c in children if c.status in _LIVE_STATUSES]
         elif all(s == "done" for s in statuses):
             parent.status = "done"
@@ -739,6 +753,40 @@ def child_status_changed(
         return None
     _changed, status = refresh_parent(parent_id, cancelled_owners=cancelled_owners)
     return status
+
+
+def refresh_parent_progress(job_id: str) -> Optional[float]:
+    """§3.4：子 job 回報進度之後，把父 job 的 `progress` 更新成子 job 的平均。
+
+    和 `refresh_parent` 分開的原因是呼叫頻率：進度來自心跳（每個子 job 每 30
+    秒一次，跑的時候更密），而狀態推導要跑串聯取消、要寫五六個欄位。這裡只做
+    一次子 job 查詢加一次 UPDATE，狀態一個字都不碰。
+
+    不是子 job、父 job 已經不是父 job（`split_count == 0`）、或父 job 已經終止
+    （遲到的心跳不該把 progress 從 1.0 拉回去）就什麼都不做並回 None；否則回
+    傳父 job 的新 progress。
+
+    刻意**不**發面板事件 -- 那是 Task 7 的事。
+    """
+    with db.get_session() as session:
+        job = session.get(db.Job, job_id)
+        parent_id = job.parent_id if job is not None else None
+        if not parent_id:
+            return None
+
+        parent = session.get(db.Job, parent_id)
+        if parent is None or parent.split_count <= 0 or parent.status in _TERMINAL_STATUSES:
+            return None
+
+        children = session.query(db.Job).filter(db.Job.parent_id == parent_id).all()
+        if not children:
+            return None
+
+        progress = sum(c.progress or 0.0 for c in children) / len(children)
+        if parent.progress != progress:
+            parent.progress = progress
+            session.commit()
+        return progress
 
 
 def parent_outputs(parent) -> list[tuple[str, str]]:

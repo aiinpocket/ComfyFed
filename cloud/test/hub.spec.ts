@@ -3,6 +3,7 @@ import { env, runDurableObjectAlarm, runInDurableObject } from "cloudflare:test"
 import { toSqliteTimestamp, getJobById, getReceiptsForJob, getWorkerById } from "../src/db/queries";
 import { signHex } from "../src/lib/ed25519";
 import { connectAgent, expectNoMessage, hub, nextMessage, openAgentWs, waitForClose } from "./helpers/ws";
+import * as split from "../src/core/split";
 import golden from "./fixtures/golden.json";
 
 // Ports the core assertions of tests/server/test_agent_ws.py against the
@@ -788,5 +789,232 @@ describe("internal kick_worker", () => {
     const job = await getJobById(db(), jobId);
     expect(job!.status).toBe("queued");
     ws.close();
+  });
+});
+
+
+// ---------------------------------------------------------------------------
+// Phase 3.3 §3.4/§3.6: split families through the real Hub DO
+//
+// Ports tests/server/test_agent_ws.py's split-cancel/derivation block. The
+// three derivation hook sites live in hub.ts's own handlers (heartbeat ->
+// running, job_done, job_failed), NOT in dispatch.ts's mark* -- hub writes
+// through `queries` directly -- so they can only be covered from here.
+
+describe("split families (§3.4/§3.6)", () => {
+  /** Parent + one running child per worker. Written straight to D1 rather
+   * than produced by a real tick: this block pins what happens to an
+   * ALREADY-split family, and the splitting itself is covered by
+   * split.spec.ts / dispatch.spec.ts. */
+  async function makeSplitFamily(workerIds: (string | null)[]): Promise<{ parentId: string; childIds: string[] }> {
+    const parentId = uniqueId("parent");
+    await db()
+      .prepare(
+        `INSERT INTO jobs (id, workflow_json, status, created_at, input_assets, split_count, split_plan)
+         VALUES (?, '{}', 'running', ?, '[]', ?, ?)`
+      )
+      .bind(
+        parentId,
+        toSqliteTimestamp(new Date()),
+        workerIds.length,
+        JSON.stringify({ source_node_id: "1", batch_size: 2 })
+      )
+      .run();
+
+    const childIds: string[] = [];
+    for (let index = 0; index < workerIds.length; index++) {
+      const childId = `${parentId}-c${index}`;
+      childIds.push(childId);
+      await db()
+        .prepare(
+          `INSERT INTO jobs (id, workflow_json, status, worker_id, created_at, input_assets, parent_id, split_index)
+           VALUES (?, '{}', ?, ?, ?, '[]', ?, ?)`
+        )
+        .bind(
+          childId,
+          workerIds[index] ? "running" : "queued",
+          workerIds[index] ?? null,
+          toSqliteTimestamp(new Date()),
+          parentId,
+          index
+        )
+        .run();
+    }
+    return { parentId, childIds };
+  }
+
+  async function cancelViaHub(jobId: string, reason = "cancelled by admin"): Promise<any> {
+    const res = await hub().fetch("http://hub.internal/internal/cancel", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ job_id: jobId, reason }),
+    });
+    expect(res.ok).toBe(true);
+    return res.json();
+  }
+
+  it("cancelling the parent tells EVERY child's worker", async () => {
+    // Review fix 1: the sibling cascade inside the first child's cancel used
+    // to swallow the other owners, so only one of k workers ever heard about
+    // it and the rest rendered to completion for nothing.
+    const [kpA, kpB] = [KEYPAIRS[0]!, KEYPAIRS[1]!];
+    const workerA = await makeWorker({ pubkeyHex: kpA.pubkey_hex });
+    const workerB = await makeWorker({ pubkeyHex: kpB.pubkey_hex });
+    const { parentId, childIds } = await makeSplitFamily([workerA, workerB]);
+
+    const wsA = await connectAgent(workerA, kpA.seed_hex);
+    const wsB = await connectAgent(workerB, kpB.seed_hex);
+    // protocol 2 -> job_cancelled is deliverable at all (a protocol-1
+    // connection never receives it; see "never sends job_cancelled to a
+    // protocol-1 connection"). Draws no reply frame to drain.
+    wsA.send(JSON.stringify({ type: "hello", protocol: 2 }));
+    wsB.send(JSON.stringify({ type: "hello", protocol: 2 }));
+    // The hello is processed by the DO asynchronously after the frame lands,
+    // and the cancel below arrives over a SEPARATE (HTTP) path -- so settle
+    // first, or the push can be suppressed as protocol-1.
+    await expectNoMessage(wsA, 150);
+    await expectNoMessage(wsB, 150);
+    try {
+      // Listeners attached BEFORE the trigger (see collectMessages' docstring).
+      const gotA = nextMessage(wsA);
+      const gotB = nextMessage(wsB);
+
+      await cancelViaHub(parentId);
+
+      expect(await gotA).toEqual({ type: "job_cancelled", job_id: childIds[0] });
+      expect(await gotB).toEqual({ type: "job_cancelled", job_id: childIds[1] });
+    } finally {
+      wsA.close();
+      wsB.close();
+    }
+
+    const parent = (await getJobById(db(), parentId))!;
+    expect(parent.status).toBe("cancelled");
+    for (const [index, childId] of childIds.entries()) {
+      const child = (await getJobById(db(), childId))!;
+      expect(child.status).toBe("cancelled");
+      // 串聯掉的兄弟帶的是這次取消的理由，不是「sibling cancelled」。
+      expect(child.error).toBe("cancelled by admin");
+      expect(child.workerId).toBeNull();
+      expect(child.lastWorkerId).toBe(index === 0 ? workerA : workerB);
+    }
+  });
+
+  it("a busy heartbeat on a child moves the parent to running", async () => {
+    const kp = KEYPAIRS[0]!;
+    const workerId = await makeWorker({ pubkeyHex: kp.pubkey_hex });
+    const { parentId, childIds } = await makeSplitFamily([workerId, null]);
+    // The child must be `assigned` for the running transition to fire.
+    await db().prepare("UPDATE jobs SET status = 'assigned' WHERE id = ?").bind(childIds[0]).run();
+    await db().prepare("UPDATE jobs SET status = 'assigned' WHERE id = ?").bind(parentId).run();
+
+    const ws = await connectAgent(workerId, kp.seed_hex);
+    try {
+      ws.send(
+        JSON.stringify({ type: "heartbeat", state: "busy", progress: 0.0, job_id: childIds[0], dynamic: {} })
+      );
+      await expectNoMessage(ws, 200);
+    } finally {
+      ws.close();
+    }
+
+    expect((await getJobById(db(), childIds[0]!))!.status).toBe("running");
+    expect((await getJobById(db(), parentId))!.status).toBe("running");
+  });
+
+  it("the parent turns done only once every child is done, and collects their outputs", async () => {
+    const [kpA, kpB] = [KEYPAIRS[0]!, KEYPAIRS[1]!];
+    const workerA = await makeWorker({ pubkeyHex: kpA.pubkey_hex });
+    const workerB = await makeWorker({ pubkeyHex: kpB.pubkey_hex });
+    const { parentId, childIds } = await makeSplitFamily([workerA, workerB]);
+
+    const wsA = await connectAgent(workerA, kpA.seed_hex);
+    try {
+      const receiptA = nextMessage(wsA);
+      wsA.send(JSON.stringify({ type: "job_done", job_id: childIds[0], result_files: ["a.png"] }));
+      // job_done mints and pushes a completed receipt -- drain it, which also
+      // synchronises on the handler having finished.
+      expect((await receiptA).type).toBe("receipt");
+    } finally {
+      wsA.close();
+    }
+    expect((await getJobById(db(), parentId))!.status).toBe("running");
+
+    const wsB = await connectAgent(workerB, kpB.seed_hex);
+    try {
+      const receiptB = nextMessage(wsB);
+      wsB.send(JSON.stringify({ type: "job_done", job_id: childIds[1], result_files: ["b.png"] }));
+      expect((await receiptB).type).toBe("receipt");
+    } finally {
+      wsB.close();
+    }
+
+    const parent = (await getJobById(db(), parentId))!;
+    expect(parent.status).toBe("done");
+    expect(parent.progress).toBe(1);
+    // 父 job 自己沒有 result_files；輸出由 parentOutputs 依 split_index 串起來。
+    expect(parent.resultFiles).toEqual([]);
+    expect(await split.parentOutputs(db(), parent)).toEqual([
+      [childIds[0], "a.png"],
+      [childIds[1], "b.png"],
+    ]);
+  });
+
+  it("a failed child fails the parent, cancels the sibling and tells its worker", async () => {
+    const [kpA, kpB] = [KEYPAIRS[0]!, KEYPAIRS[1]!];
+    const workerA = await makeWorker({ pubkeyHex: kpA.pubkey_hex });
+    const workerB = await makeWorker({ pubkeyHex: kpB.pubkey_hex });
+    const { parentId, childIds } = await makeSplitFamily([workerA, workerB]);
+
+    const wsB = await connectAgent(workerB, kpB.seed_hex);
+    const wsA = await connectAgent(workerA, kpA.seed_hex);
+    wsA.send(JSON.stringify({ type: "hello", protocol: 2 }));
+    wsB.send(JSON.stringify({ type: "hello", protocol: 2 }));
+    try {
+      const gotB = nextMessage(wsB);
+      wsA.send(JSON.stringify({ type: "job_failed", job_id: childIds[0], error: "CUDA OOM" }));
+      expect(await gotB).toEqual({ type: "job_cancelled", job_id: childIds[1] });
+    } finally {
+      wsA.close();
+      wsB.close();
+    }
+
+    const parent = (await getJobById(db(), parentId))!;
+    expect(parent.status).toBe("failed");
+    expect(parent.error).toBe("子任務 1/2：CUDA OOM");
+    const sibling = (await getJobById(db(), childIds[1]!))!;
+    expect(sibling.status).toBe("cancelled");
+    expect(sibling.error).toBe("sibling failed");
+    expect(sibling.workerId).toBeNull();
+    expect(sibling.lastWorkerId).toBe(workerB);
+  });
+
+  it("a child's heartbeat progress drives the parent's progress (§3.4 mean)", async () => {
+    const [kpA, kpB] = [KEYPAIRS[0]!, KEYPAIRS[1]!];
+    const workerA = await makeWorker({ pubkeyHex: kpA.pubkey_hex });
+    const workerB = await makeWorker({ pubkeyHex: kpB.pubkey_hex });
+    const { parentId, childIds } = await makeSplitFamily([workerA, workerB]);
+
+    const wsA = await connectAgent(workerA, kpA.seed_hex);
+    try {
+      wsA.send(
+        JSON.stringify({ type: "heartbeat", state: "busy", progress: 0.2, job_id: childIds[0], dynamic: {} })
+      );
+      await expectNoMessage(wsA, 200);
+    } finally {
+      wsA.close();
+    }
+
+    const wsB = await connectAgent(workerB, kpB.seed_hex);
+    try {
+      wsB.send(
+        JSON.stringify({ type: "heartbeat", state: "busy", progress: 0.6, job_id: childIds[1], dynamic: {} })
+      );
+      await expectNoMessage(wsB, 200);
+    } finally {
+      wsB.close();
+    }
+
+    expect((await getJobById(db(), parentId))!.progress).toBeCloseTo(0.4, 10);
   });
 });
