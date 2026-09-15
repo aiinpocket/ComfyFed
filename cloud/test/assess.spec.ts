@@ -74,6 +74,8 @@ function makeWorker(id: string, overrides: Partial<Worker> = {}): Worker {
     autoFetch: false,
     deleted: false,
     peerUrl: null,
+    speedIndex: 1.0,
+    warmModels: [],
     ...overrides,
   };
 }
@@ -399,5 +401,70 @@ describe("fleetWideGaps", () => {
     const unknown = makeWorker("w1", { nodeClasses: [] });
     const [, missingNodes] = fleetWideGaps(needs([], ["SomeNode"]), [unknown]);
     expect(missingNodes.size).toBe(0);
+  });
+});
+
+import { signature, extract } from "../src/core/assess";
+import schedulerCases from "./fixtures/scheduler_cases.json";
+
+async function sig(workflow: Record<string, unknown>): Promise<string> {
+  return signature(workflow, extract(workflow));
+}
+
+describe("signature (Phase 3.3 §2.1)", () => {
+  it("is 16 hex chars", async () => {
+    const s = await sig({ "1": { class_type: "KSampler", inputs: { steps: 20 } } });
+    expect(s).toMatch(/^[0-9a-f]{16}$/);
+  });
+
+  it("ignores prompt text and seed", async () => {
+    const a = {
+      "1": { class_type: "KSampler", inputs: { steps: 20, seed: 1 } },
+      "2": { class_type: "CLIPTextEncode", inputs: { text: "a cat" } },
+    };
+    const b = {
+      "1": { class_type: "KSampler", inputs: { steps: 20, seed: 999999 } },
+      "2": { class_type: "CLIPTextEncode", inputs: { text: "a totally different prompt" } },
+    };
+    expect(await sig(a)).toBe(await sig(b));
+  });
+
+  it("changes with steps, resolution and model", async () => {
+    const base = {
+      "1": { class_type: "KSampler", inputs: { steps: 20 } },
+      "2": { class_type: "EmptyLatentImage", inputs: { width: 512, height: 512, batch_size: 1 } },
+      "3": { class_type: "CheckpointLoaderSimple", inputs: { ckpt_name: "a.safetensors" } },
+    };
+    const clone = () => JSON.parse(JSON.stringify(base));
+    const moreSteps = clone();
+    moreSteps["1"].inputs.steps = 24;
+    const bigger = clone();
+    bigger["2"].inputs.width = 1024;
+    const otherModel = clone();
+    otherModel["3"].inputs.ckpt_name = "b.safetensors";
+
+    const baseSig = await sig(base);
+    expect(await sig(moreSteps)).not.toBe(baseSig);
+    expect(await sig(bigger)).not.toBe(baseSig);
+    expect(await sig(otherModel)).not.toBe(baseSig);
+  });
+
+  it("treats linked inputs as 0/1, same as a missing literal", async () => {
+    const linked = {
+      "1": { class_type: "KSampler", inputs: { steps: ["7", 0] } },
+      "2": { class_type: "EmptyLatentImage", inputs: { width: 512, height: 512, batch_size: ["7", 1] } },
+    };
+    const literalZero = {
+      "1": { class_type: "KSampler", inputs: {} },
+      "2": { class_type: "EmptyLatentImage", inputs: { width: 512, height: 512 } },
+    };
+    expect(await sig(linked)).toBe(await sig(literalZero));
+  });
+
+  // 兩棧 parity：同一組 workflow 必須得到同一個簽章字串。
+  it("matches the shared fixture's expected signatures byte for byte", async () => {
+    for (const c of schedulerCases.signature_cases) {
+      expect(await sig(c.workflow as Record<string, unknown>), c.name).toBe(c.expected);
+    }
   });
 });

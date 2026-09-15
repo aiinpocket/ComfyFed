@@ -187,6 +187,17 @@ describe("POST /api/jobs", () => {
 
   });
 
+  it("stores a signature on the inserted job row", async () => {
+    const { cookie, csrf } = await adminSession();
+    const workflow = { "1": { class_type: "KSampler", inputs: { steps: 20 } } };
+    const form = new FormData();
+    form.set("workflow_json", JSON.stringify(workflow));
+    const res = await raw("/api/jobs", { method: "POST", body: form, cookie, headers: { "X-CSRF": csrf } });
+    expect(res.status).toBe(200);
+    const row = await db().prepare("SELECT signature FROM jobs WHERE id = ?").bind(res.body.job_id).first<{ signature: string | null }>();
+    expect(row?.signature).toMatch(/^[0-9a-f]{16}$/);
+  });
+
   it("wakes the Hub DO's /internal/wake endpoint (trivial handler)", async () => {
     const stub = hub();
     const res = await stub.fetch("http://hub.internal/internal/wake", { method: "POST" });

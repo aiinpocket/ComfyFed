@@ -233,6 +233,10 @@ export interface Worker {
    * not refreshed on heartbeat; cleared on the stale/offline transition
    * (`markWorkerOffline`) -- see `db.Worker.peer_url`'s Python docstring. */
   peerUrl: string | null;
+  /** Phase 3.3 §2.2: 相對全隊的速度係數，1.0 = 平均、2.0 = 兩倍快。 */
+  speedIndex: number;
+  /** Phase 3.3 §2.2: 最近一次被指派的 job 的 required_models；claim 時寫入。 */
+  warmModels: string[];
 }
 
 interface WorkerRow {
@@ -254,6 +258,8 @@ interface WorkerRow {
   auto_fetch: number;
   deleted: number;
   peer_url: string | null;
+  speed_index: number;
+  warm_models: string;
 }
 
 function rowToWorker(row: WorkerRow): Worker {
@@ -276,6 +282,8 @@ function rowToWorker(row: WorkerRow): Worker {
     autoFetch: row.auto_fetch !== 0,
     deleted: row.deleted !== 0,
     peerUrl: row.peer_url,
+    speedIndex: typeof row.speed_index === "number" ? row.speed_index : 1.0,
+    warmModels: safeParse(row.warm_models, []),
   };
 }
 
@@ -553,6 +561,21 @@ export interface Job {
    * possible, but a brand-new install with no such setting leaves it null),
    * or for a row a test inserts directly without setting it. */
   userId: string | null;
+  /** Phase 3.3 §2.1: `assess.signature` 的工作指紋，送件時寫入；`null` 是
+   * 舊資料列（`stats.backfillIfNeeded` 重放收據時會補寫回去）。 */
+  signature: string | null;
+  /** Phase 3.3 §2.2: claim 當下的選擇依據（predicted_seconds / basis /
+   * load_seconds / fetch_seconds / candidates），供 console 顯示。 */
+  dispatchInfo: Record<string, unknown>;
+  /** Phase 3.3 §3.4: 被拆的父 job id（子 job 才有）。 */
+  parentId: string | null;
+  splitIndex: number | null;
+  /** 父 job 的子數；0 = 不是父 job，一律當普通 job 處理。 */
+  splitCount: number;
+  /** `{"source_node_id": string, "batch_size": number}` 的 JSON 原文，
+   * `null` = 不可拆。刻意保留字串而不是解析後的物件：只有 split.ts 需要
+   * 它，rowToJob 不該替每一列付這個解析成本。 */
+  splitPlan: string | null;
 }
 
 interface JobRow {
@@ -576,6 +599,12 @@ interface JobRow {
   origin: string;
   panel_hidden: number;
   user_id: string | null;
+  signature: string | null;
+  dispatch_info: string;
+  parent_id: string | null;
+  split_index: number | null;
+  split_count: number;
+  split_plan: string | null;
 }
 
 function rowToJob(row: JobRow): Job {
@@ -600,6 +629,12 @@ function rowToJob(row: JobRow): Job {
     origin: row.origin,
     panelHidden: row.panel_hidden !== 0,
     userId: row.user_id,
+    signature: row.signature,
+    dispatchInfo: safeParse(row.dispatch_info, {}),
+    parentId: row.parent_id,
+    splitIndex: row.split_index,
+    splitCount: row.split_count ?? 0,
+    splitPlan: row.split_plan,
   };
 }
 
@@ -623,6 +658,8 @@ export interface NewJob {
    * today; kept optional so a future non-session caller doesn't need a fake
    * value). */
   userId?: string | null;
+  /** Phase 3.3 §2.1: 送件時算好的工作指紋。 */
+  signature?: string | null;
 }
 
 /** Inserts a freshly-assessed queued job row -- mirrors `jobs.create_job`'s
@@ -633,8 +670,8 @@ export async function insertJob(db: D1Database, job: NewJob): Promise<void> {
   await db
     .prepare(
       `INSERT INTO jobs (id, workflow_json, requirements, required_nodes, required_models, est_vram_gb,
-                          input_assets, origin, created_at, user_id)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+                          input_assets, origin, created_at, user_id, signature)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
     )
     .bind(
       job.id,
@@ -646,7 +683,8 @@ export async function insertJob(db: D1Database, job: NewJob): Promise<void> {
       JSON.stringify(job.inputAssets),
       job.origin,
       job.createdAt,
-      job.userId ?? null
+      job.userId ?? null,
+      job.signature ?? null
     )
     .run();
 }

@@ -50,7 +50,7 @@ import type { Env } from "../env";
 import * as queries from "../db/queries";
 import type { Job } from "../db/queries";
 import { toSqliteTimestamp, sqliteTimestampToEpochMs, resolvePlatformSeed } from "../db/queries";
-import { extract, estimateVram, modelNodes, fleetWideGaps, partitionFleetFetchable, type FetchableModels } from "../core/assess";
+import { extract, estimateVram, modelNodes, signature, fleetWideGaps, partitionFleetFetchable, type FetchableModels } from "../core/assess";
 import { peerOnlyNames } from "../core/model_manifest";
 import { jobOutputs } from "../core/outputs";
 import * as modelGuide from "../core/model_guide";
@@ -560,6 +560,7 @@ app.post("/comfy/api/prompt", async (c) => {
     origin: "panel",
     createdAt: toSqliteTimestamp(new Date()),
     userId: user.uid,
+    signature: await signature(promptObj, needs),
   });
 
   for (const [name, obj] of resolved) {

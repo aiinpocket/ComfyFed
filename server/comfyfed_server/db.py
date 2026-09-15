@@ -112,6 +112,14 @@ class Worker(Base):
     # whenever the worker is marked offline (see dispatch.requeue_stale) so
     # a stale endpoint is never handed out as a seeder.
     peer_url: Mapped[Optional[str]] = mapped_column(String, nullable=True)
+    # Phase 3.3 §2.2: 相對全隊的速度係數，1.0 = 平均、2.0 = 兩倍快。
+    # 由 stats.record_completion 在每次有效 job_done 後更新，夾在
+    # [SPEED_MIN, SPEED_MAX]。
+    speed_index: Mapped[float] = mapped_column(Float, default=1.0, server_default="1.0")
+    # Phase 3.3 §2.2: 這台 worker 最近一次被指派的 job 的 required_models
+    # （JSON array）。在 claim 成功時寫入，不等 job 完成 -- 模型載入發生在
+    # 開始執行時，熱快取親和要在那個時間點就成立。
+    warm_models: Mapped[str] = mapped_column(String, default="[]", server_default="[]")
 
 
 class ModelHash(Base):
@@ -198,6 +206,22 @@ class Job(Base):
     # actually deleted (only disabled), so the column stays populated for any
     # job created from here on.
     user_id: Mapped[Optional[str]] = mapped_column(String, nullable=True)
+    # Phase 3.3 §2.1: `assess.signature` 算出的工作指紋，送件時寫入。
+    # NULL = 舊資料列（migration 不回填；回填由 stats.backfill_if_needed 在
+    # 重放收據時順手補上，見 §2.6）。
+    signature: Mapped[Optional[str]] = mapped_column(String, nullable=True)
+    # Phase 3.3 §2.2: claim 當下的選擇依據，供 console 顯示。
+    # {"predicted_seconds": float, "basis": str, "load_seconds": float,
+    #  "fetch_seconds": float, "candidates": int}
+    dispatch_info: Mapped[str] = mapped_column(String, default="{}", server_default="{}")
+    # Phase 3.3 §3.4: 批次拆分。`parent_id` 指向被拆的父 job（子 job 才有）；
+    # `split_count` 是父 job 的子數（0 = 不是父 job，一律當普通 job 處理，
+    # 包含重試後被重設為 0 的父 job）；`split_plan` 是送件時算出的
+    # `{"source_node_id": str, "batch_size": int}`，NULL = 不可拆。
+    parent_id: Mapped[Optional[str]] = mapped_column(String, nullable=True)
+    split_index: Mapped[Optional[int]] = mapped_column(Integer, nullable=True)
+    split_count: Mapped[int] = mapped_column(Integer, default=0, server_default="0")
+    split_plan: Mapped[Optional[str]] = mapped_column(String, nullable=True)
 
 
 class Receipt(Base):
@@ -235,6 +259,22 @@ class Receipt(Base):
     # stays the payout/usage-report metric; this is purely the contributions
     # report's separate "P2P upload volume" total.
     bytes: Mapped[Optional[int]] = mapped_column(Integer, nullable=True)
+
+
+class WorkerJobStats(Base):
+    """Phase 3.3 §2.2: 每個 (worker, signature) 的執行時間指數移動平均。
+
+    只在 `job_done` 且 `exec_seconds` 有效時更新（failed/cancelled 不更新）
+    -- 見 `stats.record_completion`。
+    """
+
+    __tablename__ = "worker_job_stats"
+
+    worker_id: Mapped[str] = mapped_column(String, primary_key=True)
+    signature: Mapped[str] = mapped_column(String, primary_key=True)
+    ewma_seconds: Mapped[float] = mapped_column(Float)
+    samples: Mapped[int] = mapped_column(Integer, default=0, server_default="0")
+    updated_at: Mapped[datetime] = mapped_column(DateTime, default=_utcnow)
 
 
 class LoginAttempt(Base):

@@ -14,6 +14,7 @@ Never compare them with `==` -- every lookup here goes through
 
 from __future__ import annotations
 
+import hashlib
 import json
 from dataclasses import dataclass, field
 
@@ -706,3 +707,65 @@ def fleet_wide_gaps(needs: JobNeeds, all_workers: list) -> tuple[set[str], set[s
         }
 
     return missing_models, missing_nodes
+
+
+# Phase 3.3 §2.1: 工作簽章。
+# `steps`/`mpx`/`batch` 只讀字面 int，連到別的節點的輸入（ComfyUI API 格式裡
+# 是 ["<node_id>", <slot>] 這種 list）一律視為 0/1 -- 簽章要能穩定分群「同一
+# 種工作」，不能因為某個值是動態接線就整組崩掉。
+_STEP_NODE_CLASSES = ("KSampler", "KSamplerAdvanced", "BasicScheduler")
+_LATENT_SIZE_NODE_CLASSES = ("EmptyLatentImage", "EmptySD3LatentImage")
+_MPX_UNIT = 262144  # 0.25 MPx 級距
+
+
+def _literal_int(inputs: dict, field: str) -> int | None:
+    value = inputs.get(field)
+    if isinstance(value, bool) or not isinstance(value, int):
+        return None
+    return value
+
+
+def signature(workflow: dict, needs: "JobNeeds") -> str:
+    """穩定的「這是哪一種工作」指紋：sha256 的前 16 個 hex 字。
+
+    同一張圖改 prompt 文字或 seed 不會改簽章；改解析度、步數、模型會改。
+    `needs` 由呼叫端的 `extract`/`needs_from_job` 提供，`models` 直接用
+    `sorted(needs.models)`，和 `jobs.required_models` 存的是同一組名字。
+    """
+    counts: dict[str, int] = {}
+    steps = 0
+    pixels = 0
+    batch = 0
+    has_batch_node = False
+
+    for _node_id, node in (workflow or {}).items():
+        if not isinstance(node, dict):
+            continue
+        class_type = node.get("class_type")
+        if not isinstance(class_type, str):
+            continue
+        counts[class_type] = counts.get(class_type, 0) + 1
+
+        inputs = node.get("inputs")
+        if not isinstance(inputs, dict):
+            continue
+
+        if class_type in _STEP_NODE_CLASSES:
+            steps += _literal_int(inputs, "steps") or 0
+
+        if class_type in _LATENT_SIZE_NODE_CLASSES:
+            has_batch_node = True
+            width = _literal_int(inputs, "width") or 0
+            height = _literal_int(inputs, "height") or 0
+            pixels += width * height
+            batch += _literal_int(inputs, "batch_size") or 0
+
+    payload = {
+        "nodes": sorted(counts.items()),
+        "models": sorted(needs.models),
+        "steps": steps,
+        "mpx": pixels // _MPX_UNIT,
+        "batch": batch if (has_batch_node and batch > 0) else 1,
+    }
+    canonical = json.dumps(payload, sort_keys=True, separators=(",", ":"), ensure_ascii=False)
+    return hashlib.sha256(canonical.encode("utf-8")).hexdigest()[:16]

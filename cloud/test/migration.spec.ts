@@ -26,6 +26,7 @@ describe("D1 migration 0001_initial", () => {
         "settings",
         "upload_tokens",
         "users",
+        "worker_job_stats",
         "workers",
       ].sort()
     );
@@ -248,5 +249,65 @@ describe("D1 migration 0007_p2p", () => {
         .run()
     ).rejects.toThrow();
     await db.prepare("DELETE FROM p2p_grants WHERE grant_id = 'g2'").run();
+  });
+});
+
+// Phase 3.3 Task 1 cloud parity.
+describe("D1 migration 0009_scheduler", () => {
+  it("adds the scheduler/split columns to jobs with the right defaults", async () => {
+    const db = (env as any).DB as D1Database;
+    const cols = await db.prepare("PRAGMA table_info(jobs)").all<{ name: string }>();
+    const names = new Set(cols.results.map((c) => c.name));
+    for (const col of ["signature", "dispatch_info", "parent_id", "split_index", "split_count", "split_plan"]) {
+      expect(names.has(col), `jobs.${col} missing`).toBe(true);
+    }
+
+    await db
+      .prepare("INSERT INTO jobs (id, workflow_json, created_at) VALUES ('job-0009', '{}', '2026-01-01 00:00:00.000000')")
+      .run();
+    const row = await db
+      .prepare("SELECT signature, dispatch_info, parent_id, split_index, split_count, split_plan FROM jobs WHERE id = 'job-0009'")
+      .first<any>();
+    expect(row.signature).toBeNull();
+    expect(row.dispatch_info).toBe("{}");
+    expect(row.parent_id).toBeNull();
+    expect(row.split_index).toBeNull();
+    expect(row.split_count).toBe(0);
+    expect(row.split_plan).toBeNull();
+    await db.prepare("DELETE FROM jobs WHERE id = 'job-0009'").run();
+  });
+
+  it("adds workers.speed_index and workers.warm_models with defaults", async () => {
+    const db = (env as any).DB as D1Database;
+    await db
+      .prepare("INSERT INTO workers (id, name, pubkey, created_at) VALUES ('w-0009', 'w', 'pk', '2026-01-01 00:00:00.000000')")
+      .run();
+    const row = await db
+      .prepare("SELECT speed_index, warm_models FROM workers WHERE id = 'w-0009'")
+      .first<{ speed_index: number; warm_models: string }>();
+    expect(row?.speed_index).toBe(1.0);
+    expect(row?.warm_models).toBe("[]");
+    await db.prepare("DELETE FROM workers WHERE id = 'w-0009'").run();
+  });
+
+  it("creates worker_job_stats keyed by (worker_id, signature)", async () => {
+    const db = (env as any).DB as D1Database;
+    const cols = await db.prepare("PRAGMA table_info(worker_job_stats)").all<{ name: string; pk: number }>();
+    const byName = new Map(cols.results.map((c) => [c.name, c]));
+    expect(byName.get("worker_id")!.pk).toBeGreaterThan(0);
+    expect(byName.get("signature")!.pk).toBeGreaterThan(0);
+    for (const col of ["ewma_seconds", "samples", "updated_at"]) {
+      expect(byName.has(col), `worker_job_stats.${col} missing`).toBe(true);
+    }
+
+    await db
+      .prepare("INSERT INTO worker_job_stats (worker_id, signature, ewma_seconds, samples, updated_at) VALUES ('w1', 's1', 10.0, 1, '2026-01-01 00:00:00.000000')")
+      .run();
+    await expect(
+      db
+        .prepare("INSERT INTO worker_job_stats (worker_id, signature, ewma_seconds, samples, updated_at) VALUES ('w1', 's1', 20.0, 2, '2026-01-01 00:00:00.000000')")
+        .run()
+    ).rejects.toThrow();
+    await db.prepare("DELETE FROM worker_job_stats").run();
   });
 });

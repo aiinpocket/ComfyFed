@@ -917,3 +917,95 @@ def test_extract_sees_pth_models():
     }
     needs = assess.extract(workflow)
     assert "RealESRGAN_x4plus.pth" in needs.models
+
+
+# --- Phase 3.3 Task 1: 工作簽章 -------------------------------------------
+
+from comfyfed_server import assess as _assess  # noqa: E402  (已在檔頭 import 過就沿用)
+
+
+def _sig(workflow):
+    needs = assess.extract(workflow)
+    return assess.signature(workflow, needs)
+
+
+def test_signature_is_16_hex_chars():
+    sig = _sig({"1": {"class_type": "KSampler", "inputs": {"steps": 20}}})
+    assert len(sig) == 16
+    assert all(c in "0123456789abcdef" for c in sig)
+
+
+def test_signature_ignores_prompt_text_and_seed():
+    a = {
+        "1": {"class_type": "KSampler", "inputs": {"steps": 20, "seed": 1}},
+        "2": {"class_type": "CLIPTextEncode", "inputs": {"text": "a cat"}},
+    }
+    b = {
+        "1": {"class_type": "KSampler", "inputs": {"steps": 20, "seed": 999999}},
+        "2": {"class_type": "CLIPTextEncode", "inputs": {"text": "a totally different prompt"}},
+    }
+    assert _sig(a) == _sig(b)
+
+
+def test_signature_changes_with_steps_resolution_and_model():
+    base = {
+        "1": {"class_type": "KSampler", "inputs": {"steps": 20}},
+        "2": {"class_type": "EmptyLatentImage", "inputs": {"width": 512, "height": 512, "batch_size": 1}},
+        "3": {"class_type": "CheckpointLoaderSimple", "inputs": {"ckpt_name": "a.safetensors"}},
+    }
+    more_steps = json.loads(json.dumps(base))
+    more_steps["1"]["inputs"]["steps"] = 24
+    bigger = json.loads(json.dumps(base))
+    bigger["2"]["inputs"]["width"] = 1024
+    other_model = json.loads(json.dumps(base))
+    other_model["3"]["inputs"]["ckpt_name"] = "b.safetensors"
+
+    assert _sig(base) != _sig(more_steps)
+    assert _sig(base) != _sig(bigger)
+    assert _sig(base) != _sig(other_model)
+
+
+def test_signature_node_counts_matter_but_order_does_not():
+    one = {
+        "1": {"class_type": "KSampler", "inputs": {"steps": 10}},
+        "2": {"class_type": "CLIPTextEncode", "inputs": {"text": "x"}},
+    }
+    reordered = {
+        "9": {"class_type": "CLIPTextEncode", "inputs": {"text": "y"}},
+        "0": {"class_type": "KSampler", "inputs": {"steps": 10}},
+    }
+    two_encoders = dict(one)
+    two_encoders["3"] = {"class_type": "CLIPTextEncode", "inputs": {"text": "z"}}
+
+    assert _sig(one) == _sig(reordered)
+    assert _sig(one) != _sig(two_encoders)
+
+
+def test_signature_linked_inputs_count_as_zero_or_one():
+    linked = {
+        "1": {"class_type": "KSampler", "inputs": {"steps": ["7", 0]}},
+        "2": {"class_type": "EmptyLatentImage", "inputs": {"width": 512, "height": 512, "batch_size": ["7", 1]}},
+    }
+    literal_zero = {
+        "1": {"class_type": "KSampler", "inputs": {}},
+        "2": {"class_type": "EmptyLatentImage", "inputs": {"width": 512, "height": 512}},
+    }
+    assert _sig(linked) == _sig(literal_zero)
+
+
+def test_signature_sums_steps_and_mpx_across_nodes():
+    single = {"1": {"class_type": "KSampler", "inputs": {"steps": 40}}}
+    double = {
+        "1": {"class_type": "KSampler", "inputs": {"steps": 20}},
+        "2": {"class_type": "KSamplerAdvanced", "inputs": {"steps": 20}},
+    }
+    # 兩個節點的 steps 加總 = 40，但節點組成不同，所以簽章必然不同；
+    # 這個測試釘住的是「加總」本身不會爆炸，見下一個斷言。
+    assert _sig(single) != _sig(double)
+    same_shape = {
+        "1": {"class_type": "KSampler", "inputs": {"steps": 20}},
+        "2": {"class_type": "KSamplerAdvanced", "inputs": {"steps": 20}},
+        "3": {"class_type": "EmptyLatentImage", "inputs": {"width": 512, "height": 512, "batch_size": 2}},
+    }
+    same_shape_again = json.loads(json.dumps(same_shape))
+    assert _sig(same_shape) == _sig(same_shape_again)

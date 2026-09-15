@@ -176,6 +176,8 @@ def create_job(
             input_assets=json.dumps(sorted(available)),
             origin=origin,
             user_id=user_id,
+            # Phase 3.3 §2.1: 送件時算一次，之後派工/統計都只讀這個欄位。
+            signature=assess.signature(workflow, needs),
         )
         session.add(job)
         session.commit()

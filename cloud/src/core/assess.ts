@@ -10,6 +10,7 @@
  */
 
 import type { Job, ModelInventoryEntry, Worker } from "../db/queries";
+import { bytesToHex } from "../lib/hex";
 
 // ---------------------------------------------------------------------------
 // Workflow extraction -- ports assess.py's `_MODEL_FIELD_NAMES` /
@@ -523,4 +524,67 @@ export function verdict(
     missingModels,
     warnings: [],
   };
+}
+
+// ---------------------------------------------------------------------------
+// Phase 3.3 §2.1: 工作簽章 -- Python parity source: assess.signature.
+
+const STEP_NODE_CLASSES = ["KSampler", "KSamplerAdvanced", "BasicScheduler"];
+const LATENT_SIZE_NODE_CLASSES = ["EmptyLatentImage", "EmptySD3LatentImage"];
+const MPX_UNIT = 262144; // 0.25 MPx 級距
+
+function literalInt(inputs: Record<string, unknown>, field: string): number | null {
+  const value = inputs[field];
+  if (typeof value !== "number" || !Number.isInteger(value)) return null;
+  return value;
+}
+
+/** 穩定的「這是哪一種工作」指紋：sha256 的前 16 個 hex 字。Ports
+ * `assess.signature` -- canonical JSON 的鍵順序、`nodes` 的 (class, count)
+ * 排序、`mpx` 的整數除法都必須和 Python 逐位元一致，否則兩棧的統計互相
+ * 讀不到對方的資料。 */
+export async function signature(workflow: Record<string, unknown>, needs: JobNeeds): Promise<string> {
+  const counts = new Map<string, number>();
+  let steps = 0;
+  let pixels = 0;
+  let batch = 0;
+  let hasBatchNode = false;
+
+  for (const node of Object.values(workflow ?? {})) {
+    if (typeof node !== "object" || node === null) continue;
+    const classType = (node as Record<string, unknown>).class_type;
+    if (typeof classType !== "string") continue;
+    counts.set(classType, (counts.get(classType) ?? 0) + 1);
+
+    const inputs = (node as Record<string, unknown>).inputs;
+    if (typeof inputs !== "object" || inputs === null) continue;
+    const inputRecord = inputs as Record<string, unknown>;
+
+    if (STEP_NODE_CLASSES.includes(classType)) {
+      steps += literalInt(inputRecord, "steps") ?? 0;
+    }
+    if (LATENT_SIZE_NODE_CLASSES.includes(classType)) {
+      hasBatchNode = true;
+      pixels += (literalInt(inputRecord, "width") ?? 0) * (literalInt(inputRecord, "height") ?? 0);
+      batch += literalInt(inputRecord, "batch_size") ?? 0;
+    }
+  }
+
+  // Python 的 `sorted(counts.items())` 是 (class_type, count) 的字典序；
+  // class_type 唯一，所以只比第一項就等價。
+  const nodes = [...counts.entries()].sort((a, b) => (a[0] < b[0] ? -1 : a[0] > b[0] ? 1 : 0));
+  const models = [...needs.models].sort();
+
+  // json.dumps(..., sort_keys=True, separators=(",", ":")) 的等價輸出：鍵序
+  // batch < models < mpx < nodes < steps（字典序），沒有多餘空白。
+  const canonical = JSON.stringify({
+    batch: hasBatchNode && batch > 0 ? batch : 1,
+    models,
+    mpx: Math.floor(pixels / MPX_UNIT),
+    nodes,
+    steps,
+  });
+
+  const digest = await crypto.subtle.digest("SHA-256", new TextEncoder().encode(canonical));
+  return bytesToHex(new Uint8Array(digest)).slice(0, 16);
 }

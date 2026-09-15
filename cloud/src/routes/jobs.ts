@@ -37,7 +37,7 @@ import type { Env } from "../env";
 import * as queries from "../db/queries";
 import { toSqliteTimestamp, sqliteTimestampToIsoformat } from "../db/queries";
 import type { Job, Receipt } from "../db/queries";
-import { extract, estimateVram, needsFromJob, verdict, fleetWideGaps, partitionFleetFetchable, type JobNeeds, type FetchableModels } from "../core/assess";
+import { extract, estimateVram, needsFromJob, signature, verdict, fleetWideGaps, partitionFleetFetchable, type JobNeeds, type FetchableModels } from "../core/assess";
 import { peerOnlyNames } from "../core/model_manifest";
 import { sanitizePathComponentOrThrow, artifactKey, jobInputKey } from "../lib/store";
 import { fileCapExceeded, readLimits, tooLargeMessage } from "../lib/limits";
@@ -342,6 +342,7 @@ app.post("/api/jobs", requireCsrfUser, async (c) => {
     origin: "console",
     createdAt: toSqliteTimestamp(new Date()),
     userId: user.uid,
+    signature: await signature(workflow, needs),
   });
 
   for (const [file, filename] of assetFiles.map((f, i) => [f, uploadedNames[i]!] as const)) {

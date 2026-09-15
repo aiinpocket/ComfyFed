@@ -6,7 +6,7 @@ from datetime import datetime, timedelta, timezone
 import pytest
 from fastapi.testclient import TestClient
 
-from comfyfed_server import agentws, app as app_module
+from comfyfed_server import agentws, app as app_module, assess
 from comfyfed_server import bootstrap, db, dispatch, jobs as jobs_module, model_manifest
 
 
@@ -86,6 +86,15 @@ def test_submit_job_creates_queued_job(client):
     listed = client.get("/api/jobs", headers={"X-CSRF": csrf}).json()
     job = next(j for j in listed if j["id"] == job_id)
     assert job["status"] == "queued"
+
+
+def test_create_job_stores_a_signature(client):
+    workflow = {"1": {"class_type": "KSampler", "inputs": {"steps": 20}}}
+    job_id = jobs_module.create_job(json.dumps(workflow), workflow)
+    with db.get_session() as session:
+        stored = session.get(db.Job, job_id).signature
+    assert isinstance(stored, str) and len(stored) == 16
+    assert stored == assess.signature(workflow, assess.extract(workflow))
 
 
 def test_create_job_stamps_the_given_origin(client):

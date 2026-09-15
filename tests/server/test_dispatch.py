@@ -224,6 +224,64 @@ def test_alembic_migration_e1f2a3b4c5d6_adds_p2p_columns(tmp_path):
     assert bytes_row == (None, 12345)
 
 
+def test_alembic_migration_a2b3c4d5e6f7_adds_scheduler_columns(tmp_path):
+    """從前一個 head（f1a2b3c4d5e6）升上來，新欄位與新表都要在，
+    而且既有資料列的預設值要正確。"""
+    db_path = str(tmp_path / "t.db")
+    cfg = Config()
+    cfg.set_main_option("script_location", db._alembic_dir())
+    cfg.set_main_option("sqlalchemy.url", f"sqlite+pysqlite:///{db_path}")
+
+    command.upgrade(cfg, "f1a2b3c4d5e6")
+
+    import sqlite3
+
+    conn = sqlite3.connect(db_path)
+    try:
+        conn.execute(
+            "INSERT INTO jobs (id, workflow_json, status, progress, created_at, "
+            "result_files, requirements, required_nodes, required_models, "
+            "input_assets, result_hashes, origin, panel_hidden) "
+            "VALUES ('old-job', '{}', 'done', 0, '2026-01-01 00:00:00', "
+            "'[]', '{}', '[]', '[]', '[]', '{}', 'console', 0)"
+        )
+        conn.execute(
+            "INSERT INTO workers (id, name, pubkey, status, disabled, deleted, created_at, "
+            "hardware, dynamic, backend, torch_version, node_classes, model_inventory, "
+            "object_info_hash, protocol, auto_fetch) "
+            "VALUES ('old-w', 'old-w', 'pk', 'offline', 0, 0, '2026-01-01 00:00:00', "
+            "'{}', '{}', '', '', '[]', '[]', '', 1, 0)"
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+    command.upgrade(cfg, "head")
+
+    conn = sqlite3.connect(db_path)
+    try:
+        job_cols = {row[1] for row in conn.execute("PRAGMA table_info(jobs)").fetchall()}
+        worker_cols = {row[1] for row in conn.execute("PRAGMA table_info(workers)").fetchall()}
+        stats_cols = {
+            row[1] for row in conn.execute("PRAGMA table_info(worker_job_stats)").fetchall()
+        }
+        row = conn.execute(
+            "SELECT signature, dispatch_info, parent_id, split_index, split_count, split_plan "
+            "FROM jobs WHERE id = 'old-job'"
+        ).fetchone()
+        worker_row = conn.execute(
+            "SELECT speed_index, warm_models FROM workers WHERE id = 'old-w'"
+        ).fetchone()
+    finally:
+        conn.close()
+
+    assert {"signature", "dispatch_info", "parent_id", "split_index", "split_count", "split_plan"} <= job_cols
+    assert {"speed_index", "warm_models"} <= worker_cols
+    assert {"worker_id", "signature", "ewma_seconds", "samples", "updated_at"} == stats_cols
+    assert row == (None, "{}", None, None, 0, None)
+    assert worker_row == (1.0, "[]")
+
+
 # --- Step 2: requeue_stale records last_worker_id ------------------------
 
 

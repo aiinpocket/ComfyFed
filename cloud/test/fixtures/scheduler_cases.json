@@ -1,0 +1,66 @@
+{
+  "signature_cases": [
+    {
+      "name": "flux 512 4-step batch 2",
+      "workflow": {
+        "1": {
+          "class_type": "UNETLoader",
+          "inputs": {
+            "unet_name": "flux1-dev.safetensors"
+          }
+        },
+        "2": {
+          "class_type": "CLIPTextEncode",
+          "inputs": {
+            "text": "wuxia swordsman"
+          }
+        },
+        "3": {
+          "class_type": "EmptyLatentImage",
+          "inputs": {
+            "width": 512,
+            "height": 512,
+            "batch_size": 2
+          }
+        },
+        "4": {
+          "class_type": "KSampler",
+          "inputs": {
+            "steps": 4,
+            "seed": 424242
+          }
+        },
+        "5": {
+          "class_type": "VAEDecode",
+          "inputs": {}
+        },
+        "6": {
+          "class_type": "SaveImage",
+          "inputs": {}
+        }
+      },
+      "expected": "32272a9931ef180e"
+    },
+    {
+      "name": "zero model stitch job",
+      "workflow": {
+        "1": {
+          "class_type": "LoadImage",
+          "inputs": {
+            "image": "input.png"
+          }
+        },
+        "2": {
+          "class_type": "SaveImage",
+          "inputs": {
+            "images": [
+              "1",
+              0
+            ]
+          }
+        }
+      },
+      "expected": "eba78a4f5b0f1ffc"
+    }
+  ]
+}
