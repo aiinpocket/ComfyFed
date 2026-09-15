@@ -62,7 +62,7 @@ Login is now **username + password** (not a single admin password). The first ac
 
 **What each role sees**:
 
-- **User**: only their own jobs and artifacts (Dashboard, Jobs, and Reports all scope to their own data); Settings is trimmed down to change-password and language; no Workers page, no visibility into anyone else's data.
+- **User**: only their own jobs and artifacts (Dashboard, Jobs, and Reports all scope to their own data); Settings is trimmed down to change-password and language; no visibility into anyone else's jobs. **The Workers page and workflow templates are open to every role** — workers are shared fleet infrastructure, so a user sees the whole fleet's status (online/offline, hardware, model counts), but the **issue-token / disable / delete** controls and their APIs stay admin-only.
 - **Admin**: sees everyone's jobs and stats in the console, plus the Workers, Users, and full Settings pages, and all three report tabs (contributions, per-user usage, payout estimation).
 - The embedded workflow editor (`/comfy`) is a **personal workspace for every role**: whether admin or user, the panel only shows jobs that person submitted through the panel — see the full picture on the console's Jobs page instead.
 
