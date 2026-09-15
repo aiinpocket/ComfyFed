@@ -4,8 +4,8 @@
  *
  * A worker whose heartbeat reports `paused` (manual pause via `comfyfed
  * pause`, or automatic idle detection) renders a distinct, non-pulsing
- * badge using the existing worker-status badge system, labelled 已暫停 /
- * Paused per the zh-TW-first i18n convention.
+ * badge using the existing worker-status badge system, labelled worker 繁忙 /
+ * Worker busy per the zh-TW-first i18n convention.
  */
 import '@testing-library/jest-dom/vitest';
 
@@ -35,24 +35,24 @@ describe('WorkerStatusBadge: paused status', () => {
     cleanup();
   });
 
-  it('renders 已暫停 for status "paused" in zh-TW', async () => {
+  it('renders worker 繁忙 for status "paused" in zh-TW', async () => {
     await i18n.changeLanguage('zh-TW');
     render(
       <MantineProvider theme={theme}>
         <WorkerStatusBadge status="paused" disabled={false} />
       </MantineProvider>,
     );
-    expect(await screen.findByText('已暫停')).toBeInTheDocument();
+    expect(await screen.findByText('worker 繁忙')).toBeInTheDocument();
   });
 
-  it('renders Paused for status "paused" in en', async () => {
+  it('renders Worker busy for status "paused" in en', async () => {
     await i18n.changeLanguage('en');
     render(
       <MantineProvider theme={theme}>
         <WorkerStatusBadge status="paused" disabled={false} />
       </MantineProvider>,
     );
-    expect(await screen.findByText('Paused')).toBeInTheDocument();
+    expect(await screen.findByText('Worker busy')).toBeInTheDocument();
   });
 
   it('paints paused slate, never the offline grey', async () => {

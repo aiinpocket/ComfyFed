@@ -61,7 +61,7 @@
     "online": "上線",
     "busy": "忙碌",
     "offline": "離線",
-    "paused": "已暫停",
+    "paused": "worker 繁忙",
     "disabled": "已停用"
   },
   "job_status": {

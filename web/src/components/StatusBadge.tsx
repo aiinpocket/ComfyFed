@@ -3,7 +3,7 @@ import { useTranslation } from 'react-i18next';
 
 /** The one worker-status colour map. Exported so every consumer (dashboard
  * row accents included) shows the same colour the badge does -- a paused
- * worker reading as offline grey next to its slate 已暫停 badge is exactly
+ * worker reading as offline grey next to its slate worker-繁忙 badge is exactly
  * the mismatch this export exists to prevent. */
 export const WORKER_COLORS: Record<string, MantineColor> = {
   online: 'teal',

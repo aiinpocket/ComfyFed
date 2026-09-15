@@ -61,7 +61,7 @@
     "online": "Online",
     "busy": "Busy",
     "offline": "Offline",
-    "paused": "Paused",
+    "paused": "Worker busy",
     "disabled": "Disabled"
   },
   "job_status": {
