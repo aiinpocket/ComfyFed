@@ -20,7 +20,7 @@ from fastapi import APIRouter, Cookie, Depends, Header, HTTPException, Response
 from itsdangerous import BadSignature, SignatureExpired, URLSafeTimedSerializer
 from pydantic import BaseModel
 
-from . import db, limits, panelws, security
+from . import db, limits, panelws, security, split
 
 _SESSION_SECRET_KEY = "session_secret"
 _LANG_KEY = "lang"
@@ -405,6 +405,11 @@ class SettingsBody(BaseModel):
     platform_url: Optional[str] = None
     lang: Optional[str] = None
     object_info_mode: Optional[str] = None
+    # Phase 3.3 §3.7: whether new submissions may be split into per-batch
+    # child jobs. Typed as a bool, so a non-boolean is pydantic's 422 (same
+    # as any other wrongly-typed field here); the cloud twin answers its own
+    # 400 `settings.bad_split_batches`.
+    split_batches: Optional[bool] = None
     # Accepted as `float` for both so a JSON `50.0` (what a number input may
     # serialise) is not a 422 before the route's own range check can answer
     # the bilingual 400 -- `upload_max_file_mb` is then narrowed to an int.
@@ -426,6 +431,10 @@ def _current_settings(db_session) -> dict:
         "object_info_mode": _get_setting(db_session, _OBJECT_INFO_MODE_KEY) or _DEFAULT_OBJECT_INFO_MODE,
         "upload_max_file_mb": upload_limits.max_file_mb,
         "upload_user_quota_gb": upload_limits.quota_gb,
+        # Default ON: anything but an explicit "0" (including a missing row)
+        # means splitting is allowed -- same reading `split.split_batches_enabled`
+        # applies on the dispatch side.
+        "split_batches": _get_setting(db_session, split.SPLIT_BATCHES_SETTING_KEY) != "0",
     }
 
 
@@ -486,6 +495,12 @@ def update_settings(
                 "object_info_mode 必須是 union 或 intersection 其中之一。",
             )
         updates[_OBJECT_INFO_MODE_KEY] = body.object_info_mode
+
+    if body.split_batches is not None:
+        # Phase 3.3 §3.7: turning this off does not touch children already
+        # created (they are independent queued jobs and run to completion) --
+        # it only stops NEW submissions from getting a split plan.
+        updates[split.SPLIT_BATCHES_SETTING_KEY] = "1" if body.split_batches else "0"
 
     # The two upload limits are validated STRICTLY here (an admin typing an
     # out-of-range number deserves to be told) even though every read of them

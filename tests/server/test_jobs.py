@@ -1271,3 +1271,146 @@ def test_retry_clears_the_split_plan_and_count(client):
     assert job.status == "queued"
     assert job.split_count == 0
     assert job.split_plan is None
+
+
+# --- Phase 3.3 §3.7: the console sees parents, and children only on request ---
+
+
+def _make_split_family():
+    """One parent plus two children, each child holding one billable receipt."""
+    with db.get_session() as session:
+        session.add(db.Job(id="p", workflow_json="{}", status="done", split_count=2, user_id="u1"))
+        for index, child_id in enumerate(("c0", "c1")):
+            session.add(
+                db.Job(
+                    id=child_id,
+                    workflow_json="{}",
+                    status="done",
+                    parent_id="p",
+                    split_index=index,
+                    worker_id=f"w{index}",
+                    progress=1.0,
+                    result_files=json.dumps([f"{child_id}.png"]),
+                    user_id="u1",
+                )
+            )
+            session.add(
+                db.Receipt(
+                    id=f"r{index}",
+                    job_id=child_id,
+                    worker_id=f"w{index}",
+                    gpu_seconds=10.0 * (index + 1),
+                    platform_sig="sig",
+                    kind="completed",
+                    billable=True,
+                )
+            )
+        session.commit()
+
+
+def test_list_jobs_hides_children_by_default(client):
+    _login(client)
+    _make_split_family()
+    rows = client.get("/api/jobs").json()
+    assert [r["id"] for r in rows] == ["p"]
+    assert rows[0]["split_count"] == 2
+
+
+def test_list_jobs_include_children_shows_everything(client):
+    _login(client)
+    _make_split_family()
+    rows = client.get("/api/jobs?include_children=1").json()
+    assert sorted(r["id"] for r in rows) == ["c0", "c1", "p"]
+    by_id = {r["id"]: r for r in rows}
+    assert by_id["c0"]["parent_id"] == "p"
+    assert by_id["c0"]["split_index"] == 0
+    assert by_id["p"]["parent_id"] is None
+
+
+def test_get_job_on_a_parent_returns_children_and_gpu_total(client):
+    _login(client)
+    _make_split_family()
+    body = client.get("/api/jobs/p").json()
+    assert body["receipt"] is None
+    assert body["split_count"] == 2
+    assert body["gpu_seconds_total"] == pytest.approx(30.0)
+    assert [c["split_index"] for c in body["children"]] == [0, 1]
+    assert body["children"][0] == {
+        "id": "c0",
+        "split_index": 0,
+        "status": "done",
+        "worker_id": "w0",
+        "progress": 1.0,
+        "gpu_seconds": 10.0,
+        "error": None,
+    }
+
+
+def test_get_job_on_a_parent_exposes_child_owned_outputs(client):
+    """§3.7: the console links a parent's file to the CHILD that holds it."""
+    _login(client)
+    _make_split_family()
+    body = client.get("/api/jobs/p").json()
+    assert body["outputs"] == [
+        {"job_id": "c0", "filename": "c0.png"},
+        {"job_id": "c1", "filename": "c1.png"},
+    ]
+
+
+def test_get_job_on_a_child_without_a_receipt_has_null_gpu_seconds(client):
+    _login(client)
+    with db.get_session() as session:
+        session.add(db.Job(id="p", workflow_json="{}", status="running", split_count=1, user_id="u1"))
+        session.add(
+            db.Job(
+                id="c0",
+                workflow_json="{}",
+                status="running",
+                parent_id="p",
+                split_index=0,
+                user_id="u1",
+            )
+        )
+        session.commit()
+    body = client.get("/api/jobs/p").json()
+    assert body["children"][0]["gpu_seconds"] is None
+    assert body["gpu_seconds_total"] == 0.0
+
+
+def test_get_job_on_a_plain_job_has_empty_children(client):
+    _login(client)
+    with db.get_session() as session:
+        session.add(db.Job(id="plain", workflow_json="{}", status="queued", user_id="u1"))
+        session.commit()
+    body = client.get("/api/jobs/plain").json()
+    assert body["children"] == []
+    assert body["gpu_seconds_total"] == 0.0
+    assert body["split_count"] == 0
+    assert "outputs" not in body
+
+
+def test_job_dict_exposes_dispatch_info(client):
+    _login(client)
+    with db.get_session() as session:
+        session.add(
+            db.Job(
+                id="j1",
+                workflow_json="{}",
+                status="assigned",
+                user_id="u1",
+                dispatch_info=json.dumps(
+                    {
+                        "predicted_seconds": 41.2,
+                        "basis": "signature",
+                        "load_seconds": 0.0,
+                        "fetch_seconds": 0.0,
+                        "candidates": 3,
+                    }
+                ),
+            )
+        )
+        session.commit()
+    body = client.get("/api/jobs/j1").json()
+    assert body["dispatch_info"]["basis"] == "signature"
+    assert body["dispatch_info"]["predicted_seconds"] == pytest.approx(41.2)
+    assert client.get("/api/jobs").json()[0]["dispatch_info"]["candidates"] == 3

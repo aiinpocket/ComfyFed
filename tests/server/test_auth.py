@@ -185,6 +185,7 @@ def test_update_settings_writes_platform_url_and_lang(client):
         "object_info_mode": "union",
         "upload_max_file_mb": 50,
         "upload_user_quota_gb": 5.0,
+        "split_batches": True,
     }
 
     me = client.get("/api/auth/me").json()
@@ -237,6 +238,7 @@ def test_get_settings_reports_defaults_before_any_write(client):
         "object_info_mode": "union",
         "upload_max_file_mb": 50,
         "upload_user_quota_gb": 5.0,
+        "split_batches": True,
     }
 
 
@@ -557,3 +559,29 @@ def test_settings_parse_a_bad_stored_row_back_to_the_default(client, raw_mb, raw
     body = client.get("/api/settings").json()
     assert body["upload_max_file_mb"] == 50
     assert body["upload_user_quota_gb"] == 5.0
+
+
+def test_settings_expose_and_update_split_batches(client):
+    """Phase 3.3 §3.7: batch splitting is an admin switch, default on."""
+    csrf = _csrf(client)
+    assert client.get("/api/settings").json()["split_batches"] is True
+
+    r = client.post("/api/settings", json={"split_batches": False}, headers={"X-CSRF": csrf})
+    assert r.status_code == 200
+    assert r.json()["split_batches"] is False
+    assert client.get("/api/settings").json()["split_batches"] is False
+
+    with db.get_session() as session:
+        assert session.get(db.Setting, "split_batches").value == "0"
+
+    r = client.post("/api/settings", json={"split_batches": True}, headers={"X-CSRF": csrf})
+    assert r.json()["split_batches"] is True
+
+
+def test_update_settings_rejects_a_non_boolean_split_batches(client):
+    """Typed as a bool on the model, so a non-boolean is pydantic's 422 --
+    same as every other wrongly-typed settings field on this stack (the
+    cloud twin answers its own 400 `settings.bad_split_batches`)."""
+    csrf = _csrf(client)
+    r = client.post("/api/settings", json={"split_batches": "bogus"}, headers={"X-CSRF": csrf})
+    assert r.status_code == 422

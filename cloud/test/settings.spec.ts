@@ -31,6 +31,7 @@ describe("GET /api/settings", () => {
       object_info_mode: "union",
       upload_max_file_mb: 50,
       upload_user_quota_gb: 5,
+      split_batches: true,
     });
   });
 });
@@ -62,6 +63,7 @@ describe("POST /api/settings", () => {
       object_info_mode: "union",
       upload_max_file_mb: 50,
       upload_user_quota_gb: 5,
+      split_batches: true,
     });
 
     const me = await call("/api/auth/me", { method: "GET", cookie });
@@ -191,5 +193,43 @@ describe("upload limit settings", () => {
     const r = await call("/api/settings", { method: "GET", cookie });
     expect(r.body.upload_max_file_mb).toBe(50);
     expect(r.body.upload_user_quota_gb).toBe(5);
+  });
+});
+
+describe("POST /api/settings -- split_batches (Phase 3.3 §3.7)", () => {
+  it("exposes and updates split_batches", async () => {
+    const { cookie, csrf } = await loginSession();
+    const before = await call("/api/settings", { method: "GET", cookie });
+    expect(before.body.split_batches).toBe(true);
+
+    const off = await call("/api/settings", {
+      json: { split_batches: false },
+      cookie,
+      headers: { "X-CSRF": csrf },
+    });
+    expect(off.status).toBe(200);
+    expect(off.body.split_batches).toBe(false);
+    expect((await call("/api/settings", { method: "GET", cookie })).body.split_batches).toBe(false);
+
+    const row = await db().prepare("SELECT value FROM settings WHERE key = 'split_batches'").first<any>();
+    expect(row.value).toBe("0");
+
+    const on = await call("/api/settings", {
+      json: { split_batches: true },
+      cookie,
+      headers: { "X-CSRF": csrf },
+    });
+    expect(on.body.split_batches).toBe(true);
+  });
+
+  it("rejects a non-boolean split_batches", async () => {
+    const { cookie, csrf } = await loginSession();
+    const bad = await call("/api/settings", {
+      json: { split_batches: "no" },
+      cookie,
+      headers: { "X-CSRF": csrf },
+    });
+    expect(bad.status).toBe(400);
+    expect(bad.body.error.code).toBe("settings.bad_split_batches");
   });
 });

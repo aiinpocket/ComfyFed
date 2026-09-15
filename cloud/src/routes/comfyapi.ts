@@ -162,8 +162,15 @@ function queueEntry(number: number, job: Job): unknown[] {
   return [number, job.id, workflow, extraData, nodeIdsOfClass(workflow, OUTPUT_NODE_CLASSES)];
 }
 
-async function historyEntry(number: number, job: Job, store: R2Bucket): Promise<Record<string, unknown>> {
-  const outputs = await jobOutputs({ id: job.id, workflowJson: job.workflowJson, resultFiles: job.resultFiles }, store);
+async function historyEntry(number: number, job: Job, store: R2Bucket, db: D1Database): Promise<Record<string, unknown>> {
+  // Phase 3.3 §3.7: a parent's own `result_files` is always empty -- its
+  // outputs are its children's files, in split_index then per-child file
+  // order, each carrying the owning child's id as the `/view` subfolder.
+  const splitOutputs = job.splitCount > 0 ? await split.parentOutputs(db, job) : undefined;
+  const outputs = await jobOutputs(
+    { id: job.id, workflowJson: job.workflowJson, resultFiles: job.resultFiles, splitOutputs },
+    store
+  );
   const succeeded = job.status === "done";
   const messages: unknown[] = [];
   if (!succeeded && job.error) {
@@ -620,6 +627,7 @@ app.get("/comfy/api/queue", async (c) => {
   const rows = await queries.getJobsByStatusAndOrigin(c.env.DB, [...RUNNING_STATUSES, ...PENDING_STATUSES], {
     origin: "panel",
     userId: user.uid,
+    parentsOnly: true,
   });
   const running = rows.filter((j) => RUNNING_STATUSES.includes(j.status)).map((j) => queueEntry(numbers.get(j.id) ?? 0, j));
   const pending = rows.filter((j) => PENDING_STATUSES.includes(j.status)).map((j) => queueEntry(numbers.get(j.id) ?? 0, j));
@@ -630,9 +638,12 @@ app.get("/comfy/api/queue", async (c) => {
 
 app.post("/comfy/api/interrupt", async (c) => {
   const user = c.get(SESSION_VAR).user;
+  // Phase 3.3 §3.7: interrupt the PROMPT, not one of its children --
+  // cancelling the parent cancels every child and tells each of their workers.
   const running = await queries.getJobsByStatusAndOrigin(c.env.DB, RUNNING_STATUSES, {
     origin: "panel",
     userId: user.uid,
+    parentsOnly: true,
   });
   const job = running[0];
   if (job) {
@@ -662,9 +673,12 @@ app.post("/comfy/api/queue", async (c) => {
   }
   const bodyObj = typeof body === "object" && body !== null && !Array.isArray(body) ? (body as Record<string, unknown>) : {};
 
+  // Parents only: each one cascades to its own children (naming a child
+  // directly would cancel the whole family anyway, via refreshParent).
   const candidates = await queries.getJobsByStatusAndOrigin(c.env.DB, [...PENDING_STATUSES, ...RUNNING_STATUSES], {
     origin: "panel",
     userId: user.uid,
+    parentsOnly: true,
   });
 
   let jobIds: string[];
@@ -698,6 +712,9 @@ app.get("/comfy/api/history", async (c) => {
     excludePanelHidden: true,
     orderBy: "finished_at",
     userId: user.uid,
+    // Phase 3.3 §3.7: parents only -- a child's outputs reach the panel
+    // merged into its parent's entry (see `historyEntry`).
+    parentsOnly: true,
   });
 
   if (maxItemsParam !== undefined) {
@@ -709,7 +726,7 @@ app.get("/comfy/api/history", async (c) => {
 
   const out: Record<string, unknown> = {};
   for (const job of rows) {
-    out[job.id] = await historyEntry(numbers.get(job.id) ?? 0, job, c.env.STORE);
+    out[job.id] = await historyEntry(numbers.get(job.id) ?? 0, job, c.env.STORE, c.env.DB);
   }
   return c.json(out);
 });
@@ -725,13 +742,16 @@ app.get("/comfy/api/history/:promptId", async (c) => {
     !HISTORY_STATUSES.includes(job.status) ||
     job.panelHidden ||
     job.origin !== "panel" ||
-    job.userId !== user.uid
+    job.userId !== user.uid ||
+    // Phase 3.3 §3.7: a child id is not a prompt id the panel was ever given,
+    // so it answers like any other unknown id.
+    job.parentId !== null
   ) {
     // Upstream returns {} for an unknown prompt id, never a 404.
     return c.json({});
   }
   const numbers = await numbersByJobId(c.env.DB);
-  return c.json({ [job.id]: await historyEntry(numbers.get(job.id) ?? 0, job, c.env.STORE) });
+  return c.json({ [job.id]: await historyEntry(numbers.get(job.id) ?? 0, job, c.env.STORE, c.env.DB) });
 });
 
 // --- POST /comfy/api/history (hide) ------------------------------------------
@@ -823,6 +843,11 @@ app.get("/comfy/api/view", async (c) => {
     } catch {
       return c.body(null, 400);
     }
+    // Phase 3.3 §3.7: after a split the `subfolder` may be a CHILD job's id.
+    // A child inherits its parent's origin and user_id (split.createChildren),
+    // so the same authorization check below holds unchanged, and the child's
+    // `result_files` really does contain the filename -- the parent's own
+    // column is empty.
     const job = await queries.getJobById(c.env.DB, jobId);
     if (!job || !resultFilesOf(job).includes(safeName) || job.origin !== "panel" || job.userId !== user.uid) {
       return c.body(null, 404);

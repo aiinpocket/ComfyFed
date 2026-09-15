@@ -29,7 +29,7 @@ from typing import Optional
 
 from fastapi import WebSocket
 
-from . import db
+from . import db, split
 
 logger = logging.getLogger(__name__)
 
@@ -150,7 +150,13 @@ def queue_status() -> dict:
     with db.get_session() as session:
         remaining = (
             session.query(db.Job)
-            .filter(db.Job.status.in_(_QUEUE_REMAINING_STATUSES))
+            .filter(
+                db.Job.status.in_(_QUEUE_REMAINING_STATUSES),
+                # Phase 3.3 §3.7: one submission counts once. Without this a
+                # prompt split into 4 makes the panel's queue badge read 4
+                # (or 5, while the parent is still queued alongside them).
+                db.Job.parent_id == None,  # noqa: E711
+            )
             .count()
         )
     return {"exec_info": {"queue_remaining": remaining}}
@@ -172,6 +178,39 @@ def _job_owner(job_id: Optional[str]) -> Optional[tuple[str, Optional[str]]]:
         if job is None:
             return None
         return (job.origin, job.user_id)
+
+
+def resolve_panel_job_id(job_id: Optional[str]) -> Optional[str]:
+    """Phase 3.3 §3.7: the panel only ever sees the parent.
+
+    A child's id resolves to its parent's; an ordinary or parent job returns
+    itself; a job that no longer exists returns None. Every job-scoped event
+    below goes through this first, so each of a child's transitions becomes
+    an event about the parent and the panel never learns the split happened.
+    """
+    if not job_id:
+        return None
+    with db.get_session() as session:
+        job = session.get(db.Job, job_id)
+        if job is None:
+            return None
+        return job.parent_id or job.id
+
+
+def _parent_state(job_id: str) -> Optional[tuple[str, str, Optional[str]]]:
+    """`(parent_id, status, error)` for a CHILD's id, or None when `job_id`
+    is not a child (or nothing resolves). Plain values rather than a row: the
+    relays below only need to read these, and a detached ORM instance outside
+    its session is a trap waiting for the next person to touch another
+    column."""
+    with db.get_session() as session:
+        job = session.get(db.Job, job_id)
+        if job is None or not job.parent_id:
+            return None
+        parent = session.get(db.Job, job.parent_id)
+        if parent is None:
+            return None
+        return parent.id, parent.status, parent.error
 
 
 def _visible_to(conn_uid: Optional[str], owner: tuple[str, Optional[str]]) -> bool:
@@ -282,7 +321,22 @@ async def job_progress(
     wire shape for a plain execution-progress update is byte-identical to
     before this parameter existed. The stock ComfyUI frontend ignores unknown
     fields on a `progress` event, so this is purely additive.
+
+    Phase 3.3 §3.7: a child's progress is reported as its PARENT's, and the
+    value becomes the mean over the siblings -- one child at 50% is not the
+    prompt at 50%. The mean is read here rather than taken from the parent's
+    stored `progress` because `split.refresh_parent_progress` runs AFTER this
+    relay on the heartbeat path, so the stored value is one beat stale.
     """
+    panel_job_id = resolve_panel_job_id(job_id)
+    if panel_job_id is None:
+        return
+    if panel_job_id != job_id:
+        mean = split.mean_child_progress(panel_job_id)
+        if mean is not None:
+            progress = mean
+        job_id = panel_job_id
+
     data = {"value": int(progress * 100), "max": 100, "prompt_id": job_id}
     if stage is not None:
         data["stage"] = stage
@@ -294,6 +348,13 @@ async def job_progress(
 
 
 async def job_running(job_id: str) -> None:
+    """Phase 3.3 §3.7: a child starting is the PARENT executing, as far as the
+    panel is concerned -- repeated once per child, with an identical payload
+    the frontend is happy to see again."""
+    panel_job_id = resolve_panel_job_id(job_id)
+    if panel_job_id is None:
+        return
+    job_id = panel_job_id
     await post_event(
         {
             "type": "executing",
@@ -328,7 +389,22 @@ async def job_requeued(job_id: str) -> None:
     `queued`; without this the panel keeps showing it as the executing prompt
     forever, because the only other thing that clears `executing` is a
     done/failed transition that will now never arrive for that attempt.
+
+    Phase 3.3 §3.7: for a child this is relayed as the parent -- but ONLY
+    when the requeue actually pulled the parent back to `queued`/`assigned`.
+    One child of four going back in the queue while its siblings keep running
+    leaves the parent `running`, and clearing `executing` then would blank a
+    prompt that is still very much in flight.
     """
+    parent = _parent_state(job_id)
+    if parent is not None:
+        parent_id, parent_status, _error = parent
+        if parent_status not in ("queued", "assigned"):
+            return
+        job_id = parent_id
+    elif resolve_panel_job_id(job_id) is None:
+        return
+
     await post_event({"type": "executing", "data": {"node": None, "prompt_id": job_id}}, job_id=job_id)
 
 
@@ -341,7 +417,15 @@ async def job_cancelled(job_id: str) -> None:
     the executing marker for this job (a no-op if it wasn't the one showing
     as executing) and refresh the queue badge, which together are what stop
     the panel from believing a cancelled job is still queued or running.
+
+    Phase 3.3 §3.7: a child's cancellation is relayed as the parent's --
+    cancelling any one child cancels the whole family (`split.refresh_parent`),
+    so the prompt really is over.
     """
+    panel_job_id = resolve_panel_job_id(job_id)
+    if panel_job_id is None:
+        return
+    job_id = panel_job_id
     await post_event({"type": "executing", "data": {"node": None, "prompt_id": job_id}}, job_id=job_id)
     await job_status_refresh()
 
@@ -367,7 +451,26 @@ async def job_done(job: "db.Job") -> None:
     """
     from . import comfyapi
 
-    outputs = comfyapi.job_outputs(job) or {comfyapi.FALLBACK_OUTPUT_KEY: {}}
+    # Phase 3.3 §3.7: what the panel must see when a CHILD finishes is the
+    # parent's `executed` -- and only once the whole family is done. Until
+    # then nothing goes out but a queue refresh (the progress events are
+    # already carrying the prompt along); when the last child lands, the
+    # parent's merged outputs are sent in one piece.
+    if job.parent_id:
+        with db.get_session() as session:
+            parent = session.get(db.Job, job.parent_id)
+            parent_done = parent is not None and parent.status == "done"
+            if parent_done:
+                outputs = comfyapi.job_outputs(parent) or {comfyapi.FALLBACK_OUTPUT_KEY: {}}
+                # Everything the fan-out below reads off the row (id, origin,
+                # user_id) is loaded right here; leaving the block detaches
+                # the instance but does not expire what was already read.
+                job = parent
+        if not parent_done:
+            await post_event({"type": "status", "data": {"status": queue_status()}})
+            return
+    else:
+        outputs = comfyapi.job_outputs(job) or {comfyapi.FALLBACK_OUTPUT_KEY: {}}
 
     for node_id, payload in outputs.items():
         await post_event(
@@ -396,7 +499,19 @@ async def job_failed(job_id: str, error: str) -> None:
     The status refresh matters for the same reason it does in `job_done`: a
     failed job leaves the queue, and without a fresh `exec_info` the panel's
     queue badge keeps counting it.
+
+    Phase 3.3 §3.7: a child's failure is the whole prompt's failure (it fails
+    the parent and cancels the siblings -- `split.refresh_parent`), so it is
+    relayed as the parent, carrying the PARENT's error message: that one
+    names which child of how many failed, which the raw child error does not.
     """
+    parent = _parent_state(job_id)
+    if parent is not None:
+        job_id, _status, parent_error = parent
+        error = parent_error or error
+    elif resolve_panel_job_id(job_id) is None:
+        return
+
     await post_event(
         {
             "type": "execution_error",

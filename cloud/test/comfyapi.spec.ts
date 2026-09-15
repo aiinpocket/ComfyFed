@@ -1100,3 +1100,139 @@ describe("unmatched /comfy/api/* routes", () => {
     expect(real.body).toEqual([]);
   });
 });
+
+// --- Phase 3.3 §3.7: the panel only ever sees the parent ---------------------
+//
+// JSON-shape parity with tests/server/test_comfyapi.py: the same keys and
+// nesting the Python `/history` / `/queue` surfaces return.
+
+describe("split families on the panel surface (§3.7)", () => {
+  const SPLIT_WORKFLOW = JSON.stringify({ "2": { class_type: "SaveImage", inputs: {} } });
+
+  /** Parent + children written straight to D1 (the splitting itself is
+   * split.spec.ts / dispatch.spec.ts' business), all `origin: "panel"` and
+   * owned by `uid` -- children inherit both from the parent. */
+  async function makeSplitFamily(uid: string, opts: { parentStatus?: string; childStatuses?: string[] } = {}) {
+    const parentStatus = opts.parentStatus ?? "done";
+    const childStatuses = opts.childStatuses ?? ["done", "done"];
+    const now = toSqliteTimestamp(new Date());
+    await db()
+      .prepare(
+        `INSERT INTO jobs (id, workflow_json, status, created_at, finished_at, input_assets, origin, user_id, split_count)
+         VALUES ('p', ?, ?, ?, ?, '[]', 'panel', ?, ?)`
+      )
+      .bind(SPLIT_WORKFLOW, parentStatus, now, parentStatus === "done" ? now : null, uid, childStatuses.length)
+      .run();
+    for (let index = 0; index < childStatuses.length; index++) {
+      const status = childStatuses[index]!;
+      const files = status === "done" ? [`c${index}.png`] : [];
+      await db()
+        .prepare(
+          `INSERT INTO jobs (id, workflow_json, status, created_at, finished_at, input_assets, origin,
+                             user_id, parent_id, split_index, result_files)
+           VALUES (?, ?, ?, ?, ?, '[]', 'panel', ?, 'p', ?, ?)`
+        )
+        .bind(`c${index}`, SPLIT_WORKFLOW, status, now, status === "done" ? now : null, uid, index, JSON.stringify(files))
+        .run();
+      for (const name of files) {
+        await store().put(artifactKey(`c${index}`, name), new TextEncoder().encode(`bytes-${index}`));
+      }
+    }
+  }
+
+  async function adminUid(): Promise<string> {
+    const row = await db().prepare("SELECT id FROM users WHERE username = 'admin'").first<any>();
+    return row.id;
+  }
+
+  it("hides children from /history and merges their outputs into the parent", async () => {
+    const { cookie } = await loginSession();
+    await makeSplitFamily(await adminUid());
+
+    const r = await call("/comfy/api/history", { method: "GET", cookie });
+    expect(Object.keys(r.body)).toEqual(["p"]);
+    expect(r.body.p.outputs["2"].images).toEqual([
+      { filename: "c0.png", subfolder: "c0", type: "output" },
+      { filename: "c1.png", subfolder: "c1", type: "output" },
+    ]);
+  });
+
+  it("answers {} for a child's id on /history/:promptId", async () => {
+    const { cookie } = await loginSession();
+    await makeSplitFamily(await adminUid());
+
+    expect((await call("/comfy/api/history/c0", { method: "GET", cookie })).body).toEqual({});
+    expect(Object.keys((await call("/comfy/api/history/p", { method: "GET", cookie })).body)).toEqual(["p"]);
+  });
+
+  it("hides children from /queue", async () => {
+    const { cookie } = await loginSession();
+    await makeSplitFamily(await adminUid(), { parentStatus: "running", childStatuses: ["running", "queued"] });
+
+    const r = await call("/comfy/api/queue", { method: "GET", cookie });
+    const ids = [...r.body.queue_running, ...r.body.queue_pending].map((entry: any[]) => entry[1]);
+    expect(ids).toEqual(["p"]);
+  });
+
+  it("hides the whole family when the parent is hidden from history", async () => {
+    const { cookie } = await loginSession();
+    await makeSplitFamily(await adminUid());
+
+    const hide = await call("/comfy/api/history", { json: { delete: ["p"] }, cookie });
+    expect(hide.status).toBe(200);
+    expect((await call("/comfy/api/history", { method: "GET", cookie })).body).toEqual({});
+  });
+
+  /** `call()` parses JSON; these two need the raw body/status of a binary
+   * artifact response, so they go through the worker directly (same shape the
+   * colliding-filename test above uses). */
+  async function viewRaw(cookie: string | null): Promise<Response> {
+    const worker = (await import("../src/index")).default;
+    const { createExecutionContext, waitOnExecutionContext } = await import("cloudflare:test");
+    const ctx = createExecutionContext();
+    const res = await worker.fetch(
+      new Request("http://example.com/comfy/api/view?filename=c1.png&type=output&subfolder=c1", {
+        headers: { Cookie: cookie ?? "" },
+      }),
+      env as any,
+      ctx
+    );
+    await waitOnExecutionContext(ctx);
+    return res;
+  }
+
+  it("serves a child's file through the child id as the /view subfolder", async () => {
+    const { cookie } = await loginSession();
+    await makeSplitFamily(await adminUid());
+
+    const r = await viewRaw(cookie);
+    expect(r.status).toBe(200);
+    expect(await r.text()).toBe("bytes-1");
+  });
+
+  it("refuses another user's child file", async () => {
+    const admin = await loginSession();
+    const other = await userSession(admin, "mallory");
+    await makeSplitFamily(await adminUid());
+
+    expect((await viewRaw(other.cookie)).status).toBe(404);
+  });
+
+  it("keeps each child as the owner of a colliding filename", async () => {
+    // Every worker numbers `ComfyUI_00001_.png` from its own counter, so two
+    // children of one parent routinely produce the SAME filename -- each
+    // entry must keep ITS OWN child as the subfolder.
+    const { cookie } = await loginSession();
+    await makeSplitFamily(await adminUid());
+    await db()
+      .prepare("UPDATE jobs SET result_files = ? WHERE parent_id = 'p'")
+      .bind(JSON.stringify(["ComfyUI_00001_.png"]))
+      .run();
+
+    const r = await call("/comfy/api/history", { method: "GET", cookie });
+    expect(r.body.p.outputs["2"].images).toEqual([
+      { filename: "ComfyUI_00001_.png", subfolder: "c0", type: "output" },
+      { filename: "ComfyUI_00001_.png", subfolder: "c1", type: "output" },
+    ]);
+  });
+});

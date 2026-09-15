@@ -61,6 +61,7 @@ import * as modelManifest from "../core/model_manifest";
 import * as stats from "../core/stats";
 import * as split from "../core/split";
 import { toSqliteTimestamp, resolvePlatformSeed } from "../db/queries";
+import type { Job } from "../db/queries";
 import { buildReceiptPayload, signReceipt, verifyHex } from "../lib/signing";
 import { bytesToHex } from "../lib/hex";
 import { readSessionCookie } from "../lib/cookies";
@@ -1837,6 +1838,28 @@ export class Hub extends DurableObject<Env> {
     return job ? { origin: job.origin, userId: job.userId } : null;
   }
 
+  /** Phase 3.3 §3.7 -- ports panelws.py's `resolve_panel_job_id`: the panel
+   * only ever sees the parent. A child's id resolves to its parent's; an
+   * ordinary or parent job returns itself; a job that no longer exists
+   * returns null. Every job-scoped panel event below goes through this
+   * first, so each of a child's transitions becomes an event about the
+   * parent and the panel never learns the split happened. */
+  private async resolvePanelJobId(jobId: string): Promise<string | null> {
+    if (!jobId) return null;
+    const job = await queries.getJobById(this.env.DB, jobId);
+    if (!job) return null;
+    return job.parentId ?? job.id;
+  }
+
+  /** The parent row for a CHILD's id, or null when `jobId` is not a child
+   * (or nothing resolves) -- ports panelws.py's `_parent_state`, for the two
+   * relays that need more than the parent's id (its status, its error). */
+  private async parentOf(jobId: string): Promise<Job | null> {
+    const job = await queries.getJobById(this.env.DB, jobId);
+    if (!job || !job.parentId) return null;
+    return await queries.getJobById(this.env.DB, job.parentId);
+  }
+
   /** Broadcasts a `{type, data}` envelope to connected panel clients. Ports
    * panelws.py's `post_event` (minus the cross-event-loop dance, which has
    * no equivalent in a single-threaded DO -- every caller here already runs
@@ -1914,6 +1937,19 @@ export class Hub extends DurableObject<Env> {
     progress: number,
     fetchFields?: { stage: string; fetchPct: number | null; fetchModel: string | null }
   ): Promise<void> {
+    // Phase 3.3 §3.7: a child's progress is reported as its PARENT's, and the
+    // value becomes the mean over the siblings -- one child at 50% is not the
+    // prompt at 50%. Read here rather than off the parent's stored `progress`
+    // because `refreshParentProgress` runs AFTER this relay on the heartbeat
+    // path, so the stored value is one beat stale.
+    const panelJobId = await this.resolvePanelJobId(jobId);
+    if (panelJobId === null) return;
+    if (panelJobId !== jobId) {
+      const mean = await split.meanChildProgress(this.env.DB, panelJobId);
+      if (mean !== null) progress = mean;
+      jobId = panelJobId;
+    }
+
     const data: Record<string, unknown> = { value: Math.trunc(progress * 100), max: 100, prompt_id: jobId };
     if (fetchFields) {
       data.stage = fetchFields.stage;
@@ -1925,6 +1961,12 @@ export class Hub extends DurableObject<Env> {
 
   /** Ports panelws.py's `job_running`. */
   private async panelJobRunning(jobId: string): Promise<void> {
+    // Phase 3.3 §3.7: a child starting is the PARENT executing, as far as the
+    // panel is concerned -- repeated once per child, with an identical
+    // payload the frontend is happy to see again.
+    const panelJobId = await this.resolvePanelJobId(jobId);
+    if (panelJobId === null) return;
+    jobId = panelJobId;
     await this.postJobScopedPanelEvent(jobId, {
       type: "executing",
       data: { node: RUNNING_NODE_LABEL, prompt_id: jobId, display_node: RUNNING_NODE_LABEL },
@@ -1938,11 +1980,29 @@ export class Hub extends DurableObject<Env> {
 
   /** Ports panelws.py's `job_requeued`. */
   private async panelJobRequeued(jobId: string): Promise<void> {
+    // Phase 3.3 §3.7: for a child this is relayed as the parent -- but ONLY
+    // when the requeue actually pulled the parent back to queued/assigned.
+    // One child of four going back in the queue while its siblings keep
+    // running leaves the parent `running`, and clearing `executing` then
+    // would blank a prompt that is still very much in flight.
+    const parent = await this.parentOf(jobId);
+    if (parent !== null) {
+      if (parent.status !== "queued" && parent.status !== "assigned") return;
+      jobId = parent.id;
+    } else if ((await this.resolvePanelJobId(jobId)) === null) {
+      return;
+    }
     await this.postJobScopedPanelEvent(jobId, { type: "executing", data: { node: null, prompt_id: jobId } });
   }
 
   /** Ports panelws.py's `job_cancelled`. */
   private async panelJobCancelled(jobId: string): Promise<void> {
+    // Phase 3.3 §3.7: a child's cancellation is relayed as the parent's --
+    // cancelling any one child cancels the whole family (refreshParent), so
+    // the prompt really is over.
+    const panelJobId = await this.resolvePanelJobId(jobId);
+    if (panelJobId === null) return;
+    jobId = panelJobId;
     await this.postJobScopedPanelEvent(jobId, { type: "executing", data: { node: null, prompt_id: jobId } });
     await this.panelJobStatusRefresh();
   }
@@ -1957,8 +2017,26 @@ export class Hub extends DurableObject<Env> {
    * `job` already carries `origin`/`userId` (the caller's freshly-committed
    * `Job` row) -- unlike the jobId-only panel* methods above, no extra
    * `jobOwner` lookup is needed to scope this event's delivery. */
-  private async panelJobDone(job: JobOutputsInput & PanelOwner): Promise<void> {
-    let outputs = await jobOutputs(job, this.env.STORE);
+  private async panelJobDone(
+    job: JobOutputsInput & PanelOwner & { parentId?: string | null; splitCount?: number }
+  ): Promise<void> {
+    // Phase 3.3 §3.7: what the panel must see when a CHILD finishes is the
+    // parent's `executed` -- and only once the whole family is done. Until
+    // then nothing goes out but a queue refresh (the progress events are
+    // already carrying the prompt along); when the last child lands, the
+    // parent's merged outputs are sent in one piece.
+    if (job.parentId) {
+      const parent = await queries.getJobById(this.env.DB, job.parentId);
+      if (!parent || parent.status !== "done") {
+        await this.postPanelEvent({ type: "status", data: { status: await this.queueStatus() } });
+        return;
+      }
+      job = parent;
+    }
+
+    const splitOutputs =
+      (job.splitCount ?? 0) > 0 ? await split.parentOutputs(this.env.DB, job as Job) : undefined;
+    let outputs = await jobOutputs({ ...job, splitOutputs }, this.env.STORE);
     if (Object.keys(outputs).length === 0) {
       outputs = { [FALLBACK_OUTPUT_KEY]: {} };
     }
@@ -1979,6 +2057,18 @@ export class Hub extends DurableObject<Env> {
 
   /** Ports panelws.py's `job_failed`. */
   private async panelJobFailed(jobId: string, error: string): Promise<void> {
+    // Phase 3.3 §3.7: a child's failure is the whole prompt's failure (it
+    // fails the parent and cancels the siblings -- refreshParent), so it is
+    // relayed as the parent, carrying the PARENT's error message: that one
+    // names which child of how many failed, which the raw child error does
+    // not.
+    const parent = await this.parentOf(jobId);
+    if (parent !== null) {
+      jobId = parent.id;
+      error = parent.error ?? error;
+    } else if ((await this.resolvePanelJobId(jobId)) === null) {
+      return;
+    }
     await this.postJobScopedPanelEvent(jobId, {
       type: "execution_error",
       data: {

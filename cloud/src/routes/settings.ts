@@ -2,7 +2,8 @@
  * `/api/settings` GET/POST -- parity source: server/comfyfed_server/auth.py
  * (`_current_settings` / `read_settings` / `update_settings`). Every key the
  * Python settings surface exposes, ported: `platform_url`, `lang`,
- * `object_info_mode`, `upload_max_file_mb`, `upload_user_quota_gb` (that is
+ * `object_info_mode`, `upload_max_file_mb`, `upload_user_quota_gb`,
+ * `split_batches` (that is
  * the complete set -- auth.py's settings router defines no others; `admin_password_hash` and `session_secret` are internal
  * settings rows never surfaced through this endpoint).
  */
@@ -12,6 +13,7 @@ import type { Env } from "../env";
 import { getSetting, setSetting } from "../db/queries";
 import { requireAdmin, requireCsrf, errorJson } from "../lib/guard";
 import { MESSAGES } from "../core/auth";
+import { SPLIT_BATCHES_SETTING_KEY } from "../core/split";
 import {
   MAX_UPLOAD_MAX_FILE_MB,
   MAX_UPLOAD_USER_QUOTA_GB,
@@ -35,6 +37,7 @@ interface CurrentSettings {
   object_info_mode: string;
   upload_max_file_mb: number;
   upload_user_quota_gb: number;
+  split_batches: boolean;
 }
 
 async function currentSettings(db: D1Database): Promise<CurrentSettings> {
@@ -48,6 +51,10 @@ async function currentSettings(db: D1Database): Promise<CurrentSettings> {
     object_info_mode: (await getSetting(db, OBJECT_INFO_MODE_KEY)) || DEFAULT_OBJECT_INFO_MODE,
     upload_max_file_mb: limits.maxFileMb,
     upload_user_quota_gb: limits.quotaGb,
+    // Default ON: anything but an explicit "0" (a missing row included) means
+    // splitting is allowed -- the same reading `splitBatchesEnabled` applies
+    // on the dispatch side.
+    split_batches: (await getSetting(db, SPLIT_BATCHES_SETTING_KEY)) !== "0",
   };
 }
 
@@ -65,6 +72,7 @@ app.post("/api/settings", requireCsrf, async (c) => {
       object_info_mode?: unknown;
       upload_max_file_mb?: unknown;
       upload_user_quota_gb?: unknown;
+      split_batches?: unknown;
     }>()
     .catch(() => ({}) as any);
 
@@ -96,6 +104,21 @@ app.post("/api/settings", requireCsrf, async (c) => {
       return errorJson(c, 400, "settings.bad_object_info_mode", MESSAGES.badObjectInfoMode);
     }
     updates[OBJECT_INFO_MODE_KEY] = body.object_info_mode;
+  }
+
+  if (body.split_batches !== undefined && body.split_batches !== null) {
+    // Phase 3.3 §3.7: turning this off does not touch children already
+    // created (they are independent queued jobs and run to completion) -- it
+    // only stops NEW submissions from getting a split plan.
+    if (typeof body.split_batches !== "boolean") {
+      return errorJson(
+        c,
+        400,
+        "settings.bad_split_batches",
+        "split_batches 必須是 true 或 false。 / split_batches must be a boolean."
+      );
+    }
+    updates[SPLIT_BATCHES_SETTING_KEY] = body.split_batches ? "1" : "0";
   }
 
   // Validated STRICTLY here (an admin typing an out-of-range number deserves

@@ -784,3 +784,229 @@ describe("session_epoch bump closes open panel sockets (final review finding #6)
     await closed;
   });
 });
+
+// ---------------------------------------------------------------------------
+// Phase 3.3 §3.7: children are invisible to the panel
+//
+// JSON-shape parity with tests/server/test_comfy_panel_ws.py: every frame
+// below carries the PARENT's id as `prompt_id`, with the same keys and the
+// same nesting the Python relay emits.
+
+describe("split families on the panel (§3.7)", () => {
+  async function makeSplitFamily(opts: {
+    uid: string;
+    parentStatus?: string;
+    children: { status: string; workerId?: string | null; progress?: number; resultFiles?: string[] }[];
+    workflowJson?: string;
+  }): Promise<{ parentId: string; childIds: string[] }> {
+    const parentId = uniqueId("parent");
+    const workflowJson = opts.workflowJson ?? JSON.stringify({ "5": { class_type: "SaveImage" } });
+    await d1()
+      .prepare(
+        `INSERT INTO jobs (id, workflow_json, status, created_at, input_assets, origin, user_id, split_count)
+         VALUES (?, ?, ?, ?, '[]', 'panel', ?, ?)`
+      )
+      .bind(
+        parentId,
+        workflowJson,
+        opts.parentStatus ?? "running",
+        toSqliteTimestamp(new Date()),
+        opts.uid,
+        opts.children.length
+      )
+      .run();
+
+    const childIds: string[] = [];
+    for (let index = 0; index < opts.children.length; index++) {
+      const child = opts.children[index]!;
+      const childId = `${parentId}-c${index}`;
+      childIds.push(childId);
+      await d1()
+        .prepare(
+          `INSERT INTO jobs (id, workflow_json, status, worker_id, created_at, started_at, input_assets,
+                             origin, user_id, parent_id, split_index, progress, result_files)
+           VALUES (?, ?, ?, ?, ?, ?, '[]', 'panel', ?, ?, ?, ?, ?)`
+        )
+        .bind(
+          childId,
+          workflowJson,
+          child.status,
+          child.workerId ?? null,
+          toSqliteTimestamp(new Date()),
+          toSqliteTimestamp(new Date()),
+          opts.uid,
+          parentId,
+          index,
+          child.progress ?? 0,
+          JSON.stringify(child.resultFiles ?? [])
+        )
+        .run();
+    }
+    return { parentId, childIds };
+  }
+
+  it("reports a child's heartbeat progress as the parent's mean", async () => {
+    const kp = KEYPAIRS[0]!;
+    const workerId = await makeWorker({ pubkeyHex: kp.pubkey_hex });
+    const { cookie, uid } = await loginCookie();
+    const { parentId, childIds } = await makeSplitFamily({
+      uid,
+      children: [
+        { status: "running", workerId, progress: 0 },
+        { status: "running", progress: 0.1 },
+      ],
+    });
+
+    const panel = await connectPanel(cookie);
+    await collectMessages(panel, 2);
+
+    const agent = await connectAgent(workerId, kp.seed_hex);
+    agent.send(JSON.stringify({ type: "hello", protocol: 2 }));
+
+    const progressPromise = nextMessage(panel);
+    agent.send(JSON.stringify({ type: "heartbeat", state: "idle", job_id: childIds[0], progress: 0.5 }));
+    expect(await progressPromise).toEqual({
+      type: "progress",
+      data: { value: 30, max: 100, prompt_id: parentId },
+    });
+
+    agent.close();
+    panel.close();
+  });
+
+  it("reports a child going busy as the parent executing", async () => {
+    const kp = KEYPAIRS[0]!;
+    const workerId = await makeWorker({ pubkeyHex: kp.pubkey_hex });
+    const { cookie, uid } = await loginCookie();
+    const { parentId, childIds } = await makeSplitFamily({
+      uid,
+      parentStatus: "assigned",
+      children: [{ status: "assigned", workerId }],
+    });
+
+    const panel = await connectPanel(cookie);
+    await collectMessages(panel, 2);
+
+    const agent = await connectAgent(workerId, kp.seed_hex);
+    agent.send(JSON.stringify({ type: "hello", protocol: 2 }));
+
+    const runningPromise = nextMessage(panel);
+    agent.send(JSON.stringify({ type: "heartbeat", state: "busy", job_id: childIds[0] }));
+    expect(await runningPromise).toEqual({
+      type: "executing",
+      data: { node: "comfyfed", prompt_id: parentId, display_node: "comfyfed" },
+    });
+
+    agent.close();
+    panel.close();
+  });
+
+  it("emits no executed while a sibling is still running", async () => {
+    const kp = KEYPAIRS[0]!;
+    const workerId = await makeWorker({ pubkeyHex: kp.pubkey_hex });
+    const { cookie, uid } = await loginCookie();
+    const { childIds } = await makeSplitFamily({
+      uid,
+      children: [
+        { status: "running", workerId },
+        { status: "running" },
+      ],
+    });
+
+    const panel = await connectPanel(cookie);
+    await collectMessages(panel, 2);
+
+    const agent = await connectAgent(workerId, kp.seed_hex);
+    agent.send(JSON.stringify({ type: "hello", protocol: 2 }));
+
+    const eventsPromise = collectMessages(panel, 1);
+    agent.send(JSON.stringify({ type: "job_done", job_id: childIds[0], result_files: ["a.png"], exec_seconds: 1 }));
+    const [only] = await eventsPromise;
+    expect(only.type).toBe("status");
+
+    agent.close();
+    panel.close();
+  });
+
+  it("emits the parent's merged outputs when the last child finishes", async () => {
+    const kp = KEYPAIRS[0]!;
+    const workerId = await makeWorker({ pubkeyHex: kp.pubkey_hex });
+    const { cookie, uid } = await loginCookie();
+    const { parentId, childIds } = await makeSplitFamily({
+      uid,
+      children: [
+        { status: "done", resultFiles: ["a.png"] },
+        { status: "running", workerId },
+      ],
+    });
+
+    const panel = await connectPanel(cookie);
+    await collectMessages(panel, 2);
+
+    const agent = await connectAgent(workerId, kp.seed_hex);
+    agent.send(JSON.stringify({ type: "hello", protocol: 2 }));
+
+    const eventsPromise = collectMessages(panel, 3);
+    agent.send(JSON.stringify({ type: "job_done", job_id: childIds[1], result_files: ["b.png"], exec_seconds: 1 }));
+    const [executed, executingNull, status] = await eventsPromise;
+
+    expect(executed).toEqual({
+      type: "executed",
+      data: {
+        prompt_id: parentId,
+        output: {
+          images: [
+            { filename: "a.png", subfolder: childIds[0], type: "output" },
+            { filename: "b.png", subfolder: childIds[1], type: "output" },
+          ],
+        },
+        node: "5",
+        display_node: "5",
+      },
+    });
+    expect(executingNull).toEqual({ type: "executing", data: { node: null, prompt_id: parentId } });
+    expect(status.type).toBe("status");
+
+    agent.close();
+    panel.close();
+  });
+
+  it("counts a whole split family once in queue_remaining", async () => {
+    const { cookie, uid } = await loginCookie();
+    await makeSplitFamily({ uid, children: [{ status: "running" }, { status: "queued" }] });
+
+    const panel = await connectPanel(cookie);
+    const [status] = await collectMessages(panel, 1);
+    expect(status.data.status).toEqual({ exec_info: { queue_remaining: 1 } });
+    panel.close();
+  });
+
+  it("reports a child's failure as the parent's execution_error", async () => {
+    const kp = KEYPAIRS[0]!;
+    const workerId = await makeWorker({ pubkeyHex: kp.pubkey_hex });
+    const { cookie, uid } = await loginCookie();
+    const { parentId, childIds } = await makeSplitFamily({
+      uid,
+      children: [
+        { status: "running", workerId },
+        { status: "queued" },
+      ],
+    });
+
+    const panel = await connectPanel(cookie);
+    await collectMessages(panel, 2);
+
+    const agent = await connectAgent(workerId, kp.seed_hex);
+    agent.send(JSON.stringify({ type: "hello", protocol: 2 }));
+
+    const eventsPromise = collectMessages(panel, 1);
+    agent.send(JSON.stringify({ type: "job_failed", job_id: childIds[0], error: "boom" }));
+    const [failed] = await eventsPromise;
+    expect(failed.type).toBe("execution_error");
+    expect(failed.data.prompt_id).toBe(parentId);
+    expect(failed.data.exception_message).toContain("boom");
+
+    agent.close();
+    panel.close();
+  });
+});

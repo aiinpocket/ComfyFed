@@ -812,9 +812,17 @@ export async function updateParentDerived(
  * scope. `opts.userId` omitted means unscoped (every job, any owner) --
  * callers needing "this user's jobs" always pass it explicitly rather than
  * relying on a default. */
-export async function listJobs(db: D1Database, statuses?: string[], opts: { userId?: string } = {}): Promise<Job[]> {
+export async function listJobs(
+  db: D1Database,
+  statuses?: string[],
+  opts: { userId?: string; includeChildren?: boolean } = {}
+): Promise<Job[]> {
   const clauses: string[] = [];
   const binds: unknown[] = [];
+  // Phase 3.3 §3.7: parents and ordinary jobs only unless the caller opts in
+  // -- a child is an implementation detail of the split, and listing it
+  // alongside its parent would show one submission k+1 times.
+  if (!opts.includeChildren) clauses.push("parent_id IS NULL");
   if (statuses && statuses.length > 0) {
     clauses.push(`status IN (${statuses.map(() => "?").join(",")})`);
     binds.push(...statuses);
@@ -1082,10 +1090,20 @@ export async function getOnlinePeerCapableWorkers(
 export async function getJobsByStatusAndOrigin(
   db: D1Database,
   statuses: string[],
-  opts: { origin?: string; excludePanelHidden?: boolean; orderBy?: "created_at" | "finished_at"; userId?: string } = {}
+  opts: {
+    origin?: string;
+    excludePanelHidden?: boolean;
+    orderBy?: "created_at" | "finished_at";
+    userId?: string;
+    /** Phase 3.3 §3.7: `true` restricts the result to parent/ordinary jobs.
+     * Every panel-facing caller passes it -- the panel submitted ONE prompt
+     * and must see one row, not k. */
+    parentsOnly?: boolean;
+  } = {}
 ): Promise<Job[]> {
   const placeholders = statuses.map(() => "?").join(",");
   const clauses = [`status IN (${placeholders})`];
+  if (opts.parentsOnly) clauses.push("parent_id IS NULL");
   const binds: unknown[] = [...statuses];
   if (opts.origin !== undefined) {
     clauses.push("origin = ?");
@@ -1128,7 +1146,11 @@ export async function hidePanelHistoryJobs(
   ids?: string[],
   opts: { userId?: string } = {}
 ): Promise<number> {
-  const clauses = ["status IN ('done', 'failed')", "origin = 'panel'"];
+  // Phase 3.3 §3.7: the same parents-only scope `GET /comfy/api/history`
+  // lists. Hiding the parent is enough -- children never appear in that
+  // listing, so a `delete` naming a child id must be as inert as one naming
+  // a job that does not exist.
+  const clauses = ["status IN ('done', 'failed')", "origin = 'panel'", "parent_id IS NULL"];
   const binds: unknown[] = [];
   if (opts.userId !== undefined) {
     clauses.push("user_id = ?");
@@ -1164,7 +1186,9 @@ export async function hasActiveJobs(db: D1Database): Promise<boolean> {
  * queue_remaining` badge. */
 export async function countQueueRemaining(db: D1Database): Promise<number> {
   const row = await db
-    .prepare("SELECT COUNT(*) AS n FROM jobs WHERE status IN ('queued', 'assigned', 'running')")
+    // Phase 3.3 §3.7: `parent_id IS NULL` so one submission counts once --
+    // without it a prompt split into 4 makes the panel's queue badge read 4.
+    .prepare("SELECT COUNT(*) AS n FROM jobs WHERE status IN ('queued', 'assigned', 'running') AND parent_id IS NULL")
     .first<{ n: number }>();
   return row?.n ?? 0;
 }

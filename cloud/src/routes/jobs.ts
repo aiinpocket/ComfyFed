@@ -153,6 +153,14 @@ async function jobDict(job: Job, hub?: DurableObjectNamespace): Promise<Record<s
     result_files: job.resultFiles,
     input_assets: job.inputAssets,
     est_vram_gb: job.estVramGb,
+    // Phase 3.3 §3.7: splitting and the dispatch rationale, shared by the list
+    // and the detail page. `parent_id`/`split_index` are null on an ordinary
+    // job; they only ever carry a value on a child, which `GET /api/jobs`
+    // hides unless `?include_children=1` asks for it.
+    split_count: job.splitCount,
+    parent_id: job.parentId,
+    split_index: job.splitIndex,
+    dispatch_info: job.dispatchInfo,
   };
   if (hub) {
     const progress = await queries.getFetchProgress(hub, job.id);
@@ -186,8 +194,44 @@ function parseJsonObject(text: string): Record<string, unknown> {
   }
 }
 
-async function jobDictFull(job: Job, receipt: Receipt | null, hub?: DurableObjectNamespace): Promise<Record<string, unknown>> {
-  return {
+/** `[children, gpuSecondsTotal]` for a parent -- ports jobs.py's
+ * `_children_summary`. One receipts query per child (D1 has no `IN (...)`
+ * helper here and a parent has at most `MAX_SPLIT` children), summing only
+ * BILLABLE receipts. A child with no receipt yet (still running, or cancelled
+ * before it started) reports `gpu_seconds: null` -- distinct from a genuine
+ * 0 -- and contributes nothing to the total. */
+async function childrenSummary(
+  db: D1Database,
+  parentId: string
+): Promise<[Record<string, unknown>[], number]> {
+  const children = await split.childrenOf(db, parentId);
+  const summary: Record<string, unknown>[] = [];
+  let total = 0;
+  for (const child of children) {
+    const receipts = await queries.getReceiptsForJob(db, child.id);
+    const billable = receipts.filter((r) => r.billable);
+    const gpuSeconds = billable.length > 0 ? billable.reduce((sum, r) => sum + r.gpuSeconds, 0) : null;
+    if (gpuSeconds !== null) total += gpuSeconds;
+    summary.push({
+      id: child.id,
+      split_index: child.splitIndex,
+      status: child.status,
+      worker_id: child.workerId,
+      progress: child.progress,
+      gpu_seconds: gpuSeconds,
+      error: child.error,
+    });
+  }
+  return [summary, total];
+}
+
+async function jobDictFull(
+  job: Job,
+  receipt: Receipt | null,
+  db: D1Database,
+  hub?: DurableObjectNamespace
+): Promise<Record<string, unknown>> {
+  const d: Record<string, unknown> = {
     ...(await jobDict(job, hub)),
     workflow_json: parseJsonObject(job.workflowJson),
     requirements: job.requirements,
@@ -196,8 +240,29 @@ async function jobDictFull(job: Job, receipt: Receipt | null, hub?: DurableObjec
     started_at: job.startedAt ? sqliteTimestampToIsoformat(job.startedAt) : null,
     finished_at: job.finishedAt ? sqliteTimestampToIsoformat(job.finishedAt) : null,
     result_hashes: job.resultHashes,
-    receipt: receipt ? receiptDict(receipt) : null,
   };
+
+  // Phase 3.3 §3.7: a parent job has no receipt of its own (each child mints
+  // one), so `receipt` is always null there and the detail page reads
+  // `children` / `gpu_seconds_total` instead. `outputs` gives it the
+  // (child, filename) pairs it needs to link each merged output at
+  // `/api/jobs/<child>/artifacts/<file>` -- the parent's own `result_files`
+  // column is always empty and the bytes live under the child that made them.
+  if (job.splitCount > 0) {
+    d.receipt = null;
+    const [children, gpuSecondsTotal] = await childrenSummary(db, job.id);
+    d.children = children;
+    d.gpu_seconds_total = gpuSecondsTotal;
+    d.outputs = (await split.parentOutputs(db, job)).map(([jobId, filename]) => ({
+      job_id: jobId,
+      filename,
+    }));
+  } else {
+    d.receipt = receipt ? receiptDict(receipt) : null;
+    d.children = [];
+    d.gpu_seconds_total = receipt ? receipt.gpuSeconds : 0;
+  }
+  return d;
 }
 
 // ---------------------------------------------------------------------------
@@ -370,7 +435,14 @@ app.get("/api/jobs", requireUser, async (c) => {
         .map((s) => s.trim())
         .filter((s) => s.length > 0)
     : undefined;
-  const jobs = await queries.listJobs(c.env.DB, statuses, isAdmin ? {} : { userId: user.uid });
+  // Parity with Python's `include_children: int = 0` FastAPI param: any
+  // value but an explicit 0 (or an empty one) opts in.
+  const includeChildrenParam = c.req.query("include_children");
+  const includeChildren = includeChildrenParam !== undefined && includeChildrenParam !== "" && includeChildrenParam !== "0";
+  const jobs = await queries.listJobs(c.env.DB, statuses, {
+    ...(isAdmin ? {} : { userId: user.uid }),
+    includeChildren,
+  });
 
   if (isAdmin) {
     const userIds = [...new Set(jobs.map((j) => j.userId).filter((id): id is string => id !== null))];
@@ -403,7 +475,7 @@ app.get("/api/jobs/:jobId", requireUser, async (c) => {
   // across attempts; the detail view shows the latest.
   const receipt = receipts.length > 0 ? receipts.slice().sort((a, b) => (a.createdAt < b.createdAt ? 1 : -1))[0]! : null;
 
-  return c.json(await jobDictFull(job, receipt, c.env.HUB));
+  return c.json(await jobDictFull(job, receipt, c.env.DB, c.env.HUB));
 });
 
 // --- GET /api/jobs/{id}/assessment ----------------------------------------

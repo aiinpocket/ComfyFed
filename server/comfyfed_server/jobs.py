@@ -187,6 +187,17 @@ def create_job(
         return job.id
 
 
+def _json_dict(raw) -> dict:
+    """Defensive parse of a JSON-object column into a dict -- anything that
+    isn't an object (a hand-edited row, a NULL, a list) reads as `{}` rather
+    than reaching the console as a surprise type."""
+    try:
+        value = json.loads(raw or "{}")
+    except (TypeError, ValueError):
+        return {}
+    return value if isinstance(value, dict) else {}
+
+
 def _job_dict(job: db.Job) -> dict:
     d = {
         "id": job.id,
@@ -199,6 +210,16 @@ def _job_dict(job: db.Job) -> dict:
         "result_files": json.loads(job.result_files or "[]"),
         "input_assets": json.loads(job.input_assets or "[]"),
         "est_vram_gb": job.est_vram_gb,
+        # Phase 3.3 §3.7: splitting and the dispatch rationale, shared by the
+        # list and the detail page (the console's split badge and its
+        # "predicted seconds, and on what basis" row read these).
+        # `parent_id`/`split_index` are null for an ordinary job; they only
+        # ever carry a value on a child, which `GET /api/jobs` hides unless
+        # `?include_children=1` asks for it.
+        "split_count": job.split_count or 0,
+        "parent_id": job.parent_id,
+        "split_index": job.split_index,
+        "dispatch_info": _json_dict(job.dispatch_info),
     }
     # Phase 2.1: transient model-auto-fetch progress (stage/fetch_pct/
     # fetch_model), NOT a Job column -- see agentws._fetch_progress's
@@ -235,8 +256,63 @@ def _job_dict_full(job: db.Job, receipt: Optional["db.Receipt"] = None) -> dict:
     d["started_at"] = job.started_at.isoformat() if job.started_at else None
     d["finished_at"] = job.finished_at.isoformat() if job.finished_at else None
     d["result_hashes"] = json.loads(job.result_hashes or "{}")
-    d["receipt"] = _receipt_dict(receipt) if receipt is not None else None
+
+    # Phase 3.3 §3.7: a parent job has no receipt of its own (each child mints
+    # one), so `receipt` is always None there and the detail page reads
+    # `children` / `gpu_seconds_total` instead. `outputs` gives it the
+    # `(child, filename)` pairs it needs to link each merged output at
+    # `/api/jobs/<child>/artifacts/<file>` -- a parent's own `result_files`
+    # column is always empty, and the bytes live under the child that
+    # produced them.
+    if (job.split_count or 0) > 0:
+        d["receipt"] = None
+        d["children"], d["gpu_seconds_total"] = _children_summary(job.id)
+        d["outputs"] = [
+            {"job_id": child_id, "filename": name} for child_id, name in split.parent_outputs(job)
+        ]
+    else:
+        d["receipt"] = _receipt_dict(receipt) if receipt is not None else None
+        d["children"] = []
+        d["gpu_seconds_total"] = receipt.gpu_seconds if receipt is not None else 0.0
     return d
+
+
+def _children_summary(parent_id: str) -> tuple[list[dict], float]:
+    """`(children, gpu_seconds_total)` -- the child summary rows plus the sum
+    of their BILLABLE receipts.
+
+    One query for every child's receipts rather than one per child: a parent
+    has at most `split.MAX_SPLIT` children, but this path runs on every open
+    of the detail page. A child with no receipt yet (still running, or
+    cancelled before it started) reports `gpu_seconds: None` -- distinct from
+    a genuine 0.0 -- and contributes nothing to the total.
+    """
+    children = split.children_of(parent_id)
+    child_ids = [c.id for c in children]
+    gpu_by_job: dict[str, float] = {}
+    if child_ids:
+        with db.get_session() as session:
+            rows = (
+                session.query(db.Receipt)
+                .filter(db.Receipt.job_id.in_(child_ids), db.Receipt.billable == True)  # noqa: E712
+                .all()
+            )
+        for row in rows:
+            gpu_by_job[row.job_id] = gpu_by_job.get(row.job_id, 0.0) + row.gpu_seconds
+
+    summary = [
+        {
+            "id": c.id,
+            "split_index": c.split_index,
+            "status": c.status,
+            "worker_id": c.worker_id,
+            "progress": c.progress,
+            "gpu_seconds": gpu_by_job.get(c.id),
+            "error": c.error,
+        }
+        for c in children
+    ]
+    return summary, sum(gpu_by_job.values())
 
 
 def _require_owner_or_admin(job: db.Job, user: auth.SessionUser) -> None:
@@ -331,10 +407,20 @@ def create_router(data_dir: str) -> APIRouter:
         return {"job_id": job_id}
 
     @r.get("/api/jobs")
-    def list_jobs(status: Optional[str] = None, user: auth.SessionUser = Depends(auth.require_user)):
+    def list_jobs(
+        status: Optional[str] = None,
+        include_children: int = 0,
+        user: auth.SessionUser = Depends(auth.require_user),
+    ):
         is_admin = user.role == "admin"
         with db.get_session() as session:
             query = session.query(db.Job)
+            if not include_children:
+                # Phase 3.3 §3.7: only parent/ordinary jobs by default -- a
+                # child is an implementation detail of the split, and listing
+                # it alongside its parent would show one submission k+1 times.
+                # `?include_children=1` opts into the full picture.
+                query = query.filter(db.Job.parent_id == None)  # noqa: E711
             if not is_admin:
                 query = query.filter(db.Job.user_id == user.uid)
             if status:

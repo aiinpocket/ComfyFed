@@ -152,6 +152,16 @@ export interface JobOutputsInput {
   id: string;
   workflowJson: string;
   resultFiles: unknown[];
+  /** Phase 3.3 §3.7: a PARENT job's outputs are its children's files --
+   * `[[childId, filename], ...]` from `split.parentOutputs`, already in
+   * split_index then per-child file order. Given, it replaces `resultFiles`
+   * entirely (a parent's own column is always empty) and each entry's
+   * `subfolder` becomes the child that holds the bytes, so `/view` (and the
+   * text-artifact read below) resolves to the right job. Resolved by the
+   * CALLER rather than here so this module keeps having no dependency on
+   * `db/queries.ts`; the Python twin branches inside `job_outputs` itself
+   * because it already has DB access there. */
+  splitOutputs?: [string, string][];
 }
 
 /** Builds the `{node_id: {...}}` mapping ComfyUI's frontend expects for a
@@ -160,28 +170,41 @@ export interface JobOutputsInput {
  * duplication contract; not re-explained here to avoid the two drifting.
  * Empty until the job has result files. */
 export async function jobOutputs(job: JobOutputsInput, store: R2Bucket): Promise<Record<string, OutputPayload>> {
-  const files = job.resultFiles.filter((f): f is string => typeof f === "string");
-  if (files.length === 0) return {};
+  // Entries are `[owning job id, filename]` PAIRS, not a filename list with a
+  // name -> owner side table: two children of the same parent routinely
+  // produce the SAME filename (every worker numbers `ComfyUI_00001_.png` from
+  // its own counter), and a name-keyed map would hand both copies the last
+  // child's subfolder -- i.e. serve one child's image twice.
+  const entries: [string, string][] =
+    job.splitOutputs !== undefined
+      ? job.splitOutputs
+      : job.resultFiles.filter((f): f is string => typeof f === "string").map((name) => [job.id, name]);
+  if (entries.length === 0) return {};
 
-  const textFiles = files.filter((f) => f.toLowerCase().endsWith(TEXT_ARTIFACT_EXT));
-  const mediaFiles = files.filter((f) => !textFiles.includes(f));
+  const isText = (name: string) => name.toLowerCase().endsWith(TEXT_ARTIFACT_EXT);
+  const textEntries = entries.filter(([, name]) => isText(name));
+  const mediaEntries = entries.filter(([, name]) => !isText(name));
 
   const workflow = parseWorkflow(job.workflowJson);
   const result: Record<string, OutputPayload> = {};
 
-  if (mediaFiles.length > 0) {
+  if (mediaEntries.length > 0) {
     const mediaIds = nodeIdsOfClass(workflow, MEDIA_OUTPUT_NODE_CLASSES);
     const key = mediaIds[0] ?? FALLBACK_OUTPUT_KEY;
     mergeOutput(result, key, {
-      images: mediaFiles.map((name) => ({ filename: name, subfolder: job.id, type: "output" })),
+      images: mediaEntries.map(([owner, name]) => ({ filename: name, subfolder: owner, type: "output" })),
     });
   }
 
-  if (textFiles.length > 0) {
+  if (textEntries.length > 0) {
     const texts = (
-      await Promise.all(textFiles.map((name) => readTextArtifact(store, job.id, name)))
+      await Promise.all(textEntries.map(([owner, name]) => readTextArtifact(store, owner, name)))
     ).filter((content): content is string => content !== null);
-    const fileEntries = textFiles.map((name) => ({ filename: name, subfolder: job.id, type: "output" }));
+    const fileEntries = textEntries.map(([owner, name]) => ({
+      filename: name,
+      subfolder: owner,
+      type: "output",
+    }));
 
     // Only the FIRST SaveText node (sorted by id) gets a payload -- matches
     // comfyapi.py's documented (not "fixed") one-SaveText-per-workflow

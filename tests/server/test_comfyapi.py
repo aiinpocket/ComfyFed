@@ -1327,8 +1327,8 @@ def test_read_text_artifact_memoizes_per_job_and_filename(client, monkeypatch):
 
         monkeypatch.setattr(storage.LocalStore, "open", counting_open)
 
-        first = comfyapi._read_text_artifact(job, "comfyfed_prompt.txt")
-        second = comfyapi._read_text_artifact(job, "comfyfed_prompt.txt")
+        first = comfyapi._read_text_artifact(job.id, "comfyfed_prompt.txt")
+        second = comfyapi._read_text_artifact(job.id, "comfyfed_prompt.txt")
 
         assert first == second == "cached text"
         assert len(calls) == 1
@@ -1349,12 +1349,12 @@ def test_read_text_artifact_does_not_cache_a_failed_read(client):
 
     with db.get_session() as session:
         job = session.get(db.Job, prompt_id)
-        assert comfyapi._read_text_artifact(job, "late.txt") is None
+        assert comfyapi._read_text_artifact(job.id, "late.txt") is None
 
         # The worker's upload lands after the first (failed) read.
         storage.get_store(client.data_dir).put(prompt_id, "late.txt", io.BytesIO(b"finally"))
 
-        assert comfyapi._read_text_artifact(job, "late.txt") == "finally"
+        assert comfyapi._read_text_artifact(job.id, "late.txt") == "finally"
 
 
 def test_read_text_artifact_cache_evicts_oldest_past_128_entries(client):
@@ -1371,10 +1371,8 @@ def test_read_text_artifact_cache_evicts_oldest_past_128_entries(client):
         )
         jobs.append(prompt_id)
 
-    with db.get_session() as session:
-        for i, prompt_id in enumerate(jobs):
-            job = session.get(db.Job, prompt_id)
-            comfyapi._read_text_artifact(job, f"n{i}.txt")
+    for i, prompt_id in enumerate(jobs):
+        comfyapi._read_text_artifact(prompt_id, f"n{i}.txt")
 
     assert len(comfyapi._text_artifact_cache) == 128
     assert (jobs[0], "n0.txt") not in comfyapi._text_artifact_cache
@@ -1976,3 +1974,117 @@ def test_panel_settings_are_isolated_between_users_and_a_legacy_global_blob_is_t
         "Comfy.ColorPalette": "legacy-theme",
         "Comfy.Zoom": 2.0,
     }
+
+
+# --- Phase 3.3 §3.7: the panel only ever sees the parent ----------------------
+
+
+def _split_family(uid, *, parent_status="done", child_statuses=("done", "done")):
+    """A parent plus len(child_statuses) children, all panel-origin and owned
+    by `uid` (children inherit both from the parent -- see split.create_children)."""
+    workflow = json.dumps({"2": {"class_type": "SaveImage", "inputs": {}}})
+    with db.get_session() as session:
+        session.add(
+            db.Job(
+                id="p",
+                workflow_json=workflow,
+                status=parent_status,
+                origin="panel",
+                user_id=uid,
+                split_count=len(child_statuses),
+            )
+        )
+        for index, status in enumerate(child_statuses):
+            session.add(
+                db.Job(
+                    id=f"c{index}",
+                    workflow_json=workflow,
+                    status=status,
+                    origin="panel",
+                    user_id=uid,
+                    parent_id="p",
+                    split_index=index,
+                    result_files=json.dumps([f"c{index}.png"]) if status == "done" else "[]",
+                )
+            )
+        session.commit()
+
+
+def test_history_hides_children_and_merges_their_outputs(client):
+    _login(client)
+    _split_family(_uid())
+
+    body = client.get("/comfy/api/history").json()
+    assert list(body) == ["p"]
+    images = body["p"]["outputs"]["2"]["images"]
+    assert images == [
+        {"filename": "c0.png", "subfolder": "c0", "type": "output"},
+        {"filename": "c1.png", "subfolder": "c1", "type": "output"},
+    ]
+
+
+def test_history_by_prompt_id_returns_nothing_for_a_child(client):
+    _login(client)
+    _split_family(_uid())
+
+    assert client.get("/comfy/api/history/c0").json() == {}
+    assert list(client.get("/comfy/api/history/p").json()) == ["p"]
+
+
+def test_queue_hides_children(client):
+    _login(client)
+    _split_family(_uid(), parent_status="running", child_statuses=("running", "queued"))
+
+    body = client.get("/comfy/api/queue").json()
+    ids = [entry[1] for entry in body["queue_running"] + body["queue_pending"]]
+    assert ids == ["p"]
+
+
+def test_hiding_a_parent_from_history_hides_the_whole_family(client):
+    _login(client)
+    _split_family(_uid())
+
+    r = client.post("/comfy/api/history", json={"delete": ["p"]})
+    assert r.status_code == 200
+    assert client.get("/comfy/api/history").json() == {}
+
+
+def test_view_serves_a_childs_file_through_the_child_subfolder(client):
+    _login(client)
+    _split_family(_uid())
+    store = storage.get_store(client.data_dir)
+    store.put("c1", "c1.png", io.BytesIO(b"child-bytes"))
+
+    r = client.get("/comfy/api/view", params={"filename": "c1.png", "subfolder": "c1"})
+    assert r.status_code == 200
+    assert r.content == b"child-bytes"
+
+
+def test_view_refuses_another_users_child_file(client):
+    admin_csrf = _login(client)
+    _create_user(client, admin_csrf, "alice")
+    _split_family(_uid("alice"))
+    store = storage.get_store(client.data_dir)
+    store.put("c1", "c1.png", io.BytesIO(b"child-bytes"))
+
+    r = client.get("/comfy/api/view", params={"filename": "c1.png", "subfolder": "c1"})
+    assert r.status_code == 404
+
+
+def test_history_keeps_each_child_as_the_owner_of_a_colliding_filename(client):
+    """Every worker numbers `ComfyUI_00001_.png` from its own counter, so two
+    children of one parent routinely produce the SAME filename -- each entry
+    must keep ITS OWN child as the subfolder, or one child's image is served
+    twice and the other is unreachable."""
+    _login(client)
+    _split_family(_uid())
+    with db.get_session() as session:
+        for child_id in ("c0", "c1"):
+            session.get(db.Job, child_id).result_files = json.dumps(["ComfyUI_00001_.png"])
+        session.commit()
+
+    body = client.get("/comfy/api/history").json()
+    assert body["p"]["outputs"]["2"]["images"] == [
+        {"filename": "ComfyUI_00001_.png", "subfolder": "c0", "type": "output"},
+        {"filename": "ComfyUI_00001_.png", "subfolder": "c1", "type": "output"},
+    ]

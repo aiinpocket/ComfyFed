@@ -789,6 +789,20 @@ def refresh_parent_progress(job_id: str) -> Optional[float]:
         return progress
 
 
+def mean_child_progress(parent_id: str) -> Optional[float]:
+    """§3.4：父 job 對外的進度 = 子 job 進度的平均（沒有子 job 就是 None）。
+
+    唯讀，一次查詢，不寫任何東西 —— `refresh_parent_progress` 是「算完就寫進
+    父 job」的那一個，這個是「現在算出來給呼叫端看」的那一個。面板的 progress
+    事件（`panelws.job_progress`）用它：那個事件發在 `refresh_parent_progress`
+    之前，直接讀父 job 的欄位會慢一拍。
+    """
+    children = children_of(parent_id)
+    if not children:
+        return None
+    return sum(c.progress or 0.0 for c in children) / len(children)
+
+
 def parent_outputs(parent) -> list[tuple[str, str]]:
     """§3.4：父 job 對外的輸出 = 子 job 的 `result_files`，依 `split_index`
     再依各自檔案順序串起來，因此和整批一次跑的輸出順序一致。

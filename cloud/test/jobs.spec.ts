@@ -964,3 +964,125 @@ describe("POST /api/jobs upload limits", () => {
     }
   });
 });
+
+// --- Phase 3.3 §3.7: the console sees parents, children only on request -----
+//
+// JSON-shape parity with the Python stack: the same keys, the same nesting as
+// `jobs.py`'s `_job_dict` / `_job_dict_full` (tests/server/test_jobs.py).
+
+describe("split families on the console API (§3.7)", () => {
+  async function makeSplitFamily(uid: string | null = null): Promise<void> {
+    const now = new Date().toISOString().slice(0, 19).replace("T", " ");
+    await db()
+      .prepare(
+        `INSERT INTO jobs (id, workflow_json, status, created_at, split_count, user_id)
+         VALUES ('p', '{}', 'done', ?, 2, ?)`
+      )
+      .bind(now, uid)
+      .run();
+    for (let index = 0; index < 2; index++) {
+      await db()
+        .prepare(
+          `INSERT INTO jobs (id, workflow_json, status, created_at, parent_id, split_index,
+                             worker_id, progress, result_files, user_id)
+           VALUES (?, '{}', 'done', ?, 'p', ?, ?, 1.0, ?, ?)`
+        )
+        .bind(`c${index}`, now, index, `w${index}`, JSON.stringify([`c${index}.png`]), uid)
+        .run();
+      await db()
+        .prepare(
+          `INSERT INTO receipts (id, job_id, worker_id, gpu_seconds, platform_sig, kind, billable, created_at)
+           VALUES (?, ?, ?, ?, 'sig', 'completed', 1, ?)`
+        )
+        .bind(`r${index}`, `c${index}`, `w${index}`, 10 * (index + 1), now)
+        .run();
+    }
+  }
+
+  it("hides children from GET /api/jobs by default", async () => {
+    const { cookie } = await adminSession();
+    await makeSplitFamily();
+    const r = await call("/api/jobs", { method: "GET", cookie });
+    expect(r.body.map((j: any) => j.id)).toEqual(["p"]);
+    expect(r.body[0].split_count).toBe(2);
+    expect(r.body[0].parent_id).toBeNull();
+  });
+
+  it("lists everything with ?include_children=1", async () => {
+    const { cookie } = await adminSession();
+    await makeSplitFamily();
+    const r = await call("/api/jobs?include_children=1", { method: "GET", cookie });
+    expect(r.body.map((j: any) => j.id).sort()).toEqual(["c0", "c1", "p"]);
+    const c0 = r.body.find((j: any) => j.id === "c0");
+    expect(c0.parent_id).toBe("p");
+    expect(c0.split_index).toBe(0);
+  });
+
+  it("returns children and gpu_seconds_total for a parent", async () => {
+    const { cookie } = await adminSession();
+    await makeSplitFamily();
+    const r = await call("/api/jobs/p", { method: "GET", cookie });
+    expect(r.body.receipt).toBeNull();
+    expect(r.body.split_count).toBe(2);
+    expect(r.body.gpu_seconds_total).toBeCloseTo(30);
+    expect(r.body.children).toEqual([
+      { id: "c0", split_index: 0, status: "done", worker_id: "w0", progress: 1, gpu_seconds: 10, error: null },
+      { id: "c1", split_index: 1, status: "done", worker_id: "w1", progress: 1, gpu_seconds: 20, error: null },
+    ]);
+    expect(r.body.outputs).toEqual([
+      { job_id: "c0", filename: "c0.png" },
+      { job_id: "c1", filename: "c1.png" },
+    ]);
+  });
+
+  it("gives a plain job empty children and no outputs key", async () => {
+    const { cookie, csrf } = await adminSession();
+    const submit = await submitJob(cookie, csrf, { "1": { class_type: "KSampler", inputs: {} } });
+    const r = await call(`/api/jobs/${submit.body.job_id}`, { method: "GET", cookie });
+    expect(r.body.children).toEqual([]);
+    expect(r.body.gpu_seconds_total).toBe(0);
+    expect(r.body.split_count).toBe(0);
+    expect(r.body.outputs).toBeUndefined();
+  });
+
+  it("reports a child with no receipt as gpu_seconds: null", async () => {
+    const { cookie } = await adminSession();
+    const now = new Date().toISOString().slice(0, 19).replace("T", " ");
+    await db()
+      .prepare(
+        `INSERT INTO jobs (id, workflow_json, status, created_at, split_count) VALUES ('p', '{}', 'running', ?, 1)`
+      )
+      .bind(now)
+      .run();
+    await db()
+      .prepare(
+        `INSERT INTO jobs (id, workflow_json, status, created_at, parent_id, split_index)
+         VALUES ('c0', '{}', 'running', ?, 'p', 0)`
+      )
+      .bind(now)
+      .run();
+    const r = await call("/api/jobs/p", { method: "GET", cookie });
+    expect(r.body.children[0].gpu_seconds).toBeNull();
+    expect(r.body.gpu_seconds_total).toBe(0);
+  });
+
+  it("carries dispatch_info on both the list and the detail view", async () => {
+    const { cookie } = await adminSession();
+    const now = new Date().toISOString().slice(0, 19).replace("T", " ");
+    await db()
+      .prepare(
+        `INSERT INTO jobs (id, workflow_json, status, created_at, dispatch_info) VALUES ('j1', '{}', 'assigned', ?, ?)`
+      )
+      .bind(
+        now,
+        JSON.stringify({ predicted_seconds: 41.2, basis: "signature", load_seconds: 0, fetch_seconds: 0, candidates: 3 })
+      )
+      .run();
+    const detail = await call("/api/jobs/j1", { method: "GET", cookie });
+    expect(detail.body.dispatch_info.basis).toBe("signature");
+    expect(detail.body.dispatch_info.predicted_seconds).toBeCloseTo(41.2);
+
+    const list = await call("/api/jobs", { method: "GET", cookie });
+    expect(list.body[0].dispatch_info.candidates).toBe(3);
+  });
+});

@@ -626,6 +626,18 @@ export async function refreshParentProgress(db: D1Database, jobId: string): Prom
   return progress;
 }
 
+/** §3.4 -- ports `split.mean_child_progress`：父 job 對外的進度 = 子 job 進度
+ * 的平均（沒有子 job 就是 null）。唯讀，一次查詢，不寫任何東西 --
+ * `refreshParentProgress` 是「算完就寫進父 job」的那一個，這個是「現在算出來
+ * 給呼叫端看」的那一個。面板的 progress 事件（hub.ts 的 `panelJobProgress`）
+ * 用它：那個事件發在 `refreshParentProgress` 之前，直接讀父 job 的欄位會慢
+ * 一拍。 */
+export async function meanChildProgress(db: D1Database, parentId: string): Promise<number | null> {
+  const children = await childrenOf(db, parentId);
+  if (children.length === 0) return null;
+  return children.reduce((sum, c) => sum + (c.progress || 0), 0) / children.length;
+}
+
 /** §3.4 -- ports `split.parent_outputs`：`[[childId, filename], ...]`，依
  * split_index 再依各自檔案順序，所以和整批一次跑的輸出順序一致。childId 是
  * 面板 `/view` 用來找到真正持有檔案的那個 job 的 `subfolder`。 */

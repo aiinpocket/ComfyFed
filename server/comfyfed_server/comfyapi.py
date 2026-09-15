@@ -82,6 +82,7 @@ from . import (
     model_guide,
     model_manifest,
     panelws,
+    split,
     storage,
     workers,
 )
@@ -534,10 +535,15 @@ def _queue_entry(number: int, job: db.Job) -> list:
     return [number, job.id, workflow, extra_data, _output_node_ids(workflow)]
 
 
-def _read_text_artifact(job: db.Job, filename: str) -> Optional[str]:
+def _read_text_artifact(job_id: str, filename: str) -> Optional[str]:
     """Best-effort read of a `.txt` artifact's content for the panel preview.
 
-    Memoized in `_text_artifact_cache` per `(job.id, filename)` -- see that
+    Takes the OWNING job id rather than a row (Phase 3.3 §3.7): under a split
+    the job whose outputs are being rendered is the parent, but the bytes
+    live under the child that produced them, and that is the only thing this
+    ever needed off the row anyway.
+
+    Memoized in `_text_artifact_cache` per `(job_id, filename)` -- see that
     cache's comment for why this is sound (artifacts are immutable) and why
     a failed read is never cached (a retry after a late upload must still
     succeed). `job_outputs` stays synchronous either way; this only removes
@@ -549,7 +555,7 @@ def _read_text_artifact(job: db.Job, filename: str) -> Optional[str]:
     missing, ...) returns `None` so the caller falls back to a files-only
     entry instead of ever raising out of `job_outputs`.
     """
-    cache_key = (job.id, filename)
+    cache_key = (job_id, filename)
     cached = _text_artifact_cache.get(cache_key)
     if cached is not None:
         _text_artifact_cache.move_to_end(cache_key)
@@ -559,7 +565,7 @@ def _read_text_artifact(job: db.Job, filename: str) -> Optional[str]:
         return None
     try:
         store = storage.get_store(_data_dir)
-        with store.open(job.id, filename) as f:
+        with store.open(job_id, filename) as f:
             raw = f.read(_TEXT_ARTIFACT_MAX_BYTES)
     except Exception:  # noqa: BLE001 -- "never raise" is the explicit contract here
         return None
@@ -621,17 +627,37 @@ def job_outputs(job: db.Job) -> dict:
     purpose (its outputs live under `output/<subfolder>/`), so this is a
     shape the stock frontend already handles -- no client change needed.
     """
-    files = _result_files(job)
-    if not files:
-        return {}
+    # Phase 3.3 §3.7: a parent job's own `result_files` is always empty -- its
+    # outputs are its CHILDREN's files, assembled by `split.parent_outputs` in
+    # split_index order and then each child's own file order, which is the
+    # same order the batch would have produced had it run in one piece. The
+    # `subfolder` carries the id of the child that actually holds the bytes,
+    # so `/view` (and `_read_text_artifact` below) resolves to the right job.
+    # Entries are `(owning job id, filename)` PAIRS, not a filename list with a
+    # name -> owner side table: two children of the same parent routinely
+    # produce the SAME filename (every worker numbers `ComfyUI_00001_.png`
+    # from its own counter), and a name-keyed map would hand both copies the
+    # last child's subfolder -- i.e. serve one child's image twice.
+    if (job.split_count or 0) > 0:
+        entries = split.parent_outputs(job)
+        if not entries:
+            return {}
+    else:
+        files = _result_files(job)
+        if not files:
+            return {}
+        entries = [(job.id, name) for name in files]
 
-    text_files = [f for f in files if os.path.splitext(f)[1].lower() == _TEXT_ARTIFACT_EXT]
-    media_files = [f for f in files if f not in text_files]
+    def _is_text(name: str) -> bool:
+        return os.path.splitext(name)[1].lower() == _TEXT_ARTIFACT_EXT
+
+    text_entries = [e for e in entries if _is_text(e[1])]
+    media_entries = [e for e in entries if not _is_text(e[1])]
 
     workflow = _workflow_of(job)
     result: dict = {}
 
-    if media_files:
+    if media_entries:
         media_ids = _node_ids_of_class(workflow, _MEDIA_OUTPUT_NODE_CLASSES)
         key = media_ids[0] if media_ids else FALLBACK_OUTPUT_KEY
         _merge_output(
@@ -639,20 +665,20 @@ def job_outputs(job: db.Job) -> dict:
             key,
             {
                 "images": [
-                    {"filename": name, "subfolder": job.id, "type": "output"}
-                    for name in media_files
+                    {"filename": name, "subfolder": owner, "type": "output"}
+                    for owner, name in media_entries
                 ]
             },
         )
 
-    if text_files:
+    if text_entries:
         texts = [
             content
-            for content in (_read_text_artifact(job, name) for name in text_files)
+            for content in (_read_text_artifact(owner, name) for owner, name in text_entries)
             if content is not None
         ]
         file_entries = [
-            {"filename": name, "subfolder": job.id, "type": "output"} for name in text_files
+            {"filename": name, "subfolder": owner, "type": "output"} for owner, name in text_entries
         ]
 
         # Only the FIRST `SaveText` node (sorted by id) gets a payload; a
@@ -1116,6 +1142,9 @@ def create_router(
                     db.Job.status.in_(_RUNNING_STATUSES + _PENDING_STATUSES),
                     db.Job.origin == "panel",
                     db.Job.user_id == user.uid,
+                    # Phase 3.3 §3.7: children are invisible here -- the panel
+                    # submitted ONE prompt and must see one queue entry, not k.
+                    db.Job.parent_id == None,  # noqa: E711
                 )
                 .order_by(db.Job.created_at.asc())
                 .all()
@@ -1150,6 +1179,10 @@ def create_router(
                     db.Job.status.in_(_RUNNING_STATUSES),
                     db.Job.origin == "panel",
                     db.Job.user_id == user.uid,
+                    # Phase 3.3 §3.7: interrupt the PROMPT, not one of its
+                    # children -- `cancel_and_notify` on the parent cancels
+                    # every child and tells each of their workers.
+                    db.Job.parent_id == None,  # noqa: E711
                 )
                 .order_by(db.Job.created_at.asc())
                 .first()
@@ -1192,6 +1225,10 @@ def create_router(
                         db.Job.status.in_(_PENDING_STATUSES + _RUNNING_STATUSES),
                         db.Job.origin == "panel",
                         db.Job.user_id == user.uid,
+                        # Phase 3.3 §3.7: cancel parents; each one cascades to
+                        # its own children (naming a child directly would
+                        # cancel the whole family anyway, via refresh_parent).
+                        db.Job.parent_id == None,  # noqa: E711
                     )
                     .all()
                 ]
@@ -1209,6 +1246,7 @@ def create_router(
                             db.Job.id.in_(requested_ids),
                             db.Job.origin == "panel",
                             db.Job.user_id == user.uid,
+                            db.Job.parent_id == None,  # noqa: E711
                         )
                         .all()
                     ]
@@ -1250,6 +1288,9 @@ def create_router(
                     db.Job.panel_hidden == False,  # noqa: E712
                     db.Job.origin == "panel",
                     db.Job.user_id == user.uid,
+                    # Phase 3.3 §3.7: parents only -- a child's outputs reach
+                    # the panel merged into its parent's entry (`job_outputs`).
+                    db.Job.parent_id == None,  # noqa: E711
                 )
                 .order_by(db.Job.finished_at.asc(), db.Job.created_at.asc())
             )
@@ -1271,6 +1312,9 @@ def create_router(
                 or job.panel_hidden
                 or job.origin != "panel"
                 or job.user_id != user.uid
+                # Phase 3.3 §3.7: a child id is not a prompt id the panel was
+                # ever given, so it answers like any other unknown id.
+                or job.parent_id is not None
             ):
                 # Upstream returns {} for an unknown prompt id, never a 404.
                 return JSONResponse(content={})
@@ -1306,6 +1350,12 @@ def create_router(
                 db.Job.status.in_(_HISTORY_STATUSES),
                 db.Job.origin == "panel",
                 db.Job.user_id == user.uid,
+                # Phase 3.3 §3.7: the same parents-only scope `GET /history`
+                # lists. Hiding the parent is enough -- children never appear
+                # in the listing to begin with, so there is nothing to hide
+                # about them, and a `delete` naming a child id must be as
+                # inert as one naming a job that does not exist.
+                db.Job.parent_id == None,  # noqa: E711
             )
             if not body.get("clear"):
                 requested = body.get("delete")
@@ -1369,6 +1419,11 @@ def create_router(
                 job_id = storage.sanitize_path_component(subfolder, what="subfolder")
             except ValueError:
                 return Response(status_code=400)
+            # Phase 3.3 §3.7: after a split the `subfolder` may be a CHILD
+            # job's id. A child inherits its parent's origin and user_id
+            # (split.create_children), so the same authorization check below
+            # holds unchanged, and `_result_files(child)` really does contain
+            # the filename -- the parent's own column is empty.
             with db.get_session() as session:
                 job = session.get(db.Job, job_id)
                 if (

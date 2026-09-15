@@ -9,6 +9,7 @@ envelopes per `server.py` / `execution.py`.
 
 import asyncio
 import io
+import json
 import time
 
 import pytest
@@ -991,3 +992,139 @@ def test_disabling_a_user_closes_their_open_panel_socket(client, two_users):
 
         with pytest.raises(WebSocketDisconnect):
             bob_ws.receive_json()
+
+
+# --- Phase 3.3 §3.7: children are invisible to the panel ----------------------
+#
+# Every job event the agent socket raises names the CHILD (that is the job a
+# worker actually runs). The panel never saw the split happen, so panelws
+# re-points each of them at the parent -- and a `job_done` for one child of a
+# still-unfinished parent must not close the prompt out at all.
+
+
+def _split_family(parent_status="running", children=(("c0", "running", 0.0),), split_count=2):
+    with db.get_session() as session:
+        session.add(
+            db.Job(
+                id="p",
+                workflow_json=json.dumps({"2": {"class_type": "SaveImage", "inputs": {}}}),
+                status=parent_status,
+                origin="panel",
+                user_id="u1",
+                split_count=split_count,
+            )
+        )
+        for index, (child_id, status, progress) in enumerate(children):
+            session.add(
+                db.Job(
+                    id=child_id,
+                    workflow_json=json.dumps({"2": {"class_type": "SaveImage", "inputs": {}}}),
+                    status=status,
+                    origin="panel",
+                    user_id="u1",
+                    parent_id="p",
+                    split_index=index,
+                    progress=progress,
+                    result_files=json.dumps([f"{child_id}.png"]) if status == "done" else "[]",
+                )
+            )
+        session.commit()
+
+
+async def test_child_progress_is_reported_as_the_parent_mean(client):
+    _split_family(children=(("c0", "running", 0.5), ("c1", "running", 0.1)))
+    _sid, ws = _register_on_current_loop()
+
+    await panelws.job_progress("c0", 0.5)
+
+    assert ws.sent == [
+        {"type": "progress", "data": {"value": 30, "max": 100, "prompt_id": "p"}}
+    ]
+
+
+async def test_child_running_is_reported_as_the_parent(client):
+    _split_family()
+    _sid, ws = _register_on_current_loop()
+
+    await panelws.job_running("c0")
+
+    assert ws.sent[0]["type"] == "executing"
+    assert ws.sent[0]["data"]["prompt_id"] == "p"
+
+
+async def test_child_failure_is_reported_as_the_parent(client):
+    _split_family()
+    _sid, ws = _register_on_current_loop()
+
+    await panelws.job_failed("c0", "boom")
+
+    assert ws.sent[0]["type"] == "execution_error"
+    assert ws.sent[0]["data"]["prompt_id"] == "p"
+
+
+async def test_child_cancel_is_reported_as_the_parent(client):
+    _split_family()
+    _sid, ws = _register_on_current_loop()
+
+    await panelws.job_cancelled("c0")
+
+    assert ws.sent[0]["data"]["prompt_id"] == "p"
+
+
+async def test_a_child_finishing_alone_emits_no_executed(client):
+    _split_family(children=(("c0", "done", 1.0), ("c1", "running", 0.0)))
+    _sid, ws = _register_on_current_loop()
+
+    with db.get_session() as session:
+        child = session.get(db.Job, "c0")
+        await panelws.job_done(child)
+
+    assert [e["type"] for e in ws.sent] == ["status"]
+
+
+async def test_the_last_child_finishing_emits_the_parents_merged_outputs(client):
+    _split_family(
+        parent_status="done", children=(("c0", "done", 1.0), ("c1", "done", 1.0))
+    )
+    _sid, ws = _register_on_current_loop()
+
+    with db.get_session() as session:
+        child = session.get(db.Job, "c1")
+        await panelws.job_done(child)
+
+    assert [e["type"] for e in ws.sent] == ["executed", "executing", "status"]
+    executed = ws.sent[0]["data"]
+    assert executed["prompt_id"] == "p"
+    assert executed["output"]["images"] == [
+        {"filename": "c0.png", "subfolder": "c0", "type": "output"},
+        {"filename": "c1.png", "subfolder": "c1", "type": "output"},
+    ]
+    assert ws.sent[1]["data"] == {"node": None, "prompt_id": "p"}
+
+
+async def test_a_requeued_child_only_clears_the_parent_when_it_went_back_to_queue(client):
+    """A stale requeue of ONE child leaves the parent running via its siblings
+    -- clearing `executing` then would blank a prompt that is still going."""
+    _split_family(children=(("c0", "queued", 0.0), ("c1", "running", 0.0)))
+    _sid, ws = _register_on_current_loop()
+
+    await panelws.job_requeued("c0")
+    assert ws.sent == []
+
+    with db.get_session() as session:
+        session.get(db.Job, "p").status = "queued"
+        session.commit()
+
+    await panelws.job_requeued("c0")
+    assert ws.sent[0]["data"] == {"node": None, "prompt_id": "p"}
+
+
+def test_queue_status_counts_a_split_family_once(client):
+    _split_family(children=(("c0", "running", 0.0), ("c1", "queued", 0.0)))
+    assert panelws.queue_status() == {"exec_info": {"queue_remaining": 1}}
+
+
+async def test_an_event_for_a_vanished_job_is_still_dropped(client):
+    _sid, ws = _register_on_current_loop()
+    await panelws.job_progress("nope", 0.5)
+    assert ws.sent == []
