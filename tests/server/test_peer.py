@@ -387,6 +387,33 @@ def test_peer_grant_chunk_sha256s_null_when_not_established(client):
     assert r.json()["chunk_sha256s"] is None
 
 
+def test_grant_ttl_scales_with_the_file_size():
+    """一張授權單至少要撐得過「以 agent 預設上限 20 Mbps 傳完整個檔案」。
+
+    At the agent's default active cap (20 Mbps = 2.5 MB/s) a 6.5 GB model
+    takes ~43 min, so a flat 600 s TTL expired ~4x before the transfer ended:
+    post-expiry bytes went unaccounted and resumes were refused. Small files
+    keep the 600 s floor.
+    """
+    assert peer.MIN_ASSUMED_RATE_BYTES_PER_SEC == 20_000_000 // 8
+
+    # 6.5 GB: 2600 s at 2.5 MB/s -> 3900 s of transfer slack + 600 s floor.
+    big = peer.grant_ttl_seconds(round(6.5 * 1000 ** 3))
+    assert big >= 3900
+
+    # A 10 MB model stays at the 600 s baseline (its 4 s transfer estimate
+    # adds only a rounding-level 6 s of slack on top of the floor).
+    small = peer.grant_ttl_seconds(10 * 1000 ** 2)
+    assert peer.GRANT_TTL_SECONDS <= small <= peer.GRANT_TTL_SECONDS + 10
+
+    # Degenerate inputs never drop below the floor.
+    assert peer.grant_ttl_seconds(0) == peer.GRANT_TTL_SECONDS
+    assert peer.grant_ttl_seconds(-1) == peer.GRANT_TTL_SECONDS
+
+    # Monotonic in size.
+    assert peer.grant_ttl_seconds(2 * 1024 ** 3) > peer.grant_ttl_seconds(1024 ** 3)
+
+
 def test_peer_grant_expiry_is_ttl_seconds_ahead(client):
     csrf = _login(client)
     sha = _sha("model")
@@ -400,7 +427,10 @@ def test_peer_grant_expiry_is_ttl_seconds_ahead(client):
     )
     after = int(time.time())
     expires_at = r.json()["grant"]["expires_at"]
-    assert before + peer.GRANT_TTL_SECONDS <= expires_at <= after + peer.GRANT_TTL_SECONDS
+    # Size-scaled now (`grant_ttl_seconds`), not a flat 600 s.
+    ttl = peer.grant_ttl_seconds(_bytes(1.0))
+    assert ttl > peer.GRANT_TTL_SECONDS
+    assert before + ttl <= expires_at <= after + ttl
 
 
 def test_peer_grant_rejects_a_name_containing_the_payload_delimiter(client):

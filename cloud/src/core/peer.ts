@@ -16,8 +16,30 @@ import type { Worker } from "../db/queries";
 import { signHex } from "../lib/ed25519";
 import { buildGrantPayload, GRANT_FIELDS, type GrantFields } from "../lib/signing";
 
-/** Global Constraints: TTL 600s, single file/puller/seeder per grant. */
+/** Global Constraints: TTL 600s (the FLOOR -- see `grantTtlSeconds`), single
+ * file/puller/seeder per grant. */
 export const GRANT_TTL_SECONDS = 600;
+
+/** The slowest transfer rate a grant's TTL is sized for -- ports peer.py's
+ * `MIN_ASSUMED_RATE_BYTES_PER_SEC`. It tracks the agent's DEFAULT ACTIVE
+ * upload cap (`peer_upload_limit_mbps = 20` Mbps -> 20_000_000 / 8 bytes per
+ * second, see `agent/comfyfed_agent/peerserve.py`). Keep the two in step. */
+export const MIN_ASSUMED_RATE_BYTES_PER_SEC = 2_500_000;
+
+/** How long a grant for a `sizeBytes` file must live -- ports peer.py's
+ * `grant_ttl_seconds`, same formula, same constants.
+ *
+ * At the agent's default active upload cap a 6.5 GB model takes ~43 minutes,
+ * ~4x the flat 600 s TTL: bytes served past expiry went unaccounted and any
+ * resume after expiry was refused. So the TTL scales with the file: the
+ * estimated transfer time at `MIN_ASSUMED_RATE_BYTES_PER_SEC`, times 1.5 for
+ * slack, plus the flat `GRANT_TTL_SECONDS` of headroom -- never below the
+ * 600 s floor. */
+export function grantTtlSeconds(sizeBytes: number): number {
+  const size = Number.isFinite(sizeBytes) && sizeBytes > 0 ? Math.floor(sizeBytes) : 0;
+  const transfer = Math.ceil(size / MIN_ASSUMED_RATE_BYTES_PER_SEC);
+  return Math.floor(Math.max(GRANT_TTL_SECONDS, transfer * 1.5 + GRANT_TTL_SECONDS));
+}
 
 /** Global Constraints: agent protocol becomes 4 for P2P; older agents never
  * advertise peer_url and are never picked as a seeder. */

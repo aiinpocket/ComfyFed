@@ -1633,7 +1633,8 @@ export async function countActiveP2pGrantsForSeeder(db: D1Database, seederId: st
 /** M4 final-review fix: retention window (seconds) past `expires_at` before
  * a grant row is actually pruned -- mirrors peer.py's
  * `_GRANT_RETENTION_SECONDS`. A grant whose transfer is still active when
- * its 600s TTL elapses must still be found by an expiry-triggered
+ * its TTL elapses (see `grantTtlSeconds`) must still be found by an
+ * expiry-triggered
  * `peer-served` report; pruning at the exact TTL boundary guarantees that
  * report 404s and retries forever. `countActiveP2pGrantsForSeeder`'s
  * `expires_at > now` filter already keeps a retained-but-expired grant out

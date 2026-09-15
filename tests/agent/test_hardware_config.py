@@ -670,6 +670,9 @@ def test_config_peer_upload_limit_coercion(tmp_path):
         ("abc", 20.0),
         (-5, 20.0),
         (float("inf"), 20.0),
+        # json.dumps emits a bare `NaN` and json.load reads it straight back
+        # -- the same hand-edited-file path as `Infinity` above.
+        (float("nan"), 20.0),
         (None, 20.0),
     ]
     for raw, expected in cases:
@@ -678,7 +681,10 @@ def test_config_peer_upload_limit_coercion(tmp_path):
         path.write_text(_json.dumps({"peer_upload_limit_mbps": raw}), encoding="utf-8")
         assert AgentConfig.load(str(path)).peer_upload_limit_mbps == expected
 
-    idle_cases = [("0", 0.0), (25, 25.0), ("abc", 0.0), (-5, 0.0), (float("inf"), 0.0)]
+    idle_cases = [
+        ("0", 0.0), (25, 25.0), ("abc", 0.0), (-5, 0.0),
+        (float("inf"), 0.0), (float("nan"), 0.0),
+    ]
     for raw, expected in idle_cases:
         path.write_text(_json.dumps({"peer_upload_limit_idle_mbps": raw}), encoding="utf-8")
         assert AgentConfig.load(str(path)).peer_upload_limit_idle_mbps == expected

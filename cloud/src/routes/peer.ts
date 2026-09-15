@@ -95,7 +95,7 @@ app.post("/api/agent/peer-grant", async (c) => {
   const seeder = await peer.pickSeeder(db, seeders, now);
 
   const grantId = crypto.randomUUID().replace(/-/g, "");
-  const expiresAt = Math.floor(now) + peer.GRANT_TTL_SECONDS;
+  const expiresAt = Math.floor(now) + peer.grantTtlSeconds(sizeBytes);
   const grant: peer.Grant = {
     grant_id: grantId,
     name,

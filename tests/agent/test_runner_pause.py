@@ -409,23 +409,67 @@ async def test_upload_limit_is_applied_once_the_peer_server_starts(pause_loop, m
     assert pause_loop._peer_server.limits == [20.0]
 
 
+async def test_repeated_ticks_do_not_re_apply_an_unchanged_upload_limit(pause_loop, monkeypatch):
+    """每個 tick 只問一次閒置時鐘，上限沒變就不重套。
+
+    Several ticks with an unchanged tier apply the cap exactly ONCE, and each
+    tick consults `idle.seconds_since_input` exactly once (publishing the
+    state and applying the cap share one verdict, so they can never disagree).
+    """
+    monkeypatch.setattr(runner_module, "_CONTROL_TICK_SECONDS", 0)
+    calls = {"idle": 0}
+
+    def _seconds_since_input():
+        calls["idle"] += 1
+        return 1.0  # user at the keyboard -> the active tier
+
+    monkeypatch.setattr(idle, "seconds_since_input", _seconds_since_input)
+    peer = _FakePeerServer()
+    pause_loop._peer_server = peer
+
+    ticks = {"n": 0}
+    original_poll = pause_loop._poll_stop_request
+
+    def _poll():
+        ticks["n"] += 1
+        original_poll()
+
+    monkeypatch.setattr(pause_loop, "_poll_stop_request", _poll)
+
+    task = asyncio.create_task(pause_loop._control_loop())
+    await _run_until(task, lambda: ticks["n"] >= 3)
+
+    assert peer.limits == [pause_loop.config.peer_upload_limit_mbps]
+    # One idle-clock reading per tick (+ at most one for a tick cancelled
+    # between the reading and the poll), never the two it used to take.
+    assert ticks["n"] <= calls["idle"] <= ticks["n"] + 1
+
+
 async def test_upload_limit_tier_switch_logs_once_per_change(pause_loop, monkeypatch, caplog):
     active = {"seconds": 9999.0}
     monkeypatch.setattr(idle, "seconds_since_input", lambda: active["seconds"])
     pause_loop._peer_server = _FakePeerServer()
 
+    def _apply():
+        pause_loop._apply_peer_upload_limit(
+            control.availability(pause_loop.config, pause_loop._config_dir)
+        )
+
     with caplog.at_level("INFO", logger=runner_module.logger.name):
-        pause_loop._apply_peer_upload_limit()
-        pause_loop._apply_peer_upload_limit()  # same tier: no second line
+        _apply()
+        _apply()  # same tier: no second line, and no second application
         active["seconds"] = 1.0
-        pause_loop._apply_peer_upload_limit()
-        pause_loop._apply_peer_upload_limit()  # same tier again
+        _apply()
+        _apply()  # same tier again
 
     lines = [r.getMessage() for r in caplog.records if "upload cap" in r.getMessage()]
     assert len(lines) == 2
     assert "unlimited" in lines[0]
     assert "20 Mbps" in lines[1]
     assert "上傳限速" in lines[1]
-    # Four calls, four applications -- only the LOG is deduped, the cap is
-    # re-asserted every tick (cheap, and self-healing if it ever drifts).
-    assert pause_loop._peer_server.limits == [0.0, 0.0, 20.0, 20.0]
+    # 四次呼叫，只有兩次真的動到桶子：同一個 tier 重申沒有意義（而且每次重申
+    # 都會重設 token bucket 的時鐘，反而把已累積的額度丟掉）。
+    # Four calls, TWO applications: the cap is applied only when the
+    # effective tier changes, same latch as the log line. Re-asserting an
+    # unchanged rate every 5 s buys nothing and used to cost accrued tokens.
+    assert pause_loop._peer_server.limits == [0.0, 20.0]

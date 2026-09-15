@@ -542,7 +542,7 @@ def _verify_local_chunks(part_path: str, chunk_sha256s: Optional[list], size_byt
     No `chunk_sha256s` on the grant (M8 final-review fix): there is no way
     to verify anything already on disk chunk-by-chunk, but discarding the
     whole `.part` anyway means a large peer-only transfer on a link slower
-    than TTL/size never converges -- every re-grant (every 600s) throws away
+    than TTL/size never converges -- every re-grant (once its TTL elapses) throws away
     everything pulled so far, forever. Instead, trust the existing bytes
     BLINDLY and resume appending from the current file size: the mandatory
     whole-file SHA-256 in `_finalize_download` is still the actual trust

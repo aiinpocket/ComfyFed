@@ -82,6 +82,13 @@ from .config import AgentConfig, PlatformEntry
 logger = logging.getLogger(__name__)
 
 _CHUNK_SIZE = 1024 * 1024  # 1 MiB per wfile.write, matching fetcher._CHUNK_SIZE
+
+# Token-bucket rounding dust: `tokens` accumulates as a float, so after a
+# perfectly-paced sleep it can land a billionth of a byte short of the amount
+# it just paid for. Treating that as a real shortfall makes `consume` compute
+# a wait so small it cannot move the clock, and spin. A millionth of a byte
+# is never a meaningful debt.
+_TOKEN_EPSILON = 1e-6
 _INDEX_TTL_SECONDS = 5.0
 _IDLE_REPORT_SECONDS = 60.0
 _REPORT_POLL_SECONDS = 5.0
@@ -306,6 +313,14 @@ class UploadThrottle:
                 value = 0.0
             rate = value if math.isfinite(value) and value > 0 else None
         with self._lock:
+            # 先把「上一次補充到現在」這段時間的 token 補進來，再換速率——
+            # runner 每個 tick 都可能重申同一個速率，如果直接把 `_last` 推到
+            # 現在，這段已經累積的額度就被丟掉，實際速率會系統性低於設定值。
+            # Credit the elapsed interval BEFORE swapping the rate: re-
+            # asserting the SAME rate must be lossless, otherwise every
+            # re-assert silently discards whatever accrued since the last
+            # refill and the delivered rate sits below the configured cap.
+            self._refill_locked()
             self._rate = rate
             if rate is None:
                 self._capacity = 0.0
@@ -317,7 +332,8 @@ class UploadThrottle:
                 # unlimited) tier -- switching 0 -> 20 Mbps must take effect
                 # immediately, not after a stale burst drains.
                 self._tokens = min(self._tokens, self._capacity)
-            self._last = self._now()
+            # `_refill_locked` above already advanced `_last` to now; do NOT
+            # re-stamp it here (that is exactly what used to drop tokens).
 
     @property
     def rate_bytes_per_sec(self) -> float | None:
@@ -349,14 +365,23 @@ class UploadThrottle:
                 # negative balance would let an oversized write through
                 # unpaced.
                 take = min(remaining, self._capacity)
-                if self._tokens >= take:
-                    self._tokens -= take
+                if self._tokens >= take - _TOKEN_EPSILON:
+                    self._tokens = max(0.0, self._tokens - take)
                     remaining -= take
                     continue
                 deficit = take - self._tokens
                 wait = deficit / rate
             # Capped so a rate change (or a stop) is picked up promptly
             # instead of being stuck inside one long sleep.
+            #
+            # PARKED (reviewed, deliberately not fixed): there is no queue or
+            # fairness among simultaneous sleepers -- N threads can all be
+            # sleeping on their own (now stale) deficits while the bucket
+            # refills to `_capacity` and overflows, so AGGREGATE throughput
+            # can fall BELOW the cap and one unlucky thread can be beaten to
+            # the tokens repeatedly. Both effects are in the safe direction
+            # (never above the cap) and bounded by the 0.5 s wake-up, so a
+            # fair queue is not worth the complexity here.
             self._sleep(min(wait, 0.5))
 
 
@@ -426,6 +451,8 @@ class _GrantTracker:
         self._expires_at: dict[str, int] = {}
         self._reported: set = set()
         self._report_attempts: dict[str, int] = {}
+        # grant_id -> how many responses are STREAMING bytes for it right now.
+        self._active_streams: dict[str, int] = {}
 
     def note_grant(self, grant: dict, platform: PlatformEntry) -> None:
         grant_id = grant["grant_id"]
@@ -450,6 +477,35 @@ class _GrantTracker:
             self._bytes[grant_id] = self._bytes.get(grant_id, 0) + n
             self._last_activity[grant_id] = time.time()
 
+    def begin_stream(self, grant_id: str) -> None:
+        """Mark one response as actively streaming bytes for `grant_id`.
+
+        傳輸途中授權單過期不該把這條連線的位元組丟掉：一張還在傳的授權單即使
+        過了 `expires_at`，也要等串流結束才結算回報。（新的請求仍然會被
+        `authorize_grant` 擋掉，這裡只保護「已經在傳」的那一條。）
+
+        A grant that expires mid-stream must NOT be reported-and-closed while
+        the response is still writing: `due_for_report` skips a grant with a
+        live stream, so bytes served after expiry are still credited once the
+        stream ends. A NEW request on an expired grant is still refused by
+        `authorize_grant` -- this only protects an in-flight response.
+        """
+        with self._lock:
+            self._active_streams[grant_id] = self._active_streams.get(grant_id, 0) + 1
+
+    def end_stream(self, grant_id: str) -> None:
+        """Counterpart to `begin_stream` -- always called from a `finally`."""
+        with self._lock:
+            left = self._active_streams.get(grant_id, 0) - 1
+            if left > 0:
+                self._active_streams[grant_id] = left
+            else:
+                self._active_streams.pop(grant_id, None)
+
+    def active_streams(self, grant_id: str) -> int:
+        with self._lock:
+            return self._active_streams.get(grant_id, 0)
+
     def pop_served(self) -> dict:
         """Snapshot and zero every grant's served-bytes counter. Safe to
         call at any time (tests use it directly); grant metadata (platform,
@@ -469,12 +525,16 @@ class _GrantTracker:
 
     def due_for_report(self, idle_seconds: float = _IDLE_REPORT_SECONDS) -> list:
         """Grant ids that are idle for `idle_seconds` or already expired,
-        and have not yet been successfully reported."""
+        have not yet been successfully reported, and have NO response still
+        streaming (an in-flight transfer is settled when it finishes, so its
+        post-expiry bytes are counted -- see `begin_stream`)."""
         now = time.time()
         with self._lock:
             due = []
             for grant_id in self._seen:
                 if grant_id in self._reported:
+                    continue
+                if self._active_streams.get(grant_id, 0) > 0:
                     continue
                 last = self._last_activity.get(grant_id, 0.0)
                 expires = self._expires_at.get(grant_id, 0)
@@ -616,18 +676,27 @@ def _make_handler_class(server_state: "_ServerState") -> type:
                 self.end_headers()
 
                 remaining = length
-                while remaining > 0:
-                    chunk = fh.read(min(_CHUNK_SIZE, remaining))
-                    if not chunk:
-                        break
-                    # 先扣 token 再寫：限速在「寫上線路之前」生效，所以使用者
-                    # 在用電腦時，做種不會先一口氣灌滿 socket buffer。
-                    # Pay before writing, so the cap actually shapes what goes
-                    # on the wire instead of trailing behind a full buffer.
-                    _UPLOAD_THROTTLE.consume(len(chunk))
-                    self.wfile.write(chunk)
-                    remaining -= len(chunk)
-                    server_state.tracker.add_bytes(grant_id, len(chunk))
+                # 這條串流開始後，即使授權單中途過期也要讓它傳完並照算位元組
+                # （回報要等串流結束）；擋的是「過期後的新請求」。
+                # A throttled 6.5 GB transfer easily outlives its grant: mark
+                # the stream live so an expiry mid-flight neither closes the
+                # accounting early nor drops the bytes still to come.
+                server_state.tracker.begin_stream(grant_id)
+                try:
+                    while remaining > 0:
+                        chunk = fh.read(min(_CHUNK_SIZE, remaining))
+                        if not chunk:
+                            break
+                        # 先扣 token 再寫：限速在「寫上線路之前」生效，所以使用者
+                        # 在用電腦時，做種不會先一口氣灌滿 socket buffer。
+                        # Pay before writing, so the cap actually shapes what goes
+                        # on the wire instead of trailing behind a full buffer.
+                        _UPLOAD_THROTTLE.consume(len(chunk))
+                        self.wfile.write(chunk)
+                        remaining -= len(chunk)
+                        server_state.tracker.add_bytes(grant_id, len(chunk))
+                finally:
+                    server_state.tracker.end_stream(grant_id)
 
     return _Handler
 
@@ -707,6 +776,11 @@ class PeerHTTPServer:
             self._serve_thread.join(timeout=timeout)
         if self._reporter_thread.is_alive():
             self._reporter_thread.join(timeout=timeout)
+        # 限速桶是模組全域的：listener 收掉之後把它歸位成「不限速」，免得下一
+        # 個 listener 在 runner 套用分級之前，先沿用上一輪留下的速率。
+        # The bucket is a module global; reset it so a later listener does not
+        # inherit whatever rate this one happened to leave behind.
+        _UPLOAD_THROTTLE.set_rate(None)
 
     def set_upload_limit_mbps(self, mbps: float) -> None:
         """設定做種上傳上限（Mbps，百萬位元/秒）；`0`（或負數／非數字）= 不限速。

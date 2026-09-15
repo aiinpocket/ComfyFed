@@ -2,6 +2,7 @@ import { afterEach, describe, expect, it } from "vitest";
 import { env } from "cloudflare:test";
 import { call, db, SETUP_TOKEN } from "./helpers/http";
 import * as modelManifest from "../src/core/model_manifest";
+import * as peer from "../src/core/peer";
 import * as modelGuide from "../src/core/model_guide";
 import { resolvePlatformSeed } from "../src/db/queries";
 import * as queries from "../src/db/queries";
@@ -136,7 +137,21 @@ describe("POST /api/agent/peer-grant", () => {
     expect(await verifyHex(pubkeyHex, new TextEncoder().encode(payload), g.sig)).toBe(true);
   });
 
-  it("expires_at is exactly GRANT_TTL_SECONDS (600) ahead of issuance", async () => {
+  it("grantTtlSeconds scales the TTL with the file size (parity with peer.py)", () => {
+    expect(peer.MIN_ASSUMED_RATE_BYTES_PER_SEC).toBe(20_000_000 / 8);
+    // 6.5 GB at the agent's default 20 Mbps active cap is ~43 min of
+    // transfer -- a flat 600 s grant expired ~4x before it finished.
+    expect(peer.grantTtlSeconds(Math.round(6.5 * 1000 ** 3))).toBeGreaterThanOrEqual(3900);
+    // A 10 MB model stays at the 600 s baseline.
+    const small = peer.grantTtlSeconds(10 * 1000 ** 2);
+    expect(small).toBeGreaterThanOrEqual(peer.GRANT_TTL_SECONDS);
+    expect(small).toBeLessThanOrEqual(peer.GRANT_TTL_SECONDS + 10);
+    expect(peer.grantTtlSeconds(0)).toBe(peer.GRANT_TTL_SECONDS);
+    expect(peer.grantTtlSeconds(-1)).toBe(peer.GRANT_TTL_SECONDS);
+    expect(peer.grantTtlSeconds(2 * 1024 ** 3)).toBeGreaterThan(peer.grantTtlSeconds(1024 ** 3));
+  });
+
+  it("expires_at is grantTtlSeconds(size) ahead of issuance", async () => {
     const puller = await registerWorker("puller", 0);
     const seeder = await registerWorker("seeder", 1);
     const sha = await shaHex("model-a");
@@ -149,11 +164,13 @@ describe("POST /api/agent/peer-grant", () => {
     const after = Math.floor(Date.now() / 1000);
     expect(r.status).toBe(200);
 
-    // expires_at = floor(issuance time) + 600 -- pin the delta against the
-    // request's own before/after bracket rather than a fixed clock read, so
-    // this isn't flaky under real (if tiny) test-runner scheduling jitter.
-    expect(r.body.grant.expires_at).toBeGreaterThanOrEqual(before + 600);
-    expect(r.body.grant.expires_at).toBeLessThanOrEqual(after + 600);
+    // expires_at = floor(issuance time) + the size-scaled TTL -- pin the
+    // delta against the request's own before/after bracket rather than a
+    // fixed clock read, so this isn't flaky under scheduling jitter.
+    const ttl = peer.grantTtlSeconds(sizeBytes);
+    expect(ttl).toBeGreaterThan(peer.GRANT_TTL_SECONDS);
+    expect(r.body.grant.expires_at).toBeGreaterThanOrEqual(before + ttl);
+    expect(r.body.grant.expires_at).toBeLessThanOrEqual(after + ttl);
   });
 
   it("chunk_sha256s is null in the response when no chunk list was ever established", async () => {

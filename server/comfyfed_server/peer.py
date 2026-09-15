@@ -24,6 +24,7 @@ from __future__ import annotations
 
 import json
 import logging
+import math
 import threading
 import time
 import uuid
@@ -38,8 +39,40 @@ from . import db, security, workers
 
 logger = logging.getLogger(__name__)
 
-# Global Constraints: TTL 600s, single file/puller/seeder per grant.
+# Global Constraints: TTL 600s (the FLOOR -- see `grant_ttl_seconds`), single
+# file/puller/seeder per grant.
 GRANT_TTL_SECONDS = 600
+
+# 授權單存活時間的下限速率假設：agent 端 `peer_upload_limit_mbps` 預設 20 Mbps
+# = 2.5 MB/s，所以一張授權單至少要能撐過「整個檔案以這個速率傳完」的時間。
+#
+# The slowest transfer rate a grant's TTL is sized for. It tracks the agent's
+# DEFAULT ACTIVE upload cap (`peer_upload_limit_mbps = 20` Mbps ->
+# 20_000_000 / 8 bytes per second, see
+# `agent/comfyfed_agent/peerserve.py:PeerHTTPServer.set_upload_limit_mbps`).
+# Keep the two in step: if the agent's default active cap drops, a grant
+# sized by this constant stops covering a whole transfer again.
+MIN_ASSUMED_RATE_BYTES_PER_SEC = 2_500_000
+
+
+def grant_ttl_seconds(size_bytes: int) -> int:
+    """How long a grant for a `size_bytes` file must live.
+
+    At the agent's default active upload cap (20 Mbps = 2.5 MB/s) a 6.5 GB
+    model takes ~43 minutes, i.e. ~4x the flat 600 s TTL: every byte served
+    after expiry went unaccounted (the seeder reports a grant once, at
+    expiry) and any resume/retry after expiry was refused outright. So the
+    TTL scales with the file: the estimated transfer time at
+    `MIN_ASSUMED_RATE_BYTES_PER_SEC`, times 1.5 for slack, plus the flat
+    `GRANT_TTL_SECONDS` of setup/retry headroom -- never below the 600 s
+    floor, so small files are unchanged in practice.
+    """
+    try:
+        size = max(0, int(size_bytes))
+    except (TypeError, ValueError):
+        size = 0
+    transfer = math.ceil(size / MIN_ASSUMED_RATE_BYTES_PER_SEC)
+    return int(max(GRANT_TTL_SECONDS, transfer * 1.5 + GRANT_TTL_SECONDS))
 
 # M4 final-review fix: a grant whose transfer is still active when its TTL
 # elapses must still be able to book its bandwidth -- the seeder's
@@ -284,7 +317,7 @@ def create_router(data_dir: str) -> APIRouter:
             seeder = min(seeders, key=lambda w: (_active_grant_count(w.id, now), w.name))
 
             grant_id = uuid.uuid4().hex
-            expires_at = int(now) + GRANT_TTL_SECONDS
+            expires_at = int(now) + grant_ttl_seconds(body.size_bytes)
             grant = {
                 "grant_id": grant_id,
                 "name": body.name,

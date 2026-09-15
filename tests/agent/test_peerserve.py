@@ -395,6 +395,75 @@ def test_report_due_grants_succeeds_before_hitting_the_cap(server, monkeypatch):
     assert calls["n"] == 2
 
 
+# --- 傳輸途中授權單過期 / a grant that expires mid-stream --------------------
+
+
+def test_bytes_served_after_expiry_are_still_credited_when_the_stream_ends(server, monkeypatch):
+    """一張授權單在傳輸途中過期，這條串流要傳完、位元組要照算。
+
+    At 20 Mbps a 6.5 GB model takes ~43 minutes, so a transfer routinely
+    outlives its grant. While the response is still streaming the grant must
+    NOT be reported-and-closed (that used to drop every post-expiry byte);
+    it settles once, when the stream ends, with the full total.
+    """
+    srv, _signing_key, entry, _content = server
+    # An already-expired grant models the fake clock having advanced past
+    # `expires_at` mid-stream: expiry is the only clock-dependent input.
+    grant = _make_grant(
+        name="diffusion_models/model.bin", size_bytes=5000, seeder_id=entry.worker_id, expires_in=-10
+    )
+    tracker = srv._tracker
+    tracker.note_grant(grant, entry)
+    grant_id = grant["grant_id"]
+
+    tracker.begin_stream(grant_id)
+    tracker.add_bytes(grant_id, 1000)  # before expiry
+    # Expired, but still streaming: not due, and NOT marked reported.
+    assert tracker.due_for_report() == []
+
+    posted = []
+    monkeypatch.setattr(
+        srv, "_post_peer_served", lambda platform, gid, n: posted.append((gid, n)) or True
+    )
+    srv._report_due_grants()
+    assert posted == []
+    assert grant_id not in tracker._reported
+
+    tracker.add_bytes(grant_id, 4000)  # served AFTER expiry -- must still count
+    tracker.end_stream(grant_id)
+
+    assert tracker.due_for_report() == [grant_id]
+    srv._report_due_grants()
+    assert posted == [(grant_id, 5000)]
+
+
+def test_a_new_request_on_an_expired_grant_is_still_refused(server):
+    """Only the IN-FLIGHT response survives expiry; a fresh request (e.g. a
+    resume after a dropped connection) is refused as before."""
+    srv, signing_key, entry, content = server
+    grant = _make_grant(
+        name="diffusion_models/model.bin", size_bytes=len(content), seeder_id=entry.worker_id, expires_in=-10
+    )
+    srv._tracker.begin_stream(grant["grant_id"])  # an unrelated live stream
+    try:
+        resp = httpx.get(
+            _url(srv),
+            headers={"X-ComfyFed-Grant": _grant_header(signing_key, grant), "Range": "bytes=0-99"},
+        )
+        assert resp.status_code == 403
+    finally:
+        srv._tracker.end_stream(grant["grant_id"])
+
+
+def test_stream_bookkeeping_is_balanced_after_a_real_transfer(server):
+    srv, signing_key, entry, content = server
+    grant = _make_grant(name="diffusion_models/model.bin", size_bytes=len(content), seeder_id=entry.worker_id)
+    resp = httpx.get(_url(srv), headers={"X-ComfyFed-Grant": _grant_header(signing_key, grant)})
+
+    assert resp.status_code == 200
+    assert srv._tracker.active_streams(grant["grant_id"]) == 0
+
+
 # --- M6: listener hardening -------------------------------------------------
 
 
@@ -453,9 +522,11 @@ def test_throttle_paces_consumption_at_the_configured_rate():
     for _ in range(3):
         th.consume(1_000_000)
 
-    # Three megabytes at a megabyte a second: generous lower bound (the
-    # bucket starts empty, so the true figure is ~3 s).
-    assert clock.t >= 2.5
+    # Three megabytes at a megabyte a second: the true figure is ~3 s. The
+    # UPPER bound matters as much as the lower one -- an implementation that
+    # over-sleeps (e.g. one that throws away accrued tokens on every
+    # `set_rate`) is a regression too, and only an upper bound catches it.
+    assert 2.5 <= clock.t <= 3.5
 
 
 def test_throttle_unlimited_consumes_instantly():
@@ -475,7 +546,7 @@ def test_throttle_rate_change_applies_to_later_consumes():
 
     th.set_rate(1_000_000)
     th.consume(2_000_000)
-    assert clock.t >= 1.5
+    assert 1.5 <= clock.t <= 2.2
 
     before = clock.t
     th.set_rate(None)
@@ -493,7 +564,58 @@ def test_throttle_burst_is_capped_after_a_long_idle_gap():
     th.consume(2_000_000)  # covered by the (capped) bucket
     assert clock.t == 3600.0
     th.consume(2_000_000)  # must be paid for at the real rate
-    assert clock.t >= 3600.5
+    assert 3600.5 <= clock.t <= 3601.1
+
+
+def test_set_rate_does_not_discard_tokens_accrued_since_the_last_refill():
+    """重申同一個速率必須是「無損」的：runner 每個 tick 都可能再套一次。
+
+    Re-asserting a rate must be lossless -- `set_rate` refills for the
+    elapsed interval BEFORE re-stamping its clock, otherwise every re-assert
+    throws away whatever accrued since the last refill.
+    """
+    clock = _FakeClock()
+    th = _throttle(1_000_000, clock)  # 1 MB/s
+
+    clock.t += 0.5  # half a second of accrual with nobody pulling
+    th.set_rate(1_000_000)  # the runner re-asserting the SAME tier
+
+    th.consume(500_000)  # exactly what accrued: must not sleep at all
+    assert clock.t == 0.5
+
+
+def test_throttle_sustains_the_rate_while_the_rate_is_re_asserted_every_tick():
+    """The control tick fires every 5 s and used to land MID-SLEEP, which is
+    exactly when `set_rate` discarded the most accrual. Simulated end to end:
+    the delivered rate must still be the configured rate."""
+    rate = 1_000_000
+    holder = {}
+
+    class _TickingClock(_FakeClock):
+        """A fake clock that fires the runner's 5 s control tick from inside
+        `sleep` -- i.e. while a transfer thread is parked in `consume`."""
+
+        def __init__(self):
+            super().__init__()
+            self._next_tick = 5.0
+
+        def sleep(self, seconds):
+            super().sleep(seconds)
+            while self.t >= self._next_tick:
+                self._next_tick += 5.0
+                holder["th"].set_rate(rate)
+
+    clock = _TickingClock()
+    th = _throttle(rate, clock)
+    holder["th"] = th
+
+    chunk = 100_000
+    chunks = 300  # 30 MB at 1 MB/s -> ~30 s of simulated time
+    for _ in range(chunks):
+        th.consume(chunk)
+
+    expected = chunk * chunks / rate
+    assert expected * 0.99 <= clock.t <= expected * 1.01
 
 
 def test_throttle_is_shared_by_concurrent_consumers():
@@ -511,12 +633,20 @@ def test_throttle_is_shared_by_concurrent_consumers():
             th.consume(per_thread)
 
     started = time.monotonic()
-    threads = [_threading.Thread(target=_worker) for _ in range(2)]
+    # daemon threads: if a regression ever makes `consume` block forever, a
+    # stuck worker must not keep the interpreter (and pytest) alive at exit.
+    threads = [_threading.Thread(target=_worker, daemon=True) for _ in range(2)]
     for t in threads:
         t.start()
     for t in threads:
-        t.join(timeout=30)
+        t.join(timeout=5)
     elapsed = max(time.monotonic() - started, 1e-6)
+
+    # A join that TIMED OUT would otherwise inflate `elapsed` and make the
+    # throughput bound below pass vacuously -- assert the workers actually
+    # finished instead.
+    for t in threads:
+        assert not t.is_alive()
 
     total = per_thread * rounds * 2
     assert total / elapsed <= rate * 1.3

@@ -670,7 +670,7 @@ class AgentLoop:
             except Exception:
                 logger.exception("runner: failed to broadcast heartbeat to %s", worker_id)
 
-    def _effective_state(self, state: str) -> str:
+    def _effective_state(self, state: str, availability: Optional[str] = None) -> str:
         """Rewrite an availability-bearing heartbeat state for this tick.
 
         `"busy"` (and any other non-availability state) is returned
@@ -680,12 +680,19 @@ class AgentLoop:
         `control.availability`. `"paused"` is accepted as an input too: it is
         what the previous tick left on `conn.state`, and treating it as
         "would be idle" is what lets a resume flip back to `"idle"`.
+
+        `availability`, when given, is a value the caller already computed
+        for this tick -- reused instead of recomputed so one tick makes
+        exactly one `idle.seconds_since_input` call and cannot publish a
+        state that disagrees with the cap it applies.
         """
         if state not in ("idle", "paused"):
             return state
-        return "idle" if control.availability(self.config, self._config_dir) == "available" else "paused"
+        if availability is None:
+            availability = control.availability(self.config, self._config_dir)
+        return "idle" if availability == "available" else "paused"
 
-    def _aggregate_state(self) -> tuple[str, Optional[str]]:
+    def _aggregate_state(self, availability: Optional[str] = None) -> tuple[str, Optional[str]]:
         """What this PROCESS is doing, for `agent_state.json` -- one verdict
         for the whole agent, not one per platform connection.
 
@@ -700,13 +707,13 @@ class AgentLoop:
         for handle in self._jobs.values():
             if handle.running:
                 return "busy", handle.job_id
-        return self._effective_state("idle"), None
+        return self._effective_state("idle", availability), None
 
-    def _publish_control_state(self) -> None:
-        state, job_id = self._aggregate_state()
+    def _publish_control_state(self, availability: Optional[str] = None) -> None:
+        state, job_id = self._aggregate_state(availability)
         control.write_state(self._config_dir, state, job_id)
 
-    def _apply_peer_upload_limit(self, availability: Optional[str] = None) -> None:
+    def _apply_peer_upload_limit(self, availability: str) -> None:
         """依目前的閒置狀態，把分級上傳限速套到做種用的 peer server 上。
 
         做種跟派工不一樣：使用者在用電腦時「不」停止上傳（只吃 CPU 跟網路），
@@ -717,36 +724,44 @@ class AgentLoop:
         Seeding is throttled, never stopped, while a human uses the machine.
         Called once per control tick and once right after the peer server
         starts, so the first seconds are not unlimited-by-omission.
+
+        `availability` is the value the CALLER already computed for this tick
+        (`control.availability`), passed in rather than recomputed: a second
+        `idle.seconds_since_input` call per tick can disagree with the first,
+        publishing the state as idle while capping as active (or vice versa).
         """
         server = self._peer_server
         if server is None:
             return
-        if availability is None:
-            availability = control.availability(self.config, self._config_dir)
         idle_tier = availability == "available"
         limit = (
             self.config.peer_upload_limit_idle_mbps
             if idle_tier
             else self.config.peer_upload_limit_mbps
         )
+        # 只有「這一輪算出來的上限跟上次套用的不一樣」才真的去動桶子：重申同一
+        # 個速率不是免費的（每次都要碰全域鎖、重算容量），而且沒有任何好處。
+        # Only touch the bucket when the effective tier/rate actually CHANGES
+        # -- re-asserting the same rate every 5 s buys nothing.
+        if limit == self._peer_upload_limit_applied:
+            return
         try:
             server.set_upload_limit_mbps(limit)
         except Exception:
             logger.exception("runner: failed to apply the P2P upload limit")
             return
-        if limit != self._peer_upload_limit_applied:
-            self._peer_upload_limit_applied = limit
-            shown = "不限速 / unlimited" if not limit else f"{limit:g} Mbps"
-            reason_zh = "閒置中" if idle_tier else (
-                "手動暫停" if availability == "paused-manual" else "使用者活動中"
-            )
-            reason_en = "idle" if idle_tier else (
-                "manually paused" if availability == "paused-manual" else "user active"
-            )
-            logger.info(
-                "P2P 上傳限速 -> %s（%s）/ P2P upload cap -> %s (%s)",
-                shown, reason_zh, shown, reason_en,
-            )
+        self._peer_upload_limit_applied = limit
+        shown = "不限速 / unlimited" if not limit else f"{limit:g} Mbps"
+        reason_zh = "閒置中" if idle_tier else (
+            "手動暫停" if availability == "paused-manual" else "使用者活動中"
+        )
+        reason_en = "idle" if idle_tier else (
+            "manually paused" if availability == "paused-manual" else "user active"
+        )
+        logger.info(
+            "P2P 上傳限速 -> %s（%s）/ P2P upload cap -> %s (%s)",
+            shown, reason_zh, shown, reason_en,
+        )
 
     async def _control_loop(self) -> None:
         """Publish the agent's state and honour `comfyfed stop`, independently
@@ -761,12 +776,18 @@ class AgentLoop:
         """
         while True:
             try:
-                self._publish_control_state()
+                # 一個 tick 只算一次 availability（= 只問一次
+                # `idle.seconds_since_input`），發布狀態跟套用上傳上限共用同
+                # 一個結論，不會一個說閒置、一個說活動中。
+                # One availability verdict per tick, shared by both the
+                # published state and the upload cap.
+                availability = control.availability(self.config, self._config_dir)
+                self._publish_control_state(availability)
                 self._poll_stop_request()
                 # 做種不隨暫停停止，只降速：同一個 tick 算出來的 availability
                 # 直接決定這一輪的上傳上限。
                 # Seeding keeps running while paused -- it is only throttled.
-                self._apply_peer_upload_limit()
+                self._apply_peer_upload_limit(availability)
             except Exception:
                 # Local control is a convenience layer; a surprise here must
                 # never take down a working agent. The next tick retries.
@@ -1669,10 +1690,6 @@ class AgentLoop:
                 bind_host=self.config.peer_bind_host,
             )
             self._peer_server.start()
-            # 開機第一秒就要有上限，不能等到第一次 control tick 才套。
-            # Apply a tier immediately so the first seconds are not
-            # unlimited-by-omission before the first control tick.
-            self._apply_peer_upload_limit()
             self._peer_advertised_url = peerserve.advertised_url(self.config)
             logger.info(
                 "runner: peer HTTP server listening on port %s, advertising %s",
@@ -1682,6 +1699,22 @@ class AgentLoop:
             logger.exception("runner: failed to start the peer HTTP server; P2P serving disabled for this run")
             self._peer_server = None
             self._peer_advertised_url = None
+            return
+
+        # 套上限的動作放在 try/except 之外：listener 已經 bind 成功了，這裡若
+        # 拋例外被上面的 except 接走，會把 `_peer_server` 清成 None，留下一個
+        # 沒人關得掉的 listener（port 佔住、shutdown 不會 stop()）。
+        # Applying the tier lives OUTSIDE the try: the listener is already
+        # bound and serving by now, so a raise here must not be caught by the
+        # start handler that nulls `_peer_server` -- that would orphan a live
+        # listener (port stays bound, `shutdown()` never stops it) while the
+        # log claims P2P is disabled.
+        #
+        # 開機第一秒就要有上限，不能等到第一次 control tick 才套。
+        # Apply a tier immediately so the first seconds are not
+        # unlimited-by-omission before the first control tick.
+        if self._peer_server is not None:
+            self._apply_peer_upload_limit(control.availability(self.config, self._config_dir))
 
     def _install_signal_handlers(self, loop: asyncio.AbstractEventLoop) -> None:
         """Install SIGINT/SIGTERM (and SIGBREAK on Windows) handlers.
