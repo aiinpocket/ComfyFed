@@ -108,6 +108,133 @@ async function comfyfedWatchFleet() {
 
 comfyfedWatchFleet();
 
+// 中文：算圖實際上是丟給聯邦裡的「遠端」worker 排隊執行，不是本機跑；使用者按下
+// 面板的 Queue／執行後，畫面上完全沒有變化，很容易懷疑是不是根本沒送出去。這裡
+// 攔截 `window.fetch`（只包一次，用 window 旗標擋掉重複注入造成的雙重包裝），
+// 專門盯 `POST .../prompt`（佇列端點；同時比對 `/comfy/api/prompt` 這種絕對路徑
+// 與 `api/prompt` 這種相對路徑）。ComfyUI 對「驗證失敗」也是回 200，body 帶
+// `{error, node_errors}`，所以光看 HTTP 狀態不夠：只有 response.ok 而且 body
+// 沒有帶真正的 error／node_errors 時，才視為送出成功並跳出提示；驗證失敗一律讓
+// ComfyUI 自己的錯誤 UI 顯示，不搶戲。一律 clone 之後再讀 body，原始 response
+// 原封不動交還呼叫端；toast 本身的邏輯全包在 try/catch 裡，絕不能讓它的例外反過來
+// 弄壞真正的 fetch 呼叫。
+//
+// English: Rendering actually runs on a REMOTE worker queued elsewhere in the
+// federation, not locally -- after the user clicks Queue/執行 on the panel,
+// nothing visibly changes, which easily reads as "did that even go through?"
+// This intercepts `window.fetch` (wrapped exactly once, guarded by a window
+// flag so double injection doesn't double-wrap), watching specifically for
+// `POST .../prompt` (the queue endpoint; matches both the absolute
+// `/comfy/api/prompt` path and a relative `api/prompt`). ComfyUI also returns
+// HTTP 200 on a validation failure, with `{error, node_errors}` in the body --
+// so the HTTP status alone isn't enough: only when the response is ok AND the
+// body carries no real error/node_errors is this treated as a successful
+// submission and the toast shown; a validation failure is left entirely to
+// ComfyUI's own error UI. The body is always read from a clone so the caller
+// still gets the original response untouched; the toast logic itself is
+// wrapped in try/catch so it can never throw back into the fetch caller.
+const QUEUED_TOAST_ID = "comfyfed-queued-toast";
+
+function comfyfedShowQueuedToast() {
+  const existing = document.getElementById(QUEUED_TOAST_ID);
+  if (existing) existing.remove();
+
+  const reduceMotion =
+    window.matchMedia && window.matchMedia("(prefers-reduced-motion: reduce)").matches;
+
+  const el = document.createElement("div");
+  el.id = QUEUED_TOAST_ID;
+  el.style.cssText =
+    "position:fixed;top:16px;right:16px;z-index:10001;max-width:360px;" +
+    "background:#1f5c33;color:#fff;padding:12px 36px 12px 16px;border-radius:8px;" +
+    "box-shadow:0 4px 16px rgba(0,0,0,0.3);font:13px/1.5 system-ui,sans-serif;" +
+    (reduceMotion
+      ? ""
+      : "transition:opacity .3s ease,transform .3s ease;transform:translateY(-8px);opacity:0;");
+
+  el.innerHTML =
+    '<div style="font-weight:600;margin-bottom:4px;">已加入算圖佇列 / Job queued</div>' +
+    '<div>工作已排入等待佇列，交由聯邦中的 worker 處理。可回主控台查看進度，' +
+    "或直接進行下一個作業。 / Your job is queued and will be picked up by a worker " +
+    "in the federation. Check progress in the console, or just start your next one.</div>" +
+    '<button type="button" aria-label="Close" style="position:absolute;top:6px;right:8px;' +
+    "background:none;border:none;color:#fff;font-size:16px;line-height:1;cursor:pointer;" +
+    'padding:2px;">×</button>';
+
+  document.body.appendChild(el);
+
+  const dismiss = () => {
+    if (el.isConnected) el.remove();
+  };
+  const closeBtn = el.querySelector("button");
+  if (closeBtn) closeBtn.addEventListener("click", dismiss);
+
+  if (!reduceMotion) {
+    requestAnimationFrame(() => {
+      el.style.transform = "translateY(0)";
+      el.style.opacity = "1";
+    });
+  }
+
+  setTimeout(dismiss, 6000);
+}
+
+(function comfyfedInstallQueueToast() {
+  if (window.__comfyfedQueueToastInstalled) return;
+  window.__comfyfedQueueToastInstalled = true;
+
+  const originalFetch = window.fetch.bind(window);
+
+  function comfyfedRequestInfo(input, init) {
+    let method = "GET";
+    let url = "";
+    if (init && init.method) {
+      method = init.method;
+    } else if (typeof Request !== "undefined" && input instanceof Request) {
+      method = input.method;
+    }
+    if (typeof input === "string") {
+      url = input;
+    } else if (typeof URL !== "undefined" && input instanceof URL) {
+      url = input.href;
+    } else if (typeof Request !== "undefined" && input instanceof Request) {
+      url = input.url;
+    }
+    return { method: (method || "GET").toUpperCase(), url };
+  }
+
+  function comfyfedIsPromptUrl(url) {
+    try {
+      return new URL(url, location.href).pathname.endsWith("/prompt");
+    } catch (_e) {
+      return false;
+    }
+  }
+
+  window.fetch = async function comfyfedPatchedFetch(input, init) {
+    const response = await originalFetch(input, init);
+    try {
+      const { method, url } = comfyfedRequestInfo(input, init);
+      if (method === "POST" && response.ok && comfyfedIsPromptUrl(url)) {
+        response
+          .clone()
+          .json()
+          .then((body) => {
+            const hasError = !!(
+              body &&
+              (body.error || (body.node_errors && Object.keys(body.node_errors).length > 0))
+            );
+            if (!hasError) comfyfedShowQueuedToast();
+          })
+          .catch(() => {});
+      }
+    } catch (_e) {
+      // toast 邏輯絕不能影響真正的 fetch 呼叫 / never let toast logic break the real fetch
+    }
+    return response;
+  };
+})();
+
 // 中文：ComfyUI 的擴充模組是以 ES module 動態 import 的，匯出物件本身內容不重要，
 // 但需要是個有效模組；副作用（插入 <style>、零 worker 橫幅）已經在上面完成了。
 //
