@@ -593,6 +593,15 @@ class AgentLoop:
         # `_effective_state`), so a running job is never affected.
         state = self._effective_state(state)
         for worker_id, conn in self.connections.items():
+            # A connection that failed or lost its handshake has `ws is None`
+            # (that is what `close()` leaves behind, and a never-connected
+            # dead 4401 entry never sets it). A job-lifecycle beat must not
+            # attempt a send on it -- live incident: `AttributeError: 'NoneType'
+            # object has no attribute 'send'` spammed once per beat per dead
+            # platform entry. (The periodic beat in `_connection_loop` is
+            # unaffected: it only runs for a connection that just handshaked.)
+            if getattr(conn, "ws", None) is None:
+                continue
             try:
                 await conn.send_heartbeat(
                     state,

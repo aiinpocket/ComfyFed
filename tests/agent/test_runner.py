@@ -480,6 +480,24 @@ async def test_broadcast_heartbeat_carries_each_connections_object_info_hash(two
     assert conn_a.heartbeats[-1]["object_info_hash"] == "deadbeef"
 
 
+async def test_broadcast_heartbeat_skips_a_not_connected_platform(two_platform_loop):
+    """Live incident: a dead 4401 entry's connection has `ws is None`, and a
+    job-lifecycle beat used to crash on it with `AttributeError: 'NoneType'
+    object has no attribute 'send'`, once per beat per dead entry. The beat
+    must reach the live connection only, raise nothing, and record nothing on
+    the down one."""
+    loop = two_platform_loop
+    conn_a = loop.connections["worker-a"]
+    conn_b = loop.connections["worker-b"]
+    conn_a.ws = None  # down: no handshake, nothing to send on
+
+    await loop.broadcast_heartbeat("idle")  # must not raise
+
+    assert conn_a.heartbeats == [], "a down connection must receive no beat"
+    assert conn_b.heartbeats, "the live connection must still receive the beat"
+    assert conn_b.heartbeats[-1]["state"] == "idle"
+
+
 # --- Artifact hash verification -------------------------------------------
 
 
