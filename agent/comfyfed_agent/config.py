@@ -136,7 +136,7 @@ class AgentConfig:
     # OS cannot report last-input (headless, Wayland without XWayland) are
     # treated as always idle -- see idle.seconds_since_input.
     pause_when_active: bool = True
-    idle_minutes: float = 5.0
+    idle_minutes: float = 15.0
 
     @classmethod
     def load(cls, path: str) -> "AgentConfig":

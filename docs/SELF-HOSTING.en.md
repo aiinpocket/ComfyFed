@@ -168,7 +168,7 @@ comfyfed stop     # ask the agent to shut down gracefully: the running job is ca
 
 **Pause needs a platform on this release or newer.** `paused` is a heartbeat state added in 0.1.2; an older platform does not recognise it and keeps dispatching. A new agent against an old platform means pause silently has no effect — upgrade the platform side first.
 
-Idle-detection settings live in `agent.json`: `pause_when_active` (default `true`) toggles activity detection on/off, and `idle_minutes` (default `5`) is how many consecutive minutes without any keyboard/mouse input count as idle — while the last input is more recent than that, the agent treats the user as active and pauses intake, resuming once the machine has been idle that long. After editing `agent.json` by hand, restart the agent for the change to take effect.
+Idle-detection settings live in `agent.json`: `pause_when_active` (default `true`) toggles activity detection on/off, and `idle_minutes` (default `15`) is how many consecutive minutes without any keyboard/mouse input count as idle — while the last input is more recent than that, the agent treats the user as active and pauses intake, resuming once the machine has been idle that long. After editing `agent.json` by hand, restart the agent for the change to take effect.
 
 **When activity can't be detected, the worker is always treated as idle and keeps accepting jobs**: headless machines (no display/keyboard/mouse) and Wayland desktops without XWayland give the agent no signal to read, so detection failure never makes a worker unschedulable — it just behaves as if pause-when-active is off.
 

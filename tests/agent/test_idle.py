@@ -66,7 +66,7 @@ def test_config_pause_defaults(tmp_path):
 
     loaded = AgentConfig.load(str(path))
     assert loaded.pause_when_active is True
-    assert loaded.idle_minutes == 5.0
+    assert loaded.idle_minutes == 15.0
 
 
 def test_config_pause_round_trip(tmp_path):
@@ -83,7 +83,7 @@ def test_config_pause_coercion(tmp_path):
     agent.json falls back to the default instead of raising."""
     path = tmp_path / "agent.json"
 
-    for raw, expected in [("abc", 5.0), (-1, 5.0), (None, 5.0), ("7", 7.0), (1.5, 1.5)]:
+    for raw, expected in [("abc", 15.0), (-1, 15.0), (None, 15.0), ("7", 7.0), (1.5, 1.5)]:
         path.write_text(json.dumps({"idle_minutes": raw}), encoding="utf-8")
         assert AgentConfig.load(str(path)).idle_minutes == expected
 
