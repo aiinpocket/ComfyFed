@@ -7,7 +7,7 @@
     "dev": "node scripts/build.mjs --skip-comfy && wrangler dev",
     "test": "vitest run",
     "build": "node scripts/build.mjs",
-    "ci-build": "npm ci && npm run build",
+    "ci-build": "npm ci && npm test && npm run build && npm --prefix ../web test",
     "predeploy": "node scripts/check-assets.mjs",
     "deploy": "wrangler d1 migrations apply comfyfed --remote && wrangler deploy",
     "seed-official": "node scripts/seed-official.mjs"

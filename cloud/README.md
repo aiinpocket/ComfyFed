@@ -32,7 +32,7 @@ npx wrangler login   # 瀏覽器跳出授權畫面，登入你的 Cloudflare 帳
 npx wrangler d1 create comfyfed
 ```
 
-指令會印出一段 `database_id`，把它貼進 `cloud/wrangler.jsonc` 的 `d1_databases[0].database_id`（目前是佔位字串 `"TBD-set-at-deploy"`）：
+指令會印出一段 `database_id`，把它貼進 `cloud/wrangler.jsonc` 的 `d1_databases[0].database_id`。repo 裡已提交著 aiinpocket 部署所用的那個 ID（database_id 是識別碼、不是憑證，可以安全進 git——Workers Builds 從 git checkout 部署，**必須**能在 repo 裡讀到它）；自己另建資料庫時把它換成你的即可：
 
 ```jsonc
 "d1_databases": [
@@ -104,10 +104,13 @@ curl -X POST https://your-name.workers.dev/api/setup \
 Cloudflare Dashboard → Workers & Pages → 你的 Worker → **Settings → Builds** → 連接這個 GitHub repo：
 
 - **Root directory**：`cloud/`
-- **Build command**：`npm run ci-build`
+- **Build command**：`npm run ci-build`（= `npm ci` → cloud 測試 → 建置（含 `../web` 主控台）→ web 測試。**測試是閘門**：任一紅燈就不會走到部署，壞掉的改動上不了線）
 - **Deploy command**：`npm run deploy`（會先套用 D1 migrations 再部署；比官方預設的 `npx wrangler deploy` 多做一步，但這一步是必要的——新 migration 不會自己套用）
+- **Node**：`cloud/.node-version` 釘在 22，Workers Builds 會照它選版本。
 
-設定好之後每次 push 到你選的分支就會自動建置＋部署。
+設定好之後每次 push 到你選的分支就會自動建置＋部署。不需要自己加任何 API token——Workers Builds 用你帳號的建置權杖跑 `wrangler`。
+
+**誠實註記**：Python 端（server／agent）的 pytest 在 Workers Builds 裡跑不了（建置容器不保證有 Python），它仍是**本機 push 前**的閘門；Builds 只守 cloud＋web 兩套。
 
 ### 接一台 worker（跟自架版完全同一套 agent）
 

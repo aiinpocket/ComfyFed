@@ -1,6 +1,6 @@
-import { afterEach, describe, expect, it } from "vitest";
+import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import worker from "../src/index";
-import { env, createExecutionContext, waitOnExecutionContext, runDurableObjectAlarm } from "cloudflare:test";
+import { env, createExecutionContext, waitOnExecutionContext, runDurableObjectAlarm, runInDurableObject } from "cloudflare:test";
 import { call, db, SETUP_TOKEN } from "./helpers/http";
 import { connectAgent, connectPanel, collectMessages, expectNoMessage, hub, nextMessage } from "./helpers/ws";
 import { signRequest } from "../src/lib/signing";
@@ -27,6 +27,23 @@ import golden from "./fixtures/golden.json";
 // like hub.spec.ts/jobs.spec.ts/panel-ws.spec.ts already do; there is no
 // simulated-clock alternative available in this test harness (documented
 // per the task brief's "whatever miniflare affords").
+
+// Same alarm hygiene as hub.spec.ts, for the same root cause: every
+// `connectAgent` handshake arms a REAL 5s dispatch alarm and miniflare fires
+// due alarms for real. This chain runs well past 5s on a loaded box -- and
+// `ci-build` runs it right after two `npm ci`s, the loudest moment a CI
+// container has -- so an alarm armed earlier in the chain fired inside one of
+// the fixed `expectNoMessage(...)` windows below, dispatched, and the extra
+// frame failed the test (caught once in a fresh-clone ci-build, 3/3 green in
+// isolation). Deleting the pending alarm around every test means a tick only
+// ever runs through the explicit `runDurableObjectAlarm(hub())` calls; each
+// test's own `connectAgent` re-arms before those, so `ran === true` holds.
+async function deletePendingAlarm(): Promise<void> {
+  await runInDurableObject(hub(), (_instance, state) => state.storage.deleteAlarm());
+}
+
+beforeEach(deletePendingAlarm);
+afterEach(deletePendingAlarm);
 
 afterEach(async () => {
   await db().prepare("DELETE FROM settings").run();
