@@ -649,11 +649,31 @@ describe("agent releases (cloud publish-agent parity)", () => {
     return { cookie, csrf, body: r.body, status: r.status };
   }
 
+  /** Same as `publish()` but with a caller-chosen filename/query string, for
+   * the min_supported-policy cases below (they need distinct `latest`
+   * versions across calls, e.g. "0.1.0" then "0.2.0"). */
+  async function publishAs(
+    filename: string,
+    extraQuery = ""
+  ): Promise<{ body: any; status: number }> {
+    const { cookie, csrf } = await adminSession();
+    const r = await call(`/api/workers/agent-release?filename=${filename}${extraQuery}`, {
+      method: "POST",
+      rawBody: WHEEL,
+      cookie,
+      headers: { "X-CSRF": csrf },
+    });
+    return { body: r.body, status: r.status };
+  }
+
   it("publishes a wheel: settings written, version parsed, signature verifies", async () => {
     const { body, status } = await publish();
     expect(status).toBe(200);
     expect(body.agent_latest).toBe("9.9.9");
-    expect(body.agent_min_supported).toBe("9.9.9");
+    // First-ever publish, nothing stored yet -- min_supported falls back to
+    // AGENT_VERSION_DEFAULT ("0.1.0"), not to `latest` (see the
+    // "keeps min_supported" tests below for the owner policy this protects).
+    expect(body.agent_min_supported).toBe("0.1.0");
     expect(body.agent_wheel_url).toBe(`/api/agent/releases/${FILENAME}`);
 
     const seed = await resolvePlatformSeed(db(), undefined);
@@ -696,6 +716,57 @@ describe("agent releases (cloud publish-agent parity)", () => {
     });
     expect(bad.status).toBe(400);
     expect(bad.body.error.code).toBe("agent.bad_release_filename");
+  });
+
+  // Owner policy: min_supported must not ratchet up automatically on every
+  // publish -- see workers.ts's `POST /api/workers/agent-release` comment.
+  describe("min_supported policy", () => {
+    afterEach(async () => {
+      await store().delete("releases/comfyfed-0.1.0-py3-none-any.whl");
+      await store().delete("releases/comfyfed-0.2.0-py3-none-any.whl");
+      await store().delete("releases/comfyfed-0.3.0-py3-none-any.whl");
+    });
+
+    it("first-ever publish with nothing stored falls back to AGENT_VERSION_DEFAULT", async () => {
+      const { body, status } = await publishAs("comfyfed-0.2.0-py3-none-any.whl");
+      expect(status).toBe(200);
+      expect(body.agent_latest).toBe("0.2.0");
+      expect(body.agent_min_supported).toBe("0.1.0");
+    });
+
+    it("publishing a newer latest leaves the stored min_supported alone", async () => {
+      const first = await publishAs("comfyfed-0.1.0-py3-none-any.whl");
+      expect(first.status).toBe(200);
+      expect(first.body.agent_min_supported).toBe("0.1.0");
+
+      const second = await publishAs("comfyfed-0.2.0-py3-none-any.whl");
+      expect(second.status).toBe(200);
+      expect(second.body.agent_latest).toBe("0.2.0");
+      expect(second.body.agent_min_supported).toBe("0.1.0");
+
+      const version = await call("/api/agent/version");
+      expect(version.body.latest).toBe("0.2.0");
+      expect(version.body.min_supported).toBe("0.1.0");
+    });
+
+    it("an explicit ?min_supported= still overrides", async () => {
+      await publishAs("comfyfed-0.1.0-py3-none-any.whl");
+      const r = await publishAs("comfyfed-0.2.0-py3-none-any.whl", "&min_supported=0.2.0");
+      expect(r.status).toBe(200);
+      expect(r.body.agent_latest).toBe("0.2.0");
+      expect(r.body.agent_min_supported).toBe("0.2.0");
+    });
+
+    it("rejects an explicit min_supported greater than latest", async () => {
+      await publishAs("comfyfed-0.1.0-py3-none-any.whl");
+      const r = await publishAs("comfyfed-0.2.0-py3-none-any.whl", "&min_supported=0.3.0");
+      expect(r.status).toBe(400);
+      expect(r.body.error.code).toBe("agent.min_supported_above_latest");
+
+      // The stored setting must be untouched by the rejected call.
+      const version = await call("/api/agent/version");
+      expect(version.body.min_supported).toBe("0.1.0");
+    });
   });
 });
 

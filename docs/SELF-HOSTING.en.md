@@ -403,7 +403,7 @@ comfyfed-server publish-agent dist/comfyfed_agent-0.2.0-py3-none-any.whl \
   --min-supported 0.1.0
 ```
 
-(The version is parsed from the wheel filename unless you pass `--latest`. `--min-supported` defaults to `--latest`, which locks out every older agent.)
+(The version is parsed from the wheel filename unless you pass `--latest`. **`--min-supported` policy: publishing never raises `min_supported` automatically** — omit it and the currently-stored value stays put (falling back to the built-in default `0.1.0` only on the very first publish, before anything has ever been stored); older agents keep working, just possibly without newer features, and an agent self-updates on its next start anyway. Only pass `--min-supported` explicitly when there's a genuine hard breaking change that would actually break an older agent's connection — and the value can't exceed `--latest` (that would lock out every agent, including the one you just published; the command fails outright).)
 
 Once published, an agent asks `/api/agent/version` at startup, compares versions, downloads the wheel, and installs it only if both the sha256 and the platform signature verify. **The signed payload is `{version}|{sha256}`** — binding the version into the signature means an old release's signature cannot be replayed to advertise a newer version, so a downgrade attack does not work.
 

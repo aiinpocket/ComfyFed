@@ -314,6 +314,33 @@ function wheelVersionFromFilename(filename: string): string | null {
   return m?.[1] ?? null;
 }
 
+// Same character class the filename parser above accepts for a version
+// component -- used to sanity-check an explicit `?latest=`/`?min_supported=`
+// override, which (unlike the filename) isn't otherwise constrained.
+const VERSION_RE = /^[0-9][A-Za-z0-9_.!+]*$/;
+
+/** Best-effort dotted-version compare (PEP 440-ish, not a full parser):
+ * numeric segments compare numerically, non-numeric segments compare as
+ * strings. Good enough to reject a `min_supported` above `latest` for the
+ * versions this project actually publishes (e.g. "0.2.0"). */
+function compareVersions(a: string, b: string): number {
+  const as = a.split(".");
+  const bs = b.split(".");
+  const len = Math.max(as.length, bs.length);
+  for (let i = 0; i < len; i++) {
+    const av = as[i] ?? "0";
+    const bv = bs[i] ?? "0";
+    const an = /^\d+$/.test(av) ? Number(av) : null;
+    const bn = /^\d+$/.test(bv) ? Number(bv) : null;
+    if (an !== null && bn !== null) {
+      if (an !== bn) return an - bn;
+    } else if (av !== bv) {
+      return av < bv ? -1 : 1;
+    }
+  }
+  return 0;
+}
+
 app.get("/api/agent/releases/:filename", async (c) => {
   const raw = c.req.param("filename");
   // Basename-only, mirroring workers.py's os.path.basename guard; reject
@@ -340,11 +367,32 @@ app.post("/api/workers/agent-release", requireCsrf, async (c) => {
     return errorJson(c, 400, "agent.bad_release_filename", "filename must be a .whl basename.");
   }
   const parsed = wheelVersionFromFilename(filename);
-  const latest = c.req.query("latest") || parsed || null;
+  const latestQuery = c.req.query("latest");
+  const latest = latestQuery || parsed || null;
   if (!latest) {
     return errorJson(c, 400, "agent.bad_release_version", "Cannot parse a version from the filename; pass ?latest=.");
   }
-  const minSupported = c.req.query("min_supported") || latest;
+  if (latestQuery && !VERSION_RE.test(latestQuery)) {
+    return errorJson(c, 400, "agent.bad_release_version", "latest must be a sane version string.");
+  }
+
+  // OWNER POLICY: min_supported must NOT ratchet up automatically on every
+  // publish -- someone who rarely boots their machine must never be locked
+  // out just because releases happened. Default to whatever is currently
+  // stored (i.e. leave it alone); an explicit `?min_supported=` still lets an
+  // operator raise it deliberately for a genuine hard incompatibility. Only
+  // when nothing has ever been published does it fall back to the default.
+  const minSupportedQuery = c.req.query("min_supported");
+  const storedMinSupported = await getSetting(c.env.DB, AGENT_MIN_SUPPORTED_KEY);
+  const minSupported = minSupportedQuery || storedMinSupported || AGENT_VERSION_DEFAULT;
+  if (minSupportedQuery && !VERSION_RE.test(minSupportedQuery)) {
+    return errorJson(c, 400, "agent.bad_release_version", "min_supported must be a sane version string.");
+  }
+  if (compareVersions(minSupported, latest) > 0) {
+    // A min_supported above latest would lock out every agent, including one
+    // freshly updated to this very build.
+    return errorJson(c, 400, "agent.min_supported_above_latest", "min_supported must not be greater than latest.");
+  }
 
   const body = new Uint8Array(await c.req.arrayBuffer());
   if (body.byteLength === 0) {

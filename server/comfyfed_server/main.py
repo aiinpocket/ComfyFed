@@ -83,6 +83,34 @@ _RELEASES_DIRNAME = "releases"
 # agent-0.2.0-py3-none-any.whl / comfyfed-0.2.0.whl -> "0.2.0"
 _WHEEL_VERSION_RE = re.compile(r"^[^-]+-([^-]+)")
 
+# Same default/key names workers.py's `GET /api/agent/version` and the cloud
+# parity route (`cloud/src/routes/workers.ts`) use for this setting.
+_AGENT_MIN_SUPPORTED_KEY = "agent_min_supported"
+_AGENT_VERSION_DEFAULT = "0.1.0"
+
+
+def _get_setting(key: str, default: str | None) -> str | None:
+    with db.get_session() as session:
+        row = session.get(db.Setting, key)
+        return row.value if row is not None else default
+
+
+def _compare_versions(a: str, b: str) -> int:
+    """Best-effort dotted-version compare (PEP 440-ish, not a full parser):
+    numeric segments compare numerically, non-numeric segments compare as
+    strings. Mirrors cloud/src/routes/workers.ts's `compareVersions`."""
+    a_parts = a.split(".")
+    b_parts = b.split(".")
+    for i in range(max(len(a_parts), len(b_parts))):
+        av = a_parts[i] if i < len(a_parts) else "0"
+        bv = b_parts[i] if i < len(b_parts) else "0"
+        if av.isdigit() and bv.isdigit():
+            if int(av) != int(bv):
+                return -1 if int(av) < int(bv) else 1
+        elif av != bv:
+            return -1 if av < bv else 1
+    return 0
+
 
 def _wheel_version(wheel_path: str) -> str:
     """Pull the version out of a PEP 427 wheel filename ({name}-{version}-...)."""
@@ -129,6 +157,27 @@ def publish_agent(
     bootstrap.ensure_installed(data_dir, lang=None, url=None, interactive=False)
 
     version = latest or _wheel_version(wheel_path)
+
+    # OWNER POLICY: min_supported must NOT ratchet up automatically on every
+    # publish -- someone who rarely boots their machine must never be locked
+    # out just because releases happened. Default to whatever is currently
+    # stored (i.e. leave it alone); an explicit --min-supported still lets an
+    # operator raise it deliberately for a genuine hard incompatibility. Only
+    # when nothing has ever been published does it fall back to the default.
+    effective_min_supported = min_supported or _get_setting(
+        _AGENT_MIN_SUPPORTED_KEY, _AGENT_VERSION_DEFAULT
+    )
+    if _compare_versions(effective_min_supported, version) > 0:
+        # A min_supported above latest would lock out every agent, including
+        # one freshly updated to this very build.
+        for lang in ("zh-TW", "en"):
+            print(
+                i18n.t("publish.min_supported_above_latest", lang).format(
+                    min_supported=effective_min_supported, latest=version
+                )
+            )
+        raise SystemExit(1)
+
     filename = os.path.basename(wheel_path)
 
     releases_dir = os.path.join(data_dir, _RELEASES_DIRNAME)
@@ -145,7 +194,7 @@ def publish_agent(
 
     published = {
         "agent_latest": version,
-        "agent_min_supported": min_supported or version,
+        "agent_min_supported": effective_min_supported,
         "agent_wheel_url": f"/api/agent/releases/{filename}",
         "agent_wheel_sha256": sha256_hex,
         "agent_wheel_sig": signature,

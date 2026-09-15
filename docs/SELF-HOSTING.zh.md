@@ -403,7 +403,7 @@ comfyfed-server publish-agent dist/comfyfed_agent-0.2.0-py3-none-any.whl \
   --min-supported 0.1.0
 ```
 
-（版本號預設從 wheel 檔名解析，可用 `--latest` 覆寫；`--min-supported` 不給就等於 `--latest`，代表舊版 agent 一律擋掉。）
+（版本號預設從 wheel 檔名解析，可用 `--latest` 覆寫。**`--min-supported` 政策：發布不會自動拉高 `min_supported`**——不給就沿用目前資料庫裡已存的值（第一次發布、資料庫還沒存過才會退回內建預設 `0.1.0`），舊版 agent 照樣能跑，只是可能缺新功能；agent 每次啟動都會自我更新，通常不需要手動擋版本。只有遇到真正的破壞性變更（舊版 agent 連線會直接壞掉那種）才需要明確帶 `--min-supported` 手動拉高，而且拉高值不能超過 `--latest`（超過會把所有 agent，包含剛發布的這個版本，一起擋在外面，指令會直接失敗）。）
 
 發布完成後，agent 啟動時會去問 `/api/agent/version`，比對版本、下載 wheel、驗 sha256 與簽章，全部通過才安裝並重啟。**簽章內容是 `{版本}|{sha256}`**──把版本綁進簽章裡，就沒辦法拿舊版本的簽章去冒充新版本，避免被降版攻擊。
 

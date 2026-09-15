@@ -38,7 +38,10 @@ def test_publish_agent_writes_settings_and_copies_the_wheel(data_dir, wheel):
     published = main.publish_agent(data_dir, wheel)
 
     assert published["agent_latest"] == "0.2.0"
-    assert published["agent_min_supported"] == "0.2.0"
+    # First-ever publish, nothing stored yet -- min_supported falls back to
+    # the AGENT_VERSION_DEFAULT ("0.1.0"), not to `latest` (owner policy: see
+    # the "keeps min_supported" tests below).
+    assert published["agent_min_supported"] == "0.1.0"
     assert published["agent_wheel_url"] == (
         "/api/agent/releases/comfyfed_agent-0.2.0-py3-none-any.whl"
     )
@@ -54,6 +57,40 @@ def test_publish_agent_honours_explicit_version_bounds(data_dir, wheel):
     published = main.publish_agent(data_dir, wheel, latest="0.3.0", min_supported="0.2.0")
     assert published["agent_latest"] == "0.3.0"
     assert published["agent_min_supported"] == "0.2.0"
+
+
+def test_publish_agent_keeps_min_supported_on_a_later_publish(data_dir, wheel):
+    """Owner policy: min_supported must not ratchet up automatically just
+    because a newer `latest` was published."""
+    first = main.publish_agent(data_dir, wheel, latest="0.1.0")
+    assert first["agent_min_supported"] == "0.1.0"
+
+    second = main.publish_agent(data_dir, wheel, latest="0.2.0")
+    assert second["agent_latest"] == "0.2.0"
+    assert second["agent_min_supported"] == "0.1.0"
+
+    server = TestClient(app_module.create_app(data_dir))
+    body = server.get("/api/agent/version").json()
+    assert body["latest"] == "0.2.0"
+    assert body["min_supported"] == "0.1.0"
+
+
+def test_publish_agent_explicit_min_supported_still_overrides(data_dir, wheel):
+    main.publish_agent(data_dir, wheel, latest="0.1.0")
+    published = main.publish_agent(data_dir, wheel, latest="0.2.0", min_supported="0.2.0")
+    assert published["agent_latest"] == "0.2.0"
+    assert published["agent_min_supported"] == "0.2.0"
+
+
+def test_publish_agent_rejects_min_supported_above_latest(data_dir, wheel):
+    main.publish_agent(data_dir, wheel, latest="0.1.0")
+    with pytest.raises(SystemExit):
+        main.publish_agent(data_dir, wheel, latest="0.2.0", min_supported="0.3.0")
+
+    # The rejected call must not have touched the stored setting.
+    server = TestClient(app_module.create_app(data_dir))
+    body = server.get("/api/agent/version").json()
+    assert body["min_supported"] == "0.1.0"
 
 
 def test_publish_agent_rejects_a_missing_wheel(data_dir, tmp_path):

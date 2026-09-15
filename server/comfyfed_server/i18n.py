@@ -31,6 +31,10 @@ _DICT: dict[str, dict[str, str]] = {
         "zh-TW": "已發布 agent 版本，設定如下：",
         "en": "Agent release published; settings written:",
     },
+    "publish.min_supported_above_latest": {
+        "zh-TW": "min_supported（{min_supported}）不可高於 latest（{latest}），這會把所有 agent（包含剛發布的這個版本）都鎖在外面。",
+        "en": "min_supported ({min_supported}) must not be greater than latest ({latest}) -- that would lock out every agent, including this very build.",
+    },
     "publish.offline_key_note": {
         "zh-TW": (
             "注意：平台簽章金鑰可以離線保管。若要離線簽章，請自行對 "
