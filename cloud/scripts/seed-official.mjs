@@ -219,27 +219,75 @@ async function readBucketNameFromWrangler() {
   }
 }
 
-async function uploadDirectory(dir, prefix) {
-  const names = (await readdir(dir)).sort();
-  const s3Creds = getS3CredsFromEnv();
+// Per-file upload with retries. A single transient failure (an R2 5xx, a
+// wrangler child that exited 1 once) must not take down a 700-file sync.
+const PUT_ATTEMPTS = 3;
+async function putWithRetry(label, fn) {
+  let lastErr;
+  for (let attempt = 1; attempt <= PUT_ATTEMPTS; attempt++) {
+    try {
+      await fn();
+      return null;
+    } catch (err) {
+      lastErr = err;
+      if (attempt < PUT_ATTEMPTS) await new Promise((r) => setTimeout(r, 500 * attempt));
+    }
+  }
+  return `${label}: ${lastErr instanceof Error ? lastErr.message : String(lastErr)}`;
+}
 
+async function uploadDirectory(dir, prefix) {
+  const all = (await readdir(dir)).sort();
+  // The index and manifest go LAST, and only if every media/workflow file
+  // landed: a partial sync must never advertise templates whose assets are
+  // missing. Live-caught the other way round: one transient `wrangler r2
+  // object put` failure rejected the whole mapWithConcurrency, main()'s
+  // `finally` tore the extraction dir down while sibling uploads were
+  // still running ("The file ... does not exist" cascade), and index.json
+  // -- alphabetically mid-list -- never reached R2, so the panel showed no
+  // official templates at all.
+  const trailing = new Set(["index.json", MANIFEST_NAME]);
+  const names = all.filter((n) => !trailing.has(n));
+  const last = all.filter((n) => trailing.has(n));
+  const s3Creds = getS3CredsFromEnv();
+  const failures = [];
+
+  let put;
   if (s3Creds) {
-    console.log(`Uploading ${names.length} files via the R2 S3 API (concurrency ${S3_CONCURRENCY}) ...`);
-    await mapWithConcurrency(names, S3_CONCURRENCY, async (name) => {
+    console.log(`Uploading ${all.length} files via the R2 S3 API (concurrency ${S3_CONCURRENCY}) ...`);
+    put = async (name) => {
       const body = await readFile(path.join(dir, name));
       await s3PutObject(s3Creds, `${prefix}${name}`, body);
-    });
-    return;
+    };
+  } else {
+    console.warn(
+      "seed-official: R2_S3_ACCOUNT_ID/R2_S3_ACCESS_KEY_ID/R2_S3_SECRET_ACCESS_KEY/R2_S3_BUCKET are not all set -- " +
+        "falling back to `wrangler r2 object put`, one CLI invocation per file. This is SLOW for a full official-" +
+        "library sync (~1376 files); set the four R2_S3_* env vars to use the fast S3-API path instead."
+    );
+    const bucket = process.env.R2_BUCKET_NAME || (await readBucketNameFromWrangler()) || "comfyfed-store";
+    console.log(`Uploading ${all.length} files via wrangler CLI to bucket "${bucket}" (concurrency ${WRANGLER_CONCURRENCY}) ...`);
+    put = (name) => wranglerPut(bucket, `${prefix}${name}`, path.join(dir, name));
   }
+  const concurrency = s3Creds ? S3_CONCURRENCY : WRANGLER_CONCURRENCY;
 
-  console.warn(
-    "seed-official: R2_S3_ACCOUNT_ID/R2_S3_ACCESS_KEY_ID/R2_S3_SECRET_ACCESS_KEY/R2_S3_BUCKET are not all set -- " +
-      "falling back to `wrangler r2 object put`, one CLI invocation per file. This is SLOW for a full official-" +
-      "library sync (~1376 files); set the four R2_S3_* env vars to use the fast S3-API path instead."
-  );
-  const bucket = process.env.R2_BUCKET_NAME || (await readBucketNameFromWrangler()) || "comfyfed-store";
-  console.log(`Uploading ${names.length} files via wrangler CLI to bucket "${bucket}" (concurrency ${WRANGLER_CONCURRENCY}) ...`);
-  await mapWithConcurrency(names, WRANGLER_CONCURRENCY, (name) => wranglerPut(bucket, `${prefix}${name}`, path.join(dir, name)));
+  // Every task resolves (failures are collected, never thrown mid-flight),
+  // so nothing can tear the directory down under a sibling upload.
+  await mapWithConcurrency(names, concurrency, async (name) => {
+    const failure = await putWithRetry(name, () => put(name));
+    if (failure) failures.push(failure);
+  });
+
+  if (failures.length > 0) {
+    console.error(`seed-official: ${failures.length} of ${names.length} file(s) failed after ${PUT_ATTEMPTS} attempts; index.json NOT uploaded:`);
+    for (const f of failures) console.error(`  - ${f}`);
+    throw new Error(`${failures.length} upload(s) failed; re-run to retry (uploads are idempotent).`);
+  }
+  for (const name of last) {
+    const failure = await putWithRetry(name, () => put(name));
+    if (failure) throw new Error(`could not upload ${name} after ${PUT_ATTEMPTS} attempts: ${failure}`);
+  }
+  console.log(`Uploaded ${all.length} files (index.json last).`);
 }
 
 async function main() {
