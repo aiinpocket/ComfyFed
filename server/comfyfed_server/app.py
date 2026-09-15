@@ -27,6 +27,7 @@ from . import (
     model_manifest,
     peer,
     receipts,
+    stats,
     templates,
     users,
     workers,
@@ -151,6 +152,10 @@ def create_app(data_dir: str) -> FastAPI:
 
     @asynccontextmanager
     async def lifespan(_app: FastAPI):
+        # Phase 3.3 §2.6: 舊安裝第一次跑到這裡時，用最近 500 筆完成收據把
+        # worker_job_stats 補起來，免得排程器上線後要從零重新學。只做一次
+        # （stats.BACKFILL_SETTING_KEY 旗標），失敗只記 log。
+        stats.backfill_if_needed()
         task = agentws.start_background_task()
         try:
             yield
