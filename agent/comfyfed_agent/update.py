@@ -122,8 +122,35 @@ def _default_pip_install(path: str) -> None:
     subprocess.run([sys.executable, "-m", "pip", "install", "--no-deps", path], check=True)
 
 
+# Exit status that means "the update is installed -- start me again". Every
+# supervisor this agent runs under already restarts a NON-ZERO exit:
+# systemd `Restart=on-failure`, launchd `KeepAlive/SuccessfulExit=false`, and
+# the Windows launcher.ps1 loop, which restarts on exactly this code. A plain
+# 0 (graceful `comfyfed stop`) is never restarted.
+RESTART_EXIT_CODE = 75
+
+
 def _default_restart() -> None:
-    os.execv(sys.executable, [sys.executable] + sys.argv)
+    """Hand control to the supervisor instead of re-exec'ing ourselves.
+
+    The old `os.execv(sys.executable, [sys.executable] + sys.argv)` was the
+    fifth and last masked layer of the self-update chain: under pip's
+    Windows console-script launcher `sys.argv[0]` is the stub path WITHOUT
+    `.exe` and `sys.executable` is the base interpreter, so the re-exec'd
+    command was `python.exe ...\\Scripts\\comfyfed-agent` -- a file that does
+    not exist. The child died on the spot while the parent had already
+    exited: every successful update took the agent offline (live-caught).
+    Exiting with RESTART_EXIT_CODE lets the platform's own supervisor bring
+    the freshly installed version up -- the same mechanism on all three OSes,
+    with no dependence on argv or interpreter paths.
+    """
+    logger.info(
+        "更新已安裝，正在結束以便由監督程序重新啟動 / update installed; exiting so the supervisor restarts the agent (exit %d)",
+        RESTART_EXIT_CODE,
+    )
+    sys.stdout.flush()
+    sys.stderr.flush()
+    raise SystemExit(RESTART_EXIT_CODE)
 
 
 def apply_update(

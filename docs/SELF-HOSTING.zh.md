@@ -411,6 +411,8 @@ comfyfed-server publish-agent dist/comfyfed_agent-0.2.0-py3-none-any.whl \
 
 **自動更新的版本門檻（誠實註記）**：**0.1.6 以前**的 agent 自動更新其實從未成功過——舊版程式碼有三個互相掩蓋的 bug（低於 `min_supported` 時直接退出而不更新；把平台回的相對路徑 `wheel_url` 原樣拿去下載；下載的 wheel 存成隨機暫存檔名，被 pip 以「不是合法 wheel 檔名」拒裝）。這三個都已在 0.1.7 修正。所以**已裝 0.1.6 以下版本的機器，請重跑一次一行安裝指令**（它會直接裝上最新版、且已註冊的機器不會重複註冊），之後從 0.1.7 起的每次啟動才會真的自我更新。
 
+**更新後怎麼重新啟動（0.1.9 起）**：agent 裝好新版後不再自己重新執行自己（0.1.8 以前用 `os.execv` 重跑，在 Windows 上 pip 的啟動器給的 `sys.argv[0]` 沒有 `.exe`，重跑必失敗、agent 會直接下線——這是自動更新鏈的第五個、也是最後一個 bug），而是以 **exit code 75** 結束、交給「監督者」重新拉起新版：Linux 是 systemd 的 `Restart=on-failure`、macOS 是 launchd 的 `SuccessfulExit=false`、Windows 是安裝器產生的 `launcher.ps1` 迴圈（只在 75 時重啟）。`comfyfed stop` 回傳 0，所以停止仍然是最終的，不會被監督者復活。**已裝 0.1.8 的機器**：它升到 0.1.9 時仍會用舊的重跑方式失敗一次——升級本身會成功、但 agent 會下線，需要重新登入／重開機、或重跑一次一行安裝指令（會直接裝 0.1.9 並換上新的 launcher）。
+
 發布完成後，agent 啟動時會去問 `/api/agent/version`，比對版本、下載 wheel、驗 sha256 與簽章，全部通過才安裝並重啟。**簽章內容是 `{版本}|{sha256}`**──把版本綁進簽章裡，就沒辦法拿舊版本的簽章去冒充新版本，避免被降版攻擊。
 
 **雲端版（Cloudflare Workers）發布方式**：雲端沒有 CLI，改用管理員 API——登入後把 wheel 直接 POST 上去（wheel 存進 R2 的 `releases/`，簽章與五個設定的寫法與 CLI 完全相同）：

@@ -1,4 +1,5 @@
 import hashlib
+import inspect
 
 import httpx
 import pytest
@@ -393,3 +394,44 @@ def test_apply_update_rejects_a_signature_bound_to_another_version():
 
     assert ok is False
     assert pip_calls == []
+
+
+def test_default_restart_exits_with_the_supervisor_restart_code():
+    """The fifth masked layer: os.execv rebuilt a command from sys.argv[0],
+    which under pip's Windows launcher lacks '.exe' -- the re-exec'd child
+    died instantly and every successful update took the agent offline
+    (live-caught). Restart is now 'exit RESTART_EXIT_CODE and let the
+    supervisor start the new build': non-zero so systemd on-failure /
+    launchd SuccessfulExit=false / the Windows launcher loop all restart it,
+    and never 0 so a graceful `comfyfed stop` is still final."""
+    import comfyfed_agent.update as update_module
+
+    assert update_module.RESTART_EXIT_CODE == 75
+    with pytest.raises(SystemExit) as exc_info:
+        update_module._default_restart()
+    assert exc_info.value.code == 75
+    # No re-exec attempt of any kind: the function's only observable effect
+    # is the SystemExit above (a spawned child would outlive the test).
+    assert "os.execv(" not in inspect.getsource(update_module._default_restart).split('"""')[-1]
+
+
+def test_apply_update_default_restart_path_raises_systemexit_after_install():
+    """End-to-end with the REAL default restart: a good, verified wheel
+    installs (pip stubbed) and then the process asks its supervisor for a
+    restart via SystemExit(75) -- the exception must escape apply_update
+    (it is BaseException, deliberately not swallowed by the restart guard)."""
+    signing_key = SigningKey.generate()
+    entry = _entry(platform_pubkey=bytes(signing_key.verify_key).hex())
+    wheel_bytes = b"fake wheel contents"
+    sha256 = hashlib.sha256(wheel_bytes).hexdigest()
+    good_sig = signing_key.sign(f"0.2.0|{sha256}".encode()).signature.hex()
+    decision = UpdateDecision(
+        action="update", latest="0.2.0", min_supported="0.1.0",
+        wheel_url="http://testplatform/api/agent/releases/comfyfed-0.2.0-py3-none-any.whl",
+        sha256=sha256, platform_sig=good_sig,
+    )
+    installed: list[str] = []
+    with pytest.raises(SystemExit) as exc_info:
+        apply_update(entry, decision, _FakeClient(wheel_bytes=wheel_bytes), pip_install=lambda p: installed.append(p))
+    assert exc_info.value.code == 75
+    assert len(installed) == 1

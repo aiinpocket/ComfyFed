@@ -548,7 +548,17 @@ if (Test-Path `$ManagedMarker) {
 # string instead; the doubled outer quotes are cmd /c's rule when the
 # command both starts with a quote and contains more quotes.
 `$cmdArgs = '/c ""{0}" run >> "{1}" 2>&1"' -f `$agentExe, `$logFile
-Start-Process -FilePath 'cmd.exe' -ArgumentList `$cmdArgs -WindowStyle Hidden
+# Supervisor loop: the agent exits 75 right after installing a self-update
+# (see comfyfed_agent.update.RESTART_EXIT_CODE) and expects to be started
+# again on the new build -- exactly what systemd/launchd do on the other
+# platforms. Any other exit (0 = graceful 'comfyfed stop', or a crash) ends
+# the loop, so a stop stays final and a crash never spins.
+`$restartCode = 75
+do {
+    `$agentProc = Start-Process -FilePath 'cmd.exe' -ArgumentList `$cmdArgs -WindowStyle Hidden -PassThru -Wait
+    `$agentCode = `$agentProc.ExitCode
+    if (`$agentCode -eq `$restartCode) { Start-Sleep -Seconds 2 }
+} while (`$agentCode -eq `$restartCode)
 "@
 Set-Content -Path $LauncherScript -Value $launcherSource -Encoding UTF8
 

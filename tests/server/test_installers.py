@@ -519,3 +519,21 @@ def test_sh_refuses_to_run_as_root():
     assert '[ "$(id -u)" -eq 0 ]' in sh
     assert "COMFYFED_ALLOW_ROOT" in sh
     assert "Do not run this installer as root" in sh
+
+
+def test_generated_launcher_supervises_the_agent_restart_code():
+    """The agent exits 75 right after installing a self-update and expects
+    to be started again on the new build (comfyfed_agent.update.
+    RESTART_EXIT_CODE). systemd/launchd restart any non-zero exit; Windows
+    has no supervisor, so the generated launcher.ps1 must loop on exactly
+    that code -- and ONLY that code, so a graceful stop (0) stays final and
+    a crash never spins."""
+    text = open(_source_path("install.ps1"), encoding="utf-8-sig").read()
+    start = text.index('$launcherSource = @"')
+    end = text.index('\n"@', start)
+    block = text[start:end]
+    assert "`$restartCode = 75" in block
+    assert "-PassThru -Wait" in block
+    assert "} while (`$agentCode -eq `$restartCode)" in block
+    # Loop only on the restart code: no unconditional restart, no 'while ($true)'.
+    assert "while ($true)" not in block and "while (`$true)" not in block
