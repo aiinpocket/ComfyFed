@@ -116,10 +116,12 @@ def test_staging_requires_a_session(client):
 
 def test_staging_rejects_traversal(client):
     csrf = _login(client)
-    # Single-segment names only: a separator-bearing name is rejected by the
-    # shared sanitizer before it can become a path. (`%2F` is normalized away
-    # by the HTTP client itself, so a backslash is what actually reaches the
-    # route as one path segment here.)
+    # Single-segment names only: the route refuses BOTH separators explicitly,
+    # before any basename-dependent logic, so this is 400 on every OS (
+    # `os.path.basename` only splits on `\` when running on Windows, which
+    # used to make this assertion platform-dependent). Matches the cloud
+    # twin's 400 in test/staging.spec.ts. (`%2F` is normalized away by the
+    # HTTP client itself, so a backslash is what actually reaches the route.)
     r = client.delete("/api/staging/..%5C..%5Ccomfy_settings.json", headers={"X-CSRF": csrf})
     assert r.status_code == 400, r.text
     assert r.json()["error"]["code"] == "staging.bad_name"

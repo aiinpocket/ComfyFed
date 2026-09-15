@@ -57,6 +57,7 @@ import os
 from collections import OrderedDict
 from importlib import resources
 from typing import Callable, Optional
+from urllib.parse import urlparse
 
 from fastapi import (
     APIRouter,
@@ -1383,6 +1384,50 @@ def create_router(
         "檔案超過 5 MB 上限，無法儲存。 / File exceeds the 5 MB userdata limit."
     )
 
+    # A userdata path can name a FILE on one request and a DIRECTORY on the
+    # next (`workflows` saved as a file, then `workflows/a.json`): on a real
+    # filesystem that collides (`FileExistsError`/`NotADirectoryError` from
+    # `makedirs`, `IsADirectoryError` from `open`), and an uncaught one was a
+    # 500 the user could then never recover from. It is a client-side
+    # conflict, so it answers 409. PARITY NOTE: the cloud stack stays
+    # permissive here -- R2 has no directories, so `userdata/<uid>/workflows`
+    # and `userdata/<uid>/workflows/a.json` are simply two independent keys
+    # and both writes succeed (200). The divergence is storage-shaped and
+    # deliberate; the status is 409 only where a conflict can actually occur.
+    _CONFLICT_MESSAGE = (
+        "路徑與既有檔案/目錄衝突 / path conflicts with an existing file or directory"
+    )
+
+    def _origin_rejected(request: Request) -> Optional[JSONResponse]:
+        """Defense in depth for the CSRF-free mutating `/userdata` routes.
+
+        This router deliberately carries no `X-CSRF` check (the pinned
+        ComfyUI frontend cannot send the header), so cross-site protection
+        rests on the session cookie's `SameSite=Lax`. Lax already blocks the
+        cross-site POST, but these routes now DELETE a user's saved
+        workflows, so a second, independent control is cheap: if the browser
+        told us an `Origin` and its host is not our own, refuse.
+
+        An ABSENT `Origin` passes -- non-browser clients (curl, the desktop
+        app) send none, and neither does a same-origin GET navigation. This
+        is a supplement to SameSite, never a replacement for it. Mirrored
+        byte-for-byte in cloud/src/routes/comfyapi.ts's `originRejected`.
+        """
+        origin = request.headers.get("origin")
+        if not origin:
+            return None
+        try:
+            origin_host = urlparse(origin).netloc
+        except ValueError:
+            origin_host = ""
+        if not origin_host or origin_host != (request.headers.get("host") or ""):
+            return _userdata_error(
+                403,
+                "userdata.bad_origin",
+                "跨站請求已被拒絕。 / Cross-origin request refused.",
+            )
+        return None
+
     @r.get("/userdata")
     def list_userdata(
         dir: str = "",
@@ -1407,6 +1452,10 @@ def create_router(
         want_full_info = _qbool(full_info)
         want_split = _qbool(split)
 
+        # PARKED: this walk is unbounded (no per-user file-count or byte
+        # ceiling anywhere). Fine at trusted-circle scale -- authenticated
+        # users only, and a runaway tree only slows that user's own page
+        # loads. Pagination/a truncation marker is future work.
         rels: list[str] = []
         if want_recurse:
             for dirpath, _dirnames, filenames in os.walk(root):
@@ -1438,6 +1487,12 @@ def create_router(
 
         return JSONResponse(content=rels)
 
+    # PARKED status divergence: `GET/DELETE /comfy/api/userdata/` (empty
+    # segment) matches `{file_path:path}` with `""` here and answers 400
+    # `userdata.bad_path`, while the cloud twin's `:path{.+}` does not match
+    # at all and falls through to index.ts's JSON 404 catch-all. Both are
+    # refusals of a request no client makes; not worth contorting either
+    # router's matcher to align.
     @r.get("/userdata/{file_path:path}")
     def get_userdata(
         file_path: str, user: auth.SessionUser = Depends(auth.require_user)
@@ -1454,6 +1509,7 @@ def create_router(
 
     @r.post("/userdata/{file_path:path}/move/{dest_path:path}")
     async def move_userdata(
+        request: Request,
         file_path: str,
         dest_path: str,
         overwrite: Optional[str] = None,
@@ -1462,6 +1518,17 @@ def create_router(
         # Registered BEFORE the plain `POST /userdata/{file:path}` below:
         # `{...:path}` matches slashes, so a move URL would otherwise be
         # swallowed by that route with `file_path == "<src>/move/<dest>"`.
+        #
+        # PARKED divergence: the ASGI server decodes the whole path before
+        # routing, so a plain save to a path whose own segments happen to be
+        # `.../move/...` (`POST /userdata/workflows%2Fmove%2Fx.json`) matches
+        # THIS route here and 404s, while the cloud twin routes on the still-
+        # encoded path and stores it (200). Accepted: the ambiguity is
+        # inherited from upstream's URL shape and the pinned frontend never
+        # names a workflow file or folder `move`.
+        rejected = _origin_rejected(request)
+        if rejected is not None:
+            return rejected
         try:
             src_rel = _safe_userdata_relpath(file_path)
             dest_rel = _safe_userdata_relpath(dest_path)
@@ -1478,8 +1545,17 @@ def create_router(
         if os.path.exists(dest) and os.path.abspath(dest) != os.path.abspath(src) and not _qbool(overwrite, False):
             return _userdata_error(409, "userdata.exists", "目標檔案已存在。 / Destination already exists.")
 
-        os.makedirs(os.path.dirname(dest), exist_ok=True)
-        os.replace(src, dest)
+        if os.path.isdir(dest):
+            # Same per-OS errno spread as the plain POST's own pre-check.
+            return _userdata_error(409, "conflict", _CONFLICT_MESSAGE)
+
+        try:
+            os.makedirs(os.path.dirname(dest), exist_ok=True)
+            # Atomic, unlike the cloud twin's copy+delete -- see that route's
+            # comment for the failure-semantics divergence.
+            os.replace(src, dest)
+        except (FileExistsError, IsADirectoryError, NotADirectoryError):
+            return _userdata_error(409, "conflict", _CONFLICT_MESSAGE)
         return JSONResponse(content=_userdata_info(dest, dest_rel))
 
     @r.post("/userdata/{file_path:path}")
@@ -1489,6 +1565,9 @@ def create_router(
         overwrite: Optional[str] = None,
         user: auth.SessionUser = Depends(auth.require_user),
     ) -> Response:
+        rejected = _origin_rejected(request)
+        if rejected is not None:
+            return rejected
         try:
             rel = _safe_userdata_relpath(file_path)
         except ValueError:
@@ -1502,13 +1581,46 @@ def create_router(
         if os.path.exists(path) and not _qbool(overwrite, True):
             return _userdata_error(409, "userdata.exists", "檔案已存在。 / File already exists.")
 
+        # Refuse an oversized body off the DECLARED length before reading a
+        # single byte of it -- otherwise a 2 GB POST is buffered into RAM in
+        # full just to be answered 413. The post-read check below stays: a
+        # lying or absent `Content-Length` must never be a way past the cap,
+        # so the header check is an extra, cheaper rejection and never a
+        # substitute for measuring the real bytes.
+        declared = request.headers.get("content-length")
+        if declared and declared.isdigit() and int(declared) > _USERDATA_MAX_BYTES:
+            return _userdata_error(413, "userdata.too_large", _TOO_LARGE_MESSAGE)
+
         body = await request.body()
         if len(body) > _USERDATA_MAX_BYTES:
             return _userdata_error(413, "userdata.too_large", _TOO_LARGE_MESSAGE)
 
-        os.makedirs(os.path.dirname(path), exist_ok=True)
-        with open(path, "wb") as f:
-            f.write(body)
+        # Write to a sibling temp file and `os.replace` it into place (the
+        # same idiom as `workers._write_object_info`): `open(path, "wb")`
+        # truncates immediately, so an ENOSPC/EIO mid-write would leave a
+        # 0-byte stub where the user's only copy of a workflow used to be.
+        # The existing file is never touched until the new bytes are
+        # complete. See `_CONFLICT_MESSAGE` for the 409 branch.
+        if os.path.isdir(path):
+            # The destination is already a DIRECTORY (the user saved
+            # `notes/a.json` first and is now trying to save `notes` itself).
+            # Checked up front because the errno differs per OS --
+            # `os.replace` onto a directory is `IsADirectoryError` on POSIX
+            # but `PermissionError` on Windows -- and the answer must not.
+            return _userdata_error(409, "conflict", _CONFLICT_MESSAGE)
+
+        tmp_path = f"{path}.tmp-{os.getpid()}"
+        try:
+            os.makedirs(os.path.dirname(path), exist_ok=True)
+            with open(tmp_path, "wb") as f:
+                f.write(body)
+            os.replace(tmp_path, path)
+        except (FileExistsError, IsADirectoryError, NotADirectoryError):
+            try:
+                os.remove(tmp_path)
+            except OSError:
+                pass
+            return _userdata_error(409, "conflict", _CONFLICT_MESSAGE)
         # Always the full_info entry, whatever `full_info` said: the pinned
         # frontend guards its read with `typeof body === "object"` and only
         # ever pulls `size`/`modified` out of it, so the richer shape is
@@ -1517,8 +1629,13 @@ def create_router(
 
     @r.delete("/userdata/{file_path:path}")
     def delete_userdata(
-        file_path: str, user: auth.SessionUser = Depends(auth.require_user)
+        request: Request,
+        file_path: str,
+        user: auth.SessionUser = Depends(auth.require_user),
     ) -> Response:
+        rejected = _origin_rejected(request)
+        if rejected is not None:
+            return rejected
         try:
             rel = _safe_userdata_relpath(file_path)
         except ValueError:
@@ -1717,6 +1834,16 @@ def create_staging_router(data_dir: str) -> APIRouter:
     def delete_staging(
         filename: str, user: auth.SessionUser = Depends(auth.require_csrf_user)
     ):
+        # Separators are refused explicitly here, ahead of any
+        # basename-dependent logic: `sanitize_path_component` rejects them
+        # too, but stating it at the route keeps the guarantee visible and
+        # platform-independent (`os.path.basename` only splits on `\` when
+        # running on Windows). Same 400 the cloud twin answers with.
+        if "/" in filename or "\\" in filename:
+            raise HTTPException(
+                status_code=400,
+                detail={"code": "staging.bad_name", "message": "檔名不合法。 / Invalid filename."},
+            )
         try:
             safe_name = storage.sanitize_path_component(filename, what="staging filename")
         except ValueError:

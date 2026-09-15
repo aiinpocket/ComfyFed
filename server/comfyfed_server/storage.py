@@ -51,11 +51,27 @@ def sanitize_path_component(value: str, *, what: str = "path component") -> str:
       so `report.png.` and `report.png` are the same file -- a difference
       that lets a name slip past an equality check and then collide.
 
+    Both path separators are rejected UNCONDITIONALLY, before any
+    ``os.path.basename`` call: ``os.path.basename`` only treats a backslash
+    as a separator on Windows, so ``..\\..\\x`` would survive this check on
+    POSIX and become a literal one-segment filename there while Windows (and
+    the cloud twin, ``lib/store.ts``'s ``basename``, which always splits on
+    both separators) rejected it. Same name, same verdict, every host.
+
+    Control characters (anything below 0x20, plus DEL) are rejected too: a
+    NUL in particular makes `open()` raise `ValueError: embedded null byte`
+    deep inside a route, which would surface as an unhandled 500 instead of
+    a 400.
+
     Public because every place that turns a client-supplied name into a path
     segment -- artifact storage here, and job-input uploads in jobs.py --
     must use exactly this rule, so there is only one definition of "safe".
     """
     if not value:
+        raise ValueError(f"Invalid {what}: {value!r}")
+    if "/" in value or "\\" in value:
+        raise ValueError(f"Invalid {what}: {value!r}")
+    if any(ch < " " or ch == "\x7f" for ch in value):
         raise ValueError(f"Invalid {what}: {value!r}")
     base = os.path.basename(value)
     if base != value or base in ("", ".", ".."):

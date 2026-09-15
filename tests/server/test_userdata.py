@@ -6,8 +6,10 @@ for the exact `api.ts` calls each route answers. Harness idioms (fixture,
 `_login`, `_create_user`, ALICE/BOB) mirror `test_comfyapi.py`.
 """
 
+import builtins
 import json
 import os
+from unittest import mock
 
 import pytest
 from fastapi.testclient import TestClient
@@ -204,6 +206,97 @@ def test_userdata_rejects_oversized_file(client):
     # Just under the limit still stores.
     ok = client.post("/comfy/api/userdata/workflows%2Fok.json", content=b"y" * (5 * 1024 * 1024))
     assert ok.status_code == 200
+
+
+def test_userdata_rejects_oversized_content_length_without_reading_body(client):
+    """A declared length over the cap is refused BEFORE the body is read --
+    otherwise a huge POST is buffered into RAM in full just to be 413'd."""
+    _login(client)
+    r = client.post(
+        "/comfy/api/userdata/workflows%2Fhuge.json",
+        content=b"x",
+        headers={"content-length": str(2 * 1024 * 1024 * 1024)},
+    )
+    assert r.status_code == 413, r.text
+    assert r.json()["error"]["code"] == "userdata.too_large"
+    # Nothing was written.
+    assert client.get("/comfy/api/userdata/workflows%2Fhuge.json").status_code == 404
+
+
+def test_userdata_file_vs_directory_collision_is_409(client):
+    """A path that names a FILE on one request and a DIRECTORY on the next
+    collides on a real filesystem; that must be a typed 409, never a 500.
+    (The cloud stack stays permissive -- R2 has no directories.)"""
+    _login(client)
+    # `workflows` as a plain file, then a child under it.
+    assert client.post("/comfy/api/userdata/workflows", content=b"{}").status_code == 200
+    r = client.post("/comfy/api/userdata/workflows%2Fa.json", content=b"{}")
+    assert r.status_code == 409, r.text
+    assert r.json()["error"]["code"] == "conflict"
+    assert "衝突" in r.json()["error"]["message"]
+
+    # And the reverse order: a directory where a file is now wanted.
+    assert _store(client, "notes%2Fa.json").status_code == 200
+    r = client.post("/comfy/api/userdata/notes", content=b"{}")
+    assert r.status_code == 409, r.text
+    assert r.json()["error"]["code"] == "conflict"
+
+
+def test_userdata_rejects_control_characters(client):
+    """A NUL byte used to reach `open()` and raise an uncaught ValueError."""
+    _login(client)
+    assert client.post("/comfy/api/userdata/a%00b", content=b"{}").status_code == 400
+    assert client.get("/comfy/api/userdata/a%00b").status_code == 400
+    assert client.delete("/comfy/api/userdata/a%00b").status_code == 400
+
+
+def test_userdata_write_is_atomic(client):
+    """The existing file survives intact when the new write fails -- the
+    temp-file + `os.replace` idiom, not a truncating `open(path, "wb")`."""
+    _login(client)
+    assert _store(client, "workflows%2Fkeep.json", {"v": 1}).status_code == 200
+    path = os.path.join(
+        comfyapi.userdata_dir(client.data_dir, _uid("admin")), "workflows", "keep.json"
+    )
+    original = open(path, "rb").read()
+
+    real_open = builtins.open
+
+    def exploding_open(file, mode="r", *args, **kwargs):
+        if isinstance(file, str) and ".tmp-" in file and "w" in mode:
+            raise OSError(28, "No space left on device")
+        return real_open(file, mode, *args, **kwargs)
+
+    with mock.patch.object(builtins, "open", exploding_open):
+        with pytest.raises(OSError):
+            _store(client, "workflows%2Fkeep.json", {"v": 2})
+
+    assert open(path, "rb").read() == original
+
+
+def test_userdata_mutations_reject_a_cross_origin_request(client):
+    """Defense in depth on the CSRF-free mutating routes: a present Origin
+    whose host is not ours is refused; absent Origin (non-browser clients)
+    and a same-origin Origin both pass."""
+    _login(client)
+    assert _store(client, "workflows%2Forigin.json").status_code == 200
+
+    evil = {"origin": "https://evil.example"}
+    assert client.post("/comfy/api/userdata/workflows%2Fx.json", content=b"{}", headers=evil).status_code == 403
+    r = client.delete("/comfy/api/userdata/workflows%2Forigin.json", headers=evil)
+    assert r.status_code == 403
+    assert r.json()["error"]["code"] == "userdata.bad_origin"
+    assert client.post(
+        "/comfy/api/userdata/workflows%2Forigin.json/move/workflows%2Fmoved.json", headers=evil
+    ).status_code == 403
+    # Nothing was touched.
+    assert client.get("/comfy/api/userdata/workflows%2Forigin.json").status_code == 200
+
+    # Same-origin passes...
+    same = {"origin": "http://testserver"}
+    assert client.post("/comfy/api/userdata/workflows%2Fsame.json", content=b"{}", headers=same).status_code == 200
+    # ... and so does no Origin at all.
+    assert client.delete("/comfy/api/userdata/workflows%2Forigin.json").status_code == 204
 
 
 def test_userdata_requires_a_session(client):

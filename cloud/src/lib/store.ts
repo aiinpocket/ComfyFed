@@ -56,6 +56,12 @@ export function sanitizePathComponent(value: string, what = "path component"): s
     throw new Error(`Invalid ${what}: ${JSON.stringify(value)}`);
   };
   if (!value) fail();
+  // Control characters (and DEL) are rejected before anything else, mirroring
+  // storage.py's identical check: a NUL makes Python's `open()` throw deep
+  // inside a route (an unhandled 500 instead of a 400), and an R2 key must
+  // never carry one either. Same verdict on both stacks.
+  // eslint-disable-next-line no-control-regex
+  if (/[\x00-\x1f\x7f]/.test(value)) fail();
   const base = basename(value);
   if (base !== value || base === "" || base === "." || base === "..") fail();
   const last = base[base.length - 1];
@@ -101,7 +107,15 @@ export const SHARED_STAGING_UID = "_shared";
  * filename is; it always comes from an authenticated session, but defense
  * in depth costs nothing here. */
 export function stagingKey(uid: string, filename: string): string {
-  return `${STAGING_PREFIX}/${sanitizePathComponent(uid, "user id")}/${sanitizePathComponent(filename, "staging filename")}`;
+  return `${stagingPrefix(uid)}${sanitizePathComponent(filename, "staging filename")}`;
+}
+
+/** The R2 prefix every one of `uid`'s staging objects sits under (trailing
+ * slash included), for LIST -- the twin of `userdataPrefix`. Exported so
+ * `routes/staging.ts`'s listing and `stagingKey`'s delete can never address
+ * different namespaces if `STAGING_PREFIX` is ever renamed. */
+export function stagingPrefix(uid: string): string {
+  return `${STAGING_PREFIX}/${sanitizePathComponent(uid, "user id")}/`;
 }
 
 const USERDATA_PREFIX = "userdata";

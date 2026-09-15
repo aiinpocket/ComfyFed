@@ -23,15 +23,17 @@
 import { Hono } from "hono";
 import type { Env } from "../env";
 import { requireUser, requireCsrfUser, errorJson, SESSION_VAR } from "../lib/guard";
-import { sanitizePathComponent, stagingKey } from "../lib/store";
-
-const STAGING_PREFIX = "staging";
+// `stagingPrefix`/`stagingKey` both come from lib/store.ts, which owns the
+// single `staging/` constant -- a local copy of the prefix here would let
+// this listing and `stagingKey`'s delete silently address different
+// namespaces if that constant were ever renamed.
+import { stagingKey, stagingPrefix } from "../lib/store";
 
 const app = new Hono<{ Bindings: Env }>();
 
 app.get("/api/staging", requireUser, async (c) => {
   const uid = c.get(SESSION_VAR).user.uid;
-  const prefix = `${STAGING_PREFIX}/${sanitizePathComponent(uid, "user id")}/`;
+  const prefix = stagingPrefix(uid);
 
   const objects: R2Object[] = [];
   let cursor: string | undefined;

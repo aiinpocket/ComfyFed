@@ -875,6 +875,31 @@ function qbool(value: string | undefined, fallback = false): boolean {
   return ["1", "true", "yes", "on"].includes(value.trim().toLowerCase());
 }
 
+/** Defense in depth for the CSRF-free mutating `/comfy/api/userdata` routes.
+ * This router carries no `X-CSRF` check (the pinned ComfyUI frontend cannot
+ * send the header), so cross-site protection rests on the session cookie's
+ * `SameSite=Lax`. Lax already blocks the cross-site POST, but these routes
+ * now DELETE a user's saved workflows, so a second, independent control is
+ * cheap: if the browser told us an `Origin` and its host is not our own,
+ * refuse. An ABSENT `Origin` passes -- non-browser clients send none, and
+ * neither does a same-origin GET navigation. Supplement to SameSite, never a
+ * replacement. Mirrors comfyapi.py's `_origin_rejected`. */
+function originRejected(c: Context<{ Bindings: Env }>): Response | null {
+  const origin = c.req.header("origin");
+  if (!origin) return null;
+  let originHost = "";
+  try {
+    originHost = new URL(origin).host;
+  } catch {
+    originHost = "";
+  }
+  const host = c.req.header("host") ?? new URL(c.req.url).host;
+  if (!originHost || originHost !== host) {
+    return userdataError(c, 403, "userdata.bad_origin", "跨站請求已被拒絕。 / Cross-origin request refused.");
+  }
+  return null;
+}
+
 /** Same bilingual envelope shape Python's userdata routes answer with. */
 function userdataError(c: Context<{ Bindings: Env }>, status: number, code: string, message: string): Response {
   return c.json({ error: { code, message } }, status as any);
@@ -904,6 +929,10 @@ app.get("/comfy/api/userdata", async (c) => {
 
   // R2 LIST is paginated (1000 keys per page by default); a user with a lot
   // of saved workflows must still see all of them.
+  // PARKED: the drain is unbounded (no per-user object-count or byte ceiling
+  // anywhere). Fine at trusted-circle scale -- authenticated users only, and
+  // a runaway tree only slows that user's own page loads. A capped drain with
+  // a truncation marker is the future work if the circle ever widens.
   const objects: R2Object[] = [];
   let cursor: string | undefined;
   do {
@@ -932,7 +961,17 @@ app.get("/comfy/api/userdata", async (c) => {
 // Registered BEFORE the plain `POST /comfy/api/userdata/:path` below: the
 // `{.+}` params match slashes, so a move URL would otherwise be swallowed by
 // that route with the whole `<src>/move/<dest>` as its path.
+//
+// PARKED divergence: this route matches on the still-encoded path, so a plain
+// save whose own segments happen to be `.../move/...` (`POST
+// /comfy/api/userdata/workflows%2Fmove%2Fx.json`) falls through to the plain
+// POST below and is stored (200), while Python's ASGI server decodes the path
+// before routing and matches the move route there (404). Accepted: inherited
+// from upstream's URL shape, and the pinned frontend never names a workflow
+// file or folder `move`.
 app.post("/comfy/api/userdata/:src{.+}/move/:dest{.+}", async (c) => {
+  const rejectedOrigin = originRejected(c);
+  if (rejectedOrigin) return rejectedOrigin;
   const user = c.get(SESSION_VAR).user;
   let srcKey: string;
   let destKey: string;
@@ -959,6 +998,19 @@ app.post("/comfy/api/userdata/:src{.+}/move/:dest{.+}", async (c) => {
     }
   }
 
+  // `source.size` comes free off the R2 object we already fetched, so the
+  // 5 MB per-file ceiling the plain POST enforces applies to a move too --
+  // without it a pre-existing oversized object would be materialised whole
+  // in the isolate by `arrayBuffer()` below.
+  if (source.size > USERDATA_MAX_BYTES) {
+    return userdataError(c, 413, "userdata.too_large", USERDATA_TOO_LARGE_MESSAGE);
+  }
+
+  // PARKED: this is a copy+delete, not an atomic rename (R2 has no rename,
+  // and Python's `os.replace` is atomic) -- if the `delete` throws after the
+  // `put` succeeded, the destination exists and the source survives, so the
+  // client's retry sees the 409 for a move it believes failed. Acceptable at
+  // handshake level: nothing is lost, and the user can delete the leftover.
   const bytes = await source.arrayBuffer();
   const written = await c.env.STORE.put(destKey, bytes);
   if (destKey !== srcKey) await c.env.STORE.delete(srcKey);
@@ -981,6 +1033,8 @@ app.get("/comfy/api/userdata/:path{.+}", async (c) => {
 });
 
 app.post("/comfy/api/userdata/:path{.+}", async (c) => {
+  const rejectedOrigin = originRejected(c);
+  if (rejectedOrigin) return rejectedOrigin;
   const user = c.get(SESSION_VAR).user;
   let key: string;
   let rel: string;
@@ -1000,11 +1054,27 @@ app.post("/comfy/api/userdata/:path{.+}", async (c) => {
     if (existing) return userdataError(c, 409, "userdata.exists", USERDATA_EXISTS_MESSAGE);
   }
 
+  // Refuse an oversized body off the DECLARED length before reading a byte
+  // of it, mirroring comfyapi.py's identical short-circuit. The post-read
+  // check below stays: a lying or absent `Content-Length` must never be a
+  // way past the cap, so this is an extra, cheaper rejection and never a
+  // substitute for measuring the real bytes.
+  const declared = c.req.header("content-length");
+  if (declared && /^\d+$/.test(declared) && Number(declared) > USERDATA_MAX_BYTES) {
+    return userdataError(c, 413, "userdata.too_large", USERDATA_TOO_LARGE_MESSAGE);
+  }
+
   const body = await c.req.arrayBuffer();
   if (body.byteLength > USERDATA_MAX_BYTES) {
     return userdataError(c, 413, "userdata.too_large", USERDATA_TOO_LARGE_MESSAGE);
   }
 
+  // PARITY NOTE: no file-vs-directory collision is possible here -- R2 has no
+  // directories, so `userdata/<uid>/workflows` and
+  // `userdata/<uid>/workflows/a.json` are two independent keys and both
+  // writes succeed. comfyapi.py answers 409 `conflict` for that same pair
+  // because a real filesystem cannot hold both; the divergence is
+  // storage-shaped and deliberate.
   const written = await c.env.STORE.put(key, body);
   // Always the full_info entry, whatever `full_info` said -- the pinned
   // frontend guards its read with `typeof body === "object"` and only ever
@@ -1013,6 +1083,8 @@ app.post("/comfy/api/userdata/:path{.+}", async (c) => {
 });
 
 app.delete("/comfy/api/userdata/:path{.+}", async (c) => {
+  const rejectedOrigin = originRejected(c);
+  if (rejectedOrigin) return rejectedOrigin;
   const user = c.get(SESSION_VAR).user;
   let key: string;
   try {

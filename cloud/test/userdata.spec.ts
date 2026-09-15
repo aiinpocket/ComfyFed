@@ -190,6 +190,73 @@ describe("/comfy/api/userdata", () => {
     expect(ok.status).toBe(200);
   });
 
+  it("refuses an oversized declared Content-Length before reading the body", async () => {
+    const admin = await loginSession();
+    const huge = await call("/comfy/api/userdata/workflows%2Fhuge.json", {
+      method: "POST",
+      cookie: admin.cookie,
+      rawBody: new TextEncoder().encode("x"),
+      headers: { "content-length": String(2 * 1024 * 1024 * 1024) },
+    });
+    expect(huge.status).toBe(413);
+    expect(huge.body.error.code).toBe("userdata.too_large");
+    // Nothing was written.
+    const after = await call("/comfy/api/userdata/workflows%2Fhuge.json", { method: "GET", cookie: admin.cookie });
+    expect(after.status).toBe(404);
+  });
+
+  it("rejects control characters in a userdata path", async () => {
+    const admin = await loginSession();
+    expect((await store_(admin.cookie, "a%00b")).status).toBe(400);
+    expect((await call("/comfy/api/userdata/a%00b", { method: "GET", cookie: admin.cookie })).status).toBe(400);
+    expect((await call("/comfy/api/userdata/a%00b", { method: "DELETE", cookie: admin.cookie })).status).toBe(400);
+  });
+
+  it("refuses a cross-origin mutation and passes same-origin / no-origin ones", async () => {
+    const admin = await loginSession();
+    expect((await store_(admin.cookie, "workflows%2Forigin.json")).status).toBe(200);
+
+    const evil = { origin: "https://evil.example" };
+    const crossPost = await call("/comfy/api/userdata/workflows%2Fx.json", {
+      method: "POST",
+      cookie: admin.cookie,
+      rawBody: new TextEncoder().encode("{}"),
+      headers: evil,
+    });
+    expect(crossPost.status).toBe(403);
+    expect(crossPost.body.error.code).toBe("userdata.bad_origin");
+
+    const crossDelete = await call("/comfy/api/userdata/workflows%2Forigin.json", {
+      method: "DELETE",
+      cookie: admin.cookie,
+      headers: evil,
+    });
+    expect(crossDelete.status).toBe(403);
+
+    const crossMove = await call("/comfy/api/userdata/workflows%2Forigin.json/move/workflows%2Fmoved.json", {
+      method: "POST",
+      cookie: admin.cookie,
+      headers: evil,
+    });
+    expect(crossMove.status).toBe(403);
+
+    // Untouched.
+    expect((await call("/comfy/api/userdata/workflows%2Forigin.json", { method: "GET", cookie: admin.cookie })).status).toBe(200);
+
+    // Same-origin passes...
+    const same = await call("/comfy/api/userdata/workflows%2Fsame.json", {
+      method: "POST",
+      cookie: admin.cookie,
+      rawBody: new TextEncoder().encode("{}"),
+      headers: { origin: "http://example.com" },
+    });
+    expect(same.status).toBe(200);
+
+    // ... and so does no Origin at all (non-browser clients).
+    const plain = await call("/comfy/api/userdata/workflows%2Forigin.json", { method: "DELETE", cookie: admin.cookie });
+    expect(plain.status).toBe(204);
+  });
+
   it("requires an authenticated session", async () => {
     await loginSession(); // a user exists, but this call carries no cookie
     for (const [method, path] of [
