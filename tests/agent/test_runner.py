@@ -2299,3 +2299,173 @@ async def test_run_raises_all_registrations_rejected_when_the_only_entry_is_4401
 
     with pytest.raises(AllRegistrationsRejected):
         await asyncio.wait_for(loop.run(), timeout=5)
+
+
+# --- 4401 give-up prunes the dead registration to agent.dead.json -----------
+
+
+def _entry_at(worker_id: str, platform_url: str) -> PlatformEntry:
+    entry = _entry(worker_id)
+    entry.platform_url = platform_url
+    return entry
+
+
+def _dead_records(tmp_path) -> list:
+    with open(tmp_path / "agent.dead.json", "r", encoding="utf-8") as f:
+        return json.load(f)
+
+
+@pytest.fixture()
+def prunable_loop(monkeypatch, tmp_path):
+    """A two-entry (two DIFFERENT platforms) loop whose config really exists
+    on disk, so `_prune_dead_registration` has something to rewrite."""
+    monkeypatch.setattr(hardware, "collect_hardware", lambda *a, **k: {})
+    monkeypatch.setattr(hardware, "detect_backend", lambda: ("cpu", "0"))
+    monkeypatch.setattr(hardware, "collect_dynamic", lambda *a, **k: {})
+    monkeypatch.setattr(whitelist, "allowed_classes", lambda *a, **k: {"KSampler"})
+    monkeypatch.setattr(runner_module, "_BACKOFF_START_SECONDS", 0)
+    monkeypatch.setattr(runner_module, "_BACKOFF_MAX_SECONDS", 0)
+
+    cfg_path = str(tmp_path / "agent.json")
+    config = AgentConfig(
+        platforms=[
+            _entry_at("worker-dead", "http://dead.example"),
+            _entry_at("worker-live", "http://live.example"),
+        ],
+        pause_when_active=False,
+    )
+    config.save(cfg_path)
+    return AgentLoop(config, cfg_path, connection_factory=FakeConnection)
+
+
+async def test_4401_give_up_prunes_only_that_entry_and_backs_it_up(prunable_loop, tmp_path):
+    """The definitive per-entry 4401 give-up removes exactly that entry from
+    agent.json, keeps the signing key recoverable in agent.dead.json, and
+    leaves every other platform's entry untouched."""
+    loop = prunable_loop
+    conn = loop.connections["worker-dead"]
+
+    async def _handshake_4401():
+        raise ConnectionClosedError(Close(_4401(), "worker removed"), None)
+
+    conn.connect = _noop
+    conn.close = _noop
+    conn.handshake = _handshake_4401
+
+    await asyncio.wait_for(loop._run_platform(conn), timeout=5)
+
+    saved = AgentConfig.load(loop.cfg_path)
+    assert [p.worker_id for p in saved.platforms] == ["worker-live"]
+    # The in-memory config follows the file; the OTHER platform's connection
+    # is untouched so its own `_run_platform` keeps running.
+    assert [p.worker_id for p in loop.config.platforms] == ["worker-live"]
+    assert set(loop.connections) == {"worker-dead", "worker-live"}
+
+    records = _dead_records(tmp_path)
+    assert len(records) == 1
+    assert records[0]["worker_id"] == "worker-dead"
+    assert records[0]["platform_url"] == "http://dead.example"
+    # The whole point of the backup: the signing key is recoverable.
+    assert records[0]["signing_key_hex"] == "11" * 32
+    assert records[0]["certificate"] == "cert"
+    assert records[0]["reason"] == "auth_rejected_4401"
+    assert records[0]["removed_at"].endswith("+00:00")
+
+
+async def test_4401_prune_leaves_no_temp_file_behind(prunable_loop, tmp_path):
+    """Both writes go through tmp + os.replace (config.save's contract), so a
+    completed prune leaves exactly agent.json and agent.dead.json."""
+    loop = prunable_loop
+    conn = loop.connections["worker-dead"]
+
+    async def _handshake_4401():
+        raise ConnectionClosedError(Close(_4401(), "gone"), None)
+
+    conn.connect = _noop
+    conn.close = _noop
+    conn.handshake = _handshake_4401
+
+    await asyncio.wait_for(loop._run_platform(conn), timeout=5)
+
+    leftovers = [p.name for p in tmp_path.iterdir() if ".tmp-" in p.name]
+    assert leftovers == []
+
+
+async def test_1006_drop_prunes_nothing(prunable_loop, tmp_path):
+    """A transient 1006 is retried, never pruned: agent.json keeps both
+    entries and no backup file is created at all."""
+    loop = prunable_loop
+    conn = loop.connections["worker-dead"]
+
+    calls = {"n": 0}
+
+    async def _handshake_1006():
+        calls["n"] += 1
+        if calls["n"] >= 3:
+            raise asyncio.CancelledError()
+        raise ConnectionClosedError(Close(1006, "blip"), None)
+
+    conn.connect = _noop
+    conn.close = _noop
+    conn.handshake = _handshake_1006
+
+    with pytest.raises(asyncio.CancelledError):
+        await asyncio.wait_for(loop._run_platform(conn), timeout=5)
+
+    saved = AgentConfig.load(loop.cfg_path)
+    assert [p.worker_id for p in saved.platforms] == ["worker-dead", "worker-live"]
+    assert not (tmp_path / "agent.dead.json").exists()
+
+
+async def test_two_prunes_append_to_the_same_backup_file(prunable_loop, tmp_path):
+    """agent.dead.json is a growing JSON list, not a one-shot file: a second
+    dead registration is APPENDED, the first record is still there."""
+    loop = prunable_loop
+
+    async def _handshake_4401():
+        raise ConnectionClosedError(Close(_4401(), "gone"), None)
+
+    for worker_id in ("worker-dead", "worker-live"):
+        conn = loop.connections[worker_id]
+        conn.connect = _noop
+        conn.close = _noop
+        conn.handshake = _handshake_4401
+        await asyncio.wait_for(loop._run_platform(conn), timeout=5)
+
+    assert AgentConfig.load(loop.cfg_path).platforms == []
+
+    records = _dead_records(tmp_path)
+    assert [r["worker_id"] for r in records] == ["worker-dead", "worker-live"]
+
+
+@pytest.mark.skipif(os.name == "nt", reason="POSIX file modes only")
+async def test_dead_registration_backup_is_owner_only(prunable_loop, tmp_path):
+    """It carries a signing key in the clear, same as agent.json, so it must
+    not be group/world readable where the OS can express that."""
+    loop = prunable_loop
+    conn = loop.connections["worker-dead"]
+
+    async def _handshake_4401():
+        raise ConnectionClosedError(Close(_4401(), "gone"), None)
+
+    conn.connect = _noop
+    conn.close = _noop
+    conn.handshake = _handshake_4401
+
+    await asyncio.wait_for(loop._run_platform(conn), timeout=5)
+
+    mode = os.stat(tmp_path / "agent.dead.json").st_mode & 0o777
+    assert mode == 0o600
+
+
+async def test_prune_of_an_already_absent_entry_is_a_no_op(prunable_loop, tmp_path):
+    """Hand-edited away (or pruned by an earlier run): nothing to back up, so
+    no backup file appears and the surviving entry is left alone."""
+    loop = prunable_loop
+    stranger = _entry_at("worker-gone", "http://gone.example")
+
+    loop._prune_dead_registration(stranger)
+
+    saved = AgentConfig.load(loop.cfg_path)
+    assert [p.worker_id for p in saved.platforms] == ["worker-dead", "worker-live"]
+    assert not (tmp_path / "agent.dead.json").exists()

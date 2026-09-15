@@ -11,7 +11,8 @@ import ntpath
 import os
 import signal
 import time
-from dataclasses import dataclass, field
+from dataclasses import asdict, dataclass, field
+from datetime import datetime, timezone
 from enum import Enum
 from typing import Optional
 from urllib.parse import urlsplit, urlunsplit
@@ -70,6 +71,20 @@ _AUTO_FETCH_DISABLED_MESSAGE = (
 # deploy/network drop (1006/1011), 4401 is PERMANENT -- retrying it can never
 # succeed, so it is classified and handled categorically differently.
 _AUTH_REJECTED_CLOSE_CODE = 4401
+
+# Where a 4401-pruned registration is parked (see
+# `AgentLoop._prune_dead_registration`), always beside `agent.json` itself.
+# A removed entry is NEVER just deleted: it carries this machine's Ed25519
+# signing key for that platform, so it is appended here first and only then
+# dropped from the live config -- an operator who disagrees with the prune
+# (or a platform that comes back) can copy the record's fields straight back
+# into `agent.json`'s `platforms` list.
+_DEAD_REGISTRATIONS_FILENAME = "agent.dead.json"
+
+# The only `reason` this agent writes into `agent.dead.json` today: the
+# definitive per-entry 4401 give-up in `_run_platform`. Transient failures
+# (1006/1011, DNS, refused TCP) never prune anything.
+_DEAD_REASON_AUTH_REJECTED = "auth_rejected_4401"
 
 
 class AllRegistrationsRejected(Exception):
@@ -1954,6 +1969,12 @@ class AgentLoop:
                         conn.entry.worker_id, conn.entry.platform_url,
                         conn.entry.worker_id, conn.entry.platform_url,
                     )
+                    # ...and take the dead entry OUT of agent.json, so the
+                    # next start doesn't re-attempt (and re-log) it forever.
+                    # Only ever reached from THIS definitive per-entry 4401
+                    # give-up -- never from a transient drop, and never from
+                    # `run()`'s `AllRegistrationsRejected` aggregation.
+                    self._prune_dead_registration(conn.entry)
                     # `finally` below still runs `conn.close()` on the way out.
                     return
                 logger.exception("runner: connection to %s dropped, retrying in %ss", conn.entry.platform_url, backoff)
@@ -1975,6 +1996,126 @@ class AgentLoop:
 
             await asyncio.sleep(backoff)
             backoff = min(backoff * 2, _BACKOFF_MAX_SECONDS)
+
+    def _dead_registrations_path(self) -> str:
+        """`agent.dead.json`, always beside the config this loop was given."""
+        return os.path.join(self._config_dir, _DEAD_REGISTRATIONS_FILENAME)
+
+    def _append_dead_registration(self, entry: PlatformEntry) -> None:
+        """Append `entry` (plus when and why) to `agent.dead.json`.
+
+        Written BEFORE the entry leaves `agent.json`, so a crash in between
+        can only ever leave the registration recorded twice -- never lost.
+        The file holds an Ed25519 signing key in the clear, exactly like the
+        config, so it gets the same atomic write + best-effort 0600 treatment
+        (`config.save`); chmod is a no-op on Windows and that is fine.
+        """
+        path = self._dead_registrations_path()
+        records: list = []
+        if os.path.exists(path):
+            try:
+                # utf-8-sig for the same reason config.load uses it: a
+                # hand-edited file on Windows often carries a BOM.
+                with open(path, "r", encoding="utf-8-sig") as f:
+                    loaded = json.load(f)
+                if isinstance(loaded, list):
+                    records = loaded
+                else:
+                    logger.warning(
+                        "runner: %s is not a JSON list, starting a fresh backup list", path
+                    )
+            except (OSError, ValueError):
+                logger.warning(
+                    "runner: could not read %s, starting a fresh backup list", path
+                )
+
+        records.append(
+            {
+                **asdict(entry),
+                "removed_at": datetime.now(timezone.utc).isoformat(),
+                "reason": _DEAD_REASON_AUTH_REJECTED,
+            }
+        )
+
+        parent = os.path.dirname(os.path.abspath(path))
+        if parent:
+            os.makedirs(parent, exist_ok=True)
+        tmp_path = f"{path}.tmp-{os.getpid()}"
+        with open(tmp_path, "w", encoding="utf-8") as f:
+            json.dump(records, f, indent=2, ensure_ascii=False)
+        os.replace(tmp_path, path)
+        try:
+            os.chmod(path, 0o600)
+        except OSError:
+            pass
+
+    def _prune_dead_registration(self, entry: PlatformEntry) -> None:
+        """Remove a definitively 4401-dead `entry` from the persisted config.
+
+        Called ONLY from `_run_platform`'s per-entry give-up. Deliberately
+        synchronous: it runs to completion within one event-loop step, so two
+        platforms giving up in the same tick can't interleave a read-modify-
+        write of `agent.json`. It re-reads the config from disk rather than
+        serialising `self.config`, so an unrelated hand edit made while the
+        agent was running is not silently reverted by this prune, and it does
+        NOT touch `self.connections` -- the other platforms' `_run_platform`
+        tasks are still iterating over their own connections.
+        """
+        try:
+            cfg = AgentConfig.load(self.cfg_path)
+        except (OSError, ValueError):
+            logger.exception(
+                "runner: could not read %s to prune the dead registration", self.cfg_path
+            )
+            return
+
+        remaining = [
+            p
+            for p in cfg.platforms
+            if not (p.worker_id == entry.worker_id and p.platform_url == entry.platform_url)
+        ]
+        if len(remaining) == len(cfg.platforms):
+            # Already gone -- a previous run pruned it, or the operator
+            # removed it by hand while this process was up. Nothing to back
+            # up, nothing to save, nothing to announce.
+            return
+
+        try:
+            self._append_dead_registration(entry)
+        except OSError:
+            # The backup is the whole point: without it the signing key would
+            # be unrecoverable, so a failed backup CANCELS the prune. The
+            # entry stays in agent.json and is simply re-attempted next start
+            # (today's behavior), which is the safe direction to fail.
+            logger.exception(
+                "runner: could not back up the dead registration to %s; leaving %s in %s",
+                self._dead_registrations_path(), entry.worker_id, self.cfg_path,
+            )
+            return
+
+        cfg.platforms = remaining
+        try:
+            cfg.save(self.cfg_path)  # tmp + os.replace, i.e. atomic
+        except OSError:
+            logger.exception("runner: could not save %s after pruning", self.cfg_path)
+            return
+
+        # Keep the in-memory config in step with what is now on disk. NOT
+        # `self.connections`: this connection's own task is about to return,
+        # and every other platform's task keeps its connection untouched.
+        self.config.platforms = [
+            p
+            for p in self.config.platforms
+            if not (p.worker_id == entry.worker_id and p.platform_url == entry.platform_url)
+        ]
+
+        logger.info(
+            "已將失效的註冊（worker %s）移出 agent.json，備份於 agent.dead.json；"
+            "下次啟動不再嘗試。 / Moved the dead registration (worker %s) out of "
+            "agent.json (backup in agent.dead.json); it will not be retried on "
+            "the next start.",
+            entry.worker_id, entry.worker_id,
+        )
 
     async def run(self) -> None:
         if not self.connections:

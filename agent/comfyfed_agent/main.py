@@ -64,7 +64,16 @@ def _cmd_register(args: argparse.Namespace) -> None:
 def _cmd_run(args: argparse.Namespace) -> None:
     cfg = AgentConfig.load(args.config)
     if not cfg.platforms:
-        print(f"No platforms registered in {args.config}. Run 'comfyfed-agent register <bundle.json>' first.")
+        # Reachable two ways now: a never-registered machine, and one whose
+        # only registration was 4401-dead and got pruned to agent.dead.json
+        # on the previous run (see runner.AgentLoop._prune_dead_registration).
+        # Re-running the installer is the path that covers BOTH, so name it.
+        print(
+            f"{args.config} 中沒有任何已註冊的平台。請重新執行安裝指令，"
+            f"或執行 'comfyfed-agent register <bundle.json>'。 / "
+            f"No platforms registered in {args.config}. "
+            f"Re-run the installer, or run 'comfyfed-agent register <bundle.json>' first."
+        )
         return
 
     # Auto-detect / re-detect the local ComfyUI before starting: fills any
