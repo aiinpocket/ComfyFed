@@ -50,10 +50,12 @@ const BACKEND_COLORS: Record<string, string> = {
 };
 
 interface DashboardProps {
-  /** Non-admins can't call `GET /api/workers` (403) -- their federation-wide
-   * worker fleet isn't their concern anyway, so this skips that fetch and the
-   * worker-facing stats/section below rather than spamming 403s. Their own
-   * jobs still come through `GET /api/jobs`, which is scoped server-side. */
+  /** `GET /api/workers` is now a read-only listing any logged-in user may load
+   * (workers are shared infrastructure), so every role fetches the fleet and
+   * sees the worker cards below -- a user's dashboard shows fleet status too.
+   * `role` still gates the aggregate operator KPI tiles (online/busy counts),
+   * which stay admin-only; no admin ACTION is ever exposed here. Jobs come
+   * through `GET /api/jobs`, scoped to the caller server-side. */
   role: Role;
 }
 
@@ -64,11 +66,11 @@ export function Dashboard({ role }: DashboardProps) {
 
   const loadAll = useCallback(async () => {
     const [workers, jobs] = await Promise.all([
-      isAdmin ? api.listWorkers() : Promise.resolve<Worker[]>([]),
+      api.listWorkers(),
       api.listJobs(ACTIVE_STATUSES),
     ]);
     return { workers, jobs };
-  }, [isAdmin]);
+  }, []);
 
   const { data, loading, error } = usePolling(loadAll, POLL_MS);
 
@@ -138,35 +140,37 @@ export function Dashboard({ role }: DashboardProps) {
         />
       </SimpleGrid>
 
-      {isAdmin && (
-        <Stack gap="sm">
-          <Text fw={600} fz="md">
-            {t('dashboard.workers_heading')}
-          </Text>
+      {/* Fleet cards render for every role now: workers are shared
+          infrastructure and `GET /api/workers` is a read-only listing any
+          logged-in user may load. No mutation controls live here, so nothing
+          admin-only is exposed by showing it. */}
+      <Stack gap="sm">
+        <Text fw={600} fz="md">
+          {t('dashboard.workers_heading')}
+        </Text>
 
-          {loading ? (
-            <SimpleGrid cols={{ base: 1, sm: 2, lg: 3 }} spacing="md">
-              <CardSkeleton />
-              <CardSkeleton />
-              <CardSkeleton />
-            </SimpleGrid>
-          ) : workers.length === 0 ? (
-            <Card style={{ background: theme.other.surfaces.card, borderColor: theme.other.surfaces.border }}>
-              <EmptyState
-                icon={<IconDeviceDesktopOff size={26} />}
-                title={t('dashboard.no_workers')}
-                description={t('dashboard.no_workers_hint')}
-              />
-            </Card>
-          ) : (
-            <SimpleGrid cols={{ base: 1, sm: 2, lg: 3 }} spacing="md">
-              {workers.map((worker) => (
-                <WorkerCard key={worker.id} worker={worker} job={jobByWorker.get(worker.id) ?? null} />
-              ))}
-            </SimpleGrid>
-          )}
-        </Stack>
-      )}
+        {loading ? (
+          <SimpleGrid cols={{ base: 1, sm: 2, lg: 3 }} spacing="md">
+            <CardSkeleton />
+            <CardSkeleton />
+            <CardSkeleton />
+          </SimpleGrid>
+        ) : workers.length === 0 ? (
+          <Card style={{ background: theme.other.surfaces.card, borderColor: theme.other.surfaces.border }}>
+            <EmptyState
+              icon={<IconDeviceDesktopOff size={26} />}
+              title={t('dashboard.no_workers')}
+              description={t('dashboard.no_workers_hint')}
+            />
+          </Card>
+        ) : (
+          <SimpleGrid cols={{ base: 1, sm: 2, lg: 3 }} spacing="md">
+            {workers.map((worker) => (
+              <WorkerCard key={worker.id} worker={worker} job={jobByWorker.get(worker.id) ?? null} />
+            ))}
+          </SimpleGrid>
+        )}
+      </Stack>
 
       <Stack gap="sm">
         <Text fw={600} fz="md">

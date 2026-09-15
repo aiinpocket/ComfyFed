@@ -37,7 +37,7 @@ const APP_VERSION = '0.1.0';
 const NAV_ITEMS = [
   { to: '/dashboard', labelKey: 'nav.dashboard', icon: IconLayoutDashboard, adminOnly: false },
   { to: '/jobs', labelKey: 'nav.jobs', icon: IconStack2, adminOnly: false },
-  { to: '/workers', labelKey: 'nav.workers', icon: IconServer2, adminOnly: true },
+  { to: '/workers', labelKey: 'nav.workers', icon: IconServer2, adminOnly: false },
   { to: '/users', labelKey: 'nav.users', icon: IconUsers, adminOnly: true },
   { to: '/reports', labelKey: 'nav.reports', icon: IconChartBar, adminOnly: false },
   { to: '/settings', labelKey: 'nav.settings', icon: IconSettings, adminOnly: false },

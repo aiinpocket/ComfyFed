@@ -136,14 +136,15 @@ export function App() {
         <Route path="/dashboard" element={<Dashboard role={role} />} />
         <Route path="/jobs" element={<Jobs role={role} />} />
         <Route path="/jobs/:id" element={<JobDetail role={role} />} />
-        {/* Admin-only: guarded at the route level, not just hidden from nav --
-            a non-admin navigating here directly (deep link, back button)
-            bounces to the dashboard instead of rendering a page whose
-            `/api/workers` call would just 403. */}
-        <Route
-          path="/workers"
-          element={isAdmin ? <Workers /> : <Navigate to="/dashboard" replace />}
-        />
+        {/* Workers is open to every role: `GET /api/workers` is a read-only
+            fleet listing any logged-in user may load (workers are shared
+            infrastructure). The page itself hides the admin-only mutation
+            controls (add/disable/delete) for non-admins via its `role` prop,
+            and those endpoints stay admin-gated server-side regardless. */}
+        <Route path="/workers" element={<Workers role={role} />} />
+        {/* Users stays admin-only: guarded at the route level, not just hidden
+            from nav -- a non-admin deep-linking here bounces to the dashboard
+            instead of rendering a page whose `/api/users` calls would 403. */}
         <Route
           path="/users"
           element={isAdmin ? <Users /> : <Navigate to="/dashboard" replace />}

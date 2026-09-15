@@ -31,7 +31,7 @@ import {
 import { useCallback, useState, useEffect } from 'react';
 import { useTranslation } from 'react-i18next';
 
-import { ApiError, api, type TokenBundle, type Worker } from '../api';
+import { ApiError, api, type Role, type TokenBundle, type Worker } from '../api';
 import { EmptyState, Mono, SectionHeader, TableSkeleton } from '../components/Primitives';
 import { WorkerStatusBadge } from '../components/StatusBadge';
 import { formatGb, formatRelative, shortId } from '../lib/format';
@@ -39,9 +39,19 @@ import { usePolling } from '../lib/usePolling';
 
 const POLL_MS = 10000;
 
-export function Workers() {
+interface WorkersProps {
+  /** `GET /api/workers` is now a read-only listing any logged-in user may
+   * load (workers are shared infrastructure), so every role renders this
+   * page. Only admins see the mutation controls -- add/disable/delete -- and
+   * those endpoints stay admin-gated server-side regardless: a non-admin must
+   * never see a control whose API would 403. */
+  role: Role;
+}
+
+export function Workers({ role }: WorkersProps) {
   const { t } = useTranslation();
   const theme = useMantineTheme();
+  const isAdmin = role === 'admin';
 
   const loader = useCallback(() => api.listWorkers(), []);
   const { data, loading, error, refresh } = usePolling(loader, POLL_MS);
@@ -96,9 +106,10 @@ export function Workers() {
 
   // Soft delete: the row disappears from this list for good (and the worker
   // can never reconnect), but its receipts stay in the billing reports --
-  // hence a separate confirm from `disable`, spelling that out. The whole
-  // page is admin-only at the route level (see App.tsx), so no extra role
-  // gate is needed on the action itself.
+  // hence a separate confirm from `disable`, spelling that out. The page is
+  // now open to every role (see App.tsx), so this action -- like disable and
+  // add-worker -- is rendered only for admins (`isAdmin` below); the endpoint
+  // is admin-gated server-side too, so a non-admin never sees a 403 control.
   const [deleteTarget, setDeleteTarget] = useState<Worker | null>(null);
   const [deleting, setDeleting] = useState(false);
 
@@ -147,9 +158,11 @@ export function Workers() {
                 {t('workers.download_agent')}
               </Button>
             )}
-            <Button leftSection={<IconPlus size={16} />} onClick={() => setAddOpen(true)}>
-              {t('workers.add')}
-            </Button>
+            {isAdmin && (
+              <Button leftSection={<IconPlus size={16} />} onClick={() => setAddOpen(true)}>
+                {t('workers.add')}
+              </Button>
+            )}
           </Group>
         }
       />
@@ -176,9 +189,11 @@ export function Workers() {
             title={t('workers.empty')}
             description={t('workers.empty_hint')}
             action={
-              <Button variant="light" leftSection={<IconPlus size={16} />} onClick={() => setAddOpen(true)}>
-                {t('workers.add')}
-              </Button>
+              isAdmin ? (
+                <Button variant="light" leftSection={<IconPlus size={16} />} onClick={() => setAddOpen(true)}>
+                  {t('workers.add')}
+                </Button>
+              ) : undefined
             }
           />
         ) : (
@@ -196,8 +211,9 @@ export function Workers() {
                   <Table.Th>{t('workers.col_backend')}</Table.Th>
                   <Table.Th>{t('workers.col_models')}</Table.Th>
                   <Table.Th>{t('workers.col_last_seen')}</Table.Th>
-                  {/* Wide enough for the disable + delete pair. */}
-                  <Table.Th w={210} />
+                  {/* Wide enough for the disable + delete pair. Admin-only:
+                      non-admins have no per-row actions, so no action column. */}
+                  {isAdmin && <Table.Th w={210} />}
                 </Table.Tr>
               </Table.Thead>
               <Table.Tbody>
@@ -266,34 +282,36 @@ export function Workers() {
                         {formatRelative(worker.last_seen, t)}
                       </Text>
                     </Table.Td>
-                    <Table.Td>
-                      <Group gap={4} wrap="nowrap" justify="flex-end">
-                        {!worker.disabled && (
+                    {isAdmin && (
+                      <Table.Td>
+                        <Group gap={4} wrap="nowrap" justify="flex-end">
+                          {!worker.disabled && (
+                            <Button
+                              size="compact-sm"
+                              variant="subtle"
+                              color="red"
+                              leftSection={<IconBan size={14} />}
+                              onClick={() => setConfirmTarget(worker)}
+                            >
+                              {t('workers.disable')}
+                            </Button>
+                          )}
+                          {/* Deliberately NOT a second `variant="subtle"`
+                              red button: delete is irreversible and sits right
+                              next to disable, so it carries its own outline
+                              weight to break the misclick pair. */}
                           <Button
                             size="compact-sm"
-                            variant="subtle"
+                            variant="outline"
                             color="red"
-                            leftSection={<IconBan size={14} />}
-                            onClick={() => setConfirmTarget(worker)}
+                            leftSection={<IconTrash size={14} />}
+                            onClick={() => setDeleteTarget(worker)}
                           >
-                            {t('workers.disable')}
+                            {t('workers.delete')}
                           </Button>
-                        )}
-                        {/* Deliberately NOT a second `variant="subtle"`
-                            red button: delete is irreversible and sits right
-                            next to disable, so it carries its own outline
-                            weight to break the misclick pair. */}
-                        <Button
-                          size="compact-sm"
-                          variant="outline"
-                          color="red"
-                          leftSection={<IconTrash size={14} />}
-                          onClick={() => setDeleteTarget(worker)}
-                        >
-                          {t('workers.delete')}
-                        </Button>
-                      </Group>
-                    </Table.Td>
+                        </Group>
+                      </Table.Td>
+                    )}
                   </Table.Tr>
                 ))}
               </Table.Tbody>
@@ -302,6 +320,11 @@ export function Workers() {
         )}
       </Card>
 
+      {/* Every modal below drives an admin-only mutation and is reachable only
+          through a control gated on `isAdmin` above; rendered under the same
+          gate so a non-admin never mounts them at all. */}
+      {isAdmin && (
+        <>
       <AddWorkerModal opened={addOpen} onClose={() => setAddOpen(false)} onCreated={refresh} />
 
       <Modal
@@ -347,6 +370,8 @@ export function Workers() {
           </Group>
         </Stack>
       </Modal>
+        </>
+      )}
     </Stack>
   );
 }

@@ -13,7 +13,7 @@ import { cleanup, fireEvent, render, screen, waitFor } from '@testing-library/re
 import { MemoryRouter } from 'react-router-dom';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 
-import type { TokenBundle, Worker } from '../api';
+import type { Role, TokenBundle, Worker } from '../api';
 import '../i18n';
 import { theme } from '../theme';
 import { Workers } from './Workers';
@@ -68,11 +68,11 @@ function jsonResponse(body: unknown, status = 200): Response {
   });
 }
 
-function renderWorkers() {
+function renderWorkers(role: Role = 'admin') {
   return render(
     <MantineProvider theme={theme}>
       <MemoryRouter>
-        <Workers />
+        <Workers role={role} />
       </MemoryRouter>
     </MantineProvider>,
   );
@@ -243,5 +243,36 @@ describe('Workers page: delete a worker', () => {
       fetchMock.mock.calls.some(([, init]) => (init as RequestInit | undefined)?.method === 'DELETE'),
     ).toBe(false);
     expect(screen.getByText('runner-sharing')).toBeInTheDocument();
+  });
+});
+
+describe('Workers page: role-gated mutation controls', () => {
+  afterEach(() => {
+    cleanup();
+    vi.unstubAllGlobals();
+  });
+
+  it('renders the read-only fleet list for a non-admin user without add/disable/delete controls', async () => {
+    stubFetch([BASE_WORKER]);
+    renderWorkers('user');
+
+    // The list itself is visible: name, model column, P2P badge all render.
+    expect(await screen.findByText('runner-sharing')).toBeInTheDocument();
+    expect(screen.getByText('P2P sharing')).toBeInTheDocument();
+
+    // None of the admin-only mutation controls are present for a user.
+    expect(screen.queryByRole('button', { name: 'Add worker' })).not.toBeInTheDocument();
+    expect(screen.queryByRole('button', { name: 'Disable' })).not.toBeInTheDocument();
+    expect(screen.queryByRole('button', { name: 'Delete' })).not.toBeInTheDocument();
+  });
+
+  it('renders the add/disable/delete controls for an admin', async () => {
+    stubFetch([BASE_WORKER]);
+    renderWorkers('admin');
+
+    expect(await screen.findByText('runner-sharing')).toBeInTheDocument();
+    expect(screen.getByRole('button', { name: 'Add worker' })).toBeInTheDocument();
+    expect(screen.getByRole('button', { name: 'Disable' })).toBeInTheDocument();
+    expect(screen.getByRole('button', { name: 'Delete' })).toBeInTheDocument();
   });
 });
