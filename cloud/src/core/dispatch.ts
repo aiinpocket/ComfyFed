@@ -17,6 +17,7 @@ import type { Job } from "../db/queries";
 import { toSqliteTimestamp } from "../db/queries";
 import { freeVramGb, needsFromJob, verdict, type FetchableModels } from "./assess";
 import * as scheduler from "./scheduler";
+import * as split from "./split";
 import * as stats from "./stats";
 
 const STALE_SECONDS = 90;
@@ -99,11 +100,20 @@ export async function assignJobs(
   const allWorkers = await queries.getAllWorkers(db);
   const queuedJobs = await queries.getQueuedJobsForDispatch(db);
 
+  // §3.5：配對之前先決定要不要拆。拆過之後 queued 清單變了（父 job 的
+  // `split_count` 現在 > 0，`getQueuedJobsForDispatch` 再也撈不到它；取而代之
+  // 的是它的子 job），所以重讀一次 -- 從這裡往下一律用 `jobsForMatching`，
+  // 絕不能有任何一處還看著舊的 `queuedJobs`，否則被取代的父 job 會被派工。
+  let jobsForMatching = queuedJobs;
+  if (await split.createChildrenForTick(db, queuedJobs, idleWorkers, allWorkers, fetchableModels, peerOnlyModels)) {
+    jobsForMatching = await queries.getQueuedJobsForDispatch(db);
+  }
+
   const limit = Math.min(MAX_JOBS_PER_TICK, JOBS_PER_IDLE_WORKER * idleWorkers.length);
   const starveCutoffMs = now.getTime() - scheduler.STARVE_SECONDS * 1000;
-  const head = queuedJobs.slice(0, limit);
+  const head = jobsForMatching.slice(0, limit);
   const headIds = new Set(head.map((j) => j.id));
-  const starved = queuedJobs
+  const starved = jobsForMatching
     .slice(limit)
     .filter((j) => new Date(`${j.createdAt}Z`).getTime() <= starveCutoffMs && !headIds.has(j.id));
   const selectedJobs = [...head, ...starved];
@@ -217,6 +227,11 @@ export async function requeueStale(db: D1Database, now: Date): Promise<string[]>
     const jobIds = await queries.requeueJobsForWorker(db, worker.id);
     requeued.push(...jobIds);
     await queries.markWorkerOffline(db, worker.id);
+    // Phase 3.3 §3.4：子 job 被 requeue 之後父 job 可能要從 running 退回
+    // assigned/queued。requeue 從不產生 failed/cancelled，所以不會串聯取消。
+    for (const jobId of jobIds) {
+      await split.childStatusChanged(db, jobId, now);
+    }
   }
   return requeued;
 }
@@ -229,13 +244,29 @@ export async function requeueStale(db: D1Database, now: Date): Promise<string[]>
  * `worker_id` cleared). Returns the worker id that owned the job at the
  * moment of cancellation (null if it was still unowned/queued, or if the
  * job doesn't exist / is already terminal). Ports `dispatch.cancel_job` --
- * see its docstring for why ownership release here matters beyond tidiness. */
-export async function cancelJob(db: D1Database, jobId: string, reason: string, now: Date): Promise<string | null> {
+ * see its docstring for why ownership release here matters beyond tidiness.
+ *
+ * Phase 3.3 §3.6: cancelling a CHILD cancels the whole family -- the parent
+ * moves to `cancelled` and the surviving siblings with it (see
+ * `split.refreshParent`). `cancelledOwners`, when given, collects
+ * `[childId, workerId]` for each sibling that still had a live owner so the
+ * caller can push `job_cancelled` to those workers too; the return value
+ * stays exactly what it always was (the worker that owned `jobId` itself).
+ * Cancelling a PARENT does not cascade from here -- it has no `parentId` --
+ * `hub.handleInternalCancel` walks its children explicitly instead. */
+export async function cancelJob(
+  db: D1Database,
+  jobId: string,
+  reason: string,
+  now: Date,
+  cancelledOwners?: [string, string][]
+): Promise<string | null> {
   const job = await queries.getJobById(db, jobId);
   if (job === null || !CANCELLABLE_STATUSES.includes(job.status)) return null;
 
   const owningWorkerId = job.workerId;
   await queries.updateJobCancelled(db, jobId, reason, toSqliteTimestamp(now), owningWorkerId);
+  await split.childStatusChanged(db, jobId, now, cancelledOwners);
   return owningWorkerId;
 }
 
@@ -321,6 +352,8 @@ export async function markRunning(db: D1Database, jobId: string, workerId: strin
   const result = await resolveOwnedJob(db, jobId, workerId, ["assigned"]);
   if (!result.ok) return false;
   await queries.updateJobRunning(db, jobId, toSqliteTimestamp(now));
+  // Phase 3.3 §3.4：子 job 動了就重算父 job（不是子 job 的話是 no-op）。
+  await split.childStatusChanged(db, jobId, now);
   return true;
 }
 
@@ -336,20 +369,29 @@ export async function markDone(
   const result = await resolveOwnedJob(db, jobId, workerId, OWNED_STATUSES);
   if (!result.ok) return false;
   await queries.updateJobDone(db, jobId, resultFiles, toSqliteTimestamp(now));
+  // Phase 3.3 §3.4：最後一個子 job 完成時父 job 才會翻成 done。
+  await split.childStatusChanged(db, jobId, now);
   return true;
 }
 
 /** Fail an assigned/running job of `workerId`. Returns whether it acted.
- * Ports `dispatch.mark_failed`. */
+ * Ports `dispatch.mark_failed`.
+ *
+ * Phase 3.3 §3.4/§3.6: failing a CHILD also fails its parent and
+ * cascade-cancels the surviving siblings. `cancelledOwners`, when given,
+ * collects `[childId, workerId]` for each sibling that still had a live
+ * owner, so the Hub can push `job_cancelled` to those workers. */
 export async function markFailed(
   db: D1Database,
   jobId: string,
   workerId: string,
   error: string,
-  now: Date
+  now: Date,
+  cancelledOwners?: [string, string][]
 ): Promise<boolean> {
   const result = await resolveOwnedJob(db, jobId, workerId, OWNED_STATUSES);
   if (!result.ok) return false;
   await queries.updateJobFailed(db, jobId, error, toSqliteTimestamp(now));
+  await split.childStatusChanged(db, jobId, now, cancelledOwners);
   return true;
 }

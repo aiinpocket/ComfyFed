@@ -1209,3 +1209,62 @@ def test_submit_assets_are_not_charged_against_the_storage_quota(client):
     workflow = {"1": {"class_type": "LoadImage", "inputs": {"image": "ref.png"}}}
     files = [("assets", ("ref.png", io.BytesIO(b"x" * 4096), "image/png"))]
     assert _submit(client, csrf, workflow=workflow, files=files).status_code == 200
+
+
+# --- Phase 3.3 §3.2 / §3.6：送件存 split_plan、重試清掉拆分欄位 ----------
+
+_SPLITTABLE_WORKFLOW = {
+    "1": {"class_type": "EmptyLatentImage", "inputs": {"width": 512, "height": 512, "batch_size": 4}},
+    "2": {"class_type": "KSampler", "inputs": {"latent_image": ["1", 0], "steps": 20}},
+    "3": {"class_type": "VAEDecode", "inputs": {"samples": ["2", 0]}},
+    "4": {"class_type": "SaveImage", "inputs": {"images": ["3", 0]}},
+}
+
+
+def test_create_job_stores_a_split_plan_for_a_batch_workflow(client):
+    job_id = jobs_module.create_job(json.dumps(_SPLITTABLE_WORKFLOW), _SPLITTABLE_WORKFLOW)
+    with db.get_session() as session:
+        plan = json.loads(session.get(db.Job, job_id).split_plan)
+    assert plan == {"source_node_id": "1", "batch_size": 4}
+
+
+def test_create_job_respects_requirements_split_false(client):
+    job_id = jobs_module.create_job(
+        json.dumps(_SPLITTABLE_WORKFLOW), _SPLITTABLE_WORKFLOW, requirements={"split": False}
+    )
+    with db.get_session() as session:
+        assert session.get(db.Job, job_id).split_plan is None
+
+
+def test_create_job_leaves_split_plan_null_for_an_unsplittable_workflow(client):
+    workflow = {"1": {"class_type": "LoadImage", "inputs": {"image": "ref.png"}}}
+    job_id = jobs_module.create_job(
+        json.dumps(workflow), workflow, available_assets={"ref.png"}
+    )
+    with db.get_session() as session:
+        assert session.get(db.Job, job_id).split_plan is None
+
+
+def test_retry_clears_the_split_plan_and_count(client):
+    """§3.6：重試一律不再拆，整包在一台 worker 跑。"""
+    csrf = _login(client)
+    with db.get_session() as session:
+        session.add(
+            db.Job(
+                id="p",
+                workflow_json="{}",
+                status="failed",
+                split_count=2,
+                split_plan=json.dumps({"source_node_id": "1", "batch_size": 4}),
+            )
+        )
+        session.commit()
+
+    response = client.post("/api/jobs/p/retry", headers={"X-CSRF": csrf})
+    assert response.status_code == 200
+
+    with db.get_session() as session:
+        job = session.get(db.Job, "p")
+    assert job.status == "queued"
+    assert job.split_count == 0
+    assert job.split_plan is None

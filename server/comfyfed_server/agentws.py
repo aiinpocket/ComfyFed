@@ -111,7 +111,7 @@ from fastapi import APIRouter, WebSocket, WebSocketDisconnect
 from nacl.exceptions import BadSignatureError
 from nacl.signing import SigningKey, VerifyKey
 
-from . import assess, db, dispatch, metrics, model_manifest, panelws, security, stats, workers
+from . import assess, db, dispatch, metrics, model_manifest, panelws, security, split, stats, workers
 
 logger = logging.getLogger(__name__)
 
@@ -499,9 +499,18 @@ async def _handle_message(worker_id: str, conn: _Connection, message: dict) -> N
         elif msg_type == "job_failed":
             job_id = message.get("job_id")
             error = message.get("error") or ""
+            # Phase 3.3 §3.6：這件 job 如果是子 job，它的失敗會連坐取消還在
+            # 跑的兄弟；那些 worker 要立刻收到 `job_cancelled`，否則得等到
+            # 下一次心跳落在 not-owned 路徑才停下來。
+            cascade_cancelled: list = []
             if dispatch.mark_failed(
-                job_id, worker_id, error, resolve_warn_level=lambda jid: _resolve_warn_level(conn, jid)
+                job_id,
+                worker_id,
+                error,
+                resolve_warn_level=lambda jid: _resolve_warn_level(conn, jid),
+                cancelled_owners=cascade_cancelled,
             ):
+                await _push_cascade_cancellations(cascade_cancelled)
                 _clear_fetch_progress(job_id)
                 await panelws.job_failed(job_id, error)
                 exec_seconds = message.get("exec_seconds")
@@ -604,6 +613,30 @@ async def push_job_cancelled(worker_id: Optional[str], job_id: str) -> None:
         )
 
 
+async def _push_cascade_cancellations(cancelled_owners: list) -> None:
+    """Push `job_cancelled` for every sibling a split cascade just cancelled.
+
+    Phase 3.3 §3.6: `split.refresh_parent` cancels the surviving siblings by
+    writing the same fields `dispatch.cancel_job` writes (including releasing
+    ownership) rather than calling it, because it is itself reached FROM
+    `cancel_job`/`mark_failed` and would recurse. The one thing it cannot do
+    from there is talk to a WebSocket, so it hands back the owners instead
+    and this is where they get told. Each push is isolated: one dead socket
+    must not stop the rest, and a missed push self-heals on that worker's
+    next message anyway (see `dispatch.cancel_job`).
+    """
+    for child_id, owner in cancelled_owners:
+        try:
+            await push_job_cancelled(owner, child_id)
+        except Exception:
+            logger.warning(
+                "agentws: failed to push job_cancelled for split sibling %s owner %s",
+                child_id,
+                owner,
+                exc_info=True,
+            )
+
+
 async def cancel_and_notify(job_id: str, *, reason: str) -> bool:
     """Cancel `job_id` if it is still cancellable, notifying whoever cares.
 
@@ -640,7 +673,11 @@ async def cancel_and_notify(job_id: str, *, reason: str) -> bool:
     if not cancellable:
         return False
 
-    owner = dispatch.cancel_job(job_id, reason=reason)
+    # Phase 3.3 §3.6: cancelling a CHILD cascades up (parent + siblings)
+    # inside `cancel_job`; `cascade_cancelled` carries back the siblings whose
+    # workers still need telling.
+    cascade_cancelled: list = []
+    owner = dispatch.cancel_job(job_id, reason=reason, cancelled_owners=cascade_cancelled)
     _clear_fetch_progress(job_id)
 
     if was_running and owner:
@@ -658,6 +695,25 @@ async def cancel_and_notify(job_id: str, *, reason: str) -> bool:
             logger.warning(
                 "agentws: failed to push job_cancelled for job %s owner %s", job_id, owner, exc_info=True
             )
+
+    # Phase 3.3 §3.6：取消父 job -> 每個未終止的子 job 一併取消並推送（每個
+    # 子 job 走完整的 cancel_job，所有權釋放與 not-owned 自癒都一樣）；取消
+    # 子 job -> 上面的 cancel_job 已經透過 refresh_parent 讓父與其他兄弟一起
+    # 收攤，這裡只剩下把那些兄弟的 owner 通知掉。
+    for child in split.children_of(job_id):
+        if child.status in ("queued", "assigned", "running"):
+            child_owner = dispatch.cancel_job(child.id, reason=reason)
+            if child_owner is not None:
+                try:
+                    await push_job_cancelled(child_owner, child.id)
+                except Exception:
+                    logger.warning(
+                        "agentws: failed to push job_cancelled for split child %s owner %s",
+                        child.id,
+                        child_owner,
+                        exc_info=True,
+                    )
+    await _push_cascade_cancellations(cascade_cancelled)
 
     try:
         await panelws.job_cancelled(job_id)

@@ -701,3 +701,211 @@ describe("Phase 3.3 scheduler semantics", () => {
     expect(await dispatch.assignJobs(db(), [workerId])).toEqual([]);
   });
 });
+
+describe("assignJobs 的拆分步驟 (§3.5)", () => {
+  /** 一件可拆的 queued job：workflow 是真的（子 workflow 重寫要用），
+   * `split_plan` 是送件時就算好存下來的那個 JSON。 */
+  async function makeSplittableJob(
+    label = "j_split",
+    opts: { batchSize?: number; createdAt?: Date; requiredModels?: string[] } = {}
+  ): Promise<string> {
+    const batchSize = opts.batchSize ?? 4;
+    const workflow: Record<string, unknown> = {
+      "1": { class_type: "EmptyLatentImage", inputs: { width: 512, height: 512, batch_size: batchSize } },
+      "2": { class_type: "KSampler", inputs: { latent_image: ["1", 0], steps: 20 } },
+      "3": { class_type: "SaveImage", inputs: { images: ["2", 0] } },
+    };
+    const id = uniqueId(label);
+    await db()
+      .prepare(
+        `INSERT INTO jobs (id, workflow_json, status, created_at, signature, required_nodes, required_models, split_plan)
+         VALUES (?, ?, 'queued', ?, 'sig', ?, ?, ?)`
+      )
+      .bind(
+        id,
+        JSON.stringify(workflow),
+        toSqliteTimestamp(opts.createdAt ?? new Date()),
+        JSON.stringify(["EmptyLatentImage", "KSampler", "SaveImage"]),
+        JSON.stringify(opts.requiredModels ?? []),
+        JSON.stringify({ source_node_id: "1", batch_size: batchSize })
+      )
+      .run();
+    return id;
+  }
+
+  async function childrenOf(parentId: string) {
+    const { results } = await db()
+      .prepare("SELECT id, split_index FROM jobs WHERE parent_id = ? ORDER BY split_index ASC")
+      .bind(parentId)
+      .all<any>();
+    return results;
+  }
+
+  it("splits a batch across the idle fleet and dispatches the children", async () => {
+    const workers = [
+      await makeWorker("ws0", { dynamic: { free_vram_gb: 24 } }),
+      await makeWorker("ws1", { dynamic: { free_vram_gb: 24 } }),
+      await makeWorker("ws2", { dynamic: { free_vram_gb: 24 } }),
+    ];
+    const parentId = await makeSplittableJob();
+
+    const assignments = await dispatch.assignJobs(db(), workers);
+
+    const children = await childrenOf(parentId);
+    expect(children.map((c: any) => c.split_index)).toEqual([0, 1, 2]);
+    expect(new Set(assignments.map((a) => a.job.id))).toEqual(new Set(children.map((c: any) => c.id)));
+    const parent = await getJobRow(parentId);
+    expect(parent.split_count).toBe(3);
+    // 父 job 自己從沒被指派出去。
+    expect(parent.worker_id).toBeNull();
+  });
+
+  it("does not split for a single idle worker", async () => {
+    const workerId = await makeWorker("ws-solo", { dynamic: { free_vram_gb: 24 } });
+    const parentId = await makeSplittableJob();
+
+    const assignments = await dispatch.assignJobs(db(), [workerId]);
+
+    expect(await childrenOf(parentId)).toEqual([]);
+    expect(assignments.map((a) => a.job.id)).toEqual([parentId]);
+  });
+
+  it("caps the split at the batch size", async () => {
+    const workers = [];
+    for (let i = 0; i < 4; i++) workers.push(await makeWorker(`ws-cap${i}`, { dynamic: { free_vram_gb: 24 } }));
+    const parentId = await makeSplittableJob("j_cap", { batchSize: 2 });
+
+    await dispatch.assignJobs(db(), workers);
+
+    expect((await childrenOf(parentId)).length).toBe(2);
+  });
+
+  it("leaves an earlier job's worker out of the split budget", async () => {
+    const workers = [];
+    for (let i = 0; i < 3; i++) workers.push(await makeWorker(`ws-budget${i}`, { dynamic: { free_vram_gb: 24 } }));
+    const base = new Date(Date.now() - 60_000);
+    await makeJob({ id: "j_plain", createdAt: base });
+    const parentId = await makeSplittableJob("j_after", { createdAt: new Date(base.getTime() + 1000) });
+
+    await dispatch.assignJobs(db(), workers);
+
+    // `consumed` 的估計：前面那件不可拆的 job 會用掉一台，所以只剩 2 台。
+    expect((await childrenOf(parentId)).length).toBe(2);
+  });
+
+  it("does not split a job no worker is eligible for", async () => {
+    const workers = [];
+    for (let i = 0; i < 3; i++) workers.push(await makeWorker(`ws-inel${i}`, { dynamic: { free_vram_gb: 24 } }));
+    // 沒有任何 worker 有這個模型，也沒傳 fetchableModels -> 一律 ineligible。
+    const parentId = await makeSplittableJob("j_inel", { requiredModels: ["nobody-has-this.safetensors"] });
+
+    const assignments = await dispatch.assignJobs(db(), workers);
+
+    expect(await childrenOf(parentId)).toEqual([]);
+    expect(assignments).toEqual([]);
+  });
+});
+
+describe("子 job 動了就推導父 job (§3.4/§3.6)", () => {
+  async function makeSplitFamily(
+    label: string,
+    childStatuses: string[],
+    workerIds: (string | null)[] = []
+  ): Promise<{ parentId: string; childIds: string[] }> {
+    const parentId = uniqueId(label);
+    await db()
+      .prepare(
+        `INSERT INTO jobs (id, workflow_json, status, created_at, split_count, split_plan)
+         VALUES (?, '{}', 'queued', ?, ?, ?)`
+      )
+      .bind(
+        parentId,
+        toSqliteTimestamp(new Date()),
+        childStatuses.length,
+        JSON.stringify({ source_node_id: "1", batch_size: 4 })
+      )
+      .run();
+    const childIds: string[] = [];
+    for (let i = 0; i < childStatuses.length; i++) {
+      const childId = `${parentId}-c${i}`;
+      childIds.push(childId);
+      await db()
+        .prepare(
+          `INSERT INTO jobs (id, workflow_json, status, worker_id, created_at, parent_id, split_index)
+           VALUES (?, '{}', ?, ?, ?, ?, ?)`
+        )
+        .bind(childId, childStatuses[i]!, workerIds[i] ?? null, toSqliteTimestamp(new Date()), parentId, i)
+        .run();
+    }
+    return { parentId, childIds };
+  }
+
+  it("cancelling a child cancels the parent and the siblings", async () => {
+    const { parentId, childIds } = await makeSplitFamily("p-cancel", ["queued", "running"], [null, "w7"]);
+    const owners: [string, string][] = [];
+
+    await dispatch.cancelJob(db(), childIds[0]!, "cancelled by admin", now(), owners);
+
+    expect((await getJobRow(parentId)).status).toBe("cancelled");
+    expect((await getJobRow(childIds[1]!)).status).toBe("cancelled");
+    // 裁決：串聯取消的 owner 要回到呼叫端，Hub 才推得出 `job_cancelled`。
+    expect(owners).toEqual([[childIds[1]!, "w7"]]);
+  });
+
+  it("marking a child running moves the parent to running", async () => {
+    const { parentId, childIds } = await makeSplitFamily("p-run", ["assigned", "queued"], ["w1", null]);
+
+    expect(await dispatch.markRunning(db(), childIds[0]!, "w1", now())).toBe(true);
+
+    expect((await getJobRow(parentId)).status).toBe("running");
+  });
+
+  it("a failed child fails the parent and cancels the siblings", async () => {
+    const { parentId, childIds } = await makeSplitFamily("p-fail", ["running", "running"], ["w1", "w2"]);
+    const owners: [string, string][] = [];
+
+    expect(await dispatch.markFailed(db(), childIds[0]!, "w1", "CUDA OOM", now(), owners)).toBe(true);
+
+    const parent = await getJobRow(parentId);
+    expect(parent.status).toBe("failed");
+    expect(parent.error).toBe("子任務 1/2：CUDA OOM");
+    const sibling = await getJobRow(childIds[1]!);
+    expect(sibling.status).toBe("cancelled");
+    expect(sibling.worker_id).toBeNull();
+    expect(sibling.last_worker_id).toBe("w2");
+    expect(owners).toEqual([[childIds[1]!, "w2"]]);
+  });
+
+  it("the parent is done only once every child is done", async () => {
+    const { parentId, childIds } = await makeSplitFamily("p-done", ["running", "running"], ["w1", "w2"]);
+
+    expect(await dispatch.markDone(db(), childIds[0]!, "w1", ["a.png"], now())).toBe(true);
+    expect((await getJobRow(parentId)).status).toBe("running");
+
+    expect(await dispatch.markDone(db(), childIds[1]!, "w2", ["b.png"], now())).toBe(true);
+    expect((await getJobRow(parentId)).status).toBe("done");
+  });
+
+  it("requeueStale pulls the parent back from running", async () => {
+    const workerId = await makeWorker("w-stale-split");
+    await setWorkerLastSeen(workerId, new Date(Date.now() - 600_000));
+    const { parentId, childIds } = await makeSplitFamily("p-stale", ["running", "queued"], [workerId, null]);
+    await db().prepare("UPDATE jobs SET status = 'running' WHERE id = ?").bind(parentId).run();
+
+    expect(await dispatch.requeueStale(db(), now())).toEqual([childIds[0]!]);
+
+    expect((await getJobRow(parentId)).status).toBe("queued");
+  });
+
+  it("treats a retried parent (split_count 0) as a plain job", async () => {
+    const { parentId, childIds } = await makeSplitFamily("p-retried-dispatch", ["done", "done"]);
+    await db()
+      .prepare("UPDATE jobs SET split_count = 0, split_plan = NULL, status = 'queued' WHERE id = ?")
+      .bind(parentId)
+      .run();
+
+    // 子 job 早就 done、也不歸誰，所以這個轉移不成立；父 job 完全不受影響。
+    expect(await dispatch.markDone(db(), childIds[0]!, "w1", [], now())).toBe(false);
+    expect((await getJobRow(parentId)).status).toBe("queued");
+  });
+});

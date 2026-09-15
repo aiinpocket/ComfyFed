@@ -660,6 +660,9 @@ export interface NewJob {
   userId?: string | null;
   /** Phase 3.3 §2.1: 送件時算好的工作指紋。 */
   signature?: string | null;
+  /** Phase 3.3 §3.2: 送件時判定出的拆分計畫 JSON（`split.planForJob`），
+   * 不可拆時 null/省略。 */
+  splitPlan?: string | null;
 }
 
 /** Inserts a freshly-assessed queued job row -- mirrors `jobs.create_job`'s
@@ -670,8 +673,8 @@ export async function insertJob(db: D1Database, job: NewJob): Promise<void> {
   await db
     .prepare(
       `INSERT INTO jobs (id, workflow_json, requirements, required_nodes, required_models, est_vram_gb,
-                          input_assets, origin, created_at, user_id, signature)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+                          input_assets, origin, created_at, user_id, signature, split_plan)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
     )
     .bind(
       job.id,
@@ -684,8 +687,122 @@ export async function insertJob(db: D1Database, job: NewJob): Promise<void> {
       job.origin,
       job.createdAt,
       job.userId ?? null,
-      job.signature ?? null
+      job.signature ?? null,
+      job.splitPlan ?? null
     )
+    .run();
+}
+
+// --- Phase 3.3 §3.3-§3.4: 子 job ------------------------------------------
+
+/** `parentId` 的子 job，依 `split_index` 排序 -- ports `split.children_of`. */
+export async function getChildJobs(db: D1Database, parentId: string): Promise<Job[]> {
+  const { results } = await db
+    .prepare("SELECT * FROM jobs WHERE parent_id = ? ORDER BY split_index ASC")
+    .bind(parentId)
+    .all<JobRow>();
+  return results.map(rowToJob);
+}
+
+export interface NewChildJob {
+  id: string;
+  parentId: string;
+  splitIndex: number;
+  workflowJson: string;
+  createdAt: string;
+  signature: string | null;
+  requiredNodes: string[];
+  requiredModels: string[];
+  estVramGb: number | null;
+  requirements: Record<string, unknown>;
+  inputAssets: unknown[];
+  origin: string;
+  userId: string | null;
+}
+
+/** The conditional UPDATE that marks a parent as split, as a STATEMENT
+ * rather than an executed write, so `split.createChildren` can put it and
+ * every child insert into one `db.batch([...])` -- D1 has no multi-statement
+ * transaction seam other than `batch`, and spec §5 requires that a failure
+ * part-way through leaves the parent untouched rather than half-split.
+ *
+ * The `WHERE status = 'queued' AND split_count = 0` guard is the same atomic
+ * shape as `claimJob`'s: a parent someone else already split or claimed
+ * changes 0 rows, and the batch's child inserts (guarded to match, see
+ * `childJobInsertStatement`) then insert nothing either. */
+export function markJobSplitStatement(db: D1Database, jobId: string, splitCount: number): D1PreparedStatement {
+  return db
+    .prepare("UPDATE jobs SET split_count = ? WHERE id = ? AND status = 'queued' AND split_count = 0")
+    .bind(splitCount, jobId);
+}
+
+/** One child insert, as a STATEMENT for the same `db.batch` as
+ * `markJobSplitStatement` (see there for why).
+ *
+ * Every column is inherited from the parent; only the workflow, `parent_id`
+ * and `split_index` differ. `created_at` is deliberately the PARENT's, so a
+ * child keeps the family's place in the `created_at ASC` dispatch queue
+ * instead of jumping to the back of it.
+ *
+ * `INSERT ... SELECT ... WHERE` rather than `VALUES` so the insert carries
+ * the same guard the parent UPDATE did: it only fires when the parent now
+ * reads `status='queued' AND split_count = expectedSplitCount` (i.e. the
+ * UPDATE earlier in this batch is the one that set it) AND this split_index
+ * is not already taken. Without that pair, a parent claimed between the
+ * caller's read and this batch would gain orphan children while staying
+ * dispatchable itself -- the one way this feature could run a batch twice. */
+export function childJobInsertStatement(
+  db: D1Database,
+  child: NewChildJob,
+  expectedSplitCount: number
+): D1PreparedStatement {
+  return db
+    .prepare(
+      `INSERT INTO jobs (id, workflow_json, status, created_at, signature, required_nodes, required_models,
+                          est_vram_gb, requirements, input_assets, origin, user_id, parent_id, split_index)
+       SELECT ?, ?, 'queued', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?
+       WHERE EXISTS (SELECT 1 FROM jobs WHERE id = ? AND status = 'queued' AND split_count = ?)
+         AND NOT EXISTS (SELECT 1 FROM jobs WHERE parent_id = ? AND split_index = ?)`
+    )
+    .bind(
+      child.id,
+      child.workflowJson,
+      child.createdAt,
+      child.signature,
+      JSON.stringify(child.requiredNodes),
+      JSON.stringify(child.requiredModels),
+      child.estVramGb,
+      JSON.stringify(child.requirements),
+      JSON.stringify(child.inputAssets),
+      child.origin,
+      child.userId,
+      child.parentId,
+      child.splitIndex,
+      child.parentId,
+      expectedSplitCount,
+      child.parentId,
+      child.splitIndex
+    );
+}
+
+/** Phase 3.3 §3.4: 把 `refreshParent` 推導出來的欄位一次寫回父 job。 */
+export async function updateParentDerived(
+  db: D1Database,
+  jobId: string,
+  patch: {
+    status: string;
+    progress: number;
+    startedAt: string | null;
+    finishedAt: string | null;
+    error: string | null;
+    workerId: string | null;
+  }
+): Promise<void> {
+  await db
+    .prepare(
+      "UPDATE jobs SET status = ?, progress = ?, started_at = ?, finished_at = ?, error = ?, worker_id = ? WHERE id = ?"
+    )
+    .bind(patch.status, patch.progress, patch.startedAt, patch.finishedAt, patch.error, patch.workerId, jobId)
     .run();
 }
 
@@ -734,13 +851,21 @@ export async function getUsernamesByIds(db: D1Database, ids: string[]): Promise<
  * whether the row was still `failed` at the moment of the UPDATE (the same
  * atomic-guard shape as `claimJob`), so a caller can't retry a job that
  * raced into a different terminal state between its own read and this
- * write. */
+ * write.
+ *
+ * Phase 3.3 §3.6: the retry also clears `split_count`/`split_plan`, so a
+ * previously-split parent re-runs whole on one worker instead of spawning a
+ * second generation of children -- and every parent-derived function then
+ * treats it as a plain job (they all short-circuit on `split_count === 0`).
+ * The old children are left exactly as they are: terminal rows, kept as
+ * history. */
 export async function retryFailedJob(db: D1Database, jobId: string): Promise<boolean> {
   const result = await db
     .prepare(
       `UPDATE jobs
        SET status = 'queued', worker_id = NULL, error = NULL, progress = 0,
-           started_at = NULL, finished_at = NULL
+           started_at = NULL, finished_at = NULL,
+           split_count = 0, split_plan = NULL
        WHERE id = ? AND status = 'failed'`
     )
     .bind(jobId)

@@ -10,7 +10,7 @@ from typing import Optional
 from fastapi import APIRouter, Depends, File, Form, HTTPException, Request, UploadFile
 from fastapi.responses import FileResponse, JSONResponse
 
-from . import agentws, assess, auth, db, dispatch, limits, model_guide, model_manifest, storage
+from . import agentws, assess, auth, db, dispatch, limits, model_guide, model_manifest, split, storage
 from .workers import verify_agent
 
 _JOB_INPUTS_DIRNAME = "job_inputs"
@@ -178,6 +178,9 @@ def create_job(
             user_id=user_id,
             # Phase 3.3 §2.1: 送件時算一次，之後派工/統計都只讀這個欄位。
             signature=assess.signature(workflow, needs),
+            # Phase 3.3 §3.2：送件時就判定可不可拆（含 requirements.split 與
+            # 平台設定 split_batches）；不可拆存 NULL。
+            split_plan=split.plan_for_job(workflow, requirements or {}),
         )
         session.add(job)
         session.commit()
@@ -606,6 +609,12 @@ def create_router(data_dir: str) -> APIRouter:
             job.progress = 0
             job.started_at = None
             job.finished_at = None
+            # Phase 3.3 §3.6：重試一律不再拆 -- 整包在一台 worker 跑，避免兩
+            # 代子 job 混在一起。舊子 job 不動（終止狀態，歷史保留），
+            # `parent_id` 仍指向這個 job，但 `split_count == 0` 讓所有父 job
+            # 推導函數把它當普通 job 看。
+            job.split_count = 0
+            job.split_plan = None
             session.commit()
 
         return {"ok": True, "job_id": job_id}

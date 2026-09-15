@@ -53,6 +53,7 @@ import { toSqliteTimestamp, sqliteTimestampToEpochMs, resolvePlatformSeed } from
 import { extract, estimateVram, modelNodes, signature, fleetWideGaps, partitionFleetFetchable, type FetchableModels } from "../core/assess";
 import { peerOnlyNames } from "../core/model_manifest";
 import { jobOutputs } from "../core/outputs";
+import * as split from "../core/split";
 import * as modelGuide from "../core/model_guide";
 import * as modelManifest from "../core/model_manifest";
 import {
@@ -561,6 +562,9 @@ app.post("/comfy/api/prompt", async (c) => {
     createdAt: toSqliteTimestamp(new Date()),
     userId: user.uid,
     signature: await signature(promptObj, needs),
+    // Phase 3.3 §3.2：送件時就判定可不可拆。panel 這條路沒有 requirements
+    // 可帶，所以只剩平台設定 split_batches 這個開關。
+    splitPlan: split.planForJob(promptObj, {}, await split.splitBatchesEnabled(c.env.DB)),
   });
 
   for (const [name, obj] of resolved) {

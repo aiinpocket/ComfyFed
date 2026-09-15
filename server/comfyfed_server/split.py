@@ -14,9 +14,15 @@
 from __future__ import annotations
 
 import copy
+import json
 import logging
 from dataclasses import dataclass
+from datetime import datetime, timezone
 from typing import Optional
+
+from sqlalchemy import update
+
+from . import assess, db
 
 logger = logging.getLogger(__name__)
 
@@ -364,3 +370,395 @@ def partition(batch_size: int, k: int) -> list[tuple[int, int]]:
         ranges.append((start, length))
         start += length
     return ranges
+
+
+# --- DB 層（§3.4-§3.6）-----------------------------------------------------
+
+SPLIT_BATCHES_SETTING_KEY = "split_batches"
+
+# 子 job 被兄弟拖著一起收攤時寫進 `error` 的理由（`_cancel_sibling`）。
+_SIBLING_FAILED_REASON = "sibling failed"
+_SIBLING_CANCELLED_REASON = "sibling cancelled"
+
+# 還沒終止、因此會被串聯取消掃到的狀態。
+_LIVE_STATUSES = ("queued", "assigned", "running")
+
+
+def _utcnow() -> datetime:
+    return datetime.now(timezone.utc).replace(tzinfo=None)
+
+
+def split_batches_enabled(session=None) -> bool:
+    """平台設定 `split_batches`（預設 true）。任何非 `"0"` 的值都算開啟，
+    和其他 boolean 設定的寬鬆讀法一致；讀不到（沒有這一列、DB 還沒初始化）
+    就是預設開。"""
+
+    def _read(s) -> bool:
+        row = s.get(db.Setting, SPLIT_BATCHES_SETTING_KEY)
+        return True if row is None else row.value != "0"
+
+    if session is not None:
+        return _read(session)
+    try:
+        with db.get_session() as own:
+            return _read(own)
+    except Exception:
+        logger.exception("split: failed to read the split_batches setting")
+        return True
+
+
+def plan_for_job(workflow: dict, requirements: Optional[dict]) -> Optional[str]:
+    """送件時算一次，回傳要存進 `jobs.split_plan` 的 JSON 字串（不可拆 =
+    None）。存字串而不是存物件，是因為這一欄大多數時候沒人看，解析成本應該
+    留給真的要用的人（tick 的拆分步驟）。"""
+    plan = split_plan(workflow, requirements, split_batches_enabled())
+    if plan is None:
+        return None
+    return json.dumps({"source_node_id": plan.source_node_id, "batch_size": plan.batch_size})
+
+
+def _plan_from_json(raw: Optional[str]) -> Optional[SplitPlan]:
+    if not raw:
+        return None
+    try:
+        data = json.loads(raw)
+    except (TypeError, ValueError):
+        return None
+    if not isinstance(data, dict):
+        return None
+    source_node_id = data.get("source_node_id")
+    batch_size = data.get("batch_size")
+    if not isinstance(source_node_id, str) or not isinstance(batch_size, int) or batch_size < 2:
+        return None
+    return SplitPlan(source_node_id=source_node_id, batch_size=batch_size)
+
+
+def children_of(parent_id: str) -> list["db.Job"]:
+    """`parent_id` 的子 job，依 `split_index` 排序。"""
+    with db.get_session() as session:
+        return (
+            session.query(db.Job)
+            .filter(db.Job.parent_id == parent_id)
+            .order_by(db.Job.split_index.asc())
+            .all()
+        )
+
+
+def create_children(parent_id: str, k: int) -> int:
+    """§3.3 + §3.5：在同一個交易裡插入 k 個子 job 並把父 job 的
+    `split_count` 設成 k。回傳實際建立的子 job 數，0 代表沒拆。
+
+    父 job 的標記是一個條件 UPDATE（`WHERE status='queued' AND
+    split_count=0`，和 `dispatch.assign_jobs` 的原子 claim 同一個形狀），所以
+    兩個 tick 同時看到同一件 queued 父 job 時，只有一個會真的拆。
+
+    交易失敗 -> 父 job 維持原狀（`split_count` 仍 0），本 tick 當作不可拆
+    處理，下個 tick 重試（spec §5）。
+    """
+    try:
+        with db.get_session() as session:
+            parent = session.get(db.Job, parent_id)
+            if parent is None or parent.status != "queued" or parent.split_count != 0:
+                return 0
+            plan = _plan_from_json(parent.split_plan)
+            if plan is None:
+                return 0
+
+            try:
+                workflow = json.loads(parent.workflow_json or "{}")
+            except (TypeError, ValueError):
+                return 0
+            if not isinstance(workflow, dict):
+                return 0
+
+            try:
+                parent_nodes = json.loads(parent.required_nodes or "[]")
+            except (TypeError, ValueError):
+                parent_nodes = []
+            if not isinstance(parent_nodes, list):
+                parent_nodes = []
+            # 子 workflow 多了一個 `LatentFromBatch`，資格判定（§2.3 的
+            # required_nodes 檢查）必須看得到它，否則子 job 會被派給一台其實
+            # 跑不動它的 worker。
+            child_nodes = json.dumps(sorted(set(parent_nodes) | {"LatentFromBatch"}))
+
+            ranges = partition(plan.batch_size, k)
+            children = []
+            for index, (start, length) in enumerate(ranges):
+                child_json = child_workflow(workflow, plan, start, length)
+                if child_json is None:
+                    return 0
+                children.append(
+                    db.Job(
+                        workflow_json=json.dumps(child_json),
+                        status="queued",
+                        # 承襲父 job，保住在佇列中的位置與派工資格判定。
+                        created_at=parent.created_at,
+                        signature=parent.signature,
+                        required_nodes=child_nodes,
+                        required_models=parent.required_models,
+                        est_vram_gb=parent.est_vram_gb,
+                        requirements=parent.requirements,
+                        input_assets=parent.input_assets,
+                        origin=parent.origin,
+                        user_id=parent.user_id,
+                        parent_id=parent.id,
+                        split_index=index,
+                    )
+                )
+
+            # 原子護欄先行：搶輸了（rowcount 0）就一個子 job 都不插。
+            result = session.execute(
+                update(db.Job)
+                .where(
+                    db.Job.id == parent_id,
+                    db.Job.status == "queued",
+                    db.Job.split_count == 0,
+                )
+                .values(split_count=len(children))
+            )
+            if result.rowcount != 1:
+                session.rollback()
+                return 0
+
+            for child in children:
+                session.add(child)
+            session.commit()
+            return len(children)
+    except Exception:
+        logger.exception("split: create_children failed for parent %s", parent_id)
+        return 0
+
+
+def create_children_for_tick(
+    session,
+    queued_jobs: list,
+    workers: list,
+    all_workers: list,
+    fetchable_models: Optional[dict] = None,
+    peer_only_models=None,
+) -> bool:
+    """§3.5：tick 第 2 步與第 3 步之間的拆分決策。回傳有沒有真的拆出東西。
+
+    ```
+    consumed = 0
+    for j in queued（舊到新）:
+        E = 對 j 合格的 idle worker 集合
+        if j 不可拆: if E 非空: consumed += 1; continue
+        S = |E| - consumed
+        k = min(batch_size, S, MAX_SPLIT)
+        if k >= 2: 拆成 k 個子 job; consumed += k
+        elif E 非空: consumed += 1
+    ```
+
+    `consumed` 是「前面的 job 大概會用掉幾台 worker」的估計而不是精確保留 --
+    真正的配對是後面的 Hungarian 在做，這裡寧可少拆不多拆。
+    """
+    total_workers = len(workers)
+    consumed = 0
+    split_any = False
+
+    for job in queued_jobs:
+        try:
+            requirements_override = json.loads(job.requirements or "{}")
+        except (TypeError, ValueError):
+            requirements_override = {}
+        if not isinstance(requirements_override, dict):
+            requirements_override = {}
+        needs = assess.needs_from_job(job)
+        eligible = sum(
+            1
+            for worker in workers
+            if assess.verdict(
+                worker, needs, requirements_override, all_workers, fetchable_models, peer_only_models
+            ).kind
+            in ("eligible", "eligible_after_fetch")
+        )
+
+        plan = _plan_from_json(job.split_plan)
+        if plan is None:
+            if eligible > 0:
+                consumed += 1
+            continue
+
+        available = min(eligible, total_workers) - consumed
+        k = min(plan.batch_size, available, MAX_SPLIT)
+        if k >= 2:
+            # 這個 session 已經讀過這些列，先 commit 再讓 create_children 開它
+            # 自己的 session，免得兩個 session 同時想寫同一列。
+            session.commit()
+            created = create_children(job.id, k)
+            if created >= 2:
+                consumed += created
+                split_any = True
+                continue
+        if eligible > 0:
+            consumed += 1
+
+    return split_any
+
+
+def refresh_parent(
+    parent_id: str, cancelled_owners: Optional[list[tuple[str, str]]] = None
+) -> tuple[bool, Optional[str]]:
+    """§3.4：由子 job 推導父 job 的狀態，回傳 `(有沒有變, 新狀態)`。
+
+    `split_count == 0`（不是父 job，或重試後被重設）一律回 `(False, None)`，
+    這是「重試一律不再拆」的那條規則的實作點：所有以父 job 推導的函數都只在
+    `split_count > 0` 時看子 job。
+
+    `cancelled_owners`，給了的話，會被 append 上這一次串聯取消掉的
+    `(child_id, worker_id)` -- 只收取消當下真的有 owner 的那些，讓呼叫端
+    （WS 層）可以對那台 worker 推一次 `job_cancelled`。給 None（預設）代表
+    呼叫端不打算推，取消照樣發生。
+    """
+    with db.get_session() as session:
+        parent = session.get(db.Job, parent_id)
+        if parent is None or parent.split_count <= 0:
+            return False, None
+
+        children = (
+            session.query(db.Job)
+            .filter(db.Job.parent_id == parent_id)
+            .order_by(db.Job.split_index.asc())
+            .all()
+        )
+        if not children:
+            return False, None
+
+        total = len(children)
+        statuses = [c.status for c in children]
+        before = (
+            parent.status,
+            parent.progress,
+            parent.started_at,
+            parent.finished_at,
+            parent.error,
+            parent.worker_id,
+        )
+        cascade_cancel_ids: list[str] = []
+        cascade_reason = _SIBLING_FAILED_REASON
+
+        failed = next((c for c in children if c.status == "failed"), None)
+        cancelled = next((c for c in children if c.status == "cancelled"), None)
+
+        if failed is not None:
+            parent.status = "failed"
+            parent.error = f"子任務 {(failed.split_index or 0) + 1}/{total}：{failed.error or ''}"
+            parent.finished_at = parent.finished_at or _utcnow()
+            cascade_cancel_ids = [c.id for c in children if c.status in _LIVE_STATUSES]
+        elif cancelled is not None:
+            parent.status = "cancelled"
+            parent.error = cancelled.error
+            parent.finished_at = parent.finished_at or _utcnow()
+            cascade_reason = _SIBLING_CANCELLED_REASON
+            cascade_cancel_ids = [c.id for c in children if c.status in _LIVE_STATUSES]
+        elif all(s == "done" for s in statuses):
+            parent.status = "done"
+            finishes = [c.finished_at for c in children if c.finished_at is not None]
+            parent.finished_at = max(finishes) if finishes else _utcnow()
+            parent.progress = 1.0
+        elif any(s == "running" for s in statuses):
+            parent.status = "running"
+            starts = [c.started_at for c in children if c.started_at is not None]
+            if starts:
+                parent.started_at = min(starts)
+            parent.progress = sum(c.progress or 0.0 for c in children) / total
+        elif any(s == "assigned" for s in statuses):
+            parent.status = "assigned"
+            # 父 job 從來沒有自己的 worker：它的工作分散在子 job 身上。
+            parent.worker_id = None
+        else:
+            parent.status = "queued"
+            parent.progress = 0.0
+
+        after = (
+            parent.status,
+            parent.progress,
+            parent.started_at,
+            parent.finished_at,
+            parent.error,
+            parent.worker_id,
+        )
+        changed = before != after
+        new_status = parent.status
+        session.commit()
+
+    for child_id in cascade_cancel_ids:
+        owner = _cancel_sibling(child_id, cascade_reason)
+        if owner is not None and cancelled_owners is not None:
+            cancelled_owners.append((child_id, owner))
+
+    return changed, new_status
+
+
+def _cancel_sibling(child_id: str, reason: str) -> Optional[str]:
+    """取消一個還沒終止的兄弟子 job；回傳取消當下持有它的 worker id（沒有人
+    持有就是 None）。
+
+    刻意**不**走 `dispatch.cancel_job`：那個函式尾端會呼叫
+    `child_status_changed` -> `refresh_parent`，而我們正是從 `refresh_parent`
+    裡呼叫過來的，會變成互相遞迴。這裡直接寫欄位，寫的是和 `cancel_job`
+    一模一樣的一組（status/error/finished_at/last_worker_id/worker_id），父
+    job 的狀態由外層那一次 `refresh_parent` 負責，不需要再觸發一次。
+
+    所有權的釋放（`worker_id = None`、`last_worker_id` 留底）是載重的，理由
+    見 `dispatch.cancel_job` 的 docstring：即使呼叫端沒推成 `job_cancelled`，
+    那台 worker 之後的每一次心跳／回報都會落在 not-owned 路徑，由那裡補推
+    一次。
+    """
+    with db.get_session() as session:
+        child = session.get(db.Job, child_id)
+        if child is None or child.status not in _LIVE_STATUSES:
+            return None
+        owning_worker_id = child.worker_id
+        child.status = "cancelled"
+        child.error = reason
+        child.finished_at = _utcnow()
+        if owning_worker_id is not None:
+            child.last_worker_id = owning_worker_id
+            child.worker_id = None
+        session.commit()
+    return owning_worker_id
+
+
+def child_status_changed(
+    job_id: str, cancelled_owners: Optional[list[tuple[str, str]]] = None
+) -> Optional[str]:
+    """子 job 狀態／進度變動後的統一入口。
+
+    不是子 job（沒有 `parent_id`）或父 job 已經不是父 job（`split_count == 0`）
+    就什麼都不做並回 None；否則重算父 job 並回傳父 job 的新狀態，讓呼叫端
+    決定要不要對面板／console 發事件。`cancelled_owners` 原樣傳給
+    `refresh_parent`，見那裡的說明。
+    """
+    with db.get_session() as session:
+        job = session.get(db.Job, job_id)
+        parent_id = job.parent_id if job is not None else None
+    if not parent_id:
+        return None
+    _changed, status = refresh_parent(parent_id, cancelled_owners=cancelled_owners)
+    return status
+
+
+def parent_outputs(parent) -> list[tuple[str, str]]:
+    """§3.4：父 job 對外的輸出 = 子 job 的 `result_files`，依 `split_index`
+    再依各自檔案順序串起來，因此和整批一次跑的輸出順序一致。
+
+    回傳 `[(child_id, filename), ...]` -- child_id 是面板 `/view` 用來找到
+    真正持有檔案的那個 job 的 `subfolder`。
+    """
+    if parent is None or (parent.split_count or 0) <= 0:
+        return []
+    outputs: list[tuple[str, str]] = []
+    for child in children_of(parent.id):
+        try:
+            files = json.loads(child.result_files or "[]")
+        except (TypeError, ValueError):
+            files = []
+        if not isinstance(files, list):
+            continue
+        for name in files:
+            if isinstance(name, str):
+                outputs.append((child.id, name))
+    return outputs

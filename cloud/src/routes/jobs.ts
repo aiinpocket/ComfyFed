@@ -49,6 +49,7 @@ import { presignUrl, r2S3Host } from "../lib/sigv4";
 import { bilingualMessage } from "../core/auth";
 import * as modelGuide from "../core/model_guide";
 import * as modelManifest from "../core/model_manifest";
+import * as split from "../core/split";
 import { resolvePlatformSeed } from "../db/queries";
 
 // Cloud-only (no Python parity source -- the monolith calls its dispatcher
@@ -343,6 +344,9 @@ app.post("/api/jobs", requireCsrfUser, async (c) => {
     createdAt: toSqliteTimestamp(new Date()),
     userId: user.uid,
     signature: await signature(workflow, needs),
+    // Phase 3.3 §3.2：送件時就判定可不可拆（含 requirements.split 與平台設定
+    // split_batches）；不可拆存 NULL。
+    splitPlan: split.planForJob(workflow, requirements, await split.splitBatchesEnabled(c.env.DB)),
   });
 
   for (const [file, filename] of assetFiles.map((f, i) => [f, uploadedNames[i]!] as const)) {

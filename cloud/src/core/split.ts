@@ -9,6 +9,10 @@
  * 在不同 GPU 上本來就有的差異。
  */
 
+import * as queries from "../db/queries";
+import { toSqliteTimestamp, type Job } from "../db/queries";
+import { needsFromJob, verdict, type FetchableModels } from "./assess";
+
 export const MAX_SPLIT = 8;
 
 /** §3.2 條件 1：批次來源節點。 */
@@ -303,4 +307,300 @@ export function partition(batchSize: number, k: number): [number, number][] {
     start += length;
   }
   return ranges;
+}
+
+// --- DB 層（§3.4-§3.6）------------------------------------------------------
+// Parity source: `split.py` 的同名函式。
+
+export const SPLIT_BATCHES_SETTING_KEY = "split_batches";
+
+/** 子 job 被兄弟拖著一起收攤時寫進 `error` 的理由（見 `refreshParent`）。 */
+const SIBLING_FAILED_REASON = "sibling failed";
+const SIBLING_CANCELLED_REASON = "sibling cancelled";
+
+/** 還沒終止、因此會被串聯取消掃到的狀態。 */
+const LIVE_STATUSES: readonly string[] = ["queued", "assigned", "running"];
+
+/** 平台設定 `split_batches`（預設 true）。任何非 "0" 的值都算開啟，和其他
+ * boolean 設定的寬鬆讀法一致 -- ports `split.split_batches_enabled`. */
+export async function splitBatchesEnabled(db: D1Database): Promise<boolean> {
+  try {
+    const value = await queries.getSetting(db, SPLIT_BATCHES_SETTING_KEY);
+    return value === null || value === undefined ? true : value !== "0";
+  } catch (err) {
+    console.error("split: failed to read the split_batches setting", err);
+    return true;
+  }
+}
+
+/** 送件時算一次，回傳要存進 `jobs.split_plan` 的 JSON 字串（不可拆 = null）
+ * -- ports `split.plan_for_job`. */
+export function planForJob(
+  workflow: Record<string, unknown>,
+  requirements: Record<string, unknown> | null,
+  splitBatches: boolean
+): string | null {
+  const plan = splitPlan(workflow, requirements, splitBatches);
+  if (plan === null) return null;
+  return JSON.stringify({ source_node_id: plan.sourceNodeId, batch_size: plan.batchSize });
+}
+
+function planFromJson(raw: string | null): SplitPlan | null {
+  if (!raw) return null;
+  let data: unknown;
+  try {
+    data = JSON.parse(raw);
+  } catch {
+    return null;
+  }
+  if (typeof data !== "object" || data === null) return null;
+  const record = data as Record<string, unknown>;
+  const sourceNodeId = record.source_node_id;
+  const batchSize = record.batch_size;
+  if (
+    typeof sourceNodeId !== "string" ||
+    typeof batchSize !== "number" ||
+    !Number.isInteger(batchSize) ||
+    batchSize < 2
+  ) {
+    return null;
+  }
+  return { sourceNodeId, batchSize };
+}
+
+/** `parentId` 的子 job，依 split_index 排序 -- ports `split.children_of`. */
+export async function childrenOf(db: D1Database, parentId: string): Promise<Job[]> {
+  return queries.getChildJobs(db, parentId);
+}
+
+/** §3.3 + §3.5 -- ports `split.create_children`；回傳實際建立的子 job 數，
+ * 0 = 沒拆。
+ *
+ * 父 job 的 `split_count` 更新與每一個子 job 的 INSERT 全部放進同一個
+ * `db.batch([...])`：D1 沒有別的跨 statement 交易 seam，而 spec §5 要求「拆到
+ * 一半失敗 -> 父 job 維持原狀」-- 批次是全成或全不成，所以中途失敗不會留下
+ * 「父 job 已標成已拆但只有 3 個子 job」這種狀態。本輪當作不可拆處理，下個
+ * tick 重試。 */
+export async function createChildren(db: D1Database, parentId: string, k: number): Promise<number> {
+  try {
+    const parent = await queries.getJobById(db, parentId);
+    if (!parent || parent.status !== "queued" || parent.splitCount !== 0) return 0;
+    const plan = planFromJson(parent.splitPlan);
+    if (plan === null) return 0;
+
+    let workflow: unknown;
+    try {
+      workflow = JSON.parse(parent.workflowJson || "{}");
+    } catch {
+      return 0;
+    }
+    if (typeof workflow !== "object" || workflow === null) return 0;
+    const wf = workflow as Record<string, unknown>;
+
+    // 子 workflow 多了一個 `LatentFromBatch`，資格判定（§2.3 的 requiredNodes
+    // 檢查）必須看得到它，否則子 job 會被派給一台其實跑不動它的 worker。
+    const childNodes = [...new Set([...parent.requiredNodes, "LatentFromBatch"])].sort();
+    const ranges = partition(plan.batchSize, k);
+    const children: queries.NewChildJob[] = [];
+    for (let index = 0; index < ranges.length; index++) {
+      const [start, length] = ranges[index]!;
+      const childJson = childWorkflow(wf, plan, start, length);
+      if (childJson === null) return 0;
+      children.push({
+        id: crypto.randomUUID(),
+        parentId: parent.id,
+        splitIndex: index,
+        workflowJson: JSON.stringify(childJson),
+        // 承襲父 job，保住在佇列中的位置與派工資格判定。
+        createdAt: parent.createdAt,
+        signature: parent.signature,
+        requiredNodes: childNodes,
+        requiredModels: parent.requiredModels,
+        estVramGb: parent.estVramGb,
+        requirements: parent.requirements,
+        inputAssets: parent.inputAssets,
+        origin: parent.origin,
+        userId: parent.userId,
+      });
+    }
+    if (children.length < 1) return 0;
+
+    const results = await db.batch([
+      queries.markJobSplitStatement(db, parent.id, children.length),
+      ...children.map((child) => queries.childJobInsertStatement(db, child, children.length)),
+    ]);
+    // 搶輸的情況（別人先 claim 或先拆了這件父 job）：UPDATE 動到 0 列，批次裡
+    // 的每個 INSERT 的守衛條件也因此不成立，所以一個子 job 都沒進去。
+    if ((results[0]?.meta.changes ?? 0) !== 1) return 0;
+    return children.length;
+  } catch (err) {
+    console.error(`split: createChildren failed for parent ${parentId}`, err);
+    return 0;
+  }
+}
+
+/** §3.5 -- ports `split.create_children_for_tick`；回傳有沒有真的拆出東西。
+ *
+ * `consumed` 是「前面的 job 大概會用掉幾台 worker」的估計而不是精確保留 --
+ * 真正的配對是後面的 Hungarian 在做，這裡寧可少拆不多拆。 */
+export async function createChildrenForTick(
+  db: D1Database,
+  queuedJobs: Job[],
+  workers: queries.Worker[],
+  allWorkers: queries.Worker[],
+  fetchableModels?: FetchableModels | null,
+  peerOnlyModels?: ReadonlySet<string> | null
+): Promise<boolean> {
+  const totalWorkers = workers.length;
+  let consumed = 0;
+  let splitAny = false;
+
+  for (const job of queuedJobs) {
+    const needs = needsFromJob(job);
+    const eligible = workers.filter((w) => {
+      const kind = verdict(w, needs, job.requirements, allWorkers, fetchableModels, peerOnlyModels).kind;
+      return kind === "eligible" || kind === "eligible_after_fetch";
+    }).length;
+
+    const plan = planFromJson(job.splitPlan);
+    if (plan === null) {
+      if (eligible > 0) consumed += 1;
+      continue;
+    }
+
+    const available = Math.min(eligible, totalWorkers) - consumed;
+    const k = Math.min(plan.batchSize, available, MAX_SPLIT);
+    if (k >= 2) {
+      const created = await createChildren(db, job.id, k);
+      if (created >= 2) {
+        consumed += created;
+        splitAny = true;
+        continue;
+      }
+    }
+    if (eligible > 0) consumed += 1;
+  }
+
+  return splitAny;
+}
+
+/** §3.4 -- ports `split.refresh_parent`；回傳 `{ changed, status }`。
+ *
+ * `splitCount === 0`（不是父 job，或重試後被重設）一律回
+ * `{ changed: false, status: null }` -- 這是「重試一律不再拆」那條規則的實作
+ * 點：所有以父 job 推導的函數都只在 `splitCount > 0` 時看子 job。
+ *
+ * `cancelledOwners`，給了的話，會被 push 上這一次串聯取消掉的
+ * `[childId, workerId]`（只收取消當下真的有 owner 的那些），讓呼叫端（Hub）
+ * 對那台 worker 推一次 `job_cancelled`。 */
+export async function refreshParent(
+  db: D1Database,
+  parentId: string,
+  now: Date,
+  cancelledOwners?: [string, string][]
+): Promise<{ changed: boolean; status: string | null }> {
+  const parent = await queries.getJobById(db, parentId);
+  if (!parent || parent.splitCount <= 0) return { changed: false, status: null };
+
+  const children = await queries.getChildJobs(db, parentId);
+  if (children.length === 0) return { changed: false, status: null };
+
+  const total = children.length;
+  const nowStamp = toSqliteTimestamp(now);
+  const patch = {
+    status: parent.status,
+    progress: parent.progress,
+    startedAt: parent.startedAt,
+    finishedAt: parent.finishedAt,
+    error: parent.error,
+    workerId: parent.workerId,
+  };
+  let cascade: Job[] = [];
+  let cascadeReason = SIBLING_FAILED_REASON;
+
+  const failed = children.find((c) => c.status === "failed");
+  const cancelled = children.find((c) => c.status === "cancelled");
+  const live = (c: Job) => LIVE_STATUSES.includes(c.status);
+
+  if (failed) {
+    patch.status = "failed";
+    patch.error = `子任務 ${(failed.splitIndex ?? 0) + 1}/${total}：${failed.error ?? ""}`;
+    patch.finishedAt = patch.finishedAt ?? nowStamp;
+    cascade = children.filter(live);
+  } else if (cancelled) {
+    patch.status = "cancelled";
+    patch.error = cancelled.error;
+    patch.finishedAt = patch.finishedAt ?? nowStamp;
+    cascadeReason = SIBLING_CANCELLED_REASON;
+    cascade = children.filter(live);
+  } else if (children.every((c) => c.status === "done")) {
+    patch.status = "done";
+    const finishes = children.map((c) => c.finishedAt).filter((f): f is string => f !== null);
+    patch.finishedAt = finishes.length > 0 ? finishes.slice().sort()[finishes.length - 1]! : nowStamp;
+    patch.progress = 1;
+  } else if (children.some((c) => c.status === "running")) {
+    patch.status = "running";
+    const starts = children.map((c) => c.startedAt).filter((s): s is string => s !== null);
+    if (starts.length > 0) patch.startedAt = starts.slice().sort()[0]!;
+    patch.progress = children.reduce((sum, c) => sum + (c.progress || 0), 0) / total;
+  } else if (children.some((c) => c.status === "assigned")) {
+    patch.status = "assigned";
+    // 父 job 從來沒有自己的 worker：它的工作分散在子 job 身上。
+    patch.workerId = null;
+  } else {
+    patch.status = "queued";
+    patch.progress = 0;
+  }
+
+  // `workerId` 必須進這個比較：assigned 分支唯一的改動就是把它清成 null，
+  // 少了這一項那次 `worker_id = NULL` 的寫入會被整個跳過。（Python 端無條件
+  // commit，所以那邊沒有這個陷阱。）
+  const changed =
+    patch.status !== parent.status ||
+    patch.progress !== parent.progress ||
+    patch.startedAt !== parent.startedAt ||
+    patch.finishedAt !== parent.finishedAt ||
+    patch.error !== parent.error ||
+    patch.workerId !== parent.workerId;
+
+  if (changed) await queries.updateParentDerived(db, parentId, patch);
+
+  // 串聯取消刻意不走 `dispatch.cancelJob`：那個函式尾端會呼叫
+  // `childStatusChanged` -> 回到這裡，變成互相遞迴。寫的欄位和它一模一樣
+  // （status/error/finished_at + 所有權釋放），所有權釋放是載重的 -- 見
+  // `dispatch.cancelJob` 的 docstring。
+  for (const child of cascade) {
+    await queries.updateJobCancelled(db, child.id, cascadeReason, nowStamp, child.workerId);
+    if (child.workerId && cancelledOwners) cancelledOwners.push([child.id, child.workerId]);
+  }
+
+  return { changed, status: patch.status };
+}
+
+/** 子 job 狀態／進度變動後的統一入口 -- ports `split.child_status_changed`.
+ * 不是子 job 就什麼都不做並回 null。 */
+export async function childStatusChanged(
+  db: D1Database,
+  jobId: string,
+  now: Date,
+  cancelledOwners?: [string, string][]
+): Promise<string | null> {
+  const job = await queries.getJobById(db, jobId);
+  if (!job || !job.parentId) return null;
+  const { status } = await refreshParent(db, job.parentId, now, cancelledOwners);
+  return status;
+}
+
+/** §3.4 -- ports `split.parent_outputs`：`[[childId, filename], ...]`，依
+ * split_index 再依各自檔案順序，所以和整批一次跑的輸出順序一致。childId 是
+ * 面板 `/view` 用來找到真正持有檔案的那個 job 的 `subfolder`。 */
+export async function parentOutputs(db: D1Database, parent: Job): Promise<[string, string][]> {
+  if (!parent || parent.splitCount <= 0) return [];
+  const outputs: [string, string][] = [];
+  for (const child of await queries.getChildJobs(db, parent.id)) {
+    for (const name of child.resultFiles) {
+      if (typeof name === "string") outputs.push([child.id, name]);
+    }
+  }
+  return outputs;
 }

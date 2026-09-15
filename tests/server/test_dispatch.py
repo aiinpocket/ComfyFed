@@ -14,7 +14,7 @@ from alembic import command
 from alembic.config import Config
 from sqlalchemy import update
 
-from comfyfed_server import db, dispatch, metrics, scheduler
+from comfyfed_server import db, dispatch, metrics, scheduler, split
 
 
 @pytest.fixture()
@@ -944,3 +944,219 @@ def test_try_readopt_refuses_a_cancelled_job(_db):
         job = session.get(db.Job, job_id)
         assert job.status == "cancelled"
         assert job.worker_id is None
+
+
+# --- Phase 3.3 §3.4/§3.6：子 job 動了就推導父 job ------------------------
+
+
+def _make_split_family(parent_id="p", child_statuses=("queued", "running"), worker_ids=(None, None)):
+    with db.get_session() as session:
+        session.add(
+            db.Job(
+                id=parent_id,
+                workflow_json="{}",
+                status="queued",
+                split_count=len(child_statuses),
+                split_plan=json.dumps({"source_node_id": "1", "batch_size": 4}),
+            )
+        )
+        for index, (status, worker_id) in enumerate(zip(child_statuses, worker_ids)):
+            session.add(
+                db.Job(
+                    id=f"c{index}",
+                    workflow_json="{}",
+                    status=status,
+                    worker_id=worker_id,
+                    parent_id=parent_id,
+                    split_index=index,
+                )
+            )
+        session.commit()
+    return parent_id
+
+
+def test_cancelling_a_child_cancels_the_parent_and_siblings(_db):
+    parent_id = _make_split_family()
+
+    dispatch.cancel_job("c0", reason="cancelled by admin")
+
+    with db.get_session() as session:
+        assert session.get(db.Job, parent_id).status == "cancelled"
+        assert session.get(db.Job, "c1").status == "cancelled"
+
+
+def test_cancelling_a_child_hands_back_the_surviving_siblings_owners(_db):
+    """裁決：串聯取消的 owner 要回到呼叫端，WS 層才推得出 `job_cancelled`。"""
+    _make_split_family(child_statuses=("queued", "running"), worker_ids=(None, "w7"))
+    owners: list = []
+
+    dispatch.cancel_job("c0", reason="cancelled by admin", cancelled_owners=owners)
+
+    assert owners == [("c1", "w7")]
+
+
+def test_marking_a_child_running_moves_the_parent_to_running(_db):
+    parent_id = _make_split_family(child_statuses=("assigned", "queued"), worker_ids=("w1", None))
+
+    assert dispatch.mark_running("c0", "w1") is True
+
+    with db.get_session() as session:
+        assert session.get(db.Job, parent_id).status == "running"
+
+
+def test_a_failed_child_fails_the_parent_and_cancels_the_siblings(_db):
+    parent_id = _make_split_family(child_statuses=("running", "running"), worker_ids=("w1", "w2"))
+    owners: list = []
+
+    assert dispatch.mark_failed("c0", "w1", "CUDA OOM", cancelled_owners=owners) is True
+
+    with db.get_session() as session:
+        parent = session.get(db.Job, parent_id)
+        sibling = session.get(db.Job, "c1")
+    assert parent.status == "failed"
+    assert parent.error == "子任務 1/2：CUDA OOM"
+    assert sibling.status == "cancelled"
+    assert sibling.worker_id is None
+    assert sibling.last_worker_id == "w2"
+    assert owners == [("c1", "w2")]
+
+
+def test_the_parent_is_done_only_once_every_child_is_done(_db):
+    parent_id = _make_split_family(child_statuses=("running", "running"), worker_ids=("w1", "w2"))
+
+    assert dispatch.mark_done("c0", "w1", ["a.png"]) is True
+    with db.get_session() as session:
+        assert session.get(db.Job, parent_id).status == "running"
+
+    assert dispatch.mark_done("c1", "w2", ["b.png"]) is True
+    with db.get_session() as session:
+        assert session.get(db.Job, parent_id).status == "done"
+
+
+def test_requeue_stale_pulls_the_parent_back_from_running(_db):
+    _make_worker("w1")
+    parent_id = _make_split_family(child_statuses=("running", "queued"), worker_ids=("w1", None))
+    with db.get_session() as session:
+        session.get(db.Job, parent_id).status = "running"
+        worker = session.get(db.Worker, "w1")
+        worker.last_seen = _utcnow() - timedelta(seconds=600)
+        session.commit()
+
+    assert dispatch.requeue_stale(_utcnow()) == ["c0"]
+
+    with db.get_session() as session:
+        assert session.get(db.Job, parent_id).status == "queued"
+
+
+def test_a_retried_parent_is_dispatched_as_a_plain_job(_db):
+    """§3.6：`split_count` 重設為 0 之後，子 job 的狀態再也影響不到它。"""
+    parent_id = _make_split_family(child_statuses=("done", "done"))
+    with db.get_session() as session:
+        parent = session.get(db.Job, parent_id)
+        parent.split_count = 0
+        parent.split_plan = None
+        parent.status = "queued"
+        session.commit()
+
+    assert dispatch.mark_done("c0", "w1", []) is False  # 早就 done，不歸誰
+    with db.get_session() as session:
+        assert session.get(db.Job, parent_id).status == "queued"
+
+
+# --- Phase 3.3 §3.5：tick 的拆分步驟 -------------------------------------
+
+
+def _make_splittable_job(job_id="j_split", batch_size=4, created_at=None):
+    """一件可拆的 queued job：workflow 是真的（子 workflow 重寫要用），
+    `split_plan` 是送件時就算好存下來的那個 JSON。"""
+    workflow = {
+        "1": {
+            "class_type": "EmptyLatentImage",
+            "inputs": {"width": 512, "height": 512, "batch_size": batch_size},
+        },
+        "2": {"class_type": "KSampler", "inputs": {"latent_image": ["1", 0], "steps": 20}},
+        "3": {"class_type": "SaveImage", "inputs": {"images": ["2", 0]}},
+    }
+    with db.get_session() as session:
+        session.add(
+            db.Job(
+                id=job_id,
+                workflow_json=json.dumps(workflow),
+                status="queued",
+                signature="sig",
+                required_models=json.dumps([]),
+                required_nodes=json.dumps(sorted({n["class_type"] for n in workflow.values()})),
+                split_plan=json.dumps({"source_node_id": "1", "batch_size": batch_size}),
+                **({"created_at": created_at} if created_at is not None else {}),
+            )
+        )
+        session.commit()
+    return job_id
+
+
+def test_assign_jobs_splits_a_batch_across_the_idle_fleet(_db):
+    """§3.5：3 台閒置 worker + batch_size 4 -> 拆成 3 個子 job，父 job 退出
+    派工清單，被派出去的全是子 job。"""
+    workers = [_make_worker(f"w{i}", dynamic={"free_vram_gb": 24}) for i in range(3)]
+    parent_id = _make_splittable_job()
+
+    assignments = dispatch.assign_jobs(workers)
+
+    children = split.children_of(parent_id)
+    assert len(children) == 3
+    assert [c.split_index for c in children] == [0, 1, 2]
+    assert {job.id for _worker_id, job in assignments} == {c.id for c in children}
+    with db.get_session() as session:
+        parent = session.get(db.Job, parent_id)
+    assert parent.split_count == 3
+    # 父 job 自己從沒被指派出去。
+    assert parent.worker_id is None
+
+
+def test_assign_jobs_does_not_split_for_a_single_idle_worker(_db):
+    """k < 2 -> 不拆，整批照舊在一台 worker 上跑。"""
+    worker_id = _make_worker("w1", dynamic={"free_vram_gb": 24})
+    parent_id = _make_splittable_job()
+
+    assignments = dispatch.assign_jobs([worker_id])
+
+    assert split.children_of(parent_id) == []
+    assert [job.id for _worker_id, job in assignments] == [parent_id]
+
+
+def test_assign_jobs_caps_the_split_at_the_batch_size(_db):
+    """batch_size 2 + 4 台閒置 worker -> 只拆成 2 個（partition 夾住 k）。"""
+    workers = [_make_worker(f"w{i}", dynamic={"free_vram_gb": 24}) for i in range(4)]
+    parent_id = _make_splittable_job(batch_size=2)
+
+    dispatch.assign_jobs(workers)
+
+    assert len(split.children_of(parent_id)) == 2
+
+
+def test_assign_jobs_leaves_later_jobs_workers_for_themselves(_db):
+    """`consumed` 的估計：前面那件不可拆的 job 會用掉一台，所以後面那件可拆的
+    只剩 2 台可用，拆 2 個而不是 3 個。"""
+    workers = [_make_worker(f"w{i}", dynamic={"free_vram_gb": 24}) for i in range(3)]
+    base = _utcnow() - timedelta(seconds=60)
+    _make_signed_job("j_plain", created_at=base)
+    parent_id = _make_splittable_job(created_at=base + timedelta(seconds=1))
+
+    dispatch.assign_jobs(workers)
+
+    assert len(split.children_of(parent_id)) == 2
+
+
+def test_assign_jobs_does_not_split_a_job_no_worker_is_eligible_for(_db):
+    """沒有合格的 worker -> `eligible` 0 -> 不拆（拆了也沒人跑得動）。"""
+    workers = [_make_worker(f"w{i}", dynamic={"free_vram_gb": 24}) for i in range(3)]
+    parent_id = _make_splittable_job()
+    # 沒有任何 worker 有這個模型，也沒傳 fetchable_models -> 一律 ineligible。
+    with db.get_session() as session:
+        session.get(db.Job, parent_id).required_models = json.dumps(["nobody-has-this.safetensors"])
+        session.commit()
+
+    assignments = dispatch.assign_jobs(workers)
+
+    assert split.children_of(parent_id) == []
+    assert assignments == []

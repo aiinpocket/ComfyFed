@@ -59,6 +59,7 @@ import * as assess from "../core/assess";
 import type { FetchableModels } from "../core/assess";
 import * as modelManifest from "../core/model_manifest";
 import * as stats from "../core/stats";
+import * as split from "../core/split";
 import { toSqliteTimestamp, resolvePlatformSeed } from "../db/queries";
 import { buildReceiptPayload, signReceipt, verifyHex } from "../lib/signing";
 import { bytesToHex } from "../lib/hex";
@@ -552,6 +553,29 @@ export class Hub extends DurableObject<Env> {
     return new Response(null, { status: 101, webSocket: client });
   }
 
+  /** Push `job_cancelled` for every sibling a split cascade just cancelled.
+   *
+   * Phase 3.3 §3.6: `split.refreshParent` cancels the surviving siblings by
+   * writing the same fields `dispatch.cancelJob` writes (ownership release
+   * included) rather than calling it, because it is itself reached FROM
+   * `cancelJob`/`markFailed` and would recurse. The one thing it cannot do
+   * from there is talk to a WebSocket, so it hands back the owners and this
+   * is where they get told. Each push is isolated: one dead socket must not
+   * stop the rest, and a missed push self-heals on that worker's next
+   * message anyway (see `dispatch.cancelJob`). */
+  private async pushCascadeCancellations(cancelledOwners: [string, string][]): Promise<void> {
+    for (const [childId, owner] of cancelledOwners) {
+      try {
+        const ws = this.findWsForWorker(owner);
+        if (!ws) continue;
+        const att = ws.deserializeAttachment() as AgentAttachment;
+        await this.sendJobCancelled(ws, att, this.ephemeralFor(ws), childId);
+      } catch (err) {
+        console.warn(`hub: failed to push job_cancelled for split sibling ${childId} owner ${owner}`, err);
+      }
+    }
+  }
+
   private async handleInternalCancel(request: Request): Promise<Response> {
     const body = await request
       .json<{ job_id?: unknown; reason?: unknown }>()
@@ -574,7 +598,11 @@ export class Hub extends DurableObject<Env> {
       return Response.json({ cancelled: false, worker_id: null });
     }
 
-    const owner = await dispatch.cancelJob(db, jobId, reason, now);
+    // Phase 3.3 §3.6: cancelling a CHILD cascades up (parent + siblings)
+    // inside `cancelJob`; `cascadeCancelled` carries back the siblings whose
+    // workers still need telling.
+    const cascadeCancelled: [string, string][] = [];
+    const owner = await dispatch.cancelJob(db, jobId, reason, now, cascadeCancelled);
     this.fetchProgress.delete(jobId);
 
     if (wasRunning && owner) {
@@ -598,6 +626,18 @@ export class Hub extends DurableObject<Env> {
         await this.sendJobCancelled(ws, att, this.ephemeralFor(ws), jobId);
       }
     }
+
+    // Phase 3.3 §3.6：取消父 job -> 每個未終止的子 job 一併取消並推送（每個
+    // 子 job 走完整的 cancelJob，所有權釋放與 not-owned 自癒都一樣）；取消
+    // 子 job -> 上面的 cancelJob 已經透過 refreshParent 讓父與其他兄弟一起
+    // 收攤，這裡只剩下把那些兄弟的 owner 通知掉。
+    for (const child of await split.childrenOf(db, jobId)) {
+      if (child.status === "queued" || child.status === "assigned" || child.status === "running") {
+        const childOwner = await dispatch.cancelJob(db, child.id, reason, now);
+        if (childOwner) await this.pushCascadeCancellations([[child.id, childOwner]]);
+      }
+    }
+    await this.pushCascadeCancellations(cascadeCancelled);
 
     // Ports agentws.py's `cancel_and_notify`: the panel gets told regardless
     // of whether anyone owned the job yet -- unlike the agent push above
@@ -1091,6 +1131,10 @@ export class Hub extends DurableObject<Env> {
     if (state === "busy" && jobId && msg.stage !== "fetching_models") {
       await this.applyOwnedTransition(db, jobId, workerId, ["assigned"], ephemeral, async () => {
         await queries.updateJobRunning(db, jobId, toSqliteTimestamp(now));
+        // Phase 3.3 §3.4：子 job 動了就重算父 job（不是子 job 的話是 no-op）。
+        // 這裡的三個轉移沒有走 `dispatch.markRunning/markDone/markFailed`
+        // （它們是 ephemeral 記帳 + panel 推播的宿主），所以推導要自己掛。
+        await split.childStatusChanged(db, jobId, now);
         await this.panelJobRunning(jobId);
       });
     }
@@ -1192,6 +1236,8 @@ export class Hub extends DurableObject<Env> {
     const applyDone = () =>
       this.applyOwnedTransition(db, jobId, workerId, OWNED_STATUSES, ephemeral, async () => {
         await queries.updateJobDone(db, jobId!, resultFiles, toSqliteTimestamp(now));
+        // Phase 3.3 §3.4：最後一個子 job 完成時父 job 才會翻成 done。
+        await split.childStatusChanged(db, jobId!, now);
       });
 
     let done = await applyDone();
@@ -1233,11 +1279,17 @@ export class Hub extends DurableObject<Env> {
     const error = typeof msg.error === "string" ? msg.error : "";
     const now = new Date();
 
+    // Phase 3.3 §3.6：這件 job 如果是子 job，它的失敗會連坐取消還在跑的兄弟；
+    // 那些 worker 要立刻收到 `job_cancelled`，否則得等到下一次心跳落在
+    // not-owned 路徑才停下來。
+    const cascadeCancelled: [string, string][] = [];
     const applied = await this.applyOwnedTransition(db, jobId, workerId, OWNED_STATUSES, ephemeral, async () => {
       await queries.updateJobFailed(db, jobId!, error, toSqliteTimestamp(now));
+      await split.childStatusChanged(db, jobId!, now, cascadeCancelled);
     });
 
     if (applied) {
+      await this.pushCascadeCancellations(cascadeCancelled);
       this.fetchProgress.delete(jobId!);
       await this.panelJobFailed(jobId!, error);
       const execSeconds = isValidExecSeconds(msg.exec_seconds) ? msg.exec_seconds : null;

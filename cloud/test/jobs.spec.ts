@@ -720,6 +720,43 @@ describe("POST /api/jobs/{id}/retry", () => {
     expect(detail.body.progress).toBe(0);
     expect(detail.body.started_at).toBeNull();
   });
+
+  it("clears the split plan and count so the retry never re-splits (§3.6)", async () => {
+    const { cookie, csrf } = await adminSession();
+    const submit = await submitJob(cookie, csrf, SIMPLE_WORKFLOW);
+    const jobId = submit.body.job_id;
+    await db()
+      .prepare(
+        "UPDATE jobs SET status = 'failed', split_count = 2, split_plan = ? WHERE id = ?"
+      )
+      .bind(JSON.stringify({ source_node_id: "1", batch_size: 4 }), jobId)
+      .run();
+
+    expect((await call(`/api/jobs/${jobId}/retry`, { method: "POST", cookie, headers: { "X-CSRF": csrf } })).status).toBe(200);
+
+    const row = (await db().prepare("SELECT status, split_count, split_plan FROM jobs WHERE id = ?").bind(jobId).first<any>())!;
+    expect(row.status).toBe("queued");
+    expect(row.split_count).toBe(0);
+    expect(row.split_plan).toBeNull();
+  });
+
+  it("stores a split plan at submission for a batch workflow (§3.2)", async () => {
+    const { cookie, csrf } = await adminSession();
+    const batchWorkflow = {
+      "1": { class_type: "EmptyLatentImage", inputs: { width: 512, height: 512, batch_size: 4 } },
+      "2": { class_type: "KSampler", inputs: { latent_image: ["1", 0], steps: 20 } },
+      "3": { class_type: "VAEDecode", inputs: { samples: ["2", 0] } },
+      "4": { class_type: "SaveImage", inputs: { images: ["3", 0] } },
+    };
+    const submit = await submitJob(cookie, csrf, batchWorkflow as any);
+    const row = (await db().prepare("SELECT split_plan FROM jobs WHERE id = ?").bind(submit.body.job_id).first<any>())!;
+    expect(JSON.parse(row.split_plan)).toEqual({ source_node_id: "1", batch_size: 4 });
+
+    // SIMPLE_WORKFLOW 沒有批次來源 -> 不可拆 -> NULL。
+    const plain = await submitJob(cookie, csrf, SIMPLE_WORKFLOW);
+    const plainRow = (await db().prepare("SELECT split_plan FROM jobs WHERE id = ?").bind(plain.body.job_id).first<any>())!;
+    expect(plainRow.split_plan).toBeNull();
+  });
 });
 
 // ---------------------------------------------------------------------------

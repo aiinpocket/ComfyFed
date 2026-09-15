@@ -9,7 +9,7 @@ from typing import Optional
 
 from sqlalchemy import update
 
-from . import assess, db, metrics, scheduler, stats
+from . import assess, db, metrics, scheduler, split, stats
 
 logger = logging.getLogger(__name__)
 
@@ -131,6 +131,19 @@ def assign_jobs(
             .order_by(db.Job.created_at.asc(), db.Job.id.asc())
             .all()
         )
+
+        # §3.5：配對之前先決定要不要拆。
+        if split.create_children_for_tick(
+            session, queued_jobs, workers, all_workers, fetchable_models, peer_only_models
+        ):
+            # 拆過之後 queued 清單變了（子 job 取代父 job -- 父 job 的
+            # `split_count` 現在 > 0，這個查詢再也撈不到它），重讀一次。
+            queued_jobs = (
+                session.query(db.Job)
+                .filter(db.Job.status == "queued", db.Job.split_count == 0)
+                .order_by(db.Job.created_at.asc(), db.Job.id.asc())
+                .all()
+            )
 
         limit = min(_MAX_JOBS_PER_TICK, _JOBS_PER_IDLE_WORKER * len(workers))
         starve_cutoff = now - timedelta(seconds=scheduler.STARVE_SECONDS)
@@ -331,10 +344,17 @@ def requeue_stale(now: datetime) -> list[str]:
 
         session.commit()
 
+    # Phase 3.3 §3.4：子 job 被 requeue 之後父 job 可能要從 running 退回
+    # assigned/queued。requeue 從不產生 failed/cancelled，所以不會串聯取消。
+    for job_id in requeued:
+        split.child_status_changed(job_id)
+
     return requeued
 
 
-def cancel_job(job_id: str, *, reason: str) -> Optional[str]:
+def cancel_job(
+    job_id: str, *, reason: str, cancelled_owners: Optional[list] = None
+) -> Optional[str]:
     """Move a queued/assigned/running job to `cancelled`.
 
     Sets `error=reason` and `finished_at`, and returns the worker_id that
@@ -369,6 +389,17 @@ def cancel_job(job_id: str, *, reason: str) -> Optional[str]:
     `status`/`error`/`finished_at`, the same fields `mark_done`/`mark_failed`
     touch -- receipt creation lives entirely in agentws's `job_done` handling
     and is never invoked from here.
+
+    Phase 3.3 §3.6: cancelling a CHILD job cancels the whole family -- the
+    parent moves to `cancelled` and the surviving siblings are cancelled with
+    it (see `split.refresh_parent`). `cancelled_owners`, when given, collects
+    `(child_id, worker_id)` for each sibling that still had a live owner, so
+    the caller can push `job_cancelled` to those workers too; this function's
+    own return value stays exactly what it always was (the worker that owned
+    `job_id` itself). Cancelling a PARENT does not cascade from here -- the
+    parent has no `parent_id` -- `agentws.cancel_and_notify` walks its
+    children explicitly so each one gets the full cancel-and-notify
+    treatment.
     """
     with db.get_session() as session:
         job = session.get(db.Job, job_id)
@@ -382,6 +413,7 @@ def cancel_job(job_id: str, *, reason: str) -> Optional[str]:
             job.last_worker_id = owning_worker_id
             job.worker_id = None
         session.commit()
+    split.child_status_changed(job_id, cancelled_owners=cancelled_owners)
     return owning_worker_id
 
 
@@ -522,6 +554,8 @@ def mark_running(job_id: str, worker_id: str, resolve_warn_level=None) -> bool:
         wait_seconds = (job.started_at - job.created_at).total_seconds()
         session.commit()
     metrics.get_metrics().job_wait_seconds.observe(max(wait_seconds, 0.0))
+    # Phase 3.3 §3.4：子 job 動了就重算父 job（不是子 job 的話是 no-op）。
+    split.child_status_changed(job_id)
     return True
 
 
@@ -538,11 +572,30 @@ def mark_done(job_id: str, worker_id: str, result_files: list, resolve_warn_leve
         session.commit()
     if run_seconds is not None:
         metrics.get_metrics().job_run_seconds.observe(max(run_seconds, 0.0))
+    # Phase 3.3 §3.4：子 job 動了就重算父 job（不是子 job 的話是 no-op）。
+    # 最後一個子 job 完成時父 job 才會翻成 done。
+    split.child_status_changed(job_id)
     return True
 
 
-def mark_failed(job_id: str, worker_id: str, error: str, resolve_warn_level=None) -> bool:
-    """Fail an assigned/running job of `worker_id`. Returns whether it acted."""
+def mark_failed(
+    job_id: str,
+    worker_id: str,
+    error: str,
+    resolve_warn_level=None,
+    cancelled_owners: Optional[list] = None,
+) -> bool:
+    """Fail an assigned/running job of `worker_id`. Returns whether it acted.
+
+    Phase 3.3 §3.4/§3.6: failing a CHILD job also fails its parent and
+    cascade-cancels the surviving siblings. `cancelled_owners`, when given,
+    collects `(child_id, worker_id)` for each sibling that still had a live
+    owner at that moment, so the WebSocket layer can push `job_cancelled` to
+    those workers (see `split.refresh_parent`). Omitting it does not change
+    what happens in the database -- the cancellations still occur, they just
+    self-heal on the worker's next message instead of being pushed
+    immediately (see `cancel_job`'s docstring for that mechanism).
+    """
     with db.get_session() as session:
         job = _owned_job(session, job_id, worker_id, _OWNED_STATUSES, resolve_warn_level)
         if job is None:
@@ -554,4 +607,6 @@ def mark_failed(job_id: str, worker_id: str, error: str, resolve_warn_level=None
         session.commit()
     if run_seconds is not None:
         metrics.get_metrics().job_run_seconds.observe(max(run_seconds, 0.0))
+    # Phase 3.3 §3.4：子 job 失敗 -> 父 job 失敗 + 其他子 job 一起取消。
+    split.child_status_changed(job_id, cancelled_owners=cancelled_owners)
     return True
