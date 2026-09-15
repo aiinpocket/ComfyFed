@@ -629,6 +629,7 @@ def test_prompt_queues_when_missing_model_is_fully_fetchable(client):
         worker.protocol = 3
         worker.auto_fetch = True
         worker.dynamic = json.dumps({"free_disk_gb": 100.0})
+        worker.hardware = json.dumps({"max_fetch_gb": 100})
         session.commit()
 
     r = _post_prompt(client, prompt=FLUX_PROMPT)
@@ -651,6 +652,7 @@ def test_prompt_queues_zero_holder_curated_model_via_guide_hash_alone(client):
         worker.protocol = 3
         worker.auto_fetch = True
         worker.dynamic = json.dumps({"free_disk_gb": 100.0})
+        worker.hardware = json.dumps({"max_fetch_gb": 100})
         session.commit()
 
     r = _post_prompt(client, prompt=FLUX_PROMPT)
@@ -704,6 +706,7 @@ def test_prompt_mixed_fetchable_and_unfetchable_lists_only_unfetchable(client):
         worker.protocol = 3
         worker.auto_fetch = True
         worker.dynamic = json.dumps({"free_disk_gb": 100.0})
+        worker.hardware = json.dumps({"max_fetch_gb": 100})
         session.commit()
 
     r = _post_prompt(client, prompt=TWO_MODEL_PROMPT)

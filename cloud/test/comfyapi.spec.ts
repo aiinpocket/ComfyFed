@@ -74,6 +74,7 @@ async function setWorkerRow(
     protocol?: number;
     autoFetch?: boolean;
     dynamic?: Record<string, unknown>;
+    hardware?: Record<string, unknown>;
   }
 ): Promise<void> {
   if (fields.status !== undefined) {
@@ -105,6 +106,9 @@ async function setWorkerRow(
   }
   if (fields.dynamic !== undefined) {
     await db().prepare("UPDATE workers SET dynamic = ? WHERE id = ?").bind(JSON.stringify(fields.dynamic), workerId).run();
+  }
+  if (fields.hardware !== undefined) {
+    await db().prepare("UPDATE workers SET hardware = ? WHERE id = ?").bind(JSON.stringify(fields.hardware), workerId).run();
   }
 }
 
@@ -414,7 +418,12 @@ describe("POST /comfy/api/prompt", () => {
     // queue the job instead of 400ing with a manual-download prompt.
     const { cookie, csrf } = await loginSession();
     const fetcher = await registerWorker(cookie, csrf, "fetcher");
-    await setWorkerRow(fetcher, { protocol: 3, autoFetch: true, dynamic: { free_disk_gb: 100.0 } });
+    await setWorkerRow(fetcher, {
+      protocol: 3,
+      autoFetch: true,
+      dynamic: { free_disk_gb: 100.0 },
+      hardware: { max_fetch_gb: 100 },
+    });
 
     const r = await postPrompt(cookie, FLUX_PROMPT);
     expect(r.status).toBe(200);

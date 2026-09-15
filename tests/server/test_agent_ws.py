@@ -351,6 +351,7 @@ def test_job_push_includes_fetch_models_for_an_eligible_after_fetch_worker(clien
         worker.protocol = 3
         worker.auto_fetch = True
         worker.dynamic = json.dumps({"free_disk_gb": 100.0})
+        worker.hardware = json.dumps({"max_fetch_gb": 100})
         session.commit()
 
     workflow = {"1": {"class_type": "UNETLoader", "inputs": {"unet_name": "flux1-dev.safetensors"}}}
@@ -365,7 +366,7 @@ def test_job_push_includes_fetch_models_for_an_eligible_after_fetch_worker(clien
         ws.send_json(
             {
                 "type": "hello",
-                "hardware": {},
+                "hardware": {"max_fetch_gb": 100},
                 "backend": "cuda",
                 "torch_version": "",
                 "node_classes": [],
@@ -566,6 +567,7 @@ def test_job_push_never_sent_to_a_protocol_2_worker_even_when_manifest_covers_it
             other.protocol = 3
             other.auto_fetch = True
             other.dynamic = json.dumps({"free_disk_gb": 100.0})
+            other.hardware = json.dumps({"max_fetch_gb": 100})
             session.commit()
 
         job_id = _submit(client, csrf, workflow=workflow)
@@ -3022,3 +3024,143 @@ def test_deleted_worker_is_not_dispatched_to(client):
 
     with db.get_session() as session:
         assert session.get(db.Job, job_id).status == "queued"
+
+
+# --- Phase 3.3 §3.6 fix round 1：取消父 job 要通知**每一台** worker --------
+
+
+def _make_split_family(parent_id, child_worker_ids):
+    """父 job + 一個子 job per worker，子 job 都在 running。
+
+    直接寫 DB（而不是走一次真正的 tick 拆分）是刻意的：這個測試釘的是「取消
+    一個已經拆好的 job 會發生什麼」，拆分本身在 test_split.py / test_dispatch.py
+    已經有覆蓋，這裡不該再依賴排程器剛好把兩個子 job 派到這兩台 worker 上。
+    """
+    with db.get_session() as session:
+        session.add(
+            db.Job(
+                id=parent_id,
+                workflow_json="{}",
+                status="running",
+                split_count=len(child_worker_ids),
+                split_plan=json.dumps({"source_node_id": "1", "batch_size": 2}),
+            )
+        )
+        for index, worker_id in enumerate(child_worker_ids):
+            session.add(
+                db.Job(
+                    id=f"{parent_id}-c{index}",
+                    workflow_json="{}",
+                    status="running",
+                    worker_id=worker_id,
+                    parent_id=parent_id,
+                    split_index=index,
+                )
+            )
+        session.commit()
+    return [f"{parent_id}-c{index}" for index in range(len(child_worker_ids))]
+
+
+def test_cancelling_a_split_parent_notifies_every_child_worker(client):
+    """Review fix 1：串聯取消掉的兄弟，它們的 owner 也要收到 `job_cancelled`。
+
+    以前只有迴圈第一圈的那個子 job 的 owner 收得到 -- 第一個子 job 的取消會
+    透過 `refresh_parent` 把兄弟一起收掉，於是後面的圈次看到它們已經是
+    cancelled、`cancel_job` 回 None，那些 owner 就被丟掉了。所以一個拆成 k 份
+    的 job 被取消時，有 k-1 台 worker 會一路把圖跑完才發現沒人要。
+    """
+    csrf = _login(client)
+    worker_a, sk_a = _register_worker(client, csrf, "wa")
+    worker_b, sk_b = _register_worker(client, csrf, "wb")
+    child_ids = _make_split_family("p_cancel", [worker_a, worker_b])
+
+    ws_a = _connect(client, worker_a, sk_a)
+    ws_b = _connect(client, worker_b, sk_b)
+    try:
+        _send_hello_v2(ws_a)
+        _send_hello_v2(ws_b)
+        for ws, child_id in ((ws_a, child_ids[0]), (ws_b, child_ids[1])):
+            ws.send_json(
+                {"type": "heartbeat", "state": "busy", "progress": 0.1, "job_id": child_id, "dynamic": {}}
+            )
+
+        assert client.post("/api/jobs/p_cancel/cancel", headers={"X-CSRF": csrf}).status_code == 200
+
+        # 兩條連線都收得到自己那個子 job 的 job_cancelled。
+        for ws, child_id in ((ws_a, child_ids[0]), (ws_b, child_ids[1])):
+            frame = ws.receive_json()
+            assert frame == {"type": "job_cancelled", "job_id": child_id}
+    finally:
+        ws_a.close()
+        ws_b.close()
+
+    with db.get_session() as session:
+        parent = session.get(db.Job, "p_cancel")
+        children = [session.get(db.Job, child_id) for child_id in child_ids]
+    assert parent.status == "cancelled"
+    assert [c.status for c in children] == ["cancelled", "cancelled"]
+    # 串聯掉的兄弟帶的是這次取消的理由，不是「sibling cancelled」。
+    assert [c.error for c in children] == ["cancelled by admin", "cancelled by admin"]
+    # 所有權都釋放了，所以那台 worker 之後的每一句話都會落在 not-owned 自癒路徑。
+    assert all(c.worker_id is None for c in children)
+    assert sorted(c.last_worker_id for c in children) == sorted([worker_a, worker_b])
+
+
+def test_a_failed_child_cancels_its_sibling_and_tells_that_worker(client):
+    """§3.4/§3.6：子 job 失敗 -> 父 job 失敗 + 兄弟取消 + 兄弟的 worker 收到
+    `job_cancelled`（不用等下一次心跳落在 not-owned 路徑）。"""
+    csrf = _login(client)
+    worker_a, sk_a = _register_worker(client, csrf, "wa")
+    worker_b, sk_b = _register_worker(client, csrf, "wb")
+    child_ids = _make_split_family("p_fail", [worker_a, worker_b])
+
+    ws_a = _connect(client, worker_a, sk_a)
+    ws_b = _connect(client, worker_b, sk_b)
+    try:
+        _send_hello_v2(ws_a)
+        _send_hello_v2(ws_b)
+        ws_a.send_json({"type": "job_failed", "job_id": child_ids[0], "error": "CUDA OOM"})
+
+        frame = ws_b.receive_json()
+        assert frame == {"type": "job_cancelled", "job_id": child_ids[1]}
+    finally:
+        ws_a.close()
+        ws_b.close()
+
+    with db.get_session() as session:
+        parent = session.get(db.Job, "p_fail")
+        sibling = session.get(db.Job, child_ids[1])
+    assert parent.status == "failed"
+    assert parent.error == "子任務 1/2：CUDA OOM"
+    assert sibling.status == "cancelled"
+    assert sibling.error == "sibling failed"
+    assert sibling.worker_id is None
+
+
+def test_child_heartbeat_progress_drives_the_parent_progress(client):
+    """§3.4：父 job 的 progress 是子 job 的平均，靠子 job 的心跳推動。"""
+    csrf = _login(client)
+    worker_a, sk_a = _register_worker(client, csrf, "wa")
+    worker_b, sk_b = _register_worker(client, csrf, "wb")
+    child_ids = _make_split_family("p_prog", [worker_a, worker_b])
+
+    ws_a = _connect(client, worker_a, sk_a)
+    ws_b = _connect(client, worker_b, sk_b)
+    try:
+        _send_hello_v2(ws_a)
+        _send_hello_v2(ws_b)
+        ws_a.send_json(
+            {"type": "heartbeat", "state": "busy", "progress": 0.2, "job_id": child_ids[0], "dynamic": {}}
+        )
+        ws_b.send_json(
+            {"type": "heartbeat", "state": "busy", "progress": 0.6, "job_id": child_ids[1], "dynamic": {}}
+        )
+        # 心跳是 fire-and-forget，用一句同步的 HTTP 請求確保兩個都處理完了。
+        assert client.get("/api/jobs/p_prog", headers={"X-CSRF": csrf}).status_code == 200
+    finally:
+        ws_a.close()
+        ws_b.close()
+
+    with db.get_session() as session:
+        parent = session.get(db.Job, "p_prog")
+    assert parent.progress == pytest.approx(0.4)

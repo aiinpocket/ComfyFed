@@ -626,7 +626,7 @@ def _make_fetch_ready_worker(worker_id, dynamic=None, protocol=3, auto_fetch=Tru
                 pubkey="pk",
                 protocol=protocol,
                 auto_fetch=auto_fetch,
-                hardware=json.dumps({}),
+                hardware=json.dumps({"max_fetch_gb": 100}),
                 dynamic=json.dumps(dynamic or {}),
                 node_classes=json.dumps(["UNETLoader"]),
             )
@@ -766,12 +766,12 @@ def test_assign_jobs_fetch_tier_still_prefers_clean_over_warned(_db):
     )
     with db.get_session() as session:
         worker = session.get(db.Worker, warned)
-        worker.hardware = json.dumps({"vram_gb": 8, "ram_gb": 64})
+        worker.hardware = json.dumps({"vram_gb": 8, "ram_gb": 64, "max_fetch_gb": 100})
         session.commit()
     clean = _make_fetch_ready_worker("w_clean", dynamic={"free_disk_gb": 100.0})
     with db.get_session() as session:
         worker = session.get(db.Worker, clean)
-        worker.hardware = json.dumps({"vram_gb": 24, "ram_gb": 64})
+        worker.hardware = json.dumps({"vram_gb": 24, "ram_gb": 64, "max_fetch_gb": 100})
         session.commit()
 
     job_id = _make_job(est_vram_gb=20)

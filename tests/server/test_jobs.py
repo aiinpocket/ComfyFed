@@ -922,6 +922,7 @@ def test_submit_accepts_when_missing_model_is_fully_fetchable(client):
         protocol=3,
         auto_fetch=True,
         dynamic={"free_disk_gb": 100.0},
+        hardware={"max_fetch_gb": 100},
     )
 
     r = _submit(client, csrf, workflow=FLUX_WORKFLOW)
@@ -968,6 +969,7 @@ def test_submit_mixed_fetchable_and_unfetchable_lists_only_unfetchable(client):
         protocol=3,
         auto_fetch=True,
         dynamic={"free_disk_gb": 100.0},
+        hardware={"max_fetch_gb": 100},
     )
 
     r = _submit(client, csrf, workflow=TWO_MODEL_WORKFLOW)
@@ -1097,6 +1099,7 @@ def test_job_assessment_reports_eligible_after_fetch_when_manifest_wired(client)
         protocol=3,
         auto_fetch=True,
         dynamic={"free_disk_gb": 100.0},
+        hardware={"max_fetch_gb": 100},
     )
 
     job_id = _submit(client, csrf, workflow=FLUX_WORKFLOW).json()["job_id"]
