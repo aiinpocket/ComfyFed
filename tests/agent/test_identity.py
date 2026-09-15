@@ -4,7 +4,7 @@ import pytest
 from fastapi.testclient import TestClient
 from nacl.signing import SigningKey, VerifyKey
 
-from comfyfed_agent.config import AgentConfig
+from comfyfed_agent.config import AgentConfig, PlatformEntry
 from comfyfed_agent.identity import CertificateInvalid, register
 from comfyfed_server import app as app_module
 from comfyfed_server import bootstrap, security
@@ -54,6 +54,48 @@ def test_register_writes_config_with_worker_id_and_signing_key(server, tmp_path)
     assert saved["platform_url"] == bundle["platform_url"]
     assert saved["platform_pubkey"] == bundle["platform_pubkey"]
     assert saved["certificate"] == entry.certificate
+
+
+def test_register_twice_to_same_platform_replaces_the_prior_entry(server, tmp_path):
+    """The live incident: register APPENDED, so re-installing to the same
+    platform stacked a second entry pointing at the same platform_url. After
+    the fix, cfg.platforms holds exactly one entry for that platform_url,
+    carrying the SECOND registration's worker_id/signing key."""
+    cfg_path = str(tmp_path / "agent" / "config.json")
+
+    first = register(_issue_bundle(server), "worker-1", cfg_path, server)
+    second = register(_issue_bundle(server), "worker-1", cfg_path, server)
+
+    assert first.worker_id != second.worker_id
+
+    cfg = AgentConfig.load(cfg_path)
+    assert len(cfg.platforms) == 1
+    saved = cfg.platforms[0]
+    assert saved.worker_id == second.worker_id
+    assert saved.signing_key_hex == second.signing_key_hex
+
+
+def test_register_leaves_an_entry_for_a_different_platform_alone(server, tmp_path):
+    """Multi-platform is still legal: an existing entry for a DIFFERENT
+    platform_url must survive a registration."""
+    cfg_path = str(tmp_path / "agent" / "config.json")
+
+    other = PlatformEntry(
+        platform_url="http://other.example",
+        platform_pubkey="pp",
+        worker_id="w-other",
+        certificate="cert",
+        signing_key_hex="22" * 32,
+    )
+    cfg = AgentConfig(platforms=[other])
+    cfg.save(cfg_path)
+
+    entry = register(_issue_bundle(server), "worker-1", cfg_path, server)
+
+    cfg = AgentConfig.load(cfg_path)
+    urls = {p.platform_url for p in cfg.platforms}
+    assert urls == {"http://other.example", entry.platform_url}
+    assert len(cfg.platforms) == 2
 
 
 def test_register_certificate_verifies_against_platform_pubkey(server, tmp_path):

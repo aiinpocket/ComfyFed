@@ -51,6 +51,11 @@ def register(bundle: dict, name: str, cfg_path: str, client: httpx.Client) -> Pl
     )
 
     cfg = AgentConfig.load(cfg_path)
+    # Re-registering the same machine to the same platform REPLACES its prior
+    # credential rather than stacking a second (the live incident: stacked
+    # entries pointing at since-deleted workers spammed 4401 forever). Entries
+    # for OTHER platform_urls are untouched -- multi-platform stays legal.
+    cfg.platforms = [p for p in cfg.platforms if p.platform_url != platform_url]
     cfg.platforms.append(entry)
     cfg.save(cfg_path)
 
