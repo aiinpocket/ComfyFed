@@ -491,6 +491,21 @@ def test_update_settings_allows_a_fractional_quota(client):
     assert r.json()["upload_user_quota_gb"] == 0.5
 
 
+def test_update_settings_rejects_nan_and_infinity_max_file_mb(client):
+    """JSON NaN/Infinity pass pydantic's float field, and `int(...)` on them
+    raises -- that must surface as THIS endpoint's bilingual 400, never an
+    untyped 500 (quota review finding)."""
+    csrf = _csrf(client)
+    for raw in ("NaN", "Infinity", "-Infinity"):
+        r = client.post(
+            "/api/settings",
+            content='{"upload_max_file_mb": ' + raw + "}",
+            headers={"X-CSRF": csrf, "Content-Type": "application/json"},
+        )
+        assert r.status_code == 400, (raw, r.text)
+        assert r.json()["error"]["code"] == "settings.bad_upload_max_file_mb"
+
+
 @pytest.mark.parametrize("value", [0, -1, 1025, 12.5])
 def test_update_settings_rejects_a_bad_max_file_mb(client, value):
     csrf = _csrf(client)

@@ -10,6 +10,7 @@ addendum.
 
 from __future__ import annotations
 
+import math
 import secrets
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
@@ -490,7 +491,16 @@ def update_settings(
     # parses defensively -- the lenient parse exists for rows that were not
     # written through this endpoint.
     if body.upload_max_file_mb is not None:
-        mb = int(body.upload_max_file_mb)
+        # `int(...)` on JSON NaN/Infinity (which pydantic's float admits)
+        # raises ValueError/OverflowError -- that must be THIS bilingual
+        # 400, never an untyped 500 (review finding; the GB branch's
+        # isfinite guard already covered its own case).
+        try:
+            if not math.isfinite(body.upload_max_file_mb):
+                raise ValueError
+            mb = int(body.upload_max_file_mb)
+        except (ValueError, OverflowError):
+            mb = limits.MIN_UPLOAD_MAX_FILE_MB - 1  # forces the 400 below
         if (
             mb != body.upload_max_file_mb
             or mb < limits.MIN_UPLOAD_MAX_FILE_MB

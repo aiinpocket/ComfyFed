@@ -213,7 +213,10 @@ export function Settings({ platformUrl, role }: SettingsProps) {
     if (savingUploadLimits) return;
     const mb = Number(maxFileMb);
     const gb = Number(quotaGb);
-    if (!Number.isFinite(mb) || !Number.isFinite(gb)) return;
+    // An empty NumberInput reads as '' and Number('') === 0 -- a finite
+    // value the server rightly 400s. Block the not-actually-filled form
+    // client-side instead of round-tripping for an error (review finding).
+    if (maxFileMb === '' || quotaGb === '' || !Number.isFinite(mb) || !Number.isFinite(gb) || mb <= 0 || gb <= 0) return;
     setSavingUploadLimits(true);
     try {
       const result = await api.updateSettings({
