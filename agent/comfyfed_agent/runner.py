@@ -89,17 +89,20 @@ def _is_auth_rejected(exc: BaseException) -> bool:
 
     4401 means the worker was removed or its credentials are invalid -- a
     PERMANENT condition, never a transient blip (those close with 1006/1011).
-    Checks the `.rcvd`/`.sent` `Close` frames the exception carries, with a
-    defensive `"4401"` substring fallback on the string form for a frame-less
-    wrapper. Anything that is not a `ConnectionClosed*` (a plain OSError, a
-    timeout) is False.
+    Decided SOLELY on the `.rcvd`/`.sent` `Close` frame codes the exception
+    carries (websockets >= 17 always populates one of them on a
+    `ConnectionClosed`). A `str(exc)` substring check was deliberately
+    removed: a transient 1006/1011 whose server-supplied reason string merely
+    CONTAINS "4401" (a nonce, a request id) would be misread as a permanent
+    rejection and make a healthy agent give up forever. Anything that is not
+    a `ConnectionClosed*` (a plain OSError, a timeout) is False.
     """
     if not isinstance(exc, ConnectionClosed):
         return False
     for frame in (getattr(exc, "rcvd", None), getattr(exc, "sent", None)):
         if frame is not None and getattr(frame, "code", None) == _AUTH_REJECTED_CLOSE_CODE:
             return True
-    return "4401" in str(exc)
+    return False
 
 
 class PlatformUnavailable(Exception):

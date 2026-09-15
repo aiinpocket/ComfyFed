@@ -295,15 +295,17 @@ fi
 
 # Self-heal a dead registration: if this platform is already pinned AND a
 # fresh token was supplied, probe whether the platform still accepts us.
-# A definitive 4401 (check-registration exit 2) means the worker was removed
+# A definitive 4401 (check-registration exit 10) means the worker was removed
 # server-side, so we fall through to re-register -- register now REPLACES the
 # dead entry rather than stacking a second. Exit 0 (live), 3 (undetermined:
 # network/timeout) or 1 (none) keep the skip: never burn the single-use token
-# on a transient outage.
+# on a transient outage. Exit 10 is deliberately NOT 2 -- argparse exits 2 on
+# an unknown subcommand, so an OLDER wheel lacking check-registration (served
+# the new installer mid-rollout) exits 2 and must NOT be read as dead.
 if [ "$ALREADY_REGISTERED" -eq 1 ] && [ -n "$REGISTER_TOKEN" ]; then
     CHECK_RC=0
     "$VENV_AGENT" check-registration || CHECK_RC=$?
-    if [ "$CHECK_RC" -eq 2 ]; then
+    if [ "$CHECK_RC" -eq 10 ]; then
         bilingual "偵測到註冊已失效（4401），將重新註冊" "Detected a dead registration (4401); re-registering"
         ALREADY_REGISTERED=0
     fi

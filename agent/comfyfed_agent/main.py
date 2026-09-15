@@ -170,9 +170,19 @@ async def _check_all_registrations(cfg: AgentConfig, timeout: float) -> list[str
     return [await _probe_registration(entry, cfg, timeout) for entry in cfg.platforms]
 
 
+_CHECK_REGISTRATION_DEAD_EXIT = 10
+"""Exit code for a DEFINITIVE 4401-dead registration. Deliberately NOT 2:
+argparse itself exits 2 on an unknown subcommand, so an older wheel that
+predates `check-registration` (served the new installer during a rollout)
+would exit 2 and be misread as 'dead' -- burning the one-time token on a
+re-register of a still-live worker. 10 is a code neither argparse (2) nor an
+uncaught Python error (1) ever produces, so the installer's dead-check can
+never false-positive against an older binary."""
+
+
 def _cmd_check_registration(args: argparse.Namespace) -> None:
     """Probe every pinned platform's live auth and exit with a code the
-    installer keys off (0 live / 2 dead-4401 / 3 undetermined / 1 none)."""
+    installer keys off (0 live / 10 dead-4401 / 3 undetermined / 1 none)."""
     cfg = AgentConfig.load(args.config)
     if not cfg.platforms:
         print("尚未設定任何平台 / No platforms configured")
@@ -190,7 +200,7 @@ def _cmd_check_registration(args: argparse.Namespace) -> None:
             "註冊已失效：平台以 4401 拒絕本 agent（worker 可能已被移除或憑證失效）/ "
             "Registration dead: platform rejected this agent with 4401 (worker removed or credentials invalid)"
         )
-        sys.exit(2)
+        sys.exit(_CHECK_REGISTRATION_DEAD_EXIT)
     print(
         "無法確認註冊狀態（連線失敗或逾時，未見 4401）/ "
         "Could not determine registration status (connection failed or timed out, no 4401)"

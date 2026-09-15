@@ -436,19 +436,19 @@ def test_installers_skip_registration_when_already_registered():
 def test_installers_recheck_and_reregister_a_dead_registration_on_rerun():
     """Task 4: when a platform is already pinned AND a token was supplied, the
     installer probes it with `check-registration` and, on a definitive dead
-    (exit 2), falls through to re-register instead of blindly skipping."""
+    (exit 10), falls through to re-register instead of blindly skipping."""
     ps1 = open(_source_path("install.ps1"), encoding="utf-8").read()
     assert "check-registration" in ps1
     # The gate: only re-check when already pinned AND a token is present.
     assert "$alreadyRegistered -and $RegisterToken -ne ''" in ps1
     # PS 5.1: exit code read from $LASTEXITCODE, dead (2) -> re-register.
     assert "$checkRc = $LASTEXITCODE" in ps1
-    assert "$checkRc -eq 2" in ps1
+    assert "$checkRc -eq 10" in ps1
     assert "$alreadyRegistered = $false" in ps1
 
     sh = open(_source_path("install.sh"), encoding="utf-8").read()
     assert "check-registration" in sh
-    assert '"$CHECK_RC" -eq 2' in sh
+    assert '"$CHECK_RC" -eq 10' in sh
     assert "ALREADY_REGISTERED=0" in sh
 
 

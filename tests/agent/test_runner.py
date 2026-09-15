@@ -2194,6 +2194,15 @@ def test_is_auth_rejected_false_for_plain_oserror():
     assert _is_auth_rejected(OSError("connection refused")) is False
 
 
+def test_is_auth_rejected_ignores_4401_in_a_non_auth_reason_string():
+    """A transient 1006/1011 whose server reason merely CONTAINS "4401" (a
+    nonce, a request id) must NOT be read as a permanent auth rejection --
+    the decision is the close-frame CODE only, never a string match. A false
+    positive here would make a healthy agent give up forever (review MEDIUM)."""
+    exc = ConnectionClosedError(Close(1011, "internal error ref=4401xyz"), None)
+    assert _is_auth_rejected(exc) is False
+
+
 def _4401() -> int:
     return runner_module._AUTH_REJECTED_CLOSE_CODE
 

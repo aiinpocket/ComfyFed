@@ -327,11 +327,14 @@ if ((Test-Path $AgentConfigPath)) {
 # server-side, so we fall through to re-register -- register now REPLACES the
 # dead entry rather than stacking a second. Exit 0 (live), 3 (undetermined:
 # network/timeout) or 1 (none) keep the skip: never burn the single-use token
-# on a transient outage. PS 5.1: read $LASTEXITCODE after the native call.
+# on a transient outage. Exit 10 is deliberately NOT 2 -- argparse exits 2
+# on an unknown subcommand, so an OLDER wheel lacking check-registration
+# (served the new installer mid-rollout) exits 2 and must NOT read as dead.
+# PS 5.1: read $LASTEXITCODE after the native call.
 if ($alreadyRegistered -and $RegisterToken -ne '') {
     & $venvAgent check-registration
     $checkRc = $LASTEXITCODE
-    if ($checkRc -eq 2) {
+    if ($checkRc -eq 10) {
         Write-Bilingual '偵測到註冊已失效（4401），將重新註冊' 'Detected a dead registration (4401); re-registering'
         $alreadyRegistered = $false
     }

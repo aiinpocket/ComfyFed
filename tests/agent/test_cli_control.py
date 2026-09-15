@@ -219,7 +219,7 @@ def test_check_registration_exits_0_when_handshake_succeeds(tmp_path, capsys, mo
     assert "Registration live" in capsys.readouterr().out
 
 
-def test_check_registration_exits_2_on_a_4401_rejection(tmp_path, capsys, monkeypatch):
+def test_check_registration_exits_10_on_a_4401_rejection(tmp_path, capsys, monkeypatch):
     async def _reject(self):
         raise ConnectionClosedError(Close(4401, "worker removed"), None)
 
@@ -227,7 +227,7 @@ def test_check_registration_exits_2_on_a_4401_rejection(tmp_path, capsys, monkey
     monkeypatch.setattr(main_module.PlatformConnection, "handshake", _reject)
     monkeypatch.setattr(main_module.PlatformConnection, "close", _ok)
 
-    assert _run_check(_configured(tmp_path)) == 2
+    assert _run_check(_configured(tmp_path)) == 10
     out = capsys.readouterr().out
     assert "註冊已失效" in out
     assert "4401" in out
