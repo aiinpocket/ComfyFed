@@ -276,6 +276,65 @@ def test_sh_syntax_check_via_bash_n():
     assert result.returncode == 0, result.stderr
 
 
+def test_generated_launcher_ps1_renders_and_parses():
+    """The installer WRITES a second PowerShell script (launcher.ps1) from a
+    here-string, and autostart + the installer's own "start now" both run
+    THAT file -- so it needs its own parse gate. Live-caught: the generated
+    Start-Process line nested double quotes inside a double-quoted string,
+    which parses fine as a here-string in install.ps1 but is broken as the
+    generated code; every launch silently failed and the agent never
+    started. Render the here-string exactly as install.ps1 does (evaluate it
+    with a dummy $InstallDir), then PSParser-tokenize the RESULT and assert
+    zero errors -- plus the specific shape that avoids the nested-quote trap.
+    """
+    powershell = shutil.which("powershell") or shutil.which("pwsh")
+    if powershell is None:
+        pytest.skip("powershell not available in this environment")
+    text = open(_source_path("install.ps1"), encoding="utf-8-sig").read()
+    start = text.index('$launcherSource = @"')
+    end = text.index('\n"@', start) + len('\n"@')
+    block = text[start:end]
+    # Render exactly as the installer does, then tokenize the rendered file.
+    ps_command = (
+        "$InstallDir = 'C:\\Dummy\\ComfyFed'; "
+        + block.replace("\n", "`n").replace('"', '"')  # placeholder, replaced below
+    )
+    # Build the render script as a file to avoid quoting the here-string
+    # through -Command; PowerShell reads it with the same BOM-less UTF-8.
+    import tempfile
+    with tempfile.TemporaryDirectory() as td:
+        render_ps1 = os.path.join(td, "render.ps1")
+        out_launcher = os.path.join(td, "launcher.ps1")
+        with open(render_ps1, "w", encoding="utf-8") as f:
+            f.write("$InstallDir = 'C:\\Dummy\\ComfyFed'\n")
+            f.write(block + "\n")
+            f.write("[System.IO.File]::WriteAllText('" + out_launcher.replace("'", "''") + "', $launcherSource)\n")
+        r = subprocess.run(
+            [powershell, "-NoProfile", "-ExecutionPolicy", "Bypass", "-File", render_ps1],
+            capture_output=True, text=True, timeout=60,
+        )
+        assert r.returncode == 0, r.stderr
+        rendered = open(out_launcher, encoding="utf-8").read()
+        # Shape: quotes live in a single-quoted -f format string; the
+        # Start-Process argument is a plain variable, never a double-quoted
+        # string with embedded double quotes.
+        assert "-ArgumentList $cmdArgs -WindowStyle Hidden" in rendered
+        assert '-ArgumentList "/c "' not in rendered
+        tokenize = (
+            "$errs = $null; "
+            "$content = [System.IO.File]::ReadAllText('" + out_launcher.replace("'", "''") + "'); "
+            "$null = [System.Management.Automation.PSParser]::Tokenize($content, [ref]$errs); "
+            "Write-Output ($errs.Count)"
+        )
+        r2 = subprocess.run(
+            [powershell, "-NoProfile", "-Command", tokenize],
+            capture_output=True, text=True, timeout=60,
+        )
+        assert r2.returncode == 0, r2.stderr
+        assert r2.stdout.strip() == "0", f"generated launcher has parse errors: {r2.stdout} {r2.stderr}"
+    del ps_command
+
+
 def test_ps1_parses_via_powershell_tokenizer():
     """PowerShell parse check -- tokenizes the script, never executes it.
 

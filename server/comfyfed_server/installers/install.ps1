@@ -540,7 +540,15 @@ if (Test-Path `$ManagedMarker) {
 
 `$agentExe = Join-Path `$InstallDir 'venv\Scripts\comfyfed-agent.exe'
 `$logFile = Join-Path `$InstallDir 'agent.log'
-Start-Process -FilePath 'cmd.exe' -ArgumentList "/c `"`$agentExe`" run >> `"`$logFile`" 2>&1" -WindowStyle Hidden
+# The generated line must NOT nest double quotes inside a double-quoted
+# PowerShell string (that is exactly what broke every launch: the string
+# ended at the first inner quote and Start-Process saw a stray positional
+# parameter -- so autostart AND the installer's own "start now" silently
+# never started the agent). Quotes live inside a single-quoted format
+# string instead; the doubled outer quotes are cmd /c's rule when the
+# command both starts with a quote and contains more quotes.
+`$cmdArgs = '/c ""{0}" run >> "{1}" 2>&1"' -f `$agentExe, `$logFile
+Start-Process -FilePath 'cmd.exe' -ArgumentList `$cmdArgs -WindowStyle Hidden
 "@
 Set-Content -Path $LauncherScript -Value $launcherSource -Encoding UTF8
 
