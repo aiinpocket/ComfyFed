@@ -435,8 +435,11 @@ app.get("/api/jobs", requireUser, async (c) => {
         .map((s) => s.trim())
         .filter((s) => s.length > 0)
     : undefined;
-  // Parity with Python's `include_children: int = 0` FastAPI param: any
-  // value but an explicit 0 (or an empty one) opts in.
+  // Any value but an explicit "0" (or an empty one) opts in. NOT byte-identical
+  // to Python's `include_children: int = 0` FastAPI param, which 422s on a
+  // non-numeric value; here a non-numeric value is simply truthy. The opt-in
+  // is a display toggle, so the lenient reading costs nothing -- documented
+  // rather than "fixed" so the difference is explicit if it ever matters.
   const includeChildrenParam = c.req.query("include_children");
   const includeChildren = includeChildrenParam !== undefined && includeChildrenParam !== "" && includeChildrenParam !== "0";
   const jobs = await queries.listJobs(c.env.DB, statuses, {

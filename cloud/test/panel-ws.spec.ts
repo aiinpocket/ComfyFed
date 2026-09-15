@@ -1009,4 +1009,142 @@ describe("split families on the panel (§3.7)", () => {
     agent.close();
     panel.close();
   });
+
+  it("relays a stale child's requeue as the parent -- but only once the parent is back in the queue", async () => {
+    // Mirrors tests/server/test_comfy_panel_ws.py's
+    // `test_a_requeued_child_only_clears_the_parent_when_it_went_back_to_queue`,
+    // driven through the real tick: one child of a 2-way split loses its
+    // worker, the other keeps running, so the parent is still `running` and
+    // clearing `executing` would blank a prompt that is still in flight.
+    const { cookie, uid } = await loginCookie();
+    const staleWorker = await makeWorker({ pubkeyHex: KEYPAIRS[0]!.pubkey_hex });
+    const liveWorker = await makeWorker({ pubkeyHex: KEYPAIRS[1]!.pubkey_hex });
+    const { parentId, childIds } = await makeSplitFamily({
+      uid,
+      children: [
+        { status: "running", workerId: staleWorker },
+        { status: "running", workerId: liveWorker },
+      ],
+    });
+
+    const stale = toSqliteTimestamp(new Date(Date.now() - 200_000));
+    const fresh = toSqliteTimestamp(new Date());
+    await d1().prepare("UPDATE workers SET last_seen = ? WHERE id = ?").bind(stale, staleWorker).run();
+    await d1().prepare("UPDATE workers SET last_seen = ? WHERE id = ?").bind(fresh, liveWorker).run();
+
+    const panel = await connectPanel(cookie);
+    await collectMessages(panel, 2); // status, feature_flags
+
+    async function runTick(): Promise<void> {
+      await runInDurableObject(hub(), async (_instance, state) => {
+        await state.storage.setAlarm(Date.now() + 5_000);
+      });
+      expect(await runDurableObjectAlarm(hub())).toBe(true);
+    }
+
+    // Phase 1: the sibling is still running -> the requeue refreshes the queue
+    // badge and nothing else. No `executing` frame for the parent.
+    const firstSweep = collectMessages(panel, 1);
+    await runTick();
+    const [onlyFrame] = await firstSweep;
+    expect(onlyFrame.type).toBe("status");
+    await expectNoMessage(panel);
+    expect((await getJobById(d1(), childIds[0]!))!.status).toBe("queued");
+    expect((await getJobById(d1(), parentId))!.status).toBe("running");
+
+    // Phase 2: the other worker goes stale too -> the parent really is back in
+    // the queue, and NOW the panel is told, naming the parent.
+    await d1().prepare("UPDATE workers SET last_seen = ? WHERE id = ?").bind(stale, liveWorker).run();
+    const secondSweep = collectMessages(panel, 2);
+    await runTick();
+    const [requeued, status] = await secondSweep;
+    expect(requeued).toEqual({ type: "executing", data: { node: null, prompt_id: parentId } });
+    expect(status.type).toBe("status");
+    expect((await getJobById(d1(), parentId))!.status).toBe("queued");
+
+    panel.close();
+  });
+
+  it("relays a child's cancellation as the parent's", async () => {
+    // Mirrors tests/server/test_comfy_panel_ws.py's
+    // `test_child_cancel_is_reported_as_the_parent`: cancelling any one child
+    // cancels the whole family (refreshParent), so the prompt really is over
+    // -- and the frame must name the PARENT, the only id the panel knows.
+    const { cookie, uid } = await loginCookie();
+    const workerId = await makeWorker({ pubkeyHex: KEYPAIRS[0]!.pubkey_hex });
+    const { parentId, childIds } = await makeSplitFamily({
+      uid,
+      children: [
+        { status: "running", workerId },
+        { status: "queued" },
+      ],
+    });
+
+    const panel = await connectPanel(cookie);
+    await collectMessages(panel, 2); // status, feature_flags
+
+    const eventsPromise = collectMessages(panel, 2); // executing:null, status
+    const response = await hub().fetch(
+      new Request("http://do/internal/cancel", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ job_id: childIds[0], reason: "cancelled by admin" }),
+      })
+    );
+    expect((await response.json<{ cancelled: boolean }>()).cancelled).toBe(true);
+
+    const [executingNull, status] = await eventsPromise;
+    expect(executingNull).toEqual({ type: "executing", data: { node: null, prompt_id: parentId } });
+    expect(status.type).toBe("status");
+    await expectNoMessage(panel);
+
+    expect((await getJobById(d1(), parentId))!.status).toBe("cancelled");
+
+    panel.close();
+  });
+
+  it("relays a parent's cancellation once, naming the parent and never a child", async () => {
+    // Mirrors tests/server/test_comfy_panel_ws.py's
+    // `test_child_cancel_is_reported_as_the_parent`, through the real
+    // `/internal/cancel` path: cancelling the parent cascades to every child
+    // (Task 6), but each child's cancellation must NOT reach the panel as its
+    // own frame -- the panel never knew the children existed.
+    const { cookie, uid } = await loginCookie();
+    const workerId = await makeWorker({ pubkeyHex: KEYPAIRS[0]!.pubkey_hex });
+    const { parentId, childIds } = await makeSplitFamily({
+      uid,
+      children: [
+        { status: "running", workerId },
+        { status: "queued" },
+      ],
+    });
+
+    const panel = await connectPanel(cookie);
+    await collectMessages(panel, 2); // status, feature_flags
+
+    const eventsPromise = collectMessages(panel, 2); // executing:null, status
+    const response = await hub().fetch(
+      new Request("http://do/internal/cancel", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ job_id: parentId, reason: "cancelled by admin" }),
+      })
+    );
+    expect((await response.json<{ cancelled: boolean }>()).cancelled).toBe(true);
+
+    const [executingNull, status] = await eventsPromise;
+    expect(executingNull).toEqual({ type: "executing", data: { node: null, prompt_id: parentId } });
+    expect(status.type).toBe("status");
+    expect(status.data.status).toEqual({ exec_info: { queue_remaining: 0 } });
+    // No second `executing` frame naming a child (nor a duplicate for the
+    // parent from the cascade).
+    await expectNoMessage(panel);
+
+    expect((await getJobById(d1(), parentId))!.status).toBe("cancelled");
+    for (const childId of childIds) {
+      expect((await getJobById(d1(), childId))!.status).toBe("cancelled");
+    }
+
+    panel.close();
+  });
 });
