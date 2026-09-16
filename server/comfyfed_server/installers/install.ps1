@@ -43,6 +43,17 @@ function Fail-Step {
     exit 1
 }
 
+function Invoke-Native {
+    # Run a native exe with stderr NOT promoted to terminating errors (PS 5.1
+    # wraps native stderr as ErrorRecords whenever a redirection is active;
+    # under $ErrorActionPreference='Stop' that aborts a step that succeeded).
+    # Success is judged by $LASTEXITCODE alone, the way every caller already does.
+    param([Parameter(Mandatory)][scriptblock]$Command)
+    $prev = $ErrorActionPreference
+    $ErrorActionPreference = 'Continue'
+    try { & $Command } finally { $ErrorActionPreference = $prev }
+}
+
 New-Item -ItemType Directory -Force -Path $InstallDir | Out-Null
 
 # ---------------------------------------------------------------------------
@@ -139,7 +150,7 @@ $venvAgent = Join-Path $VenvDir 'Scripts\comfyfed-agent.exe'
 if (-not (Test-Path $venvPython)) {
     Write-Bilingual '建立虛擬環境...' 'Creating virtual environment...'
     try {
-        & $py.Exe @($py.Args) -m venv $VenvDir
+        Invoke-Native { & $py.Exe @($py.Args) -m venv $VenvDir }
         if ($LASTEXITCODE -ne 0) { throw "venv creation exited $LASTEXITCODE" }
     } catch {
         Fail-Step '建立虛擬環境' 'creating the virtual environment' `
@@ -195,7 +206,7 @@ if ($actualHash -ne $expectedHash) {
 
 Write-Bilingual '安裝 agent...' 'Installing agent...'
 try {
-    & $venvPip install --upgrade $wheelFile
+    Invoke-Native { & $venvPip install --upgrade $wheelFile }
     if ($LASTEXITCODE -ne 0) { throw "pip install exited $LASTEXITCODE" }
 } catch {
     Fail-Step '安裝 agent wheel' 'installing the agent wheel' `
@@ -341,7 +352,7 @@ if ((Test-Path $AgentConfigPath)) {
 # (served the new installer mid-rollout) exits 2 and must NOT read as dead.
 # PS 5.1: read $LASTEXITCODE after the native call.
 if ($alreadyRegistered -and $RegisterToken -ne '') {
-    & $venvAgent check-registration
+    Invoke-Native { & $venvAgent check-registration }
     $checkRc = $LASTEXITCODE
     if ($checkRc -eq 10) {
         Write-Bilingual '偵測到註冊已失效（4401），將重新註冊' 'Detected a dead registration (4401); re-registering'
@@ -372,7 +383,7 @@ if ($alreadyRegistered) {
     [System.IO.File]::WriteAllText($bundlePath, ($bundle | ConvertTo-Json), (New-Object System.Text.UTF8Encoding($false)))
 
     try {
-        & $venvAgent register $bundlePath
+        Invoke-Native { & $venvAgent register $bundlePath }
         if ($LASTEXITCODE -ne 0) { throw "comfyfed-agent register exited $LASTEXITCODE" }
     } catch {
         Fail-Step '執行 comfyfed-agent register' 'running comfyfed-agent register' `
@@ -514,7 +525,7 @@ if ((Test-Path $ManagedMarker) -and (-not $markerIsDetected)) {
         'ComfyUI already managed by this installer, skipping reinstall'
 } else {
     Write-Bilingual '偵測本機 ComfyUI...' 'Detecting local ComfyUI...'
-    $comfyUrl = (& $venvPython $HelperScript check | Select-Object -Last 1)
+    $comfyUrl = (Invoke-Native { & $venvPython $HelperScript check } | Select-Object -Last 1)
     $found = ($LASTEXITCODE -eq 0)
 
     if ($found) {
@@ -576,7 +587,7 @@ if ((Test-Path $ManagedMarker) -and (-not $markerIsDetected)) {
 
         Write-Bilingual '安裝解壓工具 py7zr...' 'Installing py7zr for extraction...'
         try {
-            & $venvPip install py7zr
+            Invoke-Native { & $venvPip install py7zr }
             if ($LASTEXITCODE -ne 0) { throw "pip install py7zr exited $LASTEXITCODE" }
         } catch {
             Fail-Step '安裝 py7zr' 'installing py7zr' "請重跑本腳本" "please re-run this script"
@@ -586,7 +597,7 @@ if ((Test-Path $ManagedMarker) -and (-not $markerIsDetected)) {
         New-Item -ItemType Directory -Force -Path $extractTemp | Out-Null
         Write-Bilingual '解壓 ComfyUI...' 'Extracting ComfyUI...'
         try {
-            & $venvPython $HelperScript extract7z $archivePath $extractTemp
+            Invoke-Native { & $venvPython $HelperScript extract7z $archivePath $extractTemp }
             if ($LASTEXITCODE -ne 0) { throw "extract7z exited $LASTEXITCODE" }
         } catch {
             Fail-Step '解壓 ComfyUI' 'extracting ComfyUI' `
@@ -639,7 +650,7 @@ if ((Test-Path $ManagedMarker) -and (-not $markerIsDetected)) {
 
         Write-Bilingual '重新偵測並套用設定...' 'Re-running detection and saving config...'
         try {
-            & $venvPython $HelperScript apply $AgentConfigPath
+            Invoke-Native { & $venvPython $HelperScript apply $AgentConfigPath }
             if ($LASTEXITCODE -ne 0) { throw "apply detection exited $LASTEXITCODE" }
         } catch {
             Fail-Step '套用偵測設定' 'applying detection settings' `
@@ -736,7 +747,7 @@ $taskCmd = "powershell.exe -NoProfile -ExecutionPolicy Bypass -WindowStyle Hidde
 # abort an otherwise working install.
 $autostartOk = $false
 try {
-    schtasks /Create /F /TN ComfyFedAgent /SC ONLOGON /TR $taskCmd 2>$null | Out-Null
+    Invoke-Native { schtasks /Create /F /TN ComfyFedAgent /SC ONLOGON /TR $taskCmd 2>$null } | Out-Null
     if ($LASTEXITCODE -eq 0) { $autostartOk = $true }
 } catch {}
 if ($autostartOk) {
@@ -751,12 +762,29 @@ if ($autostartOk) {
     try {
         # Same rule in the other direction: a scheduled task from a previous
         # elevated run would double up with this Run key.
-        schtasks /Delete /F /TN ComfyFedAgent 2>$null | Out-Null
-        New-ItemProperty -Path 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Run' `
-            -Name 'ComfyFedAgent' -Value $taskCmd -PropertyType String -Force | Out-Null
-        $autostartOk = $true
-        Write-Bilingual '未以系統管理員執行，已改用使用者層級自動啟動（登錄檔 Run 鍵）' `
-            'Not elevated; using per-user autostart (registry Run key) instead'
+        Invoke-Native { schtasks /Delete /F /TN ComfyFedAgent 2>$null } | Out-Null
+        $deleteRc = $LASTEXITCODE
+        $taskStillExists = $false
+        if ($deleteRc -ne 0) {
+            # Live-caught 2026-09-16: a non-elevated re-run on a machine whose
+            # scheduled task was created by an earlier ELEVATED run cannot
+            # delete that task ("Access is denied"). Deletion failing is not
+            # the same as no task existing -- check before assuming the Run
+            # key path is needed, or a perfectly working scheduled task gets
+            # reported as "autostart could not be configured".
+            Invoke-Native { schtasks /Query /TN ComfyFedAgent 2>$null } | Out-Null
+            if ($LASTEXITCODE -eq 0) { $taskStillExists = $true }
+        }
+        if ($taskStillExists) {
+            $autostartOk = $true
+            Write-Bilingual '已存在排程工作 ComfyFedAgent，沿用' 'Existing scheduled task ComfyFedAgent kept'
+        } else {
+            New-ItemProperty -Path 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Run' `
+                -Name 'ComfyFedAgent' -Value $taskCmd -PropertyType String -Force | Out-Null
+            $autostartOk = $true
+            Write-Bilingual '未以系統管理員執行，已改用使用者層級自動啟動（登錄檔 Run 鍵）' `
+                'Not elevated; using per-user autostart (registry Run key) instead'
+        }
     } catch {
         Write-Host "[警告/WARNING] 無法設定開機自動啟動 / could not configure auto-start" -ForegroundColor Yellow
         Write-Host "手動替代 / Manual alternative: 以系統管理員執行 / run as administrator: schtasks /Create /F /TN ComfyFedAgent /SC ONLOGON /TR `"$taskCmd`"" -ForegroundColor Yellow

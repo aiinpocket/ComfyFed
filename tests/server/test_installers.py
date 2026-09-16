@@ -727,6 +727,72 @@ def test_installers_recapture_a_detected_marker_on_rerun():
     assert "MARKER_IS_DETECTED=1" in sh
 
 
+def test_ps1_defines_invoke_native_helper():
+    """Live-caught 2026-09-16: `irm ... | iex *> log` (any PowerShell-level
+    stream redirection) makes PS 5.1 wrap native stderr lines (e.g. pip's
+    '[notice] A new release of pip is available') as terminating
+    NativeCommandError records under $ErrorActionPreference='Stop', failing
+    steps that actually succeeded. Invoke-Native runs the native call under
+    $ErrorActionPreference='Continue' and leaves success judged by
+    $LASTEXITCODE alone, exactly like every caller already does."""
+    ps1 = open(_source_path("install.ps1"), encoding="utf-8-sig").read()
+    assert "function Invoke-Native" in ps1
+    helper = ps1[ps1.index("function Invoke-Native") : ps1.index("New-Item -ItemType Directory -Force -Path $InstallDir")]
+    assert "$ErrorActionPreference = 'Continue'" in helper
+    assert "finally { $ErrorActionPreference = $prev }" in helper
+
+
+def test_ps1_native_calls_go_through_invoke_native():
+    """Every native invocation that is judged by $LASTEXITCODE must be
+    wrapped in Invoke-Native, not called bare -- otherwise the same
+    NativeCommandError trap that broke the wheel install (see
+    test_ps1_defines_invoke_native_helper) can fire on venv creation,
+    registration, and ComfyUI detection/extraction too."""
+    ps1 = open(_source_path("install.ps1"), encoding="utf-8-sig").read()
+    for snippet in (
+        "Invoke-Native { & $py.Exe @($py.Args) -m venv $VenvDir }",
+        "Invoke-Native { & $venvPip install --upgrade $wheelFile }",
+        "Invoke-Native { & $venvAgent check-registration }",
+        "Invoke-Native { & $venvAgent register $bundlePath }",
+        "Invoke-Native { & $venvPython $HelperScript check }",
+        "Invoke-Native { & $venvPip install py7zr }",
+        "Invoke-Native { & $venvPython $HelperScript extract7z $archivePath $extractTemp }",
+        "Invoke-Native { & $venvPython $HelperScript apply $AgentConfigPath }",
+    ):
+        assert snippet in ps1, snippet
+    # No bare `& $venv...` / `& $py.Exe` calls left unwrapped.
+    import re
+    for m in re.finditer(r"^(?!.*Invoke-Native).*& \$(venv\w+|py\.Exe)\b", ps1, re.MULTILINE):
+        pytest.fail(f"unwrapped native call: {m.group(0).strip()}")
+
+
+def test_ps1_autostart_schtasks_calls_go_through_invoke_native():
+    ps1 = open(_source_path("install.ps1"), encoding="utf-8-sig").read()
+    autostart = ps1[ps1.index("Configuring auto-start on logon") : ps1.index("Starting now")]
+    assert "Invoke-Native { schtasks /Create /F /TN ComfyFedAgent /SC ONLOGON /TR $taskCmd 2>$null }" in autostart
+    assert "Invoke-Native { schtasks /Delete /F /TN ComfyFedAgent 2>$null }" in autostart
+
+
+def test_ps1_autostart_keeps_an_undeletable_scheduled_task_instead_of_stacking_run_key():
+    """Live-caught 2026-09-16: a non-elevated re-run on a machine whose
+    scheduled task was created by an earlier ELEVATED run cannot delete that
+    task ('Access is denied' on stderr, which used to be promoted to a
+    terminating error and swallowed by the outer catch) -- so the installer
+    wrongly reported that autostart could not be configured even though the
+    existing scheduled task still worked fine. Deletion failing must trigger
+    a Query check: if the task still exists, keep it (no Run key added, and
+    autostartOk stays true) instead of assuming there is nothing there."""
+    ps1 = open(_source_path("install.ps1"), encoding="utf-8-sig").read()
+    autostart = ps1[ps1.index("Configuring auto-start on logon") : ps1.index("Starting now")]
+    assert "Invoke-Native { schtasks /Query /TN ComfyFedAgent 2>$null }" in autostart
+    assert "$taskStillExists = $true" in autostart
+    assert "Existing scheduled task ComfyFedAgent kept" in autostart
+    # The kept-task branch must not fall through to writing the Run key.
+    kept_branch, _, run_branch = autostart.partition("Existing scheduled task ComfyFedAgent kept")
+    assert "New-ItemProperty" not in autostart[autostart.index("$taskStillExists = $true"):autostart.index("Existing scheduled task ComfyFedAgent kept")]
+    del kept_branch, run_branch
+
+
 def test_generated_comfyui_launcher_sh_syntax_checks():
     """install.sh writes a SECOND bash script; `bash -n install.sh` never
     looks inside a heredoc, so the generated file needs its own parse gate
