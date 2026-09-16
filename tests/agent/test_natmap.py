@@ -43,6 +43,15 @@ def test_parse_macos_route_returns_none_when_not_found():
     assert natmap.parse_macos_route("route: writing to routing socket: not in table\n") is None
 
 
+def test_parse_macos_route_rejects_a_non_ip_gateway():
+    # 直連的介面會印 `gateway: link#8`，那不是可以送 NAT-PMP 的位址。
+    assert natmap.parse_macos_route("    gateway: link#8\n") is None
+
+
+def test_parse_linux_ip_route_rejects_a_non_ip_token():
+    assert natmap.parse_linux_ip_route("default via dev eth0 proto kernel\n") is None
+
+
 def test_parse_linux_ip_route_finds_via():
     assert natmap.parse_linux_ip_route(LINUX_IP_ROUTE) == "10.0.0.1"
 
@@ -77,6 +86,8 @@ def test_detect_gateway_returns_none_when_the_command_fails():
         ("172.32.5.4", False),
         ("192.168.1.5", True),
         ("169.254.10.2", True),
+        ("100.64.3.9", True),  # RFC 6598 CGNAT：電信商級 NAT，一樣連不到
+        ("100.128.0.1", False),
         ("127.0.0.1", True),
         ("::1", True),
         ("fc00::1", True),
@@ -255,10 +266,37 @@ def test_build_soap_has_the_action_envelope_and_soapaction_header():
     assert headers["Content-Type"] == 'text/xml; charset="utf-8"'
 
 
+def test_find_control_url_honours_urlbase():
+    """有些 IGD 的控制端點跟描述檔不同埠，靠 `<URLBase>` 宣告。"""
+    xml = IGD_XML.replace(
+        "<device>", "<URLBase>http://192.168.1.1:49152/</URLBase>\n  <device>", 1
+    )
+    assert natmap.find_control_url(xml, "http://192.168.1.1:5000/rootDesc.xml") == (
+        "http://192.168.1.1:49152/ctl/IPConn",
+        "urn:schemas-upnp-org:service:WANIPConnection:1",
+    )
+
+
 def test_parse_external_ip_and_soap_error():
     assert natmap.parse_external_ip(EXTERNAL_IP_RESPONSE) == "203.0.113.7"
     assert natmap.parse_soap_error(CONFLICT_RESPONSE) == 718
     assert natmap.parse_soap_error(ADD_OK_RESPONSE) is None
+
+
+def test_parse_external_ip_rejects_a_non_ip_value():
+    assert natmap.parse_external_ip(
+        EXTERNAL_IP_RESPONSE.replace("203.0.113.7", "not-an-ip")
+    ) is None
+    assert natmap.parse_external_ip(EXTERNAL_IP_RESPONSE.replace("203.0.113.7", "")) is None
+
+
+def test_soap_parsers_tolerate_a_namespace_prefix():
+    assert natmap.parse_soap_error(
+        CONFLICT_RESPONSE.replace("errorCode>", "e:errorCode>")
+    ) == 718
+    assert natmap.parse_external_ip(
+        EXTERNAL_IP_RESPONSE.replace("NewExternalIPAddress>", "u:NewExternalIPAddress>")
+    ) == "203.0.113.7"
 
 
 class FakeClock:
@@ -278,17 +316,20 @@ class FakeClock:
 
 class FakeUdp:
     """replies 依序取用（None = 逾時）；每次 exchange 讓時鐘前進 cost
-    秒，好讓 8 秒上限測得出來。"""
+    秒，好讓 8 秒上限測得出來。真的 socket 不會超過自己的 timeout，
+    所以這裡也只前進 min(cost, timeout)。"""
 
     def __init__(self, replies, clock: FakeClock, cost: float = 0.0) -> None:
         self.replies = list(replies)
         self.clock = clock
         self.cost = cost
         self.sent: list[tuple[str, int, bytes]] = []
+        self.timeouts: list[float] = []
 
     def exchange(self, host, port, payload, timeout):
         self.sent.append((host, port, payload))
-        self.clock.now += self.cost
+        self.timeouts.append(timeout)
+        self.clock.now += min(self.cost, timeout)
         return self.replies.pop(0) if self.replies else None
 
 
@@ -338,9 +379,20 @@ def _natpmp_mapping_reply(external_port=8850, lifetime=3600, result=0):
     return struct.pack("!BBHIHHI", 0, 130, result, 1, 8850, external_port, lifetime)
 
 
-def _map(clock, *, udp, http=None, ssdp=None, gateway="192.168.1.1", port=8850, detect=_no_gateway):
+def _map(
+    clock,
+    *,
+    udp,
+    http=None,
+    ssdp=None,
+    gateway="192.168.1.1",
+    port=8850,
+    detect=_no_gateway,
+    deadline_seconds=natmap.MAP_DEADLINE_SECONDS,
+):
     return natmap.map_port(
         port=port,
+        deadline_seconds=deadline_seconds,
         clock=clock.time,
         sleep=clock.sleep,
         gateway=gateway,
@@ -376,7 +428,54 @@ def test_map_port_natpmp_retries_250ms_doubling_at_most_three_times():
     _map(clock, udp=udp)
 
     assert len(udp.sent) == 3
-    assert clock.sleeps[:3] == [0.25, 0.5, 1.0]
+    assert udp.timeouts == [0.25, 0.5, 1.0]
+    # 最後一次送完不再睡：剩下的預算要留給 UPnP。
+    assert clock.sleeps == [0.25, 0.5]
+
+
+def test_map_port_natpmp_succeeds_on_the_second_attempt():
+    clock = FakeClock()
+    udp = FakeUdp(
+        [None, _natpmp_external_ip_reply(), None, _natpmp_mapping_reply()],
+        clock,
+    )
+
+    mapping = _map(clock, udp=udp)
+
+    assert mapping is not None
+    assert mapping.method == "natpmp"
+    assert len(udp.sent) == 4
+    assert clock.sleeps == [0.25, 0.25]  # 每一輪各重送一次
+
+
+def test_map_port_ignores_a_reply_with_the_wrong_opcode_or_version():
+    clock = FakeClock()
+    stray = struct.pack("!BBHI", 1, 129, 0, 1) + bytes((203, 0, 113, 7))  # 版本 1、opcode 129
+    udp = FakeUdp([stray, stray, stray], clock)
+
+    assert _map(clock, udp=udp) is None
+    assert len(udp.sent) == 3  # 三次都當作沒收到，重送滿
+
+
+def test_map_port_falls_through_to_upnp_when_natpmp_answers_with_an_error():
+    clock = FakeClock()
+    location = "http://192.168.1.1:5000/rootDesc.xml"
+    refused = struct.pack("!BBHI", 0, 128, 3, 1) + bytes((0, 0, 0, 0))  # result 3
+    http = FakeHttp(
+        get_map={location: IGD_XML},
+        post_responses=[(200, EXTERNAL_IP_RESPONSE.encode()), (200, ADD_OK_RESPONSE.encode())],
+        clock=clock,
+    )
+
+    mapping = _map(
+        clock,
+        udp=FakeUdp([refused], clock),
+        http=http,
+        ssdp=FakeSsdp([SSDP_RESPONSE], clock),
+    )
+
+    assert mapping is not None
+    assert mapping.method == "upnp"
 
 
 def test_map_port_falls_back_to_upnp_when_natpmp_is_silent():
@@ -438,16 +537,32 @@ def test_map_port_gives_up_after_five_conflicting_ports():
 
 
 def test_map_port_respects_the_eight_second_cap():
-    """NAT-PMP 這一輪就吃掉 7.5 秒 ⇒ 不再進 UPnP（SSDP 還要等 2.5 秒）。"""
+    """每一步都吃滿自己的逾時（沒回應的路由器）也不准超過 8 秒：
+    NAT-PMP 兩輪重送、SSDP 等 2.5 秒、再抓一次裝置描述就沒預算了。"""
     clock = FakeClock()
-    udp = FakeUdp([None, None, None], clock, cost=2.5)
+    location = "http://192.168.1.1:5000/rootDesc.xml"
+    udp = FakeUdp([None, None, None], clock, cost=10.0)
+    ssdp = FakeSsdp([SSDP_RESPONSE], clock)
+    http = FakeHttp(get_map={location: IGD_XML}, clock=clock, cost=3.0)
+
+    mapping = _map(clock, udp=udp, http=http, ssdp=ssdp)
+
+    assert mapping is None
+    assert clock.now <= natmap.MAP_DEADLINE_SECONDS
+    assert http.posts == []  # 預算用完，連 SOAP 都沒送出去
+
+
+def test_map_port_skips_upnp_when_there_is_no_time_left_for_ssdp():
+    """剩下的時間不夠 SSDP 等滿 2.5 秒 ⇒ 根本不開始（不然一定超時）。"""
+    clock = FakeClock()
+    udp = FakeUdp([None, None, None], clock, cost=10.0)
     ssdp = FakeSsdp([SSDP_RESPONSE], clock)
 
-    mapping = _map(clock, udp=udp, http=FakeHttp(get_map={}), ssdp=ssdp)
+    mapping = _map(clock, udp=udp, http=FakeHttp(get_map={}), ssdp=ssdp, deadline_seconds=3.0)
 
     assert mapping is None
     assert ssdp.waited == []  # 逾時了，SSDP 根本沒開始
-    assert clock.now <= natmap.MAP_DEADLINE_SECONDS + 2.5
+    assert clock.now <= 3.0
 
 
 def test_map_port_without_a_gateway_returns_none_and_sends_nothing():
@@ -467,6 +582,37 @@ def test_map_port_detects_the_gateway_when_the_caller_does_not_pass_one():
     assert mapping is not None
     assert mapping.gateway == "192.168.9.1"
     assert udp.sent[0][0] == "192.168.9.1"
+
+
+def test_map_port_binds_the_default_ssdp_transport_to_the_local_ip(monkeypatch):
+    """多網卡的機器要從 peer server 那張網卡送 M-SEARCH，不然路由器收不到。"""
+    built: list = []
+
+    class RecordingSsdp:
+        def __init__(self, local_ip=None):
+            self.local_ip = local_ip
+            built.append(self)
+
+        def msearch(self, payload, wait_seconds):
+            return []
+
+    monkeypatch.setattr(natmap, "_MulticastSsdpTransport", RecordingSsdp)
+    clock = FakeClock()
+
+    assert (
+        natmap.map_port(
+            port=8850,
+            clock=clock.time,
+            sleep=clock.sleep,
+            gateway="192.168.1.1",
+            detect=_no_gateway,
+            udp=FakeUdp([None, None, None], clock),
+            http=FakeHttp(),
+            local_ip="192.168.1.5",
+        )
+        is None
+    )
+    assert [transport.local_ip for transport in built] == ["192.168.1.5"]
 
 
 def test_map_port_keeps_a_private_external_ip_as_none_for_the_caller_to_replace():
@@ -507,8 +653,9 @@ def test_unmap_port_sends_a_zero_lifetime_natpmp_request():
 
     natmap.unmap_port(mapping, udp=udp)
 
+    # RFC 6886 §3.4：刪除時 external port 送 0（路由器用 internal port 找映射）。
     assert udp.sent[0][2] == natmap.encode_natpmp_request(
-        2, internal_port=8850, external_port=8850, lifetime=0
+        2, internal_port=8850, external_port=0, lifetime=0
     )
 
 

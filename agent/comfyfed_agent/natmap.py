@@ -57,6 +57,8 @@ UPNP_CONFLICT_ERROR = 718
 
 # spec §4.2 的私有網段清單，逐字：10/8、172.16/12、192.168/16、169.254/16、
 # fc00::/7、::1；loopback 127/8 與 IPv6 link-local 一併納入（同樣連不到）。
+# 另加 100.64/10（RFC 6598 CGNAT）：電信商級 NAT 後面的位址從外面一樣連不到，
+# 路由器回報這種「外部 IP」就是雙層 NAT。Task 4 會在平台端鏡像同一份清單。
 _PRIVATE_NETWORKS = tuple(
     ipaddress.ip_network(cidr)
     for cidr in (
@@ -64,6 +66,7 @@ _PRIVATE_NETWORKS = tuple(
         "172.16.0.0/12",
         "192.168.0.0/16",
         "169.254.0.0/16",
+        "100.64.0.0/10",
         "127.0.0.0/8",
         "fc00::/7",
         "::1/128",
@@ -139,32 +142,40 @@ def _run_command(argv: list[str]) -> str:
     return subprocess.run(argv, capture_output=True, text=True, timeout=3, check=False).stdout
 
 
+def _as_ip(token: Optional[str]) -> Optional[str]:
+    """`token` 是合法 IP 就原樣回傳，否則 None —— 三個平台的解析器都靠它
+    擋掉 `On-link`、`default`、錯位的欄位之類的雜訊。"""
+    if not token:
+        return None
+    try:
+        ipaddress.ip_address(token)
+    except ValueError:
+        return None
+    return token
+
+
 def parse_windows_route(output: str) -> Optional[str]:
     """`route print -4 0.0.0.0` 的 `0.0.0.0 0.0.0.0 <gateway>` 那一列。"""
     for line in output.splitlines():
         fields = line.split()
         if len(fields) >= 3 and fields[0] == "0.0.0.0" and fields[1] == "0.0.0.0":
-            candidate = fields[2]
-            if candidate.lower() == "on-link":
-                continue
-            try:
-                ipaddress.ip_address(candidate)
-            except ValueError:
-                continue
-            return candidate
+            candidate = _as_ip(fields[2])
+            if candidate is not None:
+                return candidate
     return None
 
 
 def parse_macos_route(output: str) -> Optional[str]:
-    """`route -n get default` 的 `gateway: <ip>` 那一行。"""
+    """`route -n get default` 的 `gateway: <ip>` 那一行（`gateway: link#8`
+    這種非 IP 的值不算）。"""
     match = re.search(r"^\s*gateway:\s*(\S+)\s*$", output, re.MULTILINE)
-    return match.group(1) if match else None
+    return _as_ip(match.group(1)) if match else None
 
 
 def parse_linux_ip_route(output: str) -> Optional[str]:
     """`ip route show default` 的 `default via <ip> dev ...`。"""
     match = re.search(r"^default\s+via\s+(\S+)", output, re.MULTILINE)
-    return match.group(1) if match else None
+    return _as_ip(match.group(1)) if match else None
 
 
 _GATEWAY_COMMANDS: dict[str, tuple[list[str], Callable[[str], Optional[str]]]] = {
@@ -273,12 +284,19 @@ def _local_name(tag: str) -> str:
 
 def find_control_url(xml_text: str, location: str) -> Optional[tuple[str, str]]:
     """裝置描述 XML 裡 `WANIPConnection:1`（其次 `WANPPPConnection:1`，其次
-    `:2` 版本）的 `controlURL`，相對路徑用 `location` 補成絕對 URL。
-    回 `(control_url, service_type)`，找不到回 None。"""
+    `:2` 版本）的 `controlURL`，相對路徑補成絕對 URL：有 `<URLBase>` 就以它
+    為基底（UPnP DA §2.3 允許控制端點跟描述檔不同埠／不同主機），否則用
+    `location`。回 `(control_url, service_type)`，找不到回 None。"""
     try:
         root = ET.fromstring(xml_text)
     except ET.ParseError:
         return None
+
+    base = location
+    for node in root.iter():
+        if _local_name(node.tag) == "URLBase" and (node.text or "").strip():
+            base = urljoin(location, (node.text or "").strip())
+            break
 
     found: dict[str, str] = {}
     for service in root.iter():
@@ -298,7 +316,7 @@ def find_control_url(xml_text: str, location: str) -> Optional[tuple[str, str]]:
     for service_type in _SERVICE_TYPES:
         control_url = found.get(service_type)
         if control_url:
-            return urljoin(location, control_url), service_type
+            return urljoin(base, control_url), service_type
     return None
 
 
@@ -323,16 +341,20 @@ def build_soap(
 
 def parse_soap_error(body: str) -> Optional[int]:
     """SOAP Fault 裡的 `<errorCode>`（718 = ConflictInMappingEntry），
-    沒有 fault 回 None。"""
-    match = re.search(r"<errorCode>\s*(\d+)\s*</errorCode>", body)
+    沒有 fault 回 None。有些 IGD 會加命名空間前綴（`<e:errorCode>`），照收。"""
+    match = re.search(r"<(?:\w+:)?errorCode>\s*(\d+)\s*</(?:\w+:)?errorCode>", body)
     return int(match.group(1)) if match else None
 
 
 def parse_external_ip(body: str) -> Optional[str]:
-    match = re.search(r"<NewExternalIPAddress>\s*([^<\s]*)\s*</NewExternalIPAddress>", body)
+    """`GetExternalIPAddressResponse` 的 `<NewExternalIPAddress>`；空字串或
+    不是合法 IP（有些 IGD 在還沒撥上線時回 `0.0.0.0` 以外的垃圾）回 None。"""
+    match = re.search(
+        r"<(?:\w+:)?NewExternalIPAddress>\s*([^<\s]*)\s*</(?:\w+:)?NewExternalIPAddress>", body
+    )
     if match is None:
         return None
-    return match.group(1).strip() or None
+    return _as_ip(match.group(1).strip())
 
 
 # --- 真實 transport（只有 map_port 的預設值會用到）--------------------------
@@ -382,15 +404,39 @@ class _UrllibHttpTransport:
 
 
 class _MulticastSsdpTransport:
+    """M-SEARCH 綁在指定的本機 IPv4 位址上。多網卡的機器（VPN、Hyper-V、
+    WSL 的虛擬介面）預設可能從錯的介面送出多播，路由器就永遠收不到；
+    `local_ip` 就是 peer server 要通告的那張網卡。綁定失敗（IP 已經換掉、
+    介面消失）只是退回未綁定的行為，不讓探索整個掛掉。"""
+
+    def __init__(self, local_ip: Optional[str] = None) -> None:
+        self.local_ip = local_ip
+
     def msearch(self, payload: bytes, wait_seconds: float) -> list[bytes]:
         sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
         responses: list[bytes] = []
         try:
             sock.setsockopt(socket.IPPROTO_IP, socket.IP_MULTICAST_TTL, 2)
+            if self.local_ip:
+                try:
+                    sock.setsockopt(
+                        socket.IPPROTO_IP,
+                        socket.IP_MULTICAST_IF,
+                        socket.inet_aton(self.local_ip),
+                    )
+                    sock.bind((self.local_ip, 0))
+                except OSError:
+                    logger.debug("natmap: binding SSDP to %s failed; using the default interface", self.local_ip)
             sock.settimeout(0.5)
             sock.sendto(payload, (SSDP_ADDRESS, SSDP_PORT))
             deadline = time.monotonic() + wait_seconds
-            while time.monotonic() < deadline:
+            while True:
+                # 收滿 wait_seconds 就停，最後一次 recv 的逾時也不能超出剩餘
+                # 時間 —— 否則整體 8 秒上限會被這個迴圈拖過頭。
+                remaining = deadline - time.monotonic()
+                if remaining <= 0.01:
+                    break
+                sock.settimeout(min(0.5, remaining))
                 try:
                     data, _ = sock.recvfrom(4096)
                 except socket.timeout:
@@ -407,6 +453,9 @@ class _MulticastSsdpTransport:
 
 # --- 協調器（spec §3.1）----------------------------------------------------
 
+# 剩餘時間少於這個值就不要再開新的網路動作了：連送個封包都不夠。
+_MIN_STEP_SECONDS = 0.1
+
 
 def _try_natpmp(
     *, gateway: str, port: int, udp: UdpTransport, clock, sleep, deadline: float
@@ -414,24 +463,42 @@ def _try_natpmp(
     """NAT-PMP：opcode 0 取外部 IP、opcode 2 建 TCP 映射，重送 250ms 起倍增
     最多 3 次。任一步驟沒回應或 result 非 0 就回 None 讓 UPnP 接手。"""
 
-    def _exchange(payload: bytes) -> Optional[dict]:
-        for delay in NATPMP_RETRY_DELAYS:
-            if clock() >= deadline:
+    def _exchange(payload: bytes, expected_opcode: int) -> Optional[dict]:
+        last = len(NATPMP_RETRY_DELAYS) - 1
+        for index, delay in enumerate(NATPMP_RETRY_DELAYS):
+            remaining = deadline - clock()
+            if remaining <= _MIN_STEP_SECONDS:
                 return None
-            data = udp.exchange(gateway, NATPMP_PORT, payload, min(delay, max(0.05, deadline - clock())))
+            data = udp.exchange(gateway, NATPMP_PORT, payload, min(delay, remaining))
             if data is not None:
-                return decode_natpmp_response(data)
-            sleep(delay)
+                decoded = decode_natpmp_response(data)
+                # 不是 NAT-PMP v0、或回的不是我們問的那個 opcode（別人的廣播、
+                # 上一輪遲到的回應）就當沒收到，繼續等這一輪的真回應。
+                if decoded is not None and data[0] == 0 and decoded.get("opcode") == expected_opcode:
+                    return decoded
+            if index == last:
+                break  # 最後一次不必再睡，直接把時間還給 UPnP
+            remaining = deadline - clock()
+            if remaining <= _MIN_STEP_SECONDS:
+                return None
+            sleep(min(delay, remaining))
         return None
 
-    external = _exchange(encode_natpmp_request(0))
-    if external is None or external.get("result") != 0:
+    external = _exchange(encode_natpmp_request(0), 128)
+    if external is None:
+        return None
+    if external.get("result") != 0:
+        logger.debug("natmap: NAT-PMP external address refused (result=%s)", external.get("result"))
         return None
 
     mapped = _exchange(
-        encode_natpmp_request(2, internal_port=port, external_port=port, lifetime=LEASE_SECONDS)
+        encode_natpmp_request(2, internal_port=port, external_port=port, lifetime=LEASE_SECONDS),
+        130,
     )
-    if mapped is None or mapped.get("result") != 0:
+    if mapped is None:
+        return None
+    if mapped.get("result") != 0:
+        logger.debug("natmap: NAT-PMP mapping refused (result=%s)", mapped.get("result"))
         return None
 
     external_ip = external.get("external_ip")
@@ -460,14 +527,15 @@ def _try_upnp(
     deadline: float,
 ) -> Optional[Mapping]:
     # SSDP 一開始就要等滿 2.5 秒；剩下的時間不夠就別開始，免得超出 8 秒上限。
-    if clock() + SSDP_WAIT_SECONDS > deadline:
+    if deadline - clock() < SSDP_WAIT_SECONDS + _MIN_STEP_SECONDS:
         return None
 
     locations = parse_ssdp_locations(ssdp.msearch(M_SEARCH_PAYLOAD, SSDP_WAIT_SECONDS))
     for location in locations:
-        if clock() >= deadline:
+        remaining = deadline - clock()
+        if remaining <= _MIN_STEP_SECONDS:
             return None
-        status, body = http.get(location, max(0.5, deadline - clock()))
+        status, body = http.get(location, remaining)
         if status != 200 or not body:
             continue
         found = find_control_url(body.decode("utf-8", "replace"), location)
@@ -475,16 +543,20 @@ def _try_upnp(
             continue
         control_url, service_type = found
 
+        remaining = deadline - clock()
+        if remaining <= _MIN_STEP_SECONDS:
+            return None
         external_ip = None
         soap_body, headers = build_soap("GetExternalIPAddress", service_type, [])
-        status, response = http.post(control_url, soap_body, headers, max(0.5, deadline - clock()))
+        status, response = http.post(control_url, soap_body, headers, remaining)
         if status == 200:
             external_ip = parse_external_ip(response.decode("utf-8", "replace"))
         if external_ip and is_private_address(external_ip):
             external_ip = None
 
         for attempt in range(UPNP_PORT_ATTEMPTS):
-            if clock() >= deadline:
+            remaining = deadline - clock()
+            if remaining <= _MIN_STEP_SECONDS:
                 return None
             external_port = port + attempt
             soap_body, headers = build_soap(
@@ -501,7 +573,7 @@ def _try_upnp(
                     ("NewLeaseDuration", str(LEASE_SECONDS)),
                 ],
             )
-            status, response = http.post(control_url, soap_body, headers, max(0.5, deadline - clock()))
+            status, response = http.post(control_url, soap_body, headers, remaining)
             if status == 200:
                 return Mapping(
                     method="upnp",
@@ -513,8 +585,11 @@ def _try_upnp(
                     control_url=control_url,
                     service_type=service_type,
                 )
-            if parse_soap_error(response.decode("utf-8", "replace")) == UPNP_CONFLICT_ERROR:
+            error_code = parse_soap_error(response.decode("utf-8", "replace"))
+            if error_code == UPNP_CONFLICT_ERROR:
+                logger.debug("natmap: external port %s already mapped (718); trying the next one", external_port)
                 continue
+            logger.debug("natmap: AddPortMapping failed (status=%s errorCode=%s)", status, error_code)
             break
     return None
 
@@ -548,13 +623,15 @@ def map_port(
             logger.info("natmap: no default gateway found; skipping automatic port mapping")
             return None
 
-        udp = udp or _SocketUdpTransport()
-        http = http or _UrllibHttpTransport()
-        ssdp = ssdp or _MulticastSsdpTransport()
+        # 先把區網 IP 決定好，SSDP transport 要綁在同一張網卡上。
         if local_ip is None:
             from comfyfed_agent import peerserve
 
             local_ip = peerserve._detect_local_ip()
+
+        udp = udp or _SocketUdpTransport()
+        http = http or _UrllibHttpTransport()
+        ssdp = ssdp or _MulticastSsdpTransport(local_ip)
 
         mapping = _try_natpmp(
             gateway=gateway, port=port, udp=udp, clock=clock, sleep=sleep, deadline=deadline
@@ -591,10 +668,12 @@ def unmap_port(
             transport.exchange(
                 mapping.gateway,
                 NATPMP_PORT,
+                # RFC 6886 §3.4：刪除映射時 external port 必須送 0，
+                # lifetime 也是 0；路由器自己從 internal port 找出那筆映射。
                 encode_natpmp_request(
                     2,
                     internal_port=mapping.internal_port,
-                    external_port=mapping.external_port,
+                    external_port=0,
                     lifetime=0,
                 ),
                 timeout,
