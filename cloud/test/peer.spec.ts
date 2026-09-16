@@ -74,18 +74,44 @@ async function registerWorker(name: string, keypairIndex: number): Promise<Regis
 async function makeSeeder(
   worker: RegisteredWorker,
   inventory: { name: string; size_bytes: number; sha256: string }[],
-  opts: { protocol?: number; peerUrl?: string | null; status?: string; disabled?: boolean } = {}
+  opts: {
+    protocol?: number;
+    peerUrl?: string | null;
+    status?: string;
+    disabled?: boolean;
+    peerLanUrl?: string | null;
+    peerReachable?: number | null;
+    remoteIp?: string | null;
+  } = {}
 ): Promise<void> {
+  // `peerReachable` defaults to 1 (Phase 3.4 §4.2): the seeder predicate now
+  // requires a platform-verified endpoint, so "a normal, usable seeder"
+  // means one whose reachability check passed. Tests about the check itself
+  // pass null/0 explicitly. Parity: test_peer.py's `_make_online_seeder`.
   await db()
-    .prepare("UPDATE workers SET status = ?, disabled = ?, protocol = ?, peer_url = ?, model_inventory = ? WHERE id = ?")
+    .prepare(
+      "UPDATE workers SET status = ?, disabled = ?, protocol = ?, peer_url = ?, peer_lan_url = ?, peer_reachable = ?, remote_ip = ?, model_inventory = ? WHERE id = ?"
+    )
     .bind(
       opts.status ?? "online",
       opts.disabled ? 1 : 0,
       opts.protocol ?? 4,
       opts.peerUrl === undefined ? "http://192.168.1.5:8850" : opts.peerUrl,
+      opts.peerLanUrl ?? null,
+      opts.peerReachable === undefined ? 1 : opts.peerReachable,
+      opts.remoteIp ?? null,
       JSON.stringify(inventory),
       worker.workerId
     )
+    .run();
+}
+
+/** Gives a registered worker the puller shape the grant route reads:
+ * online, protocol 4, and a `remote_ip` (Phase 3.4 §5's same-NAT test). */
+async function setRemoteIp(worker: RegisteredWorker, remoteIp: string): Promise<void> {
+  await db()
+    .prepare("UPDATE workers SET status = 'online', protocol = 4, remote_ip = ? WHERE id = ?")
+    .bind(remoteIp, worker.workerId)
     .run();
 }
 
@@ -524,5 +550,79 @@ describe("POST /api/agent/peer-served", () => {
 
     const count = await db().prepare("SELECT COUNT(*) AS n FROM receipts WHERE kind = 'p2p_upload'").first<{ n: number }>();
     expect(count?.n).toBe(1);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Phase 3.4 §4.2/§5: seeder eligibility and seeder_urls
+// Ports tests/server/test_peer.py's matching block.
+
+describe("Phase 3.4: seeder eligibility and seeder_urls", () => {
+  const NAME = "loras/nat.safetensors";
+
+  async function seedOneModel(opts: {
+    peerUrl?: string | null;
+    peerLanUrl?: string | null;
+    peerReachable?: number | null;
+    remoteIp?: string | null;
+  }): Promise<{ sizeBytes: number; seederId: string; puller: RegisteredWorker }> {
+    const puller = await registerWorker("puller", 0);
+    const seeder = await registerWorker("seeder", 1);
+    const sha = await shaHex("model-nat");
+    const sizeBytes = bytesFor(1.0);
+    await modelManifest.recordHash(db(), "some-worker", NAME, sizeBytes, sha, null);
+    await makeSeeder(seeder, [{ name: NAME, size_bytes: sizeBytes, sha256: sha }], opts);
+    return { sizeBytes, seederId: seeder.workerId, puller };
+  }
+
+  it("requires peer_reachable = 1", async () => {
+    const { sizeBytes, seederId } = await seedOneModel({
+      peerUrl: "http://203.0.113.7:8850",
+      peerReachable: null,
+    });
+
+    expect(await peer.onlineSeeders(db(), NAME, sizeBytes, {})).toEqual([]);
+
+    await db().prepare("UPDATE workers SET peer_reachable = 1 WHERE id = ?").bind(seederId).run();
+    const seeders = await peer.onlineSeeders(db(), NAME, sizeBytes, {});
+    expect(seeders.map((w) => w.id)).toEqual([seederId]);
+  });
+
+  it("accepts an unreachable seeder that shares the puller's remote_ip and has a LAN url", async () => {
+    const { sizeBytes, seederId } = await seedOneModel({
+      peerUrl: "http://192.168.1.5:8850",
+      peerLanUrl: "http://192.168.1.5:8850",
+      peerReachable: 0,
+      remoteIp: "203.0.113.7",
+    });
+
+    expect(await peer.onlineSeeders(db(), NAME, sizeBytes, {})).toEqual([]);
+    const seeders = await peer.onlineSeeders(db(), NAME, sizeBytes, { pullerRemoteIp: "203.0.113.7" });
+    expect(seeders.map((w) => w.id)).toEqual([seederId]);
+
+    // Same public IP but nothing to connect to on the LAN -> still ineligible.
+    await db().prepare("UPDATE workers SET peer_lan_url = NULL WHERE id = ?").bind(seederId).run();
+    expect(await peer.onlineSeeders(db(), NAME, sizeBytes, { pullerRemoteIp: "203.0.113.7" })).toEqual([]);
+  });
+
+  it("grant returns [lan, public] for a same-NAT puller and [public] otherwise", async () => {
+    const { sizeBytes, puller } = await seedOneModel({
+      peerUrl: "http://203.0.113.7:8850",
+      peerLanUrl: "http://192.168.1.5:8850",
+      peerReachable: 1,
+      remoteIp: "203.0.113.7",
+    });
+    await setRemoteIp(puller, "203.0.113.7");
+
+    const same = await signedPost(puller, "/api/agent/peer-grant", { name: NAME, size_bytes: sizeBytes });
+    expect(same.status).toBe(200);
+    expect(same.body.seeder_urls).toEqual(["http://192.168.1.5:8850", "http://203.0.113.7:8850"]);
+    // Old agents only read `peer_url` -- it is the first element, unchanged.
+    expect(same.body.peer_url).toBe(same.body.seeder_urls[0]);
+
+    await setRemoteIp(puller, "198.51.100.9");
+    const other = await signedPost(puller, "/api/agent/peer-grant", { name: NAME, size_bytes: sizeBytes });
+    expect(other.status).toBe(200);
+    expect(other.body.seeder_urls).toEqual(["http://203.0.113.7:8850"]);
   });
 });

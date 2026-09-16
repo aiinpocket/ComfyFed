@@ -60,6 +60,7 @@ import type { FetchableModels } from "../core/assess";
 import * as modelManifest from "../core/model_manifest";
 import * as stats from "../core/stats";
 import * as split from "../core/split";
+import * as peerhealth from "../core/peerhealth";
 import { toSqliteTimestamp, resolvePlatformSeed } from "../db/queries";
 import type { Job } from "../db/queries";
 import { buildReceiptPayload, signReceipt, verifyHex } from "../lib/signing";
@@ -1062,6 +1063,36 @@ export class Hub extends DurableObject<Env> {
     }
   }
 
+  /** Ports agentws.py's `push_peer_status`：把可連性結論推給 agent
+   * （spec §4.3）。送不出去只是少一則通知，絕不影響主流程。 */
+  private pushPeerStatus(ws: WebSocket, reachable: boolean, checkedUrl: string): void {
+    try {
+      ws.send(JSON.stringify({ type: "peer_status", reachable, checked_url: checkedUrl }));
+    } catch {
+      // socket 已關 / 正在關，忽略。
+    }
+  }
+
+  /** 排一個背景可連性檢查（spec §4.2）。`waitUntil` 讓它在 hello／heartbeat
+   * 的處理回傳之後繼續跑完；`refresh` 自己吞掉所有例外。Ports agentws.py's
+   * `_schedule_peer_check`. */
+  private schedulePeerCheck(
+    ws: WebSocket,
+    workerId: string,
+    peerUrl: string,
+    opts: { notifyOnChangeOnly: boolean }
+  ): void {
+    this.ctx.waitUntil(
+      peerhealth.refresh(
+        this.env.DB,
+        workerId,
+        peerUrl,
+        (reachable, checkedUrl) => this.pushPeerStatus(ws, reachable, checkedUrl),
+        { notifyOnChangeOnly: opts.notifyOnChangeOnly }
+      )
+    );
+  }
+
   // -- hello -------------------------------------------------------------
 
   /** Ports agentws.py's `_handle_hello`. */
@@ -1134,6 +1165,13 @@ export class Hub extends DurableObject<Env> {
         console.error(`hub: failed to send deprecation notice to worker ${workerId}`, err);
       }
     }
+
+    // Phase 3.4 §4.2：可連性檢查不擋 hello。hello 觸發的檢查每次完成都推一
+    // 次 peer_status（§4.3），不論結論有沒有變 —— agent 剛連上就該拿到一則
+    // 明確的結論。
+    if (peerUrl) {
+      this.schedulePeerCheck(ws, workerId, peerUrl, { notifyOnChangeOnly: false });
+    }
   }
 
   // -- heartbeat -------------------------------------------------------------
@@ -1164,6 +1202,13 @@ export class Hub extends DurableObject<Env> {
 
     ephemeral.dynamic = dynamic;
     await queries.updateWorkerHeartbeat(db, workerId, { status: newStatus, dynamic, lastSeen: toSqliteTimestamp(now) });
+
+    // Phase 3.4 §4.2：`peer_checked_at` 超過 10 分鐘就重測一次。跟 hello 的
+    // 檢查走同一條路徑，差別只在推送條件：心跳的重測只有結論**變了**才推
+    // （裁示），免得每 10 分鐘灌一則沒有新資訊的訊息。
+    if (worker.peerUrl && peerhealth.needsRecheck(worker.peerCheckedAt, now)) {
+      this.schedulePeerCheck(ws, workerId, worker.peerUrl, { notifyOnChangeOnly: true });
+    }
 
     let currentAttachment = attachment;
     if (state) {

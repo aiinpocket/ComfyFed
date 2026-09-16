@@ -14,7 +14,7 @@ from nacl.signing import SigningKey
 from starlette.websockets import WebSocketDisconnect
 
 from comfyfed_server import agentws, app as app_module
-from comfyfed_server import bootstrap, db, dispatch, model_manifest
+from comfyfed_server import bootstrap, db, dispatch, model_manifest, peerhealth
 
 
 @pytest.fixture()
@@ -415,6 +415,8 @@ def test_job_push_includes_peer_only_entry_for_a_protocol_4_worker(client):
         seeder.status = "online"
         seeder.protocol = 4
         seeder.peer_url = "http://10.0.0.9:8850"
+        # Phase 3.4 §4.2：種子條件多了「平台驗證過連得到」（peerhealth）。
+        seeder.peer_reachable = 1
         seeder.model_inventory = json.dumps(
             [{
                 "name": "loras/wuxia/my_style.safetensors",
@@ -487,6 +489,8 @@ def test_job_push_omits_peer_only_model_job_from_a_protocol_3_worker(client):
         seeder.status = "online"
         seeder.protocol = 4
         seeder.peer_url = "http://10.0.0.9:8850"
+        # Phase 3.4 §4.2：種子條件多了「平台驗證過連得到」（peerhealth）。
+        seeder.peer_reachable = 1
         seeder.model_inventory = json.dumps(
             [{"name": "loras/x.safetensors", "size_bytes": _bytes(0.2), "sha256": _sha("x")}]
         )
@@ -3835,3 +3839,180 @@ def test_requeue_stale_clears_peer_reachable(client):
         assert w.status == "offline"
         assert w.peer_url is None
         assert w.peer_reachable is None
+
+
+# --- Phase 3.4 Task 4: hello／heartbeat 觸發的可連性檢查與 peer_status ------
+
+
+def _wait_until(predicate, timeout=5.0):
+    """輪詢到 `predicate()` 回真為止（背景檢查任務是非同步的，沒有可等的
+    handle），逾時就 assert 失敗。"""
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        value = predicate()
+        if value:
+            return value
+        time.sleep(0.02)
+    raise AssertionError("condition never became true")
+
+
+def _backdate_peer_check(worker_id, minutes):
+    with db.get_session() as session:
+        worker = session.get(db.Worker, worker_id)
+        worker.peer_checked_at = datetime.now(timezone.utc).replace(tzinfo=None) - timedelta(
+            minutes=minutes
+        )
+        session.commit()
+
+
+def test_hello_probes_the_peer_url_and_pushes_peer_status(client, monkeypatch):
+    csrf = _login(client)
+    worker_id, sk = _register_worker(client, csrf, "ph-ws-1")
+    probed = []
+    monkeypatch.setattr(peerhealth, "_probe", lambda url: probed.append(url) or True)
+
+    ctx, ws, _ = _handshake_ws(client, worker_id, sk)
+    try:
+        ws.send_json(
+            {"type": "hello", "protocol": 4, "peer_url": "http://203.0.113.7:8850"}
+        )
+        status = ws.receive_json()
+    finally:
+        ctx.__exit__(None, None, None)
+
+    assert status == {
+        "type": "peer_status",
+        "reachable": True,
+        "checked_url": "http://203.0.113.7:8850/peer/health",
+    }
+    assert probed == ["http://203.0.113.7:8850/peer/health"]
+    with db.get_session() as session:
+        assert session.get(db.Worker, worker_id).peer_reachable == 1
+
+
+def test_hello_with_a_private_peer_url_is_unreachable_without_probing(client, monkeypatch):
+    csrf = _login(client)
+    worker_id, sk = _register_worker(client, csrf, "ph-ws-2")
+    probed = []
+    monkeypatch.setattr(peerhealth, "_probe", lambda url: probed.append(url) or True)
+
+    ctx, ws, _ = _handshake_ws(client, worker_id, sk)
+    try:
+        ws.send_json(
+            {
+                "type": "hello",
+                "protocol": 4,
+                "peer_url": "http://192.168.1.5:8850",
+                "peer_lan_url": "http://192.168.1.5:8850",
+            }
+        )
+        status = ws.receive_json()
+    finally:
+        ctx.__exit__(None, None, None)
+
+    assert status["type"] == "peer_status"
+    assert status["reachable"] is False
+    assert probed == []
+    with db.get_session() as session:
+        worker = session.get(db.Worker, worker_id)
+        assert worker.peer_reachable == 0
+        # 靜態拒絕只否定對外位址，區網位址照樣留著（spec §4.2）。
+        assert worker.peer_lan_url == "http://192.168.1.5:8850"
+
+
+def test_hello_without_a_peer_url_pushes_nothing(client, monkeypatch):
+    """沒通告 peer_url 就沒什麼好檢查的 —— 不發探針，也不推 peer_status。
+    （用 deprecation frame 當「下一則訊息」的探測點。）"""
+    csrf = _login(client)
+    worker_id, sk = _register_worker(client, csrf, "ph-ws-3")
+    monkeypatch.setattr(peerhealth, "_probe", lambda url: True)
+
+    ctx, ws, _ = _handshake_ws(client, worker_id, sk)
+    try:
+        ws.send_json({"type": "hello", "protocol": 4})
+        # 舊協定版本的 hello 會回 deprecation：若上一則 hello 錯誤地推了
+        # peer_status，這裡收到的就會是它而不是 deprecation。
+        ws.send_json({"type": "hello", "protocol": 1})
+        assert ws.receive_json()["type"] == "deprecation"
+    finally:
+        ctx.__exit__(None, None, None)
+
+
+def test_heartbeat_rechecks_after_ten_minutes_and_pushes_only_on_change(client, monkeypatch):
+    csrf = _login(client)
+    worker_id, sk = _register_worker(client, csrf, "ph-ws-4")
+    verdict = {"value": True}
+    monkeypatch.setattr(peerhealth, "_probe", lambda url: verdict["value"])
+
+    ctx, ws, _ = _handshake_ws(client, worker_id, sk)
+    try:
+        ws.send_json({"type": "hello", "protocol": 4, "peer_url": "http://203.0.113.7:8850"})
+        assert ws.receive_json()["reachable"] is True
+
+        # 1) 還沒過 10 分鐘 ⇒ 心跳不重測（peer_checked_at 不動）。
+        with db.get_session() as session:
+            before = session.get(db.Worker, worker_id).peer_checked_at
+        ws.send_json({"type": "heartbeat", "state": "idle"})
+        time.sleep(0.3)
+        with db.get_session() as session:
+            assert session.get(db.Worker, worker_id).peer_checked_at == before
+
+        # 2) 超過 10 分鐘但結論沒變 ⇒ 重測了（時間戳更新），但不推。
+        _backdate_peer_check(worker_id, 11)
+        ws.send_json({"type": "heartbeat", "state": "idle"})
+        _wait_until(
+            lambda: peerhealth.needs_recheck(
+                _peer_checked_at(worker_id), datetime.now(timezone.utc)
+            )
+            is False
+        )
+
+        # 3) 結論翻成 False ⇒ 推一次。上一拍若錯誤地推了，這裡收到的會是
+        #    reachable=True 的那則。
+        verdict["value"] = False
+        _backdate_peer_check(worker_id, 11)
+        ws.send_json({"type": "heartbeat", "state": "idle"})
+        status = ws.receive_json()
+    finally:
+        ctx.__exit__(None, None, None)
+
+    assert status == {
+        "type": "peer_status",
+        "reachable": False,
+        "checked_url": "http://203.0.113.7:8850/peer/health",
+    }
+    with db.get_session() as session:
+        assert session.get(db.Worker, worker_id).peer_reachable == 0
+
+
+def _peer_checked_at(worker_id):
+    with db.get_session() as session:
+        return session.get(db.Worker, worker_id).peer_checked_at
+
+
+def test_a_failing_reachability_check_never_breaks_hello(client, monkeypatch):
+    """探針爆炸（spec §8）：hello 照常完成、worker 照常上線。"""
+    csrf = _login(client)
+    worker_id, sk = _register_worker(client, csrf, "ph-ws-5")
+
+    def _boom(url):
+        raise RuntimeError("probe exploded")
+
+    monkeypatch.setattr(peerhealth, "_probe", _boom)
+
+    ctx, ws, _ = _handshake_ws(client, worker_id, sk)
+    try:
+        ws.send_json({"type": "hello", "protocol": 4, "peer_url": "http://203.0.113.7:8850"})
+        ws.send_json({"type": "hello", "protocol": 1})
+        assert ws.receive_json()["type"] == "deprecation"
+    finally:
+        ctx.__exit__(None, None, None)
+
+    with db.get_session() as session:
+        assert session.get(db.Worker, worker_id).status == "online"
+
+
+def test_push_peer_status_to_a_disconnected_worker_is_a_no_op():
+    """agent 不在線只是少一則通知，不能拋（`peerhealth.refresh` 的 notify
+    是在背景任務裡叫的）。"""
+    asyncio.run(agentws.push_peer_status("nobody-here", True, "http://x/peer/health"))

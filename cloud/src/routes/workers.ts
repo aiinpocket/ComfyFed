@@ -274,6 +274,13 @@ app.get("/api/workers", requireUser, async (c) => {
       // address is fleet metadata, not per-user private data. Mutations
       // (token issue, disable, delete) stay admin-only on their own routes.
       peer_url: w.peerUrl,
+      // Phase 3.4 §6: the console's P2P column renders the NAT mode, the LAN
+      // address and a reachability badge from these three (parity:
+      // workers.py's `GET /api/workers`). Same "fleet metadata, not private
+      // data" reasoning as `peer_url` above.
+      peer_lan_url: w.peerLanUrl,
+      peer_nat: w.peerNat,
+      peer_reachable: w.peerReachable,
     }))
   );
   return c.json(rows);

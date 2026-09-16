@@ -428,6 +428,15 @@ def create_router(data_dir: str) -> APIRouter:
                     # per-user private data. Mutations (token issue, disable,
                     # delete) stay admin-only on their own routes.
                     "peer_url": w.peer_url,
+                    # Phase 3.4 §6: the console's P2P column renders the NAT
+                    # mode, the LAN address and a reachability badge from
+                    # these three (cloud parity: routes/workers.ts). Same
+                    # "fleet metadata, not private data" reasoning as
+                    # `peer_url` above -- `peer_reachable` is literally the
+                    # platform's own verdict on a shared endpoint.
+                    "peer_lan_url": w.peer_lan_url,
+                    "peer_nat": w.peer_nat,
+                    "peer_reachable": w.peer_reachable,
                 }
                 for w in workers
             ]

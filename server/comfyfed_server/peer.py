@@ -30,6 +30,7 @@ import time
 import uuid
 from typing import Optional
 
+import sqlalchemy as sa
 from fastapi import APIRouter, Depends, HTTPException
 from nacl.exceptions import BadSignatureError
 from nacl.signing import SigningKey, VerifyKey
@@ -284,9 +285,27 @@ def _worker_has_consensus_file(worker: db.Worker, name: str, size_bytes: int, sh
     return False
 
 
-def online_seeders(session, name: str, size_bytes: int, *, exclude_worker_id: Optional[str] = None) -> list[db.Worker]:
-    """Online, protocol>=4, peer_url-advertising workers whose inventory has
-    (name, size_bytes) at the learned consensus hash.
+def online_seeders(
+    session,
+    name: str,
+    size_bytes: int,
+    *,
+    exclude_worker_id: Optional[str] = None,
+    puller_remote_ip: Optional[str] = None,
+) -> list[db.Worker]:
+    """Online, protocol>=4, peer_url-advertising, platform-verified-reachable
+    workers whose inventory has (name, size_bytes) at the learned consensus
+    hash.
+
+    Phase 3.4 §4.2 adds the reachability half of the predicate: a seeder must
+    either have passed the platform's own `/peer/health` probe
+    (`peer_reachable = 1`, see `peerhealth.refresh`) OR sit behind the same
+    public IP as the puller with a LAN address to offer. `puller_remote_ip`
+    is what enables that second arm -- callers that have no particular puller
+    in mind (`model_manifest._seeder_candidate_files`'s "does this file have
+    a seeder at all" question) omit it and get the conservative predicate,
+    which is the right default: better to under-report one seeder than to
+    dispatch a job on the promise of a peer nobody can reach.
 
     The single seeder predicate, used by both grant issuance below and (Task
     6) `assess`'s fetchable check -- see this module's docstring and the plan's
@@ -314,11 +333,25 @@ def online_seeders(session, name: str, size_bytes: int, *, exclude_worker_id: Op
     # `dispatch.requeue_stale` flips it offline, i.e. at most ~90s. The worst
     # case is one wasted round trip -- its `peer_served` receipt mint is
     # refused by `workers.verify_agent` -- so no `deleted` filter here.
+    # Phase 3.4 §4.2：種子必須是「平台驗證過連得到」的，**或**跟拉方在同一
+    # 個公網 IP 後面（⇒ 幾乎一定同一個 NAT）且有區網位址可用 —— 後者正是
+    # 家用環境最常見的情形：兩台都在同一台路由器後面，誰都不必對外開埠。
+    reachable_or_lan_neighbour = db.Worker.peer_reachable == 1
+    if puller_remote_ip:
+        reachable_or_lan_neighbour = sa.or_(
+            reachable_or_lan_neighbour,
+            sa.and_(
+                db.Worker.remote_ip == puller_remote_ip,
+                db.Worker.peer_lan_url.isnot(None),
+            ),
+        )
+
     query = (
         session.query(db.Worker)
         .filter(db.Worker.status != "offline")
         .filter(db.Worker.protocol >= _MIN_PEER_PROTOCOL)
         .filter(db.Worker.peer_url.isnot(None))
+        .filter(reachable_or_lan_neighbour)
     )
     if exclude_worker_id is not None:
         query = query.filter(db.Worker.id != exclude_worker_id)
@@ -328,6 +361,21 @@ def online_seeders(session, name: str, size_bytes: int, *, exclude_worker_id: Op
         for w in query.all()
         if _worker_has_consensus_file(w, name, size_bytes, hash_row.sha256)
     ]
+
+
+def _seeder_urls(seeder: db.Worker, puller_remote_ip: Optional[str]) -> list[str]:
+    """拉方該依序嘗試的位址（spec §5）：
+
+    1. 拉方與種子的 `remote_ip` 相同且種子有 `peer_lan_url`
+       → `[peer_lan_url, peer_url]`（同一個 NAT，區網直連最快，而且很多
+       家用路由器不支援 hairpin，對外位址反而連不回來）。
+    2. 否則 → `[peer_url]`（此時種子必為 `peer_reachable = 1`）。
+
+    cloud parity: `cloud/src/core/peer.ts` 的 `seederUrls`。
+    """
+    if puller_remote_ip and seeder.remote_ip == puller_remote_ip and seeder.peer_lan_url:
+        return [seeder.peer_lan_url, seeder.peer_url]
+    return [seeder.peer_url]
 
 
 def _active_grant_count(worker_id: str, now: float) -> int:
@@ -371,7 +419,13 @@ def create_router(data_dir: str) -> APIRouter:
             if _worker_has_consensus_file(worker, body.name, body.size_bytes, hash_row.sha256):
                 raise _error(400, "peer.already_has_model", "You already have this model.")
 
-            seeders = online_seeders(session, body.name, body.size_bytes, exclude_worker_id=worker.id)
+            seeders = online_seeders(
+                session,
+                body.name,
+                body.size_bytes,
+                exclude_worker_id=worker.id,
+                puller_remote_ip=worker.remote_ip,
+            )
             if not seeders:
                 raise _error(404, "peer.no_seeder", "No online seeder for this model.")
 
@@ -406,11 +460,13 @@ def create_router(data_dir: str) -> APIRouter:
             _evict_oldest_beyond_cap()
 
             chunk_sha256s = json.loads(hash_row.chunk_sha256s) if hash_row.chunk_sha256s else None
-            peer_url = seeder.peer_url
+            seeder_urls = _seeder_urls(seeder, worker.remote_ip)
 
         return {
             "grant": {**grant, "sig": sig},
-            "peer_url": peer_url,
+            # 舊 agent 只看 `peer_url`，就是清單的第一個 —— 行為不變。
+            "peer_url": seeder_urls[0],
+            "seeder_urls": seeder_urls,
             "chunk_sha256s": chunk_sha256s,
         }
 

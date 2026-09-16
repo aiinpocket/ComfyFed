@@ -258,8 +258,15 @@ def _seeder_candidate_files(session) -> frozenset[tuple[str, int, str]]:
     entirely, to run exactly once.
 
     Same predicate as `peer.online_seeders` (online, protocol>=4, peer_url
-    not null), reused as a plain SQL filter here since the module already
-    defines `_MIN_PEER_PROTOCOL`, rather than re-deriving it.
+    not null, `peer_reachable = 1`), reused as a plain SQL filter here since
+    the module already defines `_MIN_PEER_PROTOCOL`, rather than re-deriving
+    it. Phase 3.4 §4.2: this question ("does this file have a seeder at
+    all?") has no particular puller, so it can't use `online_seeders`'s
+    same-NAT arm and stays on the conservative `peer_reachable = 1` half --
+    better to under-report one seeder than to let dispatch bet a job on a
+    peer nobody has ever reached. Cloud parity: `core/peer.ts`'s
+    `seederCandidateFiles`, which calls `getOnlinePeerCapableWorkers` without
+    a `pullerRemoteIp` and gets exactly this predicate.
     """
     # No `deleted` filter, same accepted ~90s window as `peer.online_seeders`
     # (review L6) -- the two predicates must stay identical.
@@ -268,6 +275,7 @@ def _seeder_candidate_files(session) -> frozenset[tuple[str, int, str]]:
         .filter(db.Worker.status != "offline")
         .filter(db.Worker.protocol >= peer._MIN_PEER_PROTOCOL)
         .filter(db.Worker.peer_url.isnot(None))
+        .filter(db.Worker.peer_reachable == 1)
     )
     files: set[tuple[str, int, str]] = set()
     for worker in query.all():

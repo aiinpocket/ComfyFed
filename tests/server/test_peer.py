@@ -3,18 +3,20 @@
 gained alongside it.
 """
 
+import asyncio
 import hashlib
 import json
 import secrets
 import threading
 import time
+from datetime import datetime, timedelta, timezone
 
 import pytest
 from fastapi.testclient import TestClient
 from nacl.signing import SigningKey, VerifyKey
 
 from comfyfed_server import app as app_module
-from comfyfed_server import agentws, bootstrap, db, model_manifest, peer, security
+from comfyfed_server import agentws, bootstrap, db, model_manifest, peer, peerhealth, security
 
 
 def _sha(label: str) -> str:
@@ -93,10 +95,19 @@ def _make_online_seeder(
     peer_url="http://10.0.0.5:8850",
     status="online",
     disabled=False,
+    peer_reachable=1,
+    peer_lan_url=None,
+    remote_ip=None,
 ):
     """Register a worker and, via a direct DB write (there's no HTTP surface
     for hello/heartbeat in these tests), give it the online/protocol/peer_url/
-    inventory shape `peer.online_seeders` looks for."""
+    inventory shape `peer.online_seeders` looks for.
+
+    `peer_reachable` defaults to 1 (Phase 3.4 §4.2): the seeder predicate now
+    requires a platform-verified endpoint, so "a normal, usable seeder" means
+    one whose reachability check passed. Tests about the check itself pass
+    None/0 explicitly.
+    """
     sha256 = sha256 or _sha(name)
     worker_id, sk = _register_worker(client, csrf, name)
     with db.get_session() as session:
@@ -104,6 +115,9 @@ def _make_online_seeder(
         worker.status = status
         worker.protocol = protocol
         worker.peer_url = peer_url
+        worker.peer_lan_url = peer_lan_url
+        worker.peer_reachable = peer_reachable
+        worker.remote_ip = remote_ip
         worker.disabled = disabled
         worker.model_inventory = json.dumps(
             [{"name": model_name, "size_bytes": size_bytes, "sha256": sha256}]
@@ -867,3 +881,273 @@ def test_grant_ttl_never_exceeds_the_seven_day_ceiling():
     )
     # ...and a rate that slipped past every other guard can't either.
     assert peer.grant_ttl_seconds(10 ** 9, 1e-300) == peer.MAX_GRANT_TTL_SECONDS
+
+
+# --- Phase 3.4 Task 4: 可連性檢查與種子條件 --------------------------------
+
+
+@pytest.mark.parametrize(
+    "url,private",
+    [
+        ("http://10.1.2.3:8850", True),
+        ("http://172.16.0.9:8850", True),
+        ("http://172.32.0.9:8850", False),
+        ("http://192.168.1.5:8850", True),
+        ("http://169.254.169.254:80", True),
+        ("http://127.0.0.1:8850", True),
+        # 100.64/10 CGNAT：電信商級 NAT 的位址，對外一樣連不到（裁示：與
+        # agent natmap 的私有判定逐條對齊）。100.128.0.0 已經出了這個範圍。
+        ("http://100.64.0.1:8850", True),
+        ("http://100.127.255.254:8850", True),
+        ("http://100.128.0.1:8850", False),
+        ("http://100.63.255.255:8850", False),
+        ("http://[::1]:8850", True),
+        ("http://[fc00::1]:8850", True),
+        ("http://[fe80::1]:8850", True),
+        ("http://203.0.113.7:8850", False),
+        ("http://[2001:db8::1]:8850", False),
+        ("http://seeder.example.com:8850", False),
+    ],
+)
+def test_is_private_peer_url(url, private):
+    assert peerhealth.is_private_peer_url(url) is private
+
+
+def test_refresh_rejects_a_private_peer_url_without_probing(client, monkeypatch):
+    csrf = _login(client)
+    worker_id, _ = _register_worker(client, csrf, "ph-1")
+    probed = []
+    monkeypatch.setattr(peerhealth, "_probe", lambda url: probed.append(url) or True)
+
+    result = asyncio.run(peerhealth.refresh(worker_id, "http://192.168.1.5:8850"))
+
+    assert result is False
+    assert probed == []  # 靜態拒絕，不發請求
+    with db.get_session() as session:
+        w = session.get(db.Worker, worker_id)
+        assert w.peer_reachable == 0
+        assert w.peer_checked_at is not None
+
+
+def test_refresh_marks_a_204_seeder_reachable(client, monkeypatch):
+    csrf = _login(client)
+    worker_id, _ = _register_worker(client, csrf, "ph-2")
+    monkeypatch.setattr(peerhealth, "_probe", lambda url: True)
+
+    assert asyncio.run(peerhealth.refresh(worker_id, "http://203.0.113.7:8850")) is True
+
+    with db.get_session() as session:
+        assert session.get(db.Worker, worker_id).peer_reachable == 1
+
+
+def test_refresh_marks_a_timeout_unreachable(client, monkeypatch):
+    csrf = _login(client)
+    worker_id, _ = _register_worker(client, csrf, "ph-3")
+    monkeypatch.setattr(peerhealth, "_probe", lambda url: False)
+
+    assert asyncio.run(peerhealth.refresh(worker_id, "http://203.0.113.7:8850")) is False
+
+    with db.get_session() as session:
+        assert session.get(db.Worker, worker_id).peer_reachable == 0
+
+
+def test_refresh_without_a_peer_url_clears_the_verdict(client, monkeypatch):
+    csrf = _login(client)
+    worker_id, _ = _register_worker(client, csrf, "ph-4")
+    monkeypatch.setattr(peerhealth, "_probe", lambda url: True)
+
+    assert asyncio.run(peerhealth.refresh(worker_id, None)) is None
+
+    with db.get_session() as session:
+        assert session.get(db.Worker, worker_id).peer_reachable is None
+
+
+def test_refresh_probes_the_health_path_not_the_bare_peer_url(client, monkeypatch):
+    csrf = _login(client)
+    worker_id, _ = _register_worker(client, csrf, "ph-4b")
+    probed = []
+    monkeypatch.setattr(peerhealth, "_probe", lambda url: probed.append(url) or True)
+
+    asyncio.run(peerhealth.refresh(worker_id, "http://203.0.113.7:8850/"))
+
+    assert probed == ["http://203.0.113.7:8850/peer/health"]
+
+
+def test_refresh_notifies_every_time_after_hello(client, monkeypatch):
+    """hello 觸發的檢查：每次檢查完成都推一次（spec §4.3「每次 hello 後檢查
+    完成」），結論有沒有變都一樣。"""
+    csrf = _login(client)
+    worker_id, _ = _register_worker(client, csrf, "ph-5")
+    monkeypatch.setattr(peerhealth, "_probe", lambda url: True)
+    pushes = []
+
+    async def notify(wid, reachable, checked_url):
+        pushes.append((wid, reachable, checked_url))
+
+    asyncio.run(peerhealth.refresh(worker_id, "http://203.0.113.7:8850", notify=notify))
+    asyncio.run(peerhealth.refresh(worker_id, "http://203.0.113.7:8850", notify=notify))
+
+    assert len(pushes) == 2
+    assert pushes[0] == (worker_id, True, "http://203.0.113.7:8850/peer/health")
+
+
+def test_refresh_notifies_only_when_the_verdict_changes(client, monkeypatch):
+    """心跳觸發的重測（`notify_on_change_only=True`）：只有結論相對於庫裡
+    存的 `peer_reachable` 真的變了才推（裁示）。"""
+    csrf = _login(client)
+    worker_id, _ = _register_worker(client, csrf, "ph-6")
+    monkeypatch.setattr(peerhealth, "_probe", lambda url: True)
+    pushes = []
+    url = "http://203.0.113.7:8850"
+
+    async def notify(wid, reachable, checked_url):
+        pushes.append((wid, reachable, checked_url))
+
+    def recheck():
+        return asyncio.run(
+            peerhealth.refresh(worker_id, url, notify=notify, notify_on_change_only=True)
+        )
+
+    # NULL -> True：變了，推。
+    assert recheck() is True
+    assert len(pushes) == 1
+    # True -> True：沒變，不推。
+    assert recheck() is True
+    assert len(pushes) == 1
+    # True -> False：變了，推。
+    monkeypatch.setattr(peerhealth, "_probe", lambda url: False)
+    assert recheck() is False
+    assert pushes[-1] == (worker_id, False, url + "/peer/health")
+    assert len(pushes) == 2
+    # False -> False：沒變，不推。
+    assert recheck() is False
+    assert len(pushes) == 2
+
+
+def test_needs_recheck_is_true_when_never_checked_or_older_than_ten_minutes():
+    now = datetime(2026, 9, 16, 12, 0, 0, tzinfo=timezone.utc)
+    assert peerhealth.needs_recheck(None, now) is True
+    assert peerhealth.needs_recheck(now - timedelta(minutes=11), now) is True
+    assert peerhealth.needs_recheck(now - timedelta(minutes=5), now) is False
+    # SQLite 存回來的是 naive UTC（見 db.Worker.peer_checked_at）—— 當成 UTC。
+    naive = (now - timedelta(minutes=11)).replace(tzinfo=None)
+    assert peerhealth.needs_recheck(naive, now) is True
+
+
+def test_refresh_never_raises_when_the_database_write_blows_up(client, monkeypatch):
+    """檢查是背景工作：任何例外都吞掉（spec §8），不會弄爛 hello／heartbeat。"""
+    csrf = _login(client)
+    worker_id, _ = _register_worker(client, csrf, "ph-7")
+
+    def _boom(url):
+        raise RuntimeError("boom")
+
+    monkeypatch.setattr(peerhealth, "_probe", _boom)
+    assert asyncio.run(peerhealth.refresh(worker_id, "http://203.0.113.7:8850")) is None
+
+
+# --- 種子條件與 grant 回應的 seeder_urls -----------------------------------
+
+
+def test_online_seeders_requires_peer_reachable(client):
+    csrf = _login(client)
+    seeder_id, _ = _make_online_seeder(
+        client, csrf, "seed-r1", peer_url="http://203.0.113.7:8850", peer_reachable=None
+    )
+    name, size_bytes = "checkpoints/model.safetensors", _bytes(1.0)
+
+    with db.get_session() as session:
+        assert peer.online_seeders(session, name, size_bytes) == []
+        session.get(db.Worker, seeder_id).peer_reachable = 1
+        session.commit()
+    with db.get_session() as session:
+        assert [w.id for w in peer.online_seeders(session, name, size_bytes)] == [seeder_id]
+
+
+def test_online_seeders_accepts_a_same_remote_ip_lan_neighbour(client):
+    """不可連（peer_reachable = 0），但跟拉方同一個公網 IP 且有區網位址
+    ⇒ 仍是合格種子（spec §4.2 最後一條）。"""
+    csrf = _login(client)
+    seeder_id, _ = _make_online_seeder(
+        client,
+        csrf,
+        "seed-r2",
+        peer_url="http://192.168.1.5:8850",
+        peer_lan_url="http://192.168.1.5:8850",
+        peer_reachable=0,
+        remote_ip="203.0.113.7",
+    )
+    name, size_bytes = "checkpoints/model.safetensors", _bytes(1.0)
+
+    with db.get_session() as session:
+        assert peer.online_seeders(session, name, size_bytes) == []
+        found = peer.online_seeders(session, name, size_bytes, puller_remote_ip="203.0.113.7")
+        assert [w.id for w in found] == [seeder_id]
+        # 同 IP 但沒有區網位址 ⇒ 還是不合格。
+        session.get(db.Worker, seeder_id).peer_lan_url = None
+        session.commit()
+    with db.get_session() as session:
+        assert peer.online_seeders(session, name, size_bytes, puller_remote_ip="203.0.113.7") == []
+
+
+def _puller_with_remote_ip(client, csrf, name, remote_ip):
+    worker_id, sk = _register_worker(client, csrf, name)
+    with db.get_session() as session:
+        worker = session.get(db.Worker, worker_id)
+        worker.status = "online"
+        worker.protocol = 4
+        worker.remote_ip = remote_ip
+        session.commit()
+    return worker_id, sk
+
+
+def test_peer_grant_returns_seeder_urls_lan_first_for_a_same_nat_puller(client):
+    csrf = _login(client)
+    _make_online_seeder(
+        client,
+        csrf,
+        "seed-u1",
+        peer_url="http://203.0.113.7:8850",
+        peer_lan_url="http://192.168.1.5:8850",
+        peer_reachable=1,
+        remote_ip="203.0.113.7",
+    )
+    puller_id, puller_sk = _puller_with_remote_ip(client, csrf, "pull-u1", "203.0.113.7")
+
+    resp = _agent_post(
+        client,
+        puller_id,
+        puller_sk,
+        "/api/agent/peer-grant",
+        {"name": "checkpoints/model.safetensors", "size_bytes": _bytes(1.0)},
+    )
+
+    assert resp.status_code == 200
+    payload = resp.json()
+    assert payload["seeder_urls"] == ["http://192.168.1.5:8850", "http://203.0.113.7:8850"]
+    # 舊 agent 只看 peer_url，行為不變：它就是 seeder_urls 的第一個。
+    assert payload["peer_url"] == payload["seeder_urls"][0]
+
+
+def test_peer_grant_returns_only_the_public_url_for_a_different_nat_puller(client):
+    csrf = _login(client)
+    _make_online_seeder(
+        client,
+        csrf,
+        "seed-u2",
+        peer_url="http://203.0.113.7:8850",
+        peer_lan_url="http://192.168.1.5:8850",
+        peer_reachable=1,
+        remote_ip="203.0.113.7",
+    )
+    puller_id, puller_sk = _puller_with_remote_ip(client, csrf, "pull-u2", "198.51.100.9")
+
+    payload = _agent_post(
+        client,
+        puller_id,
+        puller_sk,
+        "/api/agent/peer-grant",
+        {"name": "checkpoints/model.safetensors", "size_bytes": _bytes(1.0)},
+    ).json()
+
+    assert payload["seeder_urls"] == ["http://203.0.113.7:8850"]

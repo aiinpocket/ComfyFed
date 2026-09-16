@@ -743,6 +743,8 @@ def test_prompt_queues_when_missing_model_is_only_reachable_via_a_peer_seeder(cl
         worker = session.get(db.Worker, seeder)
         worker.protocol = 4
         worker.peer_url = "http://10.0.0.5:8850"
+        # Phase 3.4 §4.2：種子條件多了「平台驗證過連得到」（peerhealth）。
+        worker.peer_reachable = 1
         session.commit()
     # The requesting worker has neither the model nor any fetch opt-in --
     # only the seeder above holds it.

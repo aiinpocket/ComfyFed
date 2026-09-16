@@ -119,12 +119,28 @@ from fastapi import APIRouter, WebSocket, WebSocketDisconnect
 from nacl.exceptions import BadSignatureError
 from nacl.signing import SigningKey, VerifyKey
 
-from . import assess, db, dispatch, metrics, model_manifest, panelws, security, split, stats, workers
+from . import (
+    assess,
+    db,
+    dispatch,
+    metrics,
+    model_manifest,
+    panelws,
+    peerhealth,
+    security,
+    split,
+    stats,
+    workers,
+)
 
 logger = logging.getLogger(__name__)
 
 _AUTH_TIMEOUT_SECONDS = 10
 _TICK_INTERVAL_SECONDS = 5
+
+# Phase 3.4 §4.2：進行中的可連性檢查任務。只是持有強參照防止 GC 回收
+# （asyncio 只保留弱參照），完成後自動移除。
+_peer_check_tasks: set = set()
 
 # 三個握手關閉碼語意不同，agent 端據此決定「重試 / 慢速重試 / 放棄並清掉註冊」：
 # The handshake uses THREE distinct close codes, because the agent acts very
@@ -629,6 +645,38 @@ async def push_job_cancelled(worker_id: Optional[str], job_id: str) -> None:
         )
 
 
+async def push_peer_status(worker_id: str, reachable: bool, checked_url: str) -> None:
+    """把可連性結論推給 agent（spec §4.3）。agent 不在線、或送失敗，都只是
+    少一則通知 —— 記 debug 就好，絕不往上拋（呼叫端是 `peerhealth.refresh`
+    的背景任務，它不該因為一則通知送不出去而失敗）。"""
+    conn = _connections.get(worker_id)
+    if conn is None:
+        return
+    try:
+        await conn.ws.send_json(
+            {"type": "peer_status", "reachable": reachable, "checked_url": checked_url}
+        )
+    except Exception:
+        logger.debug(
+            "agentws: failed to push peer_status to worker %s", worker_id, exc_info=True
+        )
+
+
+def _schedule_peer_check(worker_id: str, peer_url: str, *, on_change_only: bool) -> None:
+    """排一個背景可連性檢查（spec §4.2）。hello／heartbeat 都不等它 —— 它
+    自己吞掉所有例外，所以這裡只需要留住 task 參照。"""
+    task = asyncio.create_task(
+        peerhealth.refresh(
+            worker_id,
+            peer_url,
+            notify=push_peer_status,
+            notify_on_change_only=on_change_only,
+        )
+    )
+    _peer_check_tasks.add(task)
+    task.add_done_callback(_peer_check_tasks.discard)
+
+
 async def _push_cascade_cancellations(cancelled_owners: list) -> None:
     """Push `job_cancelled` for every sibling a split cascade just cancelled.
 
@@ -1031,6 +1079,12 @@ async def _handle_hello(worker_id: str, conn: "_Connection", message: dict) -> N
                 "agentws: failed to send deprecation notice to worker %s", worker_id
             )
 
+    # Phase 3.4 §4.2：可連性檢查是非同步的背景工作，hello 不等它。hello 觸發
+    # 的檢查每次完成都推一次 peer_status（§4.3），不論結論有沒有變 —— agent
+    # 剛連上就該拿到一則明確的結論。
+    if peer_url:
+        _schedule_peer_check(worker_id, peer_url, on_change_only=False)
+
 
 async def _handle_heartbeat(worker_id: str, conn: _Connection, message: dict) -> bool:
     """Apply a heartbeat's state to the worker row.
@@ -1061,6 +1115,10 @@ async def _handle_heartbeat(worker_id: str, conn: _Connection, message: dict) ->
         worker.dynamic = json.dumps(dynamic)
         worker_name = worker.name
         stored_hash = worker.object_info_hash or ""
+        # Phase 3.4 §4.2：重測要用的兩個值，趁 session 還開著讀出來（關掉
+        # 之後這個 ORM 物件就讀不到未載入的欄位了）。
+        peer_url_for_recheck = worker.peer_url
+        peer_checked_at = worker.peer_checked_at
         session.commit()
 
         if job_id:
@@ -1103,6 +1161,13 @@ async def _handle_heartbeat(worker_id: str, conn: _Connection, message: dict) ->
                     await panelws.job_progress(job_id, job.progress, **fetch_fields)
             else:
                 job_not_owned = True
+
+    # Phase 3.4 §4.2：`peer_checked_at` 超過 10 分鐘就重測一次。跟 hello 的
+    # 檢查走同一條路徑（同樣非同步、同樣吞掉所有例外），差別只在推送條件：
+    # 心跳的重測只有在結論**變了**的時候才推 peer_status（裁示），免得每 10
+    # 分鐘對每台 worker 灌一則沒有新資訊的訊息。
+    if peer_url_for_recheck and peerhealth.needs_recheck(peer_checked_at, _utcnow()):
+        _schedule_peer_check(worker_id, peer_url_for_recheck, on_change_only=True)
 
     # A heartbeat carrying a job_id this worker doesn't (or no longer) own --
     # most commonly a stale agent still reporting a job that was requeued and

@@ -476,6 +476,32 @@ export async function updateWorkerPeerAdvert(
     .run();
 }
 
+/** Phase 3.4 §4.2：可連性檢查的結果。Ports peerhealth.py's `_record` 的寫入
+ * 那一半。`reachable`/`checkedAt` 同時為 null = 回到「未檢查」（worker 不再
+ * 通告 `peer_url`）。 */
+export async function updateWorkerPeerReachable(
+  db: D1Database,
+  workerId: string,
+  reachable: number | null,
+  checkedAt: string | null
+): Promise<void> {
+  await db
+    .prepare("UPDATE workers SET peer_reachable = ?, peer_checked_at = ? WHERE id = ?")
+    .bind(reachable, checkedAt, workerId)
+    .run();
+}
+
+/** 目前存著的可連性結論（1/0/NULL），或 worker 不存在時 null -- Ports
+ * peerhealth.py's `_record` 回傳 previous 的那一半，給「只有結論變了才推
+ * peer_status」的比較用。 */
+export async function getWorkerPeerReachable(db: D1Database, workerId: string): Promise<number | null> {
+  const row = await db
+    .prepare("SELECT peer_reachable FROM workers WHERE id = ?")
+    .bind(workerId)
+    .first<{ peer_reachable: number | null }>();
+  return row?.peer_reachable ?? null;
+}
+
 /** Applies a `heartbeat` message's worker-row writes -- mirrors
  * `agentws._handle_heartbeat`'s `worker.last_seen`/`worker.status`/
  * `worker.dynamic` writes. `status` is precomputed by the caller (idle ->
@@ -1122,6 +1148,15 @@ export async function getOnlineEnabledWorkers(db: D1Database): Promise<Worker[]>
  * worker's JSON `model_inventory`). `excludeWorkerId`, when given, omits
  * that worker (the requester itself, in grant issuance).
  *
+ * Phase 3.4 §4.2 adds the reachability half: a seeder must have passed the
+ * platform's own `/peer/health` probe (`peer_reachable = 1`), OR sit behind
+ * the same public IP as the puller (`pullerRemoteIp`) with a LAN address to
+ * offer. Callers with no particular puller in mind (`seederCandidateFiles`'s
+ * "does this file have a seeder at all") omit `pullerRemoteIp` and get the
+ * conservative half -- better to under-report one seeder than to dispatch a
+ * job on the promise of a peer nobody can reach. Parity: peer.py's
+ * `online_seeders` / `model_manifest._seeder_candidate_files`.
+ *
  * Deliberately does NOT filter `disabled`: seeding eligibility is decoupled
  * from a worker's disabled status (spec: 種子資格與 worker 停用狀態脫鉤 --
  * disabled means "does not take dispatched jobs", not "stops sharing models
@@ -1129,13 +1164,22 @@ export async function getOnlineEnabledWorkers(db: D1Database): Promise<Worker[]>
 export async function getOnlinePeerCapableWorkers(
   db: D1Database,
   minProtocol: number,
-  excludeWorkerId?: string
+  excludeWorkerId?: string,
+  pullerRemoteIp?: string | null
 ): Promise<Worker[]> {
   // No `deleted = 0` clause, same accepted ~90s window as `peer.online_seeders`
   // (review L6): a just-deleted seeder stays eligible until the stale sweep
   // marks it offline, and the worst case is one wasted fetch round trip.
   let sql = "SELECT * FROM workers WHERE status != 'offline' AND protocol >= ? AND peer_url IS NOT NULL";
   const binds: unknown[] = [minProtocol];
+  // Phase 3.4 §4.2：種子必須是平台驗證過連得到的，**或**跟拉方在同一個公網
+  // IP 後面（⇒ 幾乎一定同一個 NAT）且有區網位址可用。
+  if (pullerRemoteIp) {
+    sql += " AND (peer_reachable = 1 OR (remote_ip = ? AND peer_lan_url IS NOT NULL))";
+    binds.push(pullerRemoteIp);
+  } else {
+    sql += " AND peer_reachable = 1";
+  }
   if (excludeWorkerId !== undefined) {
     sql += " AND id != ?";
     binds.push(excludeWorkerId);

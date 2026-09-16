@@ -55,17 +55,26 @@ function bytesFor(gb: number): number {
 // Phase 3.1 P2P: inserts an online, protocol>=4, peer_url-advertising
 // worker whose inventory reports (name, sizeBytes, sha256) -- the exact
 // "online seeder" predicate `core/peer.ts`'s `onlineSeeders` checks.
+// Phase 3.4 §4.2: `peerReachable` defaults to 1, since the predicate now also
+// requires a platform-verified endpoint (parity: test_peer.py's
+// `_make_online_seeder`).
 async function seedOnlineSeeder(
   id: string,
   name: string,
   sizeBytes: number,
   sha256: string,
-  opts: { protocol?: number; peerUrl?: string | null; disabled?: boolean; status?: string } = {}
+  opts: {
+    protocol?: number;
+    peerUrl?: string | null;
+    disabled?: boolean;
+    status?: string;
+    peerReachable?: number | null;
+  } = {}
 ): Promise<void> {
   await db()
     .prepare(
-      `INSERT INTO workers (id, name, pubkey, created_at, status, disabled, protocol, peer_url, model_inventory)
-       VALUES (?, ?, 'pk', '2026-01-01 00:00:00.000000', ?, ?, ?, ?, ?)`
+      `INSERT INTO workers (id, name, pubkey, created_at, status, disabled, protocol, peer_url, peer_reachable, model_inventory)
+       VALUES (?, ?, 'pk', '2026-01-01 00:00:00.000000', ?, ?, ?, ?, ?, ?)`
     )
     .bind(
       id,
@@ -74,6 +83,7 @@ async function seedOnlineSeeder(
       opts.disabled ? 1 : 0,
       opts.protocol ?? 4,
       opts.peerUrl === undefined ? "http://192.168.1.5:8850" : opts.peerUrl,
+      opts.peerReachable === undefined ? 1 : opts.peerReachable,
       JSON.stringify([{ name, size_bytes: sizeBytes, sha256 }])
     )
     .run();
@@ -479,6 +489,22 @@ describe("entries: peer-only entries", () => {
   it("no online seeder -> no peer-only entry at all", async () => {
     const sha = await shaHex("private");
     await modelManifest.recordHash(db(), "w1", "loras/my_style.safetensors", bytesFor(1.0), sha);
+    const entries = await modelManifest.entries(db(), store(), await seed());
+    expect(entries.some((e) => e.name === "my_style.safetensors")).toBe(false);
+  });
+
+  it("an unverified seeder (peer_reachable NULL) does not count (Phase 3.4 §4.2)", async () => {
+    // The "does this file have a seeder at all" question has no particular
+    // puller, so it can't use the same-NAT arm and stays on the conservative
+    // `peer_reachable = 1` half -- parity with model_manifest.py's
+    // `_seeder_candidate_files`.
+    const sha = await shaHex("private");
+    const sizeBytes = bytesFor(1.0);
+    await modelManifest.recordHash(db(), "w1", "loras/my_style.safetensors", sizeBytes, sha);
+    await seedOnlineSeeder("seeder-unverified", "loras/my_style.safetensors", sizeBytes, sha, {
+      peerReachable: null,
+    });
+
     const entries = await modelManifest.entries(db(), store(), await seed());
     expect(entries.some((e) => e.name === "my_style.safetensors")).toBe(false);
   });

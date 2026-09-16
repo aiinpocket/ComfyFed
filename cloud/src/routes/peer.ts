@@ -87,7 +87,10 @@ app.post("/api/agent/peer-grant", async (c) => {
     return errorJson(c, 400, "peer.already_has_model", "You already have this model.");
   }
 
-  const seeders = await peer.onlineSeeders(db, name, sizeBytes, { excludeWorkerId: worker.id });
+  const seeders = await peer.onlineSeeders(db, name, sizeBytes, {
+    excludeWorkerId: worker.id,
+    pullerRemoteIp: worker.remoteIp,
+  });
   if (seeders.length === 0) {
     return errorJson(c, 404, "peer.no_seeder", "No online seeder for this model.");
   }
@@ -132,9 +135,12 @@ app.post("/api/agent/peer-grant", async (c) => {
     createdAt: Math.floor(now),
   });
 
+  const urls = peer.seederUrls(seeder, worker.remoteIp);
   return c.json({
     grant: { ...grant, sig },
-    peer_url: seeder.peerUrl,
+    // 舊 agent 只看 `peer_url`，就是清單的第一個 —— 行為不變（spec §5）。
+    peer_url: urls[0],
+    seeder_urls: urls,
     chunk_sha256s: hashRow.chunkSha256s,
   });
 });

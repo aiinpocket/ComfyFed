@@ -403,6 +403,7 @@ def _seeder_worker(
     peer_url="http://10.0.0.5:8850",
     status="online",
     disabled=False,
+    peer_reachable=1,
 ):
     """Insert a `db.Worker` row directly (no HTTP registration needed --
     `peer.online_seeders`, which `entries()` now consults, only ever queries
@@ -423,6 +424,10 @@ def _seeder_worker(
                 disabled=disabled,
                 protocol=protocol,
                 peer_url=peer_url,
+                # Phase 3.4 §4.2：種子條件多了「平台驗證過連得到」，所以
+                # 「一台正常可用的種子」預設就是驗證通過的那種（parity:
+                # test_peer.py 的 `_make_online_seeder`）。
+                peer_reachable=peer_reachable,
                 model_inventory=json.dumps(
                     [{"name": model_name, "size_bytes": size_bytes, "sha256": sha256}]
                 ),
@@ -431,6 +436,15 @@ def _seeder_worker(
         session.commit()
     model_manifest.record_hash(worker_id, model_name, size_bytes, sha256)
     return sha256
+
+
+def test_entries_ignores_a_seeder_the_platform_has_not_verified(data_dir):
+    """Phase 3.4 §4.2：「這個檔現在有沒有種子」這個問題沒有特定拉方，所以
+    用不上同 NAT 那一條，只認 `peer_reachable = 1`（cloud parity:
+    `core/peer.ts` 的 `seederCandidateFiles`）。"""
+    _seeder_worker(data_dir, "unverified-seeder", peer_reachable=None)
+    entries = model_manifest.entries(data_dir)
+    assert not any(e["name"] == "model.safetensors" for e in entries)
 
 
 def test_entries_includes_peer_only_model_with_online_seeder(data_dir):

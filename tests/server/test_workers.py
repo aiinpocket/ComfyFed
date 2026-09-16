@@ -156,6 +156,37 @@ def test_list_workers_exposes_peer_url(client):
     assert worker_after["peer_url"] == "http://192.168.1.5:8850"
 
 
+def test_list_workers_exposes_the_p2p_nat_fields(client):
+    """Phase 3.4 §6：Workers 頁的 P2P 欄要畫「開埠方式／區網位址／可連性
+    徽章」，所以列表要一併吐 `peer_lan_url`／`peer_nat`／`peer_reachable`
+    （cloud parity: `cloud/src/routes/workers.ts`）。"""
+    csrf = _login(client)
+    r = client.post("/api/workers/tokens", json={"name": "worker-nat"}, headers={"X-CSRF": csrf})
+    token = r.json()["bundle"]["register_token"]
+    reg = client.post(
+        "/api/agent/register",
+        json={"token": token, "name": "worker-nat", "pubkey": "57" * 32},
+    )
+    worker_id = reg.json()["worker_id"]
+
+    worker = next(w for w in client.get("/api/workers", headers={"X-CSRF": csrf}).json() if w["id"] == worker_id)
+    assert worker["peer_lan_url"] is None
+    assert worker["peer_nat"] == "lan"
+    assert worker["peer_reachable"] is None
+
+    with db.get_session() as session:
+        w = session.get(db.Worker, worker_id)
+        w.peer_lan_url = "http://192.168.1.5:8850"
+        w.peer_nat = "natpmp"
+        w.peer_reachable = 1
+        session.commit()
+
+    after = next(w for w in client.get("/api/workers", headers={"X-CSRF": csrf}).json() if w["id"] == worker_id)
+    assert after["peer_lan_url"] == "http://192.168.1.5:8850"
+    assert after["peer_nat"] == "natpmp"
+    assert after["peer_reachable"] == 1
+
+
 def _login_as_new_user(client, admin_csrf, username):
     """Create a non-admin `user` (as the current admin) then log in as them.
 

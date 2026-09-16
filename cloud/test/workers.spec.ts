@@ -548,6 +548,30 @@ describe("GET /api/workers", () => {
     expect(seedingRow.peer_url).toBe("http://192.168.1.5:8850");
     expect(quietRow.peer_url).toBeNull();
   });
+
+  it("reports the P2P NAT fields the console's worker column renders (Phase 3.4 §6)", async () => {
+    const worker = await registerWorker("nat-box");
+    const { cookie } = await adminSession();
+
+    const before = (await call("/api/workers", { method: "GET", cookie })).body.find(
+      (w: any) => w.id === worker.workerId
+    );
+    expect(before.peer_lan_url).toBeNull();
+    expect(before.peer_nat).toBe("lan");
+    expect(before.peer_reachable).toBeNull();
+
+    await db()
+      .prepare("UPDATE workers SET peer_lan_url = ?, peer_nat = ?, peer_reachable = 1 WHERE id = ?")
+      .bind("http://192.168.1.5:8850", "natpmp", worker.workerId)
+      .run();
+
+    const after = (await call("/api/workers", { method: "GET", cookie })).body.find(
+      (w: any) => w.id === worker.workerId
+    );
+    expect(after.peer_lan_url).toBe("http://192.168.1.5:8850");
+    expect(after.peer_nat).toBe("natpmp");
+    expect(after.peer_reachable).toBe(1);
+  });
 });
 
 // ---------------------------------------------------------------------------

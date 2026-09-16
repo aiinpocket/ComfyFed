@@ -1,8 +1,9 @@
-import { afterEach, beforeEach, describe, expect, it } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { env, runDurableObjectAlarm, runInDurableObject } from "cloudflare:test";
 import { toSqliteTimestamp, getJobById, getReceiptsForJob, getWorkerById } from "../src/db/queries";
 import { signHex } from "../src/lib/ed25519";
-import { collectMessages, connectAgent, expectNoMessage, hub, nextMessage, openAgentWs, waitForClose } from "./helpers/ws";
+import { collectMessages, connectAgent, expectNoMessage, hub, nextMessage, openAgentWs, waitFor, waitForClose } from "./helpers/ws";
+import * as peerhealth from "../src/core/peerhealth";
 import * as split from "../src/core/split";
 import golden from "./fixtures/golden.json";
 
@@ -392,9 +393,12 @@ describe("hello", () => {
     const kp = KEYPAIRS[0]!;
     const workerId = await makeWorker({ pubkeyHex: kp.pubkey_hex });
     const ws = await connectAgent(workerId, kp.seed_hex);
-    const none = expectNoMessage(ws, 300);
+    // Phase 3.4 §4.3: hello now always answers with one peer_status once the
+    // reachability check finishes (a private peer_url is rejected statically,
+    // so this one is `reachable: false` without any probe).
+    const status = nextMessage(ws);
     ws.send(JSON.stringify({ type: "hello", protocol: 4, peer_url: "http://192.168.1.5:8850" }));
-    await none;
+    expect((await status).type).toBe("peer_status");
 
     let row: { peer_url: string | null; protocol: number } | null = null;
     for (const deadline = Date.now() + 3000; Date.now() < deadline; ) {
@@ -1186,8 +1190,10 @@ describe("Phase 3.4: ready.remote_ip and hello NAT fields", () => {
     const kp = KEYPAIRS[0]!;
     const workerId = await makeWorker({ pubkeyHex: kp.pubkey_hex });
     const ws = await connectAgent(workerId, kp.seed_hex);
+    const status = nextMessage(ws);
     ws.send(JSON.stringify({ type: "hello", protocol: 4, peer_url: "http://192.168.1.9:8850" }));
-    await expectNoMessage(ws, 300);
+    // Phase 3.4 §4.3: the hello-triggered check always answers once.
+    expect((await status).type).toBe("peer_status");
     const row = await db()
       .prepare("SELECT peer_lan_url, peer_nat FROM workers WHERE id = ?")
       .bind(workerId)
@@ -1195,5 +1201,98 @@ describe("Phase 3.4: ready.remote_ip and hello NAT fields", () => {
     expect(row.peer_lan_url).toBeNull();
     expect(row.peer_nat).toBe("lan");
     ws.close();
+  });
+});
+
+describe("Phase 3.4: reachability check on hello and heartbeat", () => {
+  it("probes the advertised peer_url after hello and pushes peer_status", async () => {
+    const kp = KEYPAIRS[0]!;
+    const workerId = await makeWorker({ pubkeyHex: kp.pubkey_hex });
+    const probe = vi.spyOn(peerhealth, "probePeerHealth").mockResolvedValue(true);
+    const ws = await connectAgent(workerId, kp.seed_hex);
+
+    const status = nextMessage(ws);
+    ws.send(
+      JSON.stringify({
+        type: "hello",
+        protocol: 4,
+        peer_url: "http://203.0.113.7:8850",
+        peer_lan_url: "http://192.168.1.5:8850",
+        peer_nat: "natpmp",
+      })
+    );
+
+    expect(await status).toEqual({
+      type: "peer_status",
+      reachable: true,
+      checked_url: "http://203.0.113.7:8850/peer/health",
+    });
+    expect(probe).toHaveBeenCalledWith("http://203.0.113.7:8850/peer/health");
+    const row = await db().prepare("SELECT peer_reachable FROM workers WHERE id = ?").bind(workerId).first<any>();
+    expect(row.peer_reachable).toBe(1);
+    ws.close();
+    vi.restoreAllMocks();
+  });
+
+  it("marks a private peer_url unreachable without probing", async () => {
+    const kp = KEYPAIRS[0]!;
+    const workerId = await makeWorker({ pubkeyHex: kp.pubkey_hex });
+    const probe = vi.spyOn(peerhealth, "probePeerHealth").mockResolvedValue(true);
+    const ws = await connectAgent(workerId, kp.seed_hex);
+
+    const status = nextMessage(ws);
+    ws.send(JSON.stringify({ type: "hello", protocol: 4, peer_url: "http://192.168.1.5:8850" }));
+
+    expect((await status).reachable).toBe(false);
+    expect(probe).not.toHaveBeenCalled();
+    ws.close();
+    vi.restoreAllMocks();
+  });
+
+  it("rechecks on heartbeat once peer_checked_at is older than 10 minutes, pushing only on a changed verdict", async () => {
+    const kp = KEYPAIRS[0]!;
+    const workerId = await makeWorker({ pubkeyHex: kp.pubkey_hex });
+    const probe = vi.spyOn(peerhealth, "probePeerHealth").mockResolvedValue(true);
+    const ws = await connectAgent(workerId, kp.seed_hex);
+    const hello = nextMessage(ws);
+    ws.send(JSON.stringify({ type: "hello", protocol: 4, peer_url: "http://203.0.113.7:8850" }));
+    expect((await hello).reachable).toBe(true);
+
+    const checkedAt = async () =>
+      (await db().prepare("SELECT peer_checked_at FROM workers WHERE id = ?").bind(workerId).first<any>())
+        .peer_checked_at as string;
+    const backdate = async (minutes: number) => {
+      const stale = toSqliteTimestamp(new Date(Date.now() - minutes * 60 * 1000));
+      await db().prepare("UPDATE workers SET peer_checked_at = ? WHERE id = ?").bind(stale, workerId).run();
+      return stale;
+    };
+
+    // A fresh verdict is not rechecked at all.
+    const fresh = await checkedAt();
+    ws.send(JSON.stringify({ type: "heartbeat", state: "idle" }));
+    await expectNoMessage(ws, 300);
+    expect(await checkedAt()).toBe(fresh);
+
+    // Older than 10 minutes but the same verdict: rechecked (timestamp moves),
+    // silent (ruling).
+    const stale = await backdate(11);
+    ws.send(JSON.stringify({ type: "heartbeat", state: "idle" }));
+    await expectNoMessage(ws, 300);
+    await waitFor(async () => ((await checkedAt()) !== stale ? true : undefined), {
+      label: "peer_checked_at refreshed by the heartbeat recheck",
+    });
+
+    // Verdict flips: one push.
+    probe.mockResolvedValue(false);
+    await backdate(11);
+    const changed = nextMessage(ws);
+    ws.send(JSON.stringify({ type: "heartbeat", state: "idle" }));
+    expect(await changed).toEqual({
+      type: "peer_status",
+      reachable: false,
+      checked_url: "http://203.0.113.7:8850/peer/health",
+    });
+    ws.close();
+    vi.restoreAllMocks();
   });
 });

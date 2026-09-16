@@ -144,11 +144,13 @@ export function workerHasConsensusFile(worker: Worker, name: string, sizeBytes: 
 
 /** Online, protocol>=4, peer_url-advertising workers whose inventory has
  * (name, size_bytes) at the learned consensus hash -- ports peer.py's
- * `online_seeders`, the single seeder predicate shared by grant issuance
- * (`routes/peer.ts`) and `core/model_manifest.ts`'s peer-only entries /
- * `peer` flag, per the plan's Global Constraints ruling against implementing
- * it twice. A conflicted `model_hashes` row (two workers disagreed on the
- * whole-file hash) never has a seeder -- the platform doesn't know which
+ * `online_seeders` (including Phase 3.4 §4.2's reachability half: verified
+ * reachable, or a LAN neighbour behind the puller's own public IP -- see
+ * `queries.getOnlinePeerCapableWorkers`), the single seeder predicate shared
+ * by grant issuance (`routes/peer.ts`) and `core/model_manifest.ts`'s
+ * peer-only entries / `peer` flag, per the plan's Global Constraints ruling
+ * against implementing it twice. A conflicted `model_hashes` row (two
+ * workers disagreed on the whole-file hash) never has a seeder -- the platform doesn't know which
  * reported hash, if either, is genuine. "Online" mirrors `assess`'s online-
  * enabled definition (`status != "offline"`, not disabled) -- a disabled
  * worker's peer-serving is independent of dispatch eligibility per spec
@@ -157,13 +159,29 @@ export async function onlineSeeders(
   db: D1Database,
   name: string,
   sizeBytes: number,
-  opts: { excludeWorkerId?: string } = {}
+  opts: { excludeWorkerId?: string; pullerRemoteIp?: string | null } = {}
 ): Promise<Worker[]> {
   const hashRow = await queries.getModelHash(db, name, sizeBytes);
   if (hashRow === null || hashRow.conflict) return [];
 
-  const candidates = await queries.getOnlinePeerCapableWorkers(db, MIN_PEER_PROTOCOL, opts.excludeWorkerId);
+  const candidates = await queries.getOnlinePeerCapableWorkers(
+    db,
+    MIN_PEER_PROTOCOL,
+    opts.excludeWorkerId,
+    opts.pullerRemoteIp ?? null
+  );
   return candidates.filter((w) => workerHasConsensusFile(w, name, sizeBytes, hashRow.sha256));
+}
+
+/** 拉方該依序嘗試的位址（spec §5）：拉方與種子 `remoteIp` 相同且種子有區網
+ * 位址 ⇒ `[peerLanUrl, peerUrl]`（同一個 NAT，區網直連最快，而且很多家用
+ * 路由器不支援 hairpin，對外位址反而連不回來），否則 `[peerUrl]`（此時種子
+ * 必為 `peerReachable = 1`）。Ports peer.py's `_seeder_urls`. */
+export function seederUrls(seeder: Worker, pullerRemoteIp: string | null): string[] {
+  if (pullerRemoteIp && seeder.remoteIp === pullerRemoteIp && seeder.peerLanUrl) {
+    return [seeder.peerLanUrl, seeder.peerUrl!];
+  }
+  return [seeder.peerUrl!];
 }
 
 /** Every `(name, size_bytes, sha256)` triple currently offered by an online,
