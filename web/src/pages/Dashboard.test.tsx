@@ -54,6 +54,9 @@ const WORKER: Worker = {
   torch_version: '2.4.0',
   model_count: 3,
   peer_url: null,
+  peer_lan_url: null,
+  peer_nat: 'none',
+  peer_reachable: null,
 };
 
 function jsonResponse(body: unknown, status = 200): Response {

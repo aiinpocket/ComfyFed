@@ -210,6 +210,12 @@ export interface Worker {
   /** Phase 3.1 P2P: set when this worker's agent opted into serving chunks
    * to other workers (`hello.peer_url`); null otherwise. */
   peer_url: string | null;
+  /** Phase 3.4：區網位址（同一個 NAT 的成員優先用它）。 */
+  peer_lan_url: string | null;
+  /** Phase 3.4：`peer_url` 的來源 —— natpmp/upnp/manual/lan/none。 */
+  peer_nat: string;
+  /** Phase 3.4：平台驗證結果。null = 尚未檢查。 */
+  peer_reachable: boolean | null;
 }
 
 export type JobStatus = 'queued' | 'assigned' | 'running' | 'done' | 'failed' | 'cancelled';

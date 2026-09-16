@@ -48,6 +48,43 @@ interface WorkersProps {
   role: Role;
 }
 
+/** Phase 3.4：P2P 欄的一格 —— 開埠方式、對外位址、可連性徽章。
+ * `peer_url` 為 null（沒開分享）就只顯示「關閉」。 */
+function P2pCell({ worker }: { worker: Worker }) {
+  const { t } = useTranslation();
+  if (!worker.peer_url) {
+    return (
+      <Text size="xs" c="dimmed">
+        {t('workers.p2p_off')}
+      </Text>
+    );
+  }
+  const natKey = `workers.p2p_nat_${worker.peer_nat}`;
+  const natLabel = worker.peer_nat === 'none' ? t('workers.p2p_off') : t(natKey);
+  const reach =
+    worker.peer_reachable === true
+      ? { color: 'green', label: t('workers.p2p_verified') }
+      : worker.peer_reachable === false
+        ? { color: 'red', label: t('workers.p2p_unreachable') }
+        : { color: 'gray', label: t('workers.p2p_unchecked') };
+  return (
+    <Stack gap={2}>
+      <Text size="xs">{natLabel}</Text>
+      <Mono size="xs" title={worker.peer_url}>
+        {worker.peer_url}
+      </Mono>
+      {worker.peer_lan_url && worker.peer_lan_url !== worker.peer_url && (
+        <Mono size="xs" c="dimmed" title={worker.peer_lan_url}>
+          {t('workers.p2p_lan_label')} {worker.peer_lan_url}
+        </Mono>
+      )}
+      <Badge color={reach.color} variant="light" size="sm" tt="none" fw={500}>
+        {reach.label}
+      </Badge>
+    </Stack>
+  );
+}
+
 export function Workers({ role }: WorkersProps) {
   const { t } = useTranslation();
   const theme = useMantineTheme();
@@ -198,9 +235,10 @@ export function Workers({ role }: WorkersProps) {
           />
         ) : (
           <Table.ScrollContainer
-            // 980 = the old 880 + the action column's growth (110 -> 210)
-            // when the disable + delete pair replaced disable alone.
-            minWidth={980}
+            // 1120 = the old 880 + the action column's growth (110 -> 210)
+            // when the disable + delete pair replaced disable alone, +140 =
+            // the Phase 3.4 P2P column.
+            minWidth={1120}
           >
             <Table verticalSpacing="sm" horizontalSpacing="md" highlightOnHover>
               <Table.Thead style={{ background: theme.other.surfaces.raised }}>
@@ -210,6 +248,7 @@ export function Workers({ role }: WorkersProps) {
                   <Table.Th>{t('workers.col_gpu')}</Table.Th>
                   <Table.Th>{t('workers.col_backend')}</Table.Th>
                   <Table.Th>{t('workers.col_models')}</Table.Th>
+                  <Table.Th>{t('workers.col_p2p')}</Table.Th>
                   <Table.Th>{t('workers.col_last_seen')}</Table.Th>
                   {/* Wide enough for the disable + delete pair. Admin-only:
                       non-admins have no per-row actions, so no action column. */}
@@ -234,11 +273,6 @@ export function Workers({ role }: WorkersProps) {
                         <Mono size="xs" title={worker.id}>
                           {shortId(worker.id)}
                         </Mono>
-                        {worker.peer_url && (
-                          <Mono size="xs" title={worker.peer_url}>
-                            {worker.peer_url}
-                          </Mono>
-                        )}
                       </Stack>
                     </Table.Td>
                     <Table.Td>
@@ -276,6 +310,9 @@ export function Workers({ role }: WorkersProps) {
                       <Text size="sm" style={{ fontVariantNumeric: 'tabular-nums' }}>
                         {worker.model_count}
                       </Text>
+                    </Table.Td>
+                    <Table.Td>
+                      <P2pCell worker={worker} />
                     </Table.Td>
                     <Table.Td>
                       <Text size="sm" c="dimmed">

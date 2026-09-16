@@ -52,6 +52,9 @@ const BASE_WORKER: Worker = {
   torch_version: '2.4.0',
   model_count: 3,
   peer_url: 'http://192.168.1.5:8850',
+  peer_lan_url: 'http://10.0.0.5:8850',
+  peer_nat: 'natpmp',
+  peer_reachable: true,
 };
 
 const QUIET_WORKER: Worker = {
@@ -59,6 +62,9 @@ const QUIET_WORKER: Worker = {
   id: 'w-0000000002',
   name: 'runner-quiet',
   peer_url: null,
+  peer_lan_url: null,
+  peer_nat: 'none',
+  peer_reachable: null,
 };
 
 function jsonResponse(body: unknown, status = 200): Response {
@@ -274,5 +280,45 @@ describe('Workers page: role-gated mutation controls', () => {
     expect(screen.getByRole('button', { name: 'Add worker' })).toBeInTheDocument();
     expect(screen.getByRole('button', { name: 'Disable' })).toBeInTheDocument();
     expect(screen.getByRole('button', { name: 'Delete' })).toBeInTheDocument();
+  });
+});
+
+describe('Phase 3.4: the P2P column', () => {
+  afterEach(() => {
+    cleanup();
+    vi.unstubAllGlobals();
+  });
+
+  it('shows the mapping method, external address and a verified badge', async () => {
+    stubFetch([BASE_WORKER]);
+    renderWorkers();
+
+    expect(await screen.findByText('Auto port mapping (NAT-PMP)')).toBeInTheDocument();
+    expect(screen.getByText('http://192.168.1.5:8850')).toBeInTheDocument();
+    expect(screen.getByText('Verified')).toBeInTheDocument();
+  });
+
+  it('shows "off" for a worker that does not share', async () => {
+    stubFetch([QUIET_WORKER]);
+    renderWorkers();
+    expect(await screen.findByText('Off')).toBeInTheDocument();
+  });
+
+  it('shows "not reachable" when the platform could not connect', async () => {
+    stubFetch([{ ...BASE_WORKER, peer_reachable: false }]);
+    renderWorkers();
+    expect(await screen.findByText('Not reachable')).toBeInTheDocument();
+  });
+
+  it('shows "not checked" before the first check', async () => {
+    stubFetch([{ ...BASE_WORKER, peer_reachable: null }]);
+    renderWorkers();
+    expect(await screen.findByText('Not checked')).toBeInTheDocument();
+  });
+
+  it('shows LAN-only workers as LAN only', async () => {
+    stubFetch([{ ...BASE_WORKER, peer_nat: 'lan', peer_url: 'http://192.168.1.5:8850', peer_reachable: false }]);
+    renderWorkers();
+    expect(await screen.findByText('LAN only')).toBeInTheDocument();
   });
 });
