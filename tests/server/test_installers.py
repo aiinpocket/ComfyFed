@@ -885,3 +885,93 @@ def test_generated_comfyui_launcher_sh_syntax_checks():
             f.write(launcher)
         result = subprocess.run([bash, "-n", path], capture_output=True, text=True)
         assert result.returncode == 0, result.stderr
+
+
+# --- Phase 3.4 §11: 安裝腳本自動探測 P2P ------------------------------------
+
+
+def _installer_text(name: str) -> str:
+    path = os.path.join(installer_routes.installers_dir(), name)
+    with open(path, "r", encoding="utf-8-sig") as f:
+        return f.read()
+
+
+@pytest.mark.parametrize("name", ["install.ps1", "install.sh"])
+def test_installers_run_the_p2p_probe(name):
+    text = _installer_text(name)
+    assert "p2p-probe" in text
+    assert "--json" in text
+
+
+@pytest.mark.parametrize("name", ["install.ps1", "install.sh"])
+def test_installers_probe_after_comfyui_and_before_autostart(name):
+    """spec §11：註冊完成、偵測 ComfyUI 之後，設定自動啟動之前。"""
+    text = _installer_text(name)
+    probe_at = text.index("p2p-probe")
+    comfy_at = text.index('"$HELPER_SCRIPT" check' if name == "install.sh" else "$HelperScript check")
+    autostart_at = text.index("# 5. Autostart" if name == "install.sh" else "# 5. Launcher + autostart")
+    assert comfy_at < probe_at < autostart_at
+
+
+@pytest.mark.parametrize("name", ["install.ps1", "install.sh"])
+def test_installers_enable_sharing_through_the_helper(name):
+    text = _installer_text(name)
+    assert "p2p_enable" in text
+    assert "8850" in text
+
+
+@pytest.mark.parametrize("name", ["install.ps1", "install.sh"])
+def test_installers_print_both_p2p_outcomes_bilingually(name):
+    text = _installer_text(name)
+    assert "路由器支援自動開埠" in text
+    assert "Your router supports automatic port mapping" in text
+    assert "路由器沒有回應 UPnP／NAT-PMP" in text
+    assert "Your router did not answer UPnP/NAT-PMP" in text
+
+
+@pytest.mark.parametrize("name", ["install.ps1", "install.sh"])
+def test_helper_p2p_enable_respects_an_existing_choice(name):
+    """腳本內嵌的 helper 原始碼必須含有「只在 peer_serve 為 false 且
+    peer_listen_port 為 null 時才自動開啟」這個判斷。"""
+    text = _installer_text(name)
+    assert "peer_listen_port" in text
+    assert "respected" in text
+
+
+def test_helper_p2p_enable_only_enables_a_virgin_config(tmp_path):
+    """把 install.sh 裡那份 helper 抽出來實跑，驗證三種既有設定的行為。"""
+    import json
+    import subprocess
+    import sys
+
+    text = _installer_text("install.sh")
+    start = text.index('cat > "$HELPER_SCRIPT" <<\'PYEOF\'\n') + len('cat > "$HELPER_SCRIPT" <<\'PYEOF\'\n')
+    end = text.index("\nPYEOF", start)
+    helper_path = tmp_path / "_installer_helper.py"
+    helper_path.write_text(text[start:end], encoding="utf-8")
+
+    def run(config: dict) -> dict:
+        cfg_path = tmp_path / "agent.json"
+        cfg_path.write_text(json.dumps(config), encoding="utf-8")
+        subprocess.run(
+            [sys.executable, str(helper_path), "p2p_enable", str(cfg_path), "8850"],
+            check=True,
+            capture_output=True,
+        )
+        return json.loads(cfg_path.read_text(encoding="utf-8"))
+
+    base = {"platforms": [], "comfy_url": "http://127.0.0.1:8188"}
+
+    # 1. 從未設定過 → 自動開啟。
+    enabled = run(dict(base))
+    assert enabled["peer_serve"] is True
+    assert enabled["peer_listen_port"] == 8850
+
+    # 2. 使用者自己設過埠但關著分享 → 尊重，不動。
+    respected = run({**base, "peer_serve": False, "peer_listen_port": 9000})
+    assert respected["peer_serve"] is False
+    assert respected["peer_listen_port"] == 9000
+
+    # 3. 已經開著 → 不動。
+    already = run({**base, "peer_serve": True, "peer_listen_port": 9000})
+    assert already["peer_listen_port"] == 9000

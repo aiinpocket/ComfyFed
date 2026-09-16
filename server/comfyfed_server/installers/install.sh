@@ -444,6 +444,34 @@ def cmd_capture(pid, comfy_url, marker_path):
         json.dump(marker, fh)
 
 
+def cmd_p2p_enable(config_path, port):
+    """spec §11：路由器探測成功後，把模型分享打開 —— 但只在使用者從未表態
+    的情況下。規則刻意極簡：`peer_serve` 目前為 false **且** `peer_listen_port`
+    為 null（從未設定過）才寫入；曾經手動設過埠或手動關掉分享的一律尊重，
+    安裝腳本不會把它改回來。"""
+    import json
+    import os
+
+    try:
+        with open(config_path, "r", encoding="utf-8-sig") as f:
+            config = json.load(f)
+    except (OSError, ValueError):
+        print("respected")
+        return
+
+    if config.get("peer_serve") or config.get("peer_listen_port") is not None:
+        print("respected")
+        return
+
+    config["peer_serve"] = True
+    config["peer_listen_port"] = int(port)
+    tmp_path = config_path + ".tmp"
+    with open(tmp_path, "w", encoding="utf-8") as f:
+        json.dump(config, f, ensure_ascii=False, indent=2)
+    os.replace(tmp_path, config_path)
+    print("enabled")
+
+
 if __name__ == "__main__":
     command = sys.argv[1]
     if command == "check":
@@ -452,6 +480,8 @@ if __name__ == "__main__":
         cmd_apply(sys.argv[2])
     elif command == "capture":
         cmd_capture(sys.argv[2], sys.argv[3], sys.argv[4])
+    elif command == "p2p_enable":
+        cmd_p2p_enable(sys.argv[2], sys.argv[3])
     else:
         print(f"unknown command: {command}", file=sys.stderr)
         sys.exit(2)
@@ -703,6 +733,30 @@ if [ -n "${COMFY_CWD:-}" ] && [ -d "$COMFY_CWD" ]; then cd "$COMFY_CWD"; fi
 eval "exec $COMFY_CMD"
 LAUNCHEOF
     chmod +x "$COMFY_LAUNCHER"
+fi
+
+# ---------------------------------------------------------------------------
+# 4c. P2P probe (spec §11)
+# ---------------------------------------------------------------------------
+# 探一下路由器肯不肯自動開埠；肯就順手把模型分享打開（只在使用者從未表態
+# 時）。探測本身最多 8 秒、不留映射，失敗完全不影響安裝流程。
+bilingual "偵測 P2P 分享能力（詢問路由器是否支援自動開埠）..." \
+    "Checking whether this network can share models over P2P..."
+P2P_PROBE_OUT="$("$VENV_AGENT" p2p-probe --port 8850 --json 2>/dev/null)" && P2P_PROBE_RC=0 || P2P_PROBE_RC=$?
+if [ "${P2P_PROBE_RC:-1}" -eq 0 ]; then
+    P2P_METHOD="$("$VENV_PYTHON" -c "
+import json, sys
+try:
+    print(json.loads(sys.argv[1]).get('method') or 'unknown')
+except Exception:
+    print('unknown')
+" "$P2P_PROBE_OUT")"
+    "$VENV_PYTHON" "$HELPER_SCRIPT" p2p_enable "$AGENT_CONFIG_PATH" 8850 >/dev/null 2>&1 || true
+    bilingual "路由器支援自動開埠（$P2P_METHOD），已開啟模型分享（連接埠 8850）" \
+        "Your router supports automatic port mapping ($P2P_METHOD); model sharing is on (port 8850)"
+else
+    bilingual "路由器沒有回應 UPnP／NAT-PMP，未開啟模型分享；到路由器開啟 UPnP 後重跑安裝指令即可自動開啟，或手動設定 peer_advertise_host 與轉埠" \
+        "Your router did not answer UPnP/NAT-PMP, so model sharing stays off; enable UPnP on the router and re-run this installer, or set peer_advertise_host and forward the port by hand"
 fi
 
 # ---------------------------------------------------------------------------
