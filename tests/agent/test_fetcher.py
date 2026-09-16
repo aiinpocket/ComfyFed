@@ -1413,3 +1413,125 @@ async def test_cancel_mid_peer_pull_cleans_up(tmp_path, monkeypatch):
         assert not (dest / "checkpoints" / "model.bin").exists()
     finally:
         srv.stop()
+
+
+# --- Phase 3.4 Task 5: seeder_urls 依序嘗試 --------------------------------
+
+
+async def _noop_on_bytes(_count: int) -> None:
+    return None
+
+
+def _platform_entry():
+    return PlatformEntry(
+        platform_url="http://platform.example",
+        platform_pubkey="00" * 32,
+        worker_id="w-1",
+        certificate="cert",
+        signing_key_hex="11" * 32,
+    )
+
+
+def test_seeder_urls_prefers_the_list():
+    assert fetcher._seeder_urls(
+        {"peer_url": "http://a:1", "seeder_urls": ["http://lan:1", "http://a:1"]}
+    ) == ["http://lan:1", "http://a:1"]
+
+
+def test_seeder_urls_falls_back_to_peer_url_for_an_old_platform():
+    assert fetcher._seeder_urls({"peer_url": "http://a:1"}) == ["http://a:1"]
+
+
+def test_seeder_urls_ignores_a_malformed_list():
+    assert fetcher._seeder_urls({"peer_url": "http://a:1", "seeder_urls": [1, None]}) == ["http://a:1"]
+    assert fetcher._seeder_urls({"peer_url": "http://a:1", "seeder_urls": "nope"}) == ["http://a:1"]
+
+
+def test_seeder_urls_with_nothing_usable_is_empty():
+    assert fetcher._seeder_urls({}) == []
+
+
+def test_peer_connect_timeout_is_five_seconds():
+    assert fetcher._PEER_CONNECT_TIMEOUT_SECONDS == 5.0
+    assert fetcher._PEER_READ_TIMEOUT_SECONDS == 120.0
+
+
+@pytest.mark.asyncio
+async def test_fetch_via_peer_tries_the_second_url_when_the_first_fails(monkeypatch, tmp_path):
+    """第一個位址連不上（_PeerFailure）⇒ 換第二個，成功就不落回 URL 鏈。"""
+    attempts: list[str] = []
+
+    async def fake_pull(**kwargs):
+        attempts.append(kwargs["peer_url"])
+        if len(attempts) == 1:
+            raise fetcher._PeerFailure("connect timeout")
+        # 第二個位址成功：把完整內容寫進 .part。
+        with open(kwargs["target_path"] + fetcher._PART_SUFFIX, "wb") as f:
+            f.write(b"hello")
+
+    monkeypatch.setattr(fetcher, "_pull_chunks_from_offset", fake_pull)
+
+    async def fake_grant(**kwargs):
+        return {
+            "grant": {"sig": "x", "expires_at": 2**31},
+            "peer_url": "http://203.0.113.7:8850",
+            "seeder_urls": ["http://203.0.113.7:8850", "http://192.168.1.5:8850"],
+            "chunk_sha256s": None,
+        }
+
+    monkeypatch.setattr(fetcher, "_request_peer_grant", fake_grant)
+
+    target = str(tmp_path / "m.safetensors")
+    entry = {
+        "name": "m.safetensors",
+        "directory": "checkpoints",
+        "size_bytes": 5,
+        "sha256": hashlib.sha256(b"hello").hexdigest(),
+    }
+
+    ok = await fetcher._fetch_via_peer(
+        entry=entry,
+        target_path=target,
+        platform_entry=_platform_entry(),
+        cancel_event=asyncio.Event(),
+        on_bytes=_noop_on_bytes,
+        peer_client_factory=httpx.AsyncClient,
+        platform_client_factory=httpx.AsyncClient,
+    )
+
+    assert ok is True
+    assert attempts == ["http://203.0.113.7:8850", "http://192.168.1.5:8850"]
+
+
+@pytest.mark.asyncio
+async def test_fetch_via_peer_falls_back_to_the_url_chain_when_every_url_fails(monkeypatch, tmp_path):
+    attempts: list[str] = []
+
+    async def fake_pull(**kwargs):
+        attempts.append(kwargs["peer_url"])
+        raise fetcher._PeerFailure("connect timeout")
+
+    monkeypatch.setattr(fetcher, "_pull_chunks_from_offset", fake_pull)
+
+    async def fake_grant(**kwargs):
+        return {
+            "grant": {"sig": "x", "expires_at": 2**31},
+            "peer_url": "http://203.0.113.7:8850",
+            "seeder_urls": ["http://203.0.113.7:8850", "http://192.168.1.5:8850"],
+            "chunk_sha256s": None,
+        }
+
+    monkeypatch.setattr(fetcher, "_request_peer_grant", fake_grant)
+
+    ok = await fetcher._fetch_via_peer(
+        entry={"name": "m.safetensors", "directory": "checkpoints", "size_bytes": 5, "sha256": "0" * 64},
+        target_path=str(tmp_path / "m.safetensors"),
+        platform_entry=_platform_entry(),
+        cancel_event=asyncio.Event(),
+        on_bytes=_noop_on_bytes,
+        peer_client_factory=httpx.AsyncClient,
+        platform_client_factory=httpx.AsyncClient,
+    )
+
+    assert ok is False
+    assert attempts == ["http://203.0.113.7:8850", "http://192.168.1.5:8850"]

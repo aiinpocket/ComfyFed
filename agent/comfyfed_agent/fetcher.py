@@ -73,7 +73,12 @@ _PEER_GRANT_PATH = "/api/agent/peer-grant"
 # precedent for these cross-process wire-shape constants.
 _PEER_ROUTE_PREFIX = "/peer/models/"
 _PEER_GRANT_HEADER = "X-ComfyFed-Grant"
-_PEER_CONNECT_TIMEOUT_SECONDS = 30.0
+# Phase 3.4 §5：每個候選位址的 connect timeout 從 30 秒縮到 5 秒。現在一次
+# grant 可能有多個位址要依序試（區網 → 對外），30 秒 × N 會讓一台連不到的
+# 種子把整個 fetch 拖死；而平台在派 grant 之前已經驗過對外位址連得到
+# （peerhealth），所以 5 秒對「真的活著」的種子綽綽有餘。
+# read timeout 不變（120 秒）：那是傳輸中途的停頓，跟連不連得上無關。
+_PEER_CONNECT_TIMEOUT_SECONDS = 5.0
 _PEER_READ_TIMEOUT_SECONDS = 120.0
 # Cap on consecutive re-grants that make NO forward progress (offset
 # unchanged after re-verifying `.part`) before giving up on the peer source
@@ -474,6 +479,20 @@ def _inventory_name(entry: dict) -> str:
     return f"{directory}/{name}" if directory else name
 
 
+def _seeder_urls(grant_response: dict) -> list[str]:
+    """這張 grant 該依序嘗試的種子位址（spec §5）。新平台給 `seeder_urls`
+    （第一個就等於 `peer_url`）；舊平台只有 `peer_url`，退回單元素清單。
+    型別不對的 `seeder_urls` 一律當作沒有 —— 一個惡意／壞掉的平台回應不該
+    讓 agent 去連一串不知道是什麼的東西。"""
+    urls = grant_response.get("seeder_urls")
+    if isinstance(urls, list):
+        cleaned = [u for u in urls if isinstance(u, str) and u]
+        if cleaned:
+            return cleaned
+    peer_url = grant_response.get("peer_url")
+    return [peer_url] if isinstance(peer_url, str) and peer_url else []
+
+
 async def _request_peer_grant(
     *,
     platform_entry: PlatformEntry,
@@ -596,6 +615,7 @@ async def _pull_chunks_from_offset(
     inventory_name: str,
     target_path: str,
     grant_response: dict,
+    peer_url: str,
     start_offset: int,
     cancel_event,
     on_bytes: Callable[[int], Awaitable[None]],
@@ -619,9 +639,10 @@ async def _pull_chunks_from_offset(
     size_bytes = entry.get("size_bytes")
     part_path = target_path + _PART_SUFFIX
     chunk_sha256s = None if ignore_chunk_verification else grant_response.get("chunk_sha256s")
-    peer_url = grant_response.get("peer_url")
+    # Phase 3.4：位址由呼叫端逐一指定（`seeder_urls` 依序嘗試），不再從
+    # grant 回應裡自己撈 —— 同一張 grant 可以對多個位址使用。
     grant = grant_response.get("grant")
-    if not isinstance(peer_url, str) or not peer_url or not isinstance(grant, dict) or "sig" not in grant:
+    if not peer_url or not isinstance(grant, dict) or "sig" not in grant:
         raise _PeerFailure("malformed peer grant response")
 
     url = peer_url.rstrip("/") + _PEER_ROUTE_PREFIX + quote(inventory_name, safe="")
@@ -736,6 +757,13 @@ async def _fetch_via_peer(
     # (bad data from the network, not a bad chunk table), so it falls back to
     # the URL chain exactly as before.
     blind_retry_used = False
+    # spec §5：依序嘗試每個位址，每個 connect 5 秒，全部失敗才落回官方
+    # 載點鏈。`seeder_urls` 由平台排序（同 NAT ⇒ 區網優先）。
+    candidate_urls = _seeder_urls(grant_response)
+    if not candidate_urls:
+        logger.info("fetcher: peer grant for %r carried no usable address, falling back to URL chain", name)
+        return False
+    url_index = 0
 
     while True:
         offset_before_attempt = offset
@@ -746,6 +774,7 @@ async def _fetch_via_peer(
                 inventory_name=inventory_name,
                 target_path=target_path,
                 grant_response=grant_response,
+                peer_url=candidate_urls[url_index],
                 start_offset=offset,
                 cancel_event=cancel_event,
                 on_bytes=on_bytes,
@@ -771,6 +800,9 @@ async def _fetch_via_peer(
                 return False
             grant_response = new_grant_response
             chunk_sha256s = grant_response.get("chunk_sha256s")
+            # 新 grant 可能指向不同的種子／不同的位址順序，整組換掉並從頭試。
+            candidate_urls = _seeder_urls(grant_response) or candidate_urls
+            url_index = 0
             # Recompute from disk: any bytes already pulled under the
             # expired grant were already reported via on_bytes as they
             # landed, so this must NOT be re-reported here.
@@ -815,8 +847,20 @@ async def _fetch_via_peer(
             _safe_unlink(part_path)
             return False
         except _PeerFailure as exc:
+            failed_url = candidate_urls[url_index]
+            url_index += 1
+            if url_index < len(candidate_urls):
+                # 還有下一個位址（典型情況：對外位址 hairpin 不過，改走區網）。
+                # `.part` 留著：同一張 grant、同一個檔案，換位址續傳即可。
+                logger.info(
+                    "fetcher: peer pull from %s failed for %r (%s), trying the next seeder address %s",
+                    failed_url, name, exc, candidate_urls[url_index],
+                )
+                offset = _verify_local_chunks(part_path, chunk_sha256s, size_bytes)
+                continue
             logger.info(
-                "fetcher: peer pull failed for %r (%s), falling back to URL chain", name, exc
+                "fetcher: peer pull failed for %r (%s) on every advertised address, "
+                "falling back to URL chain", name, exc,
             )
             _safe_unlink(part_path)
             return False
@@ -826,7 +870,7 @@ async def _fetch_via_peer(
         target_path=target_path,
         expected_sha256=entry.get("sha256"),
         expected_size=size_bytes,
-        source_label=f"peer:{grant_response.get('peer_url')}",
+        source_label=f"peer:{candidate_urls[url_index]}",
     )
     if error is not None:
         logger.info("fetcher: peer whole-file verify failed for %r (%s), falling back to URL chain", name, error)
