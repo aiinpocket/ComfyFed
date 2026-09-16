@@ -1,8 +1,10 @@
-import { afterEach, beforeEach, describe, expect, it } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import worker from "../src/index";
 import { env, createExecutionContext, waitOnExecutionContext, runDurableObjectAlarm, runInDurableObject } from "cloudflare:test";
 import { call, db, SETUP_TOKEN } from "./helpers/http";
-import { connectAgent, connectPanel, collectMessages, expectNoMessage, hub, nextMessage, waitFor } from "./helpers/ws";
+import { connectAgent, connectPanel, collectMessages, expectNoMessage, hub, nextMessage, openAgentWs, waitFor } from "./helpers/ws";
+import * as modelManifest from "../src/core/model_manifest";
+import * as peerhealth from "../src/core/peerhealth";
 import { signRequest } from "../src/lib/signing";
 import { signHex, verifyHex, derivePublicKeyHexFromSeed } from "../src/lib/ed25519";
 import { bytesToHex } from "../src/lib/hex";
@@ -1377,4 +1379,246 @@ describe("cloud end-to-end", () => {
     },
     30_000
   );
+});
+
+// ===========================================================================
+// Phase 3.4 Task 9: P2P NAT traversal, end to end.
+//
+// Parity twin: tests/server/test_peer.py's `test_e2e_*` block.
+//
+// Deliberately NOT the direct-DB `makeSeeder` shortcut peer.spec.ts uses:
+// the point here is the whole chain wired together -- a real agent WS
+// handshake (whose `ready` carries `CF-Connecting-IP`), a real hello, the
+// Hub's reachability check really running, its verdict really deciding who
+// counts as a seeder, and the grant route really emitting `seeder_urls` in
+// the order the fetcher will try them. peerhealth.spec.ts / hub.spec.ts /
+// peer.spec.ts remain the source of truth for each step's edge cases.
+//
+// `probePeerHealth` is the one function that really `fetch`es (see
+// core/peerhealth.ts's docstring), so that is the mock seam -- and the
+// hostname case must never reach it, which is why that test asserts zero
+// calls rather than just a NULL verdict.
+
+describe("Phase 3.4 e2e: reachability decides who seeds", () => {
+  const KEYPAIRS = golden.keypairs;
+
+  afterEach(async () => {
+    vi.restoreAllMocks();
+    await db().prepare("DELETE FROM model_hashes").run();
+    await db().prepare("DELETE FROM p2p_grants").run();
+  });
+
+  /** Inserts a registered-looking worker row directly (ported from
+   * hub.spec.ts's helper of the same name -- e2e.spec.ts has no `makeWorker`
+   * of its own; its `connectIdleSplitWorker` is scoped to the split chain's
+   * describe and drives the console register flow, which none of these
+   * assertions need). A row plus its pubkey is all the agent WS handshake
+   * and the signed grant POST look at. */
+  async function makeWorker(opts: { pubkeyHex: string; id?: string }): Promise<string> {
+    const id = opts.id ?? `w-${crypto.randomUUID().slice(0, 8)}`;
+    await db()
+      .prepare("INSERT INTO workers (id, name, pubkey, created_at, disabled, deleted) VALUES (?, ?, ?, ?, 0, 0)")
+      .bind(id, id, opts.pubkeyHex, toSqliteTimestamp(new Date()))
+      .run();
+    return id;
+  }
+
+  async function peerColumns(workerId: string): Promise<any> {
+    return db()
+      .prepare("SELECT peer_url, peer_lan_url, peer_nat, peer_reachable, peer_checked_at, remote_ip FROM workers WHERE id = ?")
+      .bind(workerId)
+      .first<any>();
+  }
+
+  interface SeederSetup {
+    seederId: string;
+    pullerId: string;
+    pullerSeed: string;
+    name: string;
+    sizeBytes: number;
+    ready: any;
+    pushed: any;
+  }
+
+  /** Brings up one seeder (real handshake + real hello, so the Hub's
+   * reachability check really runs) and one puller, then gives the seeder
+   * the inventory + consensus hash the grant route looks for.
+   *
+   * `expectPeerStatus: false` is the hostname case: `peerhealth.refresh`
+   * never calls `notify` for a DNS-name `peer_url`, so there is no frame to
+   * wait on -- the stamped `peer_checked_at` is the sync point instead. */
+  async function setUpSeederAndPuller(opts: {
+    seederPeerUrl: string;
+    seederPeerLanUrl?: string;
+    seederPeerNat?: string;
+    seederRemoteIp: string;
+    pullerRemoteIp: string;
+    expectPeerStatus?: boolean;
+  }): Promise<SeederSetup> {
+    const seederKp = KEYPAIRS[0]!;
+    const pullerKp = KEYPAIRS[1]!;
+    const seederId = await makeWorker({ pubkeyHex: seederKp.pubkey_hex });
+    const pullerId = await makeWorker({ pubkeyHex: pullerKp.pubkey_hex });
+    const name = "checkpoints/e2e.safetensors";
+    const sizeBytes = 4096;
+    const sha256 = "a".repeat(64);
+
+    const ws = await openAgentWs({ "CF-Connecting-IP": opts.seederRemoteIp });
+    const challenge = await nextMessage(ws);
+    ws.send(
+      JSON.stringify({
+        type: "auth",
+        worker_id: seederId,
+        sig: await signHex(seederKp.seed_hex, new TextEncoder().encode(challenge.nonce)),
+      })
+    );
+    const ready = await nextMessage(ws);
+    expect(ready.type).toBe("ready");
+
+    const expectPeerStatus = opts.expectPeerStatus ?? true;
+    const statusPromise = expectPeerStatus ? nextMessage(ws) : null;
+    ws.send(
+      JSON.stringify({
+        type: "hello",
+        protocol: 4,
+        peer_url: opts.seederPeerUrl,
+        peer_lan_url: opts.seederPeerLanUrl ?? null,
+        peer_nat: opts.seederPeerNat ?? "upnp",
+      })
+    );
+    let pushed: any = null;
+    if (statusPromise) {
+      pushed = await statusPromise;
+    } else {
+      await waitFor(
+        async () => ((await peerColumns(seederId)).peer_checked_at ? true : undefined),
+        { label: "the hostname hello's check stamped peer_checked_at" }
+      );
+    }
+    ws.close();
+
+    await db()
+      .prepare("UPDATE workers SET status = 'online', protocol = 4, model_inventory = ? WHERE id = ?")
+      .bind(JSON.stringify([{ name, size_bytes: sizeBytes, sha256 }]), seederId)
+      .run();
+    await db()
+      .prepare("UPDATE workers SET status = 'online', protocol = 4, remote_ip = ? WHERE id = ?")
+      .bind(opts.pullerRemoteIp, pullerId)
+      .run();
+    await modelManifest.recordHash(db(), "some-worker", name, sizeBytes, sha256);
+
+    return { seederId, pullerId, pullerSeed: pullerKp.seed_hex, name, sizeBytes, ready, pushed };
+  }
+
+  function postGrantRaw(pullerId: string, pullerSeed: string, body: { name: string; size_bytes: number }) {
+    return signedCall(pullerId, pullerSeed, "POST", "/api/agent/peer-grant", new TextEncoder().encode(JSON.stringify(body)));
+  }
+
+  it("a verified seeder is granted with seeder_urls, and ready carried CF-Connecting-IP", async () => {
+    const probe = vi.spyOn(peerhealth, "probePeerHealth").mockResolvedValue(true);
+    const setup = await setUpSeederAndPuller({
+      seederPeerUrl: "http://203.0.113.7:8850",
+      seederPeerLanUrl: "http://192.168.1.5:8850",
+      seederRemoteIp: "203.0.113.7",
+      pullerRemoteIp: "198.51.100.9",
+    });
+
+    expect(setup.ready.remote_ip).toBe("203.0.113.7");
+    expect(setup.pushed).toEqual({
+      type: "peer_status",
+      reachable: true,
+      checked_url: "http://203.0.113.7:8850/peer/health",
+    });
+    expect(probe).toHaveBeenCalledWith("http://203.0.113.7:8850/peer/health");
+    const columns = await peerColumns(setup.seederId);
+    expect(columns.peer_reachable).toBe(1);
+    expect(columns.peer_nat).toBe("upnp");
+    expect(columns.remote_ip).toBe("203.0.113.7");
+
+    const res = await postGrantRaw(setup.pullerId, setup.pullerSeed, { name: setup.name, size_bytes: setup.sizeBytes });
+
+    expect(res.status).toBe(200);
+    expect(res.body.seeder_urls).toEqual(["http://203.0.113.7:8850"]);
+    expect(res.body.peer_url).toBe("http://203.0.113.7:8850");
+    expect(res.body.grant.seeder_id).toBe(setup.seederId);
+    expect(res.body.grant.puller_id).toBe(setup.pullerId);
+  });
+
+  it("an unreachable seeder is never chosen", async () => {
+    vi.spyOn(peerhealth, "probePeerHealth").mockResolvedValue(false);
+    const setup = await setUpSeederAndPuller({
+      seederPeerUrl: "http://203.0.113.7:8850",
+      seederRemoteIp: "203.0.113.7",
+      pullerRemoteIp: "198.51.100.9",
+    });
+
+    expect(setup.pushed).toEqual({
+      type: "peer_status",
+      reachable: false,
+      checked_url: "http://203.0.113.7:8850/peer/health",
+    });
+    expect((await peerColumns(setup.seederId)).peer_reachable).toBe(0);
+
+    const res = await postGrantRaw(setup.pullerId, setup.pullerSeed, { name: setup.name, size_bytes: setup.sizeBytes });
+
+    expect(res.status).toBe(404);
+    expect(res.body.error.code).toBe("peer.no_seeder");
+  });
+
+  it("same remote_ip gets the LAN address first", async () => {
+    vi.spyOn(peerhealth, "probePeerHealth").mockResolvedValue(false);
+    const setup = await setUpSeederAndPuller({
+      seederPeerUrl: "http://203.0.113.7:8850",
+      seederPeerLanUrl: "http://192.168.1.5:8850",
+      seederRemoteIp: "203.0.113.7",
+      pullerRemoteIp: "203.0.113.7",
+    });
+
+    expect((await peerColumns(setup.seederId)).peer_reachable).toBe(0);
+
+    const res = await postGrantRaw(setup.pullerId, setup.pullerSeed, { name: setup.name, size_bytes: setup.sizeBytes });
+
+    expect(res.status).toBe(200);
+    expect(res.body.seeder_urls).toEqual(["http://192.168.1.5:8850", "http://203.0.113.7:8850"]);
+    expect(res.body.peer_url).toBe("http://192.168.1.5:8850");
+  });
+
+  it("a hostname peer_url is never probed: not a seeder far away, still one on the same LAN", async () => {
+    const probe = vi.spyOn(peerhealth, "probePeerHealth").mockResolvedValue(true);
+    const setup = await setUpSeederAndPuller({
+      seederPeerUrl: "http://seeder.example.com:8850",
+      seederPeerLanUrl: "http://192.168.1.5:8850",
+      seederPeerNat: "manual",
+      seederRemoteIp: "203.0.113.7",
+      pullerRemoteIp: "198.51.100.9",
+      expectPeerStatus: false,
+    });
+
+    expect(setup.ready.remote_ip).toBe("203.0.113.7");
+    expect(setup.pushed).toBeNull();
+    expect(probe).not.toHaveBeenCalled();
+    const columns = await peerColumns(setup.seederId);
+    expect(columns.peer_reachable).toBeNull();
+    expect(columns.peer_url).toBe("http://seeder.example.com:8850");
+
+    const far = await postGrantRaw(setup.pullerId, setup.pullerSeed, { name: setup.name, size_bytes: setup.sizeBytes });
+    expect(far.status).toBe(404);
+    expect(far.body.error.code).toBe("peer.no_seeder");
+
+    // The same seeder, seen from behind the same public IP, still seeds --
+    // over the LAN address, with the (unverified) hostname as the fallback.
+    const nearKp = KEYPAIRS[2]!;
+    const nearId = await makeWorker({ pubkeyHex: nearKp.pubkey_hex });
+    await db()
+      .prepare("UPDATE workers SET status = 'online', protocol = 4, remote_ip = '203.0.113.7' WHERE id = ?")
+      .bind(nearId)
+      .run();
+
+    const near = await postGrantRaw(nearId, nearKp.seed_hex, { name: setup.name, size_bytes: setup.sizeBytes });
+
+    expect(near.status).toBe(200);
+    expect(near.body.seeder_urls).toEqual(["http://192.168.1.5:8850", "http://seeder.example.com:8850"]);
+    expect(near.body.grant.seeder_id).toBe(setup.seederId);
+    expect(probe).not.toHaveBeenCalled();
+  });
 });

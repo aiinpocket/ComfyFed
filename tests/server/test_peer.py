@@ -1412,3 +1412,265 @@ def test_refresh_never_probes_a_non_host_address(client, monkeypatch, url):
     assert probed == []
     with db.get_session() as session:
         assert session.get(db.Worker, worker_id).peer_reachable == 0
+
+
+# --- Phase 3.4 Task 9: 端對端（真的 WS hello → 可連性 → grant） --------------
+#
+# 這一段刻意不用 `_make_online_seeder` 的直接 DB 寫入：整個 Task 9 的重點就是
+# 「agent 真的握手、真的送 hello、平台真的排出可連性檢查、結論真的決定誰是
+# 種子、grant 真的吐出正確順序的 `seeder_urls`」這條鏈接起來。單點行為的邊界
+# 案例仍由 test_agent_ws.py（hello／peer_status）與上面的 peer 測試各自負責。
+#
+# `peerhealth._probe` 是唯一真的發請求的地方（見 peerhealth.py 的模組
+# docstring），所以 mock 縫就開在它身上；名稱型主機那條路徑連 `_probe` 都不該
+# 碰到，測試因此斷言「一次都沒被呼叫」。
+
+
+def _e2e_wait_until(predicate, timeout=5.0):
+    """輪詢到 `predicate()` 回真（背景檢查任務是 `asyncio.create_task` 排出去
+    的，沒有可等的 handle）。Parity: test_agent_ws.py 的 `_wait_until`。"""
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        value = predicate()
+        if value:
+            return value
+        time.sleep(0.02)
+    raise AssertionError("condition never became true")
+
+
+def _peer_columns(worker_id):
+    with db.get_session() as session:
+        worker = session.get(db.Worker, worker_id)
+        return {
+            "peer_url": worker.peer_url,
+            "peer_lan_url": worker.peer_lan_url,
+            "peer_nat": worker.peer_nat,
+            "peer_reachable": worker.peer_reachable,
+            "peer_checked_at": worker.peer_checked_at,
+            "remote_ip": worker.remote_ip,
+        }
+
+
+def _hello_over_ws(client, worker_id, sk, hello, *, headers=None, expect_peer_status=True):
+    """完整跑一次握手 + hello 走真的 WS route，回傳 `(ready, pushed)`。
+
+    `expect_peer_status=True` 時把推回來的 `peer_status` 當同步點；名稱型
+    `peer_url` 根本不會推（`peerhealth.refresh` 那條路連 notify 都不呼叫），
+    此時改等 `peer_checked_at` 被蓋上去，`pushed` 回 None。
+    """
+    with client.websocket_connect("/api/agent/ws", headers=headers or {}) as ws:
+        challenge = ws.receive_json()
+        sig = sk.sign(challenge["nonce"].encode()).signature.hex()
+        ws.send_json({"type": "auth", "worker_id": worker_id, "sig": sig})
+        ready = ws.receive_json()
+        ws.send_json(hello)
+        if expect_peer_status:
+            pushed = ws.receive_json()
+        else:
+            pushed = None
+            _e2e_wait_until(lambda: _peer_columns(worker_id)["peer_checked_at"] is not None)
+    return ready, pushed
+
+
+def _publish_inventory(worker_id, name, size_bytes, sha256):
+    """種子宣告庫存並讓平台學到共識雜湊（hello 之後才做，免得 hello 的欄位
+    覆寫把這裡設的 status 洗掉）。"""
+    with db.get_session() as session:
+        worker = session.get(db.Worker, worker_id)
+        worker.status = "online"
+        worker.model_inventory = json.dumps(
+            [{"name": name, "size_bytes": size_bytes, "sha256": sha256}]
+        )
+        session.commit()
+    model_manifest.record_hash(worker_id, name, size_bytes, sha256)
+
+
+def _make_puller(client, csrf, name, remote_ip):
+    """一台上線、protocol 4、有 `remote_ip` 的拉方（grant 路由是拿 worker 列
+    上的 `remote_ip` 判斷同不同 NAT，不是看這次 HTTP 請求的來源）。"""
+    worker_id, sk = _register_worker(client, csrf, name)
+    with db.get_session() as session:
+        worker = session.get(db.Worker, worker_id)
+        worker.status = "online"
+        worker.protocol = 4
+        worker.remote_ip = remote_ip
+        session.commit()
+    return worker_id, sk
+
+
+def _request_grant(client, puller_id, puller_sk, name, size_bytes):
+    return _agent_post(
+        client,
+        puller_id,
+        puller_sk,
+        "/api/agent/peer-grant",
+        {"name": name, "size_bytes": size_bytes},
+    )
+
+
+def test_e2e_reachable_seeder_is_granted_with_seeder_urls(client, monkeypatch):
+    probed = []
+    monkeypatch.setattr(peerhealth, "_probe", lambda url: probed.append(url) or True)
+    csrf = _login(client)
+    seeder_id, seeder_sk = _register_worker(client, csrf, "e2e-seed")
+    puller_id, puller_sk = _make_puller(client, csrf, "e2e-pull", "198.51.100.9")
+    name, size_bytes, sha = "checkpoints/e2e.safetensors", 4096, _sha("e2e")
+
+    ready, pushed = _hello_over_ws(
+        client,
+        seeder_id,
+        seeder_sk,
+        {
+            "type": "hello",
+            "protocol": 4,
+            "peer_url": "http://203.0.113.7:8850",
+            "peer_lan_url": "http://192.168.1.5:8850",
+            "peer_nat": "upnp",
+        },
+        headers={"X-Forwarded-For": "203.0.113.7"},
+    )
+
+    # ready 帶回這次連線的來源 IP（測試以 X-Forwarded-For 注入）。
+    assert ready["type"] == "ready"
+    assert ready["remote_ip"] == "203.0.113.7"
+    assert pushed == {
+        "type": "peer_status",
+        "reachable": True,
+        "checked_url": "http://203.0.113.7:8850/peer/health",
+    }
+    assert probed == ["http://203.0.113.7:8850/peer/health"]
+    columns = _peer_columns(seeder_id)
+    assert columns["peer_reachable"] == 1
+    assert columns["peer_nat"] == "upnp"
+    assert columns["remote_ip"] == "203.0.113.7"
+
+    _publish_inventory(seeder_id, name, size_bytes, sha)
+
+    response = _request_grant(client, puller_id, puller_sk, name, size_bytes)
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["seeder_urls"] == ["http://203.0.113.7:8850"]
+    assert payload["peer_url"] == "http://203.0.113.7:8850"
+    assert payload["grant"]["seeder_id"] == seeder_id
+    assert payload["grant"]["puller_id"] == puller_id
+
+
+def test_e2e_unreachable_seeder_is_never_chosen(client, monkeypatch):
+    monkeypatch.setattr(peerhealth, "_probe", lambda url: False)
+    csrf = _login(client)
+    seeder_id, seeder_sk = _register_worker(client, csrf, "e2e-seed-bad")
+    puller_id, puller_sk = _make_puller(client, csrf, "e2e-pull-bad", "198.51.100.9")
+    name, size_bytes, sha = "checkpoints/bad.safetensors", 4096, _sha("bad")
+
+    _, pushed = _hello_over_ws(
+        client,
+        seeder_id,
+        seeder_sk,
+        {
+            "type": "hello",
+            "protocol": 4,
+            "peer_url": "http://203.0.113.7:8850",
+            "peer_nat": "upnp",
+        },
+        headers={"X-Forwarded-For": "203.0.113.7"},
+    )
+
+    assert pushed == {
+        "type": "peer_status",
+        "reachable": False,
+        "checked_url": "http://203.0.113.7:8850/peer/health",
+    }
+    assert _peer_columns(seeder_id)["peer_reachable"] == 0
+
+    _publish_inventory(seeder_id, name, size_bytes, sha)
+
+    response = _request_grant(client, puller_id, puller_sk, name, size_bytes)
+
+    assert response.status_code == 404
+    assert response.json()["error"]["code"] == "peer.no_seeder"
+
+
+def test_e2e_same_remote_ip_gets_the_lan_address_first(client, monkeypatch):
+    """不可連的種子，只要跟拉方同一個公網 IP 且有區網位址，仍然配得到，
+    而且區網位址排第一（很多家用路由器不支援 hairpin）。"""
+    monkeypatch.setattr(peerhealth, "_probe", lambda url: False)
+    csrf = _login(client)
+    seeder_id, seeder_sk = _register_worker(client, csrf, "e2e-seed-lan")
+    puller_id, puller_sk = _make_puller(client, csrf, "e2e-pull-lan", "203.0.113.7")
+    name, size_bytes, sha = "checkpoints/lan.safetensors", 4096, _sha("lan")
+
+    _hello_over_ws(
+        client,
+        seeder_id,
+        seeder_sk,
+        {
+            "type": "hello",
+            "protocol": 4,
+            "peer_url": "http://203.0.113.7:8850",
+            "peer_lan_url": "http://192.168.1.5:8850",
+            "peer_nat": "upnp",
+        },
+        headers={"X-Forwarded-For": "203.0.113.7"},  # 跟拉方同一個 NAT
+    )
+    assert _peer_columns(seeder_id)["peer_reachable"] == 0
+
+    _publish_inventory(seeder_id, name, size_bytes, sha)
+
+    response = _request_grant(client, puller_id, puller_sk, name, size_bytes)
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["seeder_urls"] == ["http://192.168.1.5:8850", "http://203.0.113.7:8850"]
+    assert payload["peer_url"] == "http://192.168.1.5:8850"
+
+
+def test_e2e_a_hostname_peer_url_is_never_probed(client, monkeypatch):
+    """名稱型主機一律不探（fix round 1）：`peer_reachable` 留 NULL，所以對
+    不同 IP 的拉方不是種子；但對同一個公網 IP 的拉方，區網位址照樣配得出去。
+    """
+    probed = []
+    monkeypatch.setattr(peerhealth, "_probe", lambda url: probed.append(url) or True)
+    csrf = _login(client)
+    seeder_id, seeder_sk = _register_worker(client, csrf, "e2e-seed-host")
+    far_puller_id, far_puller_sk = _make_puller(client, csrf, "e2e-pull-far", "198.51.100.9")
+    near_puller_id, near_puller_sk = _make_puller(client, csrf, "e2e-pull-near", "203.0.113.7")
+    name, size_bytes, sha = "checkpoints/host.safetensors", 4096, _sha("host")
+
+    ready, pushed = _hello_over_ws(
+        client,
+        seeder_id,
+        seeder_sk,
+        {
+            "type": "hello",
+            "protocol": 4,
+            "peer_url": "http://seeder.example.com:8850",
+            "peer_lan_url": "http://192.168.1.5:8850",
+            "peer_nat": "manual",
+        },
+        headers={"X-Forwarded-For": "203.0.113.7"},
+        expect_peer_status=False,
+    )
+
+    assert ready["remote_ip"] == "203.0.113.7"
+    assert pushed is None
+    assert probed == []  # 探針一次都沒被呼叫
+    columns = _peer_columns(seeder_id)
+    assert columns["peer_reachable"] is None
+    assert columns["peer_url"] == "http://seeder.example.com:8850"
+
+    _publish_inventory(seeder_id, name, size_bytes, sha)
+
+    far = _request_grant(client, far_puller_id, far_puller_sk, name, size_bytes)
+    assert far.status_code == 404
+    assert far.json()["error"]["code"] == "peer.no_seeder"
+
+    near = _request_grant(client, near_puller_id, near_puller_sk, name, size_bytes)
+    assert near.status_code == 200
+    near_payload = near.json()
+    assert near_payload["seeder_urls"] == [
+        "http://192.168.1.5:8850",
+        "http://seeder.example.com:8850",
+    ]
+    assert near_payload["grant"]["seeder_id"] == seeder_id
+    assert probed == []
