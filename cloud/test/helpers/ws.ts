@@ -8,8 +8,10 @@ import { env, createExecutionContext, waitOnExecutionContext } from "cloudflare:
 import { expect } from "vitest";
 import { signHex } from "../../src/lib/ed25519";
 
-export async function openAgentWs(): Promise<WebSocket> {
-  const request = new Request("http://example.com/api/agent/ws", { headers: { Upgrade: "websocket" } });
+export async function openAgentWs(headers: Record<string, string> = {}): Promise<WebSocket> {
+  const request = new Request("http://example.com/api/agent/ws", {
+    headers: { Upgrade: "websocket", ...headers },
+  });
   const ctx = createExecutionContext();
   const response = await worker.fetch(request, env as any, ctx);
   await waitOnExecutionContext(ctx);

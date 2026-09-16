@@ -361,7 +361,11 @@ def requeue_stale(now: datetime) -> list[str]:
                 job.progress = 0
                 requeued.append(job.id)
 
-            if worker.status != "offline" or worker.peer_url is not None:
+            if (
+                worker.status != "offline"
+                or worker.peer_url is not None
+                or worker.peer_reachable is not None
+            ):
                 worker.status = "offline"
                 # Phase 3.1 P2P: a seeder endpoint only means anything while
                 # the worker is actually reachable -- clear it here so a
@@ -369,6 +373,10 @@ def requeue_stale(now: datetime) -> list[str]:
                 # agentws._handle_hello, which is the only place peer_url
                 # gets set again, on the agent's next hello).
                 worker.peer_url = None
+                # Phase 3.4 §4.2：可連性是「當時那個位址」的性質，位址一清
+                # 驗證結果就不再成立；留著 1 會讓 `online_seeders` 的新條件
+                # 在下一次 hello 之前誤判這台仍是可用種子。
+                worker.peer_reachable = None
 
             if not worker.deleted:
                 metrics.get_metrics().worker_up.labels(worker=worker.name).set(0)

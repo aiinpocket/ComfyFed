@@ -233,6 +233,15 @@ export interface Worker {
    * not refreshed on heartbeat; cleared on the stale/offline transition
    * (`markWorkerOffline`) -- see `db.Worker.peer_url`'s Python docstring. */
   peerUrl: string | null;
+  /** Phase 3.4 §3.2：`hello.peer_lan_url`，同 NAT 的成員優先用的區網位址。 */
+  peerLanUrl: string | null;
+  /** Phase 3.4 §3.2：`peer_url` 的來源 —— natpmp/upnp/manual/lan/none。 */
+  peerNat: string;
+  /** Phase 3.4 §4.2：null = 未檢查、1 = `/peer/health` 回 204、0 = 不可連。 */
+  peerReachable: number | null;
+  peerCheckedAt: string | null;
+  /** Phase 3.4 §2：`CF-Connecting-IP`，每次 hello 更新。 */
+  remoteIp: string | null;
   /** Phase 3.3 §2.2: 相對全隊的速度係數，1.0 = 平均、2.0 = 兩倍快。 */
   speedIndex: number;
   /** Phase 3.3 §2.2: 最近一次被指派的 job 的 required_models；claim 時寫入。 */
@@ -258,6 +267,11 @@ interface WorkerRow {
   auto_fetch: number;
   deleted: number;
   peer_url: string | null;
+  peer_lan_url: string | null;
+  peer_nat: string;
+  peer_reachable: number | null;
+  peer_checked_at: string | null;
+  remote_ip: string | null;
   speed_index: number;
   warm_models: string;
 }
@@ -282,6 +296,11 @@ function rowToWorker(row: WorkerRow): Worker {
     autoFetch: row.auto_fetch !== 0,
     deleted: row.deleted !== 0,
     peerUrl: row.peer_url,
+    peerLanUrl: row.peer_lan_url,
+    peerNat: row.peer_nat,
+    peerReachable: row.peer_reachable,
+    peerCheckedAt: row.peer_checked_at,
+    remoteIp: row.remote_ip,
     speedIndex: typeof row.speed_index === "number" ? row.speed_index : 1.0,
     warmModels: safeParse(row.warm_models, []),
   };
@@ -352,7 +371,12 @@ export async function getStaleWorkers(db: D1Database, cutoffTimestamp: string): 
  * `dispatch.requeue_stale`'s `worker.status = "offline"; worker.peer_url =
  * None` pair (same session, same commit). */
 export async function markWorkerOffline(db: D1Database, workerId: string): Promise<void> {
-  await db.prepare("UPDATE workers SET status = 'offline', peer_url = NULL WHERE id = ?").bind(workerId).run();
+  // Phase 3.4：`peer_reachable` 跟 `peer_url` 一起清 —— 可連性是那個位址的
+  // 性質，位址一清結論就不成立（parity: dispatch.requeue_stale）。
+  await db
+    .prepare("UPDATE workers SET status = 'offline', peer_url = NULL, peer_reachable = NULL WHERE id = ?")
+    .bind(workerId)
+    .run();
 }
 
 /** Inserts a freshly-registered worker row (Task 5's `POST
@@ -419,14 +443,37 @@ export async function updateWorkerHello(
     .run();
 }
 
-/** Phase 3.1 P2P: writes the hello-reported `peer_url` -- mirrors
+/** Phase 3.1 P2P: writes the hello-reported peer advertisement -- mirrors
  * `agentws._handle_hello`'s `worker.peer_url = peer_url` write, folded into
  * `updateWorkerHello` at the call site (`do/hub.ts`'s `handleHello`) rather
  * than added as a field on that function's `fields` object, since it needs
  * its own null-clearing semantics (fully replaced from each hello, never
- * merged) that the other hello fields don't need to distinguish. */
-export async function updateWorkerPeerUrl(db: D1Database, workerId: string, peerUrl: string | null): Promise<void> {
-  await db.prepare("UPDATE workers SET peer_url = ? WHERE id = ?").bind(peerUrl, workerId).run();
+ * merged) that the other hello fields don't need to distinguish.
+ *
+ * hello 的 P2P 通告一次寫完（Phase 3.4）：`peer_url`/`peer_lan_url`/
+ * `peer_nat` 全量取代，`remote_ip` 只在這次連線解析得到時覆寫，
+ * 並把上一輪的可連性結果作廢（位址換了，舊結論就不成立）。
+ * Ports agentws.py's `_handle_hello` peer writes. */
+export async function updateWorkerPeerAdvert(
+  db: D1Database,
+  workerId: string,
+  fields: { peerUrl: string | null; peerLanUrl: string | null; peerNat: string; remoteIp: string | null }
+): Promise<void> {
+  if (fields.remoteIp === null) {
+    await db
+      .prepare(
+        "UPDATE workers SET peer_url = ?, peer_lan_url = ?, peer_nat = ?, peer_reachable = NULL, peer_checked_at = NULL WHERE id = ?"
+      )
+      .bind(fields.peerUrl, fields.peerLanUrl, fields.peerNat, workerId)
+      .run();
+    return;
+  }
+  await db
+    .prepare(
+      "UPDATE workers SET peer_url = ?, peer_lan_url = ?, peer_nat = ?, remote_ip = ?, peer_reachable = NULL, peer_checked_at = NULL WHERE id = ?"
+    )
+    .bind(fields.peerUrl, fields.peerLanUrl, fields.peerNat, fields.remoteIp, workerId)
+    .run();
 }
 
 /** Applies a `heartbeat` message's worker-row writes -- mirrors

@@ -112,6 +112,22 @@ class Worker(Base):
     # whenever the worker is marked offline (see dispatch.requeue_stale) so
     # a stale endpoint is never handed out as a seeder.
     peer_url: Mapped[Optional[str]] = mapped_column(String, nullable=True)
+    # Phase 3.4 §4.1：區網位址（`hello.peer_lan_url`），永遠與 `peer_url` 一起
+    # 回報，供「拉方與種子同一個 remote_ip ⇒ 同一個 NAT」時優先使用。跟
+    # `peer_url` 一樣是 hello-only、每次 hello 全量取代。
+    peer_lan_url: Mapped[Optional[str]] = mapped_column(String, nullable=True)
+    # Phase 3.4 §3.2：`peer_url` 是怎麼來的 —— natpmp/upnp/manual/lan/none。
+    # 舊 agent 不帶 ⇒ "lan"（server_default 也是 lan，既有列不必回填）。
+    peer_nat: Mapped[str] = mapped_column(String, default="lan", server_default="lan")
+    # Phase 3.4 §4.2：平台自己打 `<peer_url>/peer/health` 的結果。
+    # None = 尚未檢查、1 = 204 通過、0 = 靜態拒絕或檢查失敗。
+    # 與 `peer_url` 一起在 dispatch.requeue_stale 清掉。
+    peer_reachable: Mapped[Optional[int]] = mapped_column(Integer, nullable=True)
+    peer_checked_at: Mapped[Optional[datetime]] = mapped_column(DateTime, nullable=True)
+    # Phase 3.4 §2：這台 worker 連過來的公網 IP（X-Forwarded-For 第一跳，
+    # 否則 request.client.host），每次 hello 更新。兩台 worker 的
+    # `remote_ip` 相同 ⇒ 極可能在同一個 NAT 後面 ⇒ 可以互相走區網位址。
+    remote_ip: Mapped[Optional[str]] = mapped_column(String, nullable=True)
     # Phase 3.3 §2.2: 相對全隊的速度係數，1.0 = 平均、2.0 = 兩倍快。
     # 由 stats.record_completion 在每次有效 job_done 後更新，夾在
     # [SPEED_MIN, SPEED_MAX]。

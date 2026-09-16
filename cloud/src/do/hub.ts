@@ -172,6 +172,10 @@ interface AgentAttachment {
   workerId: string | null;
   protocol: number;
   state: "idle" | "busy" | "dispatched" | "paused";
+  /** Phase 3.4 §2：upgrade 請求的 `CF-Connecting-IP`（Cloudflare 提供，
+   * 權威，不可偽造）。存在 attachment 裡是因為 hello 是後續的一個訊息，
+   * 那時已經沒有原始 `Request` 可以再讀一次 header 了。 */
+  remoteIp?: string | null;
 }
 
 /** A connected panel (ComfyUI-frontend) client -- ports panelws.py's
@@ -342,6 +346,35 @@ function parsePeerUrl(value: unknown, workerId: string): string | null {
   return value;
 }
 
+/** Ports agentws.py's `_PEER_NAT_VALUES` / `_parse_peer_nat`. */
+const PEER_NAT_VALUES = new Set(["natpmp", "upnp", "manual", "lan", "none"]);
+
+/** Ports agentws.py's `_parse_peer_lan_url` —— 規則與 `parsePeerUrl` 相同。 */
+function parsePeerLanUrl(value: unknown, workerId: string): string | null {
+  if (value === null || value === undefined) return null;
+  if (typeof value !== "string") {
+    console.warn(`hub: worker ${workerId} hello.peer_lan_url not a string, ignoring`);
+    return null;
+  }
+  let parsed: URL;
+  try {
+    parsed = new URL(value);
+  } catch {
+    console.warn(`hub: worker ${workerId} hello.peer_lan_url ${JSON.stringify(value)} is not a valid http(s) URL, ignoring`);
+    return null;
+  }
+  if ((parsed.protocol !== "http:" && parsed.protocol !== "https:") || !parsed.hostname) {
+    console.warn(`hub: worker ${workerId} hello.peer_lan_url ${JSON.stringify(value)} is not a valid http(s) URL, ignoring`);
+    return null;
+  }
+  return value;
+}
+
+/** Ports agentws.py's `_parse_peer_nat`：非白名單值或缺席一律 "lan"。 */
+function parsePeerNat(value: unknown): string {
+  return typeof value === "string" && PEER_NAT_VALUES.has(value) ? value : "lan";
+}
+
 /** Ports agentws.py's `_MAX_PLAUSIBLE_MODEL_GB` / `_normalize_models`. */
 const MAX_PLAUSIBLE_MODEL_GB = 10_000;
 
@@ -472,6 +505,8 @@ export class Hub extends DurableObject<Env> {
       workerId: null,
       protocol: 1,
       state: "idle",
+      // Phase 3.4 §2：`CF-Connecting-IP` 只有這個原始 upgrade 請求上有。
+      remoteIp: request.headers.get("CF-Connecting-IP"),
     };
     server.serializeAttachment(attachment);
 
@@ -960,12 +995,20 @@ export class Hub extends DurableObject<Env> {
       }
     }
 
-    const ready: AgentAttachment = { kind: "agent", phase: "ready", workerId: worker.id, protocol: 1, state: "idle" };
+    const remoteIp = attachment.remoteIp ?? null;
+    const ready: AgentAttachment = {
+      kind: "agent",
+      phase: "ready",
+      workerId: worker.id,
+      protocol: 1,
+      state: "idle",
+      remoteIp,
+    };
     ws.serializeAttachment(ready);
     this.ephemeral.set(ws, newEphemeral());
 
     try {
-      ws.send(JSON.stringify({ type: "ready" }));
+      ws.send(JSON.stringify({ type: "ready", remote_ip: remoteIp }));
     } catch {
       // Send failure right after accept is vanishingly unlikely and, per
       // agentws.py, not itself fatal to the connection.
@@ -1045,6 +1088,9 @@ export class Hub extends DurableObject<Env> {
     // reconnects with peer_serve now off (or an old/malformed value) must
     // not keep a previous session's endpoint alive.
     const peerUrl = parsePeerUrl(msg.peer_url, workerId);
+    // Phase 3.4 §3.2：與 peer_url 同批全量取代。
+    const peerLanUrl = parsePeerLanUrl(msg.peer_lan_url, workerId);
+    const peerNat = parsePeerNat(msg.peer_nat);
     // Phase 3.2 F1 fix: no new column/migration -- `max_fetch_gb` rides
     // inside the same `hardware` JSON blob this hello fully replaces every
     // time, read back by assess.ts's `workerMaxFetchGb`. Omitted entirely
@@ -1072,7 +1118,12 @@ export class Hub extends DurableObject<Env> {
       autoFetch,
       lastSeen: toSqliteTimestamp(new Date()),
     });
-    await queries.updateWorkerPeerUrl(this.env.DB, workerId, peerUrl);
+    await queries.updateWorkerPeerAdvert(this.env.DB, workerId, {
+      peerUrl,
+      peerLanUrl,
+      peerNat,
+      remoteIp: attachment.remoteIp ?? null,
+    });
 
     ws.serializeAttachment({ ...attachment, protocol } satisfies AgentAttachment);
 

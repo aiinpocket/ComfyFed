@@ -311,3 +311,27 @@ describe("D1 migration 0009_scheduler", () => {
     await db.prepare("DELETE FROM worker_job_stats").run();
   });
 });
+
+describe("D1 migration 0010_peer_nat", () => {
+  it("adds the five P2P NAT columns to workers with the right defaults", async () => {
+    const db = (env as any).DB as D1Database;
+    const cols = await db.prepare("PRAGMA table_info(workers)").all<{ name: string }>();
+    const names = new Set(cols.results.map((c) => c.name));
+    for (const col of ["peer_lan_url", "peer_nat", "peer_reachable", "peer_checked_at", "remote_ip"]) {
+      expect(names.has(col), `workers.${col} missing`).toBe(true);
+    }
+
+    await db
+      .prepare("INSERT INTO workers (id, name, pubkey, created_at) VALUES ('w-0010', 'w', 'pk', '2026-01-01 00:00:00.000000')")
+      .run();
+    const row = await db
+      .prepare("SELECT peer_lan_url, peer_nat, peer_reachable, peer_checked_at, remote_ip FROM workers WHERE id = 'w-0010'")
+      .first<any>();
+    expect(row.peer_lan_url).toBeNull();
+    expect(row.peer_nat).toBe("lan");
+    expect(row.peer_reachable).toBeNull();
+    expect(row.peer_checked_at).toBeNull();
+    expect(row.remote_ip).toBeNull();
+    await db.prepare("DELETE FROM workers WHERE id = 'w-0010'").run();
+  });
+});

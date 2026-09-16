@@ -3709,3 +3709,129 @@ def test_cancelling_a_running_split_parent_stops_both_workers(client):
     assert all(r.billable is False for r in receipts)
     assert {r.worker_id for r in receipts} == {worker_a, worker_b}
     assert {r.job_id for r in receipts} == {c.id for c in children}
+
+
+# --- Phase 3.4 Task 1: ready.remote_ip 與 hello 的 P2P NAT 欄位 -------------
+
+
+def _handshake_ws(client, worker_id, sk, headers=None):
+    """開一條 agent WS 並完成挑戰-回應，回傳 (ws_context, ready_frame)。
+    `headers` 讓測試模擬反向代理的 X-Forwarded-For。"""
+    ctx = client.websocket_connect("/api/agent/ws", headers=headers or {})
+    ws = ctx.__enter__()
+    challenge = ws.receive_json()
+    sig = sk.sign(challenge["nonce"].encode()).signature.hex()
+    ws.send_json({"type": "auth", "worker_id": worker_id, "sig": sig})
+    ready = ws.receive_json()
+    return ctx, ws, ready
+
+
+def test_ready_carries_remote_ip_from_client_host(client):
+    csrf = _login(client)
+    worker_id, sk = _register_worker(client, csrf, "nat-1")
+    ctx, ws, ready = _handshake_ws(client, worker_id, sk)
+    try:
+        assert ready["type"] == "ready"
+        # TestClient 的 client host 是 "testclient"，重點是欄位一定在且非 None。
+        assert ready["remote_ip"] is not None
+    finally:
+        ctx.__exit__(None, None, None)
+
+
+def test_ready_prefers_first_hop_of_x_forwarded_for(client):
+    csrf = _login(client)
+    worker_id, sk = _register_worker(client, csrf, "nat-2")
+    ctx, ws, ready = _handshake_ws(
+        client, worker_id, sk, headers={"X-Forwarded-For": "203.0.113.7, 70.41.3.18"}
+    )
+    try:
+        assert ready["remote_ip"] == "203.0.113.7"
+    finally:
+        ctx.__exit__(None, None, None)
+
+
+def test_hello_stores_peer_lan_url_peer_nat_and_remote_ip(client):
+    csrf = _login(client)
+    worker_id, sk = _register_worker(client, csrf, "nat-3")
+    ctx, ws, _ = _handshake_ws(
+        client, worker_id, sk, headers={"X-Forwarded-For": "203.0.113.7"}
+    )
+    try:
+        ws.send_json(
+            {
+                "type": "hello",
+                "protocol": 4,
+                "peer_url": "http://203.0.113.7:8850",
+                "peer_lan_url": "http://192.168.1.5:8850",
+                "peer_nat": "natpmp",
+            }
+        )
+        # hello 之後送一拍心跳，確保 hello 已被處理完（同步點）。
+        ws.send_json({"type": "heartbeat", "state": "idle"})
+        time.sleep(0.2)
+    finally:
+        ctx.__exit__(None, None, None)
+
+    with db.get_session() as session:
+        w = session.get(db.Worker, worker_id)
+        assert w.peer_url == "http://203.0.113.7:8850"
+        assert w.peer_lan_url == "http://192.168.1.5:8850"
+        assert w.peer_nat == "natpmp"
+        assert w.remote_ip == "203.0.113.7"
+
+
+def test_hello_without_new_fields_defaults_to_lan(client):
+    """舊 agent：不帶 peer_lan_url/peer_nat → lan_url=None、nat='lan'。"""
+    csrf = _login(client)
+    worker_id, sk = _register_worker(client, csrf, "nat-4")
+    ctx, ws, _ = _handshake_ws(client, worker_id, sk)
+    try:
+        ws.send_json({"type": "hello", "protocol": 4, "peer_url": "http://192.168.1.9:8850"})
+        ws.send_json({"type": "heartbeat", "state": "idle"})
+        time.sleep(0.2)
+    finally:
+        ctx.__exit__(None, None, None)
+
+    with db.get_session() as session:
+        w = session.get(db.Worker, worker_id)
+        assert w.peer_lan_url is None
+        assert w.peer_nat == "lan"
+
+
+def test_hello_rejects_malformed_peer_nat(client):
+    csrf = _login(client)
+    worker_id, sk = _register_worker(client, csrf, "nat-5")
+    ctx, ws, _ = _handshake_ws(client, worker_id, sk)
+    try:
+        ws.send_json({"type": "hello", "protocol": 4, "peer_nat": "totally-made-up"})
+        ws.send_json({"type": "heartbeat", "state": "idle"})
+        time.sleep(0.2)
+    finally:
+        ctx.__exit__(None, None, None)
+
+    with db.get_session() as session:
+        assert session.get(db.Worker, worker_id).peer_nat == "lan"
+
+
+def test_requeue_stale_clears_peer_reachable(client):
+    csrf = _login(client)
+    worker_id, _ = _register_worker(client, csrf, "nat-6")
+    with db.get_session() as session:
+        w = session.get(db.Worker, worker_id)
+        w.status = "online"
+        w.peer_url = "http://203.0.113.7:8850"
+        w.peer_reachable = 1
+        # dispatch.requeue_stale 比較的是 naive UTC（見 tests/server/
+        # test_dispatch.py 的 _utcnow），跟 SQLite 存回來的值一致。
+        now = datetime.now(timezone.utc).replace(tzinfo=None)
+        w.peer_checked_at = now
+        w.last_seen = now - timedelta(seconds=600)
+        session.commit()
+
+    dispatch.requeue_stale(datetime.now(timezone.utc).replace(tzinfo=None))
+
+    with db.get_session() as session:
+        w = session.get(db.Worker, worker_id)
+        assert w.status == "offline"
+        assert w.peer_url is None
+        assert w.peer_reachable is None

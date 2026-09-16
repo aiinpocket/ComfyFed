@@ -9,7 +9,8 @@ Agent -> server message contract (all JSON):
 
   {"type": "hello", "hardware": {...}, "backend": str, "torch_version": str,
    "node_classes": [str], "protocol": int, "auto_fetch": bool|absent,
-   "peer_url": str|absent}
+   "peer_url": str|absent, "peer_lan_url": str|absent,
+   "peer_nat": "natpmp"|"upnp"|"manual"|"lan"|"none"|absent}
       -- `peer_url` (Phase 3.1, protocol 4) is present when the agent has
          `peer_serve` enabled: its own advertised "http://host:port" P2P
          serving endpoint. Validated as an http(s) URL with a host (see
@@ -18,6 +19,13 @@ Agent -> server message contract (all JSON):
          Stored on `Worker.peer_url`, and cleared whenever the worker is
          marked offline (see `dispatch.requeue_stale`) so a stale seeder
          endpoint is never handed out.
+      -- `peer_lan_url`/`peer_nat` (Phase 3.4 §3.2) accompany `peer_url`:
+         the LAN-side address usable by peers behind the same NAT, and how
+         `peer_url` was obtained. Validated by `_parse_peer_lan_url` /
+         `_parse_peer_nat`; an old agent that sends neither is stored as
+         `peer_lan_url = None`, `peer_nat = "lan"`. Both are fully replaced
+         on every hello, along with `remote_ip` (see `_client_remote_ip`)
+         and a reset of `peer_reachable`/`peer_checked_at`.
   {"type": "heartbeat", "state": "idle"|"busy"|"paused", "progress": float,
    "job_id": str|null, "dynamic": {...}, "object_info_hash": str|null,
    "stage": "fetching_models"|absent, "fetch_pct": float|absent,
@@ -267,6 +275,9 @@ class _Connection:
     # sent a hello, or an old agent that doesn't send the field at all) --
     # see `_handle_hello` and `_send_job_cancelled`.
     protocol: int = 1
+    # Phase 3.4 §2：握手當下解析出來的來源 IP，`_handle_hello` 落庫時用。
+    # 存在連線物件上而非重新解析：hello handler 拿不到原始 request。
+    remote_ip: Optional[str] = None
     # job_ids this connection has already been sent `job_cancelled` for --
     # see `_send_job_cancelled`. Scoped to the connection instance itself, so
     # a reconnect naturally starts with a clean set. Bounded (see
@@ -308,7 +319,9 @@ def create_router(data_dir: str) -> APIRouter:
 
         try:
             _record_reconnect(worker_id)
-            await websocket.send_json({"type": "ready"})
+            remote_ip = _client_remote_ip(websocket)
+            conn.remote_ip = remote_ip
+            await websocket.send_json({"type": "ready", "remote_ip": remote_ip})
             while True:
                 message = await websocket.receive_json()
                 await _handle_message(worker_id, conn, message)
@@ -841,6 +854,23 @@ def _parse_protocol(message: dict) -> int:
     return protocol
 
 
+def _client_remote_ip(websocket: WebSocket) -> Optional[str]:
+    """這條 WS 的來源公網 IP（spec §2）。反向代理後面取
+    `X-Forwarded-For` 的第一個逗號前值，否則取 `request.client.host`。
+
+    刻意不做 trust-proxy 設定：這個值只用來讓 worker 組自己的通告位址，
+    而平台隨後會對那個位址做真正的可連性驗證（peerhealth），所以偽造它
+    沒有任何好處——偽造者只會讓自己拿到一個連不到、被標 0 的通告位址。
+    """
+    forwarded = websocket.headers.get("x-forwarded-for")
+    if forwarded:
+        first = forwarded.split(",")[0].strip()
+        if first:
+            return first
+    client = websocket.client
+    return client.host if client is not None else None
+
+
 def _parse_peer_url(message: dict, worker_id: str) -> Optional[str]:
     """Validate hello's optional `peer_url` (Phase 3.1 P2P seeder
     advertisement): must be a string that parses as an http:// or https://
@@ -862,6 +892,41 @@ def _parse_peer_url(message: dict, worker_id: str) -> Optional[str]:
         )
         return None
     return peer_url
+
+
+# Phase 3.4 §3.2：`peer_nat` 的合法值。任何其他字串（含舊 agent 的缺席）
+# 一律退回 "lan" —— 這只是給 console 顯示用的來源標籤，不影響任何授權決策，
+# 但仍然白名單化，免得一個惡意 worker 把任意字串塞進管理介面。
+_PEER_NAT_VALUES = frozenset({"natpmp", "upnp", "manual", "lan", "none"})
+
+
+def _parse_peer_lan_url(message: dict, worker_id: str) -> Optional[str]:
+    """驗證 hello 的選填 `peer_lan_url`（spec §3.2）。規則與 `_parse_peer_url`
+    完全相同：必須是帶 host 的 http(s) URL，否則忽略（記 log、不落庫）。"""
+    value = message.get("peer_lan_url")
+    if value is None:
+        return None
+    if not isinstance(value, str):
+        logger.warning("agentws: worker %s hello.peer_lan_url not a string, ignoring", worker_id)
+        return None
+    parsed = urlsplit(value)
+    if parsed.scheme not in ("http", "https") or not parsed.hostname:
+        logger.warning(
+            "agentws: worker %s hello.peer_lan_url %r is not a valid http(s) URL, ignoring",
+            worker_id,
+            value,
+        )
+        return None
+    return value
+
+
+def _parse_peer_nat(message: dict) -> str:
+    """hello 的選填 `peer_nat`，非白名單值或缺席一律 "lan"（spec §3.2：
+    舊 agent 不帶這些欄位時平台視為 peer_lan_url = null、peer_nat = "lan"）。"""
+    value = message.get("peer_nat")
+    if isinstance(value, str) and value in _PEER_NAT_VALUES:
+        return value
+    return "lan"
 
 
 def _parse_max_fetch_gb(message: dict) -> Optional[float]:
@@ -904,6 +969,8 @@ def _parse_peer_upload_min_mbps(message: dict) -> Optional[float]:
 async def _handle_hello(worker_id: str, conn: "_Connection", message: dict) -> None:
     protocol = _parse_protocol(message)
     peer_url = _parse_peer_url(message, worker_id)
+    peer_lan_url = _parse_peer_lan_url(message, worker_id)
+    peer_nat = _parse_peer_nat(message)
     max_fetch_gb = _parse_max_fetch_gb(message)
     peer_upload_min_mbps = _parse_peer_upload_min_mbps(message)
     with db.get_session() as session:
@@ -941,6 +1008,16 @@ async def _handle_hello(worker_id: str, conn: "_Connection", message: dict) -> N
         # reconnects with `peer_serve` now off (or an old/malformed value)
         # must not keep a previous session's endpoint alive.
         worker.peer_url = peer_url
+        # Phase 3.4：跟 `peer_url` 一樣全量取代 —— agent 關掉 NAT 穿越後
+        # 重連，不能留著上一輪的 natpmp 標籤與對外位址。
+        worker.peer_lan_url = peer_lan_url
+        worker.peer_nat = peer_nat
+        if conn.remote_ip is not None:
+            worker.remote_ip = conn.remote_ip
+        # 新的通告位址 ⇒ 舊的驗證結果作廢，回到「未檢查」。Task 4 的
+        # peerhealth 會在 hello 收尾時非同步補上真正的結果。
+        worker.peer_reachable = None
+        worker.peer_checked_at = None
         worker.status = "online"
         worker.last_seen = _utcnow()
         session.commit()

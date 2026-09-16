@@ -1138,3 +1138,62 @@ describe("split families (§3.4/§3.6)", () => {
     expect((await getJobById(db(), parentId))!.progress).toBeCloseTo(0.4, 10);
   });
 });
+
+describe("Phase 3.4: ready.remote_ip and hello NAT fields", () => {
+  it("ready carries CF-Connecting-IP", async () => {
+    const kp = KEYPAIRS[0]!;
+    const workerId = await makeWorker({ pubkeyHex: kp.pubkey_hex });
+    const ws = await openAgentWs({ "CF-Connecting-IP": "203.0.113.7" });
+    const challenge = await nextMessage(ws);
+    const sig = await signHex(kp.seed_hex, new TextEncoder().encode(challenge.nonce));
+    ws.send(JSON.stringify({ type: "auth", worker_id: workerId, sig }));
+    const ready = await nextMessage(ws);
+    expect(ready.type).toBe("ready");
+    expect(ready.remote_ip).toBe("203.0.113.7");
+    ws.close();
+  });
+
+  it("hello stores peer_lan_url, peer_nat and remote_ip", async () => {
+    const kp = KEYPAIRS[0]!;
+    const workerId = await makeWorker({ pubkeyHex: kp.pubkey_hex });
+    const ws = await openAgentWs({ "CF-Connecting-IP": "203.0.113.7" });
+    const challenge = await nextMessage(ws);
+    const sig = await signHex(kp.seed_hex, new TextEncoder().encode(challenge.nonce));
+    ws.send(JSON.stringify({ type: "auth", worker_id: workerId, sig }));
+    await nextMessage(ws);
+    ws.send(
+      JSON.stringify({
+        type: "hello",
+        protocol: 4,
+        peer_url: "http://203.0.113.7:8850",
+        peer_lan_url: "http://192.168.1.5:8850",
+        peer_nat: "upnp",
+      })
+    );
+    await expectNoMessage(ws, 300);
+    const row = await db()
+      .prepare("SELECT peer_url, peer_lan_url, peer_nat, remote_ip FROM workers WHERE id = ?")
+      .bind(workerId)
+      .first<any>();
+    expect(row.peer_url).toBe("http://203.0.113.7:8850");
+    expect(row.peer_lan_url).toBe("http://192.168.1.5:8850");
+    expect(row.peer_nat).toBe("upnp");
+    expect(row.remote_ip).toBe("203.0.113.7");
+    ws.close();
+  });
+
+  it("an old agent's hello defaults peer_lan_url to null and peer_nat to lan", async () => {
+    const kp = KEYPAIRS[0]!;
+    const workerId = await makeWorker({ pubkeyHex: kp.pubkey_hex });
+    const ws = await connectAgent(workerId, kp.seed_hex);
+    ws.send(JSON.stringify({ type: "hello", protocol: 4, peer_url: "http://192.168.1.9:8850" }));
+    await expectNoMessage(ws, 300);
+    const row = await db()
+      .prepare("SELECT peer_lan_url, peer_nat FROM workers WHERE id = ?")
+      .bind(workerId)
+      .first<any>();
+    expect(row.peer_lan_url).toBeNull();
+    expect(row.peer_nat).toBe("lan");
+    ws.close();
+  });
+});
