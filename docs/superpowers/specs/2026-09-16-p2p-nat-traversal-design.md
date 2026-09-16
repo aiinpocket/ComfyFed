@@ -117,3 +117,15 @@ Workers 頁 P2P 欄顯示：`peer_nat` 的圖示文字（自動開埠 natpmp/upn
 ## 10. 文件
 
 `docs/SELF-HOSTING.zh.md`／`.en.md` P2P 一節改寫「開啟方式」：預設自動開埠、什麼情況要手動、`peer_nat_traversal: "off"`、可連性徽章的意義；把「通告位址由 worker 自行申報，平台不代驗」那段改為新行為。README 出算力一節加一句「模型分享會自動請路由器開埠」。
+
+## 11. 安裝腳本自動決定要不要做種（2026-09-16 使用者定案）
+
+「安裝腳本探一下，探得到就開 P2P 提供者，探不到就不開。」
+
+- agent 0.1.12 新增 CLI 子命令 `comfyfed-agent p2p-probe [--port 8850] [--json]`：執行 §3.1 的映射流程（NAT-PMP → UPnP，整體 8 秒上限），成功時印出一行 JSON `{"ok": true, "method": "natpmp"|"upnp", "external_ip": "...", "external_port": 8850, "lan_ip": "..."}` 並 exit 0，隨即釋放測試用的映射（不留映射；正式映射由 `run` 時建立）；失敗 exit 1 並印 `{"ok": false, "reason": "no_gateway"|"no_response"|"error", ...}`。
+- `install.sh` / `install.ps1` 在註冊完成、偵測 ComfyUI 之後、設定自動啟動之前，新增步驟「偵測 P2P 分享能力」：呼叫 `p2p-probe --json`。
+  - 成功 → 寫入 `agent.json`：`peer_serve: true`、`peer_listen_port: 8850`（若使用者已自行設定 `peer_serve` 或 `peer_listen_port` 則不覆蓋），印「路由器支援自動開埠（natpmp/upnp），已開啟模型分享」。
+  - 失敗 → 不改設定（`peer_serve` 維持 `false`），印「路由器沒有回應 UPnP／NAT-PMP，未開啟模型分享；到路由器開啟 UPnP 後重跑安裝指令即可自動開啟，或手動設定 peer_advertise_host 與轉埠」。
+  - 使用者已在 `agent.json` 明確設定 `peer_serve: false` 且檔案裡有 `peer_serve_explicit: true`？——不做這種旗標；規則簡化為：**只有在 `peer_serve` 目前為 `false` 且 `peer_listen_port` 為 `null`（從未設定過）時才自動開啟**；曾經手動設過埠或手動關閉的（`peer_listen_port` 有值但 `peer_serve` 為 `false`）一律尊重。
+- `run` 時的行為（§3）不變：`peer_serve` 為真才做映射與做種；探測失敗只影響安裝時的預設，不會在執行期把已開啟的 `peer_serve` 關掉。
+- 文件（§10）加入這段：安裝時自動探測；如何事後開啟（開 UPnP 重跑安裝指令，或手動設定）。
