@@ -1631,9 +1631,9 @@ def test_e2e_unreachable_seeder_is_never_chosen(client, monkeypatch):
 
 
 def test_e2e_same_remote_ip_gets_the_lan_address_first(client, monkeypatch):
-    _trust_proxy_on()
     """不可連的種子，只要跟拉方同一個公網 IP 且有區網位址，仍然配得到，
     而且區網位址排第一（很多家用路由器不支援 hairpin）。"""
+    _trust_proxy_on()
     monkeypatch.setattr(peerhealth, "_probe", lambda url: False)
     csrf = _login(client)
     seeder_id, seeder_sk = _register_worker(client, csrf, "e2e-seed-lan")
@@ -1666,10 +1666,10 @@ def test_e2e_same_remote_ip_gets_the_lan_address_first(client, monkeypatch):
 
 
 def test_e2e_a_hostname_peer_url_is_never_probed(client, monkeypatch):
-    _trust_proxy_on()
     """名稱型主機一律不探（fix round 1）：`peer_reachable` 留 NULL，所以對
     不同 IP 的拉方不是種子；但對同一個公網 IP 的拉方，區網位址照樣配得出去。
     """
+    _trust_proxy_on()
     probed = []
     monkeypatch.setattr(peerhealth, "_probe", lambda url: probed.append(url) or True)
     csrf = _login(client)

@@ -236,7 +236,8 @@ def is_safe_igd_url(url: str, gateway: str) -> bool:
     """這個 URL 能不能拿去請求？SSDP 的 `LOCATION` 和裝置描述裡的
     `controlURL` 都是**區網上任何一台機器都能塞給我們**的值，照單全收等於
     把 agent 變成一台 SSRF 代理（`file://` 讀本機檔、`http://<公網主機>`
-    對外打、`http://127.0.0.1:<port>` 打自己身上的其他服務）。
+    對外打）。loopback 屬於私有網段所以會放行——IGD 不會住在 loopback 上，
+    但就算有人塞進來，打到的也只是自己機器上本來就可達的服務。
 
     放行條件：scheme 必須是 `http`，而且主機是**私有／link-local 位址**或
     **就是預設閘道**。主機名（非字面 IP）一律不放行 —— 判不出來就不要賭。

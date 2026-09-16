@@ -124,8 +124,9 @@ class Worker(Base):
     # 與 `peer_url` 一起在 dispatch.requeue_stale 清掉。
     peer_reachable: Mapped[Optional[int]] = mapped_column(Integer, nullable=True)
     peer_checked_at: Mapped[Optional[datetime]] = mapped_column(DateTime, nullable=True)
-    # Phase 3.4 §2：這台 worker 連過來的公網 IP（X-Forwarded-For 第一跳，
-    # 否則 request.client.host），每次 hello 更新。兩台 worker 的
+    # Phase 3.4 §2：這台 worker 連過來的公網 IP（預設 request.client.host；
+    # 只有平台設定 trust_proxy 開啟時才取 X-Forwarded-For 第一跳），每次
+    # hello 更新。兩台 worker 的
     # `remote_ip` 相同 ⇒ 極可能在同一個 NAT 後面 ⇒ 可以互相走區網位址。
     remote_ip: Mapped[Optional[str]] = mapped_column(String, nullable=True)
     # Phase 3.3 §2.2: 相對全隊的速度係數，1.0 = 平均、2.0 = 兩倍快。
