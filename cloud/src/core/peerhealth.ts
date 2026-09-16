@@ -108,24 +108,32 @@ function parseIpLiteral(host: string): IpLiteral | null {
   return v4 === null ? null : { v4 };
 }
 
-/** spec §4.2 的清單，逐字：10/8、172.16/12、192.168/16、169.254/16、
- * fc00::/7、::1；loopback 127/8 與 IPv6 link-local fe80::/10 一併。
- * 100.64/10 是 CGNAT（裁示補上，對齊 agent natmap 的私有判定）。 */
+/** 拒絕清單（parity: peerhealth.py 的 `PRIVATE_NETWORKS`）。spec §4.2 逐字：
+ * 10/8、172.16/12、192.168/16、169.254/16、fc00::/7、::1；loopback 127/8 與
+ * IPv6 link-local fe80::/10 一併。100.64/10 是 CGNAT（裁示）。
+ *
+ * fix round 3 再補「根本不是一台主機」的那幾類：未指定位址（0.0.0.0/8 與
+ * `::`，含 `http://0` 這種寫法）、多播（224/4、ff00::/8）、保留（240/4，含
+ * 255.255.255.255）。 */
 function isPrivateAddress(address: IpLiteral): boolean {
   if ("v4" in address) {
     const [a, b] = address.v4 as [number, number, number, number];
+    if (a === 0) return true; // 0.0.0.0/8（`http://0` 正規化成 0.0.0.0）
     if (a === 10) return true;
     if (a === 172 && b >= 16 && b <= 31) return true;
     if (a === 192 && b === 168) return true;
     if (a === 169 && b === 254) return true;
     if (a === 127) return true;
     if (a === 100 && b >= 64 && b <= 127) return true;
+    if (a >= 224) return true; // 224/4 多播 + 240/4 保留（含 255.255.255.255）
     return false;
   }
   const g = address.v6;
+  if (g.every((x) => x === 0)) return true; // ::
   if (g.slice(0, 7).every((x) => x === 0) && g[7] === 1) return true; // ::1
   if ((g[0]! & 0xfe00) === 0xfc00) return true; // fc00::/7
   if ((g[0]! & 0xffc0) === 0xfe80) return true; // fe80::/10
+  if ((g[0]! & 0xff00) === 0xff00) return true; // ff00::/8 多播
   return false;
 }
 
@@ -171,8 +179,10 @@ export function healthUrl(peerUrl: string): string {
   return peerUrl.replace(/\/+$/, "") + HEALTH_PATH;
 }
 
-/** 對 `url` 發一個 3 秒的 GET，只有 204 算通過。任何例外（逾時、DNS、連線
- * 拒絕）都是 false —— 不可連是預期結果，不是錯誤。 */
+/** 對 `url` 發一個 3 秒的 GET，只有 204 算通過。`redirect: "manual"` ⇒ 不跟
+ * 302（跟著走等於讓一個惡意種子把平台的請求導去第三方，而且 302 本來就不是
+ * 204）。任何例外（逾時、DNS、連線拒絕）都是 false —— 不可連是預期結果，
+ * 不是錯誤。Parity: peerhealth.py 的 `_probe`（`follow_redirects=False`）。 */
 export async function probePeerHealth(url: string): Promise<boolean> {
   try {
     const response = await fetch(url, {

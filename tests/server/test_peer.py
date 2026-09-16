@@ -1224,31 +1224,43 @@ def test_refresh_never_probes_a_hostname_peer_url(client, monkeypatch):
         assert peerhealth.needs_recheck(worker.peer_checked_at, datetime.now(timezone.utc)) is False
 
 
-def test_probe_reads_only_the_status_and_returns_within_the_wall_clock_bound(monkeypatch):
-    """探針不讀 body（對面可能是一條無限長的回應），而且整趟有牆鐘上限。"""
+def _mock_probe_client(monkeypatch, handler):
+    """把 `peerhealth._http_client` 換成一個走 `MockTransport` 的 AsyncClient
+    （其餘設定與正式的一致：3 秒逾時、不跟 redirect）。"""
+    import httpx
+
+    monkeypatch.setattr(
+        peerhealth,
+        "_http_client",
+        lambda: httpx.AsyncClient(
+            transport=httpx.MockTransport(handler),
+            timeout=httpx.Timeout(peerhealth.TIMEOUT_SECONDS),
+            follow_redirects=False,
+        ),
+    )
+
+
+def test_probe_reads_only_the_status(monkeypatch):
+    """探針不讀 body —— 對面可能回一條無限長的回應。"""
     import httpx
 
     drip_chunks = []
 
-    def _drip():
+    async def _drip():
         # 被讀到才會跑 —— 跑起來就代表我們讀了 body（測試要證明沒有）。
         for i in range(1000):
             drip_chunks.append(i)
-            time.sleep(0.5)
+            await asyncio.sleep(0.5)
             yield b"x"
 
     def handler(request):
         assert request.url.path == "/peer/health"
         return httpx.Response(204, content=_drip())
 
-    monkeypatch.setattr(
-        peerhealth,
-        "_http_client",
-        lambda: httpx.Client(transport=httpx.MockTransport(handler), timeout=httpx.Timeout(3.0)),
-    )
+    _mock_probe_client(monkeypatch, handler)
 
     started = time.monotonic()
-    assert peerhealth._probe("http://203.0.113.7:8850/peer/health") is True
+    assert asyncio.run(peerhealth._probe("http://203.0.113.7:8850/peer/health")) is True
     elapsed = time.monotonic() - started
 
     assert drip_chunks == []  # body 一個 byte 都沒讀
@@ -1258,15 +1270,25 @@ def test_probe_reads_only_the_status_and_returns_within_the_wall_clock_bound(mon
 def test_probe_treats_a_non_204_as_unreachable(monkeypatch):
     import httpx
 
-    monkeypatch.setattr(
-        peerhealth,
-        "_http_client",
-        lambda: httpx.Client(
-            transport=httpx.MockTransport(lambda request: httpx.Response(200, text="hi")),
-            timeout=httpx.Timeout(3.0),
-        ),
-    )
-    assert peerhealth._probe("http://203.0.113.7:8850/peer/health") is False
+    _mock_probe_client(monkeypatch, lambda request: httpx.Response(200, text="hi"))
+    assert asyncio.run(peerhealth._probe("http://203.0.113.7:8850/peer/health")) is False
+
+
+def test_probe_does_not_follow_redirects(monkeypatch):
+    """302 就是不可連：跟著走等於讓一個惡意種子把平台的請求導去第三方
+    （而且第二段回什麼都不該算數）。"""
+    import httpx
+
+    requested = []
+
+    def handler(request):
+        requested.append(str(request.url))
+        return httpx.Response(302, headers={"Location": "http://198.51.100.9:8850/peer/health"})
+
+    _mock_probe_client(monkeypatch, handler)
+
+    assert asyncio.run(peerhealth._probe("http://203.0.113.7:8850/peer/health")) is False
+    assert requested == ["http://203.0.113.7:8850/peer/health"]  # 沒有第二發
 
 
 def test_probe_treats_a_transport_error_as_unreachable(monkeypatch):
@@ -1275,9 +1297,118 @@ def test_probe_treats_a_transport_error_as_unreachable(monkeypatch):
     def boom(request):
         raise httpx.ConnectError("refused", request=request)
 
-    monkeypatch.setattr(
-        peerhealth,
-        "_http_client",
-        lambda: httpx.Client(transport=httpx.MockTransport(boom), timeout=httpx.Timeout(3.0)),
-    )
-    assert peerhealth._probe("http://203.0.113.7:8850/peer/health") is False
+    _mock_probe_client(monkeypatch, boom)
+    assert asyncio.run(peerhealth._probe("http://203.0.113.7:8850/peer/health")) is False
+
+
+def test_probe_cancels_the_request_at_the_deadline(monkeypatch):
+    """fix round 3：上限是真的上限 —— 逾時會把整個請求取消掉，不是「跑完
+    再回頭比時間」。handler 在 deadline 之後才會設旗標；取消成功的話那行
+    永遠跑不到。"""
+    import httpx
+
+    late = {"finished": False}
+
+    async def handler(request):
+        await asyncio.sleep(peerhealth.MAX_PROBE_SECONDS + 0.2)
+        late["finished"] = True
+        return httpx.Response(204)
+
+    _mock_probe_client(monkeypatch, handler)
+
+    async def run():
+        started = time.monotonic()
+        result = await peerhealth._probe("http://203.0.113.7:8850/peer/health")
+        elapsed = time.monotonic() - started
+        # 讓被取消（或沒被取消）的 handler 有機會跑到設旗標那一行。
+        await asyncio.sleep(0.5)
+        return result, elapsed
+
+    result, elapsed = asyncio.run(run())
+
+    assert result is False
+    assert elapsed < 3.6
+    assert late["finished"] is False  # 請求真的被取消了，沒有殘留的工作
+
+
+def _dribbling_server():
+    """一台每 0.5 秒才吐一個 header byte 的「種子」。每次讀取都在 3 秒的 read
+    timeout 之內，所以只有整趟的牆鐘上限擋得住它。"""
+    import socket as _socket
+    import threading
+
+    listener = _socket.socket(_socket.AF_INET, _socket.SOCK_STREAM)
+    listener.bind(("127.0.0.1", 0))
+    listener.listen(1)
+    port = listener.getsockname()[1]
+    state = {"stop": False}
+
+    def serve():
+        try:
+            conn, _ = listener.accept()
+        except OSError:
+            return
+        try:
+            conn.recv(4096)
+            for byte in b"HTTP/1.1 204 No Content\r\n\r\n":
+                if state["stop"]:
+                    break
+                conn.sendall(bytes([byte]))
+                time.sleep(0.5)
+        except OSError:
+            pass  # 客戶端在 deadline 斷線 —— 正是我們要的
+        finally:
+            conn.close()
+
+    thread = threading.Thread(target=serve, daemon=True)
+    thread.start()
+    return port, state, thread, listener
+
+
+def test_probe_is_bounded_when_a_peer_dribbles_headers():
+    """fix round 3 的核心回歸：header 慢慢滴的對手撐不過 MAX_PROBE_SECONDS。
+    （沒有上限的話這個請求會拖到約 13 秒。）"""
+    port, state, thread, listener = _dribbling_server()
+    try:
+        started = time.monotonic()
+        result = asyncio.run(peerhealth._probe(f"http://127.0.0.1:{port}/peer/health"))
+        elapsed = time.monotonic() - started
+    finally:
+        state["stop"] = True
+        listener.close()
+        thread.join(timeout=2)
+
+    assert result is False
+    assert elapsed < 3.6
+
+
+@pytest.mark.parametrize(
+    "url",
+    [
+        "http://0",  # 未指定位址的極簡寫法
+        "http://0.0.0.0:8850",
+        "http://224.0.0.1",  # 多播
+        "http://239.1.2.3:8850",
+        "http://240.0.0.1",  # 保留
+        "http://255.255.255.255",  # 廣播
+        "http://[ff02::1]",  # IPv6 多播
+        "http://[::]:8850",  # IPv6 未指定
+    ],
+)
+def test_is_private_peer_url_rejects_non_host_addresses(url):
+    """fix round 3：未指定／多播／保留／廣播位址根本不是一台種子。"""
+    assert peerhealth.is_private_peer_url(url) is True
+
+
+@pytest.mark.parametrize("url", ["http://0.0.0.0:8850", "http://224.0.0.1:8850", "http://[ff02::1]:8850"])
+def test_refresh_never_probes_a_non_host_address(client, monkeypatch, url):
+    csrf = _login(client)
+    worker_id, _ = _register_worker(client, csrf, f"reject-{abs(hash(url)) % 1000}")
+    probed = []
+    monkeypatch.setattr(peerhealth, "_probe", lambda u: probed.append(u) or True)
+
+    assert asyncio.run(peerhealth.refresh(worker_id, url)) is False
+
+    assert probed == []
+    with db.get_session() as session:
+        assert session.get(db.Worker, worker_id).peer_reachable == 0

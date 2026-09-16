@@ -204,6 +204,86 @@ describe("refresh", () => {
   });
 });
 
+describe("isPrivatePeerUrl: non-host addresses (fix round 3)", () => {
+  it.each([
+    ["http://0", true], // unspecified, shortest spelling
+    ["http://0.0.0.0:8850", true],
+    ["http://224.0.0.1", true], // multicast
+    ["http://239.1.2.3:8850", true],
+    ["http://240.0.0.1", true], // reserved
+    ["http://255.255.255.255", true], // broadcast
+    ["http://[ff02::1]", true], // IPv6 multicast
+    ["http://[::]:8850", true], // IPv6 unspecified
+    ["http://203.0.113.7:8850", false],
+  ])("%s -> %s", (url, expected) => {
+    expect(peerhealth.isPrivatePeerUrl(url as string)).toBe(expected);
+  });
+
+  it.each(["http://0.0.0.0:8850", "http://224.0.0.1:8850", "http://[ff02::1]:8850"])(
+    "refresh never probes %s and stores 0",
+    async (url) => {
+      await makeWorker("w-reject");
+      const probe = vi.spyOn(peerhealth, "probePeerHealth").mockResolvedValue(true);
+
+      expect(await peerhealth.refresh(db(), "w-reject", url)).toBe(false);
+
+      expect(probe).not.toHaveBeenCalled();
+      expect((await peerRow("w-reject")).peer_reachable).toBe(0);
+    }
+  );
+});
+
+describe("probePeerHealth", () => {
+  afterEach(() => {
+    vi.unstubAllGlobals();
+  });
+
+  it("accepts only a 204, and asks fetch not to follow redirects", async () => {
+    const calls: Array<[string, RequestInit]> = [];
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async (url: string, init: RequestInit) => {
+        calls.push([url, init]);
+        return new Response(null, { status: 204 });
+      })
+    );
+
+    expect(await peerhealth.probePeerHealth("http://203.0.113.7:8850/peer/health")).toBe(true);
+    expect(calls).toHaveLength(1);
+    expect(calls[0]![0]).toBe("http://203.0.113.7:8850/peer/health");
+    expect(calls[0]![1].redirect).toBe("manual");
+    expect(calls[0]![1].signal).toBeDefined();
+  });
+
+  it("treats a 302 as unreachable and never follows it", async () => {
+    const calls: string[] = [];
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async (url: string) => {
+        calls.push(url);
+        return new Response(null, {
+          status: 302,
+          headers: { Location: "http://198.51.100.9:8850/peer/health" },
+        });
+      })
+    );
+
+    expect(await peerhealth.probePeerHealth("http://203.0.113.7:8850/peer/health")).toBe(false);
+    expect(calls).toEqual(["http://203.0.113.7:8850/peer/health"]);
+  });
+
+  it("treats a thrown fetch (timeout, refused, DNS) as unreachable", async () => {
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async () => {
+        throw new Error("connection refused");
+      })
+    );
+
+    expect(await peerhealth.probePeerHealth("http://203.0.113.7:8850/peer/health")).toBe(false);
+  });
+});
+
 describe("needsRecheck", () => {
   it("is true when never checked and after 10 minutes", () => {
     const now = new Date("2026-09-16T12:00:00Z");

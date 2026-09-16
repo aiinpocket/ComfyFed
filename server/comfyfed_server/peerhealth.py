@@ -15,8 +15,9 @@ Phase 3.1 的平台完全不驗 `peer_url`：worker 自己說什麼就是什麼�
 2. **只驗 IP 字面值**（fix round 1 裁示）：主機不是 IP 字面值（是個 DNS
    名稱）時**完全不探**，`peer_reachable` 留在 NULL、只記 debug —— 一個
    名稱今天解到哪、明天解到哪都不是我們能保證的，驗過也不代表什麼。
-3. **主動探針**：對 `<peer_url>/peer/health` 發一個 3 秒的 GET，只認 204，
-   而且**不讀 body**（`client.stream`，拿到 status 就關）。那條路由不需要
+3. **主動探針**：對 `<peer_url>/peer/health` 發一個 GET，只認 204，而且
+   **不讀 body**（`client.stream`，拿到 status 就關）、**不跟 redirect**、
+   整趟被 `asyncio.wait_for(MAX_PROBE_SECONDS)` 真的框住。那條路由不需要
    憑證、不回任何識別資訊（見 agent 的 peerserve.HEALTH_PATH）。
 
 失敗（timeout、連線拒絕、非 204）一律是「不可連」，不是錯誤：不拋例外、
@@ -39,10 +40,10 @@ Phase 3.1 的平台完全不驗 `peer_url`：worker 自己說什麼就是什麼�
 from __future__ import annotations
 
 import asyncio
+import inspect
 import ipaddress
 import logging
 import socket
-import time
 from datetime import datetime, timezone
 from typing import Awaitable, Callable, Optional, Union
 from urllib.parse import urlsplit
@@ -64,22 +65,39 @@ RECHECK_SECONDS = 600
 # 必須與 agent 的 `peerserve.HEALTH_PATH` 逐字相同。
 HEALTH_PATH = "/peer/health"
 
-# spec §4.2 的清單，逐字：10/8、172.16/12、192.168/16、169.254/16、
-# fc00::/7、::1；loopback 127/8 與 IPv6 link-local fe80::/10 一併（同樣不是
-# 公網位址）。100.64/10 是 CGNAT（裁示補上）：電信商級 NAT 後面的位址，
-# 對外一樣不可能連得到，而且與 agent 端 natmap 的私有判定逐條對齊。
+# 拒絕清單（cloud parity: `isPrivateAddress`）。spec §4.2 的清單逐字：10/8、
+# 172.16/12、192.168/16、169.254/16、fc00::/7、::1；loopback 127/8 與 IPv6
+# link-local fe80::/10 一併（同樣不是公網位址）。100.64/10 是 CGNAT（裁示
+# 補上），與 agent 端 natmap 的私有判定逐條對齊。
+#
+# fix round 3 再補「根本不是單一主機」的那幾類：未指定位址（0.0.0.0/8、::，
+# 含 `http://0` 這種寫法）、多播（224/4、ff00::/8）、保留（240/4，含
+# 255.255.255.255 廣播）。這些通告不可能是一台種子，探它們只會製造奇怪的
+# 對外流量。
+#
+# 為什麼不是 `ipaddress.ip_address(x).is_global`（review 建議）：實測
+# （CPython 3.12）`is_global` 對 IPv4/IPv6 多播回 **True**（224.0.0.1、
+# 239.1.2.3、ff02::1），正好漏掉這次要擋的東西；反過來它對 TEST-NET-1/2/3
+# 與 2001:db8::/32 回 False，而那正是兩棧測試從頭到尾拿來當「公網種子」的
+# 位址（203.0.113.7／198.51.100.9／2001:db8::1）。用 is_global 當閘門會同時
+# 漏掉多播又擋掉自己的測試位址，所以這裡維持明確網段清單，兩棧逐條對齊。
 PRIVATE_NETWORKS = tuple(
     ipaddress.ip_network(cidr)
     for cidr in (
+        "0.0.0.0/8",
         "10.0.0.0/8",
         "172.16.0.0/12",
         "192.168.0.0/16",
         "169.254.0.0/16",
         "127.0.0.0/8",
         "100.64.0.0/10",
-        "fc00::/7",
+        "224.0.0.0/4",
+        "240.0.0.0/4",
+        "::/128",
         "::1/128",
+        "fc00::/7",
         "fe80::/10",
+        "ff00::/8",
     )
 )
 
@@ -152,42 +170,47 @@ def health_url(peer_url: str) -> str:
     return peer_url.rstrip("/") + HEALTH_PATH
 
 
-def _http_client() -> httpx.Client:
+def _http_client() -> httpx.AsyncClient:
     """探針用的 httpx client。抽成函式只是為了讓測試能塞 `MockTransport`，
-    不是為了設定彈性。"""
-    return httpx.Client(timeout=httpx.Timeout(TIMEOUT_SECONDS), follow_redirects=False)
+    不是為了設定彈性。`follow_redirects=False`：健康檢查只認對方自己回的
+    204，跟著 302 走等於讓一個惡意種子把平台的請求導去第三方。"""
+    return httpx.AsyncClient(timeout=httpx.Timeout(TIMEOUT_SECONDS), follow_redirects=False)
 
 
-def _probe(url: str) -> bool:
-    """BLOCKING：對 `url` 發一個 GET，只有 204 算通過。呼叫端一律以
-    `asyncio.to_thread` 執行（Global Constraints）。測試 monkeypatch 這個
-    函式來模擬 204／timeout。
+async def _probe_once(url: str) -> bool:
+    """一次探測，沒有上限保護 —— 呼叫端（`_probe`）負責包 `wait_for`。
 
-    **絕不讀 body**：用 `client.stream` 拿到狀態碼就結束 context，httpx 會
-    把連線收掉。健康檢查回的是 204（照定義沒有 body），但對面是一台我們不
-    信任的機器 —— 它大可回 200 加一個無限長的 body，`client.get()` 會把它
-    整個吃進平台的記憶體。狀態碼是我們唯一要的東西。
-
-    再加一道牆鐘上限 `MAX_PROBE_SECONDS`：httpx 的 timeout 是每階段計算的，
-    一個慢慢滴資料的對手可以把整趟拉得比 3 秒長；超過就當不可連。
+    **絕不讀 body**：用 `client.stream` 拿到狀態碼就結束 context。健康檢查回
+    的是 204（照定義沒有 body），但對面是一台我們不信任的機器，它大可回 200
+    加一個無限長的 body。狀態碼是我們唯一要的東西。
     """
-    started = time.monotonic()
+    async with _http_client() as client:
+        async with client.stream("GET", url) as response:
+            return response.status_code == 204
+
+
+async def _probe(url: str) -> bool:
+    """對 `url` 發一個 GET，只有 204 算通過。測試 monkeypatch 這個函式來模擬
+    204／timeout（同步或非同步 stub 都可以，見 `refresh`）。
+
+    上限是**真的**上限（fix round 3）：整趟跑在事件迴圈上並包在
+    `asyncio.wait_for(MAX_PROBE_SECONDS)` 裡，逾時就把這個 coroutine 取消掉，
+    httpx 的 `async with` 收尾會把連線關掉。先前的版本是「跑完再回頭比時間」
+    —— 一個每 0.5 秒滴一個 header byte 的對手，每次讀取都在 3 秒的 read
+    timeout 之內，卻能把整趟拖到任意長，還把 `to_thread` 的工作執行緒一起
+    佔住（那是固定大小的池）。現在沒有執行緒可佔，而且時間到就真的斷。
+    """
     try:
-        with _http_client() as client:
-            with client.stream("GET", url) as response:
-                status = response.status_code
-    except Exception:
-        return False
-    elapsed = time.monotonic() - started
-    if elapsed > MAX_PROBE_SECONDS:
+        return await asyncio.wait_for(_probe_once(url), MAX_PROBE_SECONDS)
+    except asyncio.TimeoutError:
         logger.info(
-            "peerhealth: probe of %s took %.1fs (> %.1fs), treating as unreachable",
+            "peerhealth: probe of %s exceeded %.1fs, treating as unreachable",
             url,
-            elapsed,
             MAX_PROBE_SECONDS,
         )
         return False
-    return status == 204
+    except Exception:
+        return False
 
 
 def _utcnow() -> datetime:
@@ -266,7 +289,12 @@ async def refresh(
             )
             reachable = False
         else:
-            reachable = await asyncio.to_thread(_probe, checked_url)
+            # `_probe` 本身是 coroutine function；測試常把它換成同步 stub，
+            # 兩種回傳都收（bool 或 awaitable-of-bool）。
+            probe_result = _probe(checked_url)
+            if inspect.isawaitable(probe_result):
+                probe_result = await probe_result
+            reachable = bool(probe_result)
 
         previous = _record(worker_id, reachable)
         if notify is not None and not (
