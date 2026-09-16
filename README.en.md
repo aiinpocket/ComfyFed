@@ -43,7 +43,7 @@ If you have a spare GPU you'd like to lend the group, install a small program ca
 
 Every finished job produces a receipt **signed by both sides** — you (the worker) and the platform — recording exactly how much compute you contributed. Since neither side can fake a signature the other didn't make, that record is trustworthy on its own, and the Reports page turns it into a leaderboard.
 
-Members can also hand model files to each other directly, so nobody has to re-download the same thing from the outside world — a new machine joining in gets missing models faster and with less bandwidth, as long as someone in the circle is online and already has them.
+Members can also hand model files to each other directly, so nobody has to re-download the same thing from the outside world — a new machine joining in gets missing models faster and with less bandwidth, as long as someone in the circle is online and already has them. **Model sharing asks your router to open a port automatically** (probed once at install time, turned on when it works), so a machine behind a home NAT can share too; if the router doesn't support it, sharing simply stays LAN-only and nothing breaks.
 
 When a job needs a model a worker doesn't have, the worker fills the gap itself: models the platform vouches for are downloaded automatically, up to 20 GB per job by default (`max_fetch_gb`). Larger model sets are a manual step — raise the budget or copy the files in yourself. Set `auto_fetch_models` to `false` to turn auto-fetch off entirely.
 

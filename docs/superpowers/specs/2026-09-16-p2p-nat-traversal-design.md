@@ -38,11 +38,11 @@
    - 重送依 RFC：250 ms 起倍增，最多 3 次（總計 < 2 秒）。
 3. NAT-PMP 沒回應 → **UPnP IGD**：
    - SSDP `M-SEARCH`（`239.255.255.250:1900`，ST `urn:schemas-upnp-org:device:InternetGatewayDevice:1`，MX 2，等 2.5 秒收集回應）。
-   - 抓 `LOCATION` 的裝置描述 XML，找 `urn:schemas-upnp-org:service:WANIPConnection:1`（其次 `WANPPPConnection:1`，其次 `:2` 版本）的 `controlURL`。
+   - 抓 `LOCATION` 的裝置描述 XML，依序找 `urn:schemas-upnp-org:service:WANIPConnection:1`、`WANPPPConnection:1`、`WANIPConnection:2`、`WANPPPConnection:2` 的 `controlURL`（四個 service type，這個優先順序；2026-09-16 實作修訂——原文只列了三項）。
    - SOAP `GetExternalIPAddress`；SOAP `AddPortMapping`（`NewProtocol=TCP`、`NewExternalPort=NewInternalPort=peer_listen_port`、`NewInternalClient=<區網 IP>`、`NewLeaseDuration=3600`、`NewPortMappingDescription=ComfyFed peer`）。若回 `718 ConflictInMappingEntry` 改用外部埠 `peer_listen_port+1`…最多試 5 個。
 4. 兩者都失敗 → `peer_url` 退回現行行為（區網 IP），並在 log 記一行 WARNING：「無法自動開埠（NAT-PMP/UPnP 都沒有回應）；只有同區網的成員能從這台拉模型。要跨網路分享請在路由器手動轉埠並設定 peer_advertise_host。」（雙語）。
-5. 成功 → 外部位址 = NAT-PMP/UPnP 回報的外部 IP；若為空或是私有位址（雙層 NAT），改用 §2 的 `remote_ip`（第一次連線前還沒有，此時先用區網 IP 連平台，拿到 `ready.remote_ip` 後若與目前通告不同就**重新連線一次**以送出更新的 hello；一個 process 最多自動重連一次，避免抖動）。
-6. **續租**：每 30 分鐘重新請求同一筆映射（NAT-PMP 或 UPnP 同上），外部 IP 變了就重新連線更新 hello。agent 結束時 `DeletePortMapping`／NAT-PMP lifetime 0。
+5. 成功 → 外部位址 = NAT-PMP/UPnP 回報的外部 IP；若為空或是私有位址（雙層 NAT，含 `100.64.0.0/10` CGNAT），改用 §2 的 `remote_ip`（第一次連線前還沒有，此時先用區網 IP 連平台，拿到 `ready.remote_ip` 後若與目前通告不同就重新連線一次以送出更新的 hello）。**重連節流是滾動視窗、不是「一個 process 一次」**（2026-09-16 實作修訂——與 §8 對齊，原文這裡誤寫成「最多自動重連一次」）：同一個位址變化 1 小時內最多重連一次，一小時之後同一個 process 還能再重連。多平台情境下 `remote_ip` **釘住第一個回報的公網值**——之後不同平台回報的其他公網 IP 只記 debug、不觸發重連，直到 agent 重啟；這是「簡單、可預測」優先於「永遠反映最新公網 IP」的取捨。
+6. **續租**：每 30 分鐘重新請求同一筆映射（NAT-PMP 或 UPnP 同上），外部 IP 變了就重新連線更新 hello（受同一個 1 次／小時節流）；單次續租失敗只記 WARNING、沿用現有映射。**連續兩次續租失敗就降級**（2026-09-16 實作修訂，原文沒有這一段）：`peer_nat` 改回 `"lan"`、通告位址換回區網位址，並重連一次讓平台拿到新 hello；一次成功的續租就把失敗計數歸零。agent 結束時 `DeletePortMapping`／NAT-PMP lifetime 0（`shutdown()` 先取消並等續租工作結束，才做這次收尾）。
 7. 所有網路操作都在 `asyncio.to_thread` 中執行，永遠不擋事件迴圈；任何例外只記 log。
 
 ### 3.2 hello 欄位
@@ -72,7 +72,7 @@
 - agent 的 peer server 新增 `GET /peer/health`：不需憑證，回 `204`，無內容、無識別資訊。其他路徑不變（一律憑證）。
 - 平台在收到 hello 且 `peer_url` 存在時，非同步對 `peer_url + "/peer/health"` 發 GET（connect+read 3 秒），結果寫入 `peer_reachable`／`peer_checked_at`。Cloud 用 `fetch`（Workers outbound，免費額度）；Python 用 `httpx` 於執行緒。
 - 心跳時若 `peer_checked_at` 超過 10 分鐘則重測；worker 離線時 `peer_reachable` 清為 NULL（與 `peer_url` 一起在 `requeue_stale` 清）。
-- 平台端先靜態拒絕 `peer_url` 主機為 loopback／link-local／私有網段（`10/8`、`172.16/12`、`192.168/16`、`169.254/16`、`fc00::/7`、`::1`）的**公網**位址：這種 `peer_url` 直接標 `peer_reachable = 0`（不發請求），但仍保存 `peer_lan_url`。這同時關掉現行文件所述的「申報內網位址誘導其他 agent 請求」問題（只剩區網位址，且只給同 NAT 的成員）。
+- 平台端先靜態拒絕 `peer_url` 主機為 loopback／link-local／私有網段（`10/8`、`172.16/12`、`192.168/16`、`169.254/16`、`100.64/10` CGNAT、`fc00::/7`、`::1`）的位址（2026-09-16 實作修訂：補上 `100.64/10`，與 agent natmap 的私有判定對齊）：這種 `peer_url` 直接標 `peer_reachable = 0`（不發請求），但仍保存 `peer_lan_url`。這同時關掉現行文件所述的「申報內網位址誘導其他 agent 請求」問題（只剩區網位址，且只給同 NAT 的成員）。**主機是網域名稱（不是字面 IP）時目前一律當成非私有位址，會被實際發出探針 GET**（`is_private_peer_url`/`isPrivatePeerUrl` 的既有實作刻意不做 DNS 解析、把判斷交給探針本身，見兩棧原始碼註解）；操作文件（§10）給操作者的建議是把 DDNS 場景視同「未檢查」處理、改用 `peer_advertise_host` 指定 IP，但這與目前程式碼「仍會嘗試探測網域名稱」的行為不完全一致，屬於文件與實作之間尚待收斂的落差，留給後續 task 決定是否要讓程式碼改成主機名一律跳過探針。
 - `online_seeders`／`onlineSeeders` 的種子條件增加：`peer_reachable = 1` **或**（拉方與種子 `remote_ip` 相同且 `peer_lan_url` 存在）。
 
 ### 4.3 回饋給 agent
@@ -114,9 +114,9 @@ Workers 頁 P2P 欄顯示：`peer_nat` 的圖示文字（自動開埠 natpmp/upn
 - 兩棧：`ready` 帶 `remote_ip`（Python `X-Forwarded-For` 優先；cloud `CF-Connecting-IP`）；hello 欄位落庫；私有公網位址靜態拒絕；可連性檢查 mock（204→1、timeout→0）；10 分鐘重測；離線清除；`online_seeders` 新條件（含同 `remote_ip` 走區網）；grant 回應 `seeder_urls` 順序；`peer_status` 推送一次。
 - 手動：在 POKAI-HOME（ASUS/家用路由器）實跑 `peer_serve: true`，`comfyfed status` 顯示 natpmp 或 upnp 與對外位址，平台 Workers 頁顯示「已驗證」；從 jessie 的 Mac 送一個缺模型且 POKAI-HOME 有的工作，觀察 grant 走 P2P 並產生 `p2p_upload` 收據。
 
-## 10. 文件
+## 10. 文件（2026-09-16 完成，見 Task 8）
 
-`docs/SELF-HOSTING.zh.md`／`.en.md` P2P 一節改寫「開啟方式」：預設自動開埠、什麼情況要手動、`peer_nat_traversal: "off"`、可連性徽章的意義；把「通告位址由 worker 自行申報，平台不代驗」那段改為新行為。README 出算力一節加一句「模型分享會自動請路由器開埠」。
+`docs/SELF-HOSTING.zh.md`／`.en.md` P2P 一節改寫「開啟方式」：安裝時自動探測、什麼情況要手動、`peer_nat_traversal: "off"`、可連性徽章的意義、`comfyfed status` 的 P2P 那一行、`p2p-probe` 在 agent 執行中會直接拒絕（`agent_running`）；把「通告位址由 worker 自行申報，平台不代驗」那段改為「平台驗證過才會派出去」的新行為，並補上：可連性探針只認 IP 位址（網域名稱／DDNS 的 `peer_url` 永遠停在「未檢查」）、私有網段清單含 `100.64/10` CGNAT、`peer_url`/`peer_lan_url` 一律是 agent 組出的 `scheme://host:port` 形式。README 出算力一節加一句「模型分享會自動請路由器開埠」。兩份文件逐節對齊（zh/en）。
 
 ## 11. 安裝腳本自動決定要不要做種（2026-09-16 使用者定案）
 
@@ -126,6 +126,7 @@ Workers 頁 P2P 欄顯示：`peer_nat` 的圖示文字（自動開埠 natpmp/upn
 - `install.sh` / `install.ps1` 在註冊完成、偵測 ComfyUI 之後、設定自動啟動之前，新增步驟「偵測 P2P 分享能力」：呼叫 `p2p-probe --json`。
   - 成功 → 寫入 `agent.json`：`peer_serve: true`、`peer_listen_port: 8850`（若使用者已自行設定 `peer_serve` 或 `peer_listen_port` 則不覆蓋），印「路由器支援自動開埠（natpmp/upnp），已開啟模型分享」。
   - 失敗 → 不改設定（`peer_serve` 維持 `false`），印「路由器沒有回應 UPnP／NAT-PMP，未開啟模型分享；到路由器開啟 UPnP 後重跑安裝指令即可自動開啟，或手動設定 peer_advertise_host 與轉埠」。
-  - 使用者已在 `agent.json` 明確設定 `peer_serve: false` 且檔案裡有 `peer_serve_explicit: true`？——不做這種旗標；規則簡化為：**只有在 `peer_serve` 目前為 `false` 且 `peer_listen_port` 為 `null`（從未設定過）時才自動開啟**；曾經手動設過埠或手動關閉的（`peer_listen_port` 有值但 `peer_serve` 為 `false`）一律尊重。
+  - 規則簡化為：**只有在 `peer_serve` 目前為 `false` 且 `peer_listen_port` 為 `null`（從未設定過）時才自動開啟**；曾經手動設過埠或手動關閉的（`peer_listen_port` 有值但 `peer_serve` 為 `false`）一律尊重。
 - `run` 時的行為（§3）不變：`peer_serve` 為真才做映射與做種；探測失敗只影響安裝時的預設，不會在執行期把已開啟的 `peer_serve` 關掉。
+- **`p2p-probe` 在 agent 已經在跑時直接拒絕**（2026-09-16 實作修訂，原文沒有這一段）：判準與 `comfyfed status` 相同（state 檔存在且時間戳未過期），拒絕時印 `{"ok": false, "reason": "agent_running"}`、exit 1，**連 `detect_gateway` 都不呼叫**——探測本身會建立再刪除一筆映射，如果 agent 已經在跑，那筆映射就是 agent 的正式映射，刪掉會當場關閉做種。安裝腳本設計上就是在啟動 agent 之前跑這個指令。
 - 文件（§10）加入這段：安裝時自動探測；如何事後開啟（開 UPnP 重跑安裝指令，或手動設定）。
