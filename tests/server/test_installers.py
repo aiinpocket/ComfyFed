@@ -975,3 +975,52 @@ def test_helper_p2p_enable_only_enables_a_virgin_config(tmp_path):
     # 3. 已經開著 → 不動。
     already = run({**base, "peer_serve": True, "peer_listen_port": 9000})
     assert already["peer_listen_port"] == 9000
+
+    # 4. 設定檔根本不存在（例如全新安裝、agent.json 還沒建立過）→ 視同全新
+    #    空設定，比照 AgentConfig.load 的行為，照樣自動開啟，並建立上層目錄。
+    missing_cfg_path = tmp_path / "fresh" / "nested" / "agent.json"
+    assert not missing_cfg_path.exists()
+    subprocess.run(
+        [sys.executable, str(helper_path), "p2p_enable", str(missing_cfg_path), "8850"],
+        check=True,
+        capture_output=True,
+    )
+    created = json.loads(missing_cfg_path.read_text(encoding="utf-8"))
+    assert created["peer_serve"] is True
+    assert created["peer_listen_port"] == 8850
+
+
+def test_helper_p2p_method_reads_only_the_last_line(tmp_path):
+    """spec §11 fix round 1：install.sh 不能再自己內嵌第二段 python -c 去解
+    method -- 一律丟給 helper 的 p2p_method 子指令，且只看最後一行（探測工具
+    的 stdout 可能夾雜一行警告在 JSON 之前）。"""
+    import subprocess
+    import sys
+
+    text = _installer_text("install.sh")
+    start = text.index('cat > "$HELPER_SCRIPT" <<\'PYEOF\'\n') + len('cat > "$HELPER_SCRIPT" <<\'PYEOF\'\n')
+    end = text.index("\nPYEOF", start)
+    helper_path = tmp_path / "_installer_helper.py"
+    helper_path.write_text(text[start:end], encoding="utf-8")
+
+    assert "def cmd_p2p_method(" in text
+
+    last_line = '{"ok": true, "method": "nat_pmp", "external_ip": "1.2.3.4", "external_port": 8850, "lan_ip": "10.0.0.5"}'
+    result = subprocess.run(
+        [sys.executable, str(helper_path), "p2p_method", last_line],
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    assert result.stdout.strip() == "nat_pmp"
+
+
+def test_installers_probe_uses_only_the_last_line_of_probe_output():
+    """install.sh 必須先 tail -n 1 再交給 helper 解析，不能整段（含可能的
+    警告行）直接丟給 JSON 解析器。"""
+    text = _installer_text("install.sh")
+    probe_block = text[text.index("# 4c. P2P probe"):text.index("# 5. Autostart")]
+    assert "tail -n 1" in probe_block
+    assert "p2p_method" in probe_block
+    # 不再有第二段內嵌的 python -c 解析器。
+    assert "-c \"\nimport json, sys" not in probe_block

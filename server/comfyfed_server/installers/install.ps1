@@ -314,13 +314,16 @@ def cmd_p2p_enable(config_path, port):
     """spec §11：路由器探測成功後，把模型分享打開 —— 但只在使用者從未表態
     的情況下。規則刻意極簡：`peer_serve` 目前為 false **且** `peer_listen_port`
     為 null（從未設定過）才寫入；曾經手動設過埠或手動關掉分享的一律尊重，
-    安裝腳本不會把它改回來。"""
+    安裝腳本不會把它改回來。設定檔不存在時視同全新（空）設定，比照
+    AgentConfig.load 的行為 -- 只有「檔案存在但解析失敗」才算尊重、不動。"""
     import json
     import os
 
     try:
         with open(config_path, "r", encoding="utf-8-sig") as f:
             config = json.load(f)
+    except FileNotFoundError:
+        config = {}
     except (OSError, ValueError):
         print("respected")
         return
@@ -331,6 +334,9 @@ def cmd_p2p_enable(config_path, port):
 
     config["peer_serve"] = True
     config["peer_listen_port"] = int(port)
+    parent_dir = os.path.dirname(config_path)
+    if parent_dir:
+        os.makedirs(parent_dir, exist_ok=True)
     tmp_path = config_path + ".tmp"
     with open(tmp_path, "w", encoding="utf-8") as f:
         json.dump(config, f, ensure_ascii=False, indent=2)

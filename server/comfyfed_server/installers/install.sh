@@ -448,13 +448,16 @@ def cmd_p2p_enable(config_path, port):
     """spec §11：路由器探測成功後，把模型分享打開 —— 但只在使用者從未表態
     的情況下。規則刻意極簡：`peer_serve` 目前為 false **且** `peer_listen_port`
     為 null（從未設定過）才寫入；曾經手動設過埠或手動關掉分享的一律尊重，
-    安裝腳本不會把它改回來。"""
+    安裝腳本不會把它改回來。設定檔不存在時視同全新（空）設定，比照
+    AgentConfig.load 的行為 -- 只有「檔案存在但解析失敗」才算尊重、不動。"""
     import json
     import os
 
     try:
         with open(config_path, "r", encoding="utf-8-sig") as f:
             config = json.load(f)
+    except FileNotFoundError:
+        config = {}
     except (OSError, ValueError):
         print("respected")
         return
@@ -465,11 +468,26 @@ def cmd_p2p_enable(config_path, port):
 
     config["peer_serve"] = True
     config["peer_listen_port"] = int(port)
+    parent_dir = os.path.dirname(config_path)
+    if parent_dir:
+        os.makedirs(parent_dir, exist_ok=True)
     tmp_path = config_path + ".tmp"
     with open(tmp_path, "w", encoding="utf-8") as f:
         json.dump(config, f, ensure_ascii=False, indent=2)
     os.replace(tmp_path, config_path)
     print("enabled")
+
+
+def cmd_p2p_method(probe_json_line):
+    """spec §11：從 agent 的 P2P 探測指令（--json 輸出）最後一行解出 method
+    欄位；呼叫端 (install.sh) 只需 tail -n 1 抓最後一行丟進來，不用再自己
+    內嵌一段 python -c 解析。"""
+    import json
+
+    try:
+        print(json.loads(probe_json_line).get("method") or "unknown")
+    except Exception:
+        print("unknown")
 
 
 if __name__ == "__main__":
@@ -482,6 +500,8 @@ if __name__ == "__main__":
         cmd_capture(sys.argv[2], sys.argv[3], sys.argv[4])
     elif command == "p2p_enable":
         cmd_p2p_enable(sys.argv[2], sys.argv[3])
+    elif command == "p2p_method":
+        cmd_p2p_method(sys.argv[2])
     else:
         print(f"unknown command: {command}", file=sys.stderr)
         sys.exit(2)
@@ -744,13 +764,11 @@ bilingual "偵測 P2P 分享能力（詢問路由器是否支援自動開埠）.
     "Checking whether this network can share models over P2P..."
 P2P_PROBE_OUT="$("$VENV_AGENT" p2p-probe --port 8850 --json 2>/dev/null)" && P2P_PROBE_RC=0 || P2P_PROBE_RC=$?
 if [ "${P2P_PROBE_RC:-1}" -eq 0 ]; then
-    P2P_METHOD="$("$VENV_PYTHON" -c "
-import json, sys
-try:
-    print(json.loads(sys.argv[1]).get('method') or 'unknown')
-except Exception:
-    print('unknown')
-" "$P2P_PROBE_OUT")"
+    # The probe's own stdout may carry a leading warning line before the
+    # JSON; only the LAST line is the actual `--json` payload (mirrors the
+    # PowerShell side's `Select-Object -Last 1`).
+    P2P_LAST_LINE="$(printf '%s\n' "$P2P_PROBE_OUT" | tail -n 1)"
+    P2P_METHOD="$("$VENV_PYTHON" "$HELPER_SCRIPT" p2p_method "$P2P_LAST_LINE")"
     "$VENV_PYTHON" "$HELPER_SCRIPT" p2p_enable "$AGENT_CONFIG_PATH" 8850 >/dev/null 2>&1 || true
     bilingual "路由器支援自動開埠（$P2P_METHOD），已開啟模型分享（連接埠 8850）" \
         "Your router supports automatic port mapping ($P2P_METHOD); model sharing is on (port 8850)"
