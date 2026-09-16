@@ -19,7 +19,7 @@ import pytest
 from nacl.signing import SigningKey
 
 from comfyfed_agent import peerserve
-from comfyfed_agent.config import PlatformEntry
+from comfyfed_agent.config import AgentConfig, PlatformEntry
 
 
 def _platform(worker_id="seeder-1", platform_url="http://platform.example"):
@@ -666,3 +666,49 @@ def test_set_upload_limit_mbps_converts_and_treats_zero_as_unlimited(server):
     finally:
         # The bucket is process-global: leave it unlimited for other tests.
         peerserve._UPLOAD_THROTTLE.set_rate(None)
+
+
+# --- Phase 3.4: GET /peer/health（無憑證 204）------------------------------
+
+
+def test_peer_health_returns_204_without_a_grant(tmp_path):
+    _signing_key, entry = _platform()
+    server = peerserve.PeerHTTPServer(
+        models_dir=str(tmp_path), port=0, platforms=[entry], bind_host="127.0.0.1"
+    )
+    server.start()
+    try:
+        base = f"http://127.0.0.1:{server.port}"
+        resp = httpx.get(base + "/peer/health", timeout=5)
+        assert resp.status_code == 204
+        assert resp.content == b""
+        # 不洩漏任何識別資訊：body 空、也沒有自訂標頭。
+        assert "X-ComfyFed-Worker" not in resp.headers
+    finally:
+        server.stop()
+
+
+def test_other_paths_still_require_a_grant(tmp_path):
+    _signing_key, entry = _platform()
+    server = peerserve.PeerHTTPServer(
+        models_dir=str(tmp_path), port=0, platforms=[entry], bind_host="127.0.0.1"
+    )
+    server.start()
+    try:
+        base = f"http://127.0.0.1:{server.port}"
+        assert httpx.get(base + "/peer/models/checkpoints/a.safetensors", timeout=5).status_code == 403
+        assert httpx.get(base + "/peer/healthz", timeout=5).status_code == 404
+    finally:
+        server.stop()
+
+
+def test_lan_url_always_uses_the_detected_lan_ip(monkeypatch, tmp_path):
+    """`peer_lan_url` 永遠是區網位址 —— 即使使用者設了 peer_advertise_host
+    （那個值是給 `peer_url` 用的）。"""
+    monkeypatch.setattr(peerserve, "_detect_local_ip", lambda: "192.168.1.5")
+    cfg = AgentConfig(
+        peer_serve=True, peer_listen_port=8850, peer_advertise_host="nat.example.com"
+    )
+    assert peerserve.lan_url(cfg) == "http://192.168.1.5:8850"
+    assert peerserve.advertised_url(cfg) == "http://nat.example.com:8850"
+    assert peerserve.lan_url(AgentConfig()) is None

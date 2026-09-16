@@ -2272,6 +2272,13 @@ async def _noop(*args, **kwargs):
     return None
 
 
+async def _ready(*args, **kwargs):
+    """A stand-in for `PlatformConnection.handshake`, which returns the whole
+    `ready` frame (Phase 3.4). An old platform's frame carries no
+    `remote_ip`, which is exactly what this empty-but-present dict models."""
+    return {"type": "ready"}
+
+
 @pytest.fixture()
 def one_platform_loop(monkeypatch, tmp_path):
     """A single-platform loop with the connection-setup calls stubbed, so a
@@ -2626,7 +2633,7 @@ async def test_a_single_4401_followed_by_a_good_handshake_prunes_nothing(
         calls["n"] += 1
         if calls["n"] == 1:
             raise _close_exc(runner_module._AUTH_REJECTED_CLOSE_CODE, "timeout, really")
-        return None
+        return {"type": "ready"}
 
     async def _stop_after_hello(*args, **kwargs):
         # Break out right after the handshake succeeded; CancelledError is
@@ -2714,7 +2721,7 @@ async def test_hello_time_blocking_calls_go_through_to_thread(monkeypatch, tmp_p
 
     conn.connect = _noop
     conn.close = _noop
-    conn.handshake = _noop
+    conn.handshake = _ready
     conn.send_hello = _noop
     conn.send_inventory = _stop_at_inventory
 
@@ -2763,7 +2770,7 @@ async def test_a_slow_collect_hardware_does_not_stall_another_platform(monkeypat
 
     conn_a.connect = _noop
     conn_a.close = _noop
-    conn_a.handshake = _noop
+    conn_a.handshake = _ready
     conn_a.send_hello = _stop
 
     async def _b_handshake():
@@ -3050,3 +3057,376 @@ async def test_a_connect_error_to_some_other_host_is_not_treated_as_comfy(
     assert runner_module._comfy_connect_error(other, loop.config.comfy_url) is False
     mine = _comfy_connect_error(loop.config.comfy_url)
     assert runner_module._comfy_connect_error(mine, loop.config.comfy_url) is True
+
+
+# --- Phase 3.4 Task 3: NAT 映射、hello 欄位、ready.remote_ip、peer_status ---
+
+from comfyfed_agent import natmap, peerserve  # noqa: E402
+
+
+def _loop_with_peer(tmp_path, **overrides):
+    cfg = AgentConfig(
+        platforms=[],
+        models_dir=str(tmp_path),
+        peer_serve=True,
+        peer_listen_port=8850,
+        **overrides,
+    )
+    return AgentLoop(cfg, str(tmp_path / "agent.json"))
+
+
+def _mapping(**overrides):
+    fields = dict(
+        method="natpmp",
+        external_ip="203.0.113.7",
+        external_port=8850,
+        internal_port=8850,
+        lifetime=3600,
+        gateway="192.168.1.1",
+    )
+    fields.update(overrides)
+    return natmap.Mapping(**fields)
+
+
+@pytest.mark.asyncio
+async def test_port_mapping_success_advertises_the_external_address(tmp_path, monkeypatch):
+    monkeypatch.setattr(peerserve, "_detect_local_ip", lambda: "192.168.1.5")
+    monkeypatch.setattr(natmap, "map_port", lambda **kwargs: _mapping())
+    loop = _loop_with_peer(tmp_path)
+
+    await loop._setup_port_mapping()
+
+    assert loop._peer_advertised_url == "http://203.0.113.7:8850"
+    assert loop._peer_lan_url == "http://192.168.1.5:8850"
+    assert loop._peer_nat == "natpmp"
+
+
+@pytest.mark.asyncio
+async def test_port_mapping_failure_falls_back_to_the_lan_address(tmp_path, monkeypatch, caplog):
+    monkeypatch.setattr(peerserve, "_detect_local_ip", lambda: "192.168.1.5")
+    monkeypatch.setattr(natmap, "map_port", lambda **kwargs: None)
+    loop = _loop_with_peer(tmp_path)
+
+    with caplog.at_level(logging.WARNING):
+        await loop._setup_port_mapping()
+
+    assert loop._peer_advertised_url == "http://192.168.1.5:8850"
+    assert loop._peer_nat == "lan"
+    assert "無法自動開埠" in caplog.text
+
+
+@pytest.mark.asyncio
+async def test_peer_advertise_host_skips_mapping_entirely(tmp_path, monkeypatch):
+    monkeypatch.setattr(peerserve, "_detect_local_ip", lambda: "192.168.1.5")
+    called = []
+    monkeypatch.setattr(natmap, "map_port", lambda **kwargs: called.append(kwargs) or _mapping())
+    loop = _loop_with_peer(tmp_path, peer_advertise_host="nat.example.com")
+
+    await loop._setup_port_mapping()
+
+    assert called == []
+    assert loop._peer_advertised_url == "http://nat.example.com:8850"
+    assert loop._peer_nat == "manual"
+
+
+@pytest.mark.asyncio
+async def test_peer_nat_traversal_off_skips_mapping(tmp_path, monkeypatch):
+    monkeypatch.setattr(peerserve, "_detect_local_ip", lambda: "192.168.1.5")
+    called = []
+    monkeypatch.setattr(natmap, "map_port", lambda **kwargs: called.append(kwargs) or _mapping())
+    loop = _loop_with_peer(tmp_path, peer_nat_traversal="off")
+
+    await loop._setup_port_mapping()
+
+    assert called == []
+    assert loop._peer_advertised_url == "http://192.168.1.5:8850"
+    assert loop._peer_nat == "lan"
+
+
+@pytest.mark.asyncio
+async def test_private_external_ip_waits_for_ready_remote_ip(tmp_path, monkeypatch):
+    """雙層 NAT：映射成功但外部 IP 不可用 ⇒ 先用區網位址連平台。"""
+    monkeypatch.setattr(peerserve, "_detect_local_ip", lambda: "192.168.1.5")
+    monkeypatch.setattr(natmap, "map_port", lambda **kwargs: _mapping(external_ip=None))
+    loop = _loop_with_peer(tmp_path)
+
+    await loop._setup_port_mapping()
+
+    assert loop._peer_advertised_url == "http://192.168.1.5:8850"
+    assert loop._peer_nat == "natpmp"
+
+
+def test_apply_remote_ip_rebuilds_the_url_and_asks_for_one_reconnect(tmp_path, monkeypatch):
+    monkeypatch.setattr(peerserve, "_detect_local_ip", lambda: "192.168.1.5")
+    loop = _loop_with_peer(tmp_path)
+    loop._peer_mapping = _mapping(external_ip=None, external_port=9001)
+    loop._peer_nat = "natpmp"
+    loop._peer_advertised_url = "http://192.168.1.5:8850"
+
+    assert loop._apply_remote_ip("203.0.113.7") is True
+    assert loop._peer_advertised_url == "http://203.0.113.7:9001"
+    # 同一個 IP 再來一次不該再要求重連。
+    assert loop._apply_remote_ip("203.0.113.7") is False
+
+
+def test_apply_remote_ip_reconnects_at_most_once_per_hour(tmp_path, monkeypatch):
+    monkeypatch.setattr(peerserve, "_detect_local_ip", lambda: "192.168.1.5")
+    loop = _loop_with_peer(tmp_path)
+    loop._peer_mapping = _mapping(external_ip=None)
+    loop._peer_nat = "natpmp"
+
+    assert loop._apply_remote_ip("203.0.113.7") is True
+    # 位址又變了，但一小時內已經重連過一次 ⇒ 只更新記錄，不再要求重連。
+    assert loop._apply_remote_ip("203.0.113.9") is False
+    assert loop._peer_advertised_url == "http://203.0.113.9:8850"
+
+
+def test_apply_remote_ip_allows_another_reconnect_after_the_hour(tmp_path, monkeypatch):
+    """節流是「滾動一小時最多一次」，不是「一個 process 永遠只有一次」
+    （spec §8 勝過 §3.1 的「一次」）。"""
+    monkeypatch.setattr(peerserve, "_detect_local_ip", lambda: "192.168.1.5")
+    loop = _loop_with_peer(tmp_path)
+    loop._peer_mapping = _mapping(external_ip=None)
+    loop._peer_nat = "natpmp"
+
+    assert loop._apply_remote_ip("203.0.113.7") is True
+    # 把那一筆紀錄推到一小時以前。
+    loop._peer_reconnects_at = [
+        t - runner_module._PEER_RECONNECT_WINDOW_SECONDS - 1.0
+        for t in loop._peer_reconnects_at
+    ]
+    assert loop._apply_remote_ip("203.0.113.9") is True
+
+
+def test_apply_remote_ip_ignores_a_private_or_missing_address(tmp_path, monkeypatch):
+    monkeypatch.setattr(peerserve, "_detect_local_ip", lambda: "192.168.1.5")
+    loop = _loop_with_peer(tmp_path)
+    loop._peer_mapping = _mapping(external_ip=None)
+    loop._peer_nat = "natpmp"
+
+    assert loop._apply_remote_ip(None) is False
+    assert loop._apply_remote_ip("192.168.1.9") is False
+    assert loop._peer_remote_ip is None
+
+
+def test_apply_remote_ip_ignores_a_manual_advertise_host(tmp_path, monkeypatch):
+    monkeypatch.setattr(peerserve, "_detect_local_ip", lambda: "192.168.1.5")
+    loop = _loop_with_peer(tmp_path, peer_advertise_host="nat.example.com")
+    loop._peer_nat = "manual"
+    loop._peer_advertised_url = "http://nat.example.com:8850"
+
+    assert loop._apply_remote_ip("203.0.113.7") is False
+    assert loop._peer_advertised_url == "http://nat.example.com:8850"
+
+
+@pytest.mark.asyncio
+async def test_handle_peer_status_records_and_warns(tmp_path, caplog):
+    loop = _loop_with_peer(tmp_path)
+    loop._peer_nat = "natpmp"
+    conn = object()
+
+    with caplog.at_level(logging.WARNING):
+        await loop._handle_message(
+            conn, {"type": "peer_status", "reachable": False, "checked_url": "http://203.0.113.7:8850"}
+        )
+
+    assert loop._peer_reachable is False
+    assert loop._peer_checked_url == "http://203.0.113.7:8850"
+    assert "無法自動開埠" in caplog.text or "連不到" in caplog.text
+
+
+@pytest.mark.asyncio
+async def test_handle_peer_status_warns_only_when_the_verdict_changes(tmp_path, caplog):
+    """兩次連續的 `reachable: false` 只該吼一次 —— 平台會週期性複查，否則
+    一台真的沒開埠的機器會把 log 洗滿一模一樣的段落。"""
+    loop = _loop_with_peer(tmp_path)
+    loop._peer_nat = "natpmp"
+
+    with caplog.at_level(logging.WARNING):
+        await loop._handle_message(object(), {"type": "peer_status", "reachable": False})
+        await loop._handle_message(object(), {"type": "peer_status", "reachable": False})
+
+    assert caplog.text.count("無法自動開埠") == 1
+
+
+@pytest.mark.asyncio
+async def test_handle_peer_status_true_does_not_warn(tmp_path, caplog):
+    loop = _loop_with_peer(tmp_path)
+    loop._peer_nat = "upnp"
+    with caplog.at_level(logging.WARNING):
+        await loop._handle_message(object(), {"type": "peer_status", "reachable": True})
+    assert loop._peer_reachable is True
+    assert caplog.text == ""
+
+
+@pytest.mark.asyncio
+async def test_shutdown_releases_the_port_mapping(tmp_path, monkeypatch):
+    released = []
+    monkeypatch.setattr(natmap, "unmap_port", lambda mapping: released.append(mapping))
+    loop = _loop_with_peer(tmp_path)
+    loop._peer_mapping = _mapping()
+
+    await loop.shutdown()
+
+    assert released and released[0].external_port == 8850
+    assert loop._peer_mapping is None
+
+
+@pytest.mark.asyncio
+async def test_shutdown_cancels_the_renewal_task_before_unmapping(tmp_path, monkeypatch):
+    """續租任務必須先取消並 await 完，才能解除映射 —— 否則正在飛的續租會
+    在路由器上重新開好一個沒人收的轉埠。"""
+    order = []
+
+    async def _never_ending():
+        try:
+            await asyncio.sleep(3600)
+        except asyncio.CancelledError:
+            order.append("cancelled")
+            raise
+
+    monkeypatch.setattr(natmap, "unmap_port", lambda mapping: order.append("unmapped"))
+    loop = _loop_with_peer(tmp_path)
+    loop._peer_mapping = _mapping()
+    loop._peer_renew_task = asyncio.create_task(_never_ending())
+    await asyncio.sleep(0)
+
+    await loop.shutdown()
+
+    assert order == ["cancelled", "unmapped"]
+    assert loop._peer_renew_task is None
+
+
+def test_peer_state_payload_is_published_with_the_control_state(tmp_path, monkeypatch):
+    written = {}
+    monkeypatch.setattr(
+        control, "write_state",
+        lambda config_dir, state, job_id, reason=None, peer=None: written.update(peer=peer),
+    )
+    loop = _loop_with_peer(tmp_path)
+    loop._peer_nat = "natpmp"
+    loop._peer_advertised_url = "http://203.0.113.7:8850"
+    loop._peer_lan_url = "http://192.168.1.5:8850"
+    loop._peer_reachable = True
+
+    loop._publish_control_state()
+
+    assert written["peer"] == {
+        "enabled": False,
+        "nat": "natpmp",
+        "url": "http://203.0.113.7:8850",
+        "lan_url": "http://192.168.1.5:8850",
+        "reachable": True,
+    }
+
+
+@pytest.mark.asyncio
+async def test_send_hello_carries_peer_url_lan_url_and_nat():
+    sent = []
+
+    class FakeWs:
+        async def send(self, text):
+            sent.append(json.loads(text))
+
+    entry = PlatformEntry(
+        platform_url="http://platform.example",
+        platform_pubkey="00" * 32,
+        worker_id="w-1",
+        certificate="cert",
+        signing_key_hex="11" * 32,
+    )
+    conn = PlatformConnection(entry, AgentConfig())
+    conn.ws = FakeWs()
+
+    await conn.send_hello(
+        {"gpu_name": "5080"},
+        "cuda",
+        "2.4.0",
+        ["KSampler"],
+        peer_url="http://203.0.113.7:8850",
+        peer_lan_url="http://192.168.1.5:8850",
+        peer_nat="natpmp",
+    )
+
+    assert sent[0]["peer_url"] == "http://203.0.113.7:8850"
+    assert sent[0]["peer_lan_url"] == "http://192.168.1.5:8850"
+    assert sent[0]["peer_nat"] == "natpmp"
+
+
+@pytest.mark.asyncio
+async def test_handshake_returns_the_ready_frame_with_remote_ip():
+    frames = [
+        json.dumps({"type": "challenge", "nonce": "abc"}),
+        json.dumps({"type": "ready", "remote_ip": "203.0.113.7"}),
+    ]
+
+    class FakeWs:
+        async def send(self, text):
+            return None
+
+        async def recv(self):
+            return frames.pop(0)
+
+    entry = PlatformEntry(
+        platform_url="http://platform.example",
+        platform_pubkey="00" * 32,
+        worker_id="w-1",
+        certificate="cert",
+        signing_key_hex="11" * 32,
+    )
+    conn = PlatformConnection(entry, AgentConfig())
+    conn.ws = FakeWs()
+
+    ready = await conn.handshake()
+
+    assert ready["remote_ip"] == "203.0.113.7"
+
+
+@pytest.mark.asyncio
+async def test_run_platform_reconnects_once_to_advertise_the_public_ip(
+    one_platform_loop, monkeypatch
+):
+    """`ready.remote_ip` 把「區網位址」換成真正的公網位址 ⇒ 立刻關掉這條
+    連線重來一次，讓平台拿到帶著新位址的 hello（spec §3.1 第 5 點）。"""
+    loop = one_platform_loop
+    conn = loop.connections["worker-a"]
+    loop._peer_mapping = natmap.Mapping(
+        method="natpmp",
+        external_ip=None,
+        external_port=8850,
+        internal_port=8850,
+        lifetime=3600,
+        gateway="192.168.1.1",
+    )
+    loop._peer_nat = "natpmp"
+    loop._peer_advertised_url = "http://192.168.1.5:8850"
+
+    closes = {"n": 0}
+    hellos = []
+
+    async def _connect(*args, **kwargs):
+        return None
+
+    async def _close(*args, **kwargs):
+        closes["n"] += 1
+
+    async def _handshake(*args, **kwargs):
+        return {"type": "ready", "remote_ip": "203.0.113.7"}
+
+    async def _send_hello(*args, **kwargs):
+        hellos.append(kwargs.get("peer_url"))
+        raise asyncio.CancelledError()
+
+    conn.connect = _connect
+    conn.close = _close
+    conn.handshake = _handshake
+    conn.send_hello = _send_hello
+
+    with pytest.raises(asyncio.CancelledError):
+        await asyncio.wait_for(loop._run_platform(conn), timeout=5)
+
+    # 第一輪只重連、沒送 hello；第二輪送出的才是帶著公網位址的那一份，
+    # 而且只有那一份（`_apply_remote_ip` 第二次看到同一個 IP 回 False，
+    # 所以不會無限重連）。
+    assert closes["n"] >= 1
+    assert hellos == ["http://203.0.113.7:8850"]

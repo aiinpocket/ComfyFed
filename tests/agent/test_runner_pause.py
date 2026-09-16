@@ -314,8 +314,14 @@ async def test_a_connection_sends_an_immediate_beat_after_hello(pause_loop, monk
 
     # ComfyUI is up: this test is about the immediate beat, not the wait.
     monkeypatch.setattr(detect, "probe_comfy", lambda *a, **k: True)
+
+    async def _ready(*args, **kwargs):
+        # `handshake` returns the whole `ready` frame (Phase 3.4); an old
+        # platform's frame simply carries no `remote_ip`.
+        return {"type": "ready"}
+
     conn.connect = _noop
-    conn.handshake = _noop
+    conn.handshake = _ready
     conn.send_hello = _noop
     conn.close = _noop
     conn.send_inventory = _stop_here

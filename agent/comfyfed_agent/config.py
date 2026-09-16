@@ -68,6 +68,17 @@ def _coerce_optional_str(value, default: str | None) -> str | None:
     return default
 
 
+def _coerce_nat_traversal(value, default: str) -> str:
+    """`peer_nat_traversal` from agent.json: only the two documented values
+    are honoured (`"auto"` / `"off"`, case-insensitively); anything else --
+    a typo, a bool, a number, a missing key -- falls back to the default
+    (`"auto"`), so a hand-edited config can never turn automatic port
+    mapping into an undefined third mode."""
+    if isinstance(value, str) and value.strip().lower() in ("auto", "off"):
+        return value.strip().lower()
+    return default
+
+
 def _coerce_str(value, default: str) -> str:
     """`peer_bind_host` from agent.json (M6 final-review fix): a non-empty
     string passes through, anything else (missing, empty, wrong type) falls
@@ -149,6 +160,12 @@ class AgentConfig:
     # instead of exposing the listener to the internet the moment
     # `peer_serve` is enabled.
     peer_bind_host: str = "0.0.0.0"
+    # Phase 3.4 §3：開機時要不要自動請路由器開埠（NAT-PMP → UPnP IGD）。
+    # "auto"（預設）= 在 `peer_serve` 啟用且沒有設 `peer_advertise_host` 時
+    # 嘗試映射；"off" = 完全不碰路由器（維持 Phase 3.1 的行為：通告區網
+    # 位址）。設了 `peer_advertise_host` 就不做映射 —— 使用者已經明講對外
+    # 位址了。任何其他值一律當 "auto"。
+    peer_nat_traversal: str = "auto"
     # BOINC-style idle detection (2026-09-14 directive): while the human is
     # actively using this machine, the agent reports `paused` instead of
     # `idle` so the platform stops pushing NEW jobs at it. A job already
@@ -210,6 +227,9 @@ class AgentConfig:
                 data.get("peer_advertise_host"), cls.peer_advertise_host
             ),
             peer_bind_host=_coerce_str(data.get("peer_bind_host"), cls.peer_bind_host),
+            peer_nat_traversal=_coerce_nat_traversal(
+                data.get("peer_nat_traversal"), cls.peer_nat_traversal
+            ),
             pause_when_active=_coerce_bool(
                 data.get("pause_when_active"), cls.pause_when_active
             ),
@@ -246,6 +266,7 @@ class AgentConfig:
             "peer_listen_port": self.peer_listen_port,
             "peer_advertise_host": self.peer_advertise_host,
             "peer_bind_host": self.peer_bind_host,
+            "peer_nat_traversal": self.peer_nat_traversal,
             "pause_when_active": self.pause_when_active,
             "idle_minutes": self.idle_minutes,
             "peer_upload_limit_mbps": self.peer_upload_limit_mbps,

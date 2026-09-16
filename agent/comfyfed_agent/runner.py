@@ -22,7 +22,7 @@ import websockets
 from websockets.exceptions import ConnectionClosed
 from nacl.signing import SigningKey
 
-from . import comfy, control, detect, fetcher, hardware, peerserve, signing, whitelist
+from . import comfy, control, detect, fetcher, hardware, natmap, peerserve, signing, whitelist
 from .config import AgentConfig, PlatformEntry
 
 logger = logging.getLogger(__name__)
@@ -47,6 +47,20 @@ _COMFY_WAIT_POLL_SECONDS = 30
 _COMFY_WAIT_RELOG_SECONDS = 600
 # Published in `agent_state.json` as `reason` while that wait is in effect.
 _COMFY_UNREACHABLE_REASON = "comfyui_unreachable"
+# Phase 3.4 §8：一個 process 內因位址變化而自動重連，最多 1 次／小時。
+# 滾動視窗（不是「整個 process 只有一次」）—— 一條每天換兩三次 IP 的
+# 家用線路仍然能跟上，一條每分鐘抖動的線路也不會把平台打爆。
+_PEER_RECONNECT_WINDOW_SECONDS = 3600.0
+# spec §3.1 第 4 點／§4.3 共用的那段文字（雙語）：映射失敗、以及平台回報
+# 「連不到」，對操作者來說要做的事一模一樣，所以共用同一段說明。
+_PEER_NO_MAPPING_WARNING = (
+    "無法自動開埠（NAT-PMP/UPnP 都沒有回應）；只有同區網的成員能從這台拉模型。"
+    "要跨網路分享請在路由器手動轉埠並設定 peer_advertise_host。 / "
+    "Automatic port mapping failed (neither NAT-PMP nor UPnP answered); only "
+    "members on the same LAN can pull models from this machine. To share "
+    "across networks, forward the port on your router and set "
+    "peer_advertise_host."
+)
 # httpcore is httpx's transport and is always installed with it, but it is
 # an implementation detail -- imported defensively so a future httpx that
 # drops it cannot break the agent at import time.
@@ -266,7 +280,10 @@ class PlatformConnection:
                 pass
             self.ws = None
 
-    async def handshake(self) -> None:
+    async def handshake(self) -> dict:
+        """完成挑戰-回應，**回傳整個 `ready` frame**（Phase 3.4：裡面帶
+        `remote_ip`，呼叫端要用它決定通告位址）。舊平台不帶這個欄位，
+        呼叫端讀到 None 就沿用映射回報的外部 IP（spec §8）。"""
         challenge = json.loads(await self.ws.recv())
         nonce = challenge["nonce"]
         sig = self._sign(nonce.encode())
@@ -274,6 +291,7 @@ class PlatformConnection:
         ready = json.loads(await self.ws.recv())
         if ready.get("type") != "ready":
             raise ConnectionError(f"Unexpected handshake reply: {ready!r}")
+        return ready
 
     def _sign(self, message: bytes) -> str:
         signing_key = SigningKey(bytes.fromhex(self.entry.signing_key_hex))
@@ -292,6 +310,8 @@ class PlatformConnection:
         torch_version: str,
         node_classes,
         peer_url: Optional[str] = None,
+        peer_lan_url: Optional[str] = None,
+        peer_nat: str = "none",
     ) -> None:
         message = {
             "type": "hello",
@@ -326,6 +346,12 @@ class PlatformConnection:
         }
         if peer_url:
             message["peer_url"] = peer_url
+        # Phase 3.4 §3.2：`peer_lan_url` 只在有值時帶（舊平台忽略未知欄位；
+        # 新平台看不到就當 null）。`peer_nat` 永遠帶，讓 console 能顯示這個
+        # `peer_url` 是怎麼來的（自動開埠／手動轉埠／只有區網）。
+        if peer_lan_url:
+            message["peer_lan_url"] = peer_lan_url
+        message["peer_nat"] = peer_nat
         await self._send(message)
 
     async def send_inventory(self, models: list[dict]) -> None:
@@ -771,6 +797,22 @@ class AgentLoop:
         # connection (see peerserve.PeerHTTPServer's docstring).
         self._peer_server: Optional["peerserve.PeerHTTPServer"] = None
         self._peer_advertised_url: Optional[str] = None
+        # Phase 3.4：自動開埠的結果與通告狀態。`_peer_mapping` 是 natmap 回
+        # 報的那一筆映射（續租與關機解除都要它）；`_peer_lan_url` 永遠有值
+        # （只要 peer 服務有開），`_peer_nat` 是 `peer_url` 的來源標籤。
+        self._peer_mapping: Optional["natmap.Mapping"] = None
+        self._peer_lan_url: Optional[str] = None
+        self._peer_nat: str = "none"
+        # 平台推回來的可連性結論（peer_status），只存記憶體供 status 顯示。
+        self._peer_reachable: Optional[bool] = None
+        self._peer_checked_url: Optional[str] = None
+        # 最後一次由 `ready.remote_ip` 得知的公網 IP，與自動重連的節流紀錄
+        # （`time.monotonic()` 時間戳，滾動一小時內最多一筆）。
+        self._peer_remote_ip: Optional[str] = None
+        self._peer_reconnects_at: list[float] = []
+        # 續租任務（每 `natmap.RENEW_SECONDS` 一次），由 `run()` 起、
+        # `shutdown()` 取消並 await 完之後才解除映射。
+        self._peer_renew_task: Optional[asyncio.Task] = None
         # 分級 P2P 上傳限速：最後一次真的套用下去的上限（Mbps），只用來讓
         # tier 切換的 log 一次只印一行，而不是每 5 秒 tick 都印。
         # Last upload cap actually applied (Mbps); only used so the tier-switch
@@ -877,7 +919,21 @@ class AgentLoop:
 
     def _publish_control_state(self, availability: Optional[str] = None) -> None:
         state, job_id, reason = self._aggregate_state(availability)
-        control.write_state(self._config_dir, state, job_id, reason=reason)
+        control.write_state(
+            self._config_dir, state, job_id, reason=reason, peer=self._peer_state_payload()
+        )
+
+    def _peer_state_payload(self) -> dict:
+        """`comfyfed status` 要印的 P2P 那一行所需的全部資訊（spec §3.3）。
+        `status` 是另一個 process，看不到 runner 的記憶體 —— 所以這些欄位
+        跟著 `agent_state.json` 一起發布。"""
+        return {
+            "enabled": self._peer_server is not None,
+            "nat": self._peer_nat,
+            "url": self._peer_advertised_url,
+            "lan_url": self._peer_lan_url,
+            "reachable": self._peer_reachable,
+        }
 
     def _apply_peer_upload_limit(self, availability: str) -> None:
         """依目前的閒置狀態，把分級上傳限速套到做種用的 peer server 上。
@@ -1823,6 +1879,29 @@ class AgentLoop:
         self._stop_tasks.clear()
         self._jobs.clear()
 
+        # 續租任務一定要先收乾淨再解除映射：一個正在飛的續租會在路由器上
+        # 重新開好一筆轉埠，而它指向的服務下一秒就關了。
+        if self._peer_renew_task is not None:
+            self._peer_renew_task.cancel()
+            try:
+                await self._peer_renew_task
+            except asyncio.CancelledError:
+                pass
+            except Exception:
+                logger.debug("runner: peer renewal task ended with an error", exc_info=True)
+            self._peer_renew_task = None
+
+        if self._peer_mapping is not None:
+            # spec §3.1 第 6 點：agent 結束時把映射收掉（NAT-PMP lifetime 0 /
+            # UPnP DeletePortMapping），別在路由器上留一筆指向已關閉服務的
+            # 轉埠。盡力而為 —— natmap.unmap_port 自己吞例外，而且是阻塞的，
+            # 所以照樣走 to_thread。
+            try:
+                await asyncio.to_thread(natmap.unmap_port, self._peer_mapping)
+            except Exception:
+                logger.debug("runner: releasing the port mapping failed (ignored)", exc_info=True)
+            self._peer_mapping = None
+
         if self._peer_server is not None:
             try:
                 self._peer_server.stop()
@@ -1881,6 +1960,167 @@ class AgentLoop:
         # unlimited-by-omission before the first control tick.
         if self._peer_server is not None:
             self._apply_peer_upload_limit(control.availability(self.config, self._config_dir))
+
+    async def _setup_port_mapping(self) -> None:
+        """在 peer server 起來之後、連平台之前，決定 `peer_url` 要通告什麼
+        （spec §3.1／§3.2）。順序：
+
+        1. peer 服務沒開 → 什麼都不做（`peer_nat = "none"`）。
+        2. 設了 `peer_advertise_host` → 直接用它，**不做映射**（使用者已經
+           講明對外位址了），`peer_nat = "manual"`。
+        3. `peer_nat_traversal == "off"` → 不做映射，用區網位址，`"lan"`。
+        4. 否則跑 natmap（8 秒上限，整段在 `asyncio.to_thread` 裡跑，永不擋
+           事件迴圈）。成功且外部 IP 可用 → `http://<外部IP>:<外部埠>`；成功
+           但外部 IP 不可用（雙層 NAT）→ 先用區網位址，等 `ready.remote_ip`
+           到了再由 `_apply_remote_ip` 換掉。失敗 → 區網位址 + 一行 WARNING。
+        """
+        if not peerserve.is_enabled(self.config):
+            self._peer_nat = "none"
+            return
+
+        self._peer_lan_url = peerserve.lan_url(self.config)
+
+        if self.config.peer_advertise_host:
+            self._peer_advertised_url = peerserve.advertised_url(self.config)
+            self._peer_nat = "manual"
+            return
+
+        if self.config.peer_nat_traversal == "off":
+            self._peer_advertised_url = self._peer_lan_url
+            self._peer_nat = "lan"
+            return
+
+        # BLOCKING（UDP/HTTP 到路由器）。natmap 自己吞掉所有例外並回 None，
+        # 但 to_thread 的邊界還是包一層，免得任何意外把啟動流程拖垮。
+        try:
+            mapping = await asyncio.to_thread(
+                natmap.map_port, port=self.config.peer_listen_port
+            )
+        except Exception:
+            logger.exception(
+                "runner: automatic port mapping raised; falling back to the LAN address"
+            )
+            mapping = None
+
+        if mapping is None:
+            self._peer_mapping = None
+            self._peer_advertised_url = self._peer_lan_url
+            self._peer_nat = "lan"
+            logger.warning(_PEER_NO_MAPPING_WARNING)
+            return
+
+        self._peer_mapping = mapping
+        self._peer_nat = mapping.method
+        host = mapping.external_ip or self._peer_remote_ip
+        if host:
+            self._peer_advertised_url = peerserve.peer_url_for(host, mapping.external_port)
+        else:
+            # 雙層 NAT 或路由器沒回報外部 IP：先用區網位址連上去，拿到
+            # `ready.remote_ip` 再換（spec §3.1 第 5 點）。
+            self._peer_advertised_url = self._peer_lan_url
+        logger.info(
+            "runner: port mapping via %s -> external %s:%s, advertising %s",
+            mapping.method,
+            mapping.external_ip or "(unknown, awaiting ready.remote_ip)",
+            mapping.external_port,
+            self._peer_advertised_url,
+        )
+
+    def _apply_remote_ip(self, remote_ip: Optional[str]) -> bool:
+        """吃下 `ready.remote_ip`（spec §3.1 第 5 點／§8）。回傳「是否應該
+        為了送出更新後的 hello 而重連一次」。
+
+        只在「有映射、而且映射本身沒給出可用的外部 IP」時才有意義：手動
+        指定（`manual`）尊重使用者、純區網（`lan`）沒有對外位址可言 ——
+        兩者都直接回 False。重連在滾動一小時內最多 1 次。
+        """
+        if not remote_ip or natmap.is_private_address(remote_ip):
+            return False
+        if self._peer_mapping is None or self._peer_nat in ("manual", "lan", "none"):
+            return False
+        if self._peer_mapping.external_ip:
+            # 路由器自己就報得出可用的外部 IP，以它為準。
+            return False
+
+        previous_ip = self._peer_remote_ip
+        self._peer_remote_ip = remote_ip
+        new_url = peerserve.peer_url_for(remote_ip, self._peer_mapping.external_port)
+        if new_url == self._peer_advertised_url:
+            return False
+        self._peer_advertised_url = new_url
+
+        now = time.monotonic()
+        self._peer_reconnects_at = [
+            t for t in self._peer_reconnects_at if now - t < _PEER_RECONNECT_WINDOW_SECONDS
+        ]
+        if self._peer_reconnects_at:
+            # 已經在這一小時內重連過；位址記下來，下次自然重連時就會帶出去。
+            logger.info(
+                "runner: public address changed (%s -> %s) but an automatic "
+                "reconnect already happened this hour; the new address goes "
+                "out on the next reconnect",
+                previous_ip, remote_ip,
+            )
+            return False
+        self._peer_reconnects_at.append(now)
+        return True
+
+    async def _peer_renew_loop(self) -> None:
+        """每 `natmap.RENEW_SECONDS` 重新請求同一筆映射（spec §3.1 第 6 點）。
+        外部 IP 變了就走跟 `_apply_remote_ip` 同一條路（更新通告位址，下次
+        重連自然帶出去）—— 絕不無聲地換掉 URL 卻讓平台手上的 hello 過期。
+        失敗只記 log：既有的 lease 還有 `natmap.LEASE_SECONDS` 秒，下一輪再試。
+        """
+        while True:
+            await asyncio.sleep(natmap.RENEW_SECONDS)
+            if self._peer_mapping is None:
+                continue
+            try:
+                mapping = await asyncio.to_thread(
+                    natmap.map_port, port=self.config.peer_listen_port
+                )
+            except Exception:
+                logger.exception("runner: peer port-mapping renewal raised")
+                continue
+            if mapping is None:
+                logger.warning(
+                    "runner: peer port-mapping renewal failed; keeping the current lease"
+                )
+                continue
+            self._peer_mapping = mapping
+            self._peer_nat = mapping.method
+            host = mapping.external_ip or self._peer_remote_ip
+            if not host:
+                continue
+            new_url = peerserve.peer_url_for(host, mapping.external_port)
+            if new_url == self._peer_advertised_url:
+                continue
+            logger.info("runner: renewed mapping changed the peer URL to %s", new_url)
+            self._peer_advertised_url = new_url
+            # 位址真的變了 ⇒ 平台手上的 hello 已經過期。走跟 ready.remote_ip
+            # 完全一樣的重連路徑（同一個 1 次／小時的節流），而不是偷偷換掉
+            # 本地的字串讓平台繼續拿舊位址做健康檢查。
+            await self._request_peer_reconnect()
+
+    async def _request_peer_reconnect(self) -> None:
+        """把每一條平台連線踢掉一次，讓 `_run_platform` 的重試迴圈帶著新的
+        `peer_url` 重新 handshake + hello。受同一個「滾動一小時最多一次」的
+        節流約束（spec §8）。"""
+        now = time.monotonic()
+        self._peer_reconnects_at = [
+            t for t in self._peer_reconnects_at if now - t < _PEER_RECONNECT_WINDOW_SECONDS
+        ]
+        if self._peer_reconnects_at:
+            logger.info(
+                "runner: the peer URL changed but an automatic reconnect already "
+                "happened this hour; the new address goes out on the next reconnect"
+            )
+            return
+        self._peer_reconnects_at.append(now)
+        for conn in self.connections.values():
+            # `conn.close()` 自己吞掉關閉時的例外；`_run_platform` 的
+            # ConnectionClosed 處理會照既有的 backoff 重連並重送 hello。
+            await conn.close()
 
     def _install_signal_handlers(self, loop: asyncio.AbstractEventLoop) -> None:
         """Install SIGINT/SIGTERM (and SIGBREAK on Windows) handlers.
@@ -2000,8 +2240,28 @@ class AgentLoop:
             await conn.send_receipt_ack(message["receipt_id"], worker_sig)
         elif msg_type == "want_object_info":
             await self.refresh_object_info(conn, force=True)
+        elif msg_type == "peer_status":
+            self._handle_peer_status(message)
         else:
             logger.warning("runner: unknown message type %r from platform", msg_type)
+
+    def _handle_peer_status(self, message: dict) -> None:
+        """平台推來的可連性結論（spec §4.3）。只存記憶體供 `comfyfed status`
+        顯示；`reachable=false` 且不是使用者手動指定位址時，記一行 WARNING
+        （與映射失敗同一段文字 —— 對操作者來說要做的事一模一樣）。
+
+        只在**結論改變**時才吼：平台會週期性複查，否則一台真的沒開埠的機器
+        會被同一段文字洗版。"""
+        reachable = message.get("reachable")
+        if not isinstance(reachable, bool):
+            return
+        changed = reachable != self._peer_reachable
+        self._peer_reachable = reachable
+        checked_url = message.get("checked_url")
+        if isinstance(checked_url, str):
+            self._peer_checked_url = checked_url
+        if not reachable and self._peer_nat != "manual" and changed:
+            logger.warning(_PEER_NO_MAPPING_WARNING)
 
     async def _connection_loop(self, conn: PlatformConnection) -> None:
         last_heartbeat = time.monotonic()
@@ -2113,7 +2373,7 @@ class AgentLoop:
                 # Per ITERATION, not once: ComfyUI can also go away later.
                 await self._wait_for_comfy(conn)
                 await conn.connect()
-                await conn.handshake()
+                ready = await conn.handshake()
                 # Past the handshake: this entry's credentials are accepted,
                 # so it is not a dead 4401 registration. Clears the "all
                 # rejected" verdict for the whole process AND this entry's
@@ -2122,6 +2382,23 @@ class AgentLoop:
                 self._connected_ever = True
                 conn.auth_rejections = 0
                 conn.disabled_logged = False
+
+                # spec §3.1 第 5 點：平台回報的公網 IP 若讓通告位址變了，就
+                # 重連一次把新的 hello 送出去（滾動一小時最多 1 次）。記在
+                # 上面那三行之後 —— 這次 handshake 本身是成功的。
+                if self._apply_remote_ip(ready.get("remote_ip")):
+                    logger.info(
+                        "runner: public address resolved to %s; reconnecting once to "
+                        "advertise %s",
+                        self._peer_remote_ip, self._peer_advertised_url,
+                    )
+                    # 每一條連線都得重送 hello，不只這一條：其他平台手上那份
+                    # 還寫著舊位址，它們的可連性檢查會打到一個沒人在聽的地方。
+                    for other in self.connections.values():
+                        if other is not conn:
+                            await other.close()
+                    await conn.close()
+                    continue
 
                 # BLOCKING (an HTTP call to ComfyUI), so it goes to a thread
                 # exactly like `whitelist.allowed_classes` below. On the event
@@ -2139,7 +2416,15 @@ class AgentLoop:
                     self.config.comfy_url,
                     self.config.whitelist_extra,
                 )
-                await conn.send_hello(hw, backend, torch_version, allowed, peer_url=self._peer_advertised_url)
+                await conn.send_hello(
+                    hw,
+                    backend,
+                    torch_version,
+                    allowed,
+                    peer_url=self._peer_advertised_url,
+                    peer_lan_url=self._peer_lan_url,
+                    peer_nat=self._peer_nat,
+                )
 
                 # One immediate beat carrying the real availability. Both
                 # platforms record a freshly handshaked agent as `idle` and
@@ -2478,6 +2763,14 @@ class AgentLoop:
         # run on its very first heartbeat.
         control.clear_stop(self._config_dir)
         self._start_peer_server()
+        # 開埠要在連平台之前完成（hello 一次就要帶對位址），整體上限 8 秒。
+        # 只有 listener 真的起來了才值得去動路由器。
+        if self._peer_server is not None:
+            await self._setup_port_mapping()
+            if self._peer_mapping is not None:
+                self._peer_renew_task = asyncio.create_task(
+                    self._peer_renew_loop(), name="comfyfed-peer-renew"
+                )
         # One control task for the whole process, started before any socket
         # is attempted so `stop`/`status` work during the very first connect
         # and through every reconnect backoff.

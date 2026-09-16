@@ -71,7 +71,11 @@ def clear_stop(config_dir: str) -> None:
 
 
 def write_state(
-    config_dir: str, state: str, job_id: str | None, reason: str | None = None
+    config_dir: str,
+    state: str,
+    job_id: str | None,
+    reason: str | None = None,
+    peer: dict | None = None,
 ) -> None:
     """Publish what the running agent is doing, atomically (`status` may read
     it at any instant, and must never see a half-written file).
@@ -91,6 +95,11 @@ def write_state(
         }
         if reason:
             payload["reason"] = reason
+        # Phase 3.4 §3.3：`comfyfed status` 是另一個 process，看不到 runner
+        # 的記憶體，所以 P2P 通告狀態跟著 state 檔一起發布。只在有值時寫，
+        # 讀舊檔的程式看到的仍是「沒有這個鍵」而不是 null。
+        if peer:
+            payload["peer"] = peer
         path = _path(config_dir, STATE_FILE)
         tmp_path = f"{path}.tmp-{os.getpid()}"
         with open(tmp_path, "w", encoding="utf-8") as f:

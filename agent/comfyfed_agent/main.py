@@ -13,7 +13,7 @@ import httpx
 
 from datetime import datetime, timezone
 
-from . import __version__, control, detect, identity, update
+from . import __version__, control, detect, identity, natmap, peerserve, update
 from .config import AgentConfig
 from .runner import AgentLoop, AllRegistrationsRejected, PlatformConnection, _is_auth_rejected
 
@@ -300,6 +300,81 @@ def _availability_now(args: argparse.Namespace, config_dir: str) -> str | None:
     return control.availability(cfg, config_dir)
 
 
+# spec §3.3 的 P2P 那一行要用的可連性字樣。
+_PEER_REACHABLE_TEXT = {
+    True: "平台驗證通過 / verified by the platform",
+    False: "不可連 / not reachable",
+    None: "未檢查 / not checked yet",
+}
+_PEER_NAT_TEXT = {
+    "natpmp": "natpmp（自動開埠 / auto port mapping）",
+    "upnp": "upnp（自動開埠 / auto port mapping）",
+    "manual": "手動指定 / manual",
+    "lan": "僅區網 / LAN only",
+    "none": "關閉 / off",
+}
+
+
+def _print_peer_status(state: dict | None) -> None:
+    """`comfyfed status` 的 P2P 那一行（spec §3.3）。舊的 state 檔沒有
+    `peer` 這個鍵，那就什麼都不印 —— 沿用原本的輸出。"""
+    peer = (state or {}).get("peer")
+    if not isinstance(peer, dict):
+        return
+    if not peer.get("enabled"):
+        print("P2P 分享：關閉 / P2P sharing: off")
+        return
+    nat = peer.get("nat") or "lan"
+    reachable = peer.get("reachable")
+    reach = _PEER_REACHABLE_TEXT[reachable if isinstance(reachable, bool) else None]
+    print(
+        "P2P 分享：開啟（{nat}，對外 {url}，區網 {lan}，可連性：{reach}） / "
+        "P2P sharing: on ({nat}, external {url}, LAN {lan}, reachability: {reach})".format(
+            nat=_PEER_NAT_TEXT.get(nat, nat),
+            url=peer.get("url") or "—",
+            lan=peer.get("lan_url") or "—",
+            reach=reach,
+        )
+    )
+
+
+def _cmd_p2p_probe(args: argparse.Namespace) -> int:
+    """`comfyfed-agent p2p-probe`（spec §11）：跑一次 §3.1 的映射流程（8 秒
+    上限），成功印一行 JSON 並 exit 0，**隨即把測試映射收掉**（正式映射由
+    `run` 時建立）；失敗印 `{"ok": false, "reason": ...}` 並 exit 1。
+
+    安裝腳本就是靠這個 exit code 決定要不要在 agent.json 打開 `peer_serve`。
+    """
+    port = args.port
+    try:
+        gateway = natmap.detect_gateway()
+        if gateway is None:
+            print(json.dumps({"ok": False, "reason": "no_gateway"}))
+            return 1
+        # 把偵測到的閘道傳下去：`map_port` 沒拿到就會自己再跑一次
+        # `route print`／`ip route`，白白多花一次 subprocess。
+        mapping = natmap.map_port(port=port, gateway=gateway)
+    except Exception as exc:
+        print(json.dumps({"ok": False, "reason": "error", "detail": str(exc)}))
+        return 1
+
+    if mapping is None:
+        print(json.dumps({"ok": False, "reason": "no_response"}))
+        return 1
+
+    payload = {
+        "ok": True,
+        "method": mapping.method,
+        "external_ip": mapping.external_ip,
+        "external_port": mapping.external_port,
+        "lan_ip": peerserve._detect_local_ip(),
+    }
+    print(json.dumps(payload))
+    # 探測不留映射：這只是「路由器肯不肯開」的一次性問答。
+    natmap.unmap_port(mapping)
+    return 0
+
+
 def _cmd_status(args: argparse.Namespace) -> None:
     config_dir = _config_dir(args)
     paused = control.is_pause_requested(config_dir)
@@ -342,6 +417,8 @@ def _cmd_status(args: argparse.Namespace) -> None:
             "Not manually paused (idle detection may still auto-pause)."
         )
 
+    _print_peer_status(state)
+
 
 def cli() -> None:
     parser = argparse.ArgumentParser(prog="comfyfed-agent", description="ComfyFed agent: run ComfyUI jobs for a platform.")
@@ -365,6 +442,14 @@ def cli() -> None:
     )
     chk.add_argument("--config", default=DEFAULT_CONFIG_PATH, help="Path to the agent config file.")
     chk.set_defaults(func=_cmd_check_registration)
+
+    probe = sub.add_parser(
+        "p2p-probe",
+        help="Probe whether the router will open a port for P2P model sharing (NAT-PMP/UPnP).",
+    )
+    probe.add_argument("--port", type=int, default=8850, help="Port to test (default 8850).")
+    probe.add_argument("--json", action="store_true", help="Machine-readable output (always on).")
+    probe.set_defaults(func=lambda args: sys.exit(_cmd_p2p_probe(args)))
 
     for name, help_text, handler in (
         ("pause", "暫停接收新工作 / Stop accepting new jobs (the running job finishes).", _cmd_pause),

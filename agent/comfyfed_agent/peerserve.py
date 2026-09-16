@@ -94,6 +94,11 @@ _IDLE_REPORT_SECONDS = 60.0
 _REPORT_POLL_SECONDS = 5.0
 _ROUTE_PREFIX = "/peer/models/"
 
+# Phase 3.4 §4.2：平台用來驗證這台種子連不連得到的探針。**不需要憑證**，
+# 回 204、無內容、無識別資訊 —— 它只回答「這個位址上有一個 ComfyFed peer
+# 服務在聽」，不回答這台有哪些模型、屬於誰。其他路徑一律照舊要憑證。
+HEALTH_PATH = "/peer/health"
+
 # M4 final-review fix: cap consecutive failed `peer-served` report attempts
 # per grant -- an unbounded retry loop (the pre-fix behavior) means a grant
 # rejected for any terminal reason (the platform pruned it, already booked,
@@ -138,7 +143,22 @@ def advertised_url(config: AgentConfig) -> Optional[str]:
     if not is_enabled(config):
         return None
     host = config.peer_advertise_host or _detect_local_ip()
-    return f"http://{host}:{config.peer_listen_port}"
+    return peer_url_for(host, config.peer_listen_port)
+
+
+def peer_url_for(host: str, port: int) -> str:
+    """`http://host:port`，`peer_url`／`peer_lan_url` 的唯一組法。"""
+    return f"http://{host}:{port}"
+
+
+def lan_url(config: AgentConfig) -> Optional[str]:
+    """這台的區網位址（`hello.peer_lan_url`，spec §3.2）。**永遠**用自動
+    偵測到的區網 IP，即使使用者設了 `peer_advertise_host` —— 那個值是對外
+    位址（`peer_url`），而 `peer_lan_url` 存在的意義正是給「跟我在同一個
+    NAT 後面、連對外位址反而會 hairpin 失敗」的成員用的。"""
+    if not is_enabled(config):
+        return None
+    return peer_url_for(_detect_local_ip(), config.peer_listen_port)
 
 
 def _sanitize_peer_name(name: str) -> bool:
@@ -596,6 +616,12 @@ def _make_handler_class(server_state: "_ServerState") -> type:
 
         def _serve(self) -> None:
             parsed = urlsplit(self.path)
+            # Phase 3.4 §4.2：可連性探針，無憑證 204。放在憑證檢查之前是
+            # 刻意的 —— 平台做這個檢查時手上沒有（也不該有）任何 grant。
+            # 精確比對路徑，不是 startswith：`/peer/healthz` 之類的變形不算。
+            if parsed.path == HEALTH_PATH:
+                self._deny(204)
+                return
             if not parsed.path.startswith(_ROUTE_PREFIX):
                 self._deny(404)
                 return

@@ -729,3 +729,19 @@ def test_config_load_tolerates_a_utf8_bom(tmp_path):
 
     loaded = AgentConfig.load(str(path))
     assert loaded.models_dir == str(tmp_path / "m")
+
+
+def test_config_peer_nat_traversal_default_and_round_trip(tmp_path):
+    """Phase 3.4 §3：自動開埠預設 "auto"，"off" 要能存回去也讀得回來。"""
+    path = tmp_path / "agent.json"
+    AgentConfig().save(str(path))
+    assert AgentConfig.load(str(path)).peer_nat_traversal == "auto"
+
+    AgentConfig(peer_nat_traversal="off").save(str(path))
+    assert AgentConfig.load(str(path)).peer_nat_traversal == "off"
+
+    # 任何非字串／垃圾值一律退回預設 "auto"（永遠不會因為手改壞了就爆）。
+    data = json.loads(path.read_text(encoding="utf-8"))
+    data["peer_nat_traversal"] = 17
+    path.write_text(json.dumps(data), encoding="utf-8")
+    assert AgentConfig.load(str(path)).peer_nat_traversal == "auto"
