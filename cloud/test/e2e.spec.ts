@@ -1197,7 +1197,7 @@ describe("cloud end-to-end", () => {
 
       // -----------------------------------------------------------------
       // 8. Exactly two receipts, one per worker; none on the parent. And
-      // §2.3: each worker recorded a speed sample for the CHILD signature.
+      // final-review I1: NO speed sample for a child.
       expect(await getReceiptsForJob(db(), parentId)).toHaveLength(0);
       for (const child of children) {
         const receipts = await getReceiptsForJob(db(), child.id);
@@ -1208,16 +1208,23 @@ describe("cloud end-to-end", () => {
         expect(receipts[0]!.workerId).toBe(child.worker_id);
       }
 
+      // Final-review I1：子 job 不進統計。子 job 繼承父 job 的簽章，卻只跑 1/k
+      // 批；收它的 exec_seconds 會把這個簽章的 EWMA 拉到實際全批時間的 1/k
+      // （這裡就是 12.5 而不是 25），speed_index 也跟著偏。後續：幫子 job 算一個
+      // 含切片長度的自己的簽章。與 tests/server/test_agent_ws.py 的同一個 e2e 同步。
       const signature = children[0]!.signature;
       expect(children[1]!.signature).toBe(signature);
       for (const agent of [agentA, agentB]) {
         const statRow = await db()
-          .prepare("SELECT ewma_seconds, samples FROM worker_job_stats WHERE worker_id = ? AND signature = ?")
+          .prepare("SELECT ewma_seconds FROM worker_job_stats WHERE worker_id = ? AND signature = ?")
           .bind(agent.workerId, signature)
-          .first<{ ewma_seconds: number; samples: number }>();
-        expect(statRow).not.toBeNull();
-        expect(statRow!.ewma_seconds).toBeCloseTo(12.5, 6);
-        expect(statRow!.samples).toBe(1);
+          .first<{ ewma_seconds: number }>();
+        expect(statRow).toBeNull();
+        const worker = await db()
+          .prepare("SELECT speed_index FROM workers WHERE id = ?")
+          .bind(agent.workerId)
+          .first<{ speed_index: number }>();
+        expect(worker!.speed_index).toBe(1);
       }
 
       // =====================================================================

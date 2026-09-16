@@ -333,8 +333,16 @@ def logout(response: Response):
     return {"ok": True}
 
 
+# Final-review M3：`/api/auth/me` 的回應是每個使用者各自不同的（username /
+# role / csrf），絕不能落入任何共用快取。跟 templates.py 的
+# `_INDEX_CACHE_HEADERS` 同一個理由跟同一個寫法：寫在回應上，而不是
+# 靠「反正預設不快取」的慣例。
+_ME_CACHE_CONTROL = "private, no-store"
+
+
 @router.get("/me")
-def me(cf_session: Optional[str] = Cookie(default=None)):
+def me(response: Response, cf_session: Optional[str] = Cookie(default=None)):
+    response.headers["Cache-Control"] = _ME_CACHE_CONTROL
     payload = read_session_payload(cf_session)
     with db.get_session() as db_session:
         lang = _get_setting(db_session, _LANG_KEY) or "en"

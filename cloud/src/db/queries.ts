@@ -866,15 +866,22 @@ export async function getUsernamesByIds(db: D1Database, ids: string[]): Promise<
  * second generation of children -- and every parent-derived function then
  * treats it as a plain job (they all short-circuit on `split_count === 0`).
  * The old children are left exactly as they are: terminal rows, kept as
- * history. */
+ * history.
+ *
+ * Final-review I2: `AND parent_id IS NULL` -- a split child is never
+ * retryable on its own (the route rejects it with 409 `jobs.not_retryable`
+ * first; this is the same belt-and-braces atomic guard as the status check).
+ * Final-review M5: `dispatch_info` resets to `{}` -- last attempt's estimate
+ * says nothing about this one, and leaving it would show the console a stale
+ * prediction. Mirrors `jobs.retry_job`. */
 export async function retryFailedJob(db: D1Database, jobId: string): Promise<boolean> {
   const result = await db
     .prepare(
       `UPDATE jobs
        SET status = 'queued', worker_id = NULL, error = NULL, progress = 0,
            started_at = NULL, finished_at = NULL,
-           split_count = 0, split_plan = NULL
-       WHERE id = ? AND status = 'failed'`
+           split_count = 0, split_plan = NULL, dispatch_info = '{}'
+       WHERE id = ? AND status = 'failed' AND parent_id IS NULL`
     )
     .bind(jobId)
     .run();
@@ -882,10 +889,21 @@ export async function retryFailedJob(db: D1Database, jobId: string): Promise<boo
 }
 
 /** 派工專用的 queued 清單：排除 `split_count > 0` 的父 job -- 它的工作由子
- * job 執行，父 job 本身永遠不該被指派給 worker（Phase 3.3 §2.5 第 2 步）。 */
+ * job 執行，父 job 本身永遠不該被指派給 worker（Phase 3.3 §2.5 第 2 步）。
+ *
+ * Final-review C1：LIMIT `QUEUED_DISPATCH_SCAN_LIMIT`。一輪選取最多用到
+ * 2×`MAX_JOBS_PER_TICK` = 128 件（head 一個 `limit` + 餓死補頁一個 `limit`），
+ * 1024 是故意寬鬆的常數：餓死掃描還看得到 head 後面一大段舊 job，又不
+ * 至於把幾萬件的佇列整張讀進 DO 的記憶體。排序一律 `created_at, id`，
+ * 所以 LIMIT 切掉的永遠是最新的那一端。與 dispatch.py 的 `_QUEUED_SCAN_LIMIT` 同值。 */
+export const QUEUED_DISPATCH_SCAN_LIMIT = 1024;
+
 export async function getQueuedJobsForDispatch(db: D1Database): Promise<Job[]> {
   const { results } = await db
-    .prepare("SELECT * FROM jobs WHERE status = 'queued' AND split_count = 0 ORDER BY created_at ASC, id ASC")
+    .prepare(
+      "SELECT * FROM jobs WHERE status = 'queued' AND split_count = 0 ORDER BY created_at ASC, id ASC LIMIT ?"
+    )
+    .bind(QUEUED_DISPATCH_SCAN_LIMIT)
     .all<JobRow>();
   return results.map(rowToJob);
 }

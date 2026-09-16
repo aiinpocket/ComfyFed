@@ -15,6 +15,9 @@ export interface CallResult {
   status: number;
   body: any;
   setCookie: string | null;
+  /** The raw response headers, for the handful of assertions that care about
+   * one (e.g. the `Cache-Control: private, no-store` on `/api/auth/me`). */
+  headers: Headers;
 }
 
 /** Fires one request through the real worker export (schema-guard middleware
@@ -61,7 +64,7 @@ export async function call(path: string, opts: CallOptions = {}): Promise<CallRe
     }
   }
 
-  return { status: response.status, body: json, setCookie };
+  return { status: response.status, body: json, setCookie, headers: response.headers };
 }
 
 export function db(): D1Database {

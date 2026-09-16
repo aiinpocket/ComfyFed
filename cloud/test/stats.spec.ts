@@ -174,3 +174,107 @@ describe("backfillIfNeeded (§2.6)", () => {
     expect(row.n).toBe(0);
   });
 });
+
+// --- Final-review I3: batched backfill == N sequential recordCompletion ----
+
+describe("backfillIfNeeded batching (final-review I3)", () => {
+  const REPLAY: [string, string, number][] = [
+    ["w1", "sigA", 10],
+    ["w2", "sigA", 20],
+    ["w1", "sigB", 5],
+    ["w1", "sigA", 30],
+    ["w2", "sigB", 7],
+    ["w2", "sigA", 12],
+    ["w1", "sigA", 9],
+    ["w3", "sigA", 40],
+  ];
+
+  async function seedReceipts(triples: [string, string, number][]): Promise<void> {
+    for (const [index, [workerId, signature, gpuSeconds]] of triples.entries()) {
+      const at = `2026-01-01 00:00:${String(index).padStart(2, "0")}.000000`;
+      await db()
+        .prepare("INSERT INTO jobs (id, workflow_json, status, created_at, signature) VALUES (?, '{}', 'done', ?, ?)")
+        .bind(`j${index}`, at, signature)
+        .run();
+      await db()
+        .prepare(
+          `INSERT INTO receipts (id, job_id, worker_id, gpu_seconds, platform_sig, created_at, kind, billable, basis)
+           VALUES (?, ?, ?, ?, 'sig', ?, 'completed', 1, 'exec')`
+        )
+        .bind(`r${index}`, `j${index}`, workerId, gpuSeconds, at)
+        .run();
+    }
+  }
+
+  /** Flat `name -> number` view of everything the replay may touch. */
+  async function numericSnapshot(): Promise<Record<string, number>> {
+    const out: Record<string, number> = {};
+    const statRows = await db().prepare("SELECT worker_id, signature, ewma_seconds, samples FROM worker_job_stats").all<any>();
+    for (const r of statRows.results) {
+      out[`ewma:${r.worker_id}:${r.signature}`] = r.ewma_seconds;
+      out[`samples:${r.worker_id}:${r.signature}`] = r.samples;
+    }
+    const workerRows = await db().prepare("SELECT id, speed_index FROM workers").all<any>();
+    for (const w of workerRows.results) out[`speed:${w.id}`] = w.speed_index;
+    return out;
+  }
+
+  async function reset(): Promise<void> {
+    await db().prepare("DELETE FROM worker_job_stats").run();
+    await db().prepare("DELETE FROM workers").run();
+    await db().prepare("DELETE FROM jobs").run();
+    await db().prepare("DELETE FROM receipts").run();
+    await db().prepare("DELETE FROM settings").run();
+  }
+
+  it("produces the same rows as N sequential recordCompletion calls", async () => {
+    for (const id of ["w1", "w2", "w3"]) await makeWorker(id);
+    await seedReceipts(REPLAY);
+    expect(await stats.backfillIfNeeded(db())).toBe(true);
+    const batched = await numericSnapshot();
+
+    await reset();
+    for (const id of ["w1", "w2", "w3"]) await makeWorker(id);
+    for (const [workerId, signature, gpuSeconds] of REPLAY) {
+      await stats.recordCompletion(db(), workerId, signature, gpuSeconds, new Date());
+    }
+    const sequential = await numericSnapshot();
+
+    expect(Object.keys(batched).sort()).toEqual(Object.keys(sequential).sort());
+    for (const key of Object.keys(batched)) {
+      expect(batched[key], key).toBeCloseTo(sequential[key]!, 10);
+    }
+    // And something was actually computed (not two empty snapshots).
+    expect(batched["samples:w1:sigA"]).toBe(3);
+    expect(batched["speed:w1"]).not.toBe(1);
+  });
+
+  it("leaves the flag unset when the batched write fails", async () => {
+    for (const id of ["w1", "w2", "w3"]) await makeWorker(id);
+    await seedReceipts(REPLAY.slice(0, 3));
+
+    // A db facade whose `batch` blows up: the flag must NOT be written, so the
+    // next tick retries the whole thing (hub.ts leaves `statsBackfillDone`
+    // false on a throw for the same reason).
+    const real = db();
+    const exploding = new Proxy(real, {
+      get(target, prop, receiver) {
+        if (prop === "batch") return () => Promise.reject(new Error("batch blew up"));
+        const value = Reflect.get(target, prop, receiver);
+        return typeof value === "function" ? value.bind(target) : value;
+      },
+    }) as D1Database;
+
+    await expect(stats.backfillIfNeeded(exploding)).rejects.toThrow("batch blew up");
+
+    const flag = await db().prepare("SELECT value FROM settings WHERE key = ?").bind(stats.BACKFILL_SETTING_KEY).first<any>();
+    expect(flag).toBeNull();
+    const count = await db().prepare("SELECT COUNT(*) AS n FROM worker_job_stats").first<any>();
+    expect(count.n).toBe(0);
+
+    // Flag unset, so the next attempt (with a working db) runs the whole thing.
+    expect(await stats.backfillIfNeeded(db())).toBe(true);
+    const after = await db().prepare("SELECT COUNT(*) AS n FROM worker_job_stats").first<any>();
+    expect(after.n).toBeGreaterThan(0);
+  });
+});

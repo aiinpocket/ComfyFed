@@ -260,3 +260,112 @@ def test_backfill_skips_non_billable_and_failed_receipts(_db):
     assert stats.backfill_if_needed() is True
     with db.get_session() as session:
         assert session.query(db.WorkerJobStats).count() == 0
+
+
+# --- Final-review I3: 批次回填 = N 次順序 record_completion -----------------
+
+
+_REPLAY = [
+    ("w1", "sigA", 10.0),
+    ("w2", "sigA", 20.0),
+    ("w1", "sigB", 5.0),
+    ("w1", "sigA", 30.0),
+    ("w2", "sigB", 7.0),
+    ("w2", "sigA", 12.0),
+    ("w1", "sigA", 9.0),
+    ("w3", "sigA", 40.0),
+]
+
+
+def _seed_receipts(triples):
+    """One done job + one completed billable receipt per triple, `created_at`
+    strictly increasing so the oldest-first replay order is unambiguous."""
+    base = _utcnow()
+    with db.get_session() as session:
+        for index, (worker_id, signature, gpu_seconds) in enumerate(triples):
+            session.add(
+                db.Job(
+                    id=f"j{index}",
+                    workflow_json="{}",
+                    status="done",
+                    signature=signature,
+                    required_models="[]",
+                    created_at=base + timedelta(seconds=index),
+                )
+            )
+            session.add(
+                db.Receipt(
+                    id=f"r{index}",
+                    job_id=f"j{index}",
+                    worker_id=worker_id,
+                    gpu_seconds=gpu_seconds,
+                    platform_sig="sig",
+                    kind="completed",
+                    billable=True,
+                    created_at=base + timedelta(seconds=index),
+                )
+            )
+        session.commit()
+
+
+def _numeric_snapshot():
+    """Flat `name -> float` view of everything the replay is allowed to touch."""
+    out = {}
+    with db.get_session() as session:
+        for row in session.query(db.WorkerJobStats).all():
+            out[f"ewma:{row.worker_id}:{row.signature}"] = row.ewma_seconds
+            out[f"samples:{row.worker_id}:{row.signature}"] = float(row.samples)
+        for worker in session.query(db.Worker).all():
+            out[f"speed:{worker.id}"] = worker.speed_index
+    return out
+
+
+def test_backfill_matches_n_sequential_record_completion_calls(_db, tmp_path):
+    """Final-review I3：回填改成「讀一次 -> 記憶體重放 -> 寫一次」之後，結果
+    必須和一筆一筆呼叫 `record_completion` 完全相同（同樣的快照時點、同樣的
+    排除自己規則、同樣的 EWMA 與 speed_index 演進）。
+    """
+    db.init_db(str(tmp_path / "backfilled.db"))
+    for worker_id in ("w1", "w2", "w3"):
+        _make_worker(worker_id)
+    _seed_receipts(_REPLAY)
+    assert stats.backfill_if_needed() is True
+    batched = _numeric_snapshot()
+
+    db.init_db(str(tmp_path / "sequential.db"))
+    for worker_id in ("w1", "w2", "w3"):
+        _make_worker(worker_id)
+    for worker_id, signature, gpu_seconds in _REPLAY:
+        stats.record_completion(worker_id, signature, gpu_seconds)
+    sequential = _numeric_snapshot()
+
+    assert sorted(batched) == sorted(sequential)
+    assert batched == pytest.approx(sequential)
+    # 而且真的有東西被算出來（不是兩邊都是空的）。
+    assert batched["samples:w1:sigA"] == 3.0
+    assert batched["speed:w1"] != 1.0
+
+
+def test_backfill_leaves_the_flag_unset_when_the_write_fails(_db, monkeypatch):
+    """Final-review I3：旗標只在寫入成功之後才設。寫入炸掉 -> 旗標不設 ->
+    下一次啟動會完整重試一次。"""
+    _make_worker("w1")
+    _seed_receipts(_REPLAY[:3])
+
+    def _boom(session, stats_map, speed_updates):
+        raise RuntimeError("write blew up")
+
+    monkeypatch.setattr(stats, "_apply_backfill_writes", _boom)
+
+    assert stats.backfill_if_needed() is False
+
+    with db.get_session() as session:
+        assert session.get(db.Setting, stats.BACKFILL_SETTING_KEY) is None
+        assert session.query(db.WorkerJobStats).count() == 0
+
+    # 旗標沒設，所以下一次（寫入恢復正常）會真的跑完。
+    monkeypatch.undo()
+    assert stats.backfill_if_needed() is True
+    with db.get_session() as session:
+        assert session.get(db.Setting, stats.BACKFILL_SETTING_KEY).value == "1"
+        assert session.query(db.WorkerJobStats).count() > 0

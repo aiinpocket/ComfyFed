@@ -1304,12 +1304,22 @@ def _record_job_stats(
     只讀一次 job 拿 `signature`（`record_completion` 自己不認得 job）。整段
     包在 try 裡，且 `record_completion` 內部也吞例外 -- 統計是附帶效果，
     job_done 的主流程（面板事件、收據）絕不能因為它失敗。
+
+    Final-review I1：`parent_id` 不為空的子 job 一律跳過。子 job 繼承父 job
+    的 `signature`，卻只跑 1/k 批，把它的 `exec_seconds` 餵進去會讓這個簽章
+    的 EWMA 跑到實際全批時間的 1/k，`speed_index` 也跟著被拉偏。
+    TODO（後續）：幫子 job 算一個含切片長度的自己的簽章（per-child
+    signature including slice length），子 job 就能在自己的簽章下正常計統；
+    在那之前寧可不收，也不要污染父簽章。cloud 端的對應點在
+    `do/hub.ts` 的 `stats.recordCompletion` 呼叫處。
     """
     if not job_id or not stats.is_valid_exec_seconds(exec_seconds):
         return
     try:
         with db.get_session() as session:
             job = session.get(db.Job, job_id)
+            if job is not None and job.parent_id is not None:
+                return
             signature = job.signature if job is not None else None
         stats.record_completion(worker_id, signature, exec_seconds)
     except Exception:
@@ -1641,8 +1651,14 @@ async def dispatch_tick() -> None:
     if idle_worker_ids:
         try:
             with db.get_session() as session:
+                # Final-review M2：`split_count == 0` 與
+                # `getQueuedJobsForDispatch` / `assign_jobs` 的 queued 查詢對齊 --
+                # 已拆的父 job 永遠不會被派工，不能拿它當「有活可做」。
                 has_queued_work = (
-                    session.query(db.Job.id).filter(db.Job.status == "queued").first() is not None
+                    session.query(db.Job.id)
+                    .filter(db.Job.status == "queued", db.Job.split_count == 0)
+                    .first()
+                    is not None
                 )
         except Exception:
             logger.exception("agentws: failed to check for queued work")

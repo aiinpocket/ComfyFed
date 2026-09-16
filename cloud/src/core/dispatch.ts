@@ -44,8 +44,8 @@ export interface Assignment {
 }
 
 /** 一個 tick 最多評估這麼多件 queued job（外加所有已餓死的）。 */
-const MAX_JOBS_PER_TICK = 64;
-const JOBS_PER_IDLE_WORKER = 8;
+export const MAX_JOBS_PER_TICK = 64;
+export const JOBS_PER_IDLE_WORKER = 8;
 
 function dispatchInfoJson(
   predictedSeconds: number,
@@ -116,7 +116,11 @@ export async function assignJobs(
   const starved = jobsForMatching
     .slice(limit)
     .filter((j) => new Date(`${j.createdAt}Z`).getTime() <= starveCutoffMs && !headIds.has(j.id));
-  const selectedJobs = [...head, ...starved];
+  // Final-review C1：餓死集合也要封頂（與 dispatch.py 同步）。未封頂時，
+  // 一個塞住超過 `STARVE_SECONDS` 的大佇列會把全部 queued job 丟進 O(n³)
+  // 的 Hungarian，在 DO alarm 裡跑。`starved` 已依 `created_at, id` 排序，
+  // `slice(0, limit)` 取的就是最舊的那些；剩下的下一個 tick 再排。
+  const selectedJobs = [...head, ...starved.slice(0, limit)];
   if (selectedJobs.length === 0) return [];
 
   const statRows = await stats.loadRows(db);

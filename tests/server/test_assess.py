@@ -1009,3 +1009,30 @@ def test_signature_sums_steps_and_mpx_across_nodes():
     }
     same_shape_again = json.loads(json.dumps(same_shape))
     assert _sig(same_shape) == _sig(same_shape_again)
+
+
+def test_signature_treats_an_integral_float_like_the_same_int():
+    """Final-review M1：JSON 沒有 int/float 之分，`4.0` 和 `4` 是同一個值。
+    TS 端用 `Number.isInteger`（JS 根本沒有這個區分），`assess._literal_int`
+    以前只收 `int`，所以一張存成 `20.0` 的圖會算出另一個簽章、統計分群跟著
+    裂成兩半。與 `split._literal_int` 同形。
+    """
+    as_int = {
+        "1": {"class_type": "KSampler", "inputs": {"steps": 20}},
+        "2": {"class_type": "EmptyLatentImage", "inputs": {"width": 512, "height": 512, "batch_size": 4}},
+    }
+    as_float = {
+        "1": {"class_type": "KSampler", "inputs": {"steps": 20.0}},
+        "2": {
+            "class_type": "EmptyLatentImage",
+            "inputs": {"width": 512.0, "height": 512.0, "batch_size": 4.0},
+        },
+    }
+    assert _sig(as_float) == _sig(as_int)
+
+
+def test_signature_still_ignores_a_non_integral_float():
+    """`20.5` 不是整數值，維持「當 0」的舊行為（`Number.isInteger` 也是）。"""
+    a = {"1": {"class_type": "KSampler", "inputs": {"steps": 20.5}}}
+    b = {"1": {"class_type": "KSampler", "inputs": {"steps": 0}}}
+    assert _sig(a) == _sig(b)

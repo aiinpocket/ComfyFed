@@ -1200,3 +1200,35 @@ def test_assign_jobs_does_not_split_a_job_no_worker_is_eligible_for(_db):
 
     assert split.children_of(parent_id) == []
     assert assignments == []
+
+
+def test_assign_jobs_bounds_the_matrix_when_the_whole_queue_is_starved(_db, monkeypatch):
+    """Final-review C1：餓死集合封頂，否則一個塞住的大佇列會把 O(n³) 的
+    Hungarian 餵成 200×1，直接卡住 event loop（cloud 端是 DO alarm）。
+
+    矩陣列數最多 2×limit（head 一個 limit + 餓死補頁一個 limit），而且最舊
+    的那一件仍然是本輪派出去的那一件。
+    """
+    worker_id = _make_worker("w1", dynamic={"free_vram_gb": 24})
+    now = _utcnow()
+    for index in range(200):
+        _make_signed_job(
+            f"j{index:03d}",
+            created_at=now - timedelta(seconds=scheduler.STARVE_SECONDS + 1000 - index),
+        )
+
+    seen: list[int] = []
+    original = scheduler.build_matrix
+
+    def _spy(jobs, workers, pairs, predictions, now_):
+        seen.append(len(jobs))
+        return original(jobs, workers, pairs, predictions, now_)
+
+    monkeypatch.setattr(scheduler, "build_matrix", _spy)
+
+    assignments = dispatch.assign_jobs([worker_id])
+
+    limit = min(dispatch._MAX_JOBS_PER_TICK, dispatch._JOBS_PER_IDLE_WORKER * 1)
+    assert seen, "scheduler.build_matrix was never called"
+    assert max(seen) <= 2 * limit
+    assert [j.id for _w, j in assignments] == ["j000"]

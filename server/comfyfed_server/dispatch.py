@@ -58,6 +58,13 @@ def _json_list(raw) -> list:
 _MAX_JOBS_PER_TICK = 64
 _JOBS_PER_IDLE_WORKER = 8
 
+# Final-review C1：queued 掃描的硬上限。選取逆向計算：head 最多
+# `_MAX_JOBS_PER_TICK`、餓死補頁最多又一個 `limit`，所以 2×64 = 128
+# 就夠裝滿一整輪能用到的量；1024 是故意寬鬆的常數，讓餓死掃描
+# 還看得到 head 後面一大段舊 job，又不至於把幾萬件的佇列整張讀進記憶體。
+# 排序一律 `created_at, id`，所以 LIMIT 切掉的永遠是最新的那一端。
+_QUEUED_SCAN_LIMIT = 1024
+
 
 def _dispatch_info(
     predicted_seconds: float,
@@ -131,6 +138,7 @@ def assign_jobs(
             session.query(db.Job)
             .filter(db.Job.status == "queued", db.Job.split_count == 0)
             .order_by(db.Job.created_at.asc(), db.Job.id.asc())
+            .limit(_QUEUED_SCAN_LIMIT)
             .all()
         )
 
@@ -144,6 +152,7 @@ def assign_jobs(
                 session.query(db.Job)
                 .filter(db.Job.status == "queued", db.Job.split_count == 0)
                 .order_by(db.Job.created_at.asc(), db.Job.id.asc())
+                .limit(_QUEUED_SCAN_LIMIT)
                 .all()
             )
 
@@ -156,7 +165,12 @@ def assign_jobs(
             for job in queued_jobs[limit:]
             if job.created_at is not None and job.created_at <= starve_cutoff
         ]
-        selected_jobs = head + [job for job in starved if job.id not in head_ids]
+        # Final-review C1：餓死集合也要封頂。未封頂時，一個塞住超過
+        # `STARVE_SECONDS` 的大佇列會把全部 queued job 丟進 O(n³) 的
+        # Hungarian（Python 這邊直接卡住 event loop，TS 那邊卡住 DO alarm）。
+        # 餓死清單已依 `created_at, id` 排序，`[:limit]` 取的就是最舊的那
+        # 些——最餓的優先，剩下的下一個 tick 再排。
+        selected_jobs = head + [job for job in starved if job.id not in head_ids][:limit]
 
         if not selected_jobs:
             return []

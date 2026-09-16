@@ -74,12 +74,16 @@ async function makeJob(opts: {
   workerId?: string | null;
   lastWorkerId?: string | null;
   startedAt?: Date | null;
+  signature?: string | null;
+  parentId?: string | null;
+  splitIndex?: number | null;
 }): Promise<string> {
   const id = uniqueId("job");
   await db()
     .prepare(
-      `INSERT INTO jobs (id, workflow_json, status, worker_id, last_worker_id, created_at, started_at, input_assets)
-       VALUES (?, '{}', ?, ?, ?, ?, ?, '[]')`
+      `INSERT INTO jobs (id, workflow_json, status, worker_id, last_worker_id, created_at, started_at, input_assets,
+                         signature, parent_id, split_index)
+       VALUES (?, '{}', ?, ?, ?, ?, ?, '[]', ?, ?, ?)`
     )
     .bind(
       id,
@@ -87,7 +91,10 @@ async function makeJob(opts: {
       opts.workerId ?? null,
       opts.lastWorkerId ?? null,
       toSqliteTimestamp(new Date()),
-      opts.startedAt ? toSqliteTimestamp(opts.startedAt) : null
+      opts.startedAt ? toSqliteTimestamp(opts.startedAt) : null,
+      opts.signature ?? null,
+      opts.parentId ?? null,
+      opts.splitIndex ?? null
     )
     .run();
   return id;
@@ -555,6 +562,62 @@ describe("job_done", () => {
 
     const acked = await getReceiptsForJob(db(), jobId);
     expect(acked[0]!.workerSig).toBe(workerSig);
+    ws.close();
+  });
+
+  it("does not record stats for a split child (final-review I1)", async () => {
+    // 子 job 繼承父 job 的 signature，卻只跑 1/k 批。收它的 exec_seconds 會把
+    // 這個簽章的 EWMA 拉到實際全批時間的 1/k，speed_index 也跟著被拉偏。
+    // 後續：幫子 job 算一個含切片長度的自己的簽章。與 agentws._record_job_stats 同步。
+    const kp = KEYPAIRS[0]!;
+    const workerId = await makeWorker({ pubkeyHex: kp.pubkey_hex });
+    const ws = await connectAgent(workerId, kp.seed_hex);
+    ws.send(JSON.stringify({ type: "hello", protocol: 2 }));
+
+    const parentId = await makeJob({ status: "queued", signature: "sig" });
+    const childId = await makeJob({
+      status: "running",
+      workerId,
+      startedAt: new Date(Date.now() - 60_000),
+      signature: "sig",
+      parentId,
+      splitIndex: 0,
+    });
+
+    const receiptMsg = nextMessage(ws);
+    ws.send(JSON.stringify({ type: "job_done", job_id: childId, result_files: ["a.png"], exec_seconds: 12.5 }));
+    expect((await receiptMsg).type).toBe("receipt");
+
+    const count = await db().prepare("SELECT COUNT(*) AS n FROM worker_job_stats").first<any>();
+    expect(count.n).toBe(0);
+    const worker = await db().prepare("SELECT speed_index FROM workers WHERE id = ?").bind(workerId).first<any>();
+    expect(worker.speed_index).toBe(1.0);
+    ws.close();
+  });
+
+  it("still records stats for a plain job (final-review I1 control)", async () => {
+    const kp = KEYPAIRS[0]!;
+    const workerId = await makeWorker({ pubkeyHex: kp.pubkey_hex });
+    const ws = await connectAgent(workerId, kp.seed_hex);
+    ws.send(JSON.stringify({ type: "hello", protocol: 2 }));
+
+    const jobId = await makeJob({
+      status: "running",
+      workerId,
+      startedAt: new Date(Date.now() - 60_000),
+      signature: "sig",
+    });
+
+    const receiptMsg = nextMessage(ws);
+    ws.send(JSON.stringify({ type: "job_done", job_id: jobId, result_files: ["a.png"], exec_seconds: 12.5 }));
+    expect((await receiptMsg).type).toBe("receipt");
+
+    const row = await db()
+      .prepare("SELECT ewma_seconds, samples FROM worker_job_stats WHERE worker_id = ? AND signature = 'sig'")
+      .bind(workerId)
+      .first<any>();
+    expect(row.ewma_seconds).toBeCloseTo(12.5, 10);
+    expect(row.samples).toBe(1);
     ws.close();
   });
 

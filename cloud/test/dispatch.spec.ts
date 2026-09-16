@@ -1,7 +1,10 @@
-import { afterEach, describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
+
 import { env } from "cloudflare:test";
 import * as dispatch from "../src/core/dispatch";
 import * as scheduler from "../src/core/scheduler";
+// 保留未被 spy 換掉的本尊，讓 C1 的 spy 能在計數之後照常跑真正的配對。
+const matchActual = scheduler.match;
 import * as split from "../src/core/split";
 import { toSqliteTimestamp } from "../src/db/queries";
 
@@ -671,6 +674,44 @@ describe("Phase 3.3 scheduler semantics", () => {
 
     const assignments = await dispatch.assignJobs(db(), [workerId], null, null, start);
     expect(assignments.map((a) => a.job.id)).toEqual([old]);
+  });
+
+  it("bounds the matrix when the whole queue is starved (final-review C1)", async () => {
+    // 餓死集合未封頂時，一個塞住超過 STARVE_SECONDS 的大佇列會把全部
+    // queued job 丟進 O(n³) 的 Hungarian，在 DO alarm 裡跑。矩陣列數最多
+    // 2×limit（head 一個 limit + 餓死補頁一個 limit），而且最舊的那一件仍然
+    // 是本輪派出去的那一件。與 tests/server/test_dispatch.py 的
+    // `test_assign_jobs_bounds_the_matrix_when_the_whole_queue_is_starved` 同形。
+    const workerId = await makeWorker("w1", { dynamic: { free_vram_gb: 24 } });
+    const start = new Date();
+    const oldest = uniqueId("j_starved_000");
+    await makeSignedJob(oldest, {
+      createdAt: new Date(start.getTime() - (scheduler.STARVE_SECONDS + 1000) * 1000),
+    });
+    for (let index = 1; index < 200; index++) {
+      await makeSignedJob(uniqueId(`j_starved_${String(index).padStart(3, "0")}`), {
+        createdAt: new Date(start.getTime() - (scheduler.STARVE_SECONDS + 1000 - index) * 1000),
+      });
+    }
+
+    const seen: number[] = [];
+    // `scheduler.match` 是 dispatch.ts 真正呼叫的那一個（它內部直接呼叫
+    // `buildMatrix` 的 module-local binding，spy 在 namespace 上換不到），而它
+    // 拿到的 `jobs` 就是 `buildMatrix` 會拿到的同一個陣列 -- 也就是矩陣的列數。
+    const spy = vi.spyOn(scheduler, "match").mockImplementation((jobs, workers, pairs, predictions, at) => {
+      seen.push(jobs.length);
+      return matchActual(jobs, workers, pairs, predictions, at);
+    });
+    try {
+      const assignments = await dispatch.assignJobs(db(), [workerId], null, null, start);
+
+      const limit = Math.min(dispatch.MAX_JOBS_PER_TICK, dispatch.JOBS_PER_IDLE_WORKER * 1);
+      expect(seen.length).toBeGreaterThan(0);
+      expect(Math.max(...seen)).toBeLessThanOrEqual(2 * limit);
+      expect(assignments.map((a) => a.job.id)).toEqual([oldest]);
+    } finally {
+      spy.mockRestore();
+    }
   });
 
   it("still dispatches when the warm_models write fails", async () => {

@@ -237,12 +237,58 @@ def record_completion(
         )
 
 
+def _apply_backfill_writes(
+    session,
+    stats_map: dict[tuple[str, str], tuple[float, int, datetime]],
+    speed_updates: dict[str, float],
+) -> None:
+    """回填的寫入階段（Final-review I3）。
+
+    單獨拆出來一個函數，是為了讓「寫入失敗 -> 旗標不設」路徑測得到，
+    也讓重放（純計算）跟寫入在閱讀上分開。不自己 commit -- 由呼叫端連同
+    旗標一起 commit，這樣任何一步丟例外都不會留下「旗標設了但數據沒寫」
+    的狀態。
+    """
+    for (worker_id, signature), (ewma, samples, updated_at) in stats_map.items():
+        existing = session.get(db.WorkerJobStats, (worker_id, signature))
+        if existing is None:
+            session.add(
+                db.WorkerJobStats(
+                    worker_id=worker_id,
+                    signature=signature,
+                    ewma_seconds=ewma,
+                    samples=samples,
+                    updated_at=updated_at,
+                )
+            )
+        else:
+            existing.ewma_seconds = ewma
+            existing.samples = samples
+            existing.updated_at = updated_at
+
+    for worker_id, value in speed_updates.items():
+        worker = session.get(db.Worker, worker_id)
+        if worker is not None:
+            worker.speed_index = value
+
+
 def backfill_if_needed() -> bool:
     """§2.6：第一次啟動時用最近 500 筆完成收據重放一次 `record_completion`。
 
     回傳「這次有沒有真的跑回填」（旗標已設 -> False）。簽章缺的 job 先由
     `workflow_json` 補算並寫回 `jobs.signature`，所以回填同時也是舊資料的
     簽章補齊通道。
+
+    Final-review I3：舊版本在迴圈裡逐筆呼叫 `record_completion`，每一筆都開一
+    個 session、重讀一整張 `worker_job_stats` 加一整張 `workers`，再 commit 一次
+    -- 500 筆就是 500 輪。現在改成：讀一次、在記憶體裡用同一組純函數
+    （`next_ewma` / `next_speed_index` / `fleet_reference`）依序重放，最後在同一個
+    session 裡寫出去。重放的順序、快照時點（參考值算在 EWMA 更新「之前」
+    的快照上、且排除自己）跟 `record_completion` 逐行一致，所以 N 筆回填的
+    結果等於 N 次順序 `record_completion`。
+
+    `stats_backfilled` 旗標跟資料在同一次 commit 裡寫——寫入丟例外就什麼都
+    沒進去，旗標也不會被設，下一次啟動會完整重試。
     """
     try:
         with db.get_session() as session:
@@ -261,9 +307,24 @@ def backfill_if_needed() -> bool:
                 .limit(BACKFILL_LIMIT)
                 .all()
             )
-            replay = list(reversed(receipts))  # 依 created_at 由舊到新重放
+            replay = list(reversed(receipts))  # 依 created_at 由舊到新
 
-            pending: list[tuple[str, str, float]] = []
+            # 讀一次，全程在記憶體裡演進。`worker_job_stats` 這時一定是空
+            # 的（上面的檢查已提前返回），還是照讀一次保持與
+            # `record_completion` 同形。
+            stats_map: dict[tuple[str, str], tuple[float, int, datetime]] = {
+                (r.worker_id, r.signature): (r.ewma_seconds, r.samples, r.updated_at)
+                for r in session.query(db.WorkerJobStats).all()
+            }
+            speed_index = {
+                w.id: (w.speed_index if isinstance(w.speed_index, (int, float)) else 1.0)
+                for w in session.query(db.Worker).all()
+            }
+            # `record_completion` 只在 worker 列還在時寫 speed_index（且下一筆
+            # 重讀時也拿不到已刪除的 worker），這裡同步這個行為。
+            known_workers = set(speed_index)
+            speed_updates: dict[str, float] = {}
+
             for receipt in replay:
                 if receipt.job_id is None:
                     continue
@@ -280,27 +341,51 @@ def backfill_if_needed() -> bool:
                         continue
                     signature = assess.signature(workflow, assess.needs_from_job(job))
                     job.signature = signature
-                # `gpu_seconds` 是回填唯一能拿到的執行秒數代理值（收據沒存
-                # 原始 exec_seconds；它本身就是 min(exec_seconds, wall)）。
-                pending.append((receipt.worker_id, signature, receipt.gpu_seconds))
+                # `gpu_seconds` 是回填唯一能拿到的執行秒數代理值（收據沒
+                # 存原始 exec_seconds；它本身就是 min(exec_seconds, wall)）。
+                exec_seconds = receipt.gpu_seconds
+                # `record_completion` 的兩道前置閘門，一字不漏地搬過來。
+                if not signature or not is_valid_exec_seconds(exec_seconds):
+                    continue
+                exec_value = float(exec_seconds)
 
-            session.commit()
-    except Exception:
-        logger.exception("stats: backfill scan failed")
-        return False
+                snapshot = [
+                    StatRow(
+                        worker_id=key[0],
+                        signature=key[1],
+                        ewma_seconds=value[0],
+                        samples=value[1],
+                    )
+                    for key, value in stats_map.items()
+                ]
+                key = (receipt.worker_id, signature)
+                previous = stats_map.get(key)
+                stats_map[key] = (
+                    next_ewma(previous[0] if previous is not None else None, exec_value),
+                    (previous[1] if previous is not None else 0) + 1,
+                    receipt.created_at or _utcnow(),
+                )
 
-    for worker_id, signature, exec_seconds in pending:
-        record_completion(worker_id, signature, exec_seconds)
+                # 參考值算在 EWMA 更新「之前」的快照上，且排除自己。
+                if receipt.worker_id in known_workers:
+                    reference = fleet_reference(
+                        snapshot, speed_index, signature, exclude_worker_id=receipt.worker_id
+                    )
+                    current = speed_index[receipt.worker_id]
+                    updated = next_speed_index(current, reference, exec_value)
+                    speed_index[receipt.worker_id] = updated
+                    speed_updates[receipt.worker_id] = updated
 
-    try:
-        with db.get_session() as session:
-            flag = session.get(db.Setting, BACKFILL_SETTING_KEY)
+            _apply_backfill_writes(session, stats_map, speed_updates)
+
+            # 旗標跟資料同一次 commit。
             if flag is None:
                 session.add(db.Setting(key=BACKFILL_SETTING_KEY, value="1"))
             else:
                 flag.value = "1"
             session.commit()
     except Exception:
-        logger.exception("stats: failed to set the backfill flag")
+        logger.exception("stats: backfill failed")
+        return False
 
     return True

@@ -906,6 +906,98 @@ def test_job_done_records_worker_job_stats(client):
         assert row.samples == 1
 
 
+def test_dispatch_tick_does_not_build_the_manifest_for_a_parent_only_queue(
+    client, monkeypatch
+):
+    """Final-review M2：`has_queued_work` 要跟 `assign_jobs` 的 queued 查詢同條件
+    （`split_count == 0`）。已拆的父 job 永遠不會被派工，拿它當「有活可
+    做」會讓每一個 tick 白白跑一次 manifest 建置（worker 查詢 + 每台 seeder
+    的 inventory 解析 + `model_guide.harvest` 的目錄掃描）。
+    """
+    from comfyfed_server import model_manifest
+
+    calls: list[str] = []
+    original = model_manifest.entries
+    monkeypatch.setattr(
+        model_manifest,
+        "entries",
+        lambda data_dir: (calls.append(data_dir), original(data_dir))[1],
+    )
+
+    csrf = _login(client)
+    worker_id, sk = _register_worker(client, csrf, "w1")
+
+    with client.websocket_connect("/api/agent/ws") as ws:
+        challenge = ws.receive_json()
+        sig = sk.sign(challenge["nonce"].encode()).signature.hex()
+        ws.send_json({"type": "auth", "worker_id": worker_id, "sig": sig})
+        assert ws.receive_json()["type"] == "ready"
+        ws.send_json(
+            {"type": "heartbeat", "state": "idle", "progress": 0.0, "job_id": None, "dynamic": {}}
+        )
+
+        # 只有一件已拆的父 job 在排隊 -- 沒有任何真的派工對象。
+        with db.get_session() as session:
+            session.add(
+                db.Job(id="parent", workflow_json="{}", status="queued", split_count=2)
+            )
+            session.commit()
+        agentws.dispatch_once(worker_id)
+        assert calls == []
+
+        # 對照組：一件普通的 queued job 就會建 manifest。
+        with db.get_session() as session:
+            session.add(db.Job(id="plain", workflow_json="{}", status="queued"))
+            session.commit()
+        agentws.dispatch_once(worker_id)
+        assert calls
+
+
+def test_record_job_stats_skips_a_split_child(client):
+    """Final-review I1：子 job 不進統計。子 job 繼承父 job 的 signature 卻只跑
+    1/k 批，收它的 exec_seconds 會把這個簽章的 EWMA 拉到實際全批的 1/k。"""
+    _login(client)
+    with db.get_session() as session:
+        session.add(db.Worker(id="w1", name="w1", pubkey="pk"))
+        session.add(
+            db.Job(id="p", workflow_json="{}", status="running", signature="sig", split_count=2)
+        )
+        session.add(
+            db.Job(
+                id="c0",
+                workflow_json="{}",
+                status="running",
+                signature="sig",
+                parent_id="p",
+                split_index=0,
+            )
+        )
+        session.commit()
+
+    agentws._record_job_stats("w1", "c0", 42.0)
+
+    with db.get_session() as session:
+        assert session.query(db.WorkerJobStats).count() == 0
+        assert session.get(db.Worker, "w1").speed_index == 1.0
+
+
+def test_record_job_stats_still_records_a_plain_job(client):
+    """對照組：`parent_id` 為空的普通 job 一如既往進統計。"""
+    _login(client)
+    with db.get_session() as session:
+        session.add(db.Worker(id="w1", name="w1", pubkey="pk"))
+        session.add(db.Job(id="plain", workflow_json="{}", status="running", signature="sig"))
+        session.commit()
+
+    agentws._record_job_stats("w1", "plain", 42.0)
+
+    with db.get_session() as session:
+        row = session.get(db.WorkerJobStats, ("w1", "sig"))
+        assert row is not None
+        assert row.ewma_seconds == pytest.approx(42.0)
+        assert row.samples == 1
+
+
 def test_job_failed_does_not_record_stats(client):
     """只有真的完成才進統計 -- 一次失敗的執行不是這個簽章的速度樣本。"""
     csrf = _login(client)
@@ -3501,14 +3593,16 @@ def test_batch_split_across_two_workers_end_to_end(client):
             assert all(r.kind == "completed" and r.billable for r in receipts)
             assert all(r.gpu_seconds == 12.5 for r in receipts)
 
-            # ---- §2.3：兩台 worker 各為「子 job 的簽章」留下一筆速度樣本
+            # ---- Final-review I1：子 job 不進統計。子 job 繼承父 job 的簽章，
+            # 卻只跑 1/k 批；收它的 exec_seconds 會把這個簽章的 EWMA 拉到實際
+            # 全批時間的 1/k（這裡就是 12.5 而不是 25），speed_index 也跟著偏。
+            # 後續：幫子 job 算一個含切片長度的自己的簽章。
             signature = children[0].signature
             assert children[1].signature == signature
+            assert session.query(db.WorkerJobStats).count() == 0
             for worker_id in (worker_a, worker_b):
-                row = session.get(db.WorkerJobStats, (worker_id, signature))
-                assert row is not None
-                assert row.ewma_seconds == pytest.approx(12.5)
-                assert row.samples == 1
+                assert session.get(db.WorkerJobStats, (worker_id, signature)) is None
+                assert session.get(db.Worker, worker_id).speed_index == 1.0
     finally:
         ws_a.close()
         ws_b.close()

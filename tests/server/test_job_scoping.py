@@ -366,3 +366,104 @@ def test_retry_still_requires_csrf_for_owner(client, two_users):
     r = client.post(f"/api/jobs/{job_id}/retry")
     assert r.status_code == 403
     assert r.json()["error"]["code"] == "auth.csrf"
+
+
+# --- Phase 3.3 split families × ownership (final review re-open) -----------
+
+
+def _make_split_family(username, prefix):
+    """One parent + two children owned by `username`, written straight to the
+    DB (the splitter itself is exercised in test_split.py; what this file
+    pins is the ownership scoping on top of it)."""
+    with db.get_session() as session:
+        uid = session.query(db.User).filter(db.User.username == username).one().id
+        session.add(
+            db.Job(
+                id=f"{prefix}p",
+                workflow_json="{}",
+                status="done",
+                split_count=2,
+                user_id=uid,
+            )
+        )
+        for index in range(2):
+            session.add(
+                db.Job(
+                    id=f"{prefix}c{index}",
+                    workflow_json="{}",
+                    status="done",
+                    parent_id=f"{prefix}p",
+                    split_index=index,
+                    user_id=uid,
+                )
+            )
+        session.commit()
+
+
+def test_include_children_still_only_shows_the_callers_own_family(client, two_users):
+    """`?include_children=1` opens up the CHILD filter, not the OWNER one: a
+    plain user must still see only their own parents and children."""
+    _make_split_family("alice", "a")
+    _make_split_family("bob", "b")
+
+    _login_as(client, ALICE)
+    rows = client.get("/api/jobs?include_children=1").json()
+
+    assert sorted(r["id"] for r in rows) == ["ac0", "ac1", "ap"]
+
+
+def test_non_owner_get_child_job_detail_is_404(client, two_users):
+    """A child is owner-or-admin scoped exactly like any other job row."""
+    _make_split_family("alice", "a")
+
+    _login_as(client, BOB)
+    r = client.get("/api/jobs/ac0")
+
+    assert r.status_code == 404
+    assert r.json()["error"]["code"] == "jobs.not_found"
+
+
+def test_owner_can_get_own_child_job_detail(client, two_users):
+    _make_split_family("alice", "a")
+
+    _login_as(client, ALICE)
+    r = client.get("/api/jobs/ac0")
+
+    assert r.status_code == 200
+    assert r.json()["parent_id"] == "ap"
+
+
+# --- Final-review I2: a split child is never retryable on its own ----------
+
+
+def test_retry_on_a_split_child_is_409_even_for_its_owner(client, two_users):
+    _make_split_family("alice", "a")
+    csrf = _login_as(client, ALICE)
+    with db.get_session() as session:
+        session.get(db.Job, "ac0").status = "failed"
+        session.commit()
+
+    r = client.post("/api/jobs/ac0/retry", headers={"X-CSRF": csrf})
+
+    assert r.status_code == 409
+    assert r.json()["error"]["code"] == "jobs.not_retryable"
+    with db.get_session() as session:
+        child = session.get(db.Job, "ac0")
+        assert child.status == "failed"
+        assert child.parent_id == "ap"
+
+
+def test_retry_on_the_parent_of_a_split_family_still_works(client, two_users):
+    _make_split_family("alice", "a")
+    csrf = _login_as(client, ALICE)
+    with db.get_session() as session:
+        session.get(db.Job, "ap").status = "failed"
+        session.commit()
+
+    r = client.post("/api/jobs/ap/retry", headers={"X-CSRF": csrf})
+
+    assert r.status_code == 200
+    with db.get_session() as session:
+        parent = session.get(db.Job, "ap")
+        assert parent.status == "queued"
+        assert parent.split_count == 0

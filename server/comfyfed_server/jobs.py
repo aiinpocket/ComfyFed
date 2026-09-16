@@ -680,12 +680,27 @@ def create_router(data_dir: str) -> APIRouter:
 
         Only `failed` jobs are retryable: anything queued/assigned/running is
         still in flight, and re-running a `done` job would orphan its receipt.
+
+        Final-review I2: a split CHILD (`parent_id IS NOT NULL`) is never
+        retryable on its own -- requeueing one slice behind its parent's back
+        would resurrect a job the failure cascade already settled, and the
+        parent's derived status/progress would never account for it. The user
+        retries the parent, which re-runs whole (§3.6 clears
+        `split_count`/`split_plan`). 409 `jobs.not_retryable`, same code as
+        the wrong-status case.
         """
         with db.get_session() as session:
             job = session.get(db.Job, job_id)
             if job is None:
                 raise _error(404, "jobs.not_found", "Job not found.")
             _require_owner_or_admin(job, user)
+            if job.parent_id is not None:
+                raise _error(
+                    409,
+                    "jobs.not_retryable",
+                    "子工作不能單獨重試，請改重試父工作。"
+                    " / A split child cannot be retried on its own; retry its parent job.",
+                )
             if job.status != "failed":
                 raise _error(409, "jobs.not_retryable", "Only failed jobs can be retried.")
 
@@ -695,6 +710,10 @@ def create_router(data_dir: str) -> APIRouter:
             job.progress = 0
             job.started_at = None
             job.finished_at = None
+            # Final-review M5：上一次派工的預估（predicted_seconds / basis /
+            # candidates）對這一次重試已經沒意義，留著只會讓 console 顯示
+            # 上一代的數字。清成 `{}` 而非 NULL，與 cloud 端的 SET 一致。
+            job.dispatch_info = "{}"
             # Phase 3.3 §3.6：重試一律不再拆 -- 整包在一台 worker 跑，避免兩
             # 代子 job 混在一起。舊子 job 不動（終止狀態，歷史保留），
             # `parent_id` 仍指向這個 job，但 `split_count == 0` 讓所有父 job

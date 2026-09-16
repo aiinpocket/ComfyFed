@@ -384,6 +384,8 @@ def _fail_job(job_id, worker_id):
         job.progress = 0.4
         job.started_at = datetime.now(timezone.utc).replace(tzinfo=None)
         job.finished_at = datetime.now(timezone.utc).replace(tzinfo=None)
+        # Final-review M5：上一次派工的預估，重試時必須被清掉。
+        job.dispatch_info = json.dumps({"predicted_seconds": 12.5, "basis": "signature"})
         session.commit()
 
 
@@ -404,6 +406,9 @@ def test_retry_requeues_a_failed_job_and_clears_the_last_attempt(client):
         assert job.progress == 0
         assert job.started_at is None
         assert job.finished_at is None
+        # Final-review M5：上一代的 predicted_seconds/basis 對這一次重試沒意義，
+        # 留著只會讓 console 顯示舊數字。
+        assert json.loads(job.dispatch_info) == {}
 
     # And it is dispatchable again.
     assert _pick_job_for(w1) is not None
@@ -1271,6 +1276,7 @@ def test_retry_clears_the_split_plan_and_count(client):
     assert job.status == "queued"
     assert job.split_count == 0
     assert job.split_plan is None
+    assert json.loads(job.dispatch_info) == {}
 
 
 # --- Phase 3.3 §3.7: the console sees parents, and children only on request ---

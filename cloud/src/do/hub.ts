@@ -1318,7 +1318,16 @@ export class Hub extends DurableObject<Env> {
       const execSeconds = isValidExecSeconds(msg.exec_seconds) ? msg.exec_seconds : null;
       // Phase 3.3 §2.3：只有真的完成、且 exec_seconds 有效才進統計。放在收據
       // 之前，因為 recordCompletion 自己吞例外 -- 統計壞掉絕不能少發一張收據。
-      await stats.recordCompletion(db, workerId, freshJob?.signature ?? null, execSeconds, now);
+      //
+      // Final-review I1：`parentId` 不為空的子 job 一律跳過。子 job 繼承父 job
+      // 的 signature，卻只跑 1/k 批，把它的 exec_seconds 餵進去會讓這個簽章的
+      // EWMA 跑到實際全批時間的 1/k，speed_index 也跟著被拉偏。
+      // TODO（後續）：幫子 job 算一個含切片長度的自己的簽章（per-child
+      // signature including slice length），子 job 就能在自己的簽章下正常計統。
+      // Python 端的對應點在 `agentws._record_job_stats`。
+      if (!freshJob?.parentId) {
+        await stats.recordCompletion(db, workerId, freshJob?.signature ?? null, execSeconds, now);
+      }
       await this.createAndPushReceipt(ws, attachment, jobId!, execSeconds, now);
     }
   }
@@ -1670,9 +1679,12 @@ export class Hub extends DurableObject<Env> {
     // 收據補起來（`stats_backfilled` 旗標，跨 DO 重啟只會做一次）。
     // `statsBackfillDone` 是 per-instance 的短路，避免每個 tick 都去讀旗標。
     if (!this.statsBackfillDone) {
-      this.statsBackfillDone = true;
       try {
         await stats.backfillIfNeeded(db);
+        // Final-review I3：只有成功才設短路旗標。失敗時 D1 裡的
+        // `stats_backfilled` 也還沒設（backfillIfNeeded 只在寫入成功後才寫
+        // 旗標），所以下一個 tick 會完整重試一次。
+        this.statsBackfillDone = true;
       } catch (err) {
         console.error("hub: stats backfill failed", err);
       }

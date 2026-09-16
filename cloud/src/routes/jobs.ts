@@ -909,6 +909,20 @@ app.post("/api/jobs/:jobId/retry", requireCsrfUser, async (c) => {
   const job = await queries.getJobById(c.env.DB, jobId);
   if (!job) return errorJson(c, 404, "jobs.not_found", "Job not found.");
   if (!isOwnerOrAdmin(job, c.get(SESSION_VAR).user)) return errorJson(c, 404, "jobs.not_found", "Job not found.");
+  // Final-review I2: a split child is never retryable on its own -- requeueing
+  // one slice behind its parent's back would resurrect a job the failure
+  // cascade already settled, and the parent's derived status/progress would
+  // never account for it. Retry the parent, which re-runs whole (§3.6 clears
+  // split_count/split_plan). Mirrors `jobs.retry_job`'s guard; `retryFailedJob`
+  // also carries `AND parent_id IS NULL` as the atomic backstop.
+  if (job.parentId !== null) {
+    return errorJson(
+      c,
+      409,
+      "jobs.not_retryable",
+      "子工作不能單獨重試，請改重試父工作。 / A split child cannot be retried on its own; retry its parent job."
+    );
+  }
   if (job.status !== "failed") {
     return errorJson(c, 409, "jobs.not_retryable", "Only failed jobs can be retried.");
   }

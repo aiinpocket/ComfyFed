@@ -178,6 +178,21 @@ describe("GET /api/auth/me", () => {
     expect(r.body).toEqual({ authenticated: false, lang: "en", platform_url: "" });
   });
 
+  it("is never shared-cached (final-review M3)", async () => {
+    // 回應內容（username / role / csrf）是每個使用者各自不同的。Worker 回應
+    // 預設不被 edge 快取，但一條「Cache Everything」規則就能把一個人的身分
+    // 發給另一個人 -- 跟 routes/templates.ts 的 `INDEX_CACHE_CONTROL` 同一個理由。
+    const anon = await call("/api/auth/me", { method: "GET" });
+    expect(anon.status).toBe(200);
+    expect(anon.headers.get("Cache-Control")).toBe("private, no-store");
+
+    await setup();
+    const loginRes = await login();
+    const r = await call("/api/auth/me", { method: "GET", cookie: loginRes.setCookie });
+    expect(r.body.authenticated).toBe(true);
+    expect(r.headers.get("Cache-Control")).toBe("private, no-store");
+  });
+
   it("reports authenticated with username + role for a valid session cookie", async () => {
     await setup();
     const loginRes = await login();

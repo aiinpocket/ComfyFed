@@ -719,10 +719,18 @@ _MPX_UNIT = 262144  # 0.25 MPx 級距
 
 
 def _literal_int(inputs: dict, field: str) -> int | None:
+    """字面整數。Final-review M1：JSON 沒有 int/float 之分，`4.0` 這種整數
+    值的 float 也要收 -- TS 那邊用 `Number.isInteger`，實際上 `4` 跟 `4.0`
+    在 JS 是同一個值，兩棧要算出同一個簽章。與 `split._literal_int` 同形。
+    `bool` 是 `int` 的子類別，要先排除。"""
     value = inputs.get(field)
-    if isinstance(value, bool) or not isinstance(value, int):
+    if isinstance(value, bool):
         return None
-    return value
+    if isinstance(value, int):
+        return value
+    if isinstance(value, float) and value.is_integer():
+        return int(value)
+    return None
 
 
 def signature(workflow: dict, needs: "JobNeeds") -> str:

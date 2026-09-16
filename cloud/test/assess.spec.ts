@@ -461,6 +461,28 @@ describe("signature (Phase 3.3 §2.1)", () => {
     expect(await sig(linked)).toBe(await sig(literalZero));
   });
 
+  it("treats an integral float like the same int (final-review M1)", async () => {
+    // JSON 沒有 int/float 之分，`4.0` 和 `4` 是同一個值。TS 用
+    // `Number.isInteger` 本來就是這個行為；assess.py 的 `_literal_int` 以前只收
+    // `int`，兩棧因此對一張存成 `20.0` 的圖算出不同簽章。這是那個 parity
+    // 的 TS 側釘子（tests/server/test_assess.py 同名測試）。
+    const asInt = {
+      "1": { class_type: "KSampler", inputs: { steps: 20 } },
+      "2": { class_type: "EmptyLatentImage", inputs: { width: 512, height: 512, batch_size: 4 } },
+    };
+    const asFloat = {
+      "1": { class_type: "KSampler", inputs: { steps: 20.0 } },
+      "2": { class_type: "EmptyLatentImage", inputs: { width: 512.0, height: 512.0, batch_size: 4.0 } },
+    };
+    expect(await sig(asFloat)).toBe(await sig(asInt));
+  });
+
+  it("still ignores a non-integral float (final-review M1)", async () => {
+    const a = { "1": { class_type: "KSampler", inputs: { steps: 20.5 } } };
+    const b = { "1": { class_type: "KSampler", inputs: { steps: 0 } } };
+    expect(await sig(a)).toBe(await sig(b));
+  });
+
   // 兩棧 parity：同一組 workflow 必須得到同一個簽章字串。
   it("matches the shared fixture's expected signatures byte for byte", async () => {
     for (const c of schedulerCases.signature_cases) {

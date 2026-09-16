@@ -247,7 +247,14 @@ app.post("/api/auth/logout", async (c) => {
   return c.json({ ok: true });
 });
 
+// Final-review M3：`/api/auth/me` 的回應是每個使用者各自不同的（username /
+// role / csrf），絕不能落入任何共用快取 -- 跟 routes/templates.ts 的
+// `INDEX_CACHE_CONTROL` 同一個理由：Worker 回應預設不被 edge 快取，但一條
+// 「Cache Everything」規則（或任何中繼）就能把一個人的身分發給另一個人。
+const ME_CACHE_CONTROL = "private, no-store";
+
 app.get("/api/auth/me", async (c) => {
+  c.header("Cache-Control", ME_CACHE_CONTROL);
   const payload = await readSession(c);
   const lang = (await getSetting(c.env.DB, LANG_KEY)) || "en";
   const platformUrl = (await getSetting(c.env.DB, PLATFORM_URL_KEY)) || "";

@@ -585,3 +585,19 @@ def test_update_settings_rejects_a_non_boolean_split_batches(client):
     csrf = _csrf(client)
     r = client.post("/api/settings", json={"split_batches": "bogus"}, headers={"X-CSRF": csrf})
     assert r.status_code == 422
+
+
+def test_me_is_never_shared_cached(client):
+    """Final-review M3：`/api/auth/me` 的內容（username / role / csrf）是每個
+    使用者各自不同的，絕不能落入任何共用快取。和 templates.py 的
+    `_INDEX_CACHE_HEADERS` 同一個寫法：寫在回應上，而不是靠慣例。
+    """
+    anon = client.get("/api/auth/me")
+    assert anon.status_code == 200
+    assert anon.headers["cache-control"] == "private, no-store"
+
+    client.post("/api/auth/login", json={"username": "admin", "password": client.admin_password})
+    me = client.get("/api/auth/me")
+    assert me.status_code == 200
+    assert me.json()["authenticated"] is True
+    assert me.headers["cache-control"] == "private, no-store"

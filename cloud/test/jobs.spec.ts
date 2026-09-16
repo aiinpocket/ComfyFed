@@ -706,8 +706,10 @@ describe("POST /api/jobs/{id}/retry", () => {
     const submit = await submitJob(cookie, csrf, SIMPLE_WORKFLOW);
     const jobId = submit.body.job_id;
     await db()
-      .prepare("UPDATE jobs SET status = 'failed', error = 'boom', progress = 0.5, started_at = '2026-01-01 00:00:00.000000' WHERE id = ?")
-      .bind(jobId)
+      .prepare(
+        "UPDATE jobs SET status = 'failed', error = 'boom', progress = 0.5, started_at = '2026-01-01 00:00:00.000000', dispatch_info = ? WHERE id = ?"
+      )
+      .bind(JSON.stringify({ predicted_seconds: 12.5, basis: "signature" }), jobId)
       .run();
 
     const r = await call(`/api/jobs/${jobId}/retry`, { method: "POST", cookie, headers: { "X-CSRF": csrf } });
@@ -719,6 +721,9 @@ describe("POST /api/jobs/{id}/retry", () => {
     expect(detail.body.error).toBeNull();
     expect(detail.body.progress).toBe(0);
     expect(detail.body.started_at).toBeNull();
+    // Final-review M5：上一代的 predicted_seconds/basis 對這一次重試沒意義，
+    // 留著只會讓 console 顯示舊數字。
+    expect(detail.body.dispatch_info).toEqual({});
   });
 
   it("clears the split plan and count so the retry never re-splits (§3.6)", async () => {
@@ -727,17 +732,21 @@ describe("POST /api/jobs/{id}/retry", () => {
     const jobId = submit.body.job_id;
     await db()
       .prepare(
-        "UPDATE jobs SET status = 'failed', split_count = 2, split_plan = ? WHERE id = ?"
+        "UPDATE jobs SET status = 'failed', split_count = 2, split_plan = ?, dispatch_info = ? WHERE id = ?"
       )
-      .bind(JSON.stringify({ source_node_id: "1", batch_size: 4 }), jobId)
+      .bind(JSON.stringify({ source_node_id: "1", batch_size: 4 }), JSON.stringify({ basis: "signature" }), jobId)
       .run();
 
     expect((await call(`/api/jobs/${jobId}/retry`, { method: "POST", cookie, headers: { "X-CSRF": csrf } })).status).toBe(200);
 
-    const row = (await db().prepare("SELECT status, split_count, split_plan FROM jobs WHERE id = ?").bind(jobId).first<any>())!;
+    const row = (await db()
+      .prepare("SELECT status, split_count, split_plan, dispatch_info FROM jobs WHERE id = ?")
+      .bind(jobId)
+      .first<any>())!;
     expect(row.status).toBe("queued");
     expect(row.split_count).toBe(0);
     expect(row.split_plan).toBeNull();
+    expect(row.dispatch_info).toBe("{}"); // Final-review M5
   });
 
   it("stores a split plan at submission for a batch workflow (§3.2)", async () => {
@@ -1084,5 +1093,100 @@ describe("split families on the console API (§3.7)", () => {
 
     const list = await call("/api/jobs", { method: "GET", cookie });
     expect(list.body[0].dispatch_info.candidates).toBe(3);
+  });
+});
+
+// --- Final-review: split families × ownership, and child retry -------------
+//
+// Mirrors tests/server/test_job_scoping.py's re-opened ownership × split
+// coverage: `?include_children=1` opens up the CHILD filter, never the OWNER
+// one, and a child row is owner-or-admin scoped exactly like any other job.
+
+describe("split families × ownership (final review)", () => {
+  async function makeOwnedSplitFamily(prefix: string, uid: string | null): Promise<void> {
+    const now = new Date().toISOString().slice(0, 19).replace("T", " ");
+    await db()
+      .prepare(
+        `INSERT INTO jobs (id, workflow_json, status, created_at, split_count, user_id)
+         VALUES (?, '{}', 'done', ?, 2, ?)`
+      )
+      .bind(`${prefix}p`, now, uid)
+      .run();
+    for (let index = 0; index < 2; index++) {
+      await db()
+        .prepare(
+          `INSERT INTO jobs (id, workflow_json, status, created_at, parent_id, split_index, user_id)
+           VALUES (?, '{}', 'done', ?, ?, ?, ?)`
+        )
+        .bind(`${prefix}c${index}`, now, `${prefix}p`, index, uid)
+        .run();
+    }
+  }
+
+  it("?include_children=1 still only shows the caller's own family", async () => {
+    const admin = await adminSession();
+    const alice = await userSession(admin, "alice");
+    const bob = await userSession(admin, "bob");
+    await makeOwnedSplitFamily("a", alice.uid);
+    await makeOwnedSplitFamily("b", bob.uid);
+
+    const r = await call("/api/jobs?include_children=1", { method: "GET", cookie: alice.cookie });
+
+    expect(r.body.map((j: any) => j.id).sort()).toEqual(["ac0", "ac1", "ap"]);
+  });
+
+  it("GET /api/jobs/{child of another user} is 404", async () => {
+    const admin = await adminSession();
+    const alice = await userSession(admin, "alice");
+    const bob = await userSession(admin, "bob");
+    await makeOwnedSplitFamily("a", alice.uid);
+
+    const asOther = await call("/api/jobs/ac0", { method: "GET", cookie: bob.cookie });
+    expect(asOther.status).toBe(404);
+    expect(asOther.body.error.code).toBe("jobs.not_found");
+
+    const asOwner = await call("/api/jobs/ac0", { method: "GET", cookie: alice.cookie });
+    expect(asOwner.status).toBe(200);
+    expect(asOwner.body.parent_id).toBe("ap");
+  });
+
+  it("POST /api/jobs/{child}/retry is 409 jobs.not_retryable, even for its owner", async () => {
+    // Final-review I2: requeueing one slice behind its parent's back would
+    // resurrect a job the failure cascade already settled, and the parent's
+    // derived status/progress would never account for it.
+    const admin = await adminSession();
+    const alice = await userSession(admin, "alice");
+    await makeOwnedSplitFamily("a", alice.uid);
+    await db().prepare("UPDATE jobs SET status = 'failed' WHERE id = 'ac0'").run();
+
+    const r = await call("/api/jobs/ac0/retry", {
+      method: "POST",
+      cookie: alice.cookie,
+      headers: { "X-CSRF": alice.csrf },
+    });
+
+    expect(r.status).toBe(409);
+    expect(r.body.error.code).toBe("jobs.not_retryable");
+    const row = await db().prepare("SELECT status, parent_id FROM jobs WHERE id = 'ac0'").first<any>();
+    expect(row.status).toBe("failed");
+    expect(row.parent_id).toBe("ap");
+  });
+
+  it("POST /api/jobs/{parent}/retry still works", async () => {
+    const admin = await adminSession();
+    const alice = await userSession(admin, "alice");
+    await makeOwnedSplitFamily("a", alice.uid);
+    await db().prepare("UPDATE jobs SET status = 'failed' WHERE id = 'ap'").run();
+
+    const r = await call("/api/jobs/ap/retry", {
+      method: "POST",
+      cookie: alice.cookie,
+      headers: { "X-CSRF": alice.csrf },
+    });
+
+    expect(r.status).toBe(200);
+    const row = await db().prepare("SELECT status, split_count FROM jobs WHERE id = 'ap'").first<any>();
+    expect(row.status).toBe("queued");
+    expect(row.split_count).toBe(0);
   });
 });
