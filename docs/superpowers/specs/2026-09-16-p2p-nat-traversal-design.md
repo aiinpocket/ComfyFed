@@ -21,7 +21,7 @@
 {"type": "ready", "remote_ip": "203.0.113.7"}
 ```
 
-- Python：`request.client.host`；若有 `X-Forwarded-For`（反向代理後面）取第一個逗號前的值。這個值只用來組 worker 自己的通告位址、且平台隨後會做可連性驗證（§4），所以偽造沒有好處，不需要 trust-proxy 設定。
+- Python：預設用 `request.client.host`；只有在平台設定 `trust_proxy` 為真（自架且放在反向代理後面時由管理員開啟，預設關閉）才取 `X-Forwarded-For` 第一跳。**（2026-09-16 實作修訂）** 這個值不只用來組通告位址，§4.2／§5 的「同公網 IP ⇒ 區網位址」判定也依賴它，所以不能無條件信任可偽造的標頭。
 - Cloud：`CF-Connecting-IP`（Cloudflare 提供，權威）。
 - 平台同時把它存到新欄位 `workers.remote_ip`（TEXT NULL，每次 hello 更新）。用途見 §5（同公網 IP ⇒ 很可能同一個 NAT ⇒ 可優先給區網位址）。
 - 舊 agent 忽略未知欄位，無相容性問題。
