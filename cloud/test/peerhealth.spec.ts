@@ -196,6 +196,33 @@ describe("refresh", () => {
     expect(seen.length).toBe(2);
   });
 
+  it("reads the previous verdict BEFORE probing, so a write that lands mid-probe still counts as a change", async () => {
+    // Final review: D1 has no transaction around read-then-write, so reading
+    // the old value AFTER a (up to 3s) probe would pick up whatever another
+    // heartbeat wrote meanwhile and call a real change "unchanged".
+    await makeWorker("w-race", { peer_reachable: 0 });
+    const seen: Array<[boolean, string]> = [];
+    vi.spyOn(peerhealth, "probePeerHealth").mockImplementation(async () => {
+      // Someone else's recheck lands while we are probing.
+      await db().prepare("UPDATE workers SET peer_reachable = 1 WHERE id = ?").bind("w-race").run();
+      return true;
+    });
+
+    const verdict = await peerhealth.refresh(
+      db(),
+      "w-race",
+      "http://203.0.113.7:8850",
+      (reachable, url) => {
+        seen.push([reachable, url]);
+      },
+      { notifyOnChangeOnly: true }
+    );
+
+    expect(verdict).toBe(true);
+    // Previous (read before the probe) was 0 -> this IS a change -> pushes.
+    expect(seen).toEqual([[true, "http://203.0.113.7:8850/peer/health"]]);
+  });
+
   it("swallows a probe that throws (spec §8: a failed check never breaks hello)", async () => {
     await makeWorker("w-boom");
     vi.spyOn(peerhealth, "probePeerHealth").mockRejectedValue(new Error("boom"));

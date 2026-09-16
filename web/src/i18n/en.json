@@ -269,7 +269,7 @@
     "col_backend": "Backend",
     "col_models": "Models",
     "col_last_seen": "Last seen",
-    "col_p2p": "P2P",
+    "col_p2p": "P2P status",
     "p2p_sharing": "P2P sharing",
     "p2p_off": "Off",
     "p2p_nat_natpmp": "Auto port mapping (NAT-PMP)",
@@ -446,7 +446,10 @@
     "uploads_load_failed": "Could not load your uploads",
     "split_batches": "Split batches automatically",
     "split_batches_hint": "A workflow with batch_size ≥ 2 is split across idle workers and run in parallel. Same seed, same composition — but not bit-for-bit identical (the difference is the same as running one job on a different machine). Turn this off and new jobs always run whole on a single worker.",
-    "split_batches_save_failed": "Could not save the split setting"
+    "split_batches_save_failed": "Could not save the split setting",
+    "trust_proxy": "Trust X-Forwarded-For",
+    "trust_proxy_hint": "Turn this on only when the platform sits behind a reverse proxy (nginx, Caddy, Traefik…). The platform then reads each worker's source IP from the proxy's X-Forwarded-For header instead of the TCP peer — without it every worker would look like it came from the proxy's own IP, and P2P peers would all be grouped as if they shared one NAT. With no proxy in front, leave it off: any agent could then choose its own source IP.",
+    "trust_proxy_save_failed": "Could not save the proxy-trust setting"
   },
   "errors": {
     "auth.required": "Wrong password.",

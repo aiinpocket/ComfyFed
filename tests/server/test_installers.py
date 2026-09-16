@@ -930,6 +930,41 @@ def test_installers_print_both_p2p_outcomes_bilingually(name):
 
 
 @pytest.mark.parametrize("name", ["install.ps1", "install.sh"])
+def test_installers_print_a_dedicated_line_when_the_agent_is_already_running(name):
+    """最終審查：探測在 agent 已經在跑時直接拒絕執行（`agent_running`），
+    它**沒有問過路由器** —— 這時印「路由器沒有回應」是在騙人。"""
+    text = _installer_text(name)
+    assert "agent_running" in text
+    assert "agent 正在執行，未變更分享設定" in text
+    assert "Agent is running; sharing settings left as they are" in text
+    # 而且是在「路由器沒有回應」那一行之外的另一個分支。
+    assert text.index("agent 正在執行") < text.index("路由器沒有回應 UPnP／NAT-PMP")
+
+
+def test_helper_p2p_reason_reads_the_failure_reason(tmp_path):
+    import subprocess
+    import sys
+
+    text = _installer_text("install.sh")
+    start = text.index('cat > "$HELPER_SCRIPT" <<\'PYEOF\'\n') + len('cat > "$HELPER_SCRIPT" <<\'PYEOF\'\n')
+    end = text.index("\nPYEOF", start)
+    helper_path = tmp_path / "_installer_helper.py"
+    helper_path.write_text(text[start:end], encoding="utf-8")
+
+    def run(line: str) -> str:
+        return subprocess.run(
+            [sys.executable, str(helper_path), "p2p_reason", line],
+            check=True,
+            capture_output=True,
+            text=True,
+        ).stdout.strip()
+
+    assert run('{"ok": false, "reason": "agent_running"}') == "agent_running"
+    assert run('{"ok": false, "reason": "no_mapping"}') == "no_mapping"
+    assert run("not json at all") == ""
+
+
+@pytest.mark.parametrize("name", ["install.ps1", "install.sh"])
 def test_helper_p2p_enable_respects_an_existing_choice(name):
     """腳本內嵌的 helper 原始碼必須含有「只在 peer_serve 為 false 且
     peer_listen_port 為 null 時才自動開啟」這個判斷。"""

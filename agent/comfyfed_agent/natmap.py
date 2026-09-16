@@ -35,7 +35,7 @@ import time
 import xml.etree.ElementTree as ET
 from dataclasses import dataclass
 from typing import Callable, Iterable, Optional, Protocol
-from urllib.parse import urljoin
+from urllib.parse import urljoin, urlsplit
 
 logger = logging.getLogger(__name__)
 
@@ -54,6 +54,13 @@ UPNP_DESCRIPTION = "ComfyFed peer"
 # 718 ConflictInMappingEntry：這個外部埠已被別人（或自己上一輪沒清掉的映射）
 # 占走，換下一個埠再試。
 UPNP_CONFLICT_ERROR = 718
+# 725 OnlyPermanentLeasesSupported：有些 IGD（常見於 AVM/Broadcom 韌體）不收
+# 有限期的 lease，只肯建永久映射。收到就用 `NewLeaseDuration=0` 重試一次。
+UPNP_ONLY_PERMANENT_ERROR = 725
+# 裝置描述 XML 與 SOAP 回應的讀取上限。這兩份東西正常都只有幾 KB，而且來源
+# 是區網上「自稱是路由器」的任何一台機器 —— 沒有上限的話，一個惡意（或壞掉
+# 的）SSDP 回應就能叫 agent 把記憶體吃光。
+MAX_HTTP_RESPONSE_BYTES = 256 * 1024
 
 # spec §4.2 的私有網段清單，逐字：10/8、172.16/12、192.168/16、169.254/16、
 # fc00::/7、::1；loopback 127/8 與 IPv6 link-local 一併納入（同樣連不到）。
@@ -139,7 +146,16 @@ class SsdpTransport(Protocol):
 
 
 def _run_command(argv: list[str]) -> str:
-    return subprocess.run(argv, capture_output=True, text=True, timeout=3, check=False).stdout
+    kwargs: dict = {}
+    # Windows：`route print` 之類的 console 程式在沒有主控台的情況下（pythonw、
+    # 服務、工作排程器）會彈出一個黑窗。CREATE_NO_WINDOW 只有 Windows 的
+    # subprocess 有，用 getattr 取以免其他平台 AttributeError。
+    creation_flags = getattr(subprocess, "CREATE_NO_WINDOW", None)
+    if creation_flags is not None:
+        kwargs["creationflags"] = creation_flags
+    return subprocess.run(
+        argv, capture_output=True, text=True, timeout=3, check=False, **kwargs
+    ).stdout
 
 
 def _as_ip(token: Optional[str]) -> Optional[str]:
@@ -214,6 +230,29 @@ def is_private_address(host: str) -> bool:
     except ValueError:
         return False
     return any(address in network for network in _PRIVATE_NETWORKS)
+
+
+def is_safe_igd_url(url: str, gateway: str) -> bool:
+    """這個 URL 能不能拿去請求？SSDP 的 `LOCATION` 和裝置描述裡的
+    `controlURL` 都是**區網上任何一台機器都能塞給我們**的值，照單全收等於
+    把 agent 變成一台 SSRF 代理（`file://` 讀本機檔、`http://<公網主機>`
+    對外打、`http://127.0.0.1:<port>` 打自己身上的其他服務）。
+
+    放行條件：scheme 必須是 `http`，而且主機是**私有／link-local 位址**或
+    **就是預設閘道**。主機名（非字面 IP）一律不放行 —— 判不出來就不要賭。
+    """
+    try:
+        parts = urlsplit(url)
+    except ValueError:
+        return False
+    if parts.scheme != "http":
+        return False
+    host = parts.hostname
+    if not host:
+        return False
+    if host == gateway:
+        return True
+    return is_private_address(host)
 
 
 # --- NAT-PMP 封包（RFC 6886）-----------------------------------------------
@@ -375,15 +414,18 @@ class _SocketUdpTransport:
 
 
 class _UrllibHttpTransport:
+    """讀取一律封頂在 `MAX_HTTP_RESPONSE_BYTES`（`read(n)`，不是 `read()`）——
+    對端是區網上自稱路由器的任何一台機器，沒有上限就是一條記憶體耗盡路徑。"""
+
     def get(self, url: str, timeout: float) -> tuple[int, bytes]:
         import urllib.error
         import urllib.request
 
         try:
             with urllib.request.urlopen(url, timeout=timeout) as resp:  # noqa: S310 (LAN IGD URL)
-                return resp.status, resp.read()
+                return resp.status, resp.read(MAX_HTTP_RESPONSE_BYTES)
         except urllib.error.HTTPError as exc:
-            return exc.code, exc.read()
+            return exc.code, exc.read(MAX_HTTP_RESPONSE_BYTES)
         except Exception:
             return 0, b""
 
@@ -394,11 +436,11 @@ class _UrllibHttpTransport:
         request = urllib.request.Request(url, data=body, headers=headers, method="POST")
         try:
             with urllib.request.urlopen(request, timeout=timeout) as resp:  # noqa: S310
-                return resp.status, resp.read()
+                return resp.status, resp.read(MAX_HTTP_RESPONSE_BYTES)
         except urllib.error.HTTPError as exc:
             # IGD 的 SOAP Fault 就是走 HTTP 500 回來的，body 要讀出來看
             # errorCode（718 衝突要換埠），不能當一般錯誤丟掉。
-            return exc.code, exc.read()
+            return exc.code, exc.read(MAX_HTTP_RESPONSE_BYTES)
         except Exception:
             return 0, b""
 
@@ -532,16 +574,25 @@ def _try_upnp(
 
     locations = parse_ssdp_locations(ssdp.msearch(M_SEARCH_PAYLOAD, SSDP_WAIT_SECONDS))
     for location in locations:
+        # `LOCATION` 來自區網上任何一台會回 SSDP 的機器：只跟 http、而且主機
+        # 是私有位址或就是閘道的位址講話（見 `is_safe_igd_url`）。
+        if not is_safe_igd_url(location, gateway):
+            logger.debug("natmap: ignoring SSDP LOCATION %s (not a local http URL)", location)
+            continue
         remaining = deadline - clock()
         if remaining <= _MIN_STEP_SECONDS:
             return None
         status, body = http.get(location, remaining)
         if status != 200 or not body:
             continue
-        found = find_control_url(body.decode("utf-8", "replace"), location)
+        found = find_control_url(body[:MAX_HTTP_RESPONSE_BYTES].decode("utf-8", "replace"), location)
         if found is None:
             continue
         control_url, service_type = found
+        # `controlURL`（以及 `URLBase`）同樣是裝置自己說的，過同一道關。
+        if not is_safe_igd_url(control_url, gateway):
+            logger.debug("natmap: ignoring controlURL %s (not a local http URL)", control_url)
+            continue
 
         remaining = deadline - clock()
         if remaining <= _MIN_STEP_SECONDS:
@@ -550,15 +601,13 @@ def _try_upnp(
         soap_body, headers = build_soap("GetExternalIPAddress", service_type, [])
         status, response = http.post(control_url, soap_body, headers, remaining)
         if status == 200:
-            external_ip = parse_external_ip(response.decode("utf-8", "replace"))
+            external_ip = parse_external_ip(
+                response[:MAX_HTTP_RESPONSE_BYTES].decode("utf-8", "replace")
+            )
         if external_ip and is_private_address(external_ip):
             external_ip = None
 
-        for attempt in range(UPNP_PORT_ATTEMPTS):
-            remaining = deadline - clock()
-            if remaining <= _MIN_STEP_SECONDS:
-                return None
-            external_port = port + attempt
+        def _add(external_port: int, lease: int, remaining: float) -> tuple[int, bytes]:
             soap_body, headers = build_soap(
                 "AddPortMapping",
                 service_type,
@@ -570,22 +619,54 @@ def _try_upnp(
                     ("NewInternalClient", local_ip),
                     ("NewEnabled", "1"),
                     ("NewPortMappingDescription", UPNP_DESCRIPTION),
-                    ("NewLeaseDuration", str(LEASE_SECONDS)),
+                    ("NewLeaseDuration", str(lease)),
                 ],
             )
-            status, response = http.post(control_url, soap_body, headers, remaining)
+            return http.post(control_url, soap_body, headers, remaining)
+
+        for attempt in range(UPNP_PORT_ATTEMPTS):
+            remaining = deadline - clock()
+            if remaining <= _MIN_STEP_SECONDS:
+                return None
+            external_port = port + attempt
+            lease = LEASE_SECONDS
+            status, response = _add(external_port, lease, remaining)
+            error_code = (
+                None
+                if status == 200
+                else parse_soap_error(response[:MAX_HTTP_RESPONSE_BYTES].decode("utf-8", "replace"))
+            )
+            if error_code == UPNP_ONLY_PERMANENT_ERROR:
+                # 725 OnlyPermanentLeasesSupported：這台 IGD 只肯建永久映射。
+                # 用 lease 0 重試一次，並把 `lifetime` 記成 0 —— 續租迴圈看到
+                # 0 就跳過（永久映射本來也不需要續，重送也無害）。
+                remaining = deadline - clock()
+                if remaining <= _MIN_STEP_SECONDS:
+                    return None
+                logger.debug(
+                    "natmap: IGD only supports permanent leases (725); retrying port %s with lease 0",
+                    external_port,
+                )
+                lease = 0
+                status, response = _add(external_port, lease, remaining)
+                error_code = (
+                    None
+                    if status == 200
+                    else parse_soap_error(
+                        response[:MAX_HTTP_RESPONSE_BYTES].decode("utf-8", "replace")
+                    )
+                )
             if status == 200:
                 return Mapping(
                     method="upnp",
                     external_ip=external_ip,
                     external_port=external_port,
                     internal_port=port,
-                    lifetime=LEASE_SECONDS,
+                    lifetime=lease,
                     gateway=gateway,
                     control_url=control_url,
                     service_type=service_type,
                 )
-            error_code = parse_soap_error(response.decode("utf-8", "replace"))
             if error_code == UPNP_CONFLICT_ERROR:
                 logger.debug("natmap: external port %s already mapped (718); trying the next one", external_port)
                 continue

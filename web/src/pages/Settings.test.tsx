@@ -68,6 +68,7 @@ const SETTINGS_STATE = {
   upload_max_file_mb: 50,
   upload_user_quota_gb: 5,
   split_batches: true,
+  trust_proxy: false,
 };
 
 describe('Settings page: my uploads card', () => {
@@ -264,6 +265,51 @@ describe('Settings page: split_batches switch (Phase 3.3 Task 8)', () => {
     fireEvent.click(toggle);
 
     await waitFor(() => expect(posted).toContainEqual({ split_batches: false }));
+  });
+
+  it('toggles trust_proxy and persists it', async () => {
+    const posted: unknown[] = [];
+    const fetchMock = vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+      const url = typeof input === 'string' ? input : input.toString();
+      const method = init?.method ?? 'GET';
+      if (url === '/api/settings' && method === 'GET') return jsonResponse(SETTINGS_STATE);
+      if (url === '/api/settings' && method === 'POST') {
+        const body = JSON.parse(String(init?.body));
+        posted.push(body);
+        return jsonResponse({ ...SETTINGS_STATE, ...body });
+      }
+      if (url === '/api/staging') {
+        return jsonResponse({ files: [], total_bytes: 0, quota_bytes: 0, userdata_bytes: 0 });
+      }
+      return jsonResponse({ error: { code: 'http_error', message: 'not stubbed' } }, 404);
+    });
+    vi.stubGlobal('fetch', fetchMock);
+
+    renderSettings('admin');
+
+    const toggle = await screen.findByLabelText(/Trust X-Forwarded-For/);
+    fireEvent.click(toggle);
+
+    await waitFor(() => expect(posted).toContainEqual({ trust_proxy: true }));
+  });
+
+  it('hides the trust_proxy switch when the platform does not expose it (cloud)', async () => {
+    const { trust_proxy: _omitted, ...cloudState } = SETTINGS_STATE;
+    const fetchMock = vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+      const url = typeof input === 'string' ? input : input.toString();
+      const method = init?.method ?? 'GET';
+      if (url === '/api/settings' && method === 'GET') return jsonResponse(cloudState);
+      if (url === '/api/staging') {
+        return jsonResponse({ files: [], total_bytes: 0, quota_bytes: 0, userdata_bytes: 0 });
+      }
+      return jsonResponse({ error: { code: 'http_error', message: 'not stubbed' } }, 404);
+    });
+    vi.stubGlobal('fetch', fetchMock);
+
+    renderSettings('admin');
+
+    await screen.findByLabelText(/Split batches automatically/);
+    expect(screen.queryByLabelText(/Trust X-Forwarded-For/)).not.toBeInTheDocument();
   });
 
   it('does not show the split_batches switch for a non-admin', async () => {

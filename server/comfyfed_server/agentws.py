@@ -906,21 +906,54 @@ def _parse_protocol(message: dict) -> int:
     return protocol
 
 
-def _client_remote_ip(websocket: WebSocket) -> Optional[str]:
-    """這條 WS 的來源公網 IP（spec §2）。反向代理後面取
-    `X-Forwarded-For` 的第一個逗號前值，否則取 `request.client.host`。
+TRUST_PROXY_SETTING_KEY = "trust_proxy"
 
-    刻意不做 trust-proxy 設定：這個值只用來讓 worker 組自己的通告位址，
-    而平台隨後會對那個位址做真正的可連性驗證（peerhealth），所以偽造它
-    沒有任何好處——偽造者只會讓自己拿到一個連不到、被標 0 的通告位址。
+
+def trust_proxy_enabled(session=None) -> bool:
+    """平台設定 `trust_proxy`（**預設關**）。開了才採信 `X-Forwarded-For`。
+
+    和 `split_batches` 那類「預設開、非 "0" 就算開」的設定相反：這一個預設
+    關，只有明確寫成 `"1"` 才算開。讀不到（沒有這一列、DB 還沒初始化）就是
+    關。
     """
-    forwarded = websocket.headers.get("x-forwarded-for")
-    if forwarded:
-        first = forwarded.split(",")[0].strip()
-        if first:
-            return first
+
+    def _read(s) -> bool:
+        row = s.get(db.Setting, TRUST_PROXY_SETTING_KEY)
+        return row is not None and row.value == "1"
+
+    if session is not None:
+        return _read(session)
+    try:
+        with db.get_session() as own:
+            return _read(own)
+    except Exception:
+        logger.exception("agentws: failed to read the trust_proxy setting")
+        return False
+
+
+def _client_remote_ip(websocket: WebSocket) -> Optional[str]:
+    """這條 WS 的來源公網 IP（spec §2）。預設一律取 `websocket.client.host`
+    ——也就是 TCP 對端，agent 偽造不了。
+
+    `X-Forwarded-For` 只有在平台設定 `trust_proxy` 開著時才採信（取第一個
+    逗號前值）。預設不採信，是因為 `remote_ip` 現在會影響配種子的結果
+    （`peer.online_seeders` 的「同一個 NAT」分支拿它跟其他 worker 的
+    `remote_ip` 比對），任何 agent 都能自己帶一個 XFF 標頭，等於自選要跟
+    誰同組、把區網位址拿去用。反過來說，平台真的蹲在反向代理後面時，
+    `client.host` 會是代理的 IP、全部 worker 都長一樣，那時才需要把
+    `trust_proxy` 打開。
+    """
+    if trust_proxy_enabled():
+        forwarded = websocket.headers.get("x-forwarded-for")
+        if forwarded:
+            first = forwarded.split(",")[0].strip()
+            if first:
+                return first
     client = websocket.client
     return client.host if client is not None else None
+
+
+_DEFAULT_PORTS = {"http": 80, "https": 443}
 
 
 def _normalize_advert_url(value: str) -> Optional[str]:
@@ -931,6 +964,11 @@ def _normalize_advert_url(value: str) -> Optional[str]:
     後面接 `/peer/health`（帶路徑的通告會組出 `.../foo/peer/health` 這種
     打不中的位址），而 `seeder_urls` 是直接發給拉方的連線目標 —— 上面掛
     `user:pass@` 或一段路徑都只會是干擾或誘導。
+
+    scheme 的預設埠（http 80 / https 443）會被**丟掉**，和 cloud 的
+    `normalizeAdvertUrl` 對齊（那邊用 `URL.host`，預設埠本來就不出現）：
+    留著的話 `http://h:80` 和 `http://h` 會變成兩個不同的字串，`peer_url`
+    有沒有變的比對（決定要不要重測可連性）跟 `seeder_urls` 的去重都會被騙。
 
     無法解析（含壞掉的 port）回 None，呼叫端當成無效通告處理。
     """
@@ -944,6 +982,8 @@ def _normalize_advert_url(value: str) -> Optional[str]:
         return None
     if ":" in host:
         host = f"[{host}]"
+    if port is not None and port == _DEFAULT_PORTS.get(parsed.scheme):
+        port = None
     return f"{parsed.scheme}://{host}" + (f":{port}" if port is not None else "")
 
 

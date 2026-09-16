@@ -72,6 +72,12 @@ export function Settings({ platformUrl, role }: SettingsProps) {
   const [splitBatches, setSplitBatches] = useState(true);
   const [savingSplitBatches, setSavingSplitBatches] = useState(false);
 
+  // Phase 3.4 §2: `X-Forwarded-For` trust. `null` = this platform does not
+  // expose the setting at all (the cloud stack reads Cloudflare's own
+  // `CF-Connecting-IP`), in which case the switch is not rendered.
+  const [trustProxy, setTrustProxy] = useState<boolean | null>(null);
+  const [savingTrustProxy, setSavingTrustProxy] = useState(false);
+
   // Admin-configurable upload limits. Same GET /api/settings read as
   // `object_info_mode` above -- kept as strings while editing so a
   // half-typed "1." does not snap back under the admin's cursor.
@@ -95,6 +101,7 @@ export function Settings({ platformUrl, role }: SettingsProps) {
         setMaxFileMb(settings.upload_max_file_mb);
         setQuotaGb(settings.upload_user_quota_gb);
         setSplitBatches(settings.split_batches);
+        setTrustProxy(typeof settings.trust_proxy === 'boolean' ? settings.trust_proxy : null);
       })
       .catch(() => {
         /* left null; the segmented control below just won't render yet */
@@ -273,6 +280,20 @@ export function Settings({ platformUrl, role }: SettingsProps) {
       notifyFailure(t('settings.split_batches_save_failed'), caught);
     } finally {
       setSavingSplitBatches(false);
+    }
+  };
+
+  const changeTrustProxy = async (value: boolean) => {
+    const previous = trustProxy;
+    setTrustProxy(value);
+    setSavingTrustProxy(true);
+    try {
+      await api.updateSettings({ trust_proxy: value });
+    } catch (caught) {
+      setTrustProxy(previous);
+      notifyFailure(t('settings.trust_proxy_save_failed'), caught);
+    } finally {
+      setSavingTrustProxy(false);
     }
   };
 
@@ -629,6 +650,15 @@ export function Settings({ platformUrl, role }: SettingsProps) {
                   disabled={savingSplitBatches}
                   onChange={(event) => void changeSplitBatches(event.currentTarget.checked)}
                 />
+                {trustProxy !== null && (
+                  <Switch
+                    label={t('settings.trust_proxy')}
+                    description={t('settings.trust_proxy_hint')}
+                    checked={trustProxy}
+                    disabled={savingTrustProxy}
+                    onChange={(event) => void changeTrustProxy(event.currentTarget.checked)}
+                  />
+                )}
               </Stack>
             </Card>
           )}

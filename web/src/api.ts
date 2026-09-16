@@ -214,8 +214,19 @@ export interface Worker {
   peer_lan_url: string | null;
   /** Phase 3.4：`peer_url` 的來源 —— natpmp/upnp/manual/lan/none。 */
   peer_nat: string;
-  /** Phase 3.4：平台驗證結果。null = 尚未檢查。 */
-  peer_reachable: boolean | null;
+  /** Phase 3.4：平台驗證結果。null = 尚未檢查。
+   * 兩套後端都把它序列化成整數 1/0（SQLite / D1 沒有原生 boolean），
+   * 所以型別要同時容納 number 與 boolean —— 判讀一律走 `peerReachable()`。 */
+  peer_reachable: number | boolean | null;
+}
+
+/** `peer_reachable` 的三態判讀。後端（Python SQLite / Cloud D1）都把它存成
+ * 整數 1/0，JSON 出來就是 number；只比對 `=== true/false` 會讓徽章永遠停在
+ * 「尚未檢查」。null／undefined = 尚未檢查。 */
+export function peerReachable(value: number | boolean | null | undefined): boolean | null {
+  if (value === 1 || value === true) return true;
+  if (value === 0 || value === false) return false;
+  return null;
 }
 
 export type JobStatus = 'queued' | 'assigned' | 'running' | 'done' | 'failed' | 'cancelled';
@@ -424,6 +435,10 @@ export interface SettingsUpdate {
   /** Admin-only: Phase 3.3 batch splitting toggle -- off means every new job
    * runs whole on a single worker regardless of its batch_size. */
   split_batches?: boolean;
+  /** Admin-only: Phase 3.4 -- trust `X-Forwarded-For` when deciding a
+   * worker's source IP. Self-hosted only (the cloud stack reads Cloudflare's
+   * authoritative `CF-Connecting-IP` and has no such setting). */
+  trust_proxy?: boolean;
 }
 
 export interface SettingsState {
@@ -433,6 +448,8 @@ export interface SettingsState {
   upload_max_file_mb: number;
   upload_user_quota_gb: number;
   split_batches: boolean;
+  /** Absent on the cloud stack -- the console hides the switch when it is. */
+  trust_proxy?: boolean;
 }
 
 /** One file the caller uploaded into their own panel staging area

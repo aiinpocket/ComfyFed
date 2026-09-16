@@ -1325,6 +1325,33 @@ describe("Phase 3.4 fix round 1: advert normalization and probe gating", () => {
     vi.restoreAllMocks();
   });
 
+  it("drops the scheme's default port from the advert urls (parity with `_normalize_advert_url`)", async () => {
+    const kp = KEYPAIRS[0]!;
+    const workerId = await makeWorker({ pubkeyHex: kp.pubkey_hex });
+    vi.spyOn(peerhealth, "probePeerHealth").mockResolvedValue(true);
+    const ws = await connectAgent(workerId, kp.seed_hex);
+
+    const status = nextMessage(ws);
+    ws.send(
+      JSON.stringify({
+        type: "hello",
+        protocol: 4,
+        peer_url: "https://203.0.113.7:443/",
+        peer_lan_url: "http://192.168.1.5:80/",
+      })
+    );
+    await status;
+
+    const row = await db()
+      .prepare("SELECT peer_url, peer_lan_url FROM workers WHERE id = ?")
+      .bind(workerId)
+      .first<any>();
+    expect(row.peer_url).toBe("https://203.0.113.7");
+    expect(row.peer_lan_url).toBe("http://192.168.1.5");
+    ws.close();
+    vi.restoreAllMocks();
+  });
+
   it("probes once for repeated identical advertisements, replaying the stored verdict", async () => {
     const kp = KEYPAIRS[0]!;
     const workerId = await makeWorker({ pubkeyHex: kp.pubkey_hex });

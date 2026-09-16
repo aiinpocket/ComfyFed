@@ -31,7 +31,7 @@ import {
 import { useCallback, useState, useEffect } from 'react';
 import { useTranslation } from 'react-i18next';
 
-import { ApiError, api, type Role, type TokenBundle, type Worker } from '../api';
+import { ApiError, api, peerReachable, type Role, type TokenBundle, type Worker } from '../api';
 import { EmptyState, Mono, SectionHeader, TableSkeleton } from '../components/Primitives';
 import { WorkerStatusBadge } from '../components/StatusBadge';
 import { formatGb, formatRelative, shortId } from '../lib/format';
@@ -61,10 +61,11 @@ function P2pCell({ worker }: { worker: Worker }) {
   }
   const natKey = `workers.p2p_nat_${worker.peer_nat}`;
   const natLabel = worker.peer_nat === 'none' ? t('workers.p2p_off') : t(natKey);
+  const reachable = peerReachable(worker.peer_reachable);
   const reach =
-    worker.peer_reachable === true
+    reachable === true
       ? { color: 'green', label: t('workers.p2p_verified') }
-      : worker.peer_reachable === false
+      : reachable === false
         ? { color: 'red', label: t('workers.p2p_unreachable') }
         : { color: 'gray', label: t('workers.p2p_unchecked') };
   return (

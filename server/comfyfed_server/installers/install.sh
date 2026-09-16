@@ -447,9 +447,12 @@ def cmd_capture(pid, comfy_url, marker_path):
 def cmd_p2p_enable(config_path, port):
     """spec §11：路由器探測成功後，把模型分享打開 —— 但只在使用者從未表態
     的情況下。規則刻意極簡：`peer_serve` 目前為 false **且** `peer_listen_port`
-    為 null（從未設定過）才寫入；曾經手動設過埠或手動關掉分享的一律尊重，
-    安裝腳本不會把它改回來。設定檔不存在時視同全新（空）設定，比照
-    AgentConfig.load 的行為 -- 只有「檔案存在但解析失敗」才算尊重、不動。"""
+    為 null（從未設定過）才寫入；曾經手動設過埠的一律尊重，安裝腳本不會把它
+    改回來。**注意這條規則的極限**：只寫 `peer_serve: false` 而**沒有**埠號
+    的設定檔跟預設值完全無法區分，還是會被打開 —— 要讓分享固定關著，得一併
+    設定 `peer_listen_port`（有埠號就把這個決定釘住）。設定檔不存在時視同
+    全新（空）設定，比照 AgentConfig.load 的行為 -- 只有「檔案存在但解析
+    失敗」才算尊重、不動。"""
     import json
     import os
 
@@ -478,6 +481,17 @@ def cmd_p2p_enable(config_path, port):
     print("enabled")
 
 
+def cmd_p2p_reason(probe_json_line):
+    """探測失敗（exit 1）時的 `reason` 欄位；解不出來印空字串。呼叫端用它
+    分辨「agent 已經在跑，所以根本沒探」與「路由器沒回應」。"""
+    import json
+
+    try:
+        print(json.loads(probe_json_line).get("reason") or "")
+    except Exception:
+        print("")
+
+
 def cmd_p2p_method(probe_json_line):
     """spec §11：從 agent 的 P2P 探測指令（--json 輸出）最後一行解出 method
     欄位；呼叫端 (install.sh) 只需 tail -n 1 抓最後一行丟進來，不用再自己
@@ -502,6 +516,8 @@ if __name__ == "__main__":
         cmd_p2p_enable(sys.argv[2], sys.argv[3])
     elif command == "p2p_method":
         cmd_p2p_method(sys.argv[2])
+    elif command == "p2p_reason":
+        cmd_p2p_reason(sys.argv[2])
     else:
         print(f"unknown command: {command}", file=sys.stderr)
         sys.exit(2)
@@ -773,8 +789,19 @@ if [ "${P2P_PROBE_RC:-1}" -eq 0 ]; then
     bilingual "路由器支援自動開埠（$P2P_METHOD），已開啟模型分享（連接埠 8850）" \
         "Your router supports automatic port mapping ($P2P_METHOD); model sharing is on (port 8850)"
 else
-    bilingual "路由器沒有回應 UPnP／NAT-PMP，未開啟模型分享；到路由器開啟 UPnP 後重跑安裝指令即可自動開啟，或手動設定 peer_advertise_host 與轉埠" \
-        "Your router did not answer UPnP/NAT-PMP, so model sharing stays off; enable UPnP on the router and re-run this installer, or set peer_advertise_host and forward the port by hand"
+    # exit 1 有兩種完全不同的原因。`agent_running` 不是「路由器沒回應」——
+    # 探測會刪掉它建立的映射，所以 agent 已經在跑時它直接拒絕執行，什麼都
+    # 沒問過路由器；這時印路由器那一行是在騙人。只看最後一行（跟成功分支
+    # 同樣的理由：前面可能有警告行）。
+    P2P_FAIL_LINE="$(printf '%s\n' "$P2P_PROBE_OUT" | tail -n 1)"
+    P2P_REASON="$("$VENV_PYTHON" "$HELPER_SCRIPT" p2p_reason "$P2P_FAIL_LINE" 2>/dev/null || echo "")"
+    if [ "$P2P_REASON" = "agent_running" ]; then
+        bilingual "agent 正在執行，未變更分享設定" \
+            "Agent is running; sharing settings left as they are"
+    else
+        bilingual "路由器沒有回應 UPnP／NAT-PMP，未開啟模型分享；到路由器開啟 UPnP 後重跑安裝指令即可自動開啟，或手動設定 peer_advertise_host 與轉埠" \
+            "Your router did not answer UPnP/NAT-PMP, so model sharing stays off; enable UPnP on the router and re-run this installer, or set peer_advertise_host and forward the port by hand"
+    fi
 fi
 
 # ---------------------------------------------------------------------------

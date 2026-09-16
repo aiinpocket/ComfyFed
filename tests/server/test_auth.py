@@ -186,6 +186,7 @@ def test_update_settings_writes_platform_url_and_lang(client):
         "upload_max_file_mb": 50,
         "upload_user_quota_gb": 5.0,
         "split_batches": True,
+        "trust_proxy": False,
     }
 
     me = client.get("/api/auth/me").json()
@@ -239,6 +240,7 @@ def test_get_settings_reports_defaults_before_any_write(client):
         "upload_max_file_mb": 50,
         "upload_user_quota_gb": 5.0,
         "split_batches": True,
+        "trust_proxy": False,
     }
 
 
@@ -576,6 +578,31 @@ def test_settings_expose_and_update_split_batches(client):
 
     r = client.post("/api/settings", json={"split_batches": True}, headers={"X-CSRF": csrf})
     assert r.json()["split_batches"] is True
+
+
+def test_settings_expose_and_update_trust_proxy(client):
+    """最終審查 I2：`X-Forwarded-For` 信任是 admin 開關，**預設關**。"""
+    csrf = _csrf(client)
+    assert client.get("/api/settings").json()["trust_proxy"] is False
+
+    r = client.post("/api/settings", json={"trust_proxy": True}, headers={"X-CSRF": csrf})
+    assert r.status_code == 200
+    assert r.json()["trust_proxy"] is True
+    assert client.get("/api/settings").json()["trust_proxy"] is True
+
+    with db.get_session() as session:
+        assert session.get(db.Setting, "trust_proxy").value == "1"
+
+    r = client.post("/api/settings", json={"trust_proxy": False}, headers={"X-CSRF": csrf})
+    assert r.json()["trust_proxy"] is False
+    with db.get_session() as session:
+        assert session.get(db.Setting, "trust_proxy").value == "0"
+
+
+def test_update_settings_rejects_a_non_boolean_trust_proxy(client):
+    csrf = _csrf(client)
+    r = client.post("/api/settings", json={"trust_proxy": "bogus"}, headers={"X-CSRF": csrf})
+    assert r.status_code == 422
 
 
 def test_update_settings_rejects_a_non_boolean_split_batches(client):

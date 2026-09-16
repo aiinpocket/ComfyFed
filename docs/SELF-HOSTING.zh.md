@@ -105,6 +105,10 @@ server {
 
 （agent 走的是 WebSocket 長連線，proxy 記得帶上 `Upgrade`/`Connection` header。）
 
+**架在反向代理後面時，記得一併打開「信任 X-Forwarded-For」**（主控台 →**設定**，僅管理員可見，預設關閉）。平台要用每台 worker 的真實來源 IP，才能把躲在同一個 NAT 後面的 P2P 節點分成一組（分到同一組就改走區網位址互傳分塊，不必繞出路由器再繞回來）。架在代理後面時 TCP 對端是代理自己，不開這個設定的話**每一台** worker 看起來都來自代理的 IP，會被當成同一個 NAT 底下。也要確認代理真的有送這個標頭（nginx 用 `proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;`；Caddy 的 `reverse_proxy` 預設就會帶）。
+
+**前面沒有代理就維持關閉。** `X-Forwarded-For` 是任何 agent 都能自己塞的標頭，沒有代理幫忙覆寫就採信它，等於讓 worker 自選對外 IP，也就自選要跟誰同組。
+
 ### 新增一台 worker
 
 1. 在主控台 → **Workers** → 新增，輸入名稱後系統會產生一次性的註冊 token，並直接顯示三條一行安裝指令（Windows PowerShell／Windows cmd／Linux + macOS），各附複製按鈕。
@@ -322,7 +326,7 @@ UPDATE model_hashes SET conflict = 0 WHERE name = '...' AND size_bytes = ...;
 
 - **問得到** → 自動在 `agent.json` 寫入 `peer_serve: true`、`peer_listen_port: 8850`，並在畫面上告訴你用的是哪一種（natpmp／upnp）。
 - **問不到** → 什麼都不改（分享維持關閉），並印一行說明：到路由器把 UPnP 打開之後**重跑同一行安裝指令**就會自動開啟，或是自己轉埠並設定 `peer_advertise_host`。
-- **你自己設過的一律尊重**：只有在 `peer_serve` 目前是 `false` **而且** `peer_listen_port` 從未設定過的情況下，安裝腳本才會自動開啟。手動關掉過、或自己指定過埠號的設定，重跑安裝也不會被改回去。
+- **你自己設過的一律尊重**：只有在 `peer_serve` 目前是 `false` **而且** `peer_listen_port` 從未設定過的情況下，安裝腳本才會自動開啟。自己指定過埠號的設定，重跑安裝也不會被改回去。這條規則有一個限制要知道：只寫 `peer_serve: false`、**沒有**指定埠號，跟預設值長得一模一樣，重跑安裝還是會被打開——想讓分享保持關閉，請一併設定 `peer_listen_port`（有埠號就等於把這個決定釘住）。
 - 想自己先確認一次，可以單獨跑：`comfyfed-agent p2p-probe`（印一行 JSON，成功會帶 `method`、`external_ip`、`external_port`；它不會留下任何映射）。**agent 正在執行中的話會直接拒絕**（印 `{"ok": false, "reason": "agent_running"}`），連路由器都不會去碰——這條指令是設計給安裝腳本在啟動 agent 之前用的，不是拿來跟已經在跑的 agent 搶同一筆映射。
 
 `agent.json` 相關設定：

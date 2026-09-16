@@ -54,7 +54,8 @@ const BASE_WORKER: Worker = {
   peer_url: 'http://192.168.1.5:8850',
   peer_lan_url: 'http://10.0.0.5:8850',
   peer_nat: 'natpmp',
-  peer_reachable: true,
+  // 後端（SQLite / D1）把 boolean 存成整數，JSON 出來就是 1/0——fixture 照實寫。
+  peer_reachable: 1,
 };
 
 const QUIET_WORKER: Worker = {
@@ -305,7 +306,7 @@ describe('Phase 3.4: the P2P column', () => {
   });
 
   it('shows "not reachable" when the platform could not connect', async () => {
-    stubFetch([{ ...BASE_WORKER, peer_reachable: false }]);
+    stubFetch([{ ...BASE_WORKER, peer_reachable: 0 }]);
     renderWorkers();
     expect(await screen.findByText('Not reachable')).toBeInTheDocument();
   });
@@ -317,8 +318,20 @@ describe('Phase 3.4: the P2P column', () => {
   });
 
   it('shows LAN-only workers as LAN only', async () => {
-    stubFetch([{ ...BASE_WORKER, peer_nat: 'lan', peer_url: 'http://192.168.1.5:8850', peer_reachable: false }]);
+    stubFetch([{ ...BASE_WORKER, peer_nat: 'lan', peer_url: 'http://192.168.1.5:8850', peer_reachable: 0 }]);
     renderWorkers();
     expect(await screen.findByText('LAN only')).toBeInTheDocument();
+  });
+
+  it('still reads a real JSON boolean (older payloads)', async () => {
+    stubFetch([{ ...BASE_WORKER, peer_reachable: true }]);
+    renderWorkers();
+    expect(await screen.findByText('Verified')).toBeInTheDocument();
+  });
+
+  it('still reads a real JSON false (older payloads)', async () => {
+    stubFetch([{ ...BASE_WORKER, peer_reachable: false }]);
+    renderWorkers();
+    expect(await screen.findByText('Not reachable')).toBeInTheDocument();
   });
 });

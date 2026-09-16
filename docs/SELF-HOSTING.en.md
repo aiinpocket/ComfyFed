@@ -105,6 +105,10 @@ server {
 
 (The agent uses a long-lived WebSocket connection, so make sure the proxy forwards the `Upgrade`/`Connection` headers.)
 
+**Behind a reverse proxy, also turn on `Trust X-Forwarded-For`** (console → **Settings**, admin only; off by default). The platform needs each worker's real source IP to group P2P peers that sit behind the same NAT (they then swap chunks over their LAN addresses instead of going out and back through the router). Behind a proxy the TCP peer is the proxy itself, so without this setting **every** worker looks like it came from the proxy's IP and they would all be treated as one NAT. Make sure the proxy actually sets the header (`proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;` for nginx; Caddy's `reverse_proxy` does it for you).
+
+**With no proxy in front, leave it off.** `X-Forwarded-For` is a header any agent can send for itself, so trusting it without a proxy that overwrites it lets a worker choose its own apparent source IP — and therefore which peers it is grouped with.
+
 ### Adding a worker
 
 1. In the console, go to **Workers** → add, name it, and the platform issues a one-time registration token and shows three one-line install commands right away (Windows PowerShell / Windows cmd / Linux + macOS), each with its own copy button.
@@ -322,7 +326,7 @@ Besides the official-download-then-GCS-backup chain, workers can also hand model
 
 - **It answers** → the installer writes `peer_serve: true` and `peer_listen_port: 8850` into `agent.json` and tells you which method worked (natpmp/upnp).
 - **It doesn't** → nothing is changed (sharing stays off) and you get one line explaining what to do: turn UPnP on at the router and **re-run the same install command**, or forward the port yourself and set `peer_advertise_host`.
-- **Anything you chose yourself is respected**: the installer only enables sharing when `peer_serve` is currently `false` **and** `peer_listen_port` has never been set. A port you configured by hand, or sharing you deliberately turned off, survives a re-run untouched.
+- **Anything you chose yourself is respected**: the installer only enables sharing when `peer_serve` is currently `false` **and** `peer_listen_port` has never been set. A port you configured by hand survives a re-run untouched. Note the one limit of that rule: a `peer_serve: false` **without** a port is indistinguishable from the default and will be enabled — if you want sharing to stay off across re-runs, also set `peer_listen_port` (any port pins the decision).
 - To check for yourself: `comfyfed-agent p2p-probe` prints one JSON line (`method`, `external_ip`, `external_port` on success) and leaves no mapping behind. **It refuses outright while the agent is running** (prints `{"ok": false, "reason": "agent_running"}`) without touching the router at all — it's meant for the installer to run before the agent starts, not to fight an already-running agent over the same mapping.
 
 The relevant `agent.json` settings:

@@ -269,7 +269,7 @@
     "col_backend": "後端",
     "col_models": "模型數",
     "col_last_seen": "最後上線",
-    "col_p2p": "P2P 分享",
+    "col_p2p": "P2P 狀態",
     "p2p_sharing": "P2P 分享中",
     "p2p_off": "關閉",
     "p2p_nat_natpmp": "自動開埠（natpmp）",
@@ -446,7 +446,10 @@
     "uploads_load_failed": "無法載入上傳檔案清單",
     "split_batches": "自動拆分批次",
     "split_batches_hint": "一張 batch_size ≥ 2 的圖，在有多台 worker 閒置時自動拆成多份同時跑。同 seed 同構圖，但不是逐位元一致（差異等同於同一張圖落在不同機器上）。關掉之後新送出的任務一律整包跑在一台上。",
-    "split_batches_save_failed": "無法儲存拆分設定"
+    "split_batches_save_failed": "無法儲存拆分設定",
+    "trust_proxy": "信任 X-Forwarded-For",
+    "trust_proxy_hint": "只有在平台架在反向代理（nginx、Caddy、Traefik…）後面時才打開。打開之後，平台改用代理送來的 X-Forwarded-For 判斷每台 worker 的來源 IP，而不是 TCP 對端；不打開的話全部 worker 看起來都來自代理自己的 IP，P2P 會把它們誤判成同一個 NAT 底下。前面沒有代理就維持關閉：否則任何 agent 都能自己指定來源 IP。",
+    "trust_proxy_save_failed": "無法儲存代理信任設定"
   },
   "errors": {
     "auth.required": "密碼錯誤。",

@@ -1924,6 +1924,12 @@ class AgentLoop:
                 # 再解除一次 —— 盡力而為，總比在路由器上留一筆指向已關閉服務
                 # 的轉埠好。
                 await asyncio.sleep(_PEER_RENEW_DRAIN_SECONDS)
+                # 重讀一次：那個落地的 `map_port` 走的是 `_peer_shutting_down`
+                # 分支，它會把**新的**映射寫回 `self._peer_mapping`。續租可能
+                # 拿到不同的外部埠（718 衝突換埠）或不同的 control_url，拿舊
+                # 的那一筆去 unmap 等於刪錯（或刪不到）一筆映射。
+                mapping = self._peer_mapping or mapping
+                self._peer_mapping = None
                 try:
                     await asyncio.to_thread(natmap.unmap_port, mapping)
                 except Exception:
@@ -2143,10 +2149,15 @@ class AgentLoop:
                 continue
             self._peer_renew_failures = 0
             self._peer_mapping = mapping
-            self._peer_nat = mapping.method
             host = mapping.external_ip or self._peer_remote_ip
             if not host:
+                # 續租成功，但沒有任何可用的主機可以組出通告位址（UPnP 沒回
+                # 外部 IP，平台也還沒給過 `ready.remote_ip`）。這時**不要動
+                # `_peer_nat`**：通告位址還是舊的那一個（多半是區網位址、
+                # 標籤 `lan`），把標籤改成 natpmp/upnp 只會讓平台和主控台
+                # 顯示一個跟 `peer_url` 對不起來的來源。
                 continue
+            self._peer_nat = mapping.method
             new_url = peerserve.peer_url_for(host, mapping.external_port)
             if new_url == self._peer_advertised_url:
                 continue

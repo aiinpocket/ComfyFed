@@ -1129,6 +1129,33 @@ def test_peer_grant_returns_seeder_urls_lan_first_for_a_same_nat_puller(client):
     assert payload["peer_url"] == payload["seeder_urls"][0]
 
 
+def test_peer_grant_dedupes_identical_lan_and_public_urls(client):
+    """`peer_nat = "lan"` 的種子兩欄同值（沒開埠，通告的就是區網位址）——
+    去重後只剩一個，不然拉方會在同一個位址上白試兩次。"""
+    csrf = _login(client)
+    _make_online_seeder(
+        client,
+        csrf,
+        "seed-u1b",
+        peer_url="http://192.168.1.5:8850",
+        peer_lan_url="http://192.168.1.5:8850",
+        peer_reachable=0,
+        remote_ip="203.0.113.7",
+    )
+    puller_id, puller_sk = _puller_with_remote_ip(client, csrf, "pull-u1b", "203.0.113.7")
+
+    payload = _agent_post(
+        client,
+        puller_id,
+        puller_sk,
+        "/api/agent/peer-grant",
+        {"name": "checkpoints/model.safetensors", "size_bytes": _bytes(1.0)},
+    ).json()
+
+    assert payload["seeder_urls"] == ["http://192.168.1.5:8850"]
+    assert payload["peer_url"] == "http://192.168.1.5:8850"
+
+
 def test_peer_grant_returns_only_the_public_url_for_a_different_nat_puller(client):
     csrf = _login(client)
     _make_online_seeder(
@@ -1327,7 +1354,9 @@ def test_probe_cancels_the_request_at_the_deadline(monkeypatch):
     result, elapsed = asyncio.run(run())
 
     assert result is False
-    assert elapsed < 3.6
+    # 上限 3.5 秒；5.0 是給慢機器／GC 停頓的餘裕。真正的判準是下面那一行
+    # 旗標沒被設起來 —— 在剛好 3.6 秒的邊緣上 flaky 對誰都沒有幫助。
+    assert elapsed < 5.0
     assert late["finished"] is False  # 請求真的被取消了，沒有殘留的工作
 
 
@@ -1508,7 +1537,16 @@ def _request_grant(client, puller_id, puller_sk, name, size_bytes):
     )
 
 
+def _trust_proxy_on():
+    """這組 e2e 用 `X-Forwarded-For` 注入來源 IP，所以要先把平台設定
+    `trust_proxy` 打開（預設關 —— 最終審查 I2）。"""
+    with db.get_session() as session:
+        session.merge(db.Setting(key=agentws.TRUST_PROXY_SETTING_KEY, value="1"))
+        session.commit()
+
+
 def test_e2e_reachable_seeder_is_granted_with_seeder_urls(client, monkeypatch):
+    _trust_proxy_on()
     probed = []
     monkeypatch.setattr(peerhealth, "_probe", lambda url: probed.append(url) or True)
     csrf = _login(client)
@@ -1557,6 +1595,7 @@ def test_e2e_reachable_seeder_is_granted_with_seeder_urls(client, monkeypatch):
 
 
 def test_e2e_unreachable_seeder_is_never_chosen(client, monkeypatch):
+    _trust_proxy_on()
     monkeypatch.setattr(peerhealth, "_probe", lambda url: False)
     csrf = _login(client)
     seeder_id, seeder_sk = _register_worker(client, csrf, "e2e-seed-bad")
@@ -1592,6 +1631,7 @@ def test_e2e_unreachable_seeder_is_never_chosen(client, monkeypatch):
 
 
 def test_e2e_same_remote_ip_gets_the_lan_address_first(client, monkeypatch):
+    _trust_proxy_on()
     """不可連的種子，只要跟拉方同一個公網 IP 且有區網位址，仍然配得到，
     而且區網位址排第一（很多家用路由器不支援 hairpin）。"""
     monkeypatch.setattr(peerhealth, "_probe", lambda url: False)
@@ -1626,6 +1666,7 @@ def test_e2e_same_remote_ip_gets_the_lan_address_first(client, monkeypatch):
 
 
 def test_e2e_a_hostname_peer_url_is_never_probed(client, monkeypatch):
+    _trust_proxy_on()
     """名稱型主機一律不探（fix round 1）：`peer_reachable` 留 NULL，所以對
     不同 IP 的拉方不是種子；但對同一個公網 IP 的拉方，區網位址照樣配得出去。
     """

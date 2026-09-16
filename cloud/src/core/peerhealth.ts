@@ -234,6 +234,13 @@ export async function refresh(
       return null;
     }
 
+    // 「變了沒」比的是**這一輪開始探之前**庫裡那個值。Python 那邊
+    // `_record` 在同一個 session 裡讀舊值再寫新值，中間不會被別人插進來；
+    // D1 沒有那個交易，所以讀取要放在（最長 3 秒的）探針**之前**，否則另
+    // 一拍心跳在探的期間寫進來的值會被當成「我自己寫之前的舊值」，害這一
+    // 輪把真正的變化當成沒變而不推送。
+    const previous = await queries.getWorkerPeerReachable(db, workerId);
+
     let reachable: boolean;
     if (isPrivatePeerUrl(peerUrl)) {
       console.info(
@@ -244,9 +251,6 @@ export async function refresh(
       reachable = await self.probePeerHealth(checkedUrl);
     }
 
-    // 「變了沒」比的是**寫入前**庫裡那個值（parity: peerhealth.py 的
-    // `_record` 回傳 previous）。
-    const previous = await queries.getWorkerPeerReachable(db, workerId);
     await queries.updateWorkerPeerReachable(db, workerId, reachable ? 1 : 0, toSqliteTimestamp(new Date()));
     const unchanged = previous !== null && previous !== undefined && previous === (reachable ? 1 : 0);
     if (notify && !(opts.notifyOnChangeOnly && unchanged)) {

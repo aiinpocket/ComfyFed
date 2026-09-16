@@ -179,9 +179,23 @@ export async function onlineSeeders(
  * 必為 `peerReachable = 1`）。Ports peer.py's `_seeder_urls`. */
 export function seederUrls(seeder: Worker, pullerRemoteIp: string | null): string[] {
   if (pullerRemoteIp && seeder.remoteIp === pullerRemoteIp && seeder.peerLanUrl) {
-    return [seeder.peerLanUrl, seeder.peerUrl!];
+    // 保序去重：`peerNat === "lan"` 的種子兩欄是同一個值（沒開埠，通告的
+    // 就是區網位址），不去重就會叫拉方在同一個位址上白試兩次。
+    return dedupe([seeder.peerLanUrl, seeder.peerUrl!]);
   }
   return [seeder.peerUrl!];
+}
+
+/** 保序去重。Ports peer.py's `_dedupe`. */
+function dedupe(urls: string[]): string[] {
+  const seen = new Set<string>();
+  const out: string[] = [];
+  for (const url of urls) {
+    if (!url || seen.has(url)) continue;
+    seen.add(url);
+    out.push(url);
+  }
+  return out;
 }
 
 /** Every `(name, size_bytes, sha256)` triple currently offered by an online,

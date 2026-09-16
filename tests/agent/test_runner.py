@@ -3601,6 +3601,67 @@ async def test_shutdown_unmaps_a_second_time_when_a_renewal_was_in_flight(
 
 
 @pytest.mark.asyncio
+async def test_shutdown_unmaps_the_mapping_the_in_flight_renewal_actually_created(
+    tmp_path, monkeypatch
+):
+    """最終審查：那個「飛在半空中」的續租如果在 drain 期間才落地，它會把
+    **新的**映射寫進 `_peer_mapping`（續租可能拿到另一個外部埠 —— 718 衝突
+    會換埠）。第二次解除必須重讀那一筆，拿舊的去刪等於在路由器上留下一筆
+    指向已關閉服務的轉埠。"""
+    monkeypatch.setattr(runner_module, "_PEER_RENEW_DRAIN_SECONDS", 0.2)
+    unmapped = []
+    monkeypatch.setattr(natmap, "unmap_port", lambda m: unmapped.append(m))
+    loop = _loop_with_peer(tmp_path)
+    loop._peer_mapping = _mapping(external_port=8850)
+    # 續租還在別的 thread 上飛（`shutdown` 因此會補第二次解除）。
+    loop._peer_renew_in_flight = True
+    renewed = _mapping(external_port=8853)
+
+    async def _lands_during_the_drain():
+        await asyncio.sleep(0.02)
+        loop._peer_mapping = renewed
+
+    late = asyncio.create_task(_lands_during_the_drain())
+    await loop.shutdown()
+    await late
+
+    assert [m.external_port for m in unmapped] == [8850, 8853]
+    assert loop._peer_mapping is None
+
+
+@pytest.mark.asyncio
+async def test_a_successful_renewal_without_a_usable_host_keeps_the_nat_label(
+    tmp_path, monkeypatch
+):
+    """續租成功但沒有任何可用主機（UPnP 沒回外部 IP、平台也還沒給
+    remote_ip）：通告位址沒得更新，標籤就不能跟著跳成 upnp —— 否則平台與
+    主控台會顯示一個跟 `peer_url` 對不起來的來源。"""
+    monkeypatch.setattr(natmap, "RENEW_SECONDS", 0.01)
+    calls = {"n": 0}
+
+    def _map(**kwargs):
+        calls["n"] += 1
+        return _mapping(method="upnp", external_ip=None)
+
+    monkeypatch.setattr(natmap, "map_port", _map)
+    loop = _loop_with_peer(tmp_path)
+    loop._peer_mapping = _mapping(method="upnp", external_ip=None)
+    loop._peer_nat = "lan"
+    loop._peer_remote_ip = None
+    loop._peer_advertised_url = "http://192.168.1.5:8850"
+    conn = _ClosableConn()
+    loop.connections = {"a": conn}
+
+    await _drive_renew_ticks(loop, calls, 2)
+
+    assert loop._peer_nat == "lan"
+    assert loop._peer_advertised_url == "http://192.168.1.5:8850"
+    assert conn.closes == 0
+    # 續租本身是成功的，映射還是要更新（關機時要拿它去解除）。
+    assert loop._peer_mapping is not None
+
+
+@pytest.mark.asyncio
 async def test_a_renewal_does_not_start_once_shutdown_has_begun(tmp_path, monkeypatch):
     monkeypatch.setattr(natmap, "RENEW_SECONDS", 0.01)
     calls = {"n": 0}

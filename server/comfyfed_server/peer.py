@@ -371,11 +371,26 @@ def _seeder_urls(seeder: db.Worker, puller_remote_ip: Optional[str]) -> list[str
        家用路由器不支援 hairpin，對外位址反而連不回來）。
     2. 否則 → `[peer_url]`（此時種子必為 `peer_reachable = 1`）。
 
+    回傳前**保序去重**：`peer_nat = "lan"` 的種子兩欄是同一個值（沒開埠，
+    通告的就是區網位址），第 1 種情形會產生 `[x, x]`，讓拉方在同一個位址
+    上白試兩次。
+
     cloud parity: `cloud/src/core/peer.ts` 的 `seederUrls`。
     """
     if puller_remote_ip and seeder.remote_ip == puller_remote_ip and seeder.peer_lan_url:
-        return [seeder.peer_lan_url, seeder.peer_url]
+        return _dedupe([seeder.peer_lan_url, seeder.peer_url])
     return [seeder.peer_url]
+
+
+def _dedupe(urls: list[str]) -> list[str]:
+    """保序去重（`dict.fromkeys` 的語意，寫開只為了讓 cloud 那邊照抄）。"""
+    seen: set[str] = set()
+    out: list[str] = []
+    for url in urls:
+        if url and url not in seen:
+            seen.add(url)
+            out.append(url)
+    return out
 
 
 def _active_grant_count(worker_id: str, now: float) -> int:

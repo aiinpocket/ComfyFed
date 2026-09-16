@@ -3742,21 +3742,50 @@ def test_ready_carries_remote_ip_from_client_host(client):
         ctx.__exit__(None, None, None)
 
 
-def test_ready_prefers_first_hop_of_x_forwarded_for(client):
+def _set_trust_proxy(value: bool) -> None:
+    """平台設定 `trust_proxy`（預設關）。"""
+    with db.get_session() as session:
+        session.merge(db.Setting(key=agentws.TRUST_PROXY_SETTING_KEY, value="1" if value else "0"))
+        session.commit()
+
+
+def test_ready_ignores_x_forwarded_for_by_default(client):
+    """最終審查 I2：`remote_ip` 會影響配種子（`peer.online_seeders` 的同 NAT
+    分支），而 XFF 是 agent 自己就能塞的標頭 —— 預設一律不採信。"""
     csrf = _login(client)
     worker_id, sk = _register_worker(client, csrf, "nat-2")
     ctx, ws, ready = _handshake_ws(
         client, worker_id, sk, headers={"X-Forwarded-For": "203.0.113.7, 70.41.3.18"}
     )
     try:
-        assert ready["remote_ip"] == "203.0.113.7"
+        assert ready["remote_ip"] != "203.0.113.7"
+        # TestClient 的 TCP 對端是 "testclient"。
+        assert ready["remote_ip"] == "testclient"
     finally:
         ctx.__exit__(None, None, None)
+
+
+def test_ready_prefers_first_hop_of_x_forwarded_for_when_trust_proxy_is_on(client):
+    csrf = _login(client)
+    worker_id, sk = _register_worker(client, csrf, "nat-2b")
+    _set_trust_proxy(True)
+    try:
+        ctx, ws, ready = _handshake_ws(
+            client, worker_id, sk, headers={"X-Forwarded-For": "203.0.113.7, 70.41.3.18"}
+        )
+        try:
+            assert ready["remote_ip"] == "203.0.113.7"
+        finally:
+            ctx.__exit__(None, None, None)
+    finally:
+        _set_trust_proxy(False)
 
 
 def test_hello_stores_peer_lan_url_peer_nat_and_remote_ip(client):
     csrf = _login(client)
     worker_id, sk = _register_worker(client, csrf, "nat-3")
+    # XFF 只有在 `trust_proxy` 開著時才算數（最終審查 I2）。
+    _set_trust_proxy(True)
     ctx, ws, _ = _handshake_ws(
         client, worker_id, sk, headers={"X-Forwarded-For": "203.0.113.7"}
     )
@@ -3782,6 +3811,7 @@ def test_hello_stores_peer_lan_url_peer_nat_and_remote_ip(client):
         assert w.peer_lan_url == "http://192.168.1.5:8850"
         assert w.peer_nat == "natpmp"
         assert w.remote_ip == "203.0.113.7"
+    _set_trust_proxy(False)
 
 
 def test_hello_without_new_fields_defaults_to_lan(client):
@@ -4045,6 +4075,33 @@ def test_hello_stores_the_normalized_advert_urls(client):
         w = session.get(db.Worker, worker_id)
         assert w.peer_url == "http://203.0.113.7:8850"
         assert w.peer_lan_url == "http://192.168.1.5:8850"
+
+
+def test_hello_drops_the_scheme_default_port_from_the_advert_urls(client):
+    """最終審查：`http://h:80` 與 `http://h` 是同一個位址。不把預設埠丟掉的
+    話，兩棧的正規形會不一樣（cloud 用 `URL.host`，本來就不帶預設埠），而且
+    「`peer_url` 有沒有變」的比對與 `seeder_urls` 的去重都會被騙。"""
+    csrf = _login(client)
+    worker_id, sk = _register_worker(client, csrf, "nrm-2")
+    ctx, ws, _ = _handshake_ws(client, worker_id, sk)
+    try:
+        ws.send_json(
+            {
+                "type": "hello",
+                "protocol": 4,
+                "peer_url": "https://203.0.113.7:443/",
+                "peer_lan_url": "http://192.168.1.5:80/",
+            }
+        )
+        ws.send_json({"type": "heartbeat", "state": "idle"})
+        time.sleep(0.2)
+    finally:
+        ctx.__exit__(None, None, None)
+
+    with db.get_session() as session:
+        w = session.get(db.Worker, worker_id)
+        assert w.peer_url == "https://203.0.113.7"
+        assert w.peer_lan_url == "http://192.168.1.5"
 
 
 def test_hello_probes_once_for_repeated_identical_advertisements(client, monkeypatch):

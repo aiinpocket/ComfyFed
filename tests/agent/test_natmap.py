@@ -340,8 +340,10 @@ class FakeHttp:
         self.clock = clock
         self.cost = cost
         self.posts: list[tuple[str, bytes, dict]] = []
+        self.gets: list[str] = []
 
     def get(self, url, timeout):
+        self.gets.append(url)
         if self.clock:
             self.clock.now += self.cost
         body = self.get_map.get(url)
@@ -678,3 +680,184 @@ def test_unmap_port_sends_deleteportmapping_for_upnp():
     assert url == "http://192.168.1.1:5000/ctl/IPConn"
     assert "DeletePortMapping" in headers["SOAPAction"]
     assert "<NewExternalPort>8852</NewExternalPort>" in body.decode()
+
+
+# --- 最終審查：SSDP/controlURL 的來源限制、讀取上限、725 lease fallback ----
+
+ONLY_PERMANENT_RESPONSE = """<?xml version="1.0"?>
+<s:Envelope xmlns:s="http://schemas.xmlsoap.org/soap/envelope/">
+<s:Body><s:Fault><detail><UPnPError xmlns="urn:schemas-upnp-org:control-1-0">
+<errorCode>725</errorCode><errorDescription>OnlyPermanentLeasesSupported</errorDescription>
+</UPnPError></detail></s:Fault></s:Body></s:Envelope>
+"""
+
+
+@pytest.mark.parametrize(
+    "url,ok",
+    [
+        ("http://192.168.1.1:5000/rootDesc.xml", True),   # 私有位址
+        ("http://192.168.1.1/x", True),
+        ("http://10.1.2.3:80/x", True),
+        ("http://169.254.7.7/x", True),                   # link-local
+        ("http://203.0.113.9:5000/x", False),             # 公網主機
+        ("https://192.168.1.1:5000/x", False),            # 只收 http
+        ("file:///etc/passwd", False),
+        ("ftp://192.168.1.1/x", False),
+        ("http://router.local/x", False),                 # 主機名判不出來就不放行
+        ("http://[2001:db8::1]/x", False),                # 公網 IPv6
+        ("http://[fd00::1]/x", True),                     # ULA
+        ("", False),
+        ("http:///x", False),
+    ],
+)
+def test_is_safe_igd_url(url, ok):
+    assert natmap.is_safe_igd_url(url, "192.168.1.1") is ok
+
+
+def test_is_safe_igd_url_allows_the_gateway_itself():
+    """閘道就算落在奇怪的網段（CGNAT 後面的 100.64/10 之類），它本來就是我們
+    要講話的對象。"""
+    assert natmap.is_safe_igd_url("http://100.64.0.1:5000/x", "100.64.0.1") is True
+    assert natmap.is_safe_igd_url("https://100.64.0.1:5000/x", "100.64.0.1") is False
+
+
+def test_map_port_ignores_a_ssdp_location_that_is_not_a_local_http_url():
+    """區網上任何一台機器都能回 M-SEARCH。`LOCATION` 指向公網主機（SSRF）
+    的回應直接丟掉 —— 連 GET 都不發。"""
+    clock = FakeClock()
+    evil = (
+        b"HTTP/1.1 200 OK\r\n"
+        b"LOCATION: http://203.0.113.9:5000/rootDesc.xml\r\n"
+        b"\r\n"
+    )
+    http = FakeHttp(
+        get_map={"http://203.0.113.9:5000/rootDesc.xml": IGD_XML},
+        post_responses=[(200, EXTERNAL_IP_RESPONSE.encode()), (200, ADD_OK_RESPONSE.encode())],
+        clock=clock,
+    )
+
+    mapping = _map(clock, udp=FakeUdp([None, None, None], clock), http=http, ssdp=FakeSsdp([evil], clock))
+
+    assert mapping is None
+    assert http.gets == []  # 連描述檔都沒去抓
+    assert http.posts == []
+
+
+def test_map_port_ignores_a_control_url_that_points_off_the_lan():
+    """描述檔是路由器自己寫的，`URLBase`/`controlURL` 一樣要過同一道關。"""
+    clock = FakeClock()
+    location = "http://192.168.1.1:5000/rootDesc.xml"
+    xml = IGD_XML.replace("<device>", "<URLBase>http://evil.example/</URLBase>\n  <device>", 1)
+    http = FakeHttp(
+        get_map={location: xml},
+        post_responses=[(200, EXTERNAL_IP_RESPONSE.encode()), (200, ADD_OK_RESPONSE.encode())],
+        clock=clock,
+    )
+
+    mapping = _map(clock, udp=FakeUdp([None, None, None], clock), http=http, ssdp=FakeSsdp([SSDP_RESPONSE], clock))
+
+    assert mapping is None
+    assert http.posts == []  # 沒有對那個 controlURL 發任何 SOAP
+
+
+def test_map_port_caps_how_much_of_the_description_it_parses():
+    """描述檔／SOAP 回應都封頂在 `MAX_HTTP_RESPONSE_BYTES`：超過的部分連
+    parse 都不 parse（真正的 socket 讀取上限在 `_UrllibHttpTransport`）。
+    這裡把有用的 XML 藏在上限之後，確認它真的沒被看到。"""
+    clock = FakeClock()
+    location = "http://192.168.1.1:5000/rootDesc.xml"
+    padded = "<!--" + "x" * natmap.MAX_HTTP_RESPONSE_BYTES + "-->" + IGD_XML
+    http = FakeHttp(
+        get_map={location: padded},
+        post_responses=[(200, EXTERNAL_IP_RESPONSE.encode()), (200, ADD_OK_RESPONSE.encode())],
+        clock=clock,
+    )
+
+    mapping = _map(clock, udp=FakeUdp([None, None, None], clock), http=http, ssdp=FakeSsdp([SSDP_RESPONSE], clock))
+
+    assert mapping is None
+    assert http.posts == []
+
+
+def test_map_port_retries_once_with_lease_zero_on_725():
+    """725 OnlyPermanentLeasesSupported：這台 IGD 只肯建永久映射，用
+    `NewLeaseDuration=0` 重試一次，並把 `lifetime` 記成 0（續租可以跳過）。"""
+    clock = FakeClock()
+    location = "http://192.168.1.1:5000/rootDesc.xml"
+    http = FakeHttp(
+        get_map={location: IGD_XML},
+        post_responses=[
+            (200, EXTERNAL_IP_RESPONSE.encode()),
+            (500, ONLY_PERMANENT_RESPONSE.encode()),
+            (200, ADD_OK_RESPONSE.encode()),
+        ],
+        clock=clock,
+    )
+
+    mapping = _map(clock, udp=FakeUdp([None, None, None], clock), http=http, ssdp=FakeSsdp([SSDP_RESPONSE], clock))
+
+    assert mapping is not None
+    assert mapping.external_port == 8850  # 同一個埠，不是換埠重試
+    assert mapping.lifetime == 0
+    first_add = http.posts[1][1].decode()
+    second_add = http.posts[2][1].decode()
+    assert "<NewLeaseDuration>3600</NewLeaseDuration>" in first_add
+    assert "<NewLeaseDuration>0</NewLeaseDuration>" in second_add
+    assert len(http.posts) == 3  # 只重試一次
+
+
+def test_map_port_gives_up_when_the_lease_zero_retry_also_fails():
+    clock = FakeClock()
+    location = "http://192.168.1.1:5000/rootDesc.xml"
+    http = FakeHttp(
+        get_map={location: IGD_XML},
+        post_responses=[
+            (200, EXTERNAL_IP_RESPONSE.encode()),
+            (500, ONLY_PERMANENT_RESPONSE.encode()),
+            (500, ONLY_PERMANENT_RESPONSE.encode()),
+        ],
+        clock=clock,
+    )
+
+    mapping = _map(clock, udp=FakeUdp([None, None, None], clock), http=http, ssdp=FakeSsdp([SSDP_RESPONSE], clock))
+
+    assert mapping is None
+    assert len(http.posts) == 3
+
+
+def test_run_command_passes_create_no_window_when_available(monkeypatch):
+    """Windows 上 `route print` 這種 console 程式在沒有主控台時會彈黑窗。"""
+    captured = {}
+
+    def fake_run(argv, **kwargs):
+        captured["argv"] = argv
+        captured["kwargs"] = kwargs
+
+        class _Result:
+            stdout = "out"
+
+        return _Result()
+
+    monkeypatch.setattr(natmap.subprocess, "run", fake_run)
+    monkeypatch.setattr(natmap.subprocess, "CREATE_NO_WINDOW", 0x08000000, raising=False)
+
+    assert natmap._run_command(["route", "print"]) == "out"
+    assert captured["kwargs"]["creationflags"] == 0x08000000
+
+
+def test_run_command_omits_create_no_window_where_it_does_not_exist(monkeypatch):
+    captured = {}
+
+    def fake_run(argv, **kwargs):
+        captured["kwargs"] = kwargs
+
+        class _Result:
+            stdout = ""
+
+        return _Result()
+
+    monkeypatch.setattr(natmap.subprocess, "run", fake_run)
+    monkeypatch.delattr(natmap.subprocess, "CREATE_NO_WINDOW", raising=False)
+
+    natmap._run_command(["ip", "route"])
+    assert "creationflags" not in captured["kwargs"]

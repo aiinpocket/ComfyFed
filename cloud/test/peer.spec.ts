@@ -625,4 +625,21 @@ describe("Phase 3.4: seeder eligibility and seeder_urls", () => {
     expect(other.status).toBe(200);
     expect(other.body.seeder_urls).toEqual(["http://203.0.113.7:8850"]);
   });
+
+  it("de-dupes seeder_urls when the LAN and public urls are the same (peer_nat = lan)", async () => {
+    // A `lan` seeder advertises its LAN address as BOTH urls -- without the
+    // dedupe the puller would try the identical address twice.
+    const { sizeBytes, puller } = await seedOneModel({
+      peerUrl: "http://192.168.1.5:8850",
+      peerLanUrl: "http://192.168.1.5:8850",
+      peerReachable: 0,
+      remoteIp: "203.0.113.7",
+    });
+    await setRemoteIp(puller, "203.0.113.7");
+
+    const same = await signedPost(puller, "/api/agent/peer-grant", { name: NAME, size_bytes: sizeBytes });
+    expect(same.status).toBe(200);
+    expect(same.body.seeder_urls).toEqual(["http://192.168.1.5:8850"]);
+    expect(same.body.peer_url).toBe("http://192.168.1.5:8850");
+  });
 });

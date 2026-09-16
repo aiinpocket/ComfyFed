@@ -418,6 +418,10 @@ class SettingsBody(BaseModel):
     # as any other wrongly-typed field here); the cloud twin answers its own
     # 400 `settings.bad_split_batches`.
     split_batches: Optional[bool] = None
+    # Phase 3.4 final review I2: whether `X-Forwarded-For` may be believed when
+    # deciding a worker's `remote_ip`. Default OFF -- see
+    # `agentws.trust_proxy_enabled`.
+    trust_proxy: Optional[bool] = None
     # Accepted as `float` for both so a JSON `50.0` (what a number input may
     # serialise) is not a 422 before the route's own range check can answer
     # the bilingual 400 -- `upload_max_file_mb` is then narrowed to an int.
@@ -429,6 +433,11 @@ settings_router = APIRouter()
 
 
 def _current_settings(db_session) -> dict:
+    # Imported locally (same reason as `installer_routes` below): `agentws`
+    # pulls in `workers`, which imports this module -- a top-level import here
+    # would close the cycle.
+    from . import agentws
+
     # Both upload limits go through `limits.read_limits`'s DEFENSIVE parse
     # rather than being read raw: a hand-edited or out-of-range row must
     # report (and be enforced as) the default, never as itself.
@@ -443,6 +452,10 @@ def _current_settings(db_session) -> dict:
         # means splitting is allowed -- same reading `split.split_batches_enabled`
         # applies on the dispatch side.
         "split_batches": _get_setting(db_session, split.SPLIT_BATCHES_SETTING_KEY) != "0",
+        # Default OFF (the mirror image of `split_batches`): only an explicit
+        # "1" turns X-Forwarded-For trust on -- same reading
+        # `agentws.trust_proxy_enabled` applies on the WebSocket side.
+        "trust_proxy": _get_setting(db_session, agentws.TRUST_PROXY_SETTING_KEY) == "1",
     }
 
 
@@ -471,6 +484,8 @@ def update_settings(
     `comfyapi._merged_object_info` for why the combo-value merge stays
     union-shaped either way.
     """
+    from . import agentws  # local import -- see `_current_settings`
+
     updates: dict[str, str] = {}
 
     if body.platform_url is not None:
@@ -509,6 +524,12 @@ def update_settings(
         # created (they are independent queued jobs and run to completion) --
         # it only stops NEW submissions from getting a split plan.
         updates[split.SPLIT_BATCHES_SETTING_KEY] = "1" if body.split_batches else "0"
+
+    if body.trust_proxy is not None:
+        # Phase 3.4 §2: only meaningful when the platform really sits behind a
+        # reverse proxy. Leaving it on without one lets any agent pick its own
+        # `remote_ip` (and therefore its own "same NAT" peer group).
+        updates[agentws.TRUST_PROXY_SETTING_KEY] = "1" if body.trust_proxy else "0"
 
     # The two upload limits are validated STRICTLY here (an admin typing an
     # out-of-range number deserves to be told) even though every read of them
