@@ -260,55 +260,117 @@ describe("isPrivatePeerUrl: non-host addresses (fix round 3)", () => {
   );
 });
 
+describe("parseStatusLine", () => {
+  it("reads the status code off an HTTP/1.x status line and rejects anything else", () => {
+    expect(peerhealth.parseStatusLine("HTTP/1.1 204 No Content")).toBe(204);
+    expect(peerhealth.parseStatusLine("HTTP/1.0 302 Found")).toBe(302);
+    expect(peerhealth.parseStatusLine("HTTP/1.1 204")).toBe(204);
+    expect(peerhealth.parseStatusLine("SSH-2.0-OpenSSH_9.6")).toBeNull();
+    expect(peerhealth.parseStatusLine("HTTP/1.1 20")).toBeNull();
+    expect(peerhealth.parseStatusLine("")).toBeNull();
+  });
+});
+
+/** A stand-in for `cloudflare:sockets`' Socket: records what the probe
+ * writes and feeds it a canned response (or nothing at all, for the
+ * timeout case). */
+function fakeSocket(response: string | null): { socket: Socket; written: string[]; closed: () => boolean } {
+  const written: string[] = [];
+  let closed = false;
+  const writable = new WritableStream<Uint8Array>({
+    write(chunk) {
+      written.push(new TextDecoder().decode(chunk));
+    },
+  });
+  const readable = new ReadableStream<Uint8Array>({
+    start(controller) {
+      if (response === null) return; // never answers
+      controller.enqueue(new TextEncoder().encode(response));
+      controller.close();
+    },
+  });
+  const socket = {
+    readable,
+    writable,
+    opened: Promise.resolve({}),
+    closed: Promise.resolve(),
+    close: async () => {
+      closed = true;
+    },
+    startTls: () => {
+      throw new Error("not used");
+    },
+  } as unknown as Socket;
+  return { socket, written, closed: () => closed };
+}
+
 describe("probePeerHealth", () => {
   afterEach(() => {
-    vi.unstubAllGlobals();
+    vi.restoreAllMocks();
   });
 
-  it("accepts only a 204, and asks fetch not to follow redirects", async () => {
-    const calls: Array<[string, RequestInit]> = [];
-    vi.stubGlobal(
-      "fetch",
-      vi.fn(async (url: string, init: RequestInit) => {
-        calls.push([url, init]);
-        return new Response(null, { status: 204 });
-      })
-    );
+  it("opens a raw socket to the IP literal and port (Workers fetch() cannot target IP addresses) and accepts only a 204", async () => {
+    const fake = fakeSocket("HTTP/1.1 204 No Content\r\nContent-Length: 0\r\n\r\n");
+    const open = vi.spyOn(peerhealth, "openSocket").mockReturnValue(fake.socket);
 
     expect(await peerhealth.probePeerHealth("http://203.0.113.7:8850/peer/health")).toBe(true);
-    expect(calls).toHaveLength(1);
-    expect(calls[0]![0]).toBe("http://203.0.113.7:8850/peer/health");
-    expect(calls[0]![1].redirect).toBe("manual");
-    expect(calls[0]![1].signal).toBeDefined();
+    expect(open).toHaveBeenCalledWith("203.0.113.7", 8850);
+    const request = fake.written.join("");
+    expect(request.startsWith("GET /peer/health HTTP/1.1\r\n")).toBe(true);
+    expect(request).toContain("Host: 203.0.113.7:8850\r\n");
+    expect(request).toContain("Connection: close\r\n");
+    expect(request.endsWith("\r\n\r\n")).toBe(true);
+    expect(fake.closed()).toBe(true);
+  });
+
+  it("strips the brackets off an IPv6 literal for connect() but keeps them in the Host header", async () => {
+    const fake = fakeSocket("HTTP/1.1 204 No Content\r\n\r\n");
+    const open = vi.spyOn(peerhealth, "openSocket").mockReturnValue(fake.socket);
+
+    expect(await peerhealth.probePeerHealth("http://[2001:db8::7]:8850/peer/health")).toBe(true);
+    expect(open).toHaveBeenCalledWith("2001:db8::7", 8850);
+    expect(fake.written.join("")).toContain("Host: [2001:db8::7]:8850\r\n");
   });
 
   it("treats a 302 as unreachable and never follows it", async () => {
-    const calls: string[] = [];
-    vi.stubGlobal(
-      "fetch",
-      vi.fn(async (url: string) => {
-        calls.push(url);
-        return new Response(null, {
-          status: 302,
-          headers: { Location: "http://198.51.100.9:8850/peer/health" },
-        });
-      })
+    const fake = fakeSocket(
+      "HTTP/1.1 302 Found\r\nLocation: http://198.51.100.9:8850/peer/health\r\n\r\n"
     );
+    const open = vi.spyOn(peerhealth, "openSocket").mockReturnValue(fake.socket);
 
     expect(await peerhealth.probePeerHealth("http://203.0.113.7:8850/peer/health")).toBe(false);
-    expect(calls).toEqual(["http://203.0.113.7:8850/peer/health"]);
+    expect(open).toHaveBeenCalledTimes(1);
+    expect(fake.closed()).toBe(true);
   });
 
-  it("treats a thrown fetch (timeout, refused, DNS) as unreachable", async () => {
-    vi.stubGlobal(
-      "fetch",
-      vi.fn(async () => {
-        throw new Error("connection refused");
-      })
-    );
+  it("treats a non-HTTP answer or an https peer_url as unreachable", async () => {
+    const fake = fakeSocket("SSH-2.0-OpenSSH_9.6\r\n");
+    vi.spyOn(peerhealth, "openSocket").mockReturnValue(fake.socket);
+    expect(await peerhealth.probePeerHealth("http://203.0.113.7:8850/peer/health")).toBe(false);
+
+    const open = vi.spyOn(peerhealth, "openSocket").mockReturnValue(fakeSocket("HTTP/1.1 204 OK\r\n\r\n").socket);
+    open.mockClear();
+    expect(await peerhealth.probePeerHealth("https://203.0.113.7:8850/peer/health")).toBe(false);
+    expect(open).not.toHaveBeenCalled();
+  });
+
+  it("treats a refused connection (connect() throws) as unreachable", async () => {
+    vi.spyOn(peerhealth, "openSocket").mockImplementation(() => {
+      throw new Error("connection refused");
+    });
 
     expect(await peerhealth.probePeerHealth("http://203.0.113.7:8850/peer/health")).toBe(false);
   });
+
+  it("gives up after TIMEOUT_MS when the peer accepts but never answers", async () => {
+    const fake = fakeSocket(null);
+    vi.spyOn(peerhealth, "openSocket").mockReturnValue(fake.socket);
+
+    const started = Date.now();
+    expect(await peerhealth.probePeerHealth("http://203.0.113.7:8850/peer/health")).toBe(false);
+    expect(Date.now() - started).toBeGreaterThanOrEqual(peerhealth.TIMEOUT_MS - 50);
+    expect(fake.closed()).toBe(true);
+  }, 10_000);
 });
 
 describe("needsRecheck", () => {

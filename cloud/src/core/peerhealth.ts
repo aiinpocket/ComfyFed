@@ -14,18 +14,21 @@
  * - `isIpLiteralPeerUrl(url)` / `is_ip_literal_peer_url`
  * - `peerHostAddress(url)` / `peer_host_address`
  * - `healthUrl(peerUrl)` / `health_url`：探針真正打的位址。
- * - `probePeerHealth(url)`：唯一真的 `fetch` 的地方（測試 spy 掉它）。
+ * - `probePeerHealth(url)`：唯一真的碰網路的地方（測試 spy 掉它；底下走
+ *   `cloudflare:sockets` 的 `connect()`，理由見該函式的 docstring）。
+ * - `openSocket(hostname, port)`：`connect()` 的薄包裝，探針測試的 spy 縫。
  * - `refresh(db, workerId, peerUrl, notify?, opts?)`
  * - `needsRecheck(checkedAt, now)` / `needs_recheck`
  * - `TIMEOUT_MS`（Python: `TIMEOUT_SECONDS`）、`RECHECK_MS`（Python:
  *   `RECHECK_SECONDS`）、`HEALTH_PATH`。
  *
- * 真正的 `fetch` 關在 `probePeerHealth` 這個薄函式裡，測試以
+ * 真正的網路存取關在 `probePeerHealth` 這個薄函式裡，測試以
  * `vi.spyOn(peerhealth, "probePeerHealth")` 攔掉 —— 這是這個測試樹既有的
  * mock 手法（見 dispatch.spec.ts 對 scheduler.match）。`refresh` 因此必須
  * 透過模組 namespace（下面的 `self`）呼叫它：ESM 裡直接呼叫本地繫結的話，
  * spy 換掉的是 namespace 上的匯出，攔不到同檔內的呼叫。
  */
+import { connect } from "cloudflare:sockets";
 import * as self from "./peerhealth";
 import * as queries from "../db/queries";
 import { toSqliteTimestamp, sqliteTimestampToEpochMs } from "../db/queries";
@@ -179,28 +182,93 @@ export function healthUrl(peerUrl: string): string {
   return peerUrl.replace(/\/+$/, "") + HEALTH_PATH;
 }
 
-/** 對 `url` 發一個 3 秒的 GET，只有 204 算通過。`redirect: "manual"` ⇒ 不跟
- * 302（跟著走等於讓一個惡意種子把平台的請求導去第三方，而且 302 本來就不是
- * 204）。任何例外（逾時、DNS、連線拒絕）都是 false —— 不可連是預期結果，
- * 不是錯誤。Parity: peerhealth.py 的 `_probe`（`follow_redirects=False`）。 */
+/** 開一條到種子的 raw TCP 連線。獨立成一個薄函式是為了讓測試 spy 掉它
+ * （`vi.spyOn(peerhealth, "openSocket")`），跟 `probePeerHealth` 自己被
+ * `refresh` 的測試 spy 掉是同一套手法。 */
+export function openSocket(hostname: string, port: number): Socket {
+  return connect({ hostname, port }, { allowHalfOpen: false });
+}
+
+/** HTTP/1.x 狀態列 → 狀態碼；不是狀態列就 null。 */
+export function parseStatusLine(line: string): number | null {
+  const m = /^HTTP\/1\.[01] (\d{3})(?: |\r|$)/.exec(line);
+  return m ? Number(m[1]) : null;
+}
+
+/** 對 `url` 用 raw TCP 送一個最小的 HTTP/1.1 GET，只讀狀態列，只有 204
+ * 算通過；整體 3 秒逾時。
+ *
+ * **為什麼不用 `fetch`**：Workers 的 `fetch()` 子請求「只能打 URL，不能直接
+ * 打 IP 位址」（Cloudflare Workers known issues），而這個探針**刻意只探 IP
+ * 字面值**（主機名一律不探，見 `isIpLiteralPeerUrl`）—— 用 `fetch` 的結果是
+ * 每一台種子都被判成不可連（2026-09-16 實機驗證：UPnP 開埠成功、外部埠檢
+ * 服務確認 8850 開著，雲端仍寫 `peer_reachable=0`）。`cloudflare:sockets`
+ * 的 `connect()` 沒有這個限制，任意 IP／埠都行（除了 25 與 Cloudflare 自家
+ * 網段，兩者本來就不會是種子）。
+ *
+ * 安全姿態與 fetch 版完全相同：不跟轉址（狀態列不是 204 就是 false，302
+ * 連 Location 都不看）；對面是一台我們不信任的機器，所以最多讀 512 bytes
+ * 就收線，狀態列一到手立刻取消讀取（parity: peerhealth.py 的
+ * `client.stream` + `follow_redirects=False`）。任何例外（逾時、連線拒絕、
+ * 非 HTTP 回應）都是 false —— 不可連是預期結果，不是錯誤。 */
 export async function probePeerHealth(url: string): Promise<boolean> {
+  let socket: Socket | null = null;
+  let timer: ReturnType<typeof setTimeout> | undefined;
   try {
-    const response = await fetch(url, {
-      method: "GET",
-      redirect: "manual",
-      signal: AbortSignal.timeout(TIMEOUT_MS),
+    const target = new URL(url);
+    if (target.protocol !== "http:") return false;
+    // `new URL("http://[::1]:8850").hostname` 保留中括號；connect() 要的是
+    // 不含括號的位址，Host 標頭則要含括號的形式。
+    const hostname = target.hostname.replace(/^\[|\]$/g, "");
+    const port = target.port ? Number(target.port) : 80;
+    const request =
+      `GET ${target.pathname}${target.search} HTTP/1.1\r\n` +
+      `Host: ${target.hostname}:${port}\r\n` +
+      `User-Agent: comfyfed-peerhealth\r\n` +
+      `Connection: close\r\n\r\n`;
+
+    const timeout = new Promise<never>((_, reject) => {
+      timer = setTimeout(() => reject(new Error("peerhealth: probe timed out")), TIMEOUT_MS);
     });
-    // body 一個 byte 都不讀就取消：對面是一台我們不信任的機器，它大可回一
-    // 條無限長的回應（parity: peerhealth.py 的 `client.stream`）。狀態碼是
-    // 我們唯一要的東西。
-    try {
-      await response.body?.cancel();
-    } catch {
-      // 已經關掉 / 沒有 body，無所謂。
-    }
-    return response.status === 204;
+
+    const opened = self.openSocket(hostname, port);
+    socket = opened;
+    const exchange = (async (): Promise<boolean> => {
+      const writer = opened.writable.getWriter();
+      await writer.write(new TextEncoder().encode(request));
+      writer.releaseLock();
+
+      const reader = opened.readable.getReader();
+      const decoder = new TextDecoder();
+      let text = "";
+      try {
+        while (text.length < 512) {
+          const { value, done } = await reader.read();
+          if (done) break;
+          text += decoder.decode(value, { stream: true });
+          const newline = text.indexOf("\n");
+          if (newline >= 0) {
+            return parseStatusLine(text.slice(0, newline).replace(/\r$/, "")) === 204;
+          }
+        }
+        return false;
+      } finally {
+        reader.cancel().catch(() => {});
+      }
+    })();
+
+    return await Promise.race([exchange, timeout]);
   } catch {
     return false;
+  } finally {
+    if (timer !== undefined) clearTimeout(timer);
+    if (socket) {
+      try {
+        socket.close().catch(() => {});
+      } catch {
+        // 已經關了 / 從沒開成，無所謂。
+      }
+    }
   }
 }
 
