@@ -793,6 +793,80 @@ def test_ps1_autostart_keeps_an_undeletable_scheduled_task_instead_of_stacking_r
     del kept_branch, run_branch
 
 
+# ---------------------------------------------------------------------------
+# Do not start a second agent when one is already running (live-caught
+# 2026-09-16): re-running the installer on a machine whose agent is already
+# autostarted at logon must not launch a second launcher + agent that fights
+# the first over the platform WebSocket (same worker id).
+# ---------------------------------------------------------------------------
+
+
+def test_ps1_checks_agent_state_before_starting_now():
+    ps1 = open(_source_path("install.ps1"), encoding="utf-8-sig").read()
+    assert "function Test-AgentAlreadyRunning" in ps1
+    # State-file read: same file/shape as comfyfed_agent.control.write_state.
+    assert "$AgentStatePath = Join-Path (Split-Path -Parent $AgentConfigPath) 'agent_state.json'" in ps1
+    guard = ps1[ps1.index("function Test-AgentAlreadyRunning") : ps1.index("Write-Bilingual '安裝完成")]
+    # pid liveness check: live process whose command line contains comfyfed-agent.
+    assert "Get-CimInstance -ClassName Win32_Process -Filter \"ProcessId=$statePid\"" in guard
+    assert "[string]$proc.CommandLine -notmatch 'comfyfed-agent'" in guard
+    # Freshness: only trust a heartbeat updated within the last 60s.
+    assert "TotalSeconds -gt 60" in guard
+    # The skip message (bilingual) and the "next restart" note.
+    assert "agent 已在執行（pid $existingAgentPid），不再重複啟動" in guard
+    assert "Agent already running (pid $existingAgentPid); not starting a second one" in guard
+    assert "新版會在下次重啟時生效" in guard
+    assert "the new build takes effect on the next agent restart" in guard
+    # The guard actually gates the existing "Starting now" step, not a
+    # parallel/duplicate one.
+    assert guard.count("Starting now") == 1
+    assert "if ($existingAgentPid) {" in guard
+
+
+def test_sh_checks_agent_state_before_starting_now():
+    sh = open(_source_path("install.sh"), encoding="utf-8").read()
+    assert "agent_already_running()" in sh
+    assert 'AGENT_STATE_PATH="$(dirname "$AGENT_CONFIG_PATH")/agent_state.json"' in sh
+    guard_start = sh.index("agent_already_running()")
+    guard = sh[guard_start : sh.index('if [ "$OS_KIND" = "linux" ]; then', guard_start)]
+    # pid liveness check: kill -0 plus a comfyfed-agent command-line grep.
+    assert 'kill -0 "$_AGENT_STATE_PID" 2>/dev/null || return 1' in guard
+    assert 'ps -o args= -p "$_AGENT_STATE_PID" 2>/dev/null | grep -q comfyfed-agent || return 1' in guard
+    # Freshness: only trust a heartbeat updated within the last 60s.
+    assert "age <= 60" in guard
+    # The skip message (bilingual) and the "next restart" note.
+    assert "agent 已在執行（pid $_AGENT_STATE_PID），不再重複啟動" in guard
+    assert "Agent already running (pid $_AGENT_STATE_PID); not starting a second one" in guard
+    assert "新版會在下次重啟時生效" in guard
+    assert "the new build takes effect on the next agent restart" in guard
+    assert "AGENT_ALREADY_RUNNING=1" in guard
+
+
+def test_sh_agent_already_running_skips_second_start_both_service_managers():
+    """The guard must actually gate the start action, not just print a
+    message: systemd gets `enable` without `--now`, and launchd's
+    unload/load cycle (which would otherwise kill-and-relaunch via
+    RunAtLoad) is skipped entirely, on both the agent AND already-detected
+    branches."""
+    sh = open(_source_path("install.sh"), encoding="utf-8").read()
+    assert 'if [ "$AGENT_ALREADY_RUNNING" -eq 1 ]; then\n        # Persist the unit' in sh
+    assert "systemctl --user enable comfyfed-agent.service ||" in sh
+    linux_block = sh[sh.index('if [ "$OS_KIND" = "linux" ]'):sh.index('elif [ "$OS_KIND" = "darwin" ]')]
+    assert '"$AGENT_ALREADY_RUNNING" -eq 1' in linux_block
+
+    darwin_block = sh[sh.index('elif [ "$OS_KIND" = "darwin" ]'):]
+    # Both the pre-rewrite unload and the final load are gated.
+    assert darwin_block.count('if [ "$AGENT_ALREADY_RUNNING" -eq 0 ]; then') == 2
+    unload_idx = darwin_block.index('launchctl unload -w "$LAUNCH_AGENTS_DIR/com.comfyfed.agent.plist"')
+    load_idx = darwin_block.index('launchctl load -w "$LAUNCH_AGENTS_DIR/com.comfyfed.agent.plist"')
+    gate1 = darwin_block.rindex('if [ "$AGENT_ALREADY_RUNNING" -eq 0 ]; then', 0, unload_idx)
+    gate2 = darwin_block.rindex('if [ "$AGENT_ALREADY_RUNNING" -eq 0 ]; then', 0, load_idx)
+    assert gate1 != -1 and gate2 != -1
+    # The plist file itself is still (re)written unconditionally, so a live
+    # agent picks up the new version on its own next restart.
+    assert darwin_block.index('cat > "$LAUNCH_AGENTS_DIR/com.comfyfed.agent.plist"') > gate1
+
+
 def test_generated_comfyui_launcher_sh_syntax_checks():
     """install.sh writes a SECOND bash script; `bash -n install.sh` never
     looks inside a heredoc, so the generated file needs its own parse gate

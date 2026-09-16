@@ -791,10 +791,51 @@ if ($autostartOk) {
     }
 }
 
-Write-Bilingual '立即啟動...' 'Starting now...'
-Start-Process -FilePath 'powershell.exe' -ArgumentList `
-    "-NoProfile", "-ExecutionPolicy", "Bypass", "-WindowStyle", "Hidden", "-File", "`"$LauncherScript`"" `
-    -WindowStyle Hidden
+# Live-caught 2026-09-16: re-running this installer on a machine whose agent
+# was already autostarted at logon unconditionally launched a SECOND
+# launcher + agent, which briefly fought the first one over the platform
+# WebSocket (same worker id). The agent republishes agent_state.json every
+# 5s (see comfyfed_agent.control.write_state / STATE_FILE); treat it as
+# "live" only when its pid still exists, that pid's command line is actually
+# the agent (not some unrelated process that reused the pid), AND the
+# heartbeat is fresh (>60s stale means the agent likely died without
+# cleaning up -- start a new one rather than trusting a corpse).
+$AgentStatePath = Join-Path (Split-Path -Parent $AgentConfigPath) 'agent_state.json'
+
+function Test-AgentAlreadyRunning {
+    param([string]$StatePath)
+    if (-not (Test-Path $StatePath)) { return $false }
+    try {
+        $state = Get-Content $StatePath -Raw | ConvertFrom-Json
+    } catch { return $false }
+    $stateProps = $state.PSObject.Properties.Name
+    if (-not ($stateProps -contains 'pid') -or -not ($stateProps -contains 'updated_at')) { return $false }
+    $statePid = 0
+    if (-not [int]::TryParse([string]$state.pid, [ref]$statePid) -or $statePid -le 0) { return $false }
+    try {
+        $updatedAt = [DateTimeOffset]::Parse([string]$state.updated_at)
+    } catch { return $false }
+    if (([DateTimeOffset]::UtcNow - $updatedAt).TotalSeconds -gt 60) { return $false }
+    try {
+        $proc = Get-CimInstance -ClassName Win32_Process -Filter "ProcessId=$statePid" -ErrorAction Stop
+    } catch { return $false }
+    if ($null -eq $proc) { return $false }
+    $procProps = $proc.PSObject.Properties.Name
+    if (-not ($procProps -contains 'CommandLine')) { return $false }
+    if ([string]$proc.CommandLine -notmatch 'comfyfed-agent') { return $false }
+    return $statePid
+}
+
+$existingAgentPid = Test-AgentAlreadyRunning -StatePath $AgentStatePath
+if ($existingAgentPid) {
+    Write-Bilingual "agent 已在執行（pid $existingAgentPid），不再重複啟動" "Agent already running (pid $existingAgentPid); not starting a second one"
+    Write-Bilingual '新版會在下次重啟時生效' 'the new build takes effect on the next agent restart'
+} else {
+    Write-Bilingual '立即啟動...' 'Starting now...'
+    Start-Process -FilePath 'powershell.exe' -ArgumentList `
+        "-NoProfile", "-ExecutionPolicy", "Bypass", "-WindowStyle", "Hidden", "-File", "`"$LauncherScript`"" `
+        -WindowStyle Hidden
+}
 
 Write-Host ''
 if ($autostartOk) {

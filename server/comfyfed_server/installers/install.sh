@@ -722,6 +722,61 @@ xml_escape() {
 
 bilingual "設定開機自動啟動..." "Configuring auto-start on login..."
 
+# Live-caught 2026-09-16: re-running this installer on a machine whose agent
+# was already autostarted at logon unconditionally (re)started a SECOND
+# agent, which briefly fought the first one over the platform WebSocket
+# (same worker id). The agent republishes agent_state.json every 5s (see
+# comfyfed_agent.control.write_state / STATE_FILE); treat it as "live" only
+# when its pid still exists, that pid's command line is actually the agent
+# (not some unrelated process that reused the pid), AND the heartbeat is
+# fresh (>60s stale means the agent likely died without cleaning up -- start
+# a new one rather than trusting a corpse).
+AGENT_STATE_PATH="$(dirname "$AGENT_CONFIG_PATH")/agent_state.json"
+
+agent_already_running() {
+    # Sets _AGENT_STATE_PID on success (return 0).
+    _AGENT_STATE_PID=""
+    [ -f "$1" ] || return 1
+    _AGENT_STATE_FIELDS="$("$VENV_PYTHON" -c "
+import json, sys
+try:
+    data = json.load(open(sys.argv[1], encoding='utf-8'))
+except Exception:
+    sys.exit(1)
+pid = data.get('pid')
+updated_at = data.get('updated_at')
+if not isinstance(pid, int) or not updated_at:
+    sys.exit(1)
+print(pid)
+print(updated_at)
+" "$1")" || return 1
+    _AGENT_STATE_PID="$(printf '%s\n' "$_AGENT_STATE_FIELDS" | sed -n '1p')"
+    _AGENT_STATE_UPDATED="$(printf '%s\n' "$_AGENT_STATE_FIELDS" | sed -n '2p')"
+    [ -n "$_AGENT_STATE_PID" ] || return 1
+    kill -0 "$_AGENT_STATE_PID" 2>/dev/null || return 1
+    ps -o args= -p "$_AGENT_STATE_PID" 2>/dev/null | grep -q comfyfed-agent || return 1
+    "$VENV_PYTHON" -c "
+import sys
+from datetime import datetime, timezone
+try:
+    updated = datetime.fromisoformat(sys.argv[1])
+except Exception:
+    sys.exit(1)
+if updated.tzinfo is None:
+    updated = updated.replace(tzinfo=timezone.utc)
+age = (datetime.now(timezone.utc) - updated).total_seconds()
+sys.exit(0 if age <= 60 else 1)
+" "$_AGENT_STATE_UPDATED" || return 1
+    return 0
+}
+
+AGENT_ALREADY_RUNNING=0
+if agent_already_running "$AGENT_STATE_PATH"; then
+    AGENT_ALREADY_RUNNING=1
+    bilingual "agent 已在執行（pid $_AGENT_STATE_PID），不再重複啟動" "Agent already running (pid $_AGENT_STATE_PID); not starting a second one"
+    bilingual "新版會在下次重啟時生效" "the new build takes effect on the next agent restart"
+fi
+
 if [ "$OS_KIND" = "linux" ]; then
     SYSTEMD_USER_DIR="$HOME/.config/systemd/user"
     mkdir -p "$SYSTEMD_USER_DIR"
@@ -775,10 +830,19 @@ UNITEOF
             "請手動執行: systemctl --user enable --now comfyfed-comfyui.service" \
             "please run manually: systemctl --user enable --now comfyfed-comfyui.service"
     fi
-    systemctl --user enable --now comfyfed-agent.service || fail_step \
-        "啟用 comfyfed-agent.service 失敗" "enabling comfyfed-agent.service failed" \
-        "請手動執行: systemctl --user enable --now comfyfed-agent.service" \
-        "please run manually: systemctl --user enable --now comfyfed-agent.service"
+    if [ "$AGENT_ALREADY_RUNNING" -eq 1 ]; then
+        # Persist the unit (and pick up the new wheel on the agent's next
+        # restart) without starting a second agent process right now.
+        systemctl --user enable comfyfed-agent.service || fail_step \
+            "啟用 comfyfed-agent.service 失敗" "enabling comfyfed-agent.service failed" \
+            "請手動執行: systemctl --user enable comfyfed-agent.service" \
+            "please run manually: systemctl --user enable comfyfed-agent.service"
+    else
+        systemctl --user enable --now comfyfed-agent.service || fail_step \
+            "啟用 comfyfed-agent.service 失敗" "enabling comfyfed-agent.service failed" \
+            "請手動執行: systemctl --user enable --now comfyfed-agent.service" \
+            "please run manually: systemctl --user enable --now comfyfed-agent.service"
+    fi
 
     bilingual "提示: 若要讓服務在登出後仍持續執行，請執行 'loginctl enable-linger $USER'" \
         "Tip: to keep the service running after logout, run 'loginctl enable-linger $USER'"
@@ -820,8 +884,15 @@ PLISTEOF
     # An upgrade rewrites the plist, but `launchctl load -w` on an
     # already-loaded job is a no-op: the running job would keep the OLD
     # KeepAlive=true definition (and resurrect the agent after every
-    # `comfyfed stop`) until the user logged out. Unload first.
-    launchctl unload -w "$LAUNCH_AGENTS_DIR/com.comfyfed.agent.plist" 2>/dev/null || true
+    # `comfyfed stop`) until the user logged out. Unload first -- UNLESS an
+    # agent is already live right now (AGENT_ALREADY_RUNNING), in which case
+    # unload+load would kill and immediately relaunch it (RunAtLoad), i.e.
+    # exactly the "second agent" race this whole guard exists to avoid. The
+    # plist on disk still gets the new definition either way; a live agent
+    # just picks it up on its next natural restart instead of right now.
+    if [ "$AGENT_ALREADY_RUNNING" -eq 0 ]; then
+        launchctl unload -w "$LAUNCH_AGENTS_DIR/com.comfyfed.agent.plist" 2>/dev/null || true
+    fi
     cat > "$LAUNCH_AGENTS_DIR/com.comfyfed.agent.plist" <<PLISTEOF
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
@@ -841,7 +912,9 @@ PLISTEOF
 </dict>
 </plist>
 PLISTEOF
-    launchctl load -w "$LAUNCH_AGENTS_DIR/com.comfyfed.agent.plist" 2>/dev/null || true
+    if [ "$AGENT_ALREADY_RUNNING" -eq 0 ]; then
+        launchctl load -w "$LAUNCH_AGENTS_DIR/com.comfyfed.agent.plist" 2>/dev/null || true
+    fi
 fi
 
 echo ""
