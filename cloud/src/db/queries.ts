@@ -451,28 +451,34 @@ export async function updateWorkerHello(
  * merged) that the other hello fields don't need to distinguish.
  *
  * hello 的 P2P 通告一次寫完（Phase 3.4）：`peer_url`/`peer_lan_url`/
- * `peer_nat` 全量取代，`remote_ip` 只在這次連線解析得到時覆寫，
- * 並把上一輪的可連性結果作廢（位址換了，舊結論就不成立）。
+ * `peer_nat` 全量取代，`remote_ip` 只在這次連線解析得到時覆寫。
+ * `clearReachability`（fix round 1）只有在通告的 `peer_url` 真的換了時才由
+ * 呼叫端帶 true —— 位址沒換的重連不該把已經驗過的結論丟掉。
  * Ports agentws.py's `_handle_hello` peer writes. */
 export async function updateWorkerPeerAdvert(
   db: D1Database,
   workerId: string,
-  fields: { peerUrl: string | null; peerLanUrl: string | null; peerNat: string; remoteIp: string | null }
-): Promise<void> {
-  if (fields.remoteIp === null) {
-    await db
-      .prepare(
-        "UPDATE workers SET peer_url = ?, peer_lan_url = ?, peer_nat = ?, peer_reachable = NULL, peer_checked_at = NULL WHERE id = ?"
-      )
-      .bind(fields.peerUrl, fields.peerLanUrl, fields.peerNat, workerId)
-      .run();
-    return;
+  fields: {
+    peerUrl: string | null;
+    peerLanUrl: string | null;
+    peerNat: string;
+    remoteIp: string | null;
+    clearReachability: boolean;
   }
+): Promise<void> {
+  const columns = ["peer_url = ?", "peer_lan_url = ?", "peer_nat = ?"];
+  const binds: unknown[] = [fields.peerUrl, fields.peerLanUrl, fields.peerNat];
+  if (fields.remoteIp !== null) {
+    columns.push("remote_ip = ?");
+    binds.push(fields.remoteIp);
+  }
+  if (fields.clearReachability) {
+    columns.push("peer_reachable = NULL", "peer_checked_at = NULL");
+  }
+  binds.push(workerId);
   await db
-    .prepare(
-      "UPDATE workers SET peer_url = ?, peer_lan_url = ?, peer_nat = ?, remote_ip = ?, peer_reachable = NULL, peer_checked_at = NULL WHERE id = ?"
-    )
-    .bind(fields.peerUrl, fields.peerLanUrl, fields.peerNat, fields.remoteIp, workerId)
+    .prepare(`UPDATE workers SET ${columns.join(", ")} WHERE id = ?`)
+    .bind(...binds)
     .run();
 }
 

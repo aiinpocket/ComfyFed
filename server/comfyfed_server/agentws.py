@@ -24,8 +24,12 @@ Agent -> server message contract (all JSON):
          `peer_url` was obtained. Validated by `_parse_peer_lan_url` /
          `_parse_peer_nat`; an old agent that sends neither is stored as
          `peer_lan_url = None`, `peer_nat = "lan"`. Both are fully replaced
-         on every hello, along with `remote_ip` (see `_client_remote_ip`)
-         and a reset of `peer_reachable`/`peer_checked_at`.
+         on every hello, along with `remote_ip` (see `_client_remote_ip`).
+         `peer_reachable`/`peer_checked_at` are reset (and a fresh
+         reachability check scheduled) ONLY when the advertised `peer_url`
+         actually changed -- a reconnect advertising the same endpoint keeps
+         the verdict it already earned, and the 10-minute heartbeat cadence
+         re-verifies it (see `peerhealth`).
   {"type": "heartbeat", "state": "idle"|"busy"|"paused", "progress": float,
    "job_id": str|null, "dynamic": {...}, "object_info_hash": str|null,
    "stage": "fetching_models"|absent, "fetch_pct": float|absent,
@@ -919,27 +923,54 @@ def _client_remote_ip(websocket: WebSocket) -> Optional[str]:
     return client.host if client is not None else None
 
 
+def _normalize_advert_url(value: str) -> Optional[str]:
+    """把通告位址收斂成 `scheme://host[:port]`（Phase 3.4 fix round 1）。
+
+    路徑、query、fragment、userinfo 全部丟掉，主機小寫，IPv6 補回中括號。
+    存進庫裡的一定是這個正規形，原因有二：`peerhealth.health_url` 直接在
+    後面接 `/peer/health`（帶路徑的通告會組出 `.../foo/peer/health` 這種
+    打不中的位址），而 `seeder_urls` 是直接發給拉方的連線目標 —— 上面掛
+    `user:pass@` 或一段路徑都只會是干擾或誘導。
+
+    無法解析（含壞掉的 port）回 None，呼叫端當成無效通告處理。
+    """
+    try:
+        parsed = urlsplit(value)
+        host = parsed.hostname
+        port = parsed.port
+    except ValueError:
+        return None
+    if parsed.scheme not in ("http", "https") or not host:
+        return None
+    if ":" in host:
+        host = f"[{host}]"
+    return f"{parsed.scheme}://{host}" + (f":{port}" if port is not None else "")
+
+
 def _parse_peer_url(message: dict, worker_id: str) -> Optional[str]:
     """Validate hello's optional `peer_url` (Phase 3.1 P2P seeder
     advertisement): must be a string that parses as an http:// or https://
     URL with a host. Anything else (missing, wrong type, wrong scheme, no
     host, a bare path) is ignored -- logged, not stored -- so a malformed
-    or hostile value can never end up handed out as a seeder endpoint."""
+    or hostile value can never end up handed out as a seeder endpoint.
+
+    什麼是「有效」不變，但**存下來的是正規形** `scheme://host[:port]`
+    （見 `_normalize_advert_url`）。"""
     peer_url = message.get("peer_url")
     if peer_url is None:
         return None
     if not isinstance(peer_url, str):
         logger.warning("agentws: worker %s hello.peer_url not a string, ignoring", worker_id)
         return None
-    parsed = urlsplit(peer_url)
-    if parsed.scheme not in ("http", "https") or not parsed.hostname:
+    normalized = _normalize_advert_url(peer_url)
+    if normalized is None:
         logger.warning(
             "agentws: worker %s hello.peer_url %r is not a valid http(s) URL, ignoring",
             worker_id,
             peer_url,
         )
         return None
-    return peer_url
+    return normalized
 
 
 # Phase 3.4 §3.2：`peer_nat` 的合法值。任何其他字串（含舊 agent 的缺席）
@@ -950,22 +981,23 @@ _PEER_NAT_VALUES = frozenset({"natpmp", "upnp", "manual", "lan", "none"})
 
 def _parse_peer_lan_url(message: dict, worker_id: str) -> Optional[str]:
     """驗證 hello 的選填 `peer_lan_url`（spec §3.2）。規則與 `_parse_peer_url`
-    完全相同：必須是帶 host 的 http(s) URL，否則忽略（記 log、不落庫）。"""
+    完全相同：必須是帶 host 的 http(s) URL，否則忽略（記 log、不落庫），
+    存下來的同樣是 `scheme://host[:port]` 正規形。"""
     value = message.get("peer_lan_url")
     if value is None:
         return None
     if not isinstance(value, str):
         logger.warning("agentws: worker %s hello.peer_lan_url not a string, ignoring", worker_id)
         return None
-    parsed = urlsplit(value)
-    if parsed.scheme not in ("http", "https") or not parsed.hostname:
+    normalized = _normalize_advert_url(value)
+    if normalized is None:
         logger.warning(
             "agentws: worker %s hello.peer_lan_url %r is not a valid http(s) URL, ignoring",
             worker_id,
             value,
         )
         return None
-    return value
+    return normalized
 
 
 def _parse_peer_nat(message: dict) -> str:
@@ -1055,6 +1087,12 @@ async def _handle_hello(worker_id: str, conn: "_Connection", message: dict) -> N
         # from this hello, same as every other field above -- an agent that
         # reconnects with `peer_serve` now off (or an old/malformed value)
         # must not keep a previous session's endpoint alive.
+        # Phase 3.4 fix round 1：通告位址「有沒有換」決定要不要重驗。一台
+        # agent 掉線重連（程序重啟、網路抖動）送來的是同一個 `peer_url`，
+        # 上一次的驗證結論仍然成立 —— 全部作廢再重驗，等於把重連次數變成
+        # 探針次數，一台不斷重連的 worker 就成了對它自己的放大器。位址真的
+        # 換了（或以前沒有）才作廢，其餘交給心跳的 10 分鐘節奏。
+        peer_url_changed = peer_url != worker.peer_url
         worker.peer_url = peer_url
         # Phase 3.4：跟 `peer_url` 一樣全量取代 —— agent 關掉 NAT 穿越後
         # 重連，不能留著上一輪的 natpmp 標籤與對外位址。
@@ -1062,10 +1100,11 @@ async def _handle_hello(worker_id: str, conn: "_Connection", message: dict) -> N
         worker.peer_nat = peer_nat
         if conn.remote_ip is not None:
             worker.remote_ip = conn.remote_ip
-        # 新的通告位址 ⇒ 舊的驗證結果作廢，回到「未檢查」。Task 4 的
-        # peerhealth 會在 hello 收尾時非同步補上真正的結果。
-        worker.peer_reachable = None
-        worker.peer_checked_at = None
+        if peer_url_changed:
+            # 新的通告位址 ⇒ 舊的驗證結果作廢，回到「未檢查」。下面會非同步
+            # 補上真正的結果。
+            worker.peer_reachable = None
+            worker.peer_checked_at = None
         worker.status = "online"
         worker.last_seen = _utcnow()
         session.commit()
@@ -1079,10 +1118,11 @@ async def _handle_hello(worker_id: str, conn: "_Connection", message: dict) -> N
                 "agentws: failed to send deprecation notice to worker %s", worker_id
             )
 
-    # Phase 3.4 §4.2：可連性檢查是非同步的背景工作，hello 不等它。hello 觸發
-    # 的檢查每次完成都推一次 peer_status（§4.3），不論結論有沒有變 —— agent
-    # 剛連上就該拿到一則明確的結論。
-    if peer_url:
+    # Phase 3.4 §4.2：可連性檢查是非同步的背景工作，hello 不等它。只有在
+    # 通告位址真的換了（或第一次出現）時才從 hello 觸發 —— 其餘情況沿用既
+    # 有結論，等心跳的 10 分鐘節奏重測（fix round 1）。hello 觸發的這一次
+    # 每次都推 peer_status（§4.3），不論結論有沒有變。
+    if peer_url and peer_url_changed:
         _schedule_peer_check(worker_id, peer_url, on_change_only=False)
 
 

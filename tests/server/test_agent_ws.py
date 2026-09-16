@@ -4016,3 +4016,95 @@ def test_push_peer_status_to_a_disconnected_worker_is_a_no_op():
     """agent 不在線只是少一則通知，不能拋（`peerhealth.refresh` 的 notify
     是在背景任務裡叫的）。"""
     asyncio.run(agentws.push_peer_status("nobody-here", True, "http://x/peer/health"))
+
+
+# --- Phase 3.4 Task 4 fix round 1 ------------------------------------------
+
+
+def test_hello_stores_the_normalized_advert_urls(client):
+    """fix round 1：通告位址存成 `scheme://host[:port]` —— 路徑／query／
+    userinfo 都丟掉，`peerhealth.health_url` 才會組出正確的探針位址。"""
+    csrf = _login(client)
+    worker_id, sk = _register_worker(client, csrf, "nrm-1")
+    ctx, ws, _ = _handshake_ws(client, worker_id, sk)
+    try:
+        ws.send_json(
+            {
+                "type": "hello",
+                "protocol": 4,
+                "peer_url": "http://admin:secret@203.0.113.7:8850/some/path?q=1#frag",
+                "peer_lan_url": "http://192.168.1.5:8850/",
+            }
+        )
+        ws.send_json({"type": "heartbeat", "state": "idle"})
+        time.sleep(0.2)
+    finally:
+        ctx.__exit__(None, None, None)
+
+    with db.get_session() as session:
+        w = session.get(db.Worker, worker_id)
+        assert w.peer_url == "http://203.0.113.7:8850"
+        assert w.peer_lan_url == "http://192.168.1.5:8850"
+
+
+def test_hello_probes_once_for_repeated_identical_advertisements(client, monkeypatch):
+    """fix round 1：同一個 `peer_url` 重連幾次都只驗一次 —— 位址沒換，上次
+    的結論還算數（重測交給心跳的 10 分鐘節奏）。"""
+    csrf = _login(client)
+    worker_id, sk = _register_worker(client, csrf, "rep-1")
+    probed = []
+    monkeypatch.setattr(peerhealth, "_probe", lambda url: probed.append(url) or True)
+
+    hello = {"type": "hello", "protocol": 4, "peer_url": "http://203.0.113.7:8850"}
+    ctx, ws, _ = _handshake_ws(client, worker_id, sk)
+    try:
+        ws.send_json(hello)
+        assert ws.receive_json()["type"] == "peer_status"
+    finally:
+        ctx.__exit__(None, None, None)
+
+    # 同樣的通告再來兩次：不重驗、不重推。
+    for _ in range(2):
+        ctx, ws, _ = _handshake_ws(client, worker_id, sk)
+        try:
+            ws.send_json(hello)
+            # 沒有 peer_status 的話，下一則訊息就是舊協定的 deprecation。
+            # 探測用的那則 hello 必須帶**同一個** peer_url —— 不帶的話它自己
+            # 就成了一次「通告位址變了」，下一輪就會重驗。
+            ws.send_json({**hello, "protocol": 1})
+            assert ws.receive_json()["type"] == "deprecation"
+        finally:
+            ctx.__exit__(None, None, None)
+
+    assert probed == ["http://203.0.113.7:8850/peer/health"]
+    with db.get_session() as session:
+        w = session.get(db.Worker, worker_id)
+        assert w.peer_reachable == 1
+        assert w.peer_checked_at is not None
+
+
+def test_hello_with_a_changed_peer_url_resets_the_verdict_and_reprobes(client, monkeypatch):
+    csrf = _login(client)
+    worker_id, sk = _register_worker(client, csrf, "rep-2")
+    probed = []
+    monkeypatch.setattr(peerhealth, "_probe", lambda url: probed.append(url) or True)
+
+    ctx, ws, _ = _handshake_ws(client, worker_id, sk)
+    try:
+        ws.send_json({"type": "hello", "protocol": 4, "peer_url": "http://203.0.113.7:8850"})
+        assert ws.receive_json()["reachable"] is True
+    finally:
+        ctx.__exit__(None, None, None)
+
+    ctx, ws, _ = _handshake_ws(client, worker_id, sk)
+    try:
+        ws.send_json({"type": "hello", "protocol": 4, "peer_url": "http://198.51.100.9:8850"})
+        status = ws.receive_json()
+    finally:
+        ctx.__exit__(None, None, None)
+
+    assert status["checked_url"] == "http://198.51.100.9:8850/peer/health"
+    assert probed == [
+        "http://203.0.113.7:8850/peer/health",
+        "http://198.51.100.9:8850/peer/health",
+    ]

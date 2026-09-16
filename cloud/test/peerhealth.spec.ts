@@ -56,7 +56,63 @@ describe("isPrivatePeerUrl", () => {
   });
 });
 
+describe("isPrivatePeerUrl: normalized literals (fix round 1)", () => {
+  it.each([
+    // WHATWG URL normalizes the legacy IPv4 spellings for us, but the
+    // predicate has to agree with the Python side, which does it by hand.
+    ["http://2130706433:8850", true], // 127.0.0.1
+    ["http://0177.0.0.1:8850", true], // octal 127
+    ["http://127.1:8850", true], // two-part form
+    ["http://3232235781:8850", true], // 192.168.1.5
+    ["http://3405803527:8850", false], // 203.0.113.7 -- public, not a false positive
+    // IPv4-mapped IPv6, both spellings.
+    ["http://[::ffff:10.0.0.1]:8850", true],
+    ["http://[::ffff:a00:1]:8850", true],
+    ["http://[::ffff:203.0.113.7]:8850", false],
+    // `fc::1` is 00fc::1 -- NOT inside fc00::/7 (the old regex said it was).
+    ["http://[fc::1]:8850", false],
+    ["http://[fd00::1]:8850", true],
+    ["http://[fe80::1%25eth0]:8850", true],
+    ["http://[febf::1]:8850", true],
+    ["http://[fec0::1]:8850", false], // fec0::/10 is outside fe80::/10
+  ])("%s -> %s", (url, expected) => {
+    expect(peerhealth.isPrivatePeerUrl(url as string)).toBe(expected);
+  });
+});
+
+describe("isIpLiteralPeerUrl", () => {
+  it.each([
+    ["http://203.0.113.7:8850", true],
+    ["http://2130706433:8850", true],
+    ["http://[2001:db8::1]:8850", true],
+    ["http://[::ffff:10.0.0.1]:8850", true],
+    ["http://seeder.example.com:8850", false],
+    ["http://localhost:8850", false],
+  ])("%s -> %s", (url, expected) => {
+    expect(peerhealth.isIpLiteralPeerUrl(url as string)).toBe(expected);
+  });
+});
+
 describe("refresh", () => {
+  it("never probes a hostname peer_url, leaving the verdict NULL (fix round 1)", async () => {
+    await makeWorker("w-host");
+    const probe = vi.spyOn(peerhealth, "probePeerHealth").mockResolvedValue(true);
+    const seen: unknown[] = [];
+
+    const result = await peerhealth.refresh(db(), "w-host", "http://seeder.example.com:8850", (r, u) =>
+      seen.push([r, u])
+    );
+
+    expect(result).toBeNull();
+    expect(probe).not.toHaveBeenCalled();
+    expect(seen).toEqual([]);
+    const row = await peerRow("w-host");
+    expect(row.peer_reachable).toBeNull();
+    // Stamped, so the heartbeat cadence does not re-run this every beat.
+    expect(row.peer_checked_at).not.toBeNull();
+    expect(peerhealth.needsRecheck(row.peer_checked_at, new Date())).toBe(false);
+  });
+
   it("rejects a private peer_url without probing", async () => {
     await makeWorker("w-priv");
     const probe = vi.spyOn(peerhealth, "probePeerHealth").mockResolvedValue(true);

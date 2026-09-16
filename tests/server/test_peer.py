@@ -1151,3 +1151,133 @@ def test_peer_grant_returns_only_the_public_url_for_a_different_nat_puller(clien
     ).json()
 
     assert payload["seeder_urls"] == ["http://203.0.113.7:8850"]
+
+
+# --- Phase 3.4 Task 4 fix round 1 ------------------------------------------
+
+
+@pytest.mark.parametrize(
+    "url,private",
+    [
+        # 非四段十進位的 IPv4 寫法：`connect()` 認得，所以靜態拒絕也必須認得。
+        ("http://2130706433:8850", True),      # 127.0.0.1
+        ("http://0177.0.0.1:8850", True),      # 八進位的 127
+        ("http://127.1:8850", True),           # 兩段寫法
+        ("http://0x0a000001:8850", True),      # 十六進位的 10.0.0.1
+        ("http://3232235781:8850", True),      # 192.168.1.5
+        # IPv4-mapped IPv6：兩種寫法都要還原成內含的 IPv4 再判。
+        ("http://[::ffff:10.0.0.1]:8850", True),
+        ("http://[::ffff:a00:1]:8850", True),
+        ("http://[::ffff:203.0.113.7]:8850", False),
+        # `fc::1` 是 00fc::1，**不在** fc00::/7 裡（cloud 端的字面正則曾誤判
+        # 這個，fix round 1 一併對齊）。fec0::/10 同樣在 fe80::/10 之外。
+        ("http://[fc::1]:8850", False),
+        ("http://[fd00::1]:8850", True),
+        ("http://[febf::1]:8850", True),
+        ("http://[fec0::1]:8850", False),
+        # 公網的十進位寫法不該被誤殺（3405803527 = 203.0.113.7）。
+        ("http://3405803527:8850", False),
+    ],
+)
+def test_is_private_peer_url_normalizes_ip_literals(url, private):
+    assert peerhealth.is_private_peer_url(url) is private
+
+
+@pytest.mark.parametrize(
+    "url,literal",
+    [
+        ("http://203.0.113.7:8850", True),
+        ("http://2130706433:8850", True),
+        ("http://[2001:db8::1]:8850", True),
+        ("http://[::ffff:10.0.0.1]:8850", True),
+        ("http://seeder.example.com:8850", False),
+        ("http://localhost:8850", False),
+    ],
+)
+def test_is_ip_literal_peer_url(url, literal):
+    assert peerhealth.is_ip_literal_peer_url(url) is literal
+
+
+def test_refresh_never_probes_a_hostname_peer_url(client, monkeypatch):
+    """fix round 1 裁示：名稱型主機不驗 —— 不發請求、`peer_reachable` 留
+    NULL，但時間戳有蓋（否則每一拍心跳都會白跑一次）。"""
+    csrf = _login(client)
+    worker_id, _ = _register_worker(client, csrf, "ph-host")
+    probed = []
+    monkeypatch.setattr(peerhealth, "_probe", lambda url: probed.append(url) or True)
+    pushes = []
+
+    async def notify(wid, reachable, checked_url):
+        pushes.append((wid, reachable, checked_url))
+
+    result = asyncio.run(
+        peerhealth.refresh(worker_id, "http://seeder.example.com:8850", notify=notify)
+    )
+
+    assert result is None
+    assert probed == []
+    assert pushes == []
+    with db.get_session() as session:
+        worker = session.get(db.Worker, worker_id)
+        assert worker.peer_reachable is None
+        assert worker.peer_checked_at is not None
+        assert peerhealth.needs_recheck(worker.peer_checked_at, datetime.now(timezone.utc)) is False
+
+
+def test_probe_reads_only_the_status_and_returns_within_the_wall_clock_bound(monkeypatch):
+    """探針不讀 body（對面可能是一條無限長的回應），而且整趟有牆鐘上限。"""
+    import httpx
+
+    drip_chunks = []
+
+    def _drip():
+        # 被讀到才會跑 —— 跑起來就代表我們讀了 body（測試要證明沒有）。
+        for i in range(1000):
+            drip_chunks.append(i)
+            time.sleep(0.5)
+            yield b"x"
+
+    def handler(request):
+        assert request.url.path == "/peer/health"
+        return httpx.Response(204, content=_drip())
+
+    monkeypatch.setattr(
+        peerhealth,
+        "_http_client",
+        lambda: httpx.Client(transport=httpx.MockTransport(handler), timeout=httpx.Timeout(3.0)),
+    )
+
+    started = time.monotonic()
+    assert peerhealth._probe("http://203.0.113.7:8850/peer/health") is True
+    elapsed = time.monotonic() - started
+
+    assert drip_chunks == []  # body 一個 byte 都沒讀
+    assert elapsed < peerhealth.MAX_PROBE_SECONDS
+
+
+def test_probe_treats_a_non_204_as_unreachable(monkeypatch):
+    import httpx
+
+    monkeypatch.setattr(
+        peerhealth,
+        "_http_client",
+        lambda: httpx.Client(
+            transport=httpx.MockTransport(lambda request: httpx.Response(200, text="hi")),
+            timeout=httpx.Timeout(3.0),
+        ),
+    )
+    assert peerhealth._probe("http://203.0.113.7:8850/peer/health") is False
+
+
+def test_probe_treats_a_transport_error_as_unreachable(monkeypatch):
+    import httpx
+
+    def boom(request):
+        raise httpx.ConnectError("refused", request=request)
+
+    monkeypatch.setattr(
+        peerhealth,
+        "_http_client",
+        lambda: httpx.Client(transport=httpx.MockTransport(boom), timeout=httpx.Timeout(3.0)),
+    )
+    assert peerhealth._probe("http://203.0.113.7:8850/peer/health") is False

@@ -322,53 +322,60 @@ function secondsBetween(a: string, b: string): number {
   return (parseSqliteTimestamp(b).getTime() - parseSqliteTimestamp(a).getTime()) / 1000;
 }
 
+/** 把通告位址收斂成 `scheme://host[:port]`（Phase 3.4 fix round 1）。路徑、
+ * query、fragment、userinfo 全部丟掉 —— `peerhealth.healthUrl` 直接在後面接
+ * `/peer/health`，而 `seeder_urls` 是直接發給拉方的連線目標。無法解析回
+ * null。Ports agentws.py's `_normalize_advert_url`. */
+function normalizeAdvertUrl(value: string): string | null {
+  let parsed: URL;
+  try {
+    parsed = new URL(value);
+  } catch {
+    return null;
+  }
+  if ((parsed.protocol !== "http:" && parsed.protocol !== "https:") || !parsed.hostname) return null;
+  // `URL.host` 已經是 host[:port]（預設埠會被省略），而且 IPv6 的中括號和
+  // 主機小寫都由 URL 正規化處理掉了。
+  return `${parsed.protocol}//${parsed.host}`;
+}
+
 /** Validate hello's optional `peer_url` (Phase 3.1 P2P seeder advertisement):
  * must be a string that parses as an http:// or https:// URL with a host.
  * Anything else (missing, wrong type, wrong scheme, no host, a bare path) is
  * ignored -- logged, not stored -- so a malformed or hostile value can never
- * end up handed out as a seeder endpoint. Ports agentws.py's `_parse_peer_url`. */
+ * end up handed out as a seeder endpoint. 存下來的是 `normalizeAdvertUrl` 的
+ * 正規形。Ports agentws.py's `_parse_peer_url`. */
 function parsePeerUrl(value: unknown, workerId: string): string | null {
   if (value === null || value === undefined) return null;
   if (typeof value !== "string") {
     console.warn(`hub: worker ${workerId} hello.peer_url not a string, ignoring`);
     return null;
   }
-  let parsed: URL;
-  try {
-    parsed = new URL(value);
-  } catch {
+  const normalized = normalizeAdvertUrl(value);
+  if (normalized === null) {
     console.warn(`hub: worker ${workerId} hello.peer_url ${JSON.stringify(value)} is not a valid http(s) URL, ignoring`);
     return null;
   }
-  if ((parsed.protocol !== "http:" && parsed.protocol !== "https:") || !parsed.hostname) {
-    console.warn(`hub: worker ${workerId} hello.peer_url ${JSON.stringify(value)} is not a valid http(s) URL, ignoring`);
-    return null;
-  }
-  return value;
+  return normalized;
 }
 
 /** Ports agentws.py's `_PEER_NAT_VALUES` / `_parse_peer_nat`. */
 const PEER_NAT_VALUES = new Set(["natpmp", "upnp", "manual", "lan", "none"]);
 
-/** Ports agentws.py's `_parse_peer_lan_url` —— 規則與 `parsePeerUrl` 相同。 */
+/** Ports agentws.py's `_parse_peer_lan_url` —— 規則與 `parsePeerUrl` 相同，
+ * 存下來的一樣是 `scheme://host[:port]` 正規形。 */
 function parsePeerLanUrl(value: unknown, workerId: string): string | null {
   if (value === null || value === undefined) return null;
   if (typeof value !== "string") {
     console.warn(`hub: worker ${workerId} hello.peer_lan_url not a string, ignoring`);
     return null;
   }
-  let parsed: URL;
-  try {
-    parsed = new URL(value);
-  } catch {
+  const normalized = normalizeAdvertUrl(value);
+  if (normalized === null) {
     console.warn(`hub: worker ${workerId} hello.peer_lan_url ${JSON.stringify(value)} is not a valid http(s) URL, ignoring`);
     return null;
   }
-  if ((parsed.protocol !== "http:" && parsed.protocol !== "https:") || !parsed.hostname) {
-    console.warn(`hub: worker ${workerId} hello.peer_lan_url ${JSON.stringify(value)} is not a valid http(s) URL, ignoring`);
-    return null;
-  }
-  return value;
+  return normalized;
 }
 
 /** Ports agentws.py's `_parse_peer_nat`：非白名單值或缺席一律 "lan"。 */
@@ -1149,11 +1156,17 @@ export class Hub extends DurableObject<Env> {
       autoFetch,
       lastSeen: toSqliteTimestamp(new Date()),
     });
+    // Phase 3.4 fix round 1：通告位址「有沒有換」決定要不要重驗。一台 agent
+    // 掉線重連送來的是同一個 `peer_url`，上一次的驗證結論仍然成立 —— 全部
+    // 作廢再重驗，等於把重連次數變成探針次數。位址真的換了（或以前沒有）
+    // 才作廢，其餘交給心跳的 10 分鐘節奏。Parity: agentws.py's `_handle_hello`.
+    const peerUrlChanged = peerUrl !== worker.peerUrl;
     await queries.updateWorkerPeerAdvert(this.env.DB, workerId, {
       peerUrl,
       peerLanUrl,
       peerNat,
       remoteIp: attachment.remoteIp ?? null,
+      clearReachability: peerUrlChanged,
     });
 
     ws.serializeAttachment({ ...attachment, protocol } satisfies AgentAttachment);
@@ -1166,10 +1179,10 @@ export class Hub extends DurableObject<Env> {
       }
     }
 
-    // Phase 3.4 §4.2：可連性檢查不擋 hello。hello 觸發的檢查每次完成都推一
-    // 次 peer_status（§4.3），不論結論有沒有變 —— agent 剛連上就該拿到一則
-    // 明確的結論。
-    if (peerUrl) {
+    // Phase 3.4 §4.2：可連性檢查不擋 hello。只有在通告位址真的換了（或第一
+    // 次出現）時才從 hello 觸發，其餘沿用既有結論、等心跳的 10 分鐘節奏
+    // （fix round 1）。hello 觸發的這一次每次都推 peer_status（§4.3）。
+    if (peerUrl && peerUrlChanged) {
       this.schedulePeerCheck(ws, workerId, peerUrl, { notifyOnChangeOnly: false });
     }
   }

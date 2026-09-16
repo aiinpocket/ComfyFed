@@ -1296,3 +1296,79 @@ describe("Phase 3.4: reachability check on hello and heartbeat", () => {
     vi.restoreAllMocks();
   });
 });
+
+describe("Phase 3.4 fix round 1: advert normalization and probe gating", () => {
+  it("stores peer_url/peer_lan_url as scheme://host[:port]", async () => {
+    const kp = KEYPAIRS[0]!;
+    const workerId = await makeWorker({ pubkeyHex: kp.pubkey_hex });
+    vi.spyOn(peerhealth, "probePeerHealth").mockResolvedValue(true);
+    const ws = await connectAgent(workerId, kp.seed_hex);
+
+    const status = nextMessage(ws);
+    ws.send(
+      JSON.stringify({
+        type: "hello",
+        protocol: 4,
+        peer_url: "http://admin:secret@203.0.113.7:8850/some/path?q=1#frag",
+        peer_lan_url: "http://192.168.1.5:8850/",
+      })
+    );
+    await status;
+
+    const row = await db()
+      .prepare("SELECT peer_url, peer_lan_url FROM workers WHERE id = ?")
+      .bind(workerId)
+      .first<any>();
+    expect(row.peer_url).toBe("http://203.0.113.7:8850");
+    expect(row.peer_lan_url).toBe("http://192.168.1.5:8850");
+    ws.close();
+    vi.restoreAllMocks();
+  });
+
+  it("probes once for repeated identical advertisements", async () => {
+    const kp = KEYPAIRS[0]!;
+    const workerId = await makeWorker({ pubkeyHex: kp.pubkey_hex });
+    const probe = vi.spyOn(peerhealth, "probePeerHealth").mockResolvedValue(true);
+    const hello = JSON.stringify({ type: "hello", protocol: 4, peer_url: "http://203.0.113.7:8850" });
+
+    const first = await connectAgent(workerId, kp.seed_hex);
+    const status = nextMessage(first);
+    first.send(hello);
+    expect((await status).type).toBe("peer_status");
+    first.close();
+
+    // A reconnect advertising the SAME endpoint keeps the stored verdict and
+    // does not probe again (the 10-minute heartbeat cadence re-verifies).
+    const second = await connectAgent(workerId, kp.seed_hex);
+    const none = expectNoMessage(second, 400);
+    second.send(hello);
+    await none;
+    second.close();
+
+    expect(probe).toHaveBeenCalledTimes(1);
+    const row = await db().prepare("SELECT peer_reachable FROM workers WHERE id = ?").bind(workerId).first<any>();
+    expect(row.peer_reachable).toBe(1);
+    vi.restoreAllMocks();
+  });
+
+  it("re-probes and resets the verdict when the advertised peer_url changes", async () => {
+    const kp = KEYPAIRS[0]!;
+    const workerId = await makeWorker({ pubkeyHex: kp.pubkey_hex });
+    const probe = vi.spyOn(peerhealth, "probePeerHealth").mockResolvedValue(true);
+
+    const first = await connectAgent(workerId, kp.seed_hex);
+    const firstStatus = nextMessage(first);
+    first.send(JSON.stringify({ type: "hello", protocol: 4, peer_url: "http://203.0.113.7:8850" }));
+    await firstStatus;
+    first.close();
+
+    const second = await connectAgent(workerId, kp.seed_hex);
+    const secondStatus = nextMessage(second);
+    second.send(JSON.stringify({ type: "hello", protocol: 4, peer_url: "http://198.51.100.9:8850" }));
+    expect((await secondStatus).checked_url).toBe("http://198.51.100.9:8850/peer/health");
+    second.close();
+
+    expect(probe).toHaveBeenCalledTimes(2);
+    vi.restoreAllMocks();
+  });
+});
