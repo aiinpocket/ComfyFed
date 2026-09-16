@@ -815,8 +815,9 @@ def test_ps1_checks_agent_state_before_starting_now():
     # The skip message (bilingual) and the "next restart" note.
     assert "agent 已在執行（pid $existingAgentPid），不再重複啟動" in guard
     assert "Agent already running (pid $existingAgentPid); not starting a second one" in guard
-    assert "新版會在下次重啟時生效" in guard
-    assert "the new build takes effect on the next agent restart" in guard
+    assert "新版與新設定會在下次重啟 agent 時生效" in guard
+    assert "comfyfed stop" in guard
+    assert "take effect on the next agent restart" in guard
     # The guard actually gates the existing "Starting now" step, not a
     # parallel/duplicate one.
     assert guard.count("Starting now") == 1
@@ -835,10 +836,15 @@ def test_sh_checks_agent_state_before_starting_now():
     # Freshness: only trust a heartbeat updated within the last 60s.
     assert "age <= 60" in guard
     # The skip message (bilingual) and the "next restart" note.
-    assert "agent 已在執行（pid $_AGENT_STATE_PID），不再重複啟動" in guard
+    # 全形括號緊接在變數後面：macOS 的 bash 3.2 會把 `$_AGENT_STATE_PID）` 的變數名
+    # 吃壞（實機：「_AGENT_STATE_PID?: unbound variable」），所以一定要加大括號。
+    assert "agent 已在執行（pid ${_AGENT_STATE_PID}），不再重複啟動" in guard
+    assert "pid $_AGENT_STATE_PID）" not in guard
     assert "Agent already running (pid $_AGENT_STATE_PID); not starting a second one" in guard
-    assert "新版會在下次重啟時生效" in guard
-    assert "the new build takes effect on the next agent restart" in guard
+    assert "新版與新設定會在下次重啟 agent 時生效" in guard
+    assert "launchctl kickstart -k gui/\$(id -u)/com.comfyfed.agent" in guard
+    assert "systemctl --user restart comfyfed-agent" in guard
+    assert "take effect on the next agent restart" in guard
     assert "AGENT_ALREADY_RUNNING=1" in guard
 
 
@@ -1059,3 +1065,34 @@ def test_installers_probe_uses_only_the_last_line_of_probe_output():
     assert "p2p_method" in probe_block
     # 不再有第二段內嵌的 python -c 解析器。
     assert "-c \"\nimport json, sys" not in probe_block
+
+
+@pytest.mark.parametrize("name", ["install.ps1", "install.sh"])
+def test_installer_never_downgrades_the_agent(name):
+    """一台 worker 可同時服務多個平台，各平台各自發佈 wheel：第二個平台的安裝
+    指令不能把較新的 agent 蓋成舊版。本機版本比平台發佈的新 ⇒ 跳過 wheel
+    這一步（其餘照常）。"""
+    text = open(_source_path(name), encoding="utf-8").read()
+    assert "不降級" in text
+    assert "not downgrading" in text
+    if name == "install.sh":
+        assert 'INSTALLED_VERSION="$("$VENV_PYTHON" -c "import comfyfed_agent as m; print(m.__version__)" 2>/dev/null || echo "")"' in text
+        assert 'if [ "$SKIP_WHEEL" -eq 0 ]; then' in text
+        assert text.index('"$VENV_PIP" install --upgrade "$WHEEL_FILE"') > text.index('if [ "$SKIP_WHEEL" -eq 0 ]; then')
+    else:
+        assert "[version]$installedVersionStr.Trim() -gt [version]$latestVersionStr.Trim()" in text
+        assert "if (-not $skipWheel) {" in text
+        assert text.index("install --upgrade $wheelFile") > text.index("if (-not $skipWheel) {")
+
+
+def test_sh_braces_every_variable_followed_by_fullwidth_punctuation():
+    """macOS bash 3.2 在 `curl | bash` 的 C locale 下，把 `$VAR）`（全形括號緊接
+    變數）的變數名剖析壞掉：實機 `_AGENT_STATE_PID?: unbound variable`。所有
+    緊接非 ASCII 的變數一律 `${VAR}`。"""
+    import re
+    sh = open(_source_path("install.sh"), encoding="utf-8").read()
+    offenders = []
+    for lineno, line in enumerate(sh.splitlines(), 1):
+        for m in re.finditer(r"\$([A-Za-z_][A-Za-z0-9_]*)([^\x00-\x7f])", line):
+            offenders.append((lineno, m.group(0)))
+    assert offenders == []

@@ -174,6 +174,8 @@ def test_p2p_probe_prints_json_and_exits_zero(monkeypatch, capsys):
     assert payload == {
         "ok": True,
         "method": "upnp",
+        "probe_port": 8850,
+        "agent_running": False,
         "external_ip": "203.0.113.7",
         "external_port": 8850,
         "lan_ip": "192.168.1.5",
@@ -223,20 +225,35 @@ def test_p2p_probe_is_registered_as_a_subcommand(monkeypatch):
     assert exc.value.code == 1
 
 
-def test_p2p_probe_refuses_while_an_agent_is_running(tmp_path, monkeypatch, capsys):
-    """Fix round 1：探測會**刪掉**它建立的映射。如果 agent 已經在跑，那個
-    映射就是 agent 自己的正式映射 —— 探測會把做種能力關掉。安裝腳本是在
-    啟動 agent 之前跑這個指令的（spec §11），所以拒絕是安全的。"""
+def test_p2p_probe_uses_the_neighbouring_port_while_an_agent_is_running(tmp_path, monkeypatch, capsys):
+    """探測會**刪掉**它建立的映射。agent 在跑時 8850 上的映射是它的正式映射，
+    所以改問 8851（路由器肯不肯開埠跟埠號無關），問完一樣收掉。0.1.12 是直接
+    拒絕 —— 但安裝腳本升級時 agent 一定在跑，等於升級永遠開不了 P2P。"""
     control.write_state(str(tmp_path), "idle", None)
-    called = []
-    monkeypatch.setattr(natmap, "detect_gateway", lambda: called.append(1) or "192.168.1.1")
+    monkeypatch.setattr(natmap, "detect_gateway", lambda: "192.168.1.1")
+    mapped, unmapped = [], []
+
+    def fake_map(port, gateway):
+        mapped.append((port, gateway))
+        return natmap.Mapping(
+            method="upnp", external_ip="203.0.113.7", external_port=port, internal_port=port,
+            lifetime=3600, gateway=gateway, control_url="http://192.168.1.1:1900/x",
+            service_type="urn:schemas-upnp-org:service:WANIPConnection:1",
+        )
+
+    monkeypatch.setattr(natmap, "map_port", fake_map)
+    monkeypatch.setattr(natmap, "unmap_port", lambda m: unmapped.append(m.external_port))
 
     rc = main._cmd_p2p_probe(_probe_args(config=str(tmp_path / "agent.json")))
 
-    assert rc == 1
-    assert json.loads(capsys.readouterr().out.strip()) == {"ok": False, "reason": "agent_running"}
-    # 連路由器都不該碰。
-    assert called == []
+    assert rc == 0
+    out = json.loads(capsys.readouterr().out.strip().splitlines()[-1])
+    assert out["ok"] is True
+    assert out["method"] == "upnp"
+    assert out["probe_port"] == 8851
+    assert out["agent_running"] is True
+    assert mapped == [(8851, "192.168.1.1")]
+    assert unmapped == [8851]
 
 
 def test_p2p_probe_ignores_a_stale_state_file(tmp_path, monkeypatch, capsys):

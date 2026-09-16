@@ -282,6 +282,29 @@ case "$WHEEL_URL" in
     *) WHEEL_URL="$PLATFORM_URL$WHEEL_URL" ;;
 esac
 
+# 一台 worker 可以同時服務多個平台，每個平台各自發佈 agent wheel。第二個
+# 平台的安裝指令絕不能把第一個平台裝好的**較新** agent 蓋成舊版（「後蓋
+# 前」）：本機版本比這個平台發佈的新就跳過 wheel 這一步，其餘（註冊、
+# ComfyUI 偵測、P2P、自動啟動）照常。同版仍重裝（同版重建 wheel 時要能
+# 換上去）。venv 全新時 import 失敗 ⇒ 空字串 ⇒ 一律安裝。
+LATEST_VERSION="$("$VENV_PYTHON" -c "import json,sys; print(json.loads(sys.argv[1]).get('latest') or '')" "$VERSION_JSON")"
+INSTALLED_VERSION="$("$VENV_PYTHON" -c "import comfyfed_agent as m; print(m.__version__)" 2>/dev/null || echo "")"
+SKIP_WHEEL=0
+if [ -n "$INSTALLED_VERSION" ] && [ -n "$LATEST_VERSION" ] && "$VENV_PYTHON" -c "
+import sys
+def key(v):
+    out = []
+    for part in v.split('.'):
+        digits = ''.join(ch for ch in part if ch.isdigit())
+        out.append(int(digits) if digits else 0)
+    return out
+sys.exit(0 if key(sys.argv[1]) > key(sys.argv[2]) else 1)
+" "$INSTALLED_VERSION" "$LATEST_VERSION"; then
+    SKIP_WHEEL=1
+    bilingual "本機 agent（${INSTALLED_VERSION}）比此平台發佈的（${LATEST_VERSION}）新，保留現有版本、不降級" ${BS}
+        "Installed agent ($INSTALLED_VERSION) is newer than this platform's ($LATEST_VERSION); keeping it, not downgrading"
+fi
+
 # A plain `mktemp -t NAME-XXXXXX.whl` only appends the `.whl` suffix on
 # GNU mktemp (Linux); BSD mktemp (macOS) ignores everything after the last
 # `X` and creates an extension-less file, and pip refuses to install a
@@ -293,21 +316,22 @@ esac
 # install). Use the URL's own basename -- the platform publishes the wheel
 # under its real name -- and fall back to the conventional pure-Python name
 # for this version when the URL carries no usable one.
-LATEST_VERSION="$("$VENV_PYTHON" -c "import json,sys; print(json.loads(sys.argv[1]).get('latest') or '')" "$VERSION_JSON")"
 WHEEL_NAME="$(basename "${WHEEL_URL%%\?*}")"
 case "$WHEEL_NAME" in
     *-*-*-*.whl) ;;
     *) WHEEL_NAME="comfyfed-${LATEST_VERSION:-0}-py3-none-any.whl" ;;
 esac
-WHEEL_TMPDIR="$(mktemp -d)"
-WHEEL_FILE="$WHEEL_TMPDIR/$WHEEL_NAME"
-bilingual "下載 agent wheel..." "Downloading agent wheel..."
-curl -fsSL "$WHEEL_URL" -o "$WHEEL_FILE" || fail_step "下載 agent wheel" "downloading the agent wheel" \
-    "請確認網路連線後重跑本腳本" "please check your network connection then re-run this script"
+if [ "$SKIP_WHEEL" -eq 0 ]; then
+    WHEEL_TMPDIR="$(mktemp -d)"
+    WHEEL_FILE="$WHEEL_TMPDIR/$WHEEL_NAME"
+    bilingual "下載 agent wheel..." "Downloading agent wheel..."
+    curl -fsSL "$WHEEL_URL" -o "$WHEEL_FILE" || fail_step "下載 agent wheel" "downloading the agent wheel" \
+        "請確認網路連線後重跑本腳本" "please check your network connection then re-run this script"
 
-ACTUAL_SHA256="$(sha256_of "$WHEEL_FILE")"
-if [ "$ACTUAL_SHA256" != "$WHEEL_SHA256" ]; then
-    rm -rf "$WHEEL_TMPDIR"
+    ACTUAL_SHA256="$(sha256_of "$WHEEL_FILE")"
+    if [ "$ACTUAL_SHA256" != "$WHEEL_SHA256" ]; then
+        rm -rf "$WHEEL_TMPDIR"
+fi
     fail_step "agent wheel 的 sha256 驗證失敗" "agent wheel sha256 verification failed" \
         "請重跑本腳本；若持續失敗請聯絡平台管理員" "please re-run this script; contact the platform administrator if it keeps failing"
 fi
@@ -786,7 +810,7 @@ if [ "${P2P_PROBE_RC:-1}" -eq 0 ]; then
     P2P_LAST_LINE="$(printf '%s\n' "$P2P_PROBE_OUT" | tail -n 1)"
     P2P_METHOD="$("$VENV_PYTHON" "$HELPER_SCRIPT" p2p_method "$P2P_LAST_LINE")"
     "$VENV_PYTHON" "$HELPER_SCRIPT" p2p_enable "$AGENT_CONFIG_PATH" 8850 >/dev/null 2>&1 || true
-    bilingual "路由器支援自動開埠（$P2P_METHOD），已開啟模型分享（連接埠 8850）" \
+    bilingual "路由器支援自動開埠（${P2P_METHOD}），已開啟模型分享（連接埠 8850）" \
         "Your router supports automatic port mapping ($P2P_METHOD); model sharing is on (port 8850)"
 else
     # exit 1 有兩種完全不同的原因。`agent_running` 不是「路由器沒回應」——
@@ -796,6 +820,8 @@ else
     P2P_FAIL_LINE="$(printf '%s\n' "$P2P_PROBE_OUT" | tail -n 1)"
     P2P_REASON="$("$VENV_PYTHON" "$HELPER_SCRIPT" p2p_reason "$P2P_FAIL_LINE" 2>/dev/null || echo "")"
     if [ "$P2P_REASON" = "agent_running" ]; then
+        # 舊版 agent CLI（< 0.1.13）在 agent 執行中會拒絕探測；新版改用另一個
+        # 埠探測，不會再走到這裡。
         bilingual "agent 正在執行，未變更分享設定" \
             "Agent is running; sharing settings left as they are"
     else
@@ -872,8 +898,17 @@ sys.exit(0 if age <= 60 else 1)
 AGENT_ALREADY_RUNNING=0
 if agent_already_running "$AGENT_STATE_PATH"; then
     AGENT_ALREADY_RUNNING=1
-    bilingual "agent 已在執行（pid $_AGENT_STATE_PID），不再重複啟動" "Agent already running (pid $_AGENT_STATE_PID); not starting a second one"
-    bilingual "新版會在下次重啟時生效" "the new build takes effect on the next agent restart"
+    bilingual "agent 已在執行（pid ${_AGENT_STATE_PID}），不再重複啟動" "Agent already running (pid $_AGENT_STATE_PID); not starting a second one"
+    # 新版與剛寫進 agent.json 的設定（例如 P2P 分享）都要等 agent 重啟才
+    # 生效。不在這裡幫使用者殺 agent（它可能正在跑工作），但把能立刻套用
+    # 的那一行指令印出來 —— launchd/systemd 會把它重新拉起來。
+    if [ "$OS_KIND" = "macos" ]; then
+        bilingual "新版與新設定會在下次重啟 agent 時生效；要現在套用：launchctl kickstart -k gui/\$(id -u)/com.comfyfed.agent" \
+            "The new build and settings take effect on the next agent restart; to apply now: launchctl kickstart -k gui/\$(id -u)/com.comfyfed.agent"
+    else
+        bilingual "新版與新設定會在下次重啟 agent 時生效；要現在套用：systemctl --user restart comfyfed-agent" \
+            "The new build and settings take effect on the next agent restart; to apply now: systemctl --user restart comfyfed-agent"
+    fi
 fi
 
 if [ "$OS_KIND" = "linux" ]; then

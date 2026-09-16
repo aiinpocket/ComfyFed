@@ -177,6 +177,32 @@ $wheelUrl = $wheelUrlProp.Value
 if ($wheelUrl -notmatch '^https?://') {
     $wheelUrl = "$PlatformUrl$wheelUrl"
 }
+
+# 一台 worker 可以同時服務多個平台，每個平台各自發佈 agent wheel。第二個
+# 平台的安裝指令絕不能把第一個平台裝好的**較新** agent 蓋成舊版（「後蓋
+# 前」）：本機版本比這個平台發佈的新就跳過 wheel 這一步，其餘照常。同版
+# 仍重裝。venv 全新時 import 失敗 ⇒ 空字串 ⇒ 一律安裝（parity: install.sh）。
+$latestVersionProp = $versionInfo.PSObject.Properties['latest']
+$latestVersionStr = if ($null -ne $latestVersionProp -and $latestVersionProp.Value) { [string]$latestVersionProp.Value } else { '' }
+$installedVersionStr = ''
+try {
+    $installedVersionStr = [string](Invoke-Native { & $venvPython -c "import comfyfed_agent as m; print(m.__version__)" } | Select-Object -Last 1)
+    if ($LASTEXITCODE -ne 0) { $installedVersionStr = '' }
+} catch {
+    $installedVersionStr = ''
+}
+$skipWheel = $false
+if ($installedVersionStr -and $latestVersionStr) {
+    try {
+        if ([version]$installedVersionStr.Trim() -gt [version]$latestVersionStr.Trim()) { $skipWheel = $true }
+    } catch {
+        $skipWheel = $false
+    }
+}
+if ($skipWheel) {
+    Write-Bilingual "本機 agent（$installedVersionStr）比此平台發佈的（$latestVersionStr）新，保留現有版本、不降級" `
+        "Installed agent ($installedVersionStr) is newer than this platform's ($latestVersionStr); keeping it, not downgrading"
+}
 # pip validates the wheel FILENAME (PEP 427), not just the bytes, so keep the
 # platform's real name and fall back to the conventional pure-Python name
 # when the URL carries no usable one (parity with install.sh).
@@ -188,18 +214,20 @@ if ($wheelName -notmatch '^[^-]+-[^-]+(-[^-]+)?-[^-]+-[^-]+-[^-]+\.whl$') {
 }
 $wheelFile = Join-Path $env:TEMP $wheelName
 
-Write-Bilingual '下載 agent wheel...' 'Downloading agent wheel...'
-try {
-    Invoke-WebRequest -Uri $wheelUrl -OutFile $wheelFile -UseBasicParsing
-} catch {
-    Fail-Step '下載 agent wheel' 'downloading the agent wheel' `
-        "請確認網路連線後重跑本腳本" "please check your network connection then re-run this script"
-}
+if (-not $skipWheel) {
+    Write-Bilingual '下載 agent wheel...' 'Downloading agent wheel...'
+    try {
+        Invoke-WebRequest -Uri $wheelUrl -OutFile $wheelFile -UseBasicParsing
+    } catch {
+        Fail-Step '下載 agent wheel' 'downloading the agent wheel' `
+            "請確認網路連線後重跑本腳本" "please check your network connection then re-run this script"
+    }
 
-$actualHash = (Get-FileHash -Path $wheelFile -Algorithm SHA256).Hash.ToLower()
-$expectedHash = $sha256Prop.Value.ToLower()
-if ($actualHash -ne $expectedHash) {
-    Remove-Item -Force $wheelFile -ErrorAction SilentlyContinue
+    $actualHash = (Get-FileHash -Path $wheelFile -Algorithm SHA256).Hash.ToLower()
+    $expectedHash = $sha256Prop.Value.ToLower()
+    if ($actualHash -ne $expectedHash) {
+        Remove-Item -Force $wheelFile -ErrorAction SilentlyContinue
+}
     Fail-Step 'agent wheel 的 sha256 驗證失敗' 'agent wheel sha256 verification failed' `
         "請重跑本腳本；若持續失敗請聯絡平台管理員" "please re-run this script; contact the platform administrator if it keeps failing"
 }
@@ -727,6 +755,8 @@ if ($LASTEXITCODE -eq 0) {
         $p2pReason = ''
     }
     if ($p2pReason -eq 'agent_running') {
+        # 舊版 agent CLI（< 0.1.13）在 agent 執行中會拒絕探測；新版改用另一個
+        # 埠探測，不會再走到這裡。
         Write-Bilingual 'agent 正在執行，未變更分享設定' `
             'Agent is running; sharing settings left as they are'
     } else {
@@ -905,7 +935,8 @@ function Test-AgentAlreadyRunning {
 $existingAgentPid = Test-AgentAlreadyRunning -StatePath $AgentStatePath
 if ($existingAgentPid) {
     Write-Bilingual "agent 已在執行（pid $existingAgentPid），不再重複啟動" "Agent already running (pid $existingAgentPid); not starting a second one"
-    Write-Bilingual '新版會在下次重啟時生效' 'the new build takes effect on the next agent restart'
+    Write-Bilingual '新版與新設定會在下次重啟 agent 時生效；要現在套用：先 comfyfed stop，再重新執行這行安裝指令（或重新登入）' `
+        'The new build and settings take effect on the next agent restart; to apply now: run comfyfed stop, then re-run this installer (or sign in again)'
 } else {
     Write-Bilingual '立即啟動...' 'Starting now...'
     Start-Process -FilePath 'powershell.exe' -ArgumentList `

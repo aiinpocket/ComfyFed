@@ -346,17 +346,21 @@ def _cmd_p2p_probe(args: argparse.Namespace) -> int:
     安裝腳本就是靠這個 exit code 決定要不要在 agent.json 打開 `peer_serve`。
     """
     port = args.port
-    # Fix round 1：探測**會刪掉**它建立的映射。如果 agent 已經在跑，那筆
-    # 映射就是 agent 的正式映射，刪掉等於當場把做種關掉。安裝腳本是在啟動
-    # agent 之前跑這個指令的（spec §11），所以拒絕在這裡是安全的。
+    # 探測**會刪掉**它建立的映射。如果 agent 已經在跑，`port` 上的那筆映射
+    # 就是 agent 的正式映射，刪掉等於當場把做種關掉 —— 所以 agent 在跑時改
+    # 用「隔壁的埠」探測（0.1.13 起；0.1.12 是直接拒絕，結果升級安裝永遠
+    # 探不到路由器，因為安裝腳本升級時 agent 都在跑）。探的是路由器肯不肯
+    # 開埠，用哪個埠問都一樣；映射一樣立刻收掉。回傳的 `probe_port` 讓呼叫
+    # 端知道實際問的是哪個埠。
     # 「在跑」的判準與 `comfyfed status` 完全一致：state 檔存在，而且它的
     # 時間戳沒有過期（一個被 kill 掉的 agent 留下的舊檔不算）。
+    agent_running = False
     state = control.read_state(_config_dir(args))
     if state is not None:
         age = _state_age_seconds(state)
         if age is not None and age <= _STATE_STALE_SECONDS:
-            print(json.dumps({"ok": False, "reason": "agent_running"}))
-            return 1
+            agent_running = True
+    probe_port = port + 1 if agent_running else port
     try:
         gateway = natmap.detect_gateway()
         if gateway is None:
@@ -364,7 +368,7 @@ def _cmd_p2p_probe(args: argparse.Namespace) -> int:
             return 1
         # 把偵測到的閘道傳下去：`map_port` 沒拿到就會自己再跑一次
         # `route print`／`ip route`，白白多花一次 subprocess。
-        mapping = natmap.map_port(port=port, gateway=gateway)
+        mapping = natmap.map_port(port=probe_port, gateway=gateway)
     except Exception as exc:
         print(json.dumps({"ok": False, "reason": "error", "detail": str(exc)}))
         return 1
@@ -376,6 +380,8 @@ def _cmd_p2p_probe(args: argparse.Namespace) -> int:
     payload = {
         "ok": True,
         "method": mapping.method,
+        "probe_port": probe_port,
+        "agent_running": agent_running,
         "external_ip": mapping.external_ip,
         "external_port": mapping.external_port,
         "lan_ip": peerserve._detect_local_ip(),

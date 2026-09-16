@@ -112,7 +112,7 @@ server {
 ### 新增一台 worker
 
 1. 在主控台 → **Workers** → 新增，輸入名稱後系統會產生一次性的註冊 token，並直接顯示三條一行安裝指令（Windows PowerShell／Windows cmd／Linux + macOS），各附複製按鈕。
-2. 在要貢獻算力的那台機器上，貼上對應那一行貼到終端機執行。**不需要系統管理員／sudo**：Windows 用一般終端機即可（有系統管理員權限會用工作排程器設自啟，沒有就自動改用使用者層級的登錄檔 Run 鍵，效果相同）；Linux／macOS 請以一般使用者執行、**不要加 sudo**（整套裝在你的家目錄，root 執行會被腳本擋下）。腳本可安全重跑：已註冊過的機器會自動跳過註冊步驟。
+2. 在要貢獻算力的那台機器上，貼上對應那一行貼到終端機執行。**不需要系統管理員／sudo**：Windows 用一般終端機即可（有系統管理員權限會用工作排程器設自啟，沒有就自動改用使用者層級的登錄檔 Run 鍵，效果相同）；Linux／macOS 請以一般使用者執行、**不要加 sudo**（整套裝在你的家目錄，root 執行會被腳本擋下）。腳本可安全重跑：已註冊過的機器會自動跳過註冊步驟。**重跑不會動你既有的 `agent.json`**（`auto_fetch_models`、`max_fetch_gb`、白名單等全部保留；唯一會主動改的是下面 P2P 一節說的「從未設定過」的分享開關）。**一台 worker 可以同時貢獻給多個平台**：在同一台機器上貼第二個平台的安裝指令，只會在 `agent.json` 的 `platforms` 多加一筆，不會蓋掉第一個平台的註冊；而且**絕不降級 agent**——本機已裝的 agent 比該平台發佈的版本新時，安裝腳本會跳過 wheel 這一步、保留現有版本（同版仍會重裝）。
 
 ```powershell
 # Windows（PowerShell）
@@ -327,7 +327,8 @@ UPDATE model_hashes SET conflict = 0 WHERE name = '...' AND size_bytes = ...;
 - **問得到** → 自動在 `agent.json` 寫入 `peer_serve: true`、`peer_listen_port: 8850`，並在畫面上告訴你用的是哪一種（natpmp／upnp）。
 - **問不到** → 什麼都不改（分享維持關閉），並印一行說明：到路由器把 UPnP 打開之後**重跑同一行安裝指令**就會自動開啟，或是自己轉埠並設定 `peer_advertise_host`。
 - **你自己設過的一律尊重**：只有在 `peer_serve` 目前是 `false` **而且** `peer_listen_port` 從未設定過的情況下，安裝腳本才會自動開啟。自己指定過埠號的設定，重跑安裝也不會被改回去。這條規則有一個限制要知道：只寫 `peer_serve: false`、**沒有**指定埠號，跟預設值長得一模一樣，重跑安裝還是會被打開——想讓分享保持關閉，請一併設定 `peer_listen_port`（有埠號就等於把這個決定釘住）。
-- 想自己先確認一次，可以單獨跑：`comfyfed-agent p2p-probe`（印一行 JSON，成功會帶 `method`、`external_ip`、`external_port`；它不會留下任何映射）。**agent 正在執行中的話會直接拒絕**（印 `{"ok": false, "reason": "agent_running"}`），連路由器都不會去碰——這條指令是設計給安裝腳本在啟動 agent 之前用的，不是拿來跟已經在跑的 agent 搶同一筆映射。
+- **升級時 agent 通常正在跑**：探測不會去碰 agent 自己在 8850 的映射，而是改用隔壁的埠（8851）問路由器、問完立刻收掉（0.1.13 起；0.1.12 在 agent 執行中會直接拒絕，等於升級永遠開不了分享）。問得到就照樣寫進 `agent.json`，**但要 agent 重啟才生效**——安裝腳本不會替你殺掉可能正在跑工作的 agent，只會印出立刻套用的指令：macOS `launchctl kickstart -k gui/$(id -u)/com.comfyfed.agent`、Linux `systemctl --user restart comfyfed-agent`、Windows 先 `comfyfed stop` 再重跑安裝指令（或重新登入）。
+- 想自己先確認一次，可以單獨跑：`comfyfed-agent p2p-probe`（印一行 JSON，成功會帶 `method`、`external_ip`、`external_port`、實際探的 `probe_port`；它不會留下任何映射）。
 
 `agent.json` 相關設定：
 
