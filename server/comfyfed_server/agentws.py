@@ -1093,6 +1093,8 @@ async def _handle_hello(worker_id: str, conn: "_Connection", message: dict) -> N
         # 探針次數，一台不斷重連的 worker 就成了對它自己的放大器。位址真的
         # 換了（或以前沒有）才作廢，其餘交給心跳的 10 分鐘節奏。
         peer_url_changed = peer_url != worker.peer_url
+        # 位址沒變時要回放的既有結論（fix round 2）—— 趁 session 還開著讀。
+        stored_reachable = worker.peer_reachable
         worker.peer_url = peer_url
         # Phase 3.4：跟 `peer_url` 一樣全量取代 —— agent 關掉 NAT 穿越後
         # 重連，不能留著上一輪的 natpmp 標籤與對外位址。
@@ -1124,6 +1126,14 @@ async def _handle_hello(worker_id: str, conn: "_Connection", message: dict) -> N
     # 每次都推 peer_status（§4.3），不論結論有沒有變。
     if peer_url and peer_url_changed:
         _schedule_peer_check(worker_id, peer_url, on_change_only=False)
+    elif peer_url and stored_reachable is not None:
+        # 位址沒變、而且庫裡已經有結論（fix round 2）：直接回放，不重探。
+        # agent 重啟後自己的記憶體是空的，沒有這一則它的 `comfyfed status`
+        # 會顯示「未知」直到下一次心跳重測（最長 10 分鐘）—— 回放一則已經
+        # 存在的結論不花任何網路成本。
+        await push_peer_status(
+            worker_id, bool(stored_reachable), peerhealth.health_url(peer_url)
+        )
 
 
 async def _handle_heartbeat(worker_id: str, conn: _Connection, message: dict) -> bool:

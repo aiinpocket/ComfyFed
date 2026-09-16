@@ -1325,7 +1325,7 @@ describe("Phase 3.4 fix round 1: advert normalization and probe gating", () => {
     vi.restoreAllMocks();
   });
 
-  it("probes once for repeated identical advertisements", async () => {
+  it("probes once for repeated identical advertisements, replaying the stored verdict", async () => {
     const kp = KEYPAIRS[0]!;
     const workerId = await makeWorker({ pubkeyHex: kp.pubkey_hex });
     const probe = vi.spyOn(peerhealth, "probePeerHealth").mockResolvedValue(true);
@@ -1337,17 +1337,57 @@ describe("Phase 3.4 fix round 1: advert normalization and probe gating", () => {
     expect((await status).type).toBe("peer_status");
     first.close();
 
-    // A reconnect advertising the SAME endpoint keeps the stored verdict and
-    // does not probe again (the 10-minute heartbeat cadence re-verifies).
+    // A reconnect advertising the SAME endpoint does not probe again (the
+    // 10-minute heartbeat cadence re-verifies), but the stored verdict is
+    // replayed straight away so a restarted agent isn't left on "unknown"
+    // (fix round 2).
     const second = await connectAgent(workerId, kp.seed_hex);
-    const none = expectNoMessage(second, 400);
+    const replayed = nextMessage(second);
     second.send(hello);
-    await none;
+    expect(await replayed).toEqual({
+      type: "peer_status",
+      reachable: true,
+      checked_url: "http://203.0.113.7:8850/peer/health",
+    });
     second.close();
 
     expect(probe).toHaveBeenCalledTimes(1);
     const row = await db().prepare("SELECT peer_reachable FROM workers WHERE id = ?").bind(workerId).first<any>();
     expect(row.peer_reachable).toBe(1);
+    vi.restoreAllMocks();
+  });
+
+  it("replays a stored unreachable verdict, and stays silent when there is none", async () => {
+    const kp = KEYPAIRS[0]!;
+    const workerId = await makeWorker({ pubkeyHex: kp.pubkey_hex });
+    const probe = vi.spyOn(peerhealth, "probePeerHealth").mockResolvedValue(true);
+    const hello = JSON.stringify({ type: "hello", protocol: 4, peer_url: "http://203.0.113.7:8850" });
+    await db()
+      .prepare("UPDATE workers SET peer_url = ?, peer_reachable = 0, peer_checked_at = ? WHERE id = ?")
+      .bind("http://203.0.113.7:8850", toSqliteTimestamp(new Date()), workerId)
+      .run();
+
+    const ws = await connectAgent(workerId, kp.seed_hex);
+    const replayed = nextMessage(ws);
+    ws.send(hello);
+    expect(await replayed).toEqual({
+      type: "peer_status",
+      reachable: false,
+      checked_url: "http://203.0.113.7:8850/peer/health",
+    });
+    ws.close();
+
+    // Verdict cleared (e.g. the stale sweep just ran): nothing to replay, and
+    // the address did not change either -- so nothing is sent and nothing is
+    // probed.
+    await db().prepare("UPDATE workers SET peer_reachable = NULL WHERE id = ?").bind(workerId).run();
+    const quiet = await connectAgent(workerId, kp.seed_hex);
+    const none = expectNoMessage(quiet, 400);
+    quiet.send(hello);
+    await none;
+    quiet.close();
+
+    expect(probe).not.toHaveBeenCalled();
     vi.restoreAllMocks();
   });
 

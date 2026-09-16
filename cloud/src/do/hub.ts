@@ -1184,6 +1184,11 @@ export class Hub extends DurableObject<Env> {
     // （fix round 1）。hello 觸發的這一次每次都推 peer_status（§4.3）。
     if (peerUrl && peerUrlChanged) {
       this.schedulePeerCheck(ws, workerId, peerUrl, { notifyOnChangeOnly: false });
+    } else if (peerUrl && worker.peerReachable !== null) {
+      // 位址沒變、庫裡已經有結論（fix round 2）：直接回放，不重探 —— 重啟
+      // 後的 agent 才不用在「未知」停留到下一次心跳重測。Parity:
+      // agentws.py's `_handle_hello`.
+      this.pushPeerStatus(ws, worker.peerReachable === 1, peerhealth.healthUrl(peerUrl));
     }
   }
 

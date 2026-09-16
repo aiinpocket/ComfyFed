@@ -4049,7 +4049,10 @@ def test_hello_stores_the_normalized_advert_urls(client):
 
 def test_hello_probes_once_for_repeated_identical_advertisements(client, monkeypatch):
     """fix round 1：同一個 `peer_url` 重連幾次都只驗一次 —— 位址沒換，上次
-    的結論還算數（重測交給心跳的 10 分鐘節奏）。"""
+    的結論還算數（重測交給心跳的 10 分鐘節奏）。
+
+    fix round 2：雖然不重驗，但**既有結論會被回放**一則 `peer_status`，重啟
+    後的 agent 才不用在「未知」停留到下一次重測。"""
     csrf = _login(client)
     worker_id, sk = _register_worker(client, csrf, "rep-1")
     probed = []
@@ -4063,24 +4066,72 @@ def test_hello_probes_once_for_repeated_identical_advertisements(client, monkeyp
     finally:
         ctx.__exit__(None, None, None)
 
-    # 同樣的通告再來兩次：不重驗、不重推。
+    # 同樣的通告再來兩次：不重驗，但每次都回放存著的結論。
     for _ in range(2):
         ctx, ws, _ = _handshake_ws(client, worker_id, sk)
         try:
             ws.send_json(hello)
-            # 沒有 peer_status 的話，下一則訊息就是舊協定的 deprecation。
-            # 探測用的那則 hello 必須帶**同一個** peer_url —— 不帶的話它自己
-            # 就成了一次「通告位址變了」，下一輪就會重驗。
-            ws.send_json({**hello, "protocol": 1})
-            assert ws.receive_json()["type"] == "deprecation"
+            replayed = ws.receive_json()
         finally:
             ctx.__exit__(None, None, None)
+        assert replayed == {
+            "type": "peer_status",
+            "reachable": True,
+            "checked_url": "http://203.0.113.7:8850/peer/health",
+        }
 
     assert probed == ["http://203.0.113.7:8850/peer/health"]
     with db.get_session() as session:
         w = session.get(db.Worker, worker_id)
         assert w.peer_reachable == 1
         assert w.peer_checked_at is not None
+
+
+def test_hello_replays_a_stored_unreachable_verdict_without_probing(client, monkeypatch):
+    """fix round 2：回放的是庫裡真正存著的值，不是永遠 true；而且結論還沒
+    有（NULL）的時候不回放（沒有東西可以說）。"""
+    csrf = _login(client)
+    worker_id, sk = _register_worker(client, csrf, "rep-3")
+    probed = []
+    monkeypatch.setattr(peerhealth, "_probe", lambda url: probed.append(url) or True)
+    hello = {"type": "hello", "protocol": 4, "peer_url": "http://203.0.113.7:8850"}
+
+    with db.get_session() as session:
+        worker = session.get(db.Worker, worker_id)
+        worker.peer_url = "http://203.0.113.7:8850"
+        worker.peer_reachable = 0
+        worker.peer_checked_at = datetime.now(timezone.utc).replace(tzinfo=None)
+        session.commit()
+
+    ctx, ws, _ = _handshake_ws(client, worker_id, sk)
+    try:
+        ws.send_json(hello)
+        replayed = ws.receive_json()
+    finally:
+        ctx.__exit__(None, None, None)
+
+    assert replayed == {
+        "type": "peer_status",
+        "reachable": False,
+        "checked_url": "http://203.0.113.7:8850/peer/health",
+    }
+    assert probed == []
+
+    # 結論清成 NULL（例如剛被 requeue_stale 掃過）⇒ 沒有東西可回放，
+    # 而且位址也沒變 ⇒ 什麼都不推（用 deprecation 當下一則訊息的探測點）。
+    with db.get_session() as session:
+        session.get(db.Worker, worker_id).peer_reachable = None
+        session.commit()
+
+    ctx, ws, _ = _handshake_ws(client, worker_id, sk)
+    try:
+        ws.send_json(hello)
+        ws.send_json({**hello, "protocol": 1})
+        assert ws.receive_json()["type"] == "deprecation"
+    finally:
+        ctx.__exit__(None, None, None)
+
+    assert probed == []
 
 
 def test_hello_with_a_changed_peer_url_resets_the_verdict_and_reprobes(client, monkeypatch):
