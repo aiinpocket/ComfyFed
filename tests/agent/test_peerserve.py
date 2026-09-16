@@ -684,6 +684,13 @@ def test_peer_health_returns_204_without_a_grant(tmp_path):
         assert resp.content == b""
         # 不洩漏任何識別資訊：body 空、也沒有自訂標頭。
         assert "X-ComfyFed-Worker" not in resp.headers
+        # Fix round 1：連 Python 版本都不該漏（`BaseHTTPRequestHandler` 預設
+        # 的 Server 標頭是 "ComfyFedPeer/1 Python/3.12.x"）。
+        assert "Python" not in resp.headers.get("Server", "")
+        # 204 依 RFC 9110 沒有 body，就不該帶任何描述 body 的標頭。
+        header_names = {k.lower() for k in resp.headers}
+        assert "content-length" not in header_names
+        assert "content-type" not in header_names
     finally:
         server.stop()
 

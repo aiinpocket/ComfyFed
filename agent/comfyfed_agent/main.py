@@ -346,6 +346,17 @@ def _cmd_p2p_probe(args: argparse.Namespace) -> int:
     安裝腳本就是靠這個 exit code 決定要不要在 agent.json 打開 `peer_serve`。
     """
     port = args.port
+    # Fix round 1：探測**會刪掉**它建立的映射。如果 agent 已經在跑，那筆
+    # 映射就是 agent 的正式映射，刪掉等於當場把做種關掉。安裝腳本是在啟動
+    # agent 之前跑這個指令的（spec §11），所以拒絕在這裡是安全的。
+    # 「在跑」的判準與 `comfyfed status` 完全一致：state 檔存在，而且它的
+    # 時間戳沒有過期（一個被 kill 掉的 agent 留下的舊檔不算）。
+    state = control.read_state(_config_dir(args))
+    if state is not None:
+        age = _state_age_seconds(state)
+        if age is not None and age <= _STATE_STALE_SECONDS:
+            print(json.dumps({"ok": False, "reason": "agent_running"}))
+            return 1
     try:
         gateway = natmap.detect_gateway()
         if gateway is None:
@@ -445,9 +456,20 @@ def cli() -> None:
 
     probe = sub.add_parser(
         "p2p-probe",
-        help="Probe whether the router will open a port for P2P model sharing (NAT-PMP/UPnP).",
+        help=(
+            "Probe whether the router will open a port for P2P model sharing "
+            "(NAT-PMP/UPnP). Run this BEFORE starting the agent: the probe "
+            "releases the mapping it creates, so it refuses "
+            '({"ok": false, "reason": "agent_running"}, exit 1) while a '
+            "running agent is publishing its state."
+        ),
     )
     probe.add_argument("--port", type=int, default=8850, help="Port to test (default 8850).")
+    probe.add_argument(
+        "--config",
+        default=DEFAULT_CONFIG_PATH,
+        help="Path to the agent config file (only read to refuse while an agent is running).",
+    )
     probe.add_argument("--json", action="store_true", help="Machine-readable output (always on).")
     probe.set_defaults(func=lambda args: sys.exit(_cmd_p2p_probe(args)))
 

@@ -51,6 +51,12 @@ _COMFY_UNREACHABLE_REASON = "comfyui_unreachable"
 # 滾動視窗（不是「整個 process 只有一次」）—— 一條每天換兩三次 IP 的
 # 家用線路仍然能跟上，一條每分鐘抖動的線路也不會把平台打爆。
 _PEER_RECONNECT_WINDOW_SECONDS = 3600.0
+# 關機時「等一下正在飛的續租」的時間上限。`asyncio.to_thread` 取消不了已經
+# 在跑的 thread，所以一個在 `unmap_port` 之後才落地的續租會把轉埠重新開回
+# 路由器上。等這麼一下下再補一次解除，比在路由器上留一筆死掉的轉埠好。
+_PEER_RENEW_DRAIN_SECONDS = 0.5
+# 連續幾次續租失敗之後，就不再假裝這台對外連得到（降級成 lan）。
+_PEER_RENEW_FAILURES_BEFORE_DOWNGRADE = 2
 # spec §3.1 第 4 點／§4.3 共用的那段文字（雙語）：映射失敗、以及平台回報
 # 「連不到」，對操作者來說要做的事一模一樣，所以共用同一段說明。
 _PEER_NO_MAPPING_WARNING = (
@@ -810,6 +816,14 @@ class AgentLoop:
         # （`time.monotonic()` 時間戳，滾動一小時內最多一筆）。
         self._peer_remote_ip: Optional[str] = None
         self._peer_reconnects_at: list[float] = []
+        # 關機旗標：續租迴圈在動路由器之前與之後都看它，免得關機途中又把
+        # 轉埠開回去。`_peer_renew_in_flight` 在「已經送出請求但還沒收到
+        # 結果」的期間為 True —— 取消發生在這段期間時它**不會**被清掉，
+        # 那正是 `shutdown()` 判斷要不要補第二次解除的依據。
+        self._peer_shutting_down = False
+        self._peer_renew_in_flight = False
+        # 連續失敗的續租次數（成功歸零）。
+        self._peer_renew_failures = 0
         # 續租任務（每 `natmap.RENEW_SECONDS` 一次），由 `run()` 起、
         # `shutdown()` 取消並 await 完之後才解除映射。
         self._peer_renew_task: Optional[asyncio.Task] = None
@@ -1880,7 +1894,9 @@ class AgentLoop:
         self._jobs.clear()
 
         # 續租任務一定要先收乾淨再解除映射：一個正在飛的續租會在路由器上
-        # 重新開好一筆轉埠，而它指向的服務下一秒就關了。
+        # 重新開好一筆轉埠，而它指向的服務下一秒就關了。旗標先立起來，讓
+        # 還沒進到 `to_thread` 的那一輪自己不要出發。
+        self._peer_shutting_down = True
         if self._peer_renew_task is not None:
             self._peer_renew_task.cancel()
             try:
@@ -1896,11 +1912,26 @@ class AgentLoop:
             # UPnP DeletePortMapping），別在路由器上留一筆指向已關閉服務的
             # 轉埠。盡力而為 —— natmap.unmap_port 自己吞例外，而且是阻塞的，
             # 所以照樣走 to_thread。
+            mapping = self._peer_mapping
             try:
-                await asyncio.to_thread(natmap.unmap_port, self._peer_mapping)
+                await asyncio.to_thread(natmap.unmap_port, mapping)
             except Exception:
                 logger.debug("runner: releasing the port mapping failed (ignored)", exc_info=True)
             self._peer_mapping = None
+            if self._peer_renew_in_flight:
+                # 有一個 map_port 還在別的 thread 上飛（`to_thread` 取消不了
+                # 它），它落地時會把剛剛解除的轉埠又開回去。等它一下下，然後
+                # 再解除一次 —— 盡力而為，總比在路由器上留一筆指向已關閉服務
+                # 的轉埠好。
+                await asyncio.sleep(_PEER_RENEW_DRAIN_SECONDS)
+                try:
+                    await asyncio.to_thread(natmap.unmap_port, mapping)
+                except Exception:
+                    logger.debug(
+                        "runner: the second (best-effort) port-mapping release failed",
+                        exc_info=True,
+                    )
+                self._peer_renew_in_flight = False
 
         if self._peer_server is not None:
             try:
@@ -2041,8 +2072,17 @@ class AgentLoop:
         if self._peer_mapping.external_ip:
             # 路由器自己就報得出可用的外部 IP，以它為準。
             return False
+        if self._peer_remote_ip is not None and self._peer_remote_ip != remote_ip:
+            # Fix round 1 裁定：多平台各自看到的出口位址可能不一樣（不同
+            # 路由、其中一方前面有 proxy／CDN）。認**第一個**非私有值，之後
+            # 不同的一律忽略 —— 否則兩個平台會把通告位址推來推去，而每一次
+            # 推都想吃掉那一小時一次的重連額度。
+            logger.debug(
+                "runner: platform reported a different public address (%s, pinned %s); ignoring",
+                remote_ip, self._peer_remote_ip,
+            )
+            return False
 
-        previous_ip = self._peer_remote_ip
         self._peer_remote_ip = remote_ip
         new_url = peerserve.peer_url_for(remote_ip, self._peer_mapping.external_port)
         if new_url == self._peer_advertised_url:
@@ -2056,10 +2096,10 @@ class AgentLoop:
         if self._peer_reconnects_at:
             # 已經在這一小時內重連過；位址記下來，下次自然重連時就會帶出去。
             logger.info(
-                "runner: public address changed (%s -> %s) but an automatic "
+                "runner: public address resolved to %s but an automatic "
                 "reconnect already happened this hour; the new address goes "
                 "out on the next reconnect",
-                previous_ip, remote_ip,
+                remote_ip,
             )
             return False
         self._peer_reconnects_at.append(now)
@@ -2073,20 +2113,35 @@ class AgentLoop:
         """
         while True:
             await asyncio.sleep(natmap.RENEW_SECONDS)
-            if self._peer_mapping is None:
+            # 關機已經開始：別再去動路由器（`shutdown` 正要把映射收掉）。
+            if self._peer_mapping is None or self._peer_shutting_down:
                 continue
+            self._peer_renew_in_flight = True
             try:
                 mapping = await asyncio.to_thread(
                     natmap.map_port, port=self.config.peer_listen_port
                 )
             except Exception:
+                self._peer_renew_in_flight = False
                 logger.exception("runner: peer port-mapping renewal raised")
+                await self._note_renewal_failure()
                 continue
+            # 取消（關機）會在上面那個 await 點丟 CancelledError，**不會**
+            # 走到這裡 —— `_peer_renew_in_flight` 因此留在 True，`shutdown()`
+            # 就知道有一個 map_port 可能會在它解除之後才落地。
+            self._peer_renew_in_flight = False
+            if self._peer_shutting_down:
+                # 請求送出去之後關機才開始：把結果記下來讓 shutdown 收拾。
+                if mapping is not None:
+                    self._peer_mapping = mapping
+                return
             if mapping is None:
                 logger.warning(
                     "runner: peer port-mapping renewal failed; keeping the current lease"
                 )
+                await self._note_renewal_failure()
                 continue
+            self._peer_renew_failures = 0
             self._peer_mapping = mapping
             self._peer_nat = mapping.method
             host = mapping.external_ip or self._peer_remote_ip
@@ -2101,6 +2156,21 @@ class AgentLoop:
             # 完全一樣的重連路徑（同一個 1 次／小時的節流），而不是偷偷換掉
             # 本地的字串讓平台繼續拿舊位址做健康檢查。
             await self._request_peer_reconnect()
+
+    async def _note_renewal_failure(self) -> None:
+        """連續 `_PEER_RENEW_FAILURES_BEFORE_DOWNGRADE` 次續租失敗之後，這台
+        就不該繼續對外通告一個隨時會過期的轉埠位址：降級成 `lan`、把通告
+        位址換回區網位址，並照 §8 的節流重連一次讓平台知道。只在跨過門檻的
+        那一次記 log（之後每一輪都失敗也不會洗版）。"""
+        self._peer_renew_failures += 1
+        if self._peer_renew_failures != _PEER_RENEW_FAILURES_BEFORE_DOWNGRADE:
+            return
+        if self._peer_nat == "lan":
+            return
+        logger.warning(_PEER_NO_MAPPING_WARNING)
+        self._peer_nat = "lan"
+        self._peer_advertised_url = self._peer_lan_url
+        await self._request_peer_reconnect()
 
     async def _request_peer_reconnect(self) -> None:
         """把每一條平台連線踢掉一次，讓 `_run_platform` 的重試迴圈帶著新的

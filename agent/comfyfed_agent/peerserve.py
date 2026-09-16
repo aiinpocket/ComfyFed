@@ -583,6 +583,13 @@ def _make_handler_class(server_state: "_ServerState") -> type:
 
     class _Handler(BaseHTTPRequestHandler):
         server_version = "ComfyFedPeer/1"
+        # Fix round 1: `BaseHTTPRequestHandler` appends its own
+        # `sys_version` ("Python/3.12.10") to every `Server` header. An
+        # unauthenticated `/peer/health` probe -- or any 403 -- would hand a
+        # scanner this machine's exact interpreter version, which is a free
+        # CVE shortlist and tells it nothing it needs. Empty means the header
+        # is just "ComfyFedPeer/1".
+        sys_version = ""
         protocol_version = "HTTP/1.1"
         # M6 final-review fix: `BaseHTTPRequestHandler` sets no socket
         # timeout by default, so an unauthenticated client that opens a
@@ -614,13 +621,21 @@ def _make_handler_class(server_state: "_ServerState") -> type:
             self.send_header("Content-Length", "0")
             self.end_headers()
 
+        def _no_content(self) -> None:
+            """A bare 204. Fix round 1: RFC 9110 §15.3.5 -- a 204 has no
+            body, so it must not carry `Content-Length` (or `Content-Type`)
+            either. `_deny` sends `Content-Length: 0`, which is right for a
+            403/404 but wrong here."""
+            self.send_response(204)
+            self.end_headers()
+
         def _serve(self) -> None:
             parsed = urlsplit(self.path)
             # Phase 3.4 §4.2：可連性探針，無憑證 204。放在憑證檢查之前是
             # 刻意的 —— 平台做這個檢查時手上沒有（也不該有）任何 grant。
             # 精確比對路徑，不是 startswith：`/peer/healthz` 之類的變形不算。
             if parsed.path == HEALTH_PATH:
-                self._deny(204)
+                self._no_content()
                 return
             if not parsed.path.startswith(_ROUTE_PREFIX):
                 self._deny(404)

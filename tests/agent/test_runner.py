@@ -3169,33 +3169,48 @@ def test_apply_remote_ip_rebuilds_the_url_and_asks_for_one_reconnect(tmp_path, m
     assert loop._apply_remote_ip("203.0.113.7") is False
 
 
-def test_apply_remote_ip_reconnects_at_most_once_per_hour(tmp_path, monkeypatch):
+def test_apply_remote_ip_pins_the_first_public_ip_it_is_told(tmp_path, monkeypatch):
+    """Fix round 1 裁定：多平台各自回報的 `remote_ip` 可能不同（不同出口、
+    CDN、或其中一方看到的是自己的 proxy）。規則是**認第一個**非私有值，
+    之後不一樣的一律 debug 記一行然後忽略 —— 簡單、可預測，而且不會讓兩個
+    平台互相把通告位址推來推去。"""
     monkeypatch.setattr(peerserve, "_detect_local_ip", lambda: "192.168.1.5")
     loop = _loop_with_peer(tmp_path)
     loop._peer_mapping = _mapping(external_ip=None)
     loop._peer_nat = "natpmp"
 
+    # 平台 A 先講話。
     assert loop._apply_remote_ip("203.0.113.7") is True
-    # 位址又變了，但一小時內已經重連過一次 ⇒ 只更新記錄，不再要求重連。
+    assert loop._peer_advertised_url == "http://203.0.113.7:8850"
+    # 平台 B 講了另一個位址 ⇒ 不重連、不改通告位址。
     assert loop._apply_remote_ip("203.0.113.9") is False
-    assert loop._peer_advertised_url == "http://203.0.113.9:8850"
+    assert loop._peer_remote_ip == "203.0.113.7"
+    assert loop._peer_advertised_url == "http://203.0.113.7:8850"
+    assert len(loop._peer_reconnects_at) == 1
 
 
-def test_apply_remote_ip_allows_another_reconnect_after_the_hour(tmp_path, monkeypatch):
+@pytest.mark.asyncio
+async def test_request_peer_reconnect_is_throttled_to_a_rolling_hour(tmp_path, monkeypatch):
     """節流是「滾動一小時最多一次」，不是「一個 process 永遠只有一次」
     （spec §8 勝過 §3.1 的「一次」）。"""
     monkeypatch.setattr(peerserve, "_detect_local_ip", lambda: "192.168.1.5")
     loop = _loop_with_peer(tmp_path)
-    loop._peer_mapping = _mapping(external_ip=None)
-    loop._peer_nat = "natpmp"
+    conn = _ClosableConn()
+    loop.connections = {"a": conn}
 
-    assert loop._apply_remote_ip("203.0.113.7") is True
+    await loop._request_peer_reconnect()
+    assert conn.closes == 1
+
+    await loop._request_peer_reconnect()
+    assert conn.closes == 1  # 同一小時內，不再踢第二次
+
     # 把那一筆紀錄推到一小時以前。
     loop._peer_reconnects_at = [
         t - runner_module._PEER_RECONNECT_WINDOW_SECONDS - 1.0
         for t in loop._peer_reconnects_at
     ]
-    assert loop._apply_remote_ip("203.0.113.9") is True
+    await loop._request_peer_reconnect()
+    assert conn.closes == 2
 
 
 def test_apply_remote_ip_ignores_a_private_or_missing_address(tmp_path, monkeypatch):
@@ -3430,3 +3445,176 @@ async def test_run_platform_reconnects_once_to_advertise_the_public_ip(
     # 所以不會無限重連）。
     assert closes["n"] >= 1
     assert hellos == ["http://203.0.113.7:8850"]
+
+
+# --- Fix round 1: 續租迴圈 --------------------------------------------------
+
+
+class _ClosableConn:
+    """只需要 `close()` 的假連線：`_request_peer_reconnect` 只碰這一個方法。"""
+
+    def __init__(self):
+        self.closes = 0
+
+    async def close(self):
+        self.closes += 1
+
+
+async def _drive_renew_ticks(loop, calls, target, timeout=5.0):
+    """跑 `_peer_renew_loop` 直到 `map_port` 被叫滿 `target` 次，然後收掉。"""
+    task = asyncio.create_task(loop._peer_renew_loop())
+    deadline = time.monotonic() + timeout
+    try:
+        while calls["n"] < target and time.monotonic() < deadline:
+            await asyncio.sleep(0.005)
+        # `calls` 是在 worker thread 裡加的，迴圈本體處理那個結果（記 log、
+        # 換位址、踢連線）發生在之後 —— 給它一拍再收工。
+        await asyncio.sleep(0.05)
+    finally:
+        task.cancel()
+        try:
+            await task
+        except asyncio.CancelledError:
+            pass
+    assert calls["n"] >= target, f"renewal only ran {calls['n']} times"
+
+
+@pytest.mark.asyncio
+async def test_renewal_with_a_new_external_ip_reconnects_every_connection_once(
+    tmp_path, monkeypatch
+):
+    monkeypatch.setattr(natmap, "RENEW_SECONDS", 0.01)
+    calls = {"n": 0}
+
+    def _map(**kwargs):
+        calls["n"] += 1
+        return _mapping(external_ip="203.0.113.9")
+
+    monkeypatch.setattr(natmap, "map_port", _map)
+    loop = _loop_with_peer(tmp_path)
+    loop._peer_mapping = _mapping()
+    loop._peer_nat = "natpmp"
+    loop._peer_advertised_url = "http://203.0.113.7:8850"
+    conn_a, conn_b = _ClosableConn(), _ClosableConn()
+    loop.connections = {"a": conn_a, "b": conn_b}
+
+    # 至少三輪：第一輪換位址 + 重連，之後兩輪位址沒變 ⇒ 不該再踢任何人。
+    await _drive_renew_ticks(loop, calls, 3)
+
+    assert loop._peer_advertised_url == "http://203.0.113.9:8850"
+    assert conn_a.closes == 1
+    assert conn_b.closes == 1
+    assert len(loop._peer_reconnects_at) == 1
+
+
+@pytest.mark.asyncio
+async def test_a_single_failed_renewal_keeps_the_current_lease(tmp_path, monkeypatch, caplog):
+    monkeypatch.setattr(natmap, "RENEW_SECONDS", 0.01)
+    calls = {"n": 0}
+    gate = threading.Event()
+
+    def _map(**kwargs):
+        calls["n"] += 1
+        if calls["n"] >= 2:
+            # 只讓第一輪失敗：第二輪卡在這裡，測試就不會滑進「連兩次失敗」。
+            gate.wait(1.0)
+        return None
+
+    monkeypatch.setattr(natmap, "map_port", _map)
+    loop = _loop_with_peer(tmp_path)
+    kept = _mapping()
+    loop._peer_mapping = kept
+    loop._peer_nat = "natpmp"
+    loop._peer_advertised_url = "http://203.0.113.7:8850"
+    conn = _ClosableConn()
+    loop.connections = {"a": conn}
+
+    with caplog.at_level(logging.WARNING):
+        await _drive_renew_ticks(loop, calls, 1)
+
+    assert loop._peer_mapping is kept
+    assert loop._peer_advertised_url == "http://203.0.113.7:8850"
+    assert loop._peer_nat == "natpmp"
+    assert conn.closes == 0
+    assert "renewal failed" in caplog.text
+    gate.set()
+
+
+@pytest.mark.asyncio
+async def test_two_failed_renewals_downgrade_to_the_lan_address(tmp_path, monkeypatch, caplog):
+    """連兩次沒開成 ⇒ 這台已經不能算「對外可連」了。降級成 lan、把對外
+    位址換回區網位址，並且（照 §8 的節流）重連一次讓平台知道。"""
+    monkeypatch.setattr(natmap, "RENEW_SECONDS", 0.01)
+    calls = {"n": 0}
+
+    def _map(**kwargs):
+        calls["n"] += 1
+        return None
+
+    monkeypatch.setattr(natmap, "map_port", _map)
+    loop = _loop_with_peer(tmp_path)
+    loop._peer_mapping = _mapping()
+    loop._peer_nat = "natpmp"
+    loop._peer_lan_url = "http://192.168.1.5:8850"
+    loop._peer_advertised_url = "http://203.0.113.7:8850"
+    conn = _ClosableConn()
+    loop.connections = {"a": conn}
+
+    with caplog.at_level(logging.WARNING):
+        await _drive_renew_ticks(loop, calls, 4)
+
+    assert loop._peer_nat == "lan"
+    assert loop._peer_advertised_url == "http://192.168.1.5:8850"
+    assert conn.closes == 1
+    # 降級只吼一次，不是每一輪都吼。
+    assert caplog.text.count("無法自動開埠") == 1
+
+
+@pytest.mark.asyncio
+async def test_shutdown_unmaps_a_second_time_when_a_renewal_was_in_flight(
+    tmp_path, monkeypatch
+):
+    """關機時正在飛的續租會在 `unmap_port` 之後才把轉埠重新開回路由器上。
+    收不到那個 thread 的結果（`to_thread` 取消不了它），所以關機末尾再補一次
+    盡力而為的解除。"""
+    monkeypatch.setattr(natmap, "RENEW_SECONDS", 0.01)
+    monkeypatch.setattr(runner_module, "_PEER_RENEW_DRAIN_SECONDS", 0.05)
+    started = threading.Event()
+
+    def _slow_map(**kwargs):
+        started.set()
+        time.sleep(0.3)
+        return _mapping()
+
+    unmapped = []
+    monkeypatch.setattr(natmap, "map_port", _slow_map)
+    monkeypatch.setattr(natmap, "unmap_port", lambda m: unmapped.append(m))
+    loop = _loop_with_peer(tmp_path)
+    loop._peer_mapping = _mapping()
+    loop._peer_renew_task = asyncio.create_task(loop._peer_renew_loop())
+    await asyncio.to_thread(started.wait, 5)
+
+    await loop.shutdown()
+
+    assert len(unmapped) == 2
+    assert loop._peer_mapping is None
+
+
+@pytest.mark.asyncio
+async def test_a_renewal_does_not_start_once_shutdown_has_begun(tmp_path, monkeypatch):
+    monkeypatch.setattr(natmap, "RENEW_SECONDS", 0.01)
+    calls = {"n": 0}
+    monkeypatch.setattr(natmap, "map_port", lambda **kwargs: calls.__setitem__("n", calls["n"] + 1))
+    loop = _loop_with_peer(tmp_path)
+    loop._peer_mapping = _mapping()
+    loop._peer_shutting_down = True
+
+    task = asyncio.create_task(loop._peer_renew_loop())
+    await asyncio.sleep(0.05)
+    task.cancel()
+    try:
+        await task
+    except asyncio.CancelledError:
+        pass
+
+    assert calls["n"] == 0

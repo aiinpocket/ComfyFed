@@ -114,8 +114,9 @@ def _state(tmp_path, peer):
     control.write_state(str(tmp_path), "idle", None, peer=peer)
 
 
-def _probe_args(port: int = 8850) -> argparse.Namespace:
-    return argparse.Namespace(port=port, json=True)
+def _probe_args(port: int = 8850, config: str = "/nonexistent/comfyfed/agent.json") -> argparse.Namespace:
+    # 預設指向一個不存在的設定目錄 ⇒ 沒有 state 檔 ⇒ 沒有在跑的 agent。
+    return argparse.Namespace(port=port, json=True, config=config)
 
 
 def test_status_prints_the_p2p_line_when_sharing_is_on(tmp_path, capsys):
@@ -220,3 +221,32 @@ def test_p2p_probe_is_registered_as_a_subcommand(monkeypatch):
     with pytest.raises(SystemExit) as exc:
         main.cli()
     assert exc.value.code == 1
+
+
+def test_p2p_probe_refuses_while_an_agent_is_running(tmp_path, monkeypatch, capsys):
+    """Fix round 1：探測會**刪掉**它建立的映射。如果 agent 已經在跑，那個
+    映射就是 agent 自己的正式映射 —— 探測會把做種能力關掉。安裝腳本是在
+    啟動 agent 之前跑這個指令的（spec §11），所以拒絕是安全的。"""
+    control.write_state(str(tmp_path), "idle", None)
+    called = []
+    monkeypatch.setattr(natmap, "detect_gateway", lambda: called.append(1) or "192.168.1.1")
+
+    rc = main._cmd_p2p_probe(_probe_args(config=str(tmp_path / "agent.json")))
+
+    assert rc == 1
+    assert json.loads(capsys.readouterr().out.strip()) == {"ok": False, "reason": "agent_running"}
+    # 連路由器都不該碰。
+    assert called == []
+
+
+def test_p2p_probe_ignores_a_stale_state_file(tmp_path, monkeypatch, capsys):
+    """一個被 kill 掉的 agent 留下的 state 檔不該讓探測永遠不能跑。"""
+    control.write_state(str(tmp_path), "idle", None)
+    monkeypatch.setattr(main, "_state_age_seconds", lambda state: 9999.0)
+    monkeypatch.setattr(natmap, "detect_gateway", lambda: "192.168.1.1")
+    monkeypatch.setattr(natmap, "map_port", lambda **kwargs: None)
+
+    rc = main._cmd_p2p_probe(_probe_args(config=str(tmp_path / "agent.json")))
+
+    assert rc == 1
+    assert json.loads(capsys.readouterr().out.strip()) == {"ok": False, "reason": "no_response"}
