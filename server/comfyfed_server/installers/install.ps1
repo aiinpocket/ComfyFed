@@ -798,14 +798,25 @@ if (Test-Path `$ManagedMarker) {
             if ((`$managedProps -contains 'cwd') -and `$managed.cwd -and (Test-Path `$managed.cwd)) {
                 `$comfyCwd = `$managed.cwd
             }
+            # ComfyUI's own output goes to comfyui.log next to agent.log
+            # (overwritten per launch), so a ComfyUI that dies at logon
+            # leaves a reason behind instead of nothing.
+            `$comfyLog = Join-Path `$InstallDir 'comfyui.log'
             if ((`$managedProps -contains 'command_line') -and `$managed.command_line) {
                 # A detected ComfyUI is replayed through its verbatim command
                 # line, so quoting we did not author is never re-quoted.
-                `$comfyArgs = '/c ' + `$managed.command_line
-                Start-Process -FilePath 'cmd.exe' -ArgumentList `$comfyArgs -WorkingDirectory `$comfyCwd -WindowStyle Hidden
+                # cmd /c strips the FIRST and LAST quote of its command when
+                # that command holds more than two quotes (live-caught
+                # 2026-09-18 on POKAI-HOME: the recorded Comfy Desktop line
+                # has four, so cmd ran `D:\...\python.exe"` -> exit 1 and
+                # ComfyUI never came up at logon). Doubling the outer quotes
+                # is cmd's documented rule -- same as the agent line below.
+                `$comfyArgs = '/c "' + `$managed.command_line + ' > "' + `$comfyLog + '" 2>&1"'
             } else {
-                Start-Process -FilePath `$managed.start_exe -ArgumentList `$managed.args -WorkingDirectory `$comfyCwd -WindowStyle Hidden
+                `$quotedArgs = (@(`$managed.args) | ForEach-Object { '"' + `$_ + '"' }) -join ' '
+                `$comfyArgs = '/c ""' + `$managed.start_exe + '" ' + `$quotedArgs + ' > "' + `$comfyLog + '" 2>&1"'
             }
+            Start-Process -FilePath 'cmd.exe' -ArgumentList `$comfyArgs -WorkingDirectory `$comfyCwd -WindowStyle Hidden
             `$deadline = (Get-Date).AddSeconds(180)
             while ((Get-Date) -lt `$deadline) {
                 try {
@@ -843,7 +854,15 @@ do {
 Set-Content -Path $LauncherScript -Value $launcherSource -Encoding UTF8
 
 Write-Bilingual '設定開機自動啟動...' 'Configuring auto-start on logon...'
-$taskCmd = "powershell.exe -NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -File `"$LauncherScript`""
+# Live-caught 2026-09-18 (POKAI-HOME, Windows 11 with Windows Terminal as the
+# default console host): a console app started by Task Scheduler or the Run
+# key gets its window BEFORE `-WindowStyle Hidden` runs, and Windows Terminal
+# ignores that later hide -- so every logon left a black terminal window on
+# the desktop, and closing it killed the launcher. `conhost.exe --headless`
+# hosts the launcher with no window at all, whichever console host is the
+# default. (The installer's own "start now" below is fine: Start-Process
+# passes the hidden state at creation time, which every host honours.)
+$taskCmd = "conhost.exe --headless powershell.exe -NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -File `"$LauncherScript`""
 # `schtasks /SC ONLOGON` requires elevation. A plain (non-admin) terminal is
 # the NORMAL way people run this one-liner (live-caught: the first real
 # install died right here and never reached the start step below), so:

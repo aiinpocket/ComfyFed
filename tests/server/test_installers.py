@@ -1096,3 +1096,92 @@ def test_sh_braces_every_variable_followed_by_fullwidth_punctuation():
         for m in re.finditer(r"\$([A-Za-z_][A-Za-z0-9_]*)([^\x00-\x7f])", line):
             offenders.append((lineno, m.group(0)))
     assert offenders == []
+
+
+def test_ps1_launcher_replays_comfyui_through_cmd_with_doubled_outer_quotes():
+    """Live-caught 2026-09-18 (POKAI-HOME): `cmd /c` strips the FIRST and LAST
+    quote of its command whenever that command holds more than two quotes --
+    and a detected Comfy Desktop command line has four (quoted python.exe,
+    quoted model-paths yaml). The launcher passed it bare, so cmd ran
+    `D:\...\python.exe"` (exit 1) and ComfyUI never came up at logon; the
+    agent then sat "paused / comfyui_unreachable" forever. Both ComfyUI
+    branches must wrap the command in an extra outer pair of quotes (the
+    same rule the agent line already follows) and capture ComfyUI's output
+    to comfyui.log so a ComfyUI that dies at logon leaves a reason behind."""
+    ps1 = open(_source_path("install.ps1"), encoding="utf-8-sig").read()
+    block = _launcher_ps1_block(ps1)
+    assert "`$comfyLog = Join-Path `$InstallDir 'comfyui.log'" in block
+    cl_line = "`$comfyArgs = '/c \"' + `$managed.command_line + ' > \"' + `$comfyLog + '\" 2>&1\"'"
+    args_line = (
+        "`$comfyArgs = '/c \"\"' + `$managed.start_exe + '\" ' + `$quotedArgs"
+        " + ' > \"' + `$comfyLog + '\" 2>&1\"'"
+    )
+    assert cl_line in block
+    assert args_line in block
+    assert "`$comfyArgs = '/c ' + `$managed.command_line" not in block
+    assert "Start-Process -FilePath `$managed.start_exe" not in block
+
+    # Behavioural half: run the launcher's OWN expressions against a real
+    # cmd.exe with a four-quote command line and an argument holding a space.
+    powershell = shutil.which("powershell") or shutil.which("pwsh")
+    if os.name != "nt" or powershell is None:
+        pytest.skip("needs cmd.exe and PowerShell")
+    import tempfile
+    lines = [l.strip().replace("`$", "$") for l in block.splitlines()]
+    expr_cl = next(l for l in lines if l.startswith("$comfyArgs = '/c \"' + $managed.command_line"))
+    expr_quoted = next(l for l in lines if l.startswith("$quotedArgs = "))
+    expr_args = next(l for l in lines if l.startswith("$comfyArgs = '/c \"\"' + $managed.start_exe"))
+    system32 = os.path.join(os.environ["SystemRoot"], "System32")
+    cmd_exe = os.path.join(system32, "cmd.exe")
+    attrib_exe = os.path.join(system32, "attrib.exe")
+    with tempfile.TemporaryDirectory() as td:
+        log = os.path.join(td, "comfyui.log")
+        spaced = os.path.join(td, "two words.txt")
+        open(spaced, "w").write("x")
+        command_line = f'"{cmd_exe}" /c echo hi "two words"'
+        script = "\n".join([
+            f"$comfyLog = '{log}'",
+            "$managed = [pscustomobject]@{",
+            f"    command_line = '{command_line}'",
+            f"    start_exe = '{attrib_exe}'",
+            f"    args = @('{spaced}')",
+            "}",
+            expr_cl,
+            "$p = Start-Process -FilePath 'cmd.exe' -ArgumentList $comfyArgs -WindowStyle Hidden -PassThru -Wait",
+            '"cl_exit=" + $p.ExitCode',
+            '"cl_out=" + (Get-Content $comfyLog -Raw)',
+            expr_quoted,
+            expr_args,
+            "$p = Start-Process -FilePath 'cmd.exe' -ArgumentList $comfyArgs -WindowStyle Hidden -PassThru -Wait",
+            '"args_exit=" + $p.ExitCode',
+            '"args_out=" + (Get-Content $comfyLog -Raw)',
+        ])
+        script_path = os.path.join(td, "probe.ps1")
+        open(script_path, "w", encoding="utf-8").write(script)
+        r = subprocess.run(
+            [powershell, "-NoProfile", "-ExecutionPolicy", "Bypass", "-File", script_path],
+            capture_output=True, text=True, timeout=60,
+        )
+    assert r.returncode == 0, r.stderr
+    assert "cl_exit=0" in r.stdout, r.stdout
+    assert 'cl_out=hi "two words"' in r.stdout, r.stdout
+    assert "args_exit=0" in r.stdout, r.stdout
+    assert "two words.txt" in r.stdout.split("args_out=", 1)[1], r.stdout
+
+
+def test_ps1_autostart_hosts_the_launcher_under_headless_conhost():
+    """Live-caught 2026-09-18 (POKAI-HOME, Windows 11 + Windows Terminal as
+    default console host): a console app started by Task Scheduler or the
+    Run key gets its window BEFORE `-WindowStyle Hidden` runs, and Windows
+    Terminal ignores the later hide -- every logon left a black terminal
+    window on the desktop, and closing it killed the launcher. Both autostart
+    mechanisms must host the launcher under `conhost.exe --headless`, which
+    creates no window on any console host."""
+    text = open(_source_path("install.ps1"), encoding="utf-8-sig").read()
+    task_cmd = (
+        '$taskCmd = "conhost.exe --headless powershell.exe -NoProfile -ExecutionPolicy Bypass'
+        ' -WindowStyle Hidden -File `"$LauncherScript`""'
+    )
+    assert task_cmd in text
+    assert "schtasks /Create /F /TN ComfyFedAgent /SC ONLOGON /TR $taskCmd" in text
+    assert "-Name 'ComfyFedAgent' -Value $taskCmd -PropertyType String -Force" in text
