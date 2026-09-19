@@ -35,7 +35,15 @@ from nacl.signing import SigningKey
 from comfyfed_agent import signing
 from comfyfed_agent.config import PlatformEntry
 from comfyfed_server import agentws, app as app_module
-from comfyfed_server import bootstrap, comfy_frontend, comfyapi, db, dispatch
+from comfyfed_server import (
+    bootstrap,
+    comfy_frontend,
+    comfyapi,
+    db,
+    dispatch,
+    model_fetch,
+    security,
+)
 
 # Deliberately API-format ComfyUI JSON, as the panel's "Queue" button sends:
 # a LoadImage referencing a staged upload, and a SaveImage whose node id keys
@@ -240,6 +248,192 @@ def test_panel_drives_a_job_end_to_end(server, tmp_path):
     )
     assert view.status_code == 200
     assert view.content == ARTIFACT_BYTES
+
+
+# --------------------------------------------- panel "Download" -> model_fetch
+
+# A name the platform has no curated/learned hash for, so the button takes the
+# UNVERIFIED-source path (spec 2026-09-19 §6). `ae.safetensors` -- the spec's
+# motivating example -- is one of the 11 curated models and would take the
+# verified-manifest branch instead, which is not what this test is about.
+FETCH_NAME = "zz_e2e_model.safetensors"
+FETCH_DIR = "vae"
+FETCH_URL = "https://huggingface.co/e2e/x/resolve/main/zz_e2e_model.safetensors"
+FETCH_SIZE = 5
+FETCH_SHA = "ab" * 32
+
+
+def test_panel_download_button_dispatches_model_fetch_job(server, monkeypatch):
+    """The panel's missing-model "Download" button, end to end (spec §12).
+
+    POST /comfy/api/comfyfed/model-fetch -> a `kind=model_fetch` job -> the
+    signed unverified-source entry reaches a real agent connection -> fetch
+    progress is pollable -> `job_done` carrying `fetched_models` teaches the
+    platform the sha256 and mints a NON-billable receipt, with the job never
+    having started (there is no GPU time to bill).
+    """
+    csrf = _login(server)
+    entry = _register_worker(server, csrf, name="fetch-worker")
+    sk = SigningKey(bytes.fromhex(entry.signing_key_hex))
+
+    # The button's HEAD probe (§5.1) -- the only outbound network call the
+    # route makes; it pins `size_bytes` into the signed entry.
+    monkeypatch.setattr(model_fetch, "head_size_bytes", lambda url, **kwargs: FETCH_SIZE)
+
+    with server.websocket_connect("/api/agent/ws") as ws:
+        challenge = ws.receive_json()
+        assert challenge["type"] == "challenge"
+        ws.send_json(
+            {
+                "type": "auth",
+                "worker_id": entry.worker_id,
+                "sig": sk.sign(challenge["nonce"].encode()).signature.hex(),
+            }
+        )
+        assert ws.receive_json()["type"] == "ready"
+
+        # protocol 5 (agent >= 0.1.14) is what makes this worker eligible to be
+        # handed an unverified-source entry at all; `auto_fetch`/`max_fetch_gb`
+        # ride the hello, free disk rides the heartbeat. Empty node list and
+        # empty inventory: a model_fetch job needs no nodes, and the whole
+        # point is that nobody in the federation has this model yet.
+        ws.send_json(
+            {
+                "type": "hello",
+                "hardware": {"vram_gb": 24.0, "gpu_name": "Mock GPU"},
+                "backend": "cuda",
+                "torch_version": "2.4.0",
+                "node_classes": [],
+                "models": [],
+                "protocol": 5,
+                "auto_fetch": True,
+                "max_fetch_gb": 30,
+            }
+        )
+        ws.send_json(
+            {
+                "type": "heartbeat",
+                "state": "idle",
+                "progress": 0.0,
+                "job_id": None,
+                "dynamic": {"free_vram_gb": 20.0, "free_disk_gb": 100.0},
+            }
+        )
+        # A dispatch tick doubles as this harness's "let the server drain the
+        # frames I just sent": it runs on the connection's own event loop.
+        agentws.dispatch_once(entry.worker_id)
+
+        # 1. The button POSTs the missing model's name/directory/url.
+        created = server.post(
+            "/comfy/api/comfyfed/model-fetch",
+            json={"name": FETCH_NAME, "directory": FETCH_DIR, "url": FETCH_URL},
+        )
+        assert created.status_code == 201, created.text
+        assert created.json()["reused"] is False
+        job_id = created.json()["job_id"]
+
+        # 2. Dispatch pushes it as a model_fetch job carrying the signed entry.
+        agentws.dispatch_once(entry.worker_id)
+        job_msg = ws.receive_json()
+        assert job_msg["type"] == "job"
+        assert job_msg["job_id"] == job_id
+        assert job_msg["kind"] == "model_fetch"
+        assert job_msg["workflow_json"] == "{}"
+        assert job_msg["input_assets"] == []
+
+        fetch_models = job_msg["fetch_models"]
+        assert [e["name"] for e in fetch_models] == [FETCH_NAME]
+        pushed = fetch_models[0]
+        assert pushed["unverified"] is True
+        assert pushed["sha256"] is None
+        assert pushed["url"] == FETCH_URL
+        assert pushed["size_bytes"] == FETCH_SIZE
+
+        # The agent's only trust root for an unverified entry: the platform
+        # signed THIS url at THIS size (§6).
+        _platform_sk, platform_vk = security.load_platform_keys(server.data_dir)
+        platform_vk.verify(
+            model_fetch.unverified_payload(
+                FETCH_NAME, FETCH_DIR, FETCH_URL, FETCH_SIZE
+            ).encode(),
+            bytes.fromhex(pushed["sig"]),
+        )
+
+        # 3. Download progress: every heartbeat of the fetch phase carries the
+        # stage, which is also what keeps the job out of the billing clock.
+        ws.send_json(
+            {
+                "type": "heartbeat",
+                "state": "busy",
+                "progress": 0.0,
+                "job_id": job_id,
+                "dynamic": {"free_vram_gb": 20.0, "free_disk_gb": 100.0},
+                "stage": "fetching_models",
+                "fetch_pct": 50.0,
+                "fetch_model": FETCH_NAME,
+            }
+        )
+        agentws.dispatch_once(entry.worker_id)
+
+        status = server.get(f"/comfy/api/comfyfed/model-fetch/{job_id}")
+        assert status.status_code == 200, status.text
+        body = status.json()
+        assert body["stage"] == "fetching_models"
+        assert body["fetch_pct"] == 50.0
+        assert body["fetch_model"] == FETCH_NAME
+        assert body["name"] == FETCH_NAME
+        assert body["worker_id"] == entry.worker_id
+
+        # 4. Done: no artifacts, no exec time, but the measured sha256.
+        ws.send_json(
+            {
+                "type": "job_done",
+                "job_id": job_id,
+                "result_files": [],
+                "exec_seconds": 0,
+                "fetched_models": [
+                    {
+                        "name": FETCH_NAME,
+                        "directory": FETCH_DIR,
+                        "size_bytes": FETCH_SIZE,
+                        "sha256": FETCH_SHA,
+                    }
+                ],
+            }
+        )
+        assert ws.receive_json()["type"] == "receipt"
+
+    final = server.get(f"/comfy/api/comfyfed/model-fetch/{job_id}").json()
+    assert final["status"] == "done"
+    assert final["error"] is None
+    # The transient fetch-progress fields are cleared once the job ends.
+    assert final["stage"] is None
+
+    # 5. The console's job detail shows it as a download, not a run.
+    detail = server.get(f"/api/jobs/{job_id}")
+    assert detail.status_code == 200, detail.text
+    detail_body = detail.json()
+    assert detail_body["kind"] == "model_fetch"
+    assert detail_body["fetch_entry"]["name"] == FETCH_NAME
+    assert detail_body["fetch_entry"]["unverified"] is True
+    # Never ran, so never billed: `started_at` is what a wall-clock basis
+    # would have been measured from.
+    assert detail_body["started_at"] is None
+
+    receipt = detail_body["receipt"]
+    assert receipt is not None
+    assert receipt["kind"] == "model_fetch"
+    assert receipt["billable"] is False
+    assert receipt["basis"] == "model_fetch"
+    assert receipt["gpu_seconds"] == 0
+
+    # 6. And the platform has learned what the file actually is, so the next
+    # worker fetches it as a verified (content-addressed) entry.
+    with db.get_session() as session:
+        row = session.get(db.ModelHash, (FETCH_NAME, FETCH_SIZE))
+        assert row is not None
+        assert row.sha256 == FETCH_SHA
+        assert row.conflict is False
 
 
 # --------------------------------------------------------------- /comfy gate
