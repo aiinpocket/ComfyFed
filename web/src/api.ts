@@ -295,6 +295,13 @@ export interface Job {
    */
   attempts: Record<string, number>;
   /**
+   * Server commit 7e0840d: that worker's LAST error on THIS job (`{worker_id:
+   * message}`, each value already truncated to 200 chars server-side).
+   * Optional -- a payload from before this field existed simply omits it, so
+   * callers should treat a missing value as `{}` rather than crash.
+   */
+  attempt_errors?: Record<string, string>;
+  /**
    * How many times this job has been requeued after a non-final failure.
    * While `status === 'queued'` and `retry_count > 0`, `error` holds the
    * most recent attempt's failure (design §5 -- the field's meaning shifts

@@ -251,6 +251,7 @@
     "requeued_count": "Requeued {{count}} times",
     "attempts_worker": "Worker",
     "attempts_failures": "Failures",
+    "attempts_last_error": "This worker's last error",
     "last_error": "Last error"
   },
   "workers": {

@@ -251,6 +251,7 @@
     "requeued_count": "已重派 {{count}} 次",
     "attempts_worker": "Worker",
     "attempts_failures": "失敗次數",
+    "attempts_last_error": "這台的最後錯誤",
     "last_error": "上次錯誤"
   },
   "workers": {

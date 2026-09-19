@@ -300,19 +300,28 @@ export function JobDetail({ role }: JobDetailProps) {
                       <Table.Tr>
                         <Table.Th>{t('job_detail.attempts_worker')}</Table.Th>
                         <Table.Th>{t('job_detail.attempts_failures')}</Table.Th>
+                        <Table.Th>{t('job_detail.attempts_last_error')}</Table.Th>
                       </Table.Tr>
                     </Table.Thead>
                     <Table.Tbody>
-                      {Object.entries(job.attempts).map(([workerId, failures]) => (
-                        <Table.Tr key={workerId}>
-                          <Table.Td>
-                            <Text size="sm">{workerName.get(workerId) ?? shortId(workerId)}</Text>
-                          </Table.Td>
-                          <Table.Td>
-                            <Text size="sm">{failures}</Text>
-                          </Table.Td>
-                        </Table.Tr>
-                      ))}
+                      {Object.entries(job.attempts).map(([workerId, failures]) => {
+                        const attemptError = (job.attempt_errors ?? {})[workerId];
+                        return (
+                          <Table.Tr key={workerId}>
+                            <Table.Td>
+                              <Text size="sm">{workerName.get(workerId) ?? shortId(workerId)}</Text>
+                            </Table.Td>
+                            <Table.Td>
+                              <Text size="sm">{failures}</Text>
+                            </Table.Td>
+                            <Table.Td>
+                              <Text size="xs" c="dimmed" title={attemptError ?? undefined} lineClamp={2}>
+                                {attemptError ? attemptError.slice(0, 120) : '—'}
+                              </Text>
+                            </Table.Td>
+                          </Table.Tr>
+                        );
+                      })}
                     </Table.Tbody>
                   </Table>
                 )}

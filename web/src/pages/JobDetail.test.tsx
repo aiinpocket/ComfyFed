@@ -321,6 +321,22 @@ describe('JobDetail: attempts (job-retry design 2026-09-19)', () => {
     expect(screen.getAllByText('CUDA out of memory').length).toBeGreaterThan(0);
   });
 
+  it('shows a worker\'s last error from attempt_errors on its attempts row', async () => {
+    const requeuedJob: JobDetailType = {
+      ...BASE_JOB,
+      status: 'queued',
+      error: 'CUDA out of memory',
+      attempts: { A: 2 },
+      attempt_errors: { A: 'boom' },
+      retry_count: 1,
+    };
+    stubFetch(requeuedJob, { workers: [{ ...WORKER, id: 'A' }], role: 'admin' });
+    renderDetail(requeuedJob.id, 'admin');
+
+    expect(await screen.findByText('Attempts')).toBeInTheDocument();
+    expect(screen.getByText('boom')).toBeInTheDocument();
+  });
+
   it('falls back to the id prefix when the worker is unknown (non-admin, no workers list)', async () => {
     const requeuedJob: JobDetailType = {
       ...BASE_JOB,
