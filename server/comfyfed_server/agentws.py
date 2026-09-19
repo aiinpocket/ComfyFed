@@ -871,6 +871,7 @@ class _FailedAttempt:
     """What `_record_failed_attempt` learned about one applied failure."""
 
     attempts: dict[str, int]
+    errors: dict[str, str]
     total: int
     task_key: Optional[str]
     started_at: Optional[datetime]
@@ -903,12 +904,13 @@ def _record_failed_attempt(
             return None
         key = retry.task_key(job)
         started_at = job.started_at
-        new_attempts, _mine, total = retry.bump_attempts(job.attempts, worker_id)
+        new_attempts, _mine, total = retry.bump_attempts(job.attempts, worker_id, error)
         job.attempts = new_attempts
         retry.record_failure(session, worker_id, key, error, job_id, now)
         session.commit()
     return _FailedAttempt(
         attempts=retry.attempts_dict(new_attempts),
+        errors=retry.attempt_errors(new_attempts),
         total=total,
         task_key=key,
         started_at=started_at,
@@ -918,29 +920,25 @@ def _record_failed_attempt(
 def _final_error_summary(attempt: _FailedAttempt, worker_id: str, error: str) -> str:
     """終局失敗時寫進 `jobs.error` 的彙整訊息（`retry.summarize_final_error`）。
 
-    每台 worker 的「最後錯誤」來自 `worker_task_failures[W, task_key]`：那張
-    表是平台唯一存過去每台錯誤的地方（`jobs.attempts` 只存次數）。正在回報
-    的這一台用它手上這個 `error`，因為那就是最新的一筆，不必再讀一次。
+    每台 worker 的「最後錯誤」只來自**這張 job 自己的**
+    `jobs.attempts`（見 `retry._attempt_entries`）。刊初版是從跨 job 累計的
+    `worker_task_failures[W, task_key]` 撃的，那會讓這張 job 的 `error`
+    引用到同簽章的**另一張** job（可能屬於另一個使用者）的錯誤字串 --
+    既誤導診斷（看起來像是這張 job 在那台上的錯誤），錯誤訊息又常含
+    檔名與路徑，是一條很細的跨使用者字串外洩路徑。
+
+    正在回報的這一台用它手上這個 `error`（和已經寫進去的那一筆相同，
+    只是不必再讀一次）。還沒有錯誤字串可引的（舊形狀的 attempts 欄）就只
+    列名字。
 
     顯示名取 `db.Worker.name`；worker 列不見了（或這張 job 的 attempts 裡有
-    已經被硬刪的 id）就退回 id 前 8 字 -- 一個認不出來的 id 也好過整段訊息
-    發不出來。`task_key` 是 None 的舊 job 沒有紀錄可查，其他台就只剩空字串。
+    已經被硬刪的 id）就退回 id 前 8 字 -- 一個認不出來的 id 也好過整段
+    訊息發不出去。
     """
     worker_ids = list(attempt.attempts)
-    last_errors: dict[str, str] = {}
     names: dict[str, str] = {}
     if worker_ids:
         with db.get_session() as session:
-            if attempt.task_key:
-                rows = (
-                    session.query(db.WorkerTaskFailure)
-                    .filter(
-                        db.WorkerTaskFailure.task_key == attempt.task_key,
-                        db.WorkerTaskFailure.worker_id.in_(worker_ids),
-                    )
-                    .all()
-                )
-                last_errors = {row.worker_id: row.last_error or "" for row in rows}
             names = {
                 w.id: (w.name or "")
                 for w in session.query(db.Worker).filter(db.Worker.id.in_(worker_ids)).all()
@@ -949,7 +947,7 @@ def _final_error_summary(attempt: _FailedAttempt, worker_id: str, error: str) ->
     pairs = [
         (
             names.get(wid) or wid[:8],
-            error if wid == worker_id else last_errors.get(wid, ""),
+            error if wid == worker_id else attempt.errors.get(wid, ""),
         )
         for wid in worker_ids
     ]

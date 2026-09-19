@@ -243,6 +243,9 @@ def _job_dict(job: db.Job) -> dict:
         # `retry_count > 0` 的 job，`error` 的意思是「上次錯誤」而不是
         # 「死因」（見 `dispatch.requeue_for_retry`）。
         "attempts": retry.attempts_dict(job.attempts),
+        # per-job 的最後錯誤，不是跨 job 累計的那一個（後者在
+        # `/api/workers` 的 `unsuitable[]` 裡）。沒失敗過的 worker 不會出現。
+        "attempt_errors": retry.attempt_errors(job.attempts),
         "retry_count": job.retry_count or 0,
     }
     # Phase 2.1: transient model-auto-fetch progress (stage/fetch_pct/

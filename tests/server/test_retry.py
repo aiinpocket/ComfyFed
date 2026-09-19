@@ -37,44 +37,81 @@ def test_constants_match_the_spec():
 
 
 def test_bump_attempts_on_an_empty_map():
-    assert retry.bump_attempts("{}", "w1") == ('{"w1": 1}', 1, 1)
+    new_json, mine, total = retry.bump_attempts("{}", "w1", "boom")
+    assert (mine, total) == (1, 1)
+    assert json.loads(new_json) == {"w1": {"failures": 1, "last_error": "boom"}}
 
 
 def test_bump_attempts_accumulates_per_worker_and_totals():
-    first, mine, total = retry.bump_attempts("{}", "w1")
+    first, mine, total = retry.bump_attempts("{}", "w1", "one")
     assert (mine, total) == (1, 1)
-    second, mine, total = retry.bump_attempts(first, "w1")
+    second, mine, total = retry.bump_attempts(first, "w1", "two")
     assert (mine, total) == (2, 2)
-    third, mine, total = retry.bump_attempts(second, "w2")
+    third, mine, total = retry.bump_attempts(second, "w2", "three")
     assert (mine, total) == (1, 3)
-    assert json.loads(third) == {"w1": 2, "w2": 1}
+    assert retry.attempts_dict(third) == {"w1": 2, "w2": 1}
+    # 每台的「最後錯誤」只跟著自己走，不被別台覛掉。
+    assert retry.attempt_errors(third) == {"w1": "two", "w2": "three"}
+
+
+def test_bump_attempts_truncates_the_per_job_last_error():
+    """I2：這個字串最後會進彙整訊息，而彙整訊息會進 `jobs.error`。
+    存的時候就截在 200 字，一段 CUDA traceback 才不會把 job 列擐肥。"""
+    new_json, _mine, _total = retry.bump_attempts("{}", "w1", "x" * 900)
+    assert retry.attempt_errors(new_json) == {"w1": "x" * retry.FINAL_ERROR_CHARS}
 
 
 def test_bump_attempts_tolerates_garbage_json():
     """一列壞掉的 attempts 不能讓 job_failed 整條路徑炸掉 -- 當成空的重算。"""
-    assert retry.bump_attempts("not json", "w1") == ('{"w1": 1}', 1, 1)
-    assert retry.bump_attempts("[1,2]", "w1") == ('{"w1": 1}', 1, 1)
-    assert retry.bump_attempts(None, "w1") == ('{"w1": 1}', 1, 1)
+    for raw in ("not json", "[1,2]", None):
+        new_json, mine, total = retry.bump_attempts(raw, "w1", "boom")
+        assert (mine, total) == (1, 1)
+        assert retry.attempts_dict(new_json) == {"w1": 1}
     # 非數字的值也一樣：那一個 key 當 0 重新起算，其它 key 照舊。
-    new_json, mine, total = retry.bump_attempts('{"w1": "x", "w2": 3}', "w1")
+    new_json, mine, total = retry.bump_attempts('{"w1": "x", "w2": 3}', "w1", "boom")
     assert (mine, total) == (1, 4)
-    assert json.loads(new_json) == {"w1": 1, "w2": 3}
+    assert retry.attempts_dict(new_json) == {"w1": 1, "w2": 3}
+
+
+def test_attempts_written_before_the_envelope_still_read_as_counts():
+    """舊形狀 `{worker_id: n}`（這個功能第一版的寫法）照樣讀得出次數，
+    只是沒有錯誤字串可引。"""
+    assert retry.attempts_dict('{"w1": 2, "w2": 1}') == {"w1": 2, "w2": 1}
+    assert retry.attempt_errors('{"w1": 2}') == {}
+    assert retry.is_excluded_for_job('{"w1": 2}', "w1") is True
+    # 新舊混在同一列也不會爆。
+    mixed = '{"w1": 2, "w2": {"failures": 1, "last_error": "boom"}}'
+    assert retry.attempts_dict(mixed) == {"w1": 2, "w2": 1}
+    assert retry.attempt_errors(mixed) == {"w2": "boom"}
 
 
 def test_is_excluded_for_job_only_at_the_threshold():
     assert retry.is_excluded_for_job("{}", "w1") is False
-    once, _, _ = retry.bump_attempts("{}", "w1")
+    once, _, _ = retry.bump_attempts("{}", "w1", "boom")
     assert retry.is_excluded_for_job(once, "w1") is False
-    twice, _, _ = retry.bump_attempts(once, "w1")
+    twice, _, _ = retry.bump_attempts(once, "w1", "boom")
     assert retry.is_excluded_for_job(twice, "w1") is True
     # 別台不受影響。
     assert retry.is_excluded_for_job(twice, "w2") is False
 
 
+def test_has_failed_job_is_true_from_the_very_first_failure():
+    """I1：`try_readopt` 拿這個判「這台是不是已經失敗過這張 job」--
+    門檻是 1，不是 `MAX_FAILURES_PER_WORKER_PER_JOB`。"""
+    assert retry.has_failed_job("{}", "w1") is False
+    once, _, _ = retry.bump_attempts("{}", "w1", "boom")
+    assert retry.has_failed_job(once, "w1") is True
+    assert retry.has_failed_job(once, "w2") is False
+
+
 def test_attempts_dict_parses_defensively():
-    assert retry.attempts_dict('{"w1": 2}') == {"w1": 2}
+    assert retry.attempts_dict('{"w1": {"failures": 2, "last_error": "e"}}') == {"w1": 2}
     assert retry.attempts_dict("garbage") == {}
     assert retry.attempts_dict(None) == {}
+    assert retry.attempt_errors("garbage") == {}
+    # 壞掉的 envelope（沒有 failures、error 不是字串）不會炸。
+    assert retry.attempts_dict('{"w1": {"last_error": "e"}}') == {}
+    assert retry.attempt_errors('{"w1": {"failures": 1, "last_error": 5}}') == {}
 
 
 # --- summarize_final_error --------------------------------------------------

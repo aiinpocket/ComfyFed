@@ -4555,7 +4555,7 @@ def test_job_done_fetched_models_ignored_for_a_prompt_job(client):
 # --- 2026-09-19 job-retry：失敗改派＋不適任紀錄 -----------------------------
 
 
-def _exhaust_attempts(job_id, spent=None, spender="ghost-worker"):
+def _exhaust_attempts(job_id, spent=None, spender="ghost-worker", error="spent elsewhere"):
     """把 `jobs.attempts` 先撐到「再失敗一次就達 `MAX_JOB_ATTEMPTS`」。
 
     釘「終局」行為的測試用它跳過前面幾輪 requeue -- 那幾輪由本節自己的
@@ -4565,7 +4565,9 @@ def _exhaust_attempts(job_id, spent=None, spender="ghost-worker"):
 
     spent = retry.MAX_JOB_ATTEMPTS - 1 if spent is None else spent
     with db.get_session() as session:
-        session.get(db.Job, job_id).attempts = json.dumps({spender: spent})
+        session.get(db.Job, job_id).attempts = json.dumps(
+            {spender: {"failures": spent, "last_error": error}}
+        )
         session.commit()
 
 
@@ -4628,7 +4630,10 @@ def test_job_failed_requeues_instead_of_failing(client, monkeypatch):
     assert job.last_worker_id == worker_id
     assert job.error == "boom"
     assert job.retry_count == 1
-    assert json.loads(job.attempts) == {worker_id: 1}
+    from comfyfed_server import retry as _retry
+
+    assert _retry.attempts_dict(job.attempts) == {worker_id: 1}
+    assert _retry.attempt_errors(job.attempts) == {worker_id: "boom"}
 
     with db.get_session() as session:
         receipts = session.query(db.Receipt).all()
@@ -4641,6 +4646,8 @@ def test_job_failed_requeues_instead_of_failing(client, monkeypatch):
 def test_two_failures_on_one_worker_send_the_job_to_another(client):
     """頭條情境：唯一在線的那台一直失敗，另一台（註冊了但從來沒連過線、
     在平台眼中是 offline）其實才跑得動。A 失敗兩次後這張 job 只能給 B。"""
+    from comfyfed_server import retry as retry_mod
+
     csrf = _login(client)
     worker_a, sk_a = _register_worker(client, csrf, "wa")
     worker_b, sk_b = _register_worker(client, csrf, "wb")
@@ -4659,7 +4666,7 @@ def test_two_failures_on_one_worker_send_the_job_to_another(client):
             ws_a.receive_json()  # failure receipt
             job = _job_row(job_id)
             assert job.status == "queued", "attempt %d must not be terminal" % expected
-            assert json.loads(job.attempts) == {worker_a: expected}
+            assert retry_mod.attempts_dict(job.attempts) == {worker_a: expected}
             assert job.retry_count == expected
 
         # A 現在對這張 job 出局。A 仍然 idle 且連著線，但下一輪只能給 B。
@@ -4725,8 +4732,11 @@ def test_reaching_the_attempt_cap_fails_the_job_with_a_summary(client):
     _register_worker(client, csrf, "wc")
     job_id = _submit(client, csrf)
     key = _job_row(job_id).signature
-    _exhaust_attempts(job_id, spent=5, spender=worker_b)
-    _seed_unsuitable(worker_b, key, failures=5, error="wb exploded")
+    _exhaust_attempts(job_id, spent=5, spender=worker_b, error="wb exploded")
+    # 跨 job 累計的那張表不再是彙整訊息的來源（見
+    # test_final_summary_never_quotes_another_jobs_error），這裡還是穮一列，
+    # 確保它真的沒被讀到。
+    _seed_unsuitable(worker_b, key, failures=5, error="from another job")
 
     ws = _connect(client, worker_a, sk_a)
     try:
@@ -4744,6 +4754,7 @@ def test_reaching_the_attempt_cap_fails_the_job_with_a_summary(client):
     assert "failed on 2 workers after 6 attempts" in job.error
     assert "wb: wb exploded" in job.error
     assert "wa: wa exploded" in job.error
+    assert "from another job" not in job.error
 
 
 def test_the_only_worker_being_excluded_fails_the_job_immediately(client):
@@ -4858,3 +4869,197 @@ def test_jobs_api_exposes_attempts_and_retry_count(client):
     detail = client.get("/api/jobs/%s" % job_id, headers={"X-CSRF": csrf}).json()
     assert detail["attempts"] == {worker_id: 2}
     assert detail["retry_count"] == 2
+
+
+# --- Fix round 1 / I1：requeue 之後的 job 不得被失敗的那台 readopt 回去 -----
+
+
+def test_job_done_after_a_retry_requeue_is_rejected(client):
+    """I1：`requeue_for_retry` 刻意留下 `status=queued AND last_worker_id=W`
+    （spec §5），而 `try_readopt` 本來只看這兩個條件 —— 於是一台**還連著線**
+    的 worker 只要先送 `job_failed` 再送 `job_done`，就能把自己剛失敗掉的
+    job 吃回去、標成 done、鑄出一張**計費**收據，順便清掉自己那列不適任
+    紀錄。那台不必真的斷線 90 秒，這是它自己造得出來的狀態。
+
+    修法後：job 仍 `queued`、沒有 completed 收據（只有 job_failed 那一張非
+    計費的）、不適任紀錄原封不動，而且那台會收到 `job_cancelled`。
+    """
+    csrf = _login(client)
+    worker_id, sk = _register_worker(client, csrf, "wa")
+    _register_worker(client, csrf, "wb")  # 讓 `_any_possible_worker` 為真 -> 走 requeue
+    job_id = _submit(client, csrf)
+    key = _job_row(job_id).signature
+    assert key
+
+    ws = _connect(client, worker_id, sk)
+    try:
+        # protocol 2：`job_cancelled` 只推給聽得懂它的 agent。
+        _send_hello_v2(ws)
+        ws.send_json({"type": "heartbeat", "state": "idle", "progress": 0.0, "job_id": None, "dynamic": {}})
+        agentws.dispatch_once(worker_id)
+        assert ws.receive_json()["type"] == "job"
+        ws.send_json({"type": "heartbeat", "state": "busy", "progress": 0.1, "job_id": job_id, "dynamic": {}})
+        agentws.dispatch_once(worker_id)
+
+        ws.send_json({"type": "job_failed", "job_id": job_id, "error": "boom"})
+        agentws.dispatch_once(worker_id)
+        assert ws.receive_json()["type"] == "receipt"  # 非計費失敗收據
+        assert _job_row(job_id).status == "queued"
+
+        # 同一台立刻回頭說「其實我做完了」。
+        ws.send_json({"type": "job_done", "job_id": job_id, "result_files": ["forged.png"]})
+        agentws.dispatch_once(worker_id)
+
+        assert job_id in agentws._connections[worker_id].cancelled_jobs_sent
+        assert ws.receive_json() == {"type": "job_cancelled", "job_id": job_id}
+    finally:
+        ws.close()
+
+    job = _job_row(job_id)
+    assert job.status == "queued"
+    assert job.worker_id is None
+    assert json.loads(job.result_files) == []
+
+    with db.get_session() as session:
+        receipts = session.query(db.Receipt).all()
+    assert [(r.kind, r.billable) for r in receipts] == [("failed", False)]
+    # 它的不適任紀錄不會因為這則偽 job_done 被清掉。
+    assert _failure_rows() == {(worker_id, key): 1}
+
+
+def test_an_excluded_worker_cannot_readopt_the_job_it_failed_twice(client):
+    """同一個洞最嚴重的形狀：已經因為 `failed_twice_on_job` 出局的那台，
+    不得靠 `job_done` 把 job 吃回去 —— 那會整個繞過排除。"""
+    csrf = _login(client)
+    worker_id, sk = _register_worker(client, csrf, "wa")
+    _register_worker(client, csrf, "wb")
+    job_id = _submit(client, csrf)
+
+    ws = _connect(client, worker_id, sk)
+    try:
+        for index in (1, 2):
+            ws.send_json(
+                {"type": "heartbeat", "state": "idle", "progress": 0.0, "job_id": None, "dynamic": {}}
+            )
+            agentws.dispatch_once(worker_id)
+            assert ws.receive_json()["type"] == "job"
+            ws.send_json({"type": "job_failed", "job_id": job_id, "error": "boom %d" % index})
+            agentws.dispatch_once(worker_id)
+            assert ws.receive_json()["type"] == "receipt"
+
+        from comfyfed_server import retry as _retry
+
+        assert _retry.attempts_dict(_job_row(job_id).attempts).keys() == {worker_id}
+        ws.send_json({"type": "job_done", "job_id": job_id, "result_files": ["forged.png"]})
+        agentws.dispatch_once(worker_id)
+    finally:
+        ws.close()
+
+    job = _job_row(job_id)
+    assert job.status == "queued"
+    with db.get_session() as session:
+        assert session.query(db.Receipt).filter(db.Receipt.kind == "completed").count() == 0
+
+
+def test_a_stale_blip_readoption_still_works_for_a_job_with_no_failures(client):
+    """回歸護欄：I1 的修法不得動到既有的 blip 再認領。一台**沒有**失敗過這張
+    job 的 worker，被 `requeue_stale` 放開之後照樣認得回來 —— 包括那張
+    job 還停在 `assigned`（從沒送過 busy 心跳，所以 `started_at` 是 NULL）
+    的情形，那正是「`started_at IS NOT NULL` 這個判別式不成立」的那一格。
+    """
+    csrf = _login(client)
+    worker_id, sk = _register_worker(client, csrf, "wa")
+    job_id = _submit(client, csrf)
+
+    ws = _connect(client, worker_id, sk)
+    try:
+        ws.send_json({"type": "heartbeat", "state": "idle", "progress": 0.0, "job_id": None, "dynamic": {}})
+        agentws.dispatch_once(worker_id)
+        assert ws.receive_json()["type"] == "job"
+
+        # 從沒 mark_running -> started_at 還是 NULL；模擬斷線被掃回佇列。
+        with db.get_session() as session:
+            job = session.get(db.Job, job_id)
+            assert job.started_at is None
+            job.status = "queued"
+            job.last_worker_id = worker_id
+            job.worker_id = None
+            session.commit()
+
+        ws.send_json({"type": "job_done", "job_id": job_id, "result_files": ["out.png"]})
+        agentws.dispatch_once(worker_id)
+    finally:
+        ws.close()
+
+    job = _job_row(job_id)
+    assert job.status == "done"
+    assert json.loads(job.result_files) == ["out.png"]
+
+
+# --- Fix round 1 / I2：彙整訊息只引用這張 job 自己的錯誤 --------------------
+
+
+def test_final_summary_never_quotes_another_jobs_error(client):
+    """I2：每台 worker 的「最後錯誤」本來是從跨 job 累計的
+    `worker_task_failures[W, task_key]` 撈的，所以終局訊息可能引用到**同簽章
+    的另一張 job**（可能屬於另一個使用者）的錯誤字串。錯誤訊息常含檔名／
+    路徑，那是一條很細的跨使用者外流路徑，也會誤導診斷。
+
+    現在每台的最後錯誤和計次一起存在這張 job 自己的 `attempts` 欄裡，所以
+    別張 job 的字串永遠進不來。
+    """
+    csrf = _login(client)
+    worker_a, sk_a = _register_worker(client, csrf, "wa")
+    worker_b, _sk_b = _register_worker(client, csrf, "wb")
+    _register_worker(client, csrf, "wc")
+    job_id = _submit(client, csrf)
+    key = _job_row(job_id).signature
+
+    # B 在**別張** job 上留下的跨 job 紀錄，含一個不該外流的路徑字串。
+    _seed_unsuitable(worker_b, key, failures=5, error="/home/someone-else/secret.safetensors")
+    # 這張 job 自己的紀錄：B 在這裡的錯誤是別的。
+    with db.get_session() as session:
+        job = session.get(db.Job, job_id)
+        job.attempts = json.dumps(
+            {worker_b: {"failures": 5, "last_error": "wb failed on THIS job"}}
+        )
+        session.commit()
+
+    ws = _connect(client, worker_a, sk_a)
+    try:
+        ws.send_json({"type": "heartbeat", "state": "idle", "progress": 0.0, "job_id": None, "dynamic": {}})
+        agentws.dispatch_once(worker_a)
+        assert ws.receive_json()["type"] == "job"
+        ws.send_json({"type": "job_failed", "job_id": job_id, "error": "wa exploded"})
+        agentws.dispatch_once(worker_a)
+    finally:
+        ws.close()
+
+    job = _job_row(job_id)
+    assert job.status == "failed"
+    assert "wb: wb failed on THIS job" in job.error
+    assert "wa: wa exploded" in job.error
+    assert "secret.safetensors" not in job.error
+
+
+def test_attempt_errors_are_recorded_per_job_and_exposed_by_the_api(client):
+    """§8 的 API 形狀：`attempts` 維持 `{worker_id: 次數}`，per-worker 的
+    最後錯誤放在新的 `attempt_errors: {worker_id: 錯誤}`。"""
+    csrf = _login(client)
+    worker_id, sk = _register_worker(client, csrf, "wa")
+    _register_worker(client, csrf, "wb")
+    job_id = _submit(client, csrf)
+
+    ws = _connect(client, worker_id, sk)
+    try:
+        ws.send_json({"type": "heartbeat", "state": "idle", "progress": 0.0, "job_id": None, "dynamic": {}})
+        agentws.dispatch_once(worker_id)
+        assert ws.receive_json()["type"] == "job"
+        ws.send_json({"type": "job_failed", "job_id": job_id, "error": "boom"})
+        agentws.dispatch_once(worker_id)
+    finally:
+        ws.close()
+
+    detail = client.get("/api/jobs/%s" % job_id, headers={"X-CSRF": csrf}).json()
+    assert detail["attempts"] == {worker_id: 1}
+    assert detail["attempt_errors"] == {worker_id: "boom"}

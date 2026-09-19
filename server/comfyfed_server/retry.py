@@ -44,12 +44,21 @@ LAST_ERROR_CHARS = 500
 # --- 純函式層 --------------------------------------------------------------
 
 
-def attempts_dict(attempts_json: Optional[str]) -> dict[str, int]:
-    """`jobs.attempts` 的防禦式解析：`{worker_id: failures}`。
+def _attempt_entries(attempts_json):
+    """`jobs.attempts` 的防禦式解析，回 `{worker_id: (failures, last_error)}`。
 
-    壞掉的 JSON、不是物件、值不是正整數的 key，一律當「沒有那一筆」。一列壞
-    資料絕不能讓 `job_failed` 整條路徑炸掉 -- 那會讓 job 卡在 `running` 永遠
-    等不到任何轉移。
+    欄位內容是 `{worker_id: {"failures": n, "last_error": str}}` --
+    per-job 的計數**跟**那台在這張 job 上的最後一個錯誤。錯誤存在
+    job 自己身上而不是跨 job 累計的 `worker_task_failures`，是因為
+    終局訊息會被寫進這張 job 的 `error` 給這張 job 的擁有者看：
+    引用別張 job（可能是別人的）的錯誤字串既誤導診斷，錯誤訊息
+    又常含檔名與路徑，那是一條很細的跨使用者外洩路徑。
+
+    寬容兩種寫法：舊形狀的純數字（`{worker_id: n}`，這個功能第一
+    版的欄位內容）照樣讀得出次數，只是沒有錯誤字串可引。
+    壞掉的 JSON、不是物件、key 不是字串、值不是正整數的，一律當「沒有
+    那一筆」-- `job_failed` 是唯一能把 job 從 `running` 推走的路徑，一列
+    壞資料在這裡丟例外會讓那張 job 永遠卡住。
     """
     try:
         value = json.loads(attempts_json or "{}")
@@ -57,32 +66,85 @@ def attempts_dict(attempts_json: Optional[str]) -> dict[str, int]:
         return {}
     if not isinstance(value, dict):
         return {}
-    result: dict[str, int] = {}
-    for key, count in value.items():
+
+    result: dict[str, tuple[int, Optional[str]]] = {}
+    for key, entry in value.items():
         if not isinstance(key, str):
             continue
+        if isinstance(entry, dict):
+            count = entry.get("failures")
+            error = entry.get("last_error")
+            if not isinstance(error, str):
+                error = None
+        else:
+            count = entry
+            error = None
         if not isinstance(count, int) or isinstance(count, bool) or count < 0:
             continue
-        result[key] = count
+        result[key] = (count, error)
     return result
 
 
-def bump_attempts(attempts_json: Optional[str], worker_id: str) -> tuple[str, int, int]:
-    """`worker_id` 對這張 job 再失敗一次。
+def attempts_dict(attempts_json: Optional[str]) -> dict[str, int]:
+    """`{worker_id: failures}` -- 排除判定與 API 一直以來的形狀。"""
+    return {key: count for key, (count, _error) in _attempt_entries(attempts_json).items()}
+
+
+def attempt_errors(attempts_json: Optional[str]) -> dict[str, str]:
+    """`{worker_id: last_error}`，只含真的有存到錯誤字串的那幾台。
+
+    終局彙整訊息的唯一來源（見 `_attempt_entries`），也是 `/api/jobs*`
+    新的 `attempt_errors` 欄。
+    """
+    return {
+        key: error
+        for key, (_count, error) in _attempt_entries(attempts_json).items()
+        if error is not None
+    }
+
+
+def bump_attempts(
+    attempts_json: Optional[str], worker_id: str, error: Optional[str] = None
+) -> tuple[str, int, int]:
+    """`worker_id` 對這張 job 再失敗一次，順手記下它這一次的錯誤。
 
     回 `(new_json, this_worker_failures, total)`：新的 JSON 字串（直接寫回
-    `jobs.attempts`）、這台 worker 現在的失敗次數、以及所有 worker 的總失敗
-    次數（拿去和 `MAX_JOB_ATTEMPTS` 比）。
+    `jobs.attempts`）、這台 worker 現在的失敗次數、以及所有 worker 的總
+    失敗次數（拿去和 `MAX_JOB_ATTEMPTS` 比）。
+
+    錯誤存進去之前先截 `FINAL_ERROR_CHARS` 字：它最後會進終局彙整
+    訊息，而那個訊息會進 `jobs.error`，一段 CUDA traceback 可以有好幾 KB。
+    不傳 `error`（或傳 None）就只加一次計數，保留舊的錯誤字串。
     """
-    attempts = attempts_dict(attempts_json)
-    attempts[worker_id] = attempts.get(worker_id, 0) + 1
-    total = sum(attempts.values())
-    return json.dumps(attempts), attempts[worker_id], total
+    entries = _attempt_entries(attempts_json)
+    previous_count, previous_error = entries.get(worker_id, (0, None))
+    stored_error = previous_error if error is None else error[:FINAL_ERROR_CHARS]
+    entries[worker_id] = (previous_count + 1, stored_error)
+
+    payload: dict[str, dict] = {}
+    for key, (count, last_error) in entries.items():
+        row: dict = {"failures": count}
+        if last_error is not None:
+            row["last_error"] = last_error
+        payload[key] = row
+
+    total = sum(count for count, _error in entries.values())
+    return json.dumps(payload), entries[worker_id][0], total
 
 
 def is_excluded_for_job(attempts_json: Optional[str], worker_id: str) -> bool:
     """這台 worker 對這張 job 是不是已經出局（失敗達 `MAX_FAILURES_...`）。"""
     return attempts_dict(attempts_json).get(worker_id, 0) >= MAX_FAILURES_PER_WORKER_PER_JOB
+
+
+def has_failed_job(attempts_json: Optional[str], worker_id: str) -> bool:
+    """這台 worker 對這張 job 失敗過嗎（哪怕只有一次）？
+
+    `dispatch.try_readopt` 的守衛：門檻是 1，不是
+    `MAX_FAILURES_PER_WORKER_PER_JOB` -- 「斷線了又回來」的信任窗口不該給
+    一台已經親口說過「這張我跑失敗了」的 worker。見那邊的說明。
+    """
+    return worker_id in _attempt_entries(attempts_json)
 
 
 def unsuitable_reason(key: str) -> str:

@@ -1340,3 +1340,63 @@ def test_assign_jobs_prefers_the_worker_that_is_not_excluded(_db):
         [worker_a, worker_b], exclusions=frozenset({(worker_a, job_id)})
     )
     assert [(w, j.id) for w, j in assignments] == [(worker_b, job_id)]
+
+
+# --- Fix round 1 / I1：try_readopt 不得讓失敗過的那台把 job 吃回去 -----
+
+
+def test_try_readopt_refuses_a_job_this_worker_failed_and_never_started(_db):
+    """`requeue_for_retry` 留下的狀態恰好是 `try_readopt` 本來的比對條件
+    （queued + last_worker_id == W），而那台還連著線 -- 不擋的話它只要
+    「先 job_failed 再 job_done」就能重新取得所有權。
+    判別式：`requeue_for_retry` 一定清掉 `started_at`，而它一定跟在
+    一次 attempts 計數之後；`requeue_stale` 兩者都不碰。
+    """
+    worker_id = _make_worker("w1")
+    job_id = _make_job("j1", status="running", worker_id=worker_id)
+    with db.get_session() as session:
+        job = session.get(db.Job, job_id)
+        job.started_at = _utcnow()
+        job.attempts = json.dumps({worker_id: {"failures": 1, "last_error": "boom"}})
+        session.commit()
+
+    assert dispatch.requeue_for_retry(job_id, worker_id, "boom") is True
+    assert dispatch.try_readopt(job_id, worker_id) is False
+
+    with db.get_session() as session:
+        job = session.get(db.Job, job_id)
+        assert job.status == "queued"
+        assert job.worker_id is None
+
+
+def test_try_readopt_still_works_for_a_stale_blip_without_started_at(_db):
+    """回歸護欄：`requeue_stale` 掃的是 assigned 跟 running 兩種，而
+    assigned 的 job `started_at` 是 NULL -- 所以「`started_at IS NOT NULL`」
+    不是合格的判別式，這一格必須繼續認得回來。"""
+    worker_id = _make_worker("w1")
+    job_id = _make_job("j1", status="assigned", worker_id=worker_id)
+
+    requeued = dispatch.requeue_stale(_utcnow() + timedelta(seconds=10_000))
+    assert requeued == [job_id]
+    with db.get_session() as session:
+        assert session.get(db.Job, job_id).started_at is None
+
+    assert dispatch.try_readopt(job_id, worker_id) is True
+    with db.get_session() as session:
+        job = session.get(db.Job, job_id)
+        assert (job.status, job.worker_id) == ("assigned", worker_id)
+
+
+def test_try_readopt_still_works_for_a_worker_that_failed_but_then_really_ran(_db):
+    """失敗過一次、被改派回同一台、這一次真的跑起來了
+    （`started_at` 有值），然後才斷線被 `requeue_stale` 掃回佇列 --
+    這是真的 blip，它手上有真的結果，認得回來。"""
+    worker_id = _make_worker("w1")
+    job_id = _make_job("j1", status="queued", last_worker_id=worker_id)
+    with db.get_session() as session:
+        job = session.get(db.Job, job_id)
+        job.started_at = _utcnow()
+        job.attempts = json.dumps({worker_id: {"failures": 1, "last_error": "boom"}})
+        session.commit()
+
+    assert dispatch.try_readopt(job_id, worker_id) is True

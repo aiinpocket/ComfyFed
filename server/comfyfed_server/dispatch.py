@@ -512,8 +512,55 @@ def try_readopt(job_id: str, worker_id: str) -> bool:
     `status == "queued"` in the same statement that flips it, so a concurrent
     dispatch_tick claiming the job first (rowcount 0) is detected rather than
     the two writers silently clobbering each other.
+
+    2026-09-19 job-retry — the THIRD condition, and the reason it exists:
+    before that feature, `status == "queued" AND last_worker_id == W` could
+    only ever be produced by `requeue_stale`, i.e. by W actually vanishing for
+    90 seconds. `requeue_for_retry` now produces exactly the same pair
+    deliberately (spec §5 requires `last_worker_id = W`), while W is still
+    connected — so without a guard, a worker could send `job_failed` and then
+    `job_done` for the same job, re-adopt it here, have it marked `done`, mint
+    a BILLABLE receipt for work it just said it could not do, and clear its own
+    unsuitable record. Worse, it could do that after being excluded by
+    `failed_twice_on_job`, bypassing the exclusion entirely. Unlike the stale
+    path, that is a state the worker can manufacture on demand.
+
+    The discriminator is `(this worker has already failed this job) AND
+    (it never reported starting this time)`:
+
+    * `requeue_for_retry` ALWAYS runs right after an attempt was counted
+      (`agentws._record_failed_attempt`), so W is in `attempts`, and it ALWAYS
+      clears `started_at` — both halves hold on every retry requeue, so the
+      attack is blocked in every case.
+    * `requeue_stale` writes NEITHER, so an ordinary blip re-adoption is
+      completely unaffected.
+
+    `started_at IS NOT NULL` alone would NOT have been a sound test, which is
+    why both halves are needed: `requeue_stale` sweeps `assigned` jobs too,
+    and an `assigned` job has no `started_at` (only `mark_running` sets one),
+    so that condition on its own would refuse a legitimate blip from a worker
+    that went quiet before its first busy heartbeat. The only re-adoption this
+    pair gives up is one by a worker that both failed this job before AND never
+    reported starting it this time — which has no result worth trusting
+    anyway, and simply means the job is dispatched again.
+
+    The check reads the row first because `attempts` is JSON the database
+    cannot filter on; the atomic `WHERE` below is unchanged and still settles
+    any race with a concurrent claim.
     """
     with db.get_session() as session:
+        job = session.get(db.Job, job_id)
+        if job is None:
+            return False
+        if job.started_at is None and retry.has_failed_job(job.attempts, worker_id):
+            logger.info(
+                "dispatch: refusing to re-adopt job %s for worker %s -- it already failed "
+                "this job and never reported starting it",
+                job_id,
+                worker_id,
+            )
+            return False
+
         result = session.execute(
             update(db.Job)
             .where(
