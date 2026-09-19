@@ -44,7 +44,7 @@
 
 明文格式：`cft_` + 32 bytes `secrets.token_urlsafe`（43 字）。常數 `API_TOKEN_TTL_DAYS = 30`、`API_TOKEN_MAX_ACTIVE_PER_USER = 10`、`API_TOKEN_PREFIX = "cft_"`。
 
-### 4.2 端點（皆需 **cookie session**＋CSRF；bearer 不能管理 token）
+### 4.2 端點（皆需 **cookie session**；POST／DELETE 另需 CSRF，GET 不需；bearer 不能管理 token）
 
 - `POST /api/auth/tokens` body `{"name": "..."}`（可省）→ `201 {"id","name","token","prefix","created_at","expires_at"}`。`token` 只在這一次回應出現。超過 10 個有效 token → `409 {"error":{"code":"auth.too_many_tokens"}}`。`name` > 64 字 → 400 `auth.bad_token_name`。
 - `GET /api/auth/tokens` → `[{"id","name","prefix","created_at","expires_at","last_used_at","revoked_at","active": bool}]`（只列自己的；`active` = 未撤銷且未過期）。
@@ -52,7 +52,7 @@
 
 ### 4.3 認證解析
 
-`Authorization: Bearer cft_...` 在下列地方等價於 session（使用者身分、角色皆來自 `users` 列，即時讀）：Python `require_user`／`require_admin`／`require_csrf_user`／`require_csrf`；cloud `resolveAuthedSession` 餵的四個 middleware。順序：**有 `Authorization` header 就只看 header**（不回退 cookie；避免混用時的混淆）；header 格式錯、找不到、已撤銷、已過期、epoch 不符、使用者停用 → 401 `auth.unauthorized`（與 cookie 失敗同碼，不區分原因）。bearer 請求 **跳過 CSRF**（CSRF 防的是瀏覽器跨站帶 cookie；header 不會被跨站帶）。
+`Authorization: Bearer cft_...` 在下列地方等價於 session（使用者身分、角色皆來自 `users` 列，即時讀）：Python `require_user`／`require_admin`／`require_csrf_user`／`require_csrf`；cloud `resolveAuthedSession` 餵的四個 middleware。順序：**有 `Authorization` header 就只看 header**（不回退 cookie；避免混用時的混淆）；header 格式錯、找不到、已撤銷、已過期、epoch 不符、使用者停用 → 401 `auth.required`（與 cookie 失敗同碼，不區分原因）。bearer 請求 **跳過 CSRF**（CSRF 防的是瀏覽器跨站帶 cookie；header 不會被跨站帶）。
 
 `GET /api/auth/me` 以 bearer 呼叫：`{"authenticated":true, "username","role","lang","platform_url", "csrf": null, "auth":"token", "token_expires_at": ...}`；cookie 呼叫多一個 `"auth":"session"`。
 
@@ -170,3 +170,29 @@ server 名稱 `comfyfed`，`instructions` 給 AI 一段中英雙語摘要：先 
 ## 11. 部署
 
 Alembic 新 head；D1 `0013_api_tokens.sql`；push main → 手動 `npm run deploy`（Workers Builds 不可靠）；agent 0.1.15 wheel 發佈（R2 put ＋ console 登入態 POST `agent-release`）。
+
+## 12. 增補（2026-09-20）：預設配方一律用支援 NSFW 的模型組合
+
+使用者指示：「把 comfyfed 的預設流程都套用支持 NSFW 的組合的模型」。官方 Flux dev 權重迴避露骨內容，不能當預設。
+
+### 12.1 配方清單與順序
+
+`GET /api/recipes` 依配方檔的 `order` 欄位升冪回傳；AI 客戶端把第一個當預設。每個配方多兩個欄位：`order`（整數）與 `nsfw_ok`（布林，權重本身不審查才為 true）。
+
+| order | id | 用途 | 模型（全部為本機或官方範本實測組合） |
+|---|---|---|---|
+| 10 | `chroma-t2i` | 文生圖（預設） | UNET `Chroma1-HD-fp8mixed.safetensors`（Flux 架構、無審查；來源 `https://huggingface.co/Comfy-Org/Chroma1-HD_repackaged/resolve/main/split_files/diffusion_models/Chroma1-HD-fp8mixed.safetensors`，9 193 379 316 bytes）、`CLIPLoader type=chroma` 載 `t5xxl_fp16.safetensors`、VAE `ae.safetensors`。圖照官方範本 `image_chroma_text_to_image`：`T5TokenizerOptions(min_padding 1, min_length 0)`、`CLIPTextEncode` 正／負、`CFGGuider(cfg)`、`ModelSamplingAuraFlow(shift 1)`、`KSamplerSelect euler`、`BasicScheduler beta/steps/denoise 1`、`RandomNoise(seed)`、`EmptySD3LatentImage`、`SamplerCustomAdvanced`、`VAEDecode`、`SaveImage "comfyfed_recipe"`。 |
+| 20 | `h3-t2v` | 文生影片（含音訊） | 官方範本 `video_minimax_h3_t2v` 的子圖，但 `CLIPLoader type=minimax` 改載 `qwen3vl_32b_heretic_minimax_h3_nvfp4.safetensors`（無審查版）；UNET `minimax_h3_fl2va_pruned_int8_convrot`、LoRA `minimax_h3_fl2v_turbo_8step_v1.0_comfyui_bf16`（強度 1）、VAE `minimax_h3_video_vae_fp16`＋`minimax_h3_audio_vae_fp32`、`MiniMaxH3ImageToVideo`（不接圖 = 純文字）、`KSamplerSelect res_multistep`、`BasicScheduler simple/steps 8/denoise 1`、`BasicGuider`、`RandomNoise(seed)`、`SamplerCustomAdvanced`、`VAEDecode`＋`VAEDecodeAudio`、`CreateVideo(fps 24)`、`SaveVideo "video/comfyfed_recipe"`。長度（幀數）= `max(5, round(seconds*24)) + (5 - (max(5, round(seconds*24)) % 17)) % 17`，由伺服器在渲染前算好填入（範本用 ComfyMathExpression 節點算，配方改為伺服器算，圖裡只放整數）。 |
+| 30 | `flux-t2i` | 文生圖（官方權重，保留供對照） | 不變；`nsfw_ok: false`。 |
+
+參數：
+- `chroma-t2i`：`prompt`（必填）、`negative`（預設 = 官方範本的負向句）、`width`/`height`（預設 1024，256–2048，step 16）、`steps`（預設 26，1–60）、`cfg`（預設 3.5，0–20）、`seed`（-1 隨機）。
+- `h3-t2v`：`prompt`（必填）、`seconds`（預設 5，1–10，number）、`width`/`height`（預設 1280×720，step 32，256–1536）、`steps`（預設 8，1–20）、`seed`（-1 隨機）。渲染時新增衍生值 `length`（依上式）；`params` 回傳裡也帶 `length`。
+
+### 12.2 缺模型自動下載（`model_sources`）
+
+配方檔可列 `model_sources: [{"name","directory","url"}]`（`url` 須在 `model_fetch.TRUSTED_ORIGINS` 內）。`POST /api/recipes/{id}/run` 建單**之前**：對每個 `model_sources` 項目，若沒有任何未刪除、未停用的 worker 的 `model_inventory` 持有 `directory/name`，就呼叫 `model_fetch.create_fetch_job(name, directory, url, user_id)`（既有去重、既有 HEAD 探測；`FetchRequestError` 只記 log，不擋建單）。回應多一欄 `model_fetch_jobs: [{name, job_id, reused}]`（沒有就空陣列）。真正的 job 照常建立並排隊；等 worker 抓完、inventory 回報後即可派工。`GET /api/recipes` 的每筆多 `missing_models: [name...]`（同一判定，讓 AI 事先知道會先下載）。
+
+### 12.3 MCP
+
+工具不變；`run_recipe` 原樣回傳 `model_fetch_jobs`；`instructions` 補一句：配方回 `model_fetch_jobs` 非空時，先用 `model_fetch_status` 看下載進度再 `wait_for_job`（下載 9 GB 可能要十幾分鐘），並把預設配方（清單第一個）優先推薦給使用者。

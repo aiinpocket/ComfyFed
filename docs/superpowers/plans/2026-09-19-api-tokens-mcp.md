@@ -14,7 +14,7 @@
 
 - 常數兩棧同名同值：`API_TOKEN_TTL_DAYS = 30`、`API_TOKEN_MAX_ACTIVE_PER_USER = 10`、`API_TOKEN_PREFIX = "cft_"`、`API_TOKEN_TOUCH_SECONDS = 300`、`API_TOKEN_NAME_MAX = 64`。
 - 明文 = `"cft_" + secrets.token_urlsafe(32)`；`token_hash` = sha256 hex；`prefix` = 明文前 12 字。
-- 錯誤碼逐字：`auth.too_many_tokens`（409）、`auth.bad_token_name`（400）、`auth.token_not_found`（404）、`auth.unauthorized`（401，bearer 失敗與 cookie 失敗同碼）、`recipes.not_found`（404）、`recipes.bad_params`（400）。
+- 錯誤碼逐字：`auth.too_many_tokens`（409）、`auth.bad_token_name`（400）、`auth.token_not_found`（404）、`auth.required`（401，bearer 失敗與 cookie 失敗同碼）、`recipes.not_found`（404）、`recipes.bad_params`（400）。
 - 有 `Authorization` header → 只看 bearer，不回退 cookie；bearer 跳過 CSRF。
 - bearer 一律 401 的 route：`POST/GET /api/auth/tokens`、`DELETE /api/auth/tokens/{id}`、`POST /api/auth/change-password`、`POST /api/auth/logout`。
 - 配方 JSON 兩棧逐位元相同（`server/comfyfed_server/recipes/*.json` ↔ `cloud/src/core/recipes/*.json`），vitest 強制。
@@ -115,3 +115,27 @@ def cli(argv=None) -> int   # 解析 --token-file/--platform-url 覆蓋 env；�
 
 ### Task 7: 發版（controller）
 - [ ] 全套四棧測試 → push main → 乾淨 worktree `npm run ci-build && npm run deploy`（D1 0013）→ `python -m build` 產 0.1.15 wheel → R2 put ＋ console 登入態 POST `agent-release` → `/api/agent/version` 顯示 0.1.15 → 本機 agent venv `pip install --no-deps` wheel ＋ `pip install "mcp>=2,<3"` → 用真 token 跑一次 `comfyfed-mcp` 的 `list_recipes`／`run_recipe` 端到端。
+
+---
+
+### Task 8: server — NSFW 預設配方（chroma-t2i、h3-t2v）＋ model_sources 自動下載
+
+**Spec:** §12（具約束力）。**Files:** Create `server/comfyfed_server/recipes/chroma-t2i.json`、`recipes/h3-t2v.json`；Modify `recipes.py`（`order`／`nsfw_ok`／`missing_models`／`model_sources` 處理、`h3-t2v` 的 `length` 衍生值）、`recipes/flux-t2i.json`（加 `order: 30`、`nsfw_ok: false`）；Test `tests/server/test_recipes.py`。
+**參考素材（controller 提供，唯讀）：** 官方範本 UI-format JSON 與本機 `object_info` 在 `C:\Users\user\AppData\Local\Temp\claude\D--Joseph-ceph\831b9b17-07bb-4346-a9a6-b15e7f0e25d0\scratchpad\`：`image_chroma_text_to_image.json`、`video_minimax_h3_t2v.json`、`oi.json`。配方要的是 ComfyUI **API format**（`{"<id>": {"class_type", "inputs": {...}}}`），輸入名稱以 `oi.json` 的 `input.required/optional` 為準，把 UI 範本的 `widgets_values` 依序對到有 widget 的輸入；`ComfySwitchNode`／`PrimitiveInt`／`ComfyMathExpression`／`ResolutionSelector` 這類 UI 便利節點不要搬，直接把算好的值寫死或用 `$param`。
+**Interfaces (Produces):**
+```python
+# recipes.py 新增
+def derived_params(recipe: dict, params: dict) -> dict      # h3-t2v: length = max(5, round(seconds*24)) + (5 - (max(5, round(seconds*24)) % 17)) % 17；其他配方回原 dict
+def missing_models(session, recipe: dict) -> list[str]     # model_sources 中沒有任何 live、未停用 worker 持有 "directory/name" 的 name
+def ensure_model_fetches(recipe, user_id, data_dir) -> list[dict]  # 對 missing 逐一 create_fetch_job；回 [{name, job_id, reused}]；FetchRequestError -> log + 略過
+```
+`GET /api/recipes` 依 `order` 排序、每筆含 `order`、`nsfw_ok`、`missing_models`；run 回應加 `model_fetch_jobs`，`params` 含衍生值。
+- [ ] 失敗測試：清單順序 chroma→h3→flux；`nsfw_ok` 值；`chroma-t2i` 渲染後 `UNETLoader.unet_name == "Chroma1-HD-fp8mixed.safetensors"`、`CLIPLoader.type == "chroma"`、負向句進 `CLIPTextEncode`、`CFGGuider.cfg`；`h3-t2v` `seconds=5` → `length == 124`（範本值）、`CLIPLoader.clip_name` 為 heretic、`LoraLoaderModelOnly` 為 8step、`BasicScheduler.steps == 8`；`missing_models` 在無 worker 時含 Chroma、在假 worker inventory 含 `diffusion_models/Chroma1-HD-fp8mixed.safetensors` 時為空；run `chroma-t2i` 在無 worker 時回 201 且 `model_fetch_jobs` 有一筆 `kind=model_fetch` 的 job（`model_fetch.head_size_bytes` 用 monkeypatch 回 9193379316）、再 run 一次 `reused: true`；HEAD 失敗（`FetchRequestError`）時仍 201 且 `model_fetch_jobs == []`；所有配方 `render_workflow` 無 `$param` 殘留。
+- [ ] 實作 → 跑 `test_recipes.py test_model_fetch.py` → commit `feat(server): NSFW default recipes (chroma-t2i, h3-t2v) with auto model fetch`。
+
+### Task 9: cloud twin of Task 8
+**Files:** `cp` 三個 JSON 到 `cloud/src/core/recipes/`（parity 測試會抓）；`core/recipes.ts`／`routes/recipes.ts`（`order`、`nsfw_ok`、`missing_models`、`derivedParams`、`ensureModelFetches` 走 `core/model_fetch.createFetchJob`）；tests `recipes.spec.ts`（port Task 8 案例；HEAD 用 `vi.spyOn(modelFetch, "headSizeBytes")`）。
+- [ ] → `npx tsc --noEmit && npx vitest run test/recipes.spec.ts test/model_fetch.spec.ts` → commit `feat(cloud): NSFW default recipes with auto model fetch`。
+
+### Task 10: MCP instructions ＋ docs 補述
+併入 Task 6 的文件工作：`mcp_server.py` 的 `instructions` 加 §12.3 那句；`docs/MCP.{zh,en}.md` 與 SKILL.md 說明三個配方、預設為 `chroma-t2i`、首次會先下載 9 GB。
