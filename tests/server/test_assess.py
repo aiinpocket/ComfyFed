@@ -1036,3 +1036,63 @@ def test_signature_still_ignores_a_non_integral_float():
     a = {"1": {"class_type": "KSampler", "inputs": {"steps": 20.5}}}
     b = {"1": {"class_type": "KSampler", "inputs": {"steps": 0}}}
     assert _sig(a) == _sig(b)
+
+
+# --- 2026-09-19 model_fetch: unverified-source entries require protocol>=5 -
+
+
+def test_unverified_model_requires_protocol_5():
+    """未驗證來源項目（sha256=None，信任根是「平台核可了這個 url」）只有
+    protocol>=5 的 agent 看得懂：舊 agent 的 `_validate_entry_shape` 會因
+    sha256 為 null 直接拒收，所以派工端一開始就不能把它算進 eligible。"""
+    w4 = _fetch_ready_worker(
+        "w4", model_inventory=[], dynamic={"free_disk_gb": 100},
+        hardware={"max_fetch_gb": 30}, protocol=4,
+    )
+    w5 = _fetch_ready_worker(
+        "w5", model_inventory=[], dynamic={"free_disk_gb": 100},
+        hardware={"max_fetch_gb": 30}, protocol=5,
+    )
+    needs = assess.JobNeeds(models={"ae.safetensors"}, nodes=set())
+    fetchable = {"ae.safetensors": 335_000_000}
+    unv = frozenset({"ae.safetensors"})
+
+    assert assess.verdict(w4, needs, {}, [w4], fetchable, None, unv).kind == "ineligible"
+    assert assess.verdict(w5, needs, {}, [w5], fetchable, None, unv).kind == "eligible_after_fetch"
+
+    fetchable_set, unfetchable = assess.partition_fleet_fetchable(
+        {"ae.safetensors"}, fetchable, [w4], None, unv
+    )
+    assert fetchable_set == set()
+    assert unfetchable == {"ae.safetensors"}
+
+    fetchable_set, unfetchable = assess.partition_fleet_fetchable(
+        {"ae.safetensors"}, fetchable, [w5], None, unv
+    )
+    assert fetchable_set == {"ae.safetensors"}
+    assert unfetchable == set()
+
+
+def test_unverified_models_only_gates_names_in_the_set():
+    """和 `peer_only_models` 同樣的分寸：集合非空但不含這個缺少的模型時，
+    protocol 3 的 worker 一切照舊。"""
+    w3 = _fetch_ready_worker("w3", model_inventory=[], dynamic={"free_disk_gb": 100})
+    needs = assess.JobNeeds(models={"url_only.safetensors"}, nodes=set())
+    fetchable = {"url_only.safetensors": 1 * 1024**3}
+    v = assess.verdict(
+        w3, needs, {}, [w3], fetchable, None, frozenset({"something_else.safetensors"})
+    )
+    assert v.kind == "eligible_after_fetch"
+
+
+def test_unverified_models_default_none_matches_previous_behavior():
+    """不傳 `unverified_models`（None，所有既有呼叫端）＝沒有任何項目是
+    未驗證來源，行為與這個參數存在之前一模一樣。"""
+    w3 = _fetch_ready_worker("w3", model_inventory=[], dynamic={"free_disk_gb": 100})
+    needs = assess.JobNeeds(models={"whatever.safetensors"}, nodes=set())
+    fetchable = {"whatever.safetensors": 1 * 1024**3}
+    assert assess.verdict(w3, needs, {}, [w3], fetchable).kind == "eligible_after_fetch"
+    fetchable_set, unfetchable = assess.partition_fleet_fetchable(
+        {"whatever.safetensors"}, fetchable, [w3]
+    )
+    assert fetchable_set == {"whatever.safetensors"} and unfetchable == set()

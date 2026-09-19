@@ -88,6 +88,7 @@ def assign_jobs(
     idle_worker_ids: list[str],
     fetchable_models: Optional[dict[str, int]] = None,
     peer_only_models: Optional[frozenset[str]] = None,
+    unverified_models: Optional[frozenset[str]] = None,
 ) -> list[tuple[str, db.Job]]:
     """Phase 3.3 §2.5：一次把整批 queued job 和整批 idle worker 做整體配對。
 
@@ -227,6 +228,7 @@ def assign_jobs(
                     all_workers,
                     fetchable_models,
                     peer_only_models,
+                    unverified_models,
                 )
                 total_fetch_bytes = 0
                 if v.kind == "eligible_after_fetch":

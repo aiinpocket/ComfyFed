@@ -72,6 +72,18 @@ _DEFAULT_MAX_FETCH_GB = 20.0
 # worker exactly as before this constant existed.
 _MIN_PEER_FETCH_PROTOCOL = 4
 
+# hello.protocol below which an agent cannot be handed an UNVERIFIED-SOURCE
+# manifest entry at all (2026-09-19 model_fetch, spec §6/§7). Such an entry
+# carries `sha256: null` and a `name|directory|url|size_bytes|unverified`
+# signature payload; a protocol<=4 agent's `fetcher._validate_entry_shape`
+# rejects a null sha256 outright and its `_verify_entry_signature` only
+# knows the verified payload, so pushing one to it can only ever produce a
+# refused fetch. Same shape as `_MIN_PEER_FETCH_PROTOCOL`: only required
+# when a missing model's entry actually IS unverified (see
+# `_eligible_after_fetch`/`partition_fleet_fetchable`'s `unverified_models`
+# parameter) -- every ordinary manifest entry keeps its existing floor.
+_MIN_UNVERIFIED_FETCH_PROTOCOL = 5
+
 _BYTES_PER_GB = 1024**3
 
 
@@ -346,6 +358,7 @@ def verdict(
     all_workers: list,
     fetchable_models: dict[str, int] | None = None,
     peer_only_models: frozenset[str] | None = None,
+    unverified_models: frozenset[str] | None = None,
 ) -> Verdict:
     """Judge whether `worker` can run a job needing `needs`.
 
@@ -467,7 +480,9 @@ def verdict(
     if not missing_models:
         return Verdict(kind="eligible", reasons=[], missing_models=[], warnings=warnings)
 
-    if _eligible_after_fetch(worker, missing_models, fetchable_models, dynamic, peer_only_models):
+    if _eligible_after_fetch(
+        worker, missing_models, fetchable_models, dynamic, peer_only_models, unverified_models
+    ):
         return Verdict(
             kind="eligible_after_fetch",
             reasons=[f"missing_models:{','.join(missing_models)}"],
@@ -576,6 +591,7 @@ def _eligible_after_fetch(
     fetchable_models: dict[str, int] | None,
     dynamic: dict,
     peer_only_models: frozenset[str] | None = None,
+    unverified_models: frozenset[str] | None = None,
 ) -> bool:
     """All the eligible_after_fetch gates -- see `verdict`'s docstring.
 
@@ -587,6 +603,13 @@ def _eligible_after_fetch(
     a URL-sourced model just fine, but has no way to speak the peer-grant/
     chunk-pull protocol for a peer-only one. None (every pre-3.1 caller)
     means "nothing is peer-only", identical to the pre-Task-6 behavior.
+
+    `unverified_models` (2026-09-19 model_fetch; likewise a subset of
+    `fetchable_models`' keys) names missing models whose entry is an
+    unverified-source one (`sha256: null`, url-in-signature). Those need
+    protocol>=5 for the same reason peer-only ones need >=4: an older agent
+    cannot even validate the entry's shape or signature. None means
+    "nothing is unverified", identical to the pre-2026-09-19 behavior.
     """
     fetchable_models = fetchable_models or {}
     if not all(name in fetchable_models for name in missing_models):
@@ -595,6 +618,11 @@ def _eligible_after_fetch(
     peer_only_models = peer_only_models or frozenset()
     if any(name in peer_only_models for name in missing_models):
         if _worker_protocol(worker) < _MIN_PEER_FETCH_PROTOCOL:
+            return False
+
+    unverified_models = unverified_models or frozenset()
+    if any(name in unverified_models for name in missing_models):
+        if _worker_protocol(worker) < _MIN_UNVERIFIED_FETCH_PROTOCOL:
             return False
 
     total_missing_gb = sum(fetchable_models[name] for name in missing_models) / _BYTES_PER_GB
@@ -606,6 +634,7 @@ def partition_fleet_fetchable(
     fetchable_models: dict[str, int] | None,
     online_enabled_workers: list,
     peer_only_models: frozenset[str] | None = None,
+    unverified_models: frozenset[str] | None = None,
 ) -> tuple[set[str], set[str]]:
     """Split a fleet-wide "missing from every worker" model set into
     `(fetchable, unfetchable)` for the submission-relaxation matrix
@@ -637,6 +666,10 @@ def partition_fleet_fetchable(
     capable) -- same rule `_eligible_after_fetch` applies per-candidate, just
     evaluated once against the combined subset here. None means "nothing is
     peer-only", the pre-Task-6 behavior.
+
+    `unverified_models` (2026-09-19 model_fetch) is the same idea one notch
+    higher: an unverified-source entry in the combined subset requires a
+    candidate at protocol>=5. None means "nothing is unverified".
     """
     fetchable_models = fetchable_models or {}
     manifest_covered = {name for name in missing_models if name in fetchable_models}
@@ -647,11 +680,17 @@ def partition_fleet_fetchable(
 
     peer_only_models = peer_only_models or frozenset()
     requires_peer_protocol = bool(manifest_covered & peer_only_models)
+    unverified_models = unverified_models or frozenset()
+    requires_unverified_protocol = bool(manifest_covered & unverified_models)
 
     total_missing_gb = sum(fetchable_models[name] for name in manifest_covered) / _BYTES_PER_GB
     can_fetch = any(
         _worker_fetch_capacity_ok(worker, _worker_dynamic(worker), total_missing_gb)
         and (not requires_peer_protocol or _worker_protocol(worker) >= _MIN_PEER_FETCH_PROTOCOL)
+        and (
+            not requires_unverified_protocol
+            or _worker_protocol(worker) >= _MIN_UNVERIFIED_FETCH_PROTOCOL
+        )
         for worker in online_enabled_workers
     )
     if can_fetch:
