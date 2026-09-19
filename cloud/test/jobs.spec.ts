@@ -722,6 +722,33 @@ describe("POST /api/jobs/{id}/retry", () => {
     expect(fetchDetail.body.fetch_entry).toEqual(entry);
   });
 
+  it("carries attempts/retry_count in the job JSON (2026-09-19 job-retry, spec §8)", async () => {
+    // JobDetail 用它畫「嘗試紀錄」-- ports jobs.py's `_job_dict` and
+    // tests/server/test_agent_ws.py's `test_jobs_api_exposes_attempts_and_retry_count`.
+    const { cookie, csrf } = await adminSession();
+    const submit = await submitJob(cookie, csrf, SIMPLE_WORKFLOW);
+    const jobId = submit.body.job_id;
+
+    const fresh = await call(`/api/jobs/${jobId}`, { method: "GET", cookie });
+    expect(fresh.body.attempts).toEqual({});
+    expect(fresh.body.retry_count).toBe(0);
+
+    await db()
+      .prepare("UPDATE jobs SET attempts = ?, retry_count = 2 WHERE id = ?")
+      .bind(JSON.stringify({ "w-1": 2 }), jobId)
+      .run();
+
+    const listed = await call("/api/jobs", { method: "GET", cookie });
+    const rows = Array.isArray(listed.body) ? listed.body : listed.body.jobs;
+    const row = rows.find((j: any) => j.id === jobId);
+    expect(row.attempts).toEqual({ "w-1": 2 });
+    expect(row.retry_count).toBe(2);
+
+    const detail = await call(`/api/jobs/${jobId}`, { method: "GET", cookie });
+    expect(detail.body.attempts).toEqual({ "w-1": 2 });
+    expect(detail.body.retry_count).toBe(2);
+  });
+
   it("requeues a failed job, clearing the previous attempt's outcome", async () => {
     const { cookie, csrf } = await adminSession();
     const submit = await submitJob(cookie, csrf, SIMPLE_WORKFLOW);

@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { modelNodes, verdict, partitionFleetFetchable, fleetWideGaps, type JobNeeds } from "../src/core/assess";
+import { modelNodes, verdict, partitionFleetFetchable, fleetWideGaps, exclusionKey, type JobNeeds } from "../src/core/assess";
 import * as modelGuide from "../src/core/model_guide";
 import type { Worker } from "../src/db/queries";
 
@@ -561,5 +561,88 @@ describe("signature (Phase 3.3 §2.1)", () => {
     for (const c of schedulerCases.signature_cases) {
       expect(await sig(c.workflow as Record<string, unknown>), c.name).toBe(c.expected);
     }
+  });
+});
+
+// ---------------------------------------------------------------------------
+// 2026-09-19 job-retry §6：派工排除 -- ports the `exclusions` block of
+// tests/server/test_assess.py.
+
+describe("verdict exclusions (job-retry §6)", () => {
+  it("makes the worker ineligible by (worker, job_id)", () => {
+    // 同一台對同一張 job 失敗兩次 -> `(worker.id, job_id)` 進排除集合，理由
+    // 逐字 `failed_twice_on_job`。
+    const worker = makeWorker("w1", { nodeClasses: ["KSampler"] });
+    const jobNeeds = needs([], ["KSampler"]);
+
+    const clean = verdict(worker, jobNeeds, {}, [], null, null, null, { jobId: "j1" });
+    expect(clean.kind).toBe("eligible");
+
+    const v = verdict(worker, jobNeeds, {}, [], null, null, null, {
+      jobId: "j1",
+      exclusions: new Set([exclusionKey("w1", "j1")]),
+    });
+    expect(v.kind).toBe("ineligible");
+    expect(v.reasons).toEqual(["failed_twice_on_job"]);
+  });
+
+  it("makes the worker ineligible by (worker, task_key) with a 12-char reason", () => {
+    const worker = makeWorker("w1", { nodeClasses: ["KSampler"] });
+    const key = "0123456789abcdef";
+    const v = verdict(worker, needs([], ["KSampler"]), {}, [], null, null, null, {
+      jobId: "j9",
+      taskKey: key,
+      exclusions: new Set([exclusionKey("w1", key)]),
+    });
+    expect(v.kind).toBe("ineligible");
+    expect(v.reasons).toEqual(["unsuitable:0123456789ab"]);
+  });
+
+  it("only hits the named worker", () => {
+    const worker = makeWorker("w2", { nodeClasses: ["KSampler"] });
+    const v = verdict(worker, needs([], ["KSampler"]), {}, [], null, null, null, {
+      jobId: "j1",
+      taskKey: "sig",
+      exclusions: new Set([exclusionKey("w1", "j1"), exclusionKey("w1", "sig")]),
+    });
+    expect(v.kind).toBe("eligible");
+  });
+
+  it("beats eligible_after_fetch", () => {
+    // 排除是硬理由：連「下載後就能跑」也不再成立 -- 派給它只會再失敗一次。
+    const worker = fetchReadyWorker("w1", {
+      nodeClasses: ["KSampler"],
+      dynamic: { free_disk_gb: 500.0 },
+    });
+    const jobNeeds = needs(["flux.safetensors"], ["KSampler"]);
+    const fetchable = { "flux.safetensors": 1_000_000 };
+
+    const without = verdict(worker, jobNeeds, {}, [], fetchable, null, null, { jobId: "j1" });
+    expect(without.kind).toBe("eligible_after_fetch");
+
+    const v = verdict(worker, jobNeeds, {}, [], fetchable, null, null, {
+      jobId: "j1",
+      exclusions: new Set([exclusionKey("w1", "j1")]),
+    });
+    expect(v.kind).toBe("ineligible");
+    expect(v.reasons).toEqual(["failed_twice_on_job"]);
+    // 缺哪些模型照樣回報，console 的評估面板還要顯示。
+    expect(v.missingModels).toEqual(["flux.safetensors"]);
+  });
+
+  it("defaults to the pre-feature behavior when omitted", () => {
+    const worker = makeWorker("w1", { nodeClasses: ["KSampler"] });
+    expect(verdict(worker, needs([], ["KSampler"]), {}, []).kind).toBe("eligible");
+  });
+
+  it("reports the exclusion reason alongside other hard reasons", () => {
+    const worker = makeWorker("w1", { nodeClasses: ["KSampler"] });
+    const v = verdict(worker, needs([], ["KSampler", "NotThere"]), {}, [], null, null, null, {
+      jobId: "j1",
+      exclusions: new Set([exclusionKey("w1", "j1")]),
+    });
+    expect(v.kind).toBe("ineligible");
+    expect(v.reasons).toContain("failed_twice_on_job");
+    expect(v.reasons.some((r) => r.startsWith("missing_nodes:"))).toBe(true);
   });
 });

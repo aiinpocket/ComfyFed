@@ -1,0 +1,307 @@
+import { afterEach, describe, expect, it } from "vitest";
+import { env } from "cloudflare:test";
+
+import * as retry from "../src/core/retry";
+import { exclusionKey } from "../src/core/assess";
+import type { Job } from "../src/db/queries";
+
+/**
+ * 2026-09-19 job-retry: `core/retry.ts` 的純函式與 `worker_task_failures`
+ * adapter -- ports tests/server/test_retry.py case for case.
+ *
+ * 上半是完全不碰 D1 的計次／門檻／訊息彙整（和 `retry.py` 逐行對照）；下半是
+ * upsert／清除／TTL 查詢。派工排除與 `job_failed` 分流在 assess.spec.ts／
+ * dispatch.spec.ts／hub.spec.ts。
+ */
+
+function db(): D1Database {
+  return (env as any).DB as D1Database;
+}
+
+// vitest-pool-workers isolates D1 storage per test FILE, not per `it()`.
+afterEach(async () => {
+  await db().prepare("DELETE FROM worker_task_failures").run();
+});
+
+function now(): Date {
+  return new Date();
+}
+
+const MS_PER_DAY = 24 * 60 * 60 * 1000;
+
+function daysAgo(from: Date, days: number): Date {
+  return new Date(from.getTime() - days * MS_PER_DAY);
+}
+
+/** A `Job`-shaped stub carrying only the three fields `taskKey` reads --
+ * the TS twin of the Python test's bare `db.Job(...)` construction. */
+function jobStub(overrides: Partial<Pick<Job, "signature" | "kind" | "fetchEntry">>) {
+  return { signature: null, kind: "prompt", fetchEntry: null, ...overrides };
+}
+
+async function failureRow(workerId: string, key: string) {
+  return db()
+    .prepare("SELECT * FROM worker_task_failures WHERE worker_id = ? AND task_key = ?")
+    .bind(workerId, key)
+    .first<any>();
+}
+
+// --- 常數 -------------------------------------------------------------------
+
+describe("retry constants", () => {
+  it("match the spec", () => {
+    expect(retry.MAX_FAILURES_PER_WORKER_PER_JOB).toBe(2);
+    expect(retry.MAX_JOB_ATTEMPTS).toBe(6);
+    expect(retry.UNSUITABLE_THRESHOLD).toBe(2);
+    expect(retry.UNSUITABLE_TTL_DAYS).toBe(7);
+  });
+});
+
+// --- bumpAttempts / isExcludedForJob ---------------------------------------
+
+describe("bumpAttempts / isExcludedForJob", () => {
+  it("bumps an empty map", () => {
+    const [json, mine, total] = retry.bumpAttempts("{}", "w1");
+    expect(JSON.parse(json)).toEqual({ w1: 1 });
+    expect([mine, total]).toEqual([1, 1]);
+  });
+
+  it("accumulates per worker and totals", () => {
+    const [first, mine1, total1] = retry.bumpAttempts("{}", "w1");
+    expect([mine1, total1]).toEqual([1, 1]);
+    const [second, mine2, total2] = retry.bumpAttempts(first, "w1");
+    expect([mine2, total2]).toEqual([2, 2]);
+    const [third, mine3, total3] = retry.bumpAttempts(second, "w2");
+    expect([mine3, total3]).toEqual([1, 3]);
+    expect(JSON.parse(third)).toEqual({ w1: 2, w2: 1 });
+  });
+
+  it("tolerates garbage JSON", () => {
+    // 一列壞掉的 attempts 不能讓 job_failed 整條路徑炸掉 -- 當成空的重算。
+    for (const bad of ["not json", "[1,2]", null, undefined, ""]) {
+      const [json, mine, total] = retry.bumpAttempts(bad, "w1");
+      expect(JSON.parse(json)).toEqual({ w1: 1 });
+      expect([mine, total]).toEqual([1, 1]);
+    }
+    // 非數字的值也一樣：那一個 key 當 0 重新起算，其它 key 照舊。
+    const [json, mine, total] = retry.bumpAttempts('{"w1": "x", "w2": 3}', "w1");
+    expect([mine, total]).toEqual([1, 4]);
+    expect(JSON.parse(json)).toEqual({ w1: 1, w2: 3 });
+  });
+
+  it("excludes only at the threshold", () => {
+    expect(retry.isExcludedForJob("{}", "w1")).toBe(false);
+    const [once] = retry.bumpAttempts("{}", "w1");
+    expect(retry.isExcludedForJob(once, "w1")).toBe(false);
+    const [twice] = retry.bumpAttempts(once, "w1");
+    expect(retry.isExcludedForJob(twice, "w1")).toBe(true);
+    // 別台不受影響。
+    expect(retry.isExcludedForJob(twice, "w2")).toBe(false);
+  });
+
+  it("parses attempts defensively", () => {
+    expect(retry.attemptsDict('{"w1": 2}')).toEqual({ w1: 2 });
+    expect(retry.attemptsDict("garbage")).toEqual({});
+    expect(retry.attemptsDict(null)).toEqual({});
+    // bool / 浮點數 / 負數的 key 一律丟掉（Python 端的 isinstance 檢查）。
+    expect(retry.attemptsDict('{"a": true, "b": 1.5, "c": -1, "d": 2}')).toEqual({ d: 2 });
+  });
+});
+
+// --- addJobAttemptExclusions ------------------------------------------------
+
+describe("addJobAttemptExclusions", () => {
+  it("only adds workers at or above the per-job threshold", () => {
+    const pairs = new Set<string>();
+    retry.addJobAttemptExclusions(pairs, "j1", JSON.stringify({ w1: 2, w2: 1, w3: 5 }));
+    expect(pairs).toEqual(new Set([exclusionKey("w1", "j1"), exclusionKey("w3", "j1")]));
+  });
+});
+
+// --- summarizeFinalError ----------------------------------------------------
+
+describe("summarizeFinalError", () => {
+  it("is bilingual and truncates at 200", () => {
+    const message = retry.summarizeFinalError(
+      [
+        ["A", "boom"],
+        ["B", "x".repeat(300)],
+      ],
+      6
+    );
+    expect(message).toContain("已在 2 台 worker 嘗試 6 次");
+    expect(message).toContain("failed on 2 workers after 6 attempts");
+    expect(message).toContain("A: boom");
+    expect(message).toContain("B: " + "x".repeat(200));
+    expect(message).not.toContain("x".repeat(201));
+    // zh-TW 先、en 後。
+    expect(message.indexOf("已在 2 台")).toBeLessThan(message.indexOf("failed on 2 workers"));
+  });
+
+  it("joins workers with the full-width semicolon", () => {
+    const message = retry.summarizeFinalError(
+      [
+        ["A", "one"],
+        ["B", "two"],
+      ],
+      3
+    );
+    expect(message).toContain("A: one；B: two");
+  });
+
+  it("handles no attempt errors", () => {
+    expect(retry.summarizeFinalError([], 0)).toContain("已在 0 台 worker 嘗試 0 次");
+  });
+
+  it("is byte-identical to the Python message shape", () => {
+    // retry.py's f-string, spelled out once so a whitespace/punctuation drift
+    // between the two stacks fails here rather than in a console screenshot.
+    expect(retry.summarizeFinalError([["A", "boom"]], 6)).toBe(
+      "已在 1 台 worker 嘗試 6 次全部失敗 / failed on 1 workers after 6 attempts：A: boom"
+    );
+  });
+});
+
+// --- unsuitableReason -------------------------------------------------------
+
+describe("unsuitableReason", () => {
+  it("keeps the first 12 characters of the key", () => {
+    expect(retry.unsuitableReason("0123456789abcdef")).toBe("unsuitable:0123456789ab");
+    expect(retry.unsuitableReason("short")).toBe("unsuitable:short");
+    expect(retry.unsuitableReason(null)).toBe("unsuitable:");
+  });
+});
+
+// --- taskKey ----------------------------------------------------------------
+
+describe("taskKey", () => {
+  it("prefers the signature", () => {
+    expect(retry.taskKey(jobStub({ signature: "sig-abc" }))).toBe("sig-abc");
+  });
+
+  it("uses model_fetch:<name> for a model_fetch job without a signature", () => {
+    const job = jobStub({
+      kind: "model_fetch",
+      fetchEntry: JSON.stringify({ name: "flux1-dev.safetensors", size_bytes: 10 }),
+    });
+    expect(retry.taskKey(job)).toBe("model_fetch:flux1-dev.safetensors");
+  });
+
+  it("is null without a signature or a usable fetch entry", () => {
+    expect(retry.taskKey(jobStub({}))).toBeNull();
+    expect(retry.taskKey(jobStub({ signature: "" }))).toBeNull();
+    // model_fetch 但 entry 壞掉／沒有 name -> 沒有 key，不記錄。
+    expect(retry.taskKey(jobStub({ kind: "model_fetch" }))).toBeNull();
+    expect(retry.taskKey(jobStub({ kind: "model_fetch", fetchEntry: "not json" }))).toBeNull();
+    expect(retry.taskKey(jobStub({ kind: "model_fetch", fetchEntry: "{}" }))).toBeNull();
+  });
+});
+
+// --- recordFailure / clearFailure / activeUnsuitable ------------------------
+
+describe("worker_task_failures adapter", () => {
+  it("upserts and accumulates", async () => {
+    const t = now();
+    await retry.recordFailure(db(), "w1", "sig-a", "boom", "j1", t);
+    await retry.recordFailure(db(), "w1", "sig-a", "boom again", "j2", t);
+
+    const row = await failureRow("w1", "sig-a");
+    expect(row.failures).toBe(2);
+    expect(row.last_error).toBe("boom again");
+    expect(row.last_job_id).toBe("j2");
+  });
+
+  it("is a no-op for a null key", async () => {
+    await retry.recordFailure(db(), "w1", null, "boom", "j1", now());
+    const { results } = await db().prepare("SELECT * FROM worker_task_failures").all<any>();
+    expect(results).toHaveLength(0);
+  });
+
+  it("truncates last_error at 500", async () => {
+    await retry.recordFailure(db(), "w1", "sig-a", "y".repeat(900), "j1", now());
+    expect((await failureRow("w1", "sig-a")).last_error.length).toBe(500);
+  });
+
+  it("needs the threshold and the TTL to be active", async () => {
+    const t = now();
+    await retry.recordFailure(db(), "w1", "sig-a", "boom", "j1", t);
+    // 一次還不算不適任。
+    expect(await retry.activeUnsuitable(db(), t)).toEqual(new Set());
+
+    await retry.recordFailure(db(), "w1", "sig-a", "boom", "j2", t);
+    expect(await retry.activeUnsuitable(db(), t)).toEqual(new Set([exclusionKey("w1", "sig-a")]));
+
+    // 把 updated_at 撥到 8 天前 -> 過了 TTL，不再生效（但列還在）。
+    await retry.recordFailure(db(), "w1", "sig-a", "boom", "j3", daysAgo(t, 8));
+    expect(await retry.activeUnsuitable(db(), t)).toEqual(new Set());
+    expect(await failureRow("w1", "sig-a")).not.toBeNull();
+  });
+
+  it("clears only that pair", async () => {
+    const t = now();
+    for (const workerId of ["w1", "w2"]) {
+      await retry.recordFailure(db(), workerId, "sig-a", "boom", "j1", t);
+      await retry.recordFailure(db(), workerId, "sig-a", "boom", "j1", t);
+    }
+    expect(await retry.activeUnsuitable(db(), t)).toEqual(
+      new Set([exclusionKey("w1", "sig-a"), exclusionKey("w2", "sig-a")])
+    );
+
+    await retry.clearFailure(db(), "w1", "sig-a");
+    expect(await retry.activeUnsuitable(db(), t)).toEqual(new Set([exclusionKey("w2", "sig-a")]));
+    expect(await failureRow("w1", "sig-a")).toBeNull();
+  });
+
+  it("clearing a row that isn't there is a no-op", async () => {
+    await retry.clearFailure(db(), "nobody", "sig-a");
+    await retry.clearFailure(db(), "nobody", null);
+    expect(await retry.clearOneFailure(db(), "nobody", "sig-a")).toBe(0);
+  });
+
+  it("reports active and inactive rows per worker", async () => {
+    const t = now();
+    await retry.recordFailure(db(), "w1", "sig-active", "boom", "j1", t);
+    await retry.recordFailure(db(), "w1", "sig-active", "boom", "j2", t);
+    // 達門檻但過期。
+    await retry.recordFailure(db(), "w1", "sig-stale", "old", "j3", daysAgo(t, 9));
+    await retry.recordFailure(db(), "w1", "sig-stale", "old", "j4", daysAgo(t, 9));
+    // 未達門檻。
+    await retry.recordFailure(db(), "w1", "sig-once", "once", "j5", t);
+    // 別台的列不該出現。
+    await retry.recordFailure(db(), "w2", "sig-other", "nope", "j6", t);
+
+    const rows = await retry.unsuitableRowsForWorker(db(), "w1", t);
+    const byKey = new Map(rows.map((r) => [r.task_key, r]));
+    expect(new Set(byKey.keys())).toEqual(new Set(["sig-active", "sig-stale", "sig-once"]));
+    expect(byKey.get("sig-active")!.active).toBe(true);
+    expect(byKey.get("sig-active")!.failures).toBe(2);
+    expect(byKey.get("sig-active")!.last_error).toBe("boom");
+    expect(byKey.get("sig-active")!.last_job_id).toBe("j2");
+    expect(byKey.get("sig-active")!.updated_at).toBeTruthy();
+    expect(byKey.get("sig-stale")!.active).toBe(false);
+    expect(byKey.get("sig-once")!.active).toBe(false);
+  });
+
+  it("clearWorkerFailures returns the number cleared", async () => {
+    const t = now();
+    await retry.recordFailure(db(), "w1", "sig-a", "boom", "j1", t);
+    await retry.recordFailure(db(), "w1", "sig-b", "boom", "j2", t);
+    await retry.recordFailure(db(), "w2", "sig-a", "boom", "j3", t);
+
+    expect(await retry.clearWorkerFailures(db(), "w1")).toBe(2);
+    expect(await retry.unsuitableRowsForWorker(db(), "w1", t)).toEqual([]);
+    expect(await retry.unsuitableRowsForWorker(db(), "w2", t)).toHaveLength(1);
+    expect(await retry.clearWorkerFailures(db(), "w1")).toBe(0);
+  });
+
+  it("lastErrorsForTaskKey only returns the asked-for workers and key", async () => {
+    const t = now();
+    await retry.recordFailure(db(), "w1", "sig-a", "wa boom", "j1", t);
+    await retry.recordFailure(db(), "w2", "sig-a", "wb boom", "j2", t);
+    await retry.recordFailure(db(), "w3", "sig-other", "elsewhere", "j3", t);
+
+    const errors = await retry.lastErrorsForTaskKey(db(), "sig-a", ["w1", "w3"]);
+    expect(errors).toEqual(new Map([["w1", "wa boom"]]));
+    expect(await retry.lastErrorsForTaskKey(db(), "sig-a", [])).toEqual(new Map());
+  });
+});

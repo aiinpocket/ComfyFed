@@ -60,6 +60,7 @@ import type { FetchableModels } from "../core/assess";
 import * as modelManifest from "../core/model_manifest";
 import * as modelFetch from "../core/model_fetch";
 import type { FetchEntry } from "../core/model_fetch";
+import * as retry from "../core/retry";
 import * as stats from "../core/stats";
 import * as split from "../core/split";
 import * as peerhealth from "../core/peerhealth";
@@ -236,6 +237,18 @@ interface Ephemeral {
   /** Last heartbeat's `dynamic` payload -- backs `/internal/dynamic`
    * (`queries.getDynamic`'s seam). */
   dynamic: Record<string, unknown>;
+}
+
+/** 2026-09-19 job-retry §5: what `recordFailedAttempt` learned about one
+ * applied failure -- ports agentws.py's `_FailedAttempt` dataclass. */
+interface FailedAttempt {
+  /** `{worker_id: failures}` AFTER this attempt was counted. */
+  attempts: Record<string, number>;
+  /** `Σ attempts.values()`, compared against `retry.MAX_JOB_ATTEMPTS`. */
+  total: number;
+  taskKey: string | null;
+  /** The row's `started_at` BEFORE the requeue path clears it. */
+  startedAt: string | null;
 }
 
 function newEphemeral(): Ephemeral {
@@ -1429,6 +1442,9 @@ export class Hub extends DurableObject<Env> {
       // (done)`, exactly like the receipt, so a worker cannot educate the
       // platform by sending someone else's job_id.
       const jobKind = await this.learnFetchedModels(workerId, jobId!, msg.fetched_models);
+      // 2026-09-19 job-retry §7：跑成功就是最強的反證 -- 這台對這一類任務的
+      // 不適任紀錄自動解除。同樣在 `if (done)` 之內，理由和上面一樣。
+      await this.clearUnsuitableForJob(workerId, jobId!);
       this.fetchProgress.delete(jobId!);
       // Separate lookup rather than reusing the row `updateJobDone` already
       // touched -- mirrors agentws.py's `_notify_panel_job_done`: `jobOutputs`
@@ -1518,8 +1534,28 @@ export class Hub extends DurableObject<Env> {
     return kind;
   }
 
-  /** Ports agentws.py's `job_failed` branch of `_handle_message` +
-   * `_create_and_push_failure_receipt`. */
+  /**
+   * Handle a `job_failed` message: retry on another worker, or give up.
+   * Ports agentws.py's `_handle_job_failed` (+ the `_record_failed_attempt` /
+   * `_final_error_summary` / `_any_possible_worker` helpers below).
+   *
+   * 2026-09-19 job-retry §5. `job_failed` used to be terminal, full stop --
+   * one refusal from the only worker that happened to be online killed the
+   * job even when a paused GPU box could have run it. Now every applied
+   * failure is counted, and the count decides:
+   *
+   *  * total attempts >= `retry.MAX_JOB_ATTEMPTS`, or no worker in the whole
+   *    fleet could ever run it (`anyPossibleWorker`) -> TERMINAL, through the
+   *    same `updateJobFailed` + cascade path as before but with a summarized
+   *    error, so the split cascade, the panel's `job_failed` and the failure
+   *    receipt all behave exactly as they did;
+   *  * otherwise -> `dispatch.requeueForRetry`, and the panel is told
+   *    `job_requeued` (the same event a stale-worker requeue sends).
+   *
+   * BOTH paths mint the same non-billable failure receipt they always did:
+   * the worker really did burn that time, and whether the platform decided to
+   * retry afterwards is none of the receipt's business.
+   */
   private async handleJobFailed(
     ws: WebSocket,
     attachment: AgentAttachment,
@@ -1532,12 +1568,38 @@ export class Hub extends DurableObject<Env> {
     const error = typeof msg.error === "string" ? msg.error : "";
     const now = new Date();
 
-    // Phase 3.3 §3.6：這件 job 如果是子 job，它的失敗會連坐取消還在跑的兄弟；
-    // 那些 worker 要立刻收到 `job_cancelled`，否則得等到下一次心跳落在
-    // not-owned 路徑才停下來。
+    const attempt = await this.recordFailedAttempt(db, jobId, workerId, error, ephemeral, now);
+    if (attempt === null) {
+      if (jobId && (await this.jobNotOwnedBy(jobId, workerId))) {
+        await this.sendJobCancelled(ws, attachment, ephemeral, jobId);
+      }
+      return;
+    }
+
+    const execSeconds = isValidExecSeconds(msg.exec_seconds) ? msg.exec_seconds : null;
+
+    let isFinal = attempt.total >= retry.MAX_JOB_ATTEMPTS;
+    if (!isFinal) {
+      const job = await queries.getJobById(db, jobId!);
+      isFinal = job === null || !(await this.anyPossibleWorker(job));
+    }
+
+    if (!isFinal && (await dispatch.requeueForRetry(db, jobId!, workerId, error, now))) {
+      // 面板本來以為這張 job 正在跑，而這一次嘗試的 done/failed 事件再也不會
+      // 來了 -- 和 `requeueStale` 一樣要清掉 executing 標記。
+      this.fetchProgress.delete(jobId!);
+      await this.panelJobRequeued(jobId!);
+      await this.createAndPushFailureReceipt(ws, attachment, jobId!, execSeconds, now, attempt.startedAt);
+      return;
+    }
+
+    // 終局。Phase 3.3 §3.6：這件 job 如果是子 job，它的失敗會連坐取消還在跑的
+    // 兄弟；那些 worker 要立刻收到 `job_cancelled`，否則得等到下一次心跳落在
+    // not-owned 路徑才停下來。連坐只發生在這裡，不發生在上面的 requeue。
+    const summary = await this.finalErrorSummary(attempt, workerId, error);
     const cascadeCancelled: split.CascadeCancelled[] = [];
     const applied = await this.applyOwnedTransition(db, jobId, workerId, OWNED_STATUSES, ephemeral, async () => {
-      await queries.updateJobFailed(db, jobId!, error, toSqliteTimestamp(now));
+      await queries.updateJobFailed(db, jobId!, summary, toSqliteTimestamp(now));
       await split.childStatusChanged(db, jobId!, now, cascadeCancelled);
     });
 
@@ -1547,11 +1609,217 @@ export class Hub extends DurableObject<Env> {
       // 所以取消當下在跑的那些照樣拿一張 cancelled 收據。
       await this.mintCascadeCancelledReceipts(cascadeCancelled, now);
       this.fetchProgress.delete(jobId!);
-      await this.panelJobFailed(jobId!, error);
-      const execSeconds = isValidExecSeconds(msg.exec_seconds) ? msg.exec_seconds : null;
+      await this.panelJobFailed(jobId!, summary);
       await this.createAndPushFailureReceipt(ws, attachment, jobId!, execSeconds, now);
-    } else if (jobId && (await this.jobNotOwnedBy(jobId, workerId))) {
-      await this.sendJobCancelled(ws, attachment, ephemeral, jobId);
+    }
+  }
+
+  /**
+   * 2026-09-19 job-retry §5：把這一次失敗記進 `jobs.attempts` 與
+   * `worker_task_failures`，回傳決定「requeue 還是終局」所需的快照。Ports
+   * agentws.py's `_record_failed_attempt`.
+   *
+   * `null` = 這個 worker 此刻並不擁有這張 job（或它已經終局）-- 和既有每一個
+   * transition 完全同一道閘門（`dispatch.resolveOwnedJob` ＋ 同一份 warn-once
+   * 記錄），所以一個 worker 不可能靠送別人的 job_id 去灌別人的失敗次數。
+   *
+   * D1 沒有讓我們把兩句 UPDATE 綁進一個交易的 seam（Python 端是同一個 session
+   * 的一次 commit），所以順序是刻意的：先寫 `jobs.attempts`（判定終局與排除的
+   * 唯一依據），再寫 `worker_task_failures`（只影響跨 job 的冷落）。中間掉電最
+   * 壞是少記一筆不適任，不會讓這張 job 的次數永遠追不上上限。
+   *
+   * `startedAt` 一併帶回來，因為 `requeueForRetry` 會把它清掉，而失敗收據的
+   * wall-clock 基準要算的是「這一次嘗試」跑了多久（見
+   * `createAndPushFailureReceipt`）。
+   */
+  private async recordFailedAttempt(
+    db: D1Database,
+    jobId: string | null,
+    workerId: string,
+    error: string,
+    ephemeral: Ephemeral,
+    now: Date
+  ): Promise<FailedAttempt | null> {
+    if (!jobId) return null;
+    const result = await dispatch.resolveOwnedJob(db, jobId, workerId, OWNED_STATUSES);
+    if (!result.ok) {
+      this.logOwnedJobRefusal(result.reason, jobId, ephemeral);
+      return null;
+    }
+    const job = result.job;
+    const key = retry.taskKey(job);
+    const [newAttempts, , total] = retry.bumpAttempts(job.attempts, workerId);
+    await queries.updateJobAttempts(db, jobId, newAttempts);
+    await retry.recordFailure(db, workerId, key, error, jobId, now);
+    return { attempts: retry.attemptsDict(newAttempts), total, taskKey: key, startedAt: job.startedAt };
+  }
+
+  /**
+   * 終局失敗時寫進 `jobs.error` 的彙整訊息（`retry.summarizeFinalError`）。
+   * Ports agentws.py's `_final_error_summary`.
+   *
+   * 每台 worker 的「最後錯誤」來自 `worker_task_failures[W, task_key]`：那張表
+   * 是平台唯一存過去每台錯誤的地方（`jobs.attempts` 只存次數）。正在回報的這
+   * 一台用它手上這個 `error`，因為那就是最新的一筆，不必再讀一次。
+   *
+   * 顯示名取 `workers.name`；worker 列不見了（或這張 job 的 attempts 裡有已經
+   * 被硬刪的 id）就退回 id 前 8 字 -- 一個認不出來的 id 也好過整段訊息發不
+   * 出來。`taskKey` 是 null 的舊 job 沒有紀錄可查，其他台就只剩空字串。
+   *
+   * worker 的列舉順序是 `attempts` 的插入順序，和 Python 的 `list(dict)` 一樣
+   * （worker id 都是 uuid，不是 JS 會重排的整數式 key）。
+   */
+  private async finalErrorSummary(attempt: FailedAttempt, workerId: string, error: string): Promise<string> {
+    const db = this.env.DB;
+    const workerIds = Object.keys(attempt.attempts);
+    let lastErrors = new Map<string, string>();
+    const names = new Map<string, string>();
+    if (workerIds.length > 0) {
+      if (attempt.taskKey) {
+        lastErrors = await retry.lastErrorsForTaskKey(db, attempt.taskKey, workerIds);
+      }
+      // `getWorkersByIds` deliberately does NOT filter soft-deleted rows --
+      // exactly what is wanted here: a worker an admin deleted mid-retry still
+      // has a name worth printing. Mirrors the plain `db.Worker` query Python
+      // uses.
+      for (const w of await queries.getWorkersByIds(db, workerIds)) names.set(w.id, w.name || "");
+    }
+
+    const pairs = workerIds.map(
+      (wid) =>
+        [names.get(wid) || wid.slice(0, 8), wid === workerId ? error : (lastErrors.get(wid) ?? "")] as [
+          string,
+          string,
+        ]
+    );
+    return retry.summarizeFinalError(pairs, attempt.total);
+  }
+
+  /**
+   * `[fetchableModels, peerOnlyModels, unverifiedModels]` for ONE job -- the
+   * same inputs the dispatch tick compiles for the whole sweep, narrowed to
+   * the single job `anyPossibleWorker` is asking about. Ports agentws.py's
+   * `_fetch_inputs_for_job`.
+   *
+   * The signed manifest plus, for a `model_fetch` job, that job's OWN signed
+   * entry (minted when the panel's download button was pressed, for a model
+   * the real manifest may know nothing about -- see the tick's merge). The
+   * real manifest always wins a name collision, exactly as it does there.
+   */
+  private async fetchInputsForJob(
+    job: Job
+  ): Promise<[FetchableModels, ReadonlySet<string>, ReadonlySet<string>]> {
+    const db = this.env.DB;
+    let fetchable: FetchableModels = {};
+    let peerOnly: ReadonlySet<string> = new Set<string>();
+    const unverified = new Set<string>();
+
+    try {
+      const seed = await resolvePlatformSeed(db, this.env.PLATFORM_ED25519_SEED);
+      const entries = await modelManifest.entries(db, this.env.STORE, seed);
+      for (const e of entries) fetchable[e.name] = e.size_bytes;
+      peerOnly = modelManifest.peerOnlyNames(entries);
+    } catch (err) {
+      console.error("hub: failed to build the fetch manifest for a retry decision", err);
+      fetchable = {};
+      peerOnly = new Set<string>();
+    }
+
+    if ((job.kind || "prompt") === "model_fetch" && job.fetchEntry) {
+      let parsed: unknown;
+      try {
+        parsed = JSON.parse(job.fetchEntry);
+      } catch {
+        parsed = null;
+      }
+      if (typeof parsed === "object" && parsed !== null && !Array.isArray(parsed)) {
+        const entry = parsed as Record<string, unknown>;
+        const name = entry.name;
+        const sizeBytes = entry.size_bytes;
+        if (
+          typeof name === "string" &&
+          name &&
+          !(name in fetchable) &&
+          typeof sizeBytes === "number" &&
+          Number.isInteger(sizeBytes) &&
+          sizeBytes > 0
+        ) {
+          fetchable[name] = sizeBytes;
+          if (modelFetch.isUnverifiedEntry(entry)) unverified.add(name);
+        }
+      }
+    }
+
+    return [fetchable, peerOnly, unverified];
+  }
+
+  /**
+   * 2026-09-19 job-retry §6：這艘艦隊裡還有任何一台**有可能**跑得動這張 job
+   * 嗎？Ports agentws.py's `_any_possible_worker`.
+   *
+   * 「有可能」刻意比「現在可以」寬得多：掃的是每一台未刪除、未停用的 worker
+   * -- 不論 online／offline／paused，也不論此刻在不在忙。線上那一刻的狀態不是
+   * 重點，重點是「等下去到底有沒有希望」：這整個功能的起因就是唯一在線的那台
+   * （無 GPU 的 Mac）一直失敗，而真正跑得動的 RTX 卡當時是暫停中。離線 worker
+   * 的 `dynamic`（free_disk 之類）可能過期，就照它最後回報的值判 -- 寧可讓 job
+   * 多等一輪，也不要因為一個過期的數字把它判死。
+   *
+   * `eligible_after_fetch` 同樣算數（spec §2 目標 1：「不因為別台沒有模型就放
+   * 棄」），所以缺模型但有開 auto_fetch 的 worker 會讓 job 繼續等下去。
+   *
+   * 排除集合和派工那邊同一份定義：這張 job 自己的 `attempts` 達門檻的 worker，
+   * 加上生效中的不適任紀錄。全部被排除、或全艦隊本來就沒人跑得動（缺節點、
+   * VRAM 不夠、模型哪裡都抓不到）-> false -> 立刻終局失敗，不必等
+   * `MAX_JOB_ATTEMPTS`。
+   */
+  private async anyPossibleWorker(job: Job): Promise<boolean> {
+    const db = this.env.DB;
+    const now = new Date();
+    const needs = assess.needsFromJob(job);
+    const key = retry.taskKey(job);
+
+    // `getAllWorkers` = 未刪除（Python 的 `jobs._live_workers`）；再濾掉
+    // `disabled`（admin 停用的那台在 spec §6 的定義裡不算「已註冊、未停用」的
+    // 候選）。`status`／`last_seen` 一律不看。
+    const workers = (await queries.getAllWorkers(db)).filter((w) => !w.disabled);
+    const exclusions = await retry.activeUnsuitable(db, now);
+    retry.addJobAttemptExclusions(exclusions, job.id, job.attempts);
+
+    const [fetchable, peerOnly, unverified] = await this.fetchInputsForJob(job);
+    const isModelFetch = (job.kind || "prompt") === "model_fetch";
+
+    for (const worker of workers) {
+      // `dispatch.assignJobs` 的 kind 閘門：model_fetch 單只有 protocol>=5 的
+      // agent 跑得動，舊 agent 會去跑 `{}` 佔位工作流然後失敗。
+      if (isModelFetch && !assess.modelFetchProtocolOk(worker)) continue;
+      const v = assess.verdict(worker, needs, job.requirements, [], fetchable, peerOnly, unverified, {
+        jobId: job.id,
+        taskKey: key,
+        exclusions,
+      });
+      if (v.kind === "eligible" || v.kind === "eligible_after_fetch") return true;
+    }
+    return false;
+  }
+
+  /**
+   * §7：這台 worker 成功跑完這一類任務 -> 自動解除它對這一類的不適任紀錄。
+   * Ports agentws.py's `_clear_unsuitable_for_job`.
+   *
+   * 只在 `job_done` 且 transition 真的套用時呼叫（和收據、統計同一個閘門）。
+   * 吞掉例外只記 log -- 解除失敗最壞就是那台多被冷落幾天，絕不能因此少發一張
+   * 收據或讓整條 job_done 路徑炸掉。
+   */
+  private async clearUnsuitableForJob(workerId: string, jobId: string | null): Promise<void> {
+    if (!jobId) return;
+    try {
+      const job = await queries.getJobById(this.env.DB, jobId);
+      if (job === null) return;
+      const key = retry.taskKey(job);
+      if (!key) return;
+      await retry.clearFailure(this.env.DB, workerId, key);
+    } catch (err) {
+      console.error(`hub: failed to clear the unsuitable record for worker ${workerId} job ${jobId}`, err);
     }
   }
 
@@ -1727,30 +1995,44 @@ export class Hub extends DurableObject<Env> {
     this.pushReceiptFrame(attachment.workerId!, receiptId, payload, platformSig, kind, billable, basis, ws);
   }
 
-  /** Ports agentws.py's `_create_and_push_failure_receipt`. */
+  /** Ports agentws.py's `_create_and_push_failure_receipt`.
+   *
+   * 2026-09-19 job-retry: on the REQUEUE path the row has already been reset
+   * (`started_at=NULL`, spec §5) by the time this runs, so the caller hands
+   * over the `startedAt` value it captured before the reset. Every other
+   * caller omits it and the row is read exactly as before. */
   private async createAndPushFailureReceipt(
     ws: WebSocket,
     attachment: AgentAttachment,
     jobId: string,
     execSeconds: number | null,
-    now: Date
+    now: Date,
+    startedAt?: string | null
   ): Promise<void> {
     const job = await queries.getJobById(this.env.DB, jobId);
     if (!job) return;
 
+    const runStartedAt = startedAt ?? job.startedAt;
+
     let gpuSeconds: number;
     let basis: "exec" | "wall";
-    if (execSeconds !== null && job.startedAt) {
+    if (execSeconds !== null && runStartedAt) {
       gpuSeconds = execSeconds;
-      if (job.finishedAt) {
-        gpuSeconds = Math.min(gpuSeconds, secondsBetween(job.startedAt, job.finishedAt));
-      }
+      // 2026-09-19 job-retry: the cap used to key off `finished_at`, which the
+      // terminal path always stamps -- but the REQUEUE path never does (a
+      // requeued job has no end, it goes back in the queue). Cap against "now"
+      // in that case, or an agent could inflate `unbilled_gpu_seconds` without
+      // bound simply by failing a job that is going to be retried anyway. The
+      // terminal path is unchanged: `finished_at` is set by then and still
+      // wins.
+      const spanEnd = job.finishedAt ?? toSqliteTimestamp(now);
+      gpuSeconds = Math.min(gpuSeconds, secondsBetween(runStartedAt, spanEnd));
       basis = "exec";
     } else {
       let wallSeconds = 0;
-      if (job.startedAt) {
+      if (runStartedAt) {
         const end = job.finishedAt ?? toSqliteTimestamp(now);
-        wallSeconds = secondsBetween(job.startedAt, end);
+        wallSeconds = secondsBetween(runStartedAt, end);
         if (attachment.protocol >= CURRENT_PROTOCOL) {
           console.error(
             `hub: protocol violation: job ${jobId} from worker ${attachment.workerId} ` +
@@ -2008,6 +2290,25 @@ export class Hub extends DurableObject<Env> {
       }
     }
 
+    // 2026-09-19 job-retry §6：排除集合一個 tick 建一次，整批傳進
+    // `assignJobs`。兩種來源：生效中的 (worker, task_key) 不適任紀錄，加上每張
+    // queued job 自己的 `attempts` 裡已達門檻的 (worker, job_id)。和上面的
+    // manifest 一樣掛在 `hasQueuedWork` 之下 —— 沒活可派的時候多掃兩張表是純
+    // 粹的浪費（alarm 每 5 秒跑一次）。Ports the same block in agentws.py's
+    // `dispatch_tick`.
+    let exclusions: assess.ExclusionSet = new Set<string>();
+    if (hasQueuedWork) {
+      try {
+        const pairs = await retry.activeUnsuitable(db, now);
+        for (const job of await queries.getQueuedJobsForDispatch(db)) {
+          retry.addJobAttemptExclusions(pairs, job.id, job.attempts);
+        }
+        exclusions = pairs;
+      } catch (err) {
+        console.error("hub: failed to build the dispatch exclusion set", err);
+      }
+    }
+
     let assignments: dispatch.Assignment[] = [];
     try {
       assignments = await dispatch.assignJobs(
@@ -2016,7 +2317,8 @@ export class Hub extends DurableObject<Env> {
         fetchableModels,
         peerOnlyModels,
         now,
-        unverifiedModels
+        unverifiedModels,
+        exclusions
       );
     } catch (err) {
       console.error("hub: assignJobs failed", err);

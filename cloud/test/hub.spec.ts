@@ -43,6 +43,7 @@ afterEach(async () => {
   await db().prepare("DELETE FROM nonces").run();
   await db().prepare("DELETE FROM model_hashes").run();
   await db().prepare("DELETE FROM worker_job_stats").run();
+  await db().prepare("DELETE FROM worker_task_failures").run();
   modelGuide.clearHarvestCacheForTests();
   modelManifest.clearMismatchLogForTests();
 });
@@ -113,6 +114,21 @@ async function makeJob(opts: {
     )
     .run();
   return id;
+}
+
+/** 2026-09-19 job-retry: pre-load `jobs.attempts` so the NEXT reported failure
+ * reaches `retry.MAX_JOB_ATTEMPTS` and is therefore terminal.
+ *
+ * Ports tests/server/test_agent_ws.py's `_exhaust_attempts`: every test in
+ * this file written before job-retry landed asserts the OLD "job_failed is
+ * terminal" behavior, which is now only reached at the cap. Skipping the
+ * intermediate requeues here keeps those tests about what they were about --
+ * the requeue rounds themselves are covered by the job-retry block below. */
+async function exhaustAttempts(jobId: string, spent = 5, spender = "ghost-worker"): Promise<void> {
+  await db()
+    .prepare("UPDATE jobs SET attempts = ? WHERE id = ?")
+    .bind(JSON.stringify({ [spender]: spent }), jobId)
+    .run();
 }
 
 // ---------------------------------------------------------------------------
@@ -985,6 +1001,10 @@ describe("job_failed", () => {
 
     // assigned, never started (started_at null).
     const jobId = await makeJob({ status: "assigned", workerId, startedAt: null });
+    // 2026-09-19 job-retry：`job_failed` 只有在「再重試也沒有意義」時才終局。
+    // 這裡先把 `attempts` 撐到上限，所以這一次失敗走的是既有的終局路徑 --
+    // `error` 換成彙整訊息（非終局的那一次留原始錯誤，見下面的 requeue 測試）。
+    await exhaustAttempts(jobId);
 
     const receiptMsg = nextMessage(ws);
     ws.send(JSON.stringify({ type: "job_failed", job_id: jobId, error: "boom" }));
@@ -997,7 +1017,7 @@ describe("job_failed", () => {
 
     const job = await getJobById(db(), jobId);
     expect(job!.status).toBe("failed");
-    expect(job!.error).toBe("boom");
+    expect(job!.error).toContain(": boom");
 
     const receipts = await getReceiptsForJob(db(), jobId);
     expect(receipts).toHaveLength(1);
@@ -1320,6 +1340,9 @@ describe("split families (§3.4/§3.6)", () => {
     const workerA = await makeWorker({ pubkeyHex: kpA.pubkey_hex });
     const workerB = await makeWorker({ pubkeyHex: kpB.pubkey_hex });
     const { parentId, childIds } = await makeSplitFamily([workerA, workerB]);
+    // 2026-09-19 job-retry：連坐只在**終局**失敗時發生，所以先把這個子 job 的
+    // attempts 撐到上限。「第一次失敗不連坐」由 job-retry 區塊自己的測試釘。
+    await exhaustAttempts(childIds[0]!);
 
     const wsB = await connectAgent(workerB, kpB.seed_hex);
     const wsA = await connectAgent(workerA, kpA.seed_hex);
@@ -1336,7 +1359,8 @@ describe("split families (§3.4/§3.6)", () => {
 
     const parent = (await getJobById(db(), parentId))!;
     expect(parent.status).toBe("failed");
-    expect(parent.error).toBe("子任務 1/2：CUDA OOM");
+    expect(parent.error).toMatch(/^子任務 1\/2：已在 /);
+    expect(parent.error).toContain(": CUDA OOM");
     const sibling = (await getJobById(db(), childIds[1]!))!;
     expect(sibling.status).toBe("cancelled");
     expect(sibling.error).toBe("sibling failed");
@@ -1358,6 +1382,8 @@ describe("split families (§3.4/§3.6)", () => {
     for (const childId of childIds) {
       await db().prepare("UPDATE jobs SET started_at = ? WHERE id = ?").bind(startedAt, childId).run();
     }
+    // 連坐只在終局失敗時發生（見上一個測試）。
+    await exhaustAttempts(childIds[0]!);
 
     const wsB = await connectAgent(workerB, kpB.seed_hex);
     const wsA = await connectAgent(workerA, kpA.seed_hex);
@@ -1725,5 +1751,286 @@ describe("Phase 3.4 fix round 1: advert normalization and probe gating", () => {
 
     expect(probe).toHaveBeenCalledTimes(2);
     vi.restoreAllMocks();
+  });
+});
+
+// ---------------------------------------------------------------------------
+// 2026-09-19 job-retry：失敗改派＋不適任紀錄 -- ports the job-retry block of
+// tests/server/test_agent_ws.py through the real Hub DO.
+
+describe("job retry + unsuitable workers (spec §5-§7)", () => {
+  async function failureRows(): Promise<Record<string, number>> {
+    const { results } = await db()
+      .prepare("SELECT worker_id, task_key, failures FROM worker_task_failures")
+      .all<{ worker_id: string; task_key: string; failures: number }>();
+    return Object.fromEntries(results.map((r) => [`${r.worker_id}|${r.task_key}`, r.failures]));
+  }
+
+  async function seedUnsuitable(
+    workerId: string,
+    key: string,
+    failures: number,
+    error = "earlier boom"
+  ): Promise<void> {
+    await db()
+      .prepare(
+        `INSERT INTO worker_task_failures (worker_id, task_key, failures, last_error, last_job_id, updated_at)
+         VALUES (?, ?, ?, ?, 'j-old', ?)`
+      )
+      .bind(workerId, key, failures, error, toSqliteTimestamp(new Date()))
+      .run();
+  }
+
+  /** Parent + one running child per worker -- a local copy of the split
+   * describe's own fixture (that one is scoped to its block). */
+  async function makeRetrySplitFamily(workerIds: string[]): Promise<{ parentId: string; childIds: string[] }> {
+    const parentId = uniqueId("retry-parent");
+    await db()
+      .prepare(
+        `INSERT INTO jobs (id, workflow_json, status, created_at, input_assets, split_count, split_plan)
+         VALUES (?, '{}', 'running', ?, '[]', ?, ?)`
+      )
+      .bind(
+        parentId,
+        toSqliteTimestamp(new Date()),
+        workerIds.length,
+        JSON.stringify({ source_node_id: "1", batch_size: 2 })
+      )
+      .run();
+
+    const childIds: string[] = [];
+    for (let index = 0; index < workerIds.length; index++) {
+      const childId = `${parentId}-c${index}`;
+      childIds.push(childId);
+      await db()
+        .prepare(
+          `INSERT INTO jobs (id, workflow_json, status, worker_id, created_at, input_assets, parent_id, split_index)
+           VALUES (?, '{}', 'running', ?, ?, '[]', ?, ?)`
+        )
+        .bind(childId, workerIds[index]!, toSqliteTimestamp(new Date()), parentId, index)
+        .run();
+    }
+    return { parentId, childIds };
+  }
+
+  /** Make the worker dispatchable again after a push (the tick flips its
+   * attachment to `dispatched`; a real agent reports `idle` when it is free). */
+  async function reportIdle(ws: WebSocket): Promise<void> {
+    ws.send(JSON.stringify({ type: "heartbeat", state: "idle", progress: 0.0, job_id: null, dynamic: {} }));
+    await new Promise((r) => setTimeout(r, 50));
+  }
+
+  it("requeues instead of failing, and still mints the failure receipt", async () => {
+    // §5：一次失敗不再是終局。job 回 `queued`、放開 worker、記 attempts 與
+    // `retry_count`，錯誤留在 `error` 當「最後錯誤」，失敗收據照發。
+    const kpA = KEYPAIRS[0]!;
+    const kpB = KEYPAIRS[1]!;
+    const workerA = await makeWorker({ pubkeyHex: kpA.pubkey_hex });
+    // 另一台註冊了但從來沒連過線 -- 在平台眼中是 offline，但仍然「有可能」跑。
+    await makeWorker({ pubkeyHex: kpB.pubkey_hex });
+    const jobId = await makeJob({ status: "running", workerId: workerA, signature: "sig-requeue" });
+
+    const ws = await connectAgent(workerA, kpA.seed_hex);
+    const receiptMsg = nextMessage(ws);
+    ws.send(JSON.stringify({ type: "job_failed", job_id: jobId, error: "boom" }));
+    const receipt = await receiptMsg;
+    expect(receipt.type).toBe("receipt");
+    expect(receipt.kind).toBe("failed");
+    expect(receipt.billable).toBe(false);
+    ws.close();
+
+    const job = (await getJobById(db(), jobId))!;
+    expect(job.status).toBe("queued");
+    expect(job.workerId).toBeNull();
+    expect(job.lastWorkerId).toBe(workerA);
+    expect(job.error).toBe("boom");
+    expect(job.retryCount).toBe(1);
+    expect(JSON.parse(job.attempts)).toEqual({ [workerA]: 1 });
+
+    expect(await failureRows()).toEqual({ [`${workerA}|sig-requeue`]: 1 });
+  });
+
+  it("sends the job to another worker after two failures, and job_done clears only that worker's row", async () => {
+    // 頭條情境：唯一在線的那台一直失敗，另一台（註冊了但從來沒連過線，在平台
+    // 眼中是 offline）其實才跑得動。A 失敗兩次後這張 job 只能給 B。
+    const kpA = KEYPAIRS[0]!;
+    const kpB = KEYPAIRS[1]!;
+    const workerA = await makeWorker({ pubkeyHex: kpA.pubkey_hex });
+    const workerB = await makeWorker({ pubkeyHex: kpB.pubkey_hex });
+    const key = "sig-two-failures";
+    const jobId = await makeJob({ status: "queued", signature: key });
+
+    const wsA = await connectAgent(workerA, kpA.seed_hex);
+    try {
+      for (const attemptIndex of [1, 2]) {
+        await reportIdle(wsA);
+        const pushed = nextMessage(wsA);
+        expect(await runDurableObjectAlarm(hub())).toBe(true);
+        expect((await pushed).job_id).toBe(jobId);
+
+        const receipt = nextMessage(wsA);
+        wsA.send(JSON.stringify({ type: "job_failed", job_id: jobId, error: `boom ${attemptIndex}` }));
+        expect((await receipt).kind).toBe("failed");
+
+        const mid = (await getJobById(db(), jobId))!;
+        expect(mid.status, `attempt ${attemptIndex} must not be terminal`).toBe("queued");
+        expect(JSON.parse(mid.attempts)).toEqual({ [workerA]: attemptIndex });
+        expect(mid.retryCount).toBe(attemptIndex);
+      }
+
+      // A 現在對這張 job 出局。A 仍然 idle 且連著線，但下一輪只能給 B。
+      const wsB = await connectAgent(workerB, kpB.seed_hex);
+      try {
+        await reportIdle(wsA);
+        await reportIdle(wsB);
+        const pushedB = nextMessage(wsB);
+        const quietA = expectNoMessage(wsA, 300);
+        expect(await runDurableObjectAlarm(hub())).toBe(true);
+        expect((await pushedB).job_id).toBe(jobId);
+        await quietA;
+        expect((await getJobById(db(), jobId))!.workerId).toBe(workerB);
+
+        // B 跑完 -> B 自己的不適任紀錄清空，A 的那一列原封不動。
+        const doneReceipt = nextMessage(wsB);
+        wsB.send(JSON.stringify({ type: "job_done", job_id: jobId, result_files: ["out.png"] }));
+        await doneReceipt;
+      } finally {
+        wsB.close();
+      }
+    } finally {
+      wsA.close();
+    }
+
+    expect((await getJobById(db(), jobId))!.status).toBe("done");
+    expect(await failureRows()).toEqual({ [`${workerA}|${key}`]: 2 });
+  });
+
+  it("job_done clears this worker's unsuitable row only", async () => {
+    // §7：成功跑完同類任務 -> 自動解除那一台對那一類的不適任紀錄。
+    const kp = KEYPAIRS[0]!;
+    const workerId = await makeWorker({ pubkeyHex: kp.pubkey_hex });
+    const key = "sig-cleared";
+    const jobId = await makeJob({ status: "running", workerId, signature: key });
+    await seedUnsuitable(workerId, key, 1);
+    await seedUnsuitable("someone-else", key, 2);
+
+    const ws = await connectAgent(workerId, kp.seed_hex);
+    const receipt = nextMessage(ws);
+    ws.send(JSON.stringify({ type: "job_done", job_id: jobId, result_files: ["out.png"] }));
+    await receipt;
+    ws.close();
+
+    expect(await failureRows()).toEqual({ [`someone-else|${key}`]: 2 });
+  });
+
+  it("fails the job with a summarized error once the attempt cap is reached", async () => {
+    // §5：總失敗次數達 `MAX_JOB_ATTEMPTS` -> 終局，`error` 換成彙整訊息
+    // （zh-TW 先、en 後，每台 worker 的最後錯誤）。艦隊裡還有一台完全合格的
+    // wc，所以這裡走的一定是次數上限那條路，不是「沒人跑得動」。
+    const kpA = KEYPAIRS[0]!;
+    const workerA = await makeWorker({ pubkeyHex: kpA.pubkey_hex, id: "wa-cap" });
+    const workerB = await makeWorker({ pubkeyHex: KEYPAIRS[1]!.pubkey_hex, id: "wb-cap" });
+    await makeWorker({ pubkeyHex: KEYPAIRS[2]!.pubkey_hex, id: "wc-cap" });
+    const key = "sig-cap";
+    const jobId = await makeJob({ status: "running", workerId: workerA, signature: key });
+    await exhaustAttempts(jobId, 5, workerB);
+    await seedUnsuitable(workerB, key, 5, "wb exploded");
+
+    const ws = await connectAgent(workerA, kpA.seed_hex);
+    const receipt = nextMessage(ws);
+    ws.send(JSON.stringify({ type: "job_failed", job_id: jobId, error: "wa exploded" }));
+    await receipt;
+    ws.close();
+
+    const job = (await getJobById(db(), jobId))!;
+    expect(job.status).toBe("failed");
+    expect(job.error).toContain("已在 2 台 worker 嘗試 6 次全部失敗");
+    expect(job.error).toContain("failed on 2 workers after 6 attempts");
+    expect(job.error).toContain("wb-cap: wb exploded");
+    expect(job.error).toContain("wa-cap: wa exploded");
+  });
+
+  it("fails immediately when the only worker is excluded", async () => {
+    // §5：沒有任何一台有可能跑它 -> 不等次數上限，立刻終局。每一次嘗試都有一
+    // 張非計費失敗收據，包含被 requeue 的那一次。
+    const kp = KEYPAIRS[0]!;
+    const workerId = await makeWorker({ pubkeyHex: kp.pubkey_hex, id: "wa-only" });
+    const jobId = await makeJob({ status: "queued", signature: "sig-only" });
+
+    const ws = await connectAgent(workerId, kp.seed_hex);
+    try {
+      for (const attemptIndex of [1, 2]) {
+        await reportIdle(ws);
+        const pushed = nextMessage(ws);
+        expect(await runDurableObjectAlarm(hub())).toBe(true);
+        expect((await pushed).job_id).toBe(jobId);
+
+        const receipt = nextMessage(ws);
+        ws.send(JSON.stringify({ type: "job_failed", job_id: jobId, error: `boom ${attemptIndex}` }));
+        expect((await receipt).kind).toBe("failed");
+      }
+    } finally {
+      ws.close();
+    }
+
+    const job = (await getJobById(db(), jobId))!;
+    expect(job.status).toBe("failed");
+    expect(job.error).toContain("已在 1 台 worker 嘗試 2 次全部失敗");
+    expect(job.error).toContain("wa-only: boom 2");
+
+    const receipts = await getReceiptsForJob(db(), jobId);
+    expect(receipts).toHaveLength(2);
+    expect(receipts.every((r) => r.kind === "failed" && !r.billable)).toBe(true);
+  });
+
+  it("does not count a disabled worker as a possible worker", async () => {
+    // §6：「有可能跑它」只算未刪除、未停用的 worker；admin 停用的那台不算，
+    // 所以唯一另一台被停用時第二次失敗就終局。
+    const kp = KEYPAIRS[0]!;
+    const workerA = await makeWorker({ pubkeyHex: kp.pubkey_hex });
+    await makeWorker({ pubkeyHex: KEYPAIRS[1]!.pubkey_hex, disabled: true });
+    const jobId = await makeJob({ status: "running", workerId: workerA, signature: "sig-disabled" });
+    // 第一次失敗（非終局）的計次先手動放進去，省掉一輪 alarm。
+    await exhaustAttempts(jobId, 1, workerA);
+
+    const ws = await connectAgent(workerA, kp.seed_hex);
+    const receipt = nextMessage(ws);
+    ws.send(JSON.stringify({ type: "job_failed", job_id: jobId, error: "boom 2" }));
+    await receipt;
+    ws.close();
+
+    expect((await getJobById(db(), jobId))!.status).toBe("failed");
+  });
+
+  it("retries a failed child before cascading to its siblings", async () => {
+    // §5 最後一段：分批子 job 也先重試 -- 第一次失敗不得連坐取消兄弟，也不得
+    // 把父 job 打成 failed。
+    const [kpA, kpB] = [KEYPAIRS[0]!, KEYPAIRS[1]!];
+    const workerA = await makeWorker({ pubkeyHex: kpA.pubkey_hex });
+    const workerB = await makeWorker({ pubkeyHex: kpB.pubkey_hex });
+    const { parentId, childIds } = await makeRetrySplitFamily([workerA, workerB]);
+
+    const wsB = await connectAgent(workerB, kpB.seed_hex);
+    const wsA = await connectAgent(workerA, kpA.seed_hex);
+    wsA.send(JSON.stringify({ type: "hello", protocol: 2 }));
+    wsB.send(JSON.stringify({ type: "hello", protocol: 2 }));
+    try {
+      const quietB = expectNoMessage(wsB, 400);
+      const receiptA = nextMessage(wsA);
+      wsA.send(JSON.stringify({ type: "job_failed", job_id: childIds[0], error: "CUDA OOM" }));
+      expect((await receiptA).kind).toBe("failed");
+      await quietB;
+    } finally {
+      wsA.close();
+      wsB.close();
+    }
+
+    const child = (await getJobById(db(), childIds[0]!))!;
+    const sibling = (await getJobById(db(), childIds[1]!))!;
+    const parent = (await getJobById(db(), parentId))!;
+    expect(child.status).toBe("queued");
+    expect(child.retryCount).toBe(1);
+    expect(sibling.status).toBe("running");
+    expect(parent.status).not.toBe("failed");
   });
 });

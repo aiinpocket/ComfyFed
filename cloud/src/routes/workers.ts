@@ -41,6 +41,7 @@ import {
   getSetting,
   resolvePlatformSeed,
   getAllWorkers,
+  getWorkerById,
   insertWorker,
   updateWorkerObjectInfoHash,
   setWorkerDisabled,
@@ -61,6 +62,7 @@ import { bytesToBase64Url } from "../lib/base64";
 import { verifyAgentRequest, type VerifyAgentResult } from "../lib/verify_agent";
 import { requireAdmin, requireCsrf, requireUser, errorJson } from "../lib/guard";
 import * as modelManifest from "../core/model_manifest";
+import * as retry from "../core/retry";
 
 const PLATFORM_URL_KEY = "platform_url";
 
@@ -255,6 +257,7 @@ app.post("/api/agent/object_info", async (c) => {
 
 app.get("/api/workers", requireUser, async (c) => {
   const workers = await getAllWorkers(c.env.DB);
+  const now = new Date();
   const rows = await Promise.all(
     workers.map(async (w) => ({
       id: w.id,
@@ -281,6 +284,13 @@ app.get("/api/workers", requireUser, async (c) => {
       peer_lan_url: w.peerLanUrl,
       peer_nat: w.peerNat,
       peer_reachable: w.peerReachable,
+      // 2026-09-19 job-retry §8：這台 worker 在哪些「類」任務上翻過車。
+      // `active` = 達門檻且未過 TTL（也就是真的在擋派工）；未達門檻或已過期
+      // 的列照樣帶出來，Workers 頁畫成灰字 -- 管理員要看得到歷史才決定要不要
+      // 手動清除。和 `peer_url` 同一個理由對任何登入使用者可讀：worker 是共用
+      // 基礎設施，這是艦隊 metadata，不是誰的私人資料。清除才是 admin-only
+      // （見下面兩條 DELETE）。Ports workers.py's `GET /api/workers`.
+      unsuitable: await retry.unsuitableRowsForWorker(c.env.DB, w.id, now),
     }))
   );
   return c.json(rows);
@@ -475,6 +485,48 @@ app.post("/api/workers/:workerId/disable", requireCsrf, async (c) => {
     return errorJson(c, 404, "workers.not_found", "Worker not found.");
   }
   return c.json({ ok: true });
+});
+
+// --- DELETE /api/workers/{id}/unsuitable[/{task_key}] ---------------------------
+//
+// 2026-09-19 job-retry §7：管理員的手動解除通道（自動解除是跑成功一次同類任
+// 務，見 `do/hub.ts` 的 `clearUnsuitableForJob`）：換了顯卡、修好了驅動、或者
+// 那兩次失敗根本是平台這邊的問題 -- 不該讓這台等滿七天的 TTL。
+//
+// 同一個 admin＋CSRF 閘門（`requireCsrf` 本身就掛在 admin 之下）跟 disable／
+// delete 一樣。回 `{"cleared": n}`；已經是空的就是 `{"cleared": 0}`，不是 404
+// -- 404 只保留給「沒有這台 worker」。Ports workers.py's
+// `clear_all_unsuitable` / `clear_one_unsuitable`.
+//
+// 兩條都註冊在下面的 `DELETE /api/workers/:workerId` 之前，讓比較長的路徑先
+// 被看到。
+
+/** 404 unless `workerId` names a LIVE worker -- soft-deleted reads as absent,
+ * exactly like the Python route's `worker is None or worker.deleted`. */
+async function isLiveWorker(db: D1Database, workerId: string): Promise<boolean> {
+  return (await getWorkerById(db, workerId)) !== null;
+}
+
+app.delete("/api/workers/:workerId/unsuitable", requireCsrf, async (c) => {
+  const workerId = c.req.param("workerId");
+  if (!(await isLiveWorker(c.env.DB, workerId))) {
+    return errorJson(c, 404, "workers.not_found", "Worker not found.");
+  }
+  const cleared = await retry.clearWorkerFailures(c.env.DB, workerId);
+  return c.json({ cleared });
+});
+
+// `{.+}`：`task_key` 可能是 `model_fetch:<模型名>`，而模型名含目錄分隔
+// （`loras/foo.safetensors`）-- 預設的路徑參數在第一個 `/` 就斷掉，那種 key
+// 會永遠清不掉。Hono 的正規式參數是 FastAPI `{task_key:path}` 的等價物。
+app.delete("/api/workers/:workerId/unsuitable/:taskKey{.+}", requireCsrf, async (c) => {
+  const workerId = c.req.param("workerId");
+  const taskKey = c.req.param("taskKey");
+  if (!(await isLiveWorker(c.env.DB, workerId))) {
+    return errorJson(c, 404, "workers.not_found", "Worker not found.");
+  }
+  const cleared = await retry.clearOneFailure(c.env.DB, workerId, taskKey);
+  return c.json({ cleared });
 });
 
 // --- DELETE /api/workers/{id} ---------------------------------------------------

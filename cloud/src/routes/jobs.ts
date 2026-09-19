@@ -49,6 +49,7 @@ import { presignUrl, r2S3Host } from "../lib/sigv4";
 import { bilingualMessage } from "../core/auth";
 import * as modelGuide from "../core/model_guide";
 import * as modelManifest from "../core/model_manifest";
+import * as retry from "../core/retry";
 import * as split from "../core/split";
 import { resolvePlatformSeed } from "../db/queries";
 
@@ -167,6 +168,12 @@ async function jobDict(job: Job, hub?: DurableObjectNamespace): Promise<Record<s
     // url、是否 unverified）。Ports jobs.py's `_job_dict`.
     kind: job.kind || "prompt",
     fetch_entry: job.fetchEntry ? parseJsonObject(job.fetchEntry) : null,
+    // 2026-09-19 job-retry §8：`{worker_id: 失敗次數}` 與被送回佇列的次數。
+    // JobDetail 用它畫「嘗試紀錄」；一張 `queued` 但 `retry_count > 0` 的 job，
+    // `error` 的意思是「上次錯誤」而不是「死因」（見
+    // `queries.updateJobRequeuedForRetry`）。Ports jobs.py's `_job_dict`.
+    attempts: retry.attemptsDict(job.attempts),
+    retry_count: job.retryCount || 0,
   };
   if (hub) {
     const progress = await queries.getFetchProgress(hub, job.id);

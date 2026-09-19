@@ -694,6 +694,13 @@ describe("panel WS: frame filtering is per-owner (Phase 3.0 Task 10)", () => {
     const admin = await loginCookie();
     const other = await secondUserCookie(admin, "alice");
     const jobId = await makeJob({ status: "running", workerId, startedAt: new Date(), userId: admin.uid });
+    // 2026-09-19 job-retry: `execution_error` is the TERMINAL failure event; a
+    // non-terminal one relays `executing` instead (covered in hub.spec.ts), so
+    // push `attempts` to the cap first.
+    await d1()
+      .prepare("UPDATE jobs SET attempts = ? WHERE id = ?")
+      .bind(JSON.stringify({ "ghost-worker": 5 }), jobId)
+      .run();
 
     const ownerPanel = await connectPanel(admin.cookie);
     await collectMessages(ownerPanel, 2);
@@ -712,7 +719,7 @@ describe("panel WS: frame filtering is per-owner (Phase 3.0 Task 10)", () => {
     const [executionError] = await ownerEventsPromise;
     expect(executionError.type).toBe("execution_error");
     expect(executionError.data.prompt_id).toBe(jobId);
-    expect(executionError.data.exception_message).toBe("boom");
+    expect(executionError.data.exception_message).toContain("boom");
 
     const [otherOnly] = await otherEventsPromise;
     expect(otherOnly.type).toBe("status");
@@ -1053,6 +1060,12 @@ describe("split families on the panel (§3.7)", () => {
         { status: "queued" },
       ],
     });
+
+    // 2026-09-19 job-retry: only a TERMINAL child failure fails the parent.
+    await d1()
+      .prepare("UPDATE jobs SET attempts = ? WHERE id = ?")
+      .bind(JSON.stringify({ "ghost-worker": 5 }), childIds[0])
+      .run();
 
     const panel = await connectPanel(cookie);
     await collectMessages(panel, 2);

@@ -3,6 +3,7 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 import { env } from "cloudflare:test";
 import * as dispatch from "../src/core/dispatch";
 import * as scheduler from "../src/core/scheduler";
+import { exclusionKey } from "../src/core/assess";
 // 保留未被 spy 換掉的本尊，讓 C1 的 spy 能在計數之後照常跑真正的配對。
 const matchActual = scheduler.match;
 import * as split from "../src/core/split";
@@ -30,6 +31,7 @@ afterEach(async () => {
   await db().prepare("DELETE FROM workers").run();
   await db().prepare("DELETE FROM receipts").run();
   await db().prepare("DELETE FROM worker_job_stats").run();
+  await db().prepare("DELETE FROM worker_task_failures").run();
 });
 
 function now(): Date {
@@ -96,13 +98,16 @@ async function makeJob(
     estVramGb?: number | null;
     createdAt?: Date;
     requiredModels?: string[];
+    /** 2026-09-19 job-retry: `retry.taskKey` reads this first, so the
+     * (worker, task_key) exclusion cases need a job that has one. */
+    signature?: string | null;
   } = {}
 ): Promise<string> {
   const id = opts.id ? uniqueId(opts.id) : uniqueId("j");
   await db()
     .prepare(
-      `INSERT INTO jobs (id, workflow_json, status, worker_id, last_worker_id, est_vram_gb, created_at, required_models)
-       VALUES (?, '{}', ?, ?, ?, ?, ?, ?)`
+      `INSERT INTO jobs (id, workflow_json, status, worker_id, last_worker_id, est_vram_gb, created_at, required_models, signature)
+       VALUES (?, '{}', ?, ?, ?, ?, ?, ?, ?)`
     )
     .bind(
       id,
@@ -111,7 +116,8 @@ async function makeJob(
       opts.lastWorkerId ?? null,
       opts.estVramGb ?? null,
       toSqliteTimestamp(opts.createdAt ?? now()),
-      JSON.stringify(opts.requiredModels ?? [])
+      JSON.stringify(opts.requiredModels ?? []),
+      opts.signature ?? null
     )
     .run();
   return id;
@@ -1039,5 +1045,118 @@ describe("子 job 動了就推導父 job (§3.4/§3.6)", () => {
     // 子 job 早就 done、也不歸誰，所以這個轉移不成立；父 job 完全不受影響。
     expect(await dispatch.markDone(db(), childIds[0]!, "w1", [], now())).toBe(false);
     expect((await getJobRow(parentId)).status).toBe("queued");
+  });
+});
+
+// ---------------------------------------------------------------------------
+// 2026-09-19 job-retry：requeueForRetry 與派工排除 -- ports the same block of
+// tests/server/test_dispatch.py.
+
+describe("requeueForRetry (job-retry §5)", () => {
+  it("applies the spec fields", async () => {
+    // §5 的 requeue 欄位：回 queued、放開 worker、記 last_worker_id、進度歸
+    // 零、時間戳清掉、`error` 留著當「最後錯誤」、`retry_count += 1`。
+    const workerId = await makeWorker("w1");
+    const jobId = await makeJob({ status: "running", workerId, signature: "sig-a" });
+    await db()
+      .prepare("UPDATE jobs SET started_at = ?, progress = 0.75, dispatch_info = ? WHERE id = ?")
+      .bind(toSqliteTimestamp(now()), JSON.stringify({ candidates: 3 }), jobId)
+      .run();
+
+    expect(await dispatch.requeueForRetry(db(), jobId, workerId, "boom", now())).toBe(true);
+
+    const job = await getJobRow(jobId);
+    expect(job.status).toBe("queued");
+    expect(job.worker_id).toBeNull();
+    expect(job.last_worker_id).toBe(workerId);
+    expect(job.progress).toBe(0);
+    expect(job.started_at).toBeNull();
+    expect(job.finished_at).toBeNull();
+    expect(job.error).toBe("boom");
+    expect(job.retry_count).toBe(1);
+    expect(job.dispatch_info).toBe("{}");
+    // 簽章留著 -- 它是工作本身的指紋，和哪台跑無關。
+    expect(job.signature).toBe("sig-a");
+  });
+
+  it("increments retry_count each time", async () => {
+    const workerId = await makeWorker("w1");
+    const jobId = await makeJob({ status: "running", workerId });
+    expect(await dispatch.requeueForRetry(db(), jobId, workerId, "one", now())).toBe(true);
+
+    await db()
+      .prepare("UPDATE jobs SET status = 'running', worker_id = ? WHERE id = ?")
+      .bind(workerId, jobId)
+      .run();
+    expect(await dispatch.requeueForRetry(db(), jobId, workerId, "two", now())).toBe(true);
+
+    const job = await getJobRow(jobId);
+    expect(job.retry_count).toBe(2);
+    expect(job.error).toBe("two");
+  });
+
+  it("refuses a job this worker does not own", async () => {
+    // owned 判定和 `markFailed` 同一道閘門 -- 別台的 job、不存在的 job、已經
+    // 終局的 job 一律 false 且什麼都不動。
+    const workerA = await makeWorker("w-a");
+    const workerB = await makeWorker("w-b");
+    const jobId = await makeJob({ status: "running", workerId: workerA });
+
+    expect(await dispatch.requeueForRetry(db(), jobId, workerB, "sabotage", now())).toBe(false);
+    expect(await dispatch.requeueForRetry(db(), "nope", workerA, "boom", now())).toBe(false);
+
+    const job = await getJobRow(jobId);
+    expect(job.status).toBe("running");
+    expect(job.worker_id).toBe(workerA);
+    expect(job.error).toBeNull();
+    expect(job.retry_count).toBe(0);
+
+    const doneId = await makeJob({ status: "done", workerId: workerA });
+    expect(await dispatch.requeueForRetry(db(), doneId, workerA, "late", now())).toBe(false);
+    expect((await getJobRow(doneId)).status).toBe("done");
+  });
+});
+
+describe("assignJobs exclusions (job-retry §6)", () => {
+  it("skips a worker excluded for this job", async () => {
+    const workerId = await makeWorker("w1", { dynamic: { free_vram_gb: 24 } });
+    const jobId = await makeJob({ signature: "sig-excl-job" });
+
+    expect(
+      await dispatch.assignJobs(db(), [workerId], null, null, now(), null, new Set([exclusionKey(workerId, jobId)]))
+    ).toEqual([]);
+    expect((await getJobRow(jobId)).status).toBe("queued");
+
+    const assignments = await dispatch.assignJobs(db(), [workerId]);
+    expect(assignments.map((a) => [a.workerId, a.job.id])).toEqual([[workerId, jobId]]);
+  });
+
+  it("skips a worker unsuitable for this task key", async () => {
+    // `exclusions` 帶 `(worker, task_key)` -- 同一類任務的別張 job 也擋。
+    const workerId = await makeWorker("w1", { dynamic: { free_vram_gb: 24 } });
+    const key = "sig-unsuitable";
+    const jobId = await makeJob({ signature: key });
+
+    expect(
+      await dispatch.assignJobs(db(), [workerId], null, null, now(), null, new Set([exclusionKey(workerId, key)]))
+    ).toEqual([]);
+    expect((await getJobRow(jobId)).status).toBe("queued");
+  });
+
+  it("prefers the worker that is not excluded", async () => {
+    const workerA = await makeWorker("w-a", { dynamic: { free_vram_gb: 24 } });
+    const workerB = await makeWorker("w-b", { dynamic: { free_vram_gb: 24 } });
+    const jobId = await makeJob({ signature: "sig-prefer" });
+
+    const assignments = await dispatch.assignJobs(
+      db(),
+      [workerA, workerB],
+      null,
+      null,
+      now(),
+      null,
+      new Set([exclusionKey(workerA, jobId)])
+    );
+    expect(assignments.map((a) => [a.workerId, a.job.id])).toEqual([[workerB, jobId]]);
   });
 });

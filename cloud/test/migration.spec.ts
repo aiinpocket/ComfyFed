@@ -27,6 +27,7 @@ describe("D1 migration 0001_initial", () => {
         "upload_tokens",
         "users",
         "worker_job_stats",
+        "worker_task_failures",
         "workers",
       ].sort()
     );
@@ -69,6 +70,38 @@ describe("D1 migration 0001_initial", () => {
       .first<{ kind: string; fetch_entry: string | null }>();
     expect(row?.kind).toBe("prompt");
     expect(row?.fetch_entry).toBeNull();
+  });
+
+  it("jobs has attempts/retry_count and worker_task_failures exists (migration 0012)", async () => {
+    // 2026-09-19 job-retry (spec §4): a pre-migration row -- and every INSERT
+    // that does not name the columns -- must read back as "never failed".
+    const db = (env as any).DB as D1Database;
+    const cols = await db.prepare("PRAGMA table_info(jobs)").all<{ name: string }>();
+    const names = new Set(cols.results.map((c) => c.name));
+    expect(names.has("attempts"), "jobs.attempts missing").toBe(true);
+    expect(names.has("retry_count"), "jobs.retry_count missing").toBe(true);
+
+    await db
+      .prepare("INSERT INTO jobs (id, workflow_json, created_at) VALUES (?, ?, ?)")
+      .bind("job-retry-default", "{}", new Date().toISOString())
+      .run();
+    const row = await db
+      .prepare("SELECT attempts, retry_count FROM jobs WHERE id = ?")
+      .bind("job-retry-default")
+      .first<{ attempts: string; retry_count: number }>();
+    expect(row?.attempts).toBe("{}");
+    expect(row?.retry_count).toBe(0);
+
+    const failureCols = await db
+      .prepare("PRAGMA table_info(worker_task_failures)")
+      .all<{ name: string; pk: number }>();
+    const byName = new Map(failureCols.results.map((c) => [c.name, c]));
+    for (const col of ["worker_id", "task_key", "failures", "last_error", "last_job_id", "updated_at"]) {
+      expect(byName.has(col), `worker_task_failures.${col} missing`).toBe(true);
+    }
+    // 複合主鍵 (worker_id, task_key)，和 `worker_job_stats` 同一個形狀。
+    expect(byName.get("worker_id")!.pk).toBeGreaterThan(0);
+    expect(byName.get("task_key")!.pk).toBeGreaterThan(0);
   });
 
   it("workers has protocol and object_info_hash", async () => {

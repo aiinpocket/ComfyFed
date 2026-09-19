@@ -19,6 +19,7 @@ afterEach(async () => {
   await db().prepare("DELETE FROM register_tokens").run();
   await db().prepare("DELETE FROM nonces").run();
   await db().prepare("DELETE FROM login_attempts").run();
+  await db().prepare("DELETE FROM worker_task_failures").run();
 });
 
 function store(): R2Bucket {
@@ -918,5 +919,184 @@ describe("DELETE /api/workers/:id", () => {
     const r = await signedPost(w, "/api/agent/ping");
     expect(r.status).toBe(401);
     expect(r.body.error.code).toBe("agent.bad_signature");
+  });
+});
+
+// ---------------------------------------------------------------------------
+// 2026-09-19 job-retry §8：worker 的不適任任務清單與清除 -- ports the same
+// block of tests/server/test_workers.py.
+
+const DAY_MS = 24 * 60 * 60 * 1000;
+
+async function seedFailure(
+  workerId: string,
+  taskKey: string,
+  failures: number,
+  opts: { daysAgo?: number; error?: string; jobId?: string } = {}
+): Promise<void> {
+  const updatedAt = new Date(Date.now() - (opts.daysAgo ?? 0) * DAY_MS);
+  await db()
+    .prepare(
+      `INSERT INTO worker_task_failures (worker_id, task_key, failures, last_error, last_job_id, updated_at)
+       VALUES (?, ?, ?, ?, ?, ?)`
+    )
+    .bind(workerId, taskKey, failures, opts.error ?? "boom", opts.jobId ?? "j-old", toSqliteTimestamp(updatedAt))
+    .run();
+}
+
+describe("GET /api/workers unsuitable[] (job-retry §8)", () => {
+  it("reports active and inactive rows", async () => {
+    // 達門檻且未過 TTL -> active true；未達門檻或已過 TTL 的列照樣列出來
+    // （管理員要看得到歷史），只是 false。
+    const { cookie, csrf } = await adminSession();
+    const a = await registerWorker("worker-unsuitable");
+    const b = await registerWorker("worker-other");
+    await seedFailure(a.workerId, "sig-active", 2, { error: "CUDA OOM", jobId: "j-1" });
+    await seedFailure(a.workerId, "sig-expired", 3, { daysAgo: 9 });
+    await seedFailure(a.workerId, "sig-once", 1);
+    await seedFailure(b.workerId, "sig-elsewhere", 2);
+
+    const listed = await call("/api/workers", { cookie, headers: { "X-CSRF": csrf } });
+    expect(listed.status).toBe(200);
+    const worker = listed.body.find((w: any) => w.id === a.workerId);
+    const byKey = new Map(worker.unsuitable.map((row: any) => [row.task_key, row]));
+    expect(new Set(byKey.keys())).toEqual(new Set(["sig-active", "sig-expired", "sig-once"]));
+    expect((byKey.get("sig-active") as any).active).toBe(true);
+    expect((byKey.get("sig-active") as any).failures).toBe(2);
+    expect((byKey.get("sig-active") as any).last_error).toBe("CUDA OOM");
+    expect((byKey.get("sig-active") as any).last_job_id).toBe("j-1");
+    expect((byKey.get("sig-active") as any).updated_at).toBeTruthy();
+    expect((byKey.get("sig-expired") as any).active).toBe(false);
+    expect((byKey.get("sig-once") as any).active).toBe(false);
+
+    const other = listed.body.find((w: any) => w.id === b.workerId);
+    expect(other.unsuitable.map((row: any) => row.task_key)).toEqual(["sig-elsewhere"]);
+  });
+
+  it("is empty for a clean worker", async () => {
+    const { cookie, csrf } = await adminSession();
+    const worker = await registerWorker("worker-clean");
+    const listed = await call("/api/workers", { cookie, headers: { "X-CSRF": csrf } });
+    expect(listed.body.find((w: any) => w.id === worker.workerId).unsuitable).toEqual([]);
+  });
+});
+
+describe("DELETE /api/workers/:id/unsuitable[/:task_key] (job-retry §7)", () => {
+  it("clears one task key, idempotently", async () => {
+    const { cookie, csrf } = await adminSession();
+    const worker = await registerWorker("worker-clear-one");
+    await seedFailure(worker.workerId, "sig-a", 2);
+    await seedFailure(worker.workerId, "sig-b", 2);
+
+    const r = await call(`/api/workers/${worker.workerId}/unsuitable/sig-a`, {
+      method: "DELETE",
+      cookie,
+      headers: { "X-CSRF": csrf },
+    });
+    expect(r.status).toBe(200);
+    expect(r.body).toEqual({ cleared: 1 });
+
+    const listed = await call("/api/workers", { cookie, headers: { "X-CSRF": csrf } });
+    const row = listed.body.find((w: any) => w.id === worker.workerId);
+    expect(row.unsuitable.map((u: any) => u.task_key)).toEqual(["sig-b"]);
+
+    // 再清一次就是 0 列 -- 冪等，不是 404。
+    const again = await call(`/api/workers/${worker.workerId}/unsuitable/sig-a`, {
+      method: "DELETE",
+      cookie,
+      headers: { "X-CSRF": csrf },
+    });
+    expect(again.status).toBe(200);
+    expect(again.body).toEqual({ cleared: 0 });
+  });
+
+  it("clears a task key containing slashes (model_fetch:<dir>/<file>)", async () => {
+    // `{.+}` 的理由：預設的路徑參數在第一個 `/` 就斷掉，那種 key 會永遠清不掉。
+    const { cookie, csrf } = await adminSession();
+    const worker = await registerWorker("worker-clear-path");
+    const key = "model_fetch:loras/foo.safetensors";
+    await seedFailure(worker.workerId, key, 2);
+
+    const r = await call(`/api/workers/${worker.workerId}/unsuitable/${key}`, {
+      method: "DELETE",
+      cookie,
+      headers: { "X-CSRF": csrf },
+    });
+    expect(r.status).toBe(200);
+    expect(r.body).toEqual({ cleared: 1 });
+  });
+
+  it("clears every row for one worker and leaves the others alone", async () => {
+    const { cookie, csrf } = await adminSession();
+    const worker = await registerWorker("worker-clear-all");
+    const other = await registerWorker("worker-untouched");
+    await seedFailure(worker.workerId, "sig-a", 2);
+    await seedFailure(worker.workerId, "sig-b", 1);
+    await seedFailure(other.workerId, "sig-a", 2);
+
+    const r = await call(`/api/workers/${worker.workerId}/unsuitable`, {
+      method: "DELETE",
+      cookie,
+      headers: { "X-CSRF": csrf },
+    });
+    expect(r.status).toBe(200);
+    expect(r.body).toEqual({ cleared: 2 });
+
+    const listed = await call("/api/workers", { cookie, headers: { "X-CSRF": csrf } });
+    expect(listed.body.find((w: any) => w.id === worker.workerId).unsuitable).toEqual([]);
+    // 別台的紀錄一動也沒動。
+    expect(listed.body.find((w: any) => w.id === other.workerId).unsuitable).toHaveLength(1);
+  });
+
+  it("404s for an unknown worker", async () => {
+    const { cookie, csrf } = await adminSession();
+    const all = await call("/api/workers/nope/unsuitable", {
+      method: "DELETE",
+      cookie,
+      headers: { "X-CSRF": csrf },
+    });
+    expect(all.status).toBe(404);
+    const one = await call("/api/workers/nope/unsuitable/sig-a", {
+      method: "DELETE",
+      cookie,
+      headers: { "X-CSRF": csrf },
+    });
+    expect(one.status).toBe(404);
+    expect(one.body.error.code).toBe("workers.not_found");
+  });
+
+  it("403s without X-CSRF", async () => {
+    const { cookie } = await adminSession();
+    const worker = await registerWorker("worker-csrf");
+    const r = await call(`/api/workers/${worker.workerId}/unsuitable`, { method: "DELETE", cookie });
+    expect(r.status).toBe(403);
+  });
+
+  it("403s for a logged-in non-admin, who can still READ the list", async () => {
+    const admin = await adminSession();
+    const worker = await registerWorker("worker-role");
+    await seedFailure(worker.workerId, "sig-a", 2);
+    const user = await userSession("reader-unsuitable");
+
+    const all = await call(`/api/workers/${worker.workerId}/unsuitable`, {
+      method: "DELETE",
+      cookie: user.cookie,
+      headers: { "X-CSRF": user.csrf },
+    });
+    expect(all.status).toBe(403);
+    const one = await call(`/api/workers/${worker.workerId}/unsuitable/sig-a`, {
+      method: "DELETE",
+      cookie: user.cookie,
+      headers: { "X-CSRF": user.csrf },
+    });
+    expect(one.status).toBe(403);
+
+    // 一般使用者讀得到清單（workers 是共用基礎設施），只是不能清。
+    const listed = await call("/api/workers", { cookie: user.cookie });
+    expect(listed.status).toBe(200);
+    expect(
+      listed.body.find((w: any) => w.id === worker.workerId).unsuitable.map((u: any) => u.task_key)
+    ).toEqual(["sig-a"]);
+    expect(admin.csrf).toBeTruthy();
   });
 });

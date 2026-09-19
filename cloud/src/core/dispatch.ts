@@ -21,8 +21,10 @@ import {
   needsFromJob,
   verdict,
   MODEL_FETCH_PROTOCOL_REASON,
+  type ExclusionSet,
   type FetchableModels,
 } from "./assess";
+import * as retry from "./retry";
 import * as scheduler from "./scheduler";
 import * as split from "./split";
 import * as stats from "./stats";
@@ -96,7 +98,14 @@ export async function assignJobs(
    * `unverified_models`. 刻意排在 `now` 後面而不是 Python 的參數位置：
    * `now` 是這一棧多出來的可注入時鐘，既有呼叫端都用位置參數傳它，插隊會
    * 悄悄把時鐘餵成集合。 */
-  unverifiedModels?: ReadonlySet<string> | null
+  unverifiedModels?: ReadonlySet<string> | null,
+  /** 2026-09-19 job-retry §6：`(worker_id, job_id)` 與 `(worker_id, task_key)`
+   * 的排除集合（`assess.exclusionKey` 壓成字串），由 `do/hub.ts` 的 dispatch
+   * tick 一個 tick 建一次（見 `retry.activeUnsuitable`）。這裡只負責對每一對
+   * (job, worker) 把 job 自己的 id／`taskKey` 一起傳給 `assess.verdict`；命中
+   * 就是 `ineligible`，於是那一對在 `scheduler.match` 的成本矩陣裡是 ∞，永遠
+   * 不會被選中。Ports `dispatch.assign_jobs`'s `exclusions`. */
+  exclusions?: ExclusionSet | null
 ): Promise<Assignment[]> {
   if (idleWorkerIds.length === 0) return [];
 
@@ -155,6 +164,7 @@ export async function assignJobs(
 
   for (const job of selectedJobs) {
     const needs = needsFromJob(job);
+    const jobTaskKey = retry.taskKey(job);
     const isLight = needs.models.size === 0 && !needs.estVramGb;
     jobCandidates.push({
       jobId: job.id,
@@ -172,7 +182,8 @@ export async function assignJobs(
         allWorkers,
         fetchableModels,
         peerOnlyModels,
-        unverifiedModels
+        unverifiedModels,
+        { jobId: job.id, taskKey: jobTaskKey, exclusions }
       );
       // 2026-09-19 model_fetch (final-review I1): EVERY model_fetch job needs
       // protocol>=5, not just one whose entry happens to be unverified.
@@ -428,6 +439,37 @@ export async function markDone(
   if (!result.ok) return false;
   await queries.updateJobDone(db, jobId, resultFiles, toSqliteTimestamp(now));
   // Phase 3.3 §3.4：最後一個子 job 完成時父 job 才會翻成 done。
+  await split.childStatusChanged(db, jobId, now);
+  return true;
+}
+
+/**
+ * 2026-09-19 job-retry §5：非終局失敗 -- 把 `workerId` 的 job 送回佇列。
+ * Ports `dispatch.requeue_for_retry`.
+ *
+ * `markFailed` 的重試孿生：同一道 `resolveOwnedJob` 閘門（一個 worker 永遠只
+ * 能轉移它此刻真的擁有、而且還沒終局的 job），但套的是 §5 的 requeue 欄位而
+ * 不是 `failed`（見 `queries.updateJobRequeuedForRetry`）。
+ *
+ * `attempts` 不在這裡動：計次在 `do/hub.ts` 的 `job_failed` 分流裡跟
+ * `worker_task_failures` 一起做完，這個函式只負責「怎麼放回佇列」，好讓終局／
+ * 非終局兩條路的計次邏輯只有一份。
+ *
+ * §3.4：子 job 被送回佇列後父 job 要跟著重算（可能從 running 退回
+ * assigned/queued）-- 和 `requeueStale` 同一個呼叫，而且因為這條路從不產生
+ * `failed`/`cancelled`，兄弟永遠不會被連坐取消。連坐只發生在真的終局的
+ * `markFailed` 上。
+ */
+export async function requeueForRetry(
+  db: D1Database,
+  jobId: string,
+  workerId: string,
+  error: string,
+  now: Date
+): Promise<boolean> {
+  const result = await resolveOwnedJob(db, jobId, workerId, OWNED_STATUSES);
+  if (!result.ok) return false;
+  await queries.updateJobRequeuedForRetry(db, jobId, workerId, error);
   await split.childStatusChanged(db, jobId, now);
   return true;
 }

@@ -666,6 +666,18 @@ export interface Job {
    * 只有 `core/model_fetch.ts` 與 dispatch tick 的合併需要它，`rowToJob`
    * 不該替每一列付這個解析成本（同 `splitPlan` 的理由）。 */
   fetchEntry: string | null;
+  /** 2026-09-19 job-retry §4：`{worker_id: failures}` 的 JSON 原文，每次那台
+   * worker 對這張 job 回報 `job_failed`（而且 transition 真的套用了）就 +1。
+   * 同一台達 `retry.MAX_FAILURES_PER_WORKER_PER_JOB` 就對這張 job 出局；全部
+   * 加總達 `retry.MAX_JOB_ATTEMPTS` 就終局失敗。`cancelled`（管理員取消）與
+   * `requeueStale`（worker 斷線）不計入 -- 那兩者都不是「這台跑不動這個工作」
+   * 的證據。刻意保留字串（同 `splitPlan`/`fetchEntry`）：只有 retry 路徑要它，
+   * 解析走 `retry.attemptsDict` 的防禦式版本。Mirrors `db.Job.attempts`. */
+  attempts: string;
+  /** 2026-09-19 job-retry §4：這張 job 被非終局失敗送回 `queued` 的次數。
+   * `attempts` 的總和是「失敗幾次」，這個是「重排隊幾次」，終局那一次不算，
+   * 所以兩者差 1。Mirrors `db.Job.retry_count`. */
+  retryCount: number;
 }
 
 interface JobRow {
@@ -697,6 +709,8 @@ interface JobRow {
   split_plan: string | null;
   kind: string;
   fetch_entry: string | null;
+  attempts: string;
+  retry_count: number;
 }
 
 function rowToJob(row: JobRow): Job {
@@ -733,6 +747,12 @@ function rowToJob(row: JobRow): Job {
     // same thing Python's `job.kind or "prompt"` does at every read site.
     kind: row.kind || "prompt",
     fetchEntry: row.fetch_entry ?? null,
+    // Migration 0012 declares both DEFAULTs; degrade the same defensive way
+    // `kind` does for a row read back off an older schema snapshot (and
+    // because `retry.attemptsDict` treats anything unparseable as "{}"
+    // anyway, an empty object here is exactly the "never failed" reading).
+    attempts: row.attempts || "{}",
+    retryCount: row.retry_count ?? 0,
   };
 }
 
@@ -1180,6 +1200,46 @@ export async function updateJobFailed(
   await db
     .prepare("UPDATE jobs SET status = 'failed', error = ?, finished_at = ? WHERE id = ?")
     .bind(error, finishedAt, jobId)
+    .run();
+}
+
+/** 2026-09-19 job-retry §5: write back the `{worker_id: failures}` JSON
+ * `retry.bumpAttempts` produced. Deliberately a bare column write with no
+ * status predicate -- the ownership/status gate already ran in the caller
+ * (`do/hub.ts`'s `recordFailedAttempt`, inside `applyOwnedTransition`), the
+ * same place agentws.py's `_record_failed_attempt` runs `dispatch.owned_job`
+ * before touching the column. */
+export async function updateJobAttempts(db: D1Database, jobId: string, attemptsJson: string): Promise<void> {
+  await db.prepare("UPDATE jobs SET attempts = ? WHERE id = ?").bind(attemptsJson, jobId).run();
+}
+
+/** 2026-09-19 job-retry §5: the requeue half of a non-terminal failure --
+ * `dispatch.requeueForRetry`'s single DB write, mirroring the field set
+ * `dispatch.requeue_for_retry` applies:
+ *
+ *     status=queued, worker_id=NULL, last_worker_id=W, progress=0,
+ *     started_at=NULL, finished_at=NULL, error=E, retry_count += 1,
+ *     dispatch_info='{}'
+ *
+ * `error` is deliberately kept: that column's meaning widens from "what this
+ * job died of" to "what the LAST attempt died of", and the console renders it
+ * as 「上次錯誤」on a queued job with `retry_count > 0`. `signature` survives
+ * -- it fingerprints the work itself, not who ran it. */
+export async function updateJobRequeuedForRetry(
+  db: D1Database,
+  jobId: string,
+  workerId: string,
+  error: string
+): Promise<void> {
+  await db
+    .prepare(
+      `UPDATE jobs
+       SET status = 'queued', last_worker_id = ?, worker_id = NULL, progress = 0,
+           started_at = NULL, finished_at = NULL, error = ?,
+           retry_count = retry_count + 1, dispatch_info = '{}'
+       WHERE id = ?`
+    )
+    .bind(workerId, error, jobId)
     .run();
 }
 
