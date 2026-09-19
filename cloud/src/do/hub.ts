@@ -244,6 +244,9 @@ interface Ephemeral {
 interface FailedAttempt {
   /** `{worker_id: failures}` AFTER this attempt was counted. */
   attempts: Record<string, number>;
+  /** `{worker_id: last_error}` off the SAME job row -- the only source the
+   * terminal summary is allowed to quote (see `finalErrorSummary`). */
+  errors: Record<string, string>;
   /** `Σ attempts.values()`, compared against `retry.MAX_JOB_ATTEMPTS`. */
   total: number;
   taskKey: string | null;
@@ -1648,23 +1651,35 @@ export class Hub extends DurableObject<Env> {
     }
     const job = result.job;
     const key = retry.taskKey(job);
-    const [newAttempts, , total] = retry.bumpAttempts(job.attempts, workerId);
+    const [newAttempts, , total] = retry.bumpAttempts(job.attempts, workerId, error);
     await queries.updateJobAttempts(db, jobId, newAttempts);
     await retry.recordFailure(db, workerId, key, error, jobId, now);
-    return { attempts: retry.attemptsDict(newAttempts), total, taskKey: key, startedAt: job.startedAt };
+    return {
+      attempts: retry.attemptsDict(newAttempts),
+      errors: retry.attemptErrors(newAttempts),
+      total,
+      taskKey: key,
+      startedAt: job.startedAt,
+    };
   }
 
   /**
    * 終局失敗時寫進 `jobs.error` 的彙整訊息（`retry.summarizeFinalError`）。
    * Ports agentws.py's `_final_error_summary`.
    *
-   * 每台 worker 的「最後錯誤」來自 `worker_task_failures[W, task_key]`：那張表
-   * 是平台唯一存過去每台錯誤的地方（`jobs.attempts` 只存次數）。正在回報的這
-   * 一台用它手上這個 `error`，因為那就是最新的一筆，不必再讀一次。
+   * 每台 worker 的「最後錯誤」只來自**這張 job 自己的** `jobs.attempts`
+   * （見 `retry` 的 `attemptEntries`）。最初版是從跨 job 累計的
+   * `worker_task_failures[W, task_key]` 撈的，那會讓這張 job 的 `error` 引用
+   * 到同簽章的**另一張** job（可能屬於另一個使用者）的錯誤字串 -- 既誤導診斷
+   * （看起來像是這張 job 在那台上的錯誤），錯誤訊息又常含檔名與路徑，是一條
+   * 很細的跨使用者字串外洩路徑。
+   *
+   * 正在回報的這一台用它手上這個 `error`（和已經寫進去的那一筆相同，只是不必
+   * 再讀一次）。還沒有錯誤字串可引的（舊形狀的 attempts 欄）就只列名字。
    *
    * 顯示名取 `workers.name`；worker 列不見了（或這張 job 的 attempts 裡有已經
    * 被硬刪的 id）就退回 id 前 8 字 -- 一個認不出來的 id 也好過整段訊息發不
-   * 出來。`taskKey` 是 null 的舊 job 沒有紀錄可查，其他台就只剩空字串。
+   * 出去。
    *
    * worker 的列舉順序是 `attempts` 的插入順序，和 Python 的 `list(dict)` 一樣
    * （worker id 都是 uuid，不是 JS 會重排的整數式 key）。
@@ -1672,12 +1687,8 @@ export class Hub extends DurableObject<Env> {
   private async finalErrorSummary(attempt: FailedAttempt, workerId: string, error: string): Promise<string> {
     const db = this.env.DB;
     const workerIds = Object.keys(attempt.attempts);
-    let lastErrors = new Map<string, string>();
     const names = new Map<string, string>();
     if (workerIds.length > 0) {
-      if (attempt.taskKey) {
-        lastErrors = await retry.lastErrorsForTaskKey(db, attempt.taskKey, workerIds);
-      }
       // `getWorkersByIds` deliberately does NOT filter soft-deleted rows --
       // exactly what is wanted here: a worker an admin deleted mid-retry still
       // has a name worth printing. Mirrors the plain `db.Worker` query Python
@@ -1687,7 +1698,7 @@ export class Hub extends DurableObject<Env> {
 
     const pairs = workerIds.map(
       (wid) =>
-        [names.get(wid) || wid.slice(0, 8), wid === workerId ? error : (lastErrors.get(wid) ?? "")] as [
+        [names.get(wid) || wid.slice(0, 8), wid === workerId ? error : (attempt.errors[wid] ?? "")] as [
           string,
           string,
         ]

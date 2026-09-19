@@ -342,11 +342,57 @@ export async function cancelJob(
 // ---------------------------------------------------------------------------
 // tryReadopt
 
-/** Restore ownership of a job to `workerId` if it's the worker's own job
+/**
+ * Restore ownership of a job to `workerId` if it's the worker's own job
  * blipping back (still `queued` AND `last_worker_id === workerId`), not
  * someone else's. Ports `dispatch.try_readopt`; the claim is atomic via
- * `queries.readoptJob`'s single conditional UPDATE. */
+ * `queries.readoptJob`'s single conditional UPDATE.
+ *
+ * 2026-09-19 job-retry — the THIRD condition, and the reason it exists:
+ * before that feature, `status === "queued" AND last_worker_id === W` could
+ * only ever be produced by `requeueStale`, i.e. by W actually vanishing for
+ * 90 seconds. `requeueForRetry` now produces exactly the same pair
+ * deliberately (spec §5 requires `last_worker_id = W`), while W is still
+ * connected — so without a guard, a worker could send `job_failed` and then
+ * `job_done` for the same job, re-adopt it here, have it marked `done`, mint
+ * a BILLABLE receipt for work it just said it could not do, and clear its own
+ * unsuitable record. Worse, it could do that after being excluded by
+ * `failed_twice_on_job`, bypassing the exclusion entirely. Unlike the stale
+ * path, that is a state the worker can manufacture on demand.
+ *
+ * The discriminator is `(this worker has already failed this job) AND (it
+ * never reported starting this time)`:
+ *
+ *  * `requeueForRetry` ALWAYS runs right after an attempt was counted
+ *    (`hub.recordFailedAttempt`), so W is in `attempts`, and it ALWAYS clears
+ *    `started_at` — both halves hold on every retry requeue, so the attack is
+ *    blocked in every case.
+ *  * `requeueStale` writes NEITHER, so an ordinary blip re-adoption is
+ *    completely unaffected.
+ *
+ * `started_at IS NOT NULL` alone would NOT have been a sound test, which is
+ * why both halves are needed: `requeueStale` sweeps `assigned` jobs too, and
+ * an `assigned` job has no `started_at` (only `markRunning` sets one), so
+ * that condition on its own would refuse a legitimate blip from a worker that
+ * went quiet before its first busy heartbeat. The only re-adoption this pair
+ * gives up is one by a worker that both failed this job before AND never
+ * reported starting it this time — which has no result worth trusting anyway,
+ * and simply means the job is dispatched again.
+ *
+ * The check reads the row first because `attempts` is JSON the database
+ * cannot filter on; the atomic conditional UPDATE below is unchanged and
+ * still settles any race with a concurrent claim.
+ */
 export async function tryReadopt(db: D1Database, jobId: string, workerId: string): Promise<boolean> {
+  const job = await queries.getJobById(db, jobId);
+  if (job === null) return false;
+  if (job.startedAt === null && retry.hasFailedJob(job.attempts, workerId)) {
+    console.info(
+      `dispatch: refusing to re-adopt job ${jobId} for worker ${workerId} -- ` +
+        "it already failed this job and never reported starting it"
+    );
+    return false;
+  }
   return queries.readoptJob(db, jobId, workerId);
 }
 

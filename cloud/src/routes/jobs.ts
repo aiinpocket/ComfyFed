@@ -173,6 +173,9 @@ async function jobDict(job: Job, hub?: DurableObjectNamespace): Promise<Record<s
     // `error` 的意思是「上次錯誤」而不是「死因」（見
     // `queries.updateJobRequeuedForRetry`）。Ports jobs.py's `_job_dict`.
     attempts: retry.attemptsDict(job.attempts),
+    // per-job 的最後錯誤，不是跨 job 累計的那一個（後者在 `/api/workers` 的
+    // `unsuitable[]` 裡）。沒失敗過的 worker 不會出現。
+    attempt_errors: retry.attemptErrors(job.attempts),
     retry_count: job.retryCount || 0,
   };
   if (hub) {

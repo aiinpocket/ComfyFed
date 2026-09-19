@@ -57,53 +57,96 @@ describe("retry constants", () => {
   });
 });
 
-// --- bumpAttempts / isExcludedForJob ---------------------------------------
+// --- bumpAttempts / isExcludedForJob / hasFailedJob ------------------------------------
 
-describe("bumpAttempts / isExcludedForJob", () => {
-  it("bumps an empty map", () => {
-    const [json, mine, total] = retry.bumpAttempts("{}", "w1");
-    expect(JSON.parse(json)).toEqual({ w1: 1 });
+describe("bumpAttempts / isExcludedForJob / hasFailedJob", () => {
+  it("bumps an empty map, storing this attempt's error", () => {
+    const [json, mine, total] = retry.bumpAttempts("{}", "w1", "boom");
+    expect(JSON.parse(json)).toEqual({ w1: { failures: 1, last_error: "boom" } });
     expect([mine, total]).toEqual([1, 1]);
   });
 
   it("accumulates per worker and totals", () => {
-    const [first, mine1, total1] = retry.bumpAttempts("{}", "w1");
+    const [first, mine1, total1] = retry.bumpAttempts("{}", "w1", "one");
     expect([mine1, total1]).toEqual([1, 1]);
-    const [second, mine2, total2] = retry.bumpAttempts(first, "w1");
+    const [second, mine2, total2] = retry.bumpAttempts(first, "w1", "two");
     expect([mine2, total2]).toEqual([2, 2]);
-    const [third, mine3, total3] = retry.bumpAttempts(second, "w2");
+    const [third, mine3, total3] = retry.bumpAttempts(second, "w2", "three");
     expect([mine3, total3]).toEqual([1, 3]);
-    expect(JSON.parse(third)).toEqual({ w1: 2, w2: 1 });
+    expect(retry.attemptsDict(third)).toEqual({ w1: 2, w2: 1 });
+    // 每台的「最後錯誤」只跟著自己走，不被別台蓋掉。
+    expect(retry.attemptErrors(third)).toEqual({ w1: "two", w2: "three" });
+  });
+
+  it("truncates the per-job last error at 200", () => {
+    // I2：這個字串最後會進彙整訊息，而彙整訊息會進 `jobs.error`。存的時候就
+    // 截在 200 字，一段 CUDA traceback 才不會把 job 列撐肥。
+    const [json] = retry.bumpAttempts("{}", "w1", "x".repeat(900));
+    expect(retry.attemptErrors(json)).toEqual({ w1: "x".repeat(retry.FINAL_ERROR_CHARS) });
+  });
+
+  it("keeps the previous error when no new one is given", () => {
+    const [first] = retry.bumpAttempts("{}", "w1", "boom");
+    const [second] = retry.bumpAttempts(first, "w1");
+    expect(retry.attemptsDict(second)).toEqual({ w1: 2 });
+    expect(retry.attemptErrors(second)).toEqual({ w1: "boom" });
   });
 
   it("tolerates garbage JSON", () => {
     // 一列壞掉的 attempts 不能讓 job_failed 整條路徑炸掉 -- 當成空的重算。
     for (const bad of ["not json", "[1,2]", null, undefined, ""]) {
-      const [json, mine, total] = retry.bumpAttempts(bad, "w1");
-      expect(JSON.parse(json)).toEqual({ w1: 1 });
+      const [json, mine, total] = retry.bumpAttempts(bad, "w1", "boom");
+      expect(retry.attemptsDict(json)).toEqual({ w1: 1 });
       expect([mine, total]).toEqual([1, 1]);
     }
     // 非數字的值也一樣：那一個 key 當 0 重新起算，其它 key 照舊。
-    const [json, mine, total] = retry.bumpAttempts('{"w1": "x", "w2": 3}', "w1");
+    const [json, mine, total] = retry.bumpAttempts('{"w1": "x", "w2": 3}', "w1", "boom");
     expect([mine, total]).toEqual([1, 4]);
-    expect(JSON.parse(json)).toEqual({ w1: 1, w2: 3 });
+    expect(retry.attemptsDict(json)).toEqual({ w1: 1, w2: 3 });
+  });
+
+  it("still reads attempts written before the envelope existed", () => {
+    // 舊形狀 `{worker_id: n}`（migration 0012 之後、這個跟進之前寫下的列）
+    // 照樣讀得出次數，只是沒有錯誤字串可引。
+    expect(retry.attemptsDict('{"w1": 2, "w2": 1}')).toEqual({ w1: 2, w2: 1 });
+    expect(retry.attemptErrors('{"w1": 2}')).toEqual({});
+    expect(retry.isExcludedForJob('{"w1": 2}', "w1")).toBe(true);
+    // 新舊混在同一列也不會爆。
+    const mixed = '{"w1": 2, "w2": {"failures": 1, "last_error": "boom"}}';
+    expect(retry.attemptsDict(mixed)).toEqual({ w1: 2, w2: 1 });
+    expect(retry.attemptErrors(mixed)).toEqual({ w2: "boom" });
   });
 
   it("excludes only at the threshold", () => {
     expect(retry.isExcludedForJob("{}", "w1")).toBe(false);
-    const [once] = retry.bumpAttempts("{}", "w1");
+    const [once] = retry.bumpAttempts("{}", "w1", "boom");
     expect(retry.isExcludedForJob(once, "w1")).toBe(false);
-    const [twice] = retry.bumpAttempts(once, "w1");
+    const [twice] = retry.bumpAttempts(once, "w1", "boom");
     expect(retry.isExcludedForJob(twice, "w1")).toBe(true);
     // 別台不受影響。
     expect(retry.isExcludedForJob(twice, "w2")).toBe(false);
   });
 
+  it("hasFailedJob is true from the very first failure", () => {
+    // I1：`tryReadopt` 拿這個判「這台是不是已經失敗過這張 job」-- 門檻是 1，
+    // 不是 `MAX_FAILURES_PER_WORKER_PER_JOB`。
+    expect(retry.hasFailedJob("{}", "w1")).toBe(false);
+    const [once] = retry.bumpAttempts("{}", "w1", "boom");
+    expect(retry.hasFailedJob(once, "w1")).toBe(true);
+    expect(retry.hasFailedJob(once, "w2")).toBe(false);
+    // 舊形狀也認得。
+    expect(retry.hasFailedJob('{"w1": 1}', "w1")).toBe(true);
+  });
+
   it("parses attempts defensively", () => {
-    expect(retry.attemptsDict('{"w1": 2}')).toEqual({ w1: 2 });
+    expect(retry.attemptsDict('{"w1": {"failures": 2, "last_error": "e"}}')).toEqual({ w1: 2 });
     expect(retry.attemptsDict("garbage")).toEqual({});
     expect(retry.attemptsDict(null)).toEqual({});
-    // bool / 浮點數 / 負數的 key 一律丟掉（Python 端的 isinstance 檢查）。
+    expect(retry.attemptErrors("garbage")).toEqual({});
+    // 壞掉的 envelope（沒有 failures、error 不是字串）不會炸。
+    expect(retry.attemptsDict('{"w1": {"last_error": "e"}}')).toEqual({});
+    expect(retry.attemptErrors('{"w1": {"failures": 1, "last_error": 5}}')).toEqual({});
+    // bool / 浮點數 / 負數的值一律丟掉（Python 端的 isinstance 檢查）。
     expect(retry.attemptsDict('{"a": true, "b": 1.5, "c": -1, "d": 2}')).toEqual({ d: 2 });
   });
 });
@@ -292,16 +335,5 @@ describe("worker_task_failures adapter", () => {
     expect(await retry.unsuitableRowsForWorker(db(), "w1", t)).toEqual([]);
     expect(await retry.unsuitableRowsForWorker(db(), "w2", t)).toHaveLength(1);
     expect(await retry.clearWorkerFailures(db(), "w1")).toBe(0);
-  });
-
-  it("lastErrorsForTaskKey only returns the asked-for workers and key", async () => {
-    const t = now();
-    await retry.recordFailure(db(), "w1", "sig-a", "wa boom", "j1", t);
-    await retry.recordFailure(db(), "w2", "sig-a", "wb boom", "j2", t);
-    await retry.recordFailure(db(), "w3", "sig-other", "elsewhere", "j3", t);
-
-    const errors = await retry.lastErrorsForTaskKey(db(), "sig-a", ["w1", "w3"]);
-    expect(errors).toEqual(new Map([["w1", "wa boom"]]));
-    expect(await retry.lastErrorsForTaskKey(db(), "sig-a", [])).toEqual(new Map());
   });
 });

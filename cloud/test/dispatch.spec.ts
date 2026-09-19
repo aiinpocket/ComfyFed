@@ -1160,3 +1160,67 @@ describe("assignJobs exclusions (job-retry §6)", () => {
     expect(assignments.map((a) => [a.workerId, a.job.id])).toEqual([[workerB, jobId]]);
   });
 });
+
+// --- Fix round 1 / I1：tryReadopt 不得讓失敗過的那台把 job 吃回去 ----------
+
+describe("tryReadopt after a retry requeue (job-retry I1)", () => {
+  it("refuses a job this worker failed and never started", async () => {
+    // `requeueForRetry` 留下的狀態恰好是 `tryReadopt` 本來的比對條件
+    // （queued + last_worker_id == W），而那台還連著線 -- 不擋的話它只要
+    // 「先 job_failed 再 job_done」就能重新取得所有權。判別式：
+    // `requeueForRetry` 一定清掉 `started_at`，而它一定跟在一次 attempts
+    // 計數之後；`requeueStale` 兩者都不碰。
+    const workerId = await makeWorker("w1");
+    const jobId = await makeJob({ status: "running", workerId });
+    await db()
+      .prepare("UPDATE jobs SET started_at = ?, attempts = ? WHERE id = ?")
+      .bind(
+        toSqliteTimestamp(now()),
+        JSON.stringify({ [workerId]: { failures: 1, last_error: "boom" } }),
+        jobId
+      )
+      .run();
+
+    expect(await dispatch.requeueForRetry(db(), jobId, workerId, "boom", now())).toBe(true);
+    expect(await dispatch.tryReadopt(db(), jobId, workerId)).toBe(false);
+
+    const job = await getJobRow(jobId);
+    expect(job.status).toBe("queued");
+    expect(job.worker_id).toBeNull();
+  });
+
+  it("still re-adopts a stale blip with no started_at", async () => {
+    // 回歸護欄：`requeueStale` 掃的是 assigned 跟 running 兩種，而 assigned
+    // 的 job `started_at` 是 NULL -- 所以「`started_at IS NOT NULL`」不是合格
+    // 的判別式，這一格必須繼續認得回來。
+    const workerId = await makeWorker("w-blip");
+    await setWorkerLastSeen(workerId, new Date(now().getTime() - 200_000));
+    const jobId = await makeJob({ status: "assigned", workerId });
+
+    expect(await dispatch.requeueStale(db(), now())).toEqual([jobId]);
+    expect((await getJobRow(jobId)).started_at).toBeNull();
+
+    expect(await dispatch.tryReadopt(db(), jobId, workerId)).toBe(true);
+    const job = await getJobRow(jobId);
+    expect(job.status).toBe("assigned");
+    expect(job.worker_id).toBe(workerId);
+  });
+
+  it("still re-adopts for a worker that failed once but then really ran", async () => {
+    // 失敗過一次、被改派回同一台、這一次真的跑起來了（`started_at` 有值），
+    // 然後才斷線被 `requeueStale` 掃回佇列 -- 這是真的 blip，它手上有真的
+    // 結果，認得回來。
+    const workerId = await makeWorker("w-really-ran");
+    const jobId = await makeJob({ status: "queued", lastWorkerId: workerId });
+    await db()
+      .prepare("UPDATE jobs SET started_at = ?, attempts = ? WHERE id = ?")
+      .bind(
+        toSqliteTimestamp(now()),
+        JSON.stringify({ [workerId]: { failures: 1, last_error: "boom" } }),
+        jobId
+      )
+      .run();
+
+    expect(await dispatch.tryReadopt(db(), jobId, workerId)).toBe(true);
+  });
+});

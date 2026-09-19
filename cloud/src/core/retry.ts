@@ -55,53 +55,128 @@ function sliceChars(value: string, count: number): string {
 
 // --- 純函式層 --------------------------------------------------------------
 
-/** `jobs.attempts` 的防禦式解析：`{worker_id: failures}`。
+/** 一筆 `jobs.attempts` 的內容：這台在這張 job 上的失敗次數，加上它在這張
+ * job 上的最後一個錯誤（舊形狀的列沒有，是 null）。 */
+interface AttemptEntry {
+  failures: number;
+  lastError: string | null;
+}
+
+/** `jobs.attempts` 的防禦式解析，回 `Map<worker_id, {failures, lastError}>`。
+ * Ports `retry._attempt_entries`.
  *
- * 壞掉的 JSON、不是物件、值不是非負整數的 key，一律當「沒有那一筆」。一列
- * 壞資料絕不能讓 `job_failed` 整條路徑炸掉 -- 那會讓 job 卡在 `running` 永遠
- * 等不到任何轉移。Ports `retry.attempts_dict`. */
-export function attemptsDict(attemptsJson: string | null | undefined): Record<string, number> {
+ * 欄位內容是 `{worker_id: {"failures": n, "last_error": str}}` -- per-job 的
+ * 計數**跟**那台在這張 job 上的最後一個錯誤。錯誤存在 job 自己身上而不是跨
+ * job 累計的 `worker_task_failures`，是因為終局訊息會被寫進這張 job 的
+ * `error` 給這張 job 的擁有者看：引用別張 job（可能是別人的）的錯誤字串既誤
+ * 導診斷，錯誤訊息又常含檔名與路徑，那是一條很細的跨使用者外洩路徑。
+ *
+ * 寬容兩種寫法：舊形狀的純數字（`{worker_id: n}`，這個功能第一版的欄位內容，
+ * 也就是 migration 0012 之後、這個跟進之前寫下的列）照樣讀得出次數，只是沒有
+ * 錯誤字串可引。壞掉的 JSON、不是物件、值不是非負整數的，一律當「沒有那一
+ * 筆」-- `job_failed` 是唯一能把 job 從 `running` 推走的路徑，一列壞資料在這
+ * 裡丟例外會讓那張 job 永遠卡住。
+ *
+ * 回 `Map` 而不是普通物件，是為了讓列舉順序完全等於 JSON 的書寫順序（Python
+ * 的 `dict` 天生如此；JS 的普通物件會把整數式的 key 提前，雖然 worker id 是
+ * uuid 不會踩到，但終局訊息的 worker 順序不值得賭在這個前提上）。 */
+function attemptEntries(attemptsJson: string | null | undefined): Map<string, AttemptEntry> {
+  const result = new Map<string, AttemptEntry>();
   let value: unknown;
   try {
     value = JSON.parse(attemptsJson || "{}");
   } catch {
-    return {};
+    return result;
   }
-  if (typeof value !== "object" || value === null || Array.isArray(value)) return {};
-  const result: Record<string, number> = {};
-  for (const [key, count] of Object.entries(value as Record<string, unknown>)) {
-    // JSON 的 key 一定是字串，所以 Python 的 `isinstance(key, str)` 這裡不
-    // 需要；值則照樣要擋掉字串／浮點數／負數（Python 另外擋 bool，JS 的
-    // `typeof true === "boolean"` 已經被 `typeof count !== "number"` 擋掉）。
+  if (typeof value !== "object" || value === null || Array.isArray(value)) return result;
+
+  for (const [key, entry] of Object.entries(value as Record<string, unknown>)) {
+    // JSON 的 key 一定是字串，所以 Python 的 `isinstance(key, str)` 這裡不需要。
+    let count: unknown;
+    let error: string | null = null;
+    if (typeof entry === "object" && entry !== null && !Array.isArray(entry)) {
+      const envelope = entry as Record<string, unknown>;
+      count = envelope.failures;
+      error = typeof envelope.last_error === "string" ? envelope.last_error : null;
+    } else {
+      // 舊形狀：值就是次數本身。
+      count = entry;
+    }
+    // 擋掉字串／浮點數／負數（Python 另外擋 bool，JS 的 `typeof true ===
+    // "boolean"` 已經被 `typeof count !== "number"` 擋掉）。
     if (typeof count !== "number" || !Number.isInteger(count) || count < 0) continue;
-    result[key] = count;
+    result.set(key, { failures: count, lastError: error });
   }
   return result;
 }
 
-/** `workerId` 對這張 job 再失敗一次。
+/** `{worker_id: failures}` -- 排除判定與 API 一直以來的形狀。
+ * Ports `retry.attempts_dict`. */
+export function attemptsDict(attemptsJson: string | null | undefined): Record<string, number> {
+  const result: Record<string, number> = {};
+  for (const [key, entry] of attemptEntries(attemptsJson)) result[key] = entry.failures;
+  return result;
+}
+
+/** `{worker_id: last_error}`，只含真的有存到錯誤字串的那幾台。
+ *
+ * 終局彙整訊息的唯一來源（見 `attemptEntries`），也是 `/api/jobs*` 的
+ * `attempt_errors` 欄。Ports `retry.attempt_errors`. */
+export function attemptErrors(attemptsJson: string | null | undefined): Record<string, string> {
+  const result: Record<string, string> = {};
+  for (const [key, entry] of attemptEntries(attemptsJson)) {
+    if (entry.lastError !== null) result[key] = entry.lastError;
+  }
+  return result;
+}
+
+/** `workerId` 對這張 job 再失敗一次，順手記下它這一次的錯誤。
  *
  * 回 `[newJson, thisWorkerFailures, total]`：新的 JSON 字串（直接寫回
  * `jobs.attempts`）、這台 worker 現在的失敗次數、以及所有 worker 的總失敗次數
  * （拿去和 `MAX_JOB_ATTEMPTS` 比）。Ports `retry.bump_attempts`.
  *
- * JSON 的空白和 Python 的 `json.dumps` 不同（`{"w1":1}` vs `{"w1": 1}`），這
- * 是刻意不對齊的：這個字串只會被自己這一棧寫、被 `attemptsDict` 讀回來，從來
- * 不跨棧比對，硬湊 Python 的空白只會留下一個沒人維護的格式化函式。 */
+ * 錯誤存進去之前先截 `FINAL_ERROR_CHARS` 字：它最後會進終局彙整訊息，而那個
+ * 訊息會進 `jobs.error`，一段 CUDA traceback 可以有好幾 KB。不傳 `error`
+ * （或傳 null）就只加一次計數，保留舊的錯誤字串。
+ *
+ * JSON 的空白和 Python 的 `json.dumps` 不同（`{"w1":{"failures":1}}` vs
+ * `{"w1": {"failures": 1}}`），這是刻意不對齊的：這個字串只會被自己這一棧
+ * 寫、被 `attemptEntries` 讀回來，從來不跨棧逐位元比對。 */
 export function bumpAttempts(
   attemptsJson: string | null | undefined,
-  workerId: string
+  workerId: string,
+  error?: string | null
 ): [newJson: string, mine: number, total: number] {
-  const attempts = attemptsDict(attemptsJson);
-  attempts[workerId] = (attempts[workerId] ?? 0) + 1;
-  const total = Object.values(attempts).reduce((sum, n) => sum + n, 0);
-  return [JSON.stringify(attempts), attempts[workerId]!, total];
+  const entries = attemptEntries(attemptsJson);
+  const previous = entries.get(workerId);
+  const storedError =
+    error === undefined || error === null ? (previous?.lastError ?? null) : sliceChars(error, FINAL_ERROR_CHARS);
+  entries.set(workerId, { failures: (previous?.failures ?? 0) + 1, lastError: storedError });
+
+  const payload: Record<string, { failures: number; last_error?: string }> = {};
+  let total = 0;
+  for (const [key, entry] of entries) {
+    payload[key] = entry.lastError !== null ? { failures: entry.failures, last_error: entry.lastError } : { failures: entry.failures };
+    total += entry.failures;
+  }
+  return [JSON.stringify(payload), entries.get(workerId)!.failures, total];
 }
 
 /** 這台 worker 對這張 job 是不是已經出局（失敗達 `MAX_FAILURES_...`）。
  * Ports `retry.is_excluded_for_job`. */
 export function isExcludedForJob(attemptsJson: string | null | undefined, workerId: string): boolean {
   return (attemptsDict(attemptsJson)[workerId] ?? 0) >= MAX_FAILURES_PER_WORKER_PER_JOB;
+}
+
+/** 這台 worker 對這張 job 失敗過嗎（哪怕只有一次）？
+ * Ports `retry.has_failed_job`.
+ *
+ * `dispatch.tryReadopt` 的守衛：門檻是 1，不是
+ * `MAX_FAILURES_PER_WORKER_PER_JOB` -- 「斷線了又回來」的信任窗口不該給一台
+ * 已經親口說過「這張我跑失敗了」的 worker。見那邊的說明。 */
+export function hasFailedJob(attemptsJson: string | null | undefined, workerId: string): boolean {
+  return attemptEntries(attemptsJson).has(workerId);
 }
 
 /** `unsuitable:<task_key 前 12 字>` -- 兩棧逐字相同的排除理由字串。
@@ -112,14 +187,14 @@ export function unsuitableReason(key: string | null | undefined): string {
 
 /** 終局失敗時寫進 `jobs.error` 的彙整訊息。
  *
- * `attemptErrors` 是 `[worker 顯示名, 那台的最後一個錯誤]` 的清單，`total` 是
+ * `pairs` 是 `[worker 顯示名, 那台的最後一個錯誤]` 的清單，`total` 是
  * 總嘗試次數。zh-TW 先、en 後（平台其他雙語訊息的慣例），每台的錯誤截
  * `FINAL_ERROR_CHARS` 字 -- 一段 CUDA traceback 可以有好幾 KB，六台份塞進一個
  * job 列會讓 console 的 job 列表整個爛掉。訊息逐位元對齊
  * `retry.summarize_final_error`（含全形分號與全形冒號）。 */
-export function summarizeFinalError(attemptErrors: [name: string, error: string][], total: number): string {
-  const n = attemptErrors.length;
-  const detail = attemptErrors
+export function summarizeFinalError(pairs: [name: string, error: string][], total: number): string {
+  const n = pairs.length;
+  const detail = pairs
     .map(([name, error]) => `${name}: ${sliceChars(error || "", FINAL_ERROR_CHARS)}`)
     .join("；");
   return `已在 ${n} 台 worker 嘗試 ${total} 次全部失敗 / failed on ${n} workers after ${total} attempts：${detail}`;
@@ -281,26 +356,6 @@ export async function unsuitableRowsForWorker(
     updated_at: row.updated_at ? sqliteTimestampToIsoformat(row.updated_at) : null,
     active: isActive(row, now),
   }));
-}
-
-/** 這些 worker 對這一類任務的「最後錯誤」-- 終局訊息彙整要用的唯一來源
- * （`jobs.attempts` 只存次數）。Ports the `WorkerTaskFailure` query inside
- * agentws.py's `_final_error_summary`. */
-export async function lastErrorsForTaskKey(
-  db: D1Database,
-  key: string,
-  workerIds: string[]
-): Promise<Map<string, string>> {
-  if (workerIds.length === 0) return new Map();
-  const placeholders = workerIds.map(() => "?").join(",");
-  const { results } = await db
-    .prepare(
-      `SELECT worker_id, last_error FROM worker_task_failures
-       WHERE task_key = ? AND worker_id IN (${placeholders})`
-    )
-    .bind(key, ...workerIds)
-    .all<{ worker_id: string; last_error: string | null }>();
-  return new Map(results.map((row) => [row.worker_id, row.last_error || ""]));
 }
 
 /** 這張 job 自己的 `attempts` 裡已達門檻的 `(worker, job_id)` 對，加進

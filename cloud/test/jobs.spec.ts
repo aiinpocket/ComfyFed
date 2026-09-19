@@ -722,31 +722,55 @@ describe("POST /api/jobs/{id}/retry", () => {
     expect(fetchDetail.body.fetch_entry).toEqual(entry);
   });
 
-  it("carries attempts/retry_count in the job JSON (2026-09-19 job-retry, spec §8)", async () => {
+  it("carries attempts/attempt_errors/retry_count in the job JSON (2026-09-19 job-retry, spec §8)", async () => {
     // JobDetail 用它畫「嘗試紀錄」-- ports jobs.py's `_job_dict` and
-    // tests/server/test_agent_ws.py's `test_jobs_api_exposes_attempts_and_retry_count`.
+    // tests/server/test_agent_ws.py's
+    // `test_jobs_api_exposes_attempts_and_retry_count` /
+    // `test_attempt_errors_are_recorded_per_job_and_exposed_by_the_api`.
+    // 形狀：`attempts` 維持 `{worker_id: 次數}`，per-worker 的最後錯誤放在
+    // 新的 `attempt_errors: {worker_id: 錯誤}`（per-job，不是 `/api/workers`
+    // 的跨 job `unsuitable[]`）。
     const { cookie, csrf } = await adminSession();
     const submit = await submitJob(cookie, csrf, SIMPLE_WORKFLOW);
     const jobId = submit.body.job_id;
 
     const fresh = await call(`/api/jobs/${jobId}`, { method: "GET", cookie });
     expect(fresh.body.attempts).toEqual({});
+    expect(fresh.body.attempt_errors).toEqual({});
     expect(fresh.body.retry_count).toBe(0);
 
     await db()
       .prepare("UPDATE jobs SET attempts = ?, retry_count = 2 WHERE id = ?")
-      .bind(JSON.stringify({ "w-1": 2 }), jobId)
+      .bind(JSON.stringify({ "w-1": { failures: 2, last_error: "boom" } }), jobId)
       .run();
 
     const listed = await call("/api/jobs", { method: "GET", cookie });
     const rows = Array.isArray(listed.body) ? listed.body : listed.body.jobs;
     const row = rows.find((j: any) => j.id === jobId);
     expect(row.attempts).toEqual({ "w-1": 2 });
+    expect(row.attempt_errors).toEqual({ "w-1": "boom" });
     expect(row.retry_count).toBe(2);
 
     const detail = await call(`/api/jobs/${jobId}`, { method: "GET", cookie });
     expect(detail.body.attempts).toEqual({ "w-1": 2 });
+    expect(detail.body.attempt_errors).toEqual({ "w-1": "boom" });
     expect(detail.body.retry_count).toBe(2);
+  });
+
+  it("still reads an attempts column written before the envelope existed", async () => {
+    // migration 0012 之後、這個跟進之前寫下的列是純數字形狀；次數照樣讀得
+    // 出來，只是沒有錯誤字串可引。
+    const { cookie, csrf } = await adminSession();
+    const submit = await submitJob(cookie, csrf, SIMPLE_WORKFLOW);
+    const jobId = submit.body.job_id;
+    await db()
+      .prepare("UPDATE jobs SET attempts = ? WHERE id = ?")
+      .bind(JSON.stringify({ "w-old": 2 }), jobId)
+      .run();
+
+    const detail = await call(`/api/jobs/${jobId}`, { method: "GET", cookie });
+    expect(detail.body.attempts).toEqual({ "w-old": 2 });
+    expect(detail.body.attempt_errors).toEqual({});
   });
 
   it("requeues a failed job, clearing the previous attempt's outcome", async () => {

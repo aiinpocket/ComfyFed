@@ -8,6 +8,7 @@ import * as split from "../src/core/split";
 import * as modelFetch from "../src/core/model_fetch";
 import * as modelGuide from "../src/core/model_guide";
 import * as modelManifest from "../src/core/model_manifest";
+import * as retry from "../src/core/retry";
 import { resolvePlatformSeed } from "../src/db/queries";
 import golden from "./fixtures/golden.json";
 
@@ -124,10 +125,15 @@ async function makeJob(opts: {
  * terminal" behavior, which is now only reached at the cap. Skipping the
  * intermediate requeues here keeps those tests about what they were about --
  * the requeue rounds themselves are covered by the job-retry block below. */
-async function exhaustAttempts(jobId: string, spent = 5, spender = "ghost-worker"): Promise<void> {
+async function exhaustAttempts(
+  jobId: string,
+  spent = 5,
+  spender = "ghost-worker",
+  error = "spent elsewhere"
+): Promise<void> {
   await db()
     .prepare("UPDATE jobs SET attempts = ? WHERE id = ?")
-    .bind(JSON.stringify({ [spender]: spent }), jobId)
+    .bind(JSON.stringify({ [spender]: { failures: spent, last_error: error } }), jobId)
     .run();
 }
 
@@ -1845,7 +1851,8 @@ describe("job retry + unsuitable workers (spec §5-§7)", () => {
     expect(job.lastWorkerId).toBe(workerA);
     expect(job.error).toBe("boom");
     expect(job.retryCount).toBe(1);
-    expect(JSON.parse(job.attempts)).toEqual({ [workerA]: 1 });
+    expect(retry.attemptsDict(job.attempts)).toEqual({ [workerA]: 1 });
+    expect(retry.attemptErrors(job.attempts)).toEqual({ [workerA]: "boom" });
 
     expect(await failureRows()).toEqual({ [`${workerA}|sig-requeue`]: 1 });
   });
@@ -1874,7 +1881,7 @@ describe("job retry + unsuitable workers (spec §5-§7)", () => {
 
         const mid = (await getJobById(db(), jobId))!;
         expect(mid.status, `attempt ${attemptIndex} must not be terminal`).toBe("queued");
-        expect(JSON.parse(mid.attempts)).toEqual({ [workerA]: attemptIndex });
+        expect(retry.attemptsDict(mid.attempts)).toEqual({ [workerA]: attemptIndex });
         expect(mid.retryCount).toBe(attemptIndex);
       }
 
@@ -1933,8 +1940,10 @@ describe("job retry + unsuitable workers (spec §5-§7)", () => {
     await makeWorker({ pubkeyHex: KEYPAIRS[2]!.pubkey_hex, id: "wc-cap" });
     const key = "sig-cap";
     const jobId = await makeJob({ status: "running", workerId: workerA, signature: key });
-    await exhaustAttempts(jobId, 5, workerB);
-    await seedUnsuitable(workerB, key, 5, "wb exploded");
+    await exhaustAttempts(jobId, 5, workerB, "wb exploded");
+    // 跨 job 累計的那張表不再是彙整訊息的來源（見 fix round 1 的
+    // "never quotes another job's error"），這裡還是種一列，確保它沒被讀到。
+    await seedUnsuitable(workerB, key, 5, "from another job");
 
     const ws = await connectAgent(workerA, kpA.seed_hex);
     const receipt = nextMessage(ws);
@@ -1948,6 +1957,7 @@ describe("job retry + unsuitable workers (spec §5-§7)", () => {
     expect(job.error).toContain("failed on 2 workers after 6 attempts");
     expect(job.error).toContain("wb-cap: wb exploded");
     expect(job.error).toContain("wa-cap: wa exploded");
+    expect(job.error).not.toContain("from another job");
   });
 
   it("fails immediately when the only worker is excluded", async () => {
@@ -2032,5 +2042,182 @@ describe("job retry + unsuitable workers (spec §5-§7)", () => {
     expect(child.retryCount).toBe(1);
     expect(sibling.status).toBe("running");
     expect(parent.status).not.toBe("failed");
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Fix round 1 -- ports the two blocks 7e0840d added to
+// tests/server/test_agent_ws.py.
+
+describe("job retry fix round 1 (I1 re-adoption / I2 per-job errors)", () => {
+  async function failureRows(): Promise<Record<string, number>> {
+    const { results } = await db()
+      .prepare("SELECT worker_id, task_key, failures FROM worker_task_failures")
+      .all<{ worker_id: string; task_key: string; failures: number }>();
+    return Object.fromEntries(results.map((r) => [`${r.worker_id}|${r.task_key}`, r.failures]));
+  }
+
+  async function reportIdle(ws: WebSocket): Promise<void> {
+    ws.send(JSON.stringify({ type: "heartbeat", state: "idle", progress: 0.0, job_id: null, dynamic: {} }));
+    await new Promise((r) => setTimeout(r, 50));
+  }
+
+  it("rejects job_done after a retry requeue, and tells the worker the job is gone", async () => {
+    // I1：`requeueForRetry` 刻意留下 `status=queued AND last_worker_id=W`
+    // （spec §5），而 `tryReadopt` 本來只看這兩個條件 —— 於是一台**還連著線**
+    // 的 worker 只要先送 `job_failed` 再送 `job_done`，就能把自己剛失敗掉的
+    // job 吃回去、標成 done、鑄出一張**計費**收據，順便清掉自己那列不適任
+    // 紀錄。那台不必真的斷線 90 秒，這是它自己造得出來的狀態。
+    const kp = KEYPAIRS[0]!;
+    const workerId = await makeWorker({ pubkeyHex: kp.pubkey_hex });
+    // 讓 `anyPossibleWorker` 為真 -> 這一次失敗走 requeue 而不是終局。
+    await makeWorker({ pubkeyHex: KEYPAIRS[1]!.pubkey_hex });
+    const key = "sig-readopt";
+    const jobId = await makeJob({ status: "running", workerId, startedAt: new Date(), signature: key });
+
+    const ws = await connectAgent(workerId, kp.seed_hex);
+    // protocol 2：`job_cancelled` 只推給聽得懂它的 agent。
+    ws.send(JSON.stringify({ type: "hello", protocol: 2 }));
+    try {
+      const failReceipt = nextMessage(ws);
+      ws.send(JSON.stringify({ type: "job_failed", job_id: jobId, error: "boom" }));
+      expect((await failReceipt).kind).toBe("failed"); // 非計費失敗收據
+      expect((await getJobById(db(), jobId))!.status).toBe("queued");
+
+      // 同一台立刻回頭說「其實我做完了」。
+      const cancelled = nextMessage(ws);
+      ws.send(JSON.stringify({ type: "job_done", job_id: jobId, result_files: ["forged.png"] }));
+      expect(await cancelled).toEqual({ type: "job_cancelled", job_id: jobId });
+    } finally {
+      ws.close();
+    }
+
+    const job = (await getJobById(db(), jobId))!;
+    expect(job.status).toBe("queued");
+    expect(job.workerId).toBeNull();
+    expect(job.resultFiles).toEqual([]);
+
+    const receipts = await getReceiptsForJob(db(), jobId);
+    expect(receipts.map((r) => [r.kind, r.billable])).toEqual([["failed", false]]);
+    // 它的不適任紀錄不會因為這則偽 job_done 被清掉。
+    expect(await failureRows()).toEqual({ [`${workerId}|${key}`]: 1 });
+  });
+
+  it("an excluded worker cannot re-adopt the job it failed twice", async () => {
+    // 同一個洞最嚴重的形狀：已經因為 `failed_twice_on_job` 出局的那台，不得
+    // 靠 `job_done` 把 job 吃回去 —— 那會整個繞過排除。
+    const kp = KEYPAIRS[0]!;
+    const workerId = await makeWorker({ pubkeyHex: kp.pubkey_hex });
+    await makeWorker({ pubkeyHex: KEYPAIRS[1]!.pubkey_hex });
+    const jobId = await makeJob({ status: "queued", signature: "sig-excluded-readopt" });
+
+    const ws = await connectAgent(workerId, kp.seed_hex);
+    // protocol 2：`job_cancelled` 只推給聽得懂它的 agent。
+    ws.send(JSON.stringify({ type: "hello", protocol: 2 }));
+    try {
+      for (const attemptIndex of [1, 2]) {
+        await reportIdle(ws);
+        const pushed = nextMessage(ws);
+        expect(await runDurableObjectAlarm(hub())).toBe(true);
+        expect((await pushed).job_id).toBe(jobId);
+
+        const receipt = nextMessage(ws);
+        ws.send(JSON.stringify({ type: "job_failed", job_id: jobId, error: `boom ${attemptIndex}` }));
+        expect((await receipt).kind).toBe("failed");
+      }
+
+      const mid = (await getJobById(db(), jobId))!;
+      expect(Object.keys(retry.attemptsDict(mid.attempts))).toEqual([workerId]);
+
+      const cancelled = nextMessage(ws);
+      ws.send(JSON.stringify({ type: "job_done", job_id: jobId, result_files: ["forged.png"] }));
+      expect(await cancelled).toEqual({ type: "job_cancelled", job_id: jobId });
+    } finally {
+      ws.close();
+    }
+
+    // 第二次失敗時全艦隊只剩被排除的這一台 -> 終局 failed（不是 done）。
+    const job = (await getJobById(db(), jobId))!;
+    expect(job.status).not.toBe("done");
+    const receipts = await getReceiptsForJob(db(), jobId);
+    expect(receipts.some((r) => r.kind === "completed")).toBe(false);
+  });
+
+  it("still re-adopts a stale blip for a job this worker never failed", async () => {
+    // 回歸護欄：I1 的修法不得動到既有的 blip 再認領。一台**沒有**失敗過這張
+    // job 的 worker，被 `requeueStale` 放開之後照樣認得回來 —— 包括那張 job
+    // 還停在 `assigned`（從沒送過 busy 心跳，所以 `started_at` 是 NULL）的
+    // 情形，那正是「`started_at IS NOT NULL` 這個判別式不成立」的那一格。
+    const kp = KEYPAIRS[0]!;
+    const workerId = await makeWorker({ pubkeyHex: kp.pubkey_hex });
+    const jobId = await makeJob({ status: "queued", lastWorkerId: workerId, startedAt: null });
+
+    const ws = await connectAgent(workerId, kp.seed_hex);
+    try {
+      const receipt = nextMessage(ws);
+      ws.send(JSON.stringify({ type: "job_done", job_id: jobId, result_files: ["out.png"] }));
+      expect((await receipt).kind).toBe("completed");
+    } finally {
+      ws.close();
+    }
+
+    const job = (await getJobById(db(), jobId))!;
+    expect(job.status).toBe("done");
+    expect(job.resultFiles).toEqual(["out.png"]);
+  });
+
+  it("never quotes another job's error in the final summary", async () => {
+    // I2：每台 worker 的「最後錯誤」本來是從跨 job 累計的
+    // `worker_task_failures[W, task_key]` 撈的，所以終局訊息可能引用到**同簽章
+    // 的另一張 job**（可能屬於另一個使用者）的錯誤字串。錯誤訊息常含檔名／
+    // 路徑，那是一條很細的跨使用者外流路徑，也會誤導診斷。
+    const kpA = KEYPAIRS[0]!;
+    const workerA = await makeWorker({ pubkeyHex: kpA.pubkey_hex, id: "wa-leak" });
+    const workerB = await makeWorker({ pubkeyHex: KEYPAIRS[1]!.pubkey_hex, id: "wb-leak" });
+    await makeWorker({ pubkeyHex: KEYPAIRS[2]!.pubkey_hex, id: "wc-leak" });
+    const key = "sig-leak";
+    const jobId = await makeJob({ status: "running", workerId: workerA, signature: key });
+
+    // B 在**別張** job 上留下的跨 job 紀錄，含一個不該外流的路徑字串。
+    await db()
+      .prepare(
+        `INSERT INTO worker_task_failures (worker_id, task_key, failures, last_error, last_job_id, updated_at)
+         VALUES (?, ?, 5, ?, 'j-old', ?)`
+      )
+      .bind(workerB, key, "/home/someone-else/secret.safetensors", toSqliteTimestamp(new Date()))
+      .run();
+    // 這張 job 自己的紀錄：B 在這裡的錯誤是別的。
+    await exhaustAttempts(jobId, 5, workerB, "wb failed on THIS job");
+
+    const ws = await connectAgent(workerA, kpA.seed_hex);
+    const receipt = nextMessage(ws);
+    ws.send(JSON.stringify({ type: "job_failed", job_id: jobId, error: "wa exploded" }));
+    await receipt;
+    ws.close();
+
+    const job = (await getJobById(db(), jobId))!;
+    expect(job.status).toBe("failed");
+    expect(job.error).toContain("wb-leak: wb failed on THIS job");
+    expect(job.error).toContain("wa-leak: wa exploded");
+    expect(job.error).not.toContain("secret.safetensors");
+  });
+
+  it("records the reporting worker's error on the job itself", async () => {
+    // §8 的 API 形狀由 jobs.spec.ts 釘；這裡確認 `job_failed` 真的把錯誤寫進
+    // 這張 job 的 `attempts`（I2 的資料來源）。
+    const kp = KEYPAIRS[0]!;
+    const workerId = await makeWorker({ pubkeyHex: kp.pubkey_hex });
+    await makeWorker({ pubkeyHex: KEYPAIRS[1]!.pubkey_hex });
+    const jobId = await makeJob({ status: "running", workerId, signature: "sig-attempt-errors" });
+
+    const ws = await connectAgent(workerId, kp.seed_hex);
+    const receipt = nextMessage(ws);
+    ws.send(JSON.stringify({ type: "job_failed", job_id: jobId, error: "boom" }));
+    await receipt;
+    ws.close();
+
+    const job = (await getJobById(db(), jobId))!;
+    expect(retry.attemptsDict(job.attempts)).toEqual({ [workerId]: 1 });
+    expect(retry.attemptErrors(job.attempts)).toEqual({ [workerId]: "boom" });
   });
 });
