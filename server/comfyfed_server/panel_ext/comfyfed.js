@@ -264,6 +264,7 @@ function comfyfedShowQueuedToast() {
 const FETCH_API = "api/comfyfed/model-fetch";
 const FETCH_POLL_MS = 2000;
 const FETCH_BANNER_ID = "comfyfed-model-fetch-banner";
+const FETCH_MAX_TRANSIENT_RETRIES = 30;
 
 const FETCH_TEXT = {
   starting: "下載中 0% / Fetching 0%",
@@ -274,6 +275,8 @@ const FETCH_TEXT = {
     `模型 ${n} 已下載到 worker，請重新整理以載入 / Model ${n} landed on a worker; reload to use it`,
   failed: (n, e) => `模型 ${n} 下載失敗：${e} / Fetch of ${n} failed: ${e}`,
   unknownError: "未知錯誤 / unknown error",
+  gone: "下載任務已不存在，伺服器可能重啟過，請重新整理面板 / The fetch job no longer exists (the server may have restarted); reload the panel",
+  lost: "與伺服器連線中斷，無法繼續追蹤下載進度，請重新整理面板 / Lost contact with the server while tracking the fetch; reload the panel",
   reload: "重新整理 / Reload",
   dismiss: "關閉 / Dismiss",
 };
@@ -350,6 +353,7 @@ function comfyfedFetchBanner(text, options) {
 }
 
 function comfyfedRestoreFetchButton(button) {
+  delete button.dataset.comfyfedFetching;
   button.disabled = false;
   if (typeof button.dataset.comfyfedLabel === "string") {
     button.textContent = button.dataset.comfyfedLabel;
@@ -358,14 +362,21 @@ function comfyfedRestoreFetchButton(button) {
 
 // 中文：每 2 秒問一次單子狀態。`queued`／`assigned`／`running` 都算進行中，只有在
 // `stage === "fetching_models"` 且有 `fetch_pct` 時才更新百分比（其他階段沒有進度可報）。
-// 輪詢過程中的網路錯誤不算失敗——面板可能只是暫時斷線——下一輪再試。
+// 4xx 一律是終局：`GET .../{job_id}` 的 404 代表這張單已經不存在（伺服器重啟、單子被清掉），
+// 再問一萬次也不會變出來——所以還原按鈕、跳紅字，而不是每 2 秒永遠空轉下去。只有 5xx 與
+// 網路錯誤才算暫時性（面板可能只是短暫斷線），而且連續重試上限 30 次，超過就放棄並提示。
 //
 // English: Poll the job every 2 seconds. `queued`/`assigned`/`running` all
 // count as in flight; the percentage is only updated while
 // `stage === "fetching_models"` with a `fetch_pct` (other stages have no
-// progress to report). A network error mid-poll is not a failure -- the panel
-// may just be briefly offline -- so it simply retries on the next tick.
+// progress to report). Any 4xx is terminal: a 404 from
+// `GET .../{job_id}` means the job is simply gone (server restart, job
+// reaped), and asking again forever will not bring it back -- so restore the
+// button and show the error instead of spinning every 2 s for good. Only 5xx
+// and network errors count as transient (the panel may just be briefly
+// offline), and even those are capped at 30 consecutive retries.
 async function comfyfedPollFetchJob(jobId, button, name) {
+  let transient = 0;
   for (;;) {
     await new Promise((resolve) => setTimeout(resolve, FETCH_POLL_MS));
     let status;
@@ -373,13 +384,33 @@ async function comfyfedPollFetchJob(jobId, button, name) {
       const r = await fetch(`${FETCH_API}/${encodeURIComponent(jobId)}`, {
         credentials: "same-origin",
       });
-      if (!r.ok) continue;
+      if (r.status >= 400 && r.status < 500) {
+        let detail = r.status === 404 ? FETCH_TEXT.gone : FETCH_TEXT.unknownError;
+        try {
+          const errorBody = await r.json();
+          if (errorBody && errorBody.message) detail = errorBody.message;
+        } catch (_e) {
+          // 錯誤 body 不是 JSON 就用預設字串 / non-JSON error body: keep the default
+        }
+        comfyfedRestoreFetchButton(button);
+        comfyfedFetchBanner(FETCH_TEXT.failed(name, detail), { error: true });
+        return;
+      }
+      if (!r.ok) throw new Error("HTTP " + r.status);
       status = await r.json();
     } catch (_e) {
+      transient += 1;
+      if (transient > FETCH_MAX_TRANSIENT_RETRIES) {
+        comfyfedRestoreFetchButton(button);
+        comfyfedFetchBanner(FETCH_TEXT.failed(name, FETCH_TEXT.lost), { error: true });
+        return;
+      }
       continue;
     }
     if (!status) continue;
+    transient = 0;
     if (status.status === "done") {
+      delete button.dataset.comfyfedFetching;
       button.textContent = FETCH_TEXT.ready;
       comfyfedFetchBanner(FETCH_TEXT.done(name), { reload: true });
       return;
@@ -405,6 +436,16 @@ async function comfyfedPollFetchJob(jobId, button, name) {
 // that job. A 400 carries `{error, message}`, and the server's own bilingual
 // message is what gets shown.
 async function comfyfedRequestModelFetch(model, button) {
+  // 中文：同一顆鈕只准有一張單在飛。沒有這道閘，連按兩次「全部下載」會對每個模型各送第二張
+  // 單、並在同一顆鈕上跑起第二個輪詢迴圈——兩個迴圈會搶著寫同一個 label（「已就緒」被蓋回
+  // 「下載中 N%」），其中一個收到 failed 還會把另一個仍在輪詢的鈕重新啟用。
+  // English: One in-flight job per button. Without this gate, double-clicking
+  // "download all" fires a second job per model and starts a second poll loop
+  // on the same button -- the two loops fight over the label ("Ready" reverting
+  // to "Fetching N%"), and a `failed` in one re-enables a button the other is
+  // still polling.
+  if (button.disabled || button.dataset.comfyfedFetching === "1") return;
+  button.dataset.comfyfedFetching = "1";
   if (typeof button.dataset.comfyfedLabel !== "string") {
     button.dataset.comfyfedLabel = button.textContent || "";
   }
@@ -455,41 +496,67 @@ function comfyfedModelForButton(button, models) {
   return best;
 }
 
-document.addEventListener(
-  "click",
-  (ev) => {
-    const target = ev.target instanceof Element ? ev.target : null;
-    if (!target) return;
-    const single = target.closest('[data-testid="missing-model-download"]');
-    const all = single ? null : target.closest('[data-testid="missing-model-actions"] button');
-    if (!single && !all) return;
+// 中文：對照釘死的 1.52.7 bundle 確認過：`[data-testid="missing-model-actions"]` 容器裡
+// 只有一顆鈕，就是 `missing-model-download-all`。所以這裡直接指名那顆，而不是攔容器裡
+// 的每一顆 button——否則未來版本往容器塞一顆「關閉」／「仍要繼續」時，那顆會被吞掉並
+// 反過來觸發整張卡片的大量派工。註冊也比照 queue toast 加上 window 旗標，重複注入時
+// 不會掛兩份監聽而送出兩張單。
+//
+// English: Verified against the pinned 1.52.7 bundle: the
+// `[data-testid="missing-model-actions"]` container holds exactly one button,
+// `missing-model-download-all`. Target that testid directly rather than every
+// button in the container -- otherwise a future Close / "continue anyway"
+// control dropped into that container would be swallowed and turned into a
+// mass dispatch of the whole card. Registration is guarded by a window flag
+// like the queue toast, so a double injection cannot install two listeners and
+// submit twice.
+(function comfyfedInstallModelFetchInterceptor() {
+  if (window.__comfyfedModelFetchInstalled) return;
+  window.__comfyfedModelFetchInstalled = true;
 
-    ev.preventDefault();
-    ev.stopImmediatePropagation();
+  document.addEventListener(
+    "click",
+    (ev) => {
+      const target = ev.target instanceof Element ? ev.target : null;
+      if (!target) return;
+      const single = target.closest('[data-testid="missing-model-download"]');
+      const all = single ? null : target.closest('[data-testid="missing-model-download-all"]');
+      if (!single && !all) return;
 
-    const models = comfyfedCollectGraphModels();
-    if (single) {
-      const model = comfyfedModelForButton(single, models);
-      if (!model) {
-        comfyfedFetchBanner(FETCH_TEXT.unknown, { error: true });
+      ev.preventDefault();
+      ev.stopImmediatePropagation();
+
+      if (single) {
+        // 中文：已經有單在飛就什麼都不做（但點擊仍然吞掉，官方 handler 不能跑）。
+        // English: Already in flight: do nothing -- but still swallow the click
+        // so the stock handler never runs.
+        if (single.dataset.comfyfedFetching === "1") return;
+        const model = comfyfedModelForButton(single, comfyfedCollectGraphModels());
+        if (!model) {
+          comfyfedFetchBanner(FETCH_TEXT.unknown, { error: true });
+          return;
+        }
+        comfyfedRequestModelFetch(model, single);
         return;
       }
-      comfyfedRequestModelFetch(model, single);
-      return;
-    }
-    // 中文：「全部下載」＝卡片上每一列的下載鈕各來一張單 / English: "download
-    // all" = one job per download button on the card.
-    let matched = 0;
-    for (const b of document.querySelectorAll('[data-testid="missing-model-download"]')) {
-      const model = comfyfedModelForButton(b, models);
-      if (!model) continue;
-      matched += 1;
-      comfyfedRequestModelFetch(model, b);
-    }
-    if (matched === 0) comfyfedFetchBanner(FETCH_TEXT.unknown, { error: true });
-  },
-  true
-);
+
+      // 中文：「全部下載」＝卡片上每一列的下載鈕各來一張單；已在進行中的鈕由
+      // `comfyfedRequestModelFetch` 自己擋掉 / English: "download all" = one job
+      // per download button on the card; buttons already in flight are gated
+      // inside `comfyfedRequestModelFetch`.
+      const models = comfyfedCollectGraphModels();
+      let matched = 0;
+      for (const b of document.querySelectorAll('[data-testid="missing-model-download"]')) {
+        const model = comfyfedModelForButton(b, models);
+        if (!model) continue;
+        matched += 1;
+        comfyfedRequestModelFetch(model, b);
+      }
+      if (matched === 0) comfyfedFetchBanner(FETCH_TEXT.unknown, { error: true });
+    },
+    true
+  );
+})();
 
 // 中文：ComfyUI 的擴充模組是以 ES module 動態 import 的，匯出物件本身內容不重要，
 // 但需要是個有效模組；副作用（插入 <style>、零 worker 橫幅）已經在上面完成了。
