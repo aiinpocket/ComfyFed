@@ -244,6 +244,25 @@ The platform settings page has an "automatic batch splitting" toggle that turns 
 
 To turn it off for just one job, include `{"split": false}` in that job's `requirements`.
 
+### What happens when a job fails
+
+A worker reporting "this one failed" is not the end of the line. The platform first assumes the problem is with **that machine**, not with the job:
+
+- **Failure #1** → the job goes back to `queued` and is re-matched on the next dispatch tick. Anyone can pick it up, **including the worker that just failed it** — a one-off OOM, a driver hiccup, or a wedged ComfyUI very often passes on the second run.
+- **Failure #2 on the same worker** → that worker is out for **this job** and is never matched to it again; at the same time the platform records "this worker is unsuitable for this **kind** of task". The kind is the job's workflow signature (node composition + model list + steps/resolution/batch — the same signature dispatch uses for its time predictions), so **new jobs of the same kind won't go to that worker for 7 days** either. For a model download job (`model_fetch`) the kind is "this worker can't fetch this model".
+- **Re-dispatch ignores "who already has the model".** This is the point of the feature: the normal rule is "as soon as any worker already has every required model, the workers that would need to download are excluded" — but once the worker that has the model is out, the platform hands the job to a worker that **doesn't have the model but has auto-fetch enabled**, with that model's download list (official/backup URLs, or peer-to-peer chunk transfer between members) attached to the push, so the agent downloads first and then runs. "The only machine with the model can't actually run it" is no longer a dead end.
+- **6 failures in total**, or **no worker in the fleet could possibly run it** (all excluded, or missing nodes with no fetchable model) → only then is the job finally marked failed. Its error message is a summary: how many workers were tried over how many attempts, and each one's last error — so you can tell at a glance whether every machine chokes on it or one machine keeps blowing up.
+- **Every failed attempt still mints a receipt**, `kind=failed` and **non-billable** — failures are never charged, but who attempted what and when stays on the record.
+- **Admin cancellations** and **stale requeues** (a worker drops off and its job is reclaimed) **do not count as failures** and never saddle a worker with an unsuitable record.
+
+**How a record is cleared**
+
+- **Automatically**: the moment that worker successfully completes a job of the same kind, the record is deleted.
+- **By expiry**: 7 days without another failure and it stops applying (the row stays, so admins can still see the history — it just no longer blocks dispatch).
+- **Manually**: the Workers page has an "unsuitable tasks" section per worker listing the task kind (first 12 characters of the signature), the accumulated failure count, the last error, and a link to the last failed job; an admin clicks "clear" to lift it immediately — for when the GPU was swapped, the driver was fixed, or those two failures were the platform's fault, without waiting out the 7 days.
+
+The job detail page's "attempts" panel lists how many times each worker failed this job; a job still being retried shows its "last error", so you don't have to wait for a final failure to see what went wrong.
+
 ### Security model summary
 
 - **One-time registration token**: each bundle issued by the console can be used exactly once (the server claims it atomically, so two concurrent registrations can't both win).
