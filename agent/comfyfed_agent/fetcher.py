@@ -30,6 +30,18 @@ this process's own graceful shutdown -- both simply set the same
 `asyncio.Event`, see `runner._JobHandle`) raises `comfy.JobCancelled`
 directly, so it flows through `runner.handle_job`'s existing cancellation
 branch exactly like a cancel mid-render: silently, no `job_failed` sent.
+
+Phase 3.5（面板下載鈕）adds a SECOND entry shape, `unverified: true` (spec §6):
+a url the platform approved but has never hashed, because no worker on the
+fleet has the file yet -- so `sha256` is `null` and the signature covers the
+url instead (`f"{name}|{directory}|{url}|{size_bytes}|unverified"`). Such an
+entry is downloaded from that one signed https url only (no peer source, no
+`backup_url`) and checked against `size_bytes` alone; the sha256 of whatever
+landed is REPORTED rather than verified, and the platform learns the hash
+from it (`fetch_and_verify_models`'s return value -> `job_done`'s
+`fetched_models`, spec §9). Everything else -- budget, disk, path
+sanitization, `.part` cleanup, cancellation -- is identical to a verified
+entry's, and a verified entry's behavior is unchanged in every respect.
 """
 
 from __future__ import annotations
@@ -182,15 +194,31 @@ def _validate_entry_shape(entry: dict) -> None:
     failed, landing an unverified file. Checked for every entry BEFORE any
     signature verification or download, so a malformed entry is rejected
     the same way a bad signature is: nothing downloaded, one clear error.
+
+    Phase 3.5（面板下載鈕）: an `unverified: true` entry (spec §6 -- a URL the
+    platform approved but has never hashed, because nobody on the fleet has
+    the file yet) legitimately has NO sha256, so the hash requirement flips
+    to `sha256 is None` EXACTLY -- an entry claiming both shapes at once is
+    malformed, not a free pass around the hash check. `size_bytes` stays a
+    positive int either way (with no hash it is the ONLY integrity signal
+    the download has left), and the `url` must be a non-empty https string:
+    the platform's approval of that url IS the whole trust basis here, and
+    plaintext would let anyone on the path swap the bytes undetected.
     """
     name = entry.get("name")
     sha256 = entry.get("sha256")
     size_bytes = entry.get("size_bytes")
-    sha256_ok = isinstance(sha256, str) and bool(_SHA256_HEX_RE.match(sha256))
+    url = entry.get("url")
+    if entry.get("unverified") is True:
+        sha256_ok = sha256 is None
+        url_ok = isinstance(url, str) and url.startswith("https://")
+    else:
+        sha256_ok = isinstance(sha256, str) and bool(_SHA256_HEX_RE.match(sha256))
+        url_ok = True
     size_ok = (
         isinstance(size_bytes, int) and not isinstance(size_bytes, bool) and size_bytes > 0
     )
-    if not sha256_ok or not size_ok:
+    if not sha256_ok or not size_ok or not url_ok:
         raise FetchError(f"模型清單條目無效：{name} / invalid manifest entry: {name}")
 
 
@@ -245,9 +273,24 @@ def _verify_entry_signature(entry: dict, platform_pubkey_hex: str) -> None:
     Ed25519 public key. The signed payload MUST match
     `model_manifest.entries`'s construction byte-for-byte:
     `f"{name}|{directory}|{sha256}|{size_bytes}"`.
+
+    Phase 3.5（面板下載鈕）: an `unverified: true` entry has no sha256 to sign
+    over, so its payload covers the URL instead (spec §6):
+    `f"{name}|{directory}|{url}|{size_bytes}|unverified"` -- matching
+    `model_fetch.unverified_payload` byte-for-byte. That is what makes the url
+    un-substitutable in flight, which matters far more here than for a
+    verified entry: with no hash to check the bytes against, "the platform
+    approved THIS url" is the only thing standing between the worker and
+    an attacker-chosen download.
     """
     name = entry.get("name")
-    payload = f"{name}|{entry.get('directory')}|{entry.get('sha256')}|{entry.get('size_bytes')}"
+    if entry.get("unverified") is True:
+        payload = (
+            f"{name}|{entry.get('directory')}|{entry.get('url')}|"
+            f"{entry.get('size_bytes')}|unverified"
+        )
+    else:
+        payload = f"{name}|{entry.get('directory')}|{entry.get('sha256')}|{entry.get('size_bytes')}"
     sig = entry.get("sig")
     try:
         if not isinstance(sig, str):
@@ -316,6 +359,12 @@ def _finalize_download(
     path (which re-reads `part_path` from disk here, since its chunks are
     verified individually, not against a running whole-file digest).
 
+    `expected_sha256=None` (Phase 3.5's unverified-source entries, spec §6)
+    skips the hash comparison -- there is no hash to compare against -- but
+    NOT the size comparison: `_validate_entry_shape` guarantees those entries
+    still carry a positive int `size_bytes`, so the size branch below always
+    runs for them and stays their one integrity check.
+
     Returns `None` on success (file is now at `target_path`), or an error
     message with `part_path` already removed on failure. Never raises for an
     OSError while stat'ing/reading -- folded into the returned message like
@@ -370,9 +419,13 @@ async def _download_one(
     client: httpx.AsyncClient,
     cancel_event,
     on_bytes: Callable[[int], Awaitable[None]],
-) -> None:
+) -> str:
     """Download one manifest entry to `target_path`, trying `url` then
-    `backup_url`, verifying size + sha256 before an atomic rename.
+    `backup_url`, verifying size + sha256 before an atomic rename. Returns
+    the hex SHA-256 of the bytes that actually landed -- for a verified
+    entry that is necessarily the entry's own `sha256` (it was just checked
+    against it), for an unverified one it is what the platform is told the
+    file turned out to be (spec §9's `fetched_models`).
 
     Each distinct source gets up to two attempts (one retry) for
     transient/network failures. A VERIFIED content mismatch (whole-file size
@@ -384,7 +437,13 @@ async def _download_one(
     """
     name = entry.get("name")
     primary = entry.get("url") or None
-    backup = entry.get("backup_url") or None
+    # Phase 3.5（面板下載鈕）: an unverified entry has exactly ONE approved
+    # source -- the signed url. `backup_url` is a mirror the platform
+    # vouched for BY HASH, and with no hash there is nothing tying that
+    # mirror's bytes to the approved download, so it is not a fallback here.
+    # (The server already sends `backup_url: null` for these; this makes the
+    # agent side fail closed rather than trust that it always will.)
+    backup = None if entry.get("unverified") is True else (entry.get("backup_url") or None)
     sources = [u for u in (primary, backup) if u]
     if not sources:
         raise FetchError(f"模型 {name} 沒有可用的下載網址 / model {name} has no download url")
@@ -438,6 +497,7 @@ async def _download_one(
                 _safe_unlink(part_path)
                 continue
 
+            digest_hex = digest.hexdigest()
             error = _finalize_download(
                 part_path=part_path,
                 target_path=target_path,
@@ -445,7 +505,7 @@ async def _download_one(
                 expected_size=expected_size,
                 source_label=url,
                 written_size=written,
-                precomputed_sha256=digest.hexdigest(),
+                precomputed_sha256=digest_hex,
             )
             if error is not None:
                 last_error = error
@@ -456,7 +516,7 @@ async def _download_one(
                     break
                 continue
 
-            return
+            return digest_hex
 
     raise FetchError(
         f"模型 {name} 下載失敗（已嘗試：{', '.join(urls_tried)}）：{last_error} / "
@@ -878,6 +938,22 @@ async def _fetch_via_peer(
     return True
 
 
+def _fetch_result(entry: dict, sha256) -> dict:
+    """One `fetched_models` item for a landed entry (spec §9's shape).
+
+    `name` is the entry's `name` VERBATIM -- not `_inventory_name`'s
+    `dir/file` form -- because the server matches it against the job's
+    `required_models`; anything else is dropped there with a warning or, for
+    a model_fetch job, learned under the wrong key.
+    """
+    return {
+        "name": entry.get("name"),
+        "directory": entry.get("directory") or "",
+        "size_bytes": int(entry.get("size_bytes") or 0),
+        "sha256": sha256,
+    }
+
+
 async def fetch_and_verify_models(
     *,
     entries: list[dict],
@@ -890,8 +966,17 @@ async def fetch_and_verify_models(
     platform_entry: Optional[PlatformEntry] = None,
     peer_client_factory: Callable[..., httpx.AsyncClient] = httpx.AsyncClient,
     platform_client_factory: Callable[..., httpx.AsyncClient] = httpx.AsyncClient,
-) -> None:
+) -> list[dict]:
     """Verify, budget-check, and download every `fetch_models` entry.
+
+    Returns one `{name, directory, size_bytes, sha256}` dict per entry, in
+    input order (`[]` for no entries) -- what `runner.handle_job` hands the
+    platform as a `job_done`'s `fetched_models` so the server can LEARN the
+    hash of a model it had never seen hashed before (spec §9). `name` is the
+    entry's own `name` verbatim, because that is the key the server matches
+    against the job's `required_models`; anything else is silently dropped
+    there or lands as a duplicate hash row. Callers that only care about the
+    files landing on disk (every pre-3.5 one) just ignore the return value.
 
     `report_progress(pct, model_name)` is awaited with the OVERALL percent
     (0-100, weighted by `size_bytes` across every entry, not per-file) and
@@ -918,7 +1003,7 @@ async def fetch_and_verify_models(
     failure (those are checked for every entry before any download starts).
     """
     if not entries:
-        return
+        return []
     if not models_dir:
         raise FetchError(
             "此 worker 未設定 models_dir，無法自動下載模型 / "
@@ -953,6 +1038,7 @@ async def fetch_and_verify_models(
             await report_progress(pct, model_name)
 
     created_parts = [target_path + _PART_SUFFIX for _entry, target_path in targets]
+    results: list[dict] = []
 
     try:
         async with client_factory(
@@ -961,12 +1047,18 @@ async def fetch_and_verify_models(
             for entry, target_path in targets:
                 model_name = entry.get("name")
                 is_peer_only = entry.get("url") is None and entry.get("peer") is True
+                # Phase 3.5（面板下載鈕）: a peer can only be asked for bytes the
+                # platform already holds a hash for (the grant is minted
+                # against `model_hashes`), and an unverified entry exists
+                # precisely because no such hash exists yet -- so the peer
+                # source is skipped outright rather than attempted and failed.
+                is_unverified = entry.get("unverified") is True
 
                 async def _on_bytes(n: int, _name=model_name) -> None:
                     await on_bytes(_name, n)
 
                 peer_ok = False
-                if platform_entry is not None:
+                if platform_entry is not None and not is_unverified:
                     peer_ok = await _fetch_via_peer(
                         entry=entry,
                         target_path=target_path,
@@ -977,6 +1069,9 @@ async def fetch_and_verify_models(
                         platform_client_factory=platform_client_factory,
                     )
                 if peer_ok:
+                    # The peer path verifies against the entry's own sha256
+                    # (`_finalize_download`), so that IS the landed digest.
+                    results.append(_fetch_result(entry, entry.get("sha256")))
                     continue
 
                 if is_peer_only:
@@ -985,13 +1080,14 @@ async def fetch_and_verify_models(
                         f"model {model_name} has no download url (peer source failed)"
                     )
 
-                await _download_one(
+                digest = await _download_one(
                     entry=entry,
                     target_path=target_path,
                     client=client,
                     cancel_event=cancel_event,
                     on_bytes=_on_bytes,
                 )
+                results.append(_fetch_result(entry, digest))
     except (JobCancelled, FetchError):
         for part_path in created_parts:
             _safe_unlink(part_path)
@@ -1004,3 +1100,4 @@ async def fetch_and_verify_models(
         ) from exc
 
     await report_progress(100.0, None)
+    return results

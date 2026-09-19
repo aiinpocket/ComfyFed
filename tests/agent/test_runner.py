@@ -59,6 +59,7 @@ class FakeConnection:
         self.state = "idle"
         self.heartbeats: list[dict] = []
         self.job_done = None
+        self.job_done_fetched_models = None
         self.job_failed = None
         self.object_info_hash = ""
         self.object_info_uploads: list[tuple[bytes, str]] = []
@@ -101,8 +102,12 @@ class FakeConnection:
             }
         )
 
-    async def send_job_done(self, job_id, result_files, exec_seconds=None):
+    async def send_job_done(self, job_id, result_files, exec_seconds=None, fetched_models=None):
         self.job_done = (job_id, result_files, exec_seconds)
+        # Kept off the `job_done` tuple on purpose: every pre-existing
+        # assertion compares that 3-tuple, and an ordinary job never carries
+        # this field at all (see PlatformConnection.send_job_done).
+        self.job_done_fetched_models = fetched_models
 
     async def send_job_failed(self, job_id, error, exec_seconds=None):
         self.job_failed = (job_id, error, exec_seconds)
@@ -1405,11 +1410,11 @@ async def test_job_done_is_retried_until_the_connection_comes_back(
     attempts = {"n": 0}
     real_send_job_done = conn_a.send_job_done
 
-    async def _send_job_done(job_id, result_files, exec_seconds=None):
+    async def _send_job_done(job_id, result_files, exec_seconds=None, fetched_models=None):
         attempts["n"] += 1
         if conn_a.ws is None:
             raise AttributeError("'NoneType' object has no attribute 'send'")
-        await real_send_job_done(job_id, result_files, exec_seconds)
+        await real_send_job_done(job_id, result_files, exec_seconds, fetched_models)
 
     conn_a.send_job_done = _send_job_done
 
@@ -1451,7 +1456,7 @@ async def test_unreported_completion_at_shutdown_keeps_the_files(
     conn_a.ws = None
     reporting = asyncio.Event()
 
-    async def _always_fails(job_id, result_files, exec_seconds=None):
+    async def _always_fails(job_id, result_files, exec_seconds=None, fetched_models=None):
         reporting.set()
         raise AttributeError("'NoneType' object has no attribute 'send'")
 
@@ -1705,7 +1710,7 @@ class _RecordingWS:
 
 
 @pytest.mark.asyncio
-async def test_send_hello_declares_protocol_4_and_auto_fetch_true_by_default():
+async def test_send_hello_declares_protocol_5_and_auto_fetch_true_by_default():
     entry = PlatformEntry(
         platform_url="http://p",
         platform_pubkey="aa",
@@ -1721,7 +1726,7 @@ async def test_send_hello_declares_protocol_4_and_auto_fetch_true_by_default():
     assert len(conn.ws.sent) == 1
     payload = json.loads(conn.ws.sent[0])
     assert payload["type"] == "hello"
-    assert payload["protocol"] == 4
+    assert payload["protocol"] == 5
     assert payload["auto_fetch"] is True
     assert payload["max_fetch_gb"] == 20
     assert payload["hardware"]["platform"] == "Windows"
@@ -3679,3 +3684,133 @@ async def test_a_renewal_does_not_start_once_shutdown_has_begun(tmp_path, monkey
         pass
 
     assert calls["n"] == 0
+
+
+# --- Phase 3.5 Task 6: model_fetch jobs --------------------------------------
+
+
+def _model_fetch_job_message(job_id: str, fetch_models=None) -> dict:
+    """A `kind: "model_fetch"` push: the workflow_json is a placeholder `{}`
+    the agent must never run (the server sends it only because the frame
+    shape requires the field)."""
+    message = {
+        "job_id": job_id,
+        "workflow_json": "{}",
+        "input_assets": [],
+        "kind": "model_fetch",
+    }
+    if fetch_models is not None:
+        message["fetch_models"] = fetch_models
+    return message
+
+
+async def test_model_fetch_job_skips_workflow_and_reports_fetched_models(
+    two_platform_loop, monkeypatch
+):
+    loop = two_platform_loop
+    loop.config.auto_fetch_models = True
+    loop.config.models_dir = "/fake/models"
+    conn_a = loop.connections["worker-a"]
+
+    ran = []
+    monkeypatch.setattr(comfy, "run_workflow", lambda *a, **k: ran.append(1))
+    monkeypatch.setattr(hardware, "scan_models", lambda *a, **k: [{"name": "vae/ae.safetensors", "size": 0.1}])
+
+    fetched = [
+        {"name": "ae.safetensors", "directory": "vae", "size_bytes": 5, "sha256": "ab" * 32}
+    ]
+
+    async def _fake_fetch(**kwargs):
+        return fetched
+
+    monkeypatch.setattr(runner_module.fetcher, "fetch_and_verify_models", _fake_fetch)
+
+    def _must_not_check(*a, **k):
+        raise AssertionError("whitelist.check must not run for a model_fetch job")
+
+    monkeypatch.setattr(whitelist, "check", _must_not_check)
+
+    await loop.handle_job(conn_a, _model_fetch_job_message("job-mf-1", [{"name": "ae.safetensors"}]))
+
+    assert ran == []
+    assert conn_a.job_done == ("job-mf-1", [], 0.0)
+    assert conn_a.job_done_fetched_models == fetched
+    assert conn_a.job_failed is None
+    # The fetch phase still reports itself as such, so the server never
+    # starts the (unbillable) run clock for this job.
+    assert any(hb.get("stage") == "fetching_models" for hb in conn_a.heartbeats)
+    assert conn_a.heartbeats[-1]["state"] == "idle"
+
+
+async def test_model_fetch_job_without_fetch_models_is_done_immediately(
+    two_platform_loop, monkeypatch
+):
+    """The worker already had the model (the platform found it `eligible`,
+    so the push carries no `fetch_models`) -- still a completed model_fetch
+    job, just with nothing learned."""
+    loop = two_platform_loop
+    loop.config.models_dir = "/fake/models"
+    conn_a = loop.connections["worker-a"]
+
+    def _must_not_fetch(**kwargs):
+        raise AssertionError("fetch_and_verify_models must not be called without fetch_models")
+
+    def _must_not_run(*a, **k):
+        raise AssertionError("run_workflow must not be called for a model_fetch job")
+
+    monkeypatch.setattr(runner_module.fetcher, "fetch_and_verify_models", _must_not_fetch)
+    monkeypatch.setattr(comfy, "run_workflow", _must_not_run)
+    monkeypatch.setattr(hardware, "scan_models", lambda *a, **k: [])
+
+    await loop.handle_job(conn_a, _model_fetch_job_message("job-mf-2"))
+
+    assert conn_a.job_done == ("job-mf-2", [], 0.0)
+    assert conn_a.job_done_fetched_models == []
+    assert conn_a.job_failed is None
+
+
+async def test_model_fetch_job_fetch_failure_still_reports_job_failed(
+    two_platform_loop, monkeypatch
+):
+    """A model_fetch job's fetch failure is reported exactly like any other
+    fetch failure -- the zh-TW-first FetchError message, verbatim."""
+    loop = two_platform_loop
+    loop.config.auto_fetch_models = True
+    conn_a = loop.connections["worker-a"]
+
+    async def _fake_fetch(**kwargs):
+        raise fetcher.FetchError("模型 ae.safetensors 下載失敗 / failed to download")
+
+    monkeypatch.setattr(runner_module.fetcher, "fetch_and_verify_models", _fake_fetch)
+
+    await loop.handle_job(conn_a, _model_fetch_job_message("job-mf-3", [{"name": "ae.safetensors"}]))
+
+    assert conn_a.job_done is None
+    assert conn_a.job_failed == (
+        "job-mf-3",
+        "模型 ae.safetensors 下載失敗 / failed to download",
+        None,
+    )
+
+
+async def test_ordinary_job_done_carries_no_fetched_models_key():
+    """`fetched_models` is omitted entirely from an ordinary job_done, so an
+    older server's message shape is unchanged."""
+    entry = PlatformEntry(
+        platform_url="http://p",
+        platform_pubkey="aa",
+        worker_id="w1",
+        certificate="cert",
+        signing_key_hex="00" * 32,
+    )
+    conn = PlatformConnection(entry, AgentConfig())
+    conn.ws = _RecordingWS()
+
+    await conn.send_job_done("j1", ["a.png"], 1.5)
+    payload = json.loads(conn.ws.sent[0])
+    assert payload["type"] == "job_done"
+    assert "fetched_models" not in payload
+
+    await conn.send_job_done("j2", [], 0.0, fetched_models=[{"name": "ae.safetensors"}])
+    payload = json.loads(conn.ws.sent[1])
+    assert payload["fetched_models"] == [{"name": "ae.safetensors"}]

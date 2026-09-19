@@ -1535,3 +1535,301 @@ async def test_fetch_via_peer_falls_back_to_the_url_chain_when_every_url_fails(m
 
     assert ok is False
     assert attempts == ["http://203.0.113.7:8850", "http://192.168.1.5:8850"]
+
+
+# --- Phase 3.5 Task 6: unverified-source entries -----------------------------
+
+
+def _unverified_entry(
+    signing_key,
+    *,
+    name="ae.safetensors",
+    directory="vae",
+    url="https://huggingface.co/x/ae.safetensors",
+    size_bytes=5,
+):
+    """An unverified-source manifest entry (spec 6): no `sha256` at all, and
+    the signed payload covers the URL instead -- the platform having approved
+    THAT url is the entire trust basis, so it must not be swappable in
+    flight. The payload MUST match the server side byte-for-byte.
+    """
+    payload = f"{name}|{directory}|{url}|{size_bytes}|unverified"
+    return {
+        "name": name,
+        "directory": directory,
+        "url": url,
+        "backup_url": None,
+        "sha256": None,
+        "size_bytes": size_bytes,
+        "unverified": True,
+        "sig": signing_key.sign(payload.encode()).signature.hex(),
+    }
+
+
+async def test_unverified_entry_downloads_checks_size_and_returns_sha(tmp_path):
+    signing_key, pubkey_hex = _keypair()
+    entry = _unverified_entry(signing_key)
+    recorded = []
+    client_cls = _client_factory([_StreamSpec(chunks=[b"hello"])], recorded)
+
+    out = await fetcher.fetch_and_verify_models(
+        entries=[entry],
+        platform_pubkey_hex=pubkey_hex,
+        models_dir=str(tmp_path),
+        max_fetch_gb=1,
+        cancel_event=asyncio.Event(),
+        report_progress=_noop_progress,
+        client_factory=client_cls,
+    )
+
+    assert out == [
+        {
+            "name": "ae.safetensors",
+            "directory": "vae",
+            "size_bytes": 5,
+            "sha256": hashlib.sha256(b"hello").hexdigest(),
+        }
+    ]
+    assert (tmp_path / "vae" / "ae.safetensors").read_bytes() == b"hello"
+    assert recorded == [entry["url"]]
+
+
+async def test_unverified_entry_size_mismatch_fails_and_cleans_part(tmp_path):
+    """With no sha256 to check, `size_bytes` is the ONLY integrity signal an
+    unverified entry has -- it must still be enforced, and a mismatch must
+    leave nothing behind."""
+    signing_key, pubkey_hex = _keypair()
+    entry = _unverified_entry(signing_key, size_bytes=99)
+    recorded = []
+    client_cls = _client_factory(
+        [_StreamSpec(chunks=[b"hello"]), _StreamSpec(chunks=[b"hello"])], recorded
+    )
+
+    with pytest.raises(fetcher.FetchError) as exc_info:
+        await fetcher.fetch_and_verify_models(
+            entries=[entry],
+            platform_pubkey_hex=pubkey_hex,
+            models_dir=str(tmp_path),
+            max_fetch_gb=1,
+            cancel_event=asyncio.Event(),
+            report_progress=_noop_progress,
+            client_factory=client_cls,
+        )
+
+    assert "size mismatch" in str(exc_info.value)
+    assert not (tmp_path / "vae" / "ae.safetensors").exists()
+    assert not (tmp_path / "vae" / "ae.safetensors.part").exists()
+
+
+async def test_unverified_entry_with_wrong_signature_rejected(tmp_path):
+    """The url sits inside the signed payload, so swapping it invalidates the
+    signature -- exactly the substitution this entry shape exists to stop."""
+    signing_key, pubkey_hex = _keypair()
+    entry = _unverified_entry(signing_key)
+    entry["url"] = "https://huggingface.co/x/other"
+
+    class _ExplodingClient:
+        def __init__(self, *a, **k):
+            raise AssertionError("must not even construct a client for a bad signature")
+
+    with pytest.raises(fetcher.FetchError, match="簽章"):
+        await fetcher.fetch_and_verify_models(
+            entries=[entry],
+            platform_pubkey_hex=pubkey_hex,
+            models_dir=str(tmp_path),
+            max_fetch_gb=1,
+            cancel_event=asyncio.Event(),
+            report_progress=_noop_progress,
+            client_factory=_ExplodingClient,
+        )
+
+    assert list(tmp_path.rglob("*")) == []
+
+
+@pytest.mark.parametrize("sha256", ["", "ab" * 32])
+async def test_unverified_entry_must_not_carry_a_sha256(tmp_path, sha256):
+    """`unverified` relaxes the sha256 requirement to EXACTLY `None` -- an
+    entry claiming both shapes at once is malformed, not a free pass around
+    the verified path's hash check."""
+    signing_key, pubkey_hex = _keypair()
+    entry = _unverified_entry(signing_key)
+    entry["sha256"] = sha256
+
+    class _ExplodingClient:
+        def __init__(self, *a, **k):
+            raise AssertionError("must not even construct a client for a malformed entry")
+
+    with pytest.raises(fetcher.FetchError) as exc_info:
+        await fetcher.fetch_and_verify_models(
+            entries=[entry],
+            platform_pubkey_hex=pubkey_hex,
+            models_dir=str(tmp_path),
+            max_fetch_gb=1,
+            cancel_event=asyncio.Event(),
+            report_progress=_noop_progress,
+            client_factory=_ExplodingClient,
+        )
+
+    assert "模型清單條目無效" in str(exc_info.value)
+
+
+@pytest.mark.parametrize("url", ["", None, 123, "http://huggingface.co/x/ae.safetensors"])
+async def test_unverified_entry_needs_a_non_empty_https_url(tmp_path, url):
+    """The url IS the trust basis here: it must actually be present, and it
+    must be https (plaintext would let anyone on the path swap the bytes,
+    with no hash left to catch it)."""
+    signing_key, pubkey_hex = _keypair()
+    name, directory, size_bytes = "ae.safetensors", "vae", 5
+    payload = f"{name}|{directory}|{url}|{size_bytes}|unverified"
+    entry = {
+        "name": name,
+        "directory": directory,
+        "url": url,
+        "backup_url": None,
+        "sha256": None,
+        "size_bytes": size_bytes,
+        "unverified": True,
+        "sig": signing_key.sign(payload.encode()).signature.hex(),
+    }
+
+    class _ExplodingClient:
+        def __init__(self, *a, **k):
+            raise AssertionError("must not even construct a client for a malformed entry")
+
+    with pytest.raises(fetcher.FetchError) as exc_info:
+        await fetcher.fetch_and_verify_models(
+            entries=[entry],
+            platform_pubkey_hex=pubkey_hex,
+            models_dir=str(tmp_path),
+            max_fetch_gb=1,
+            cancel_event=asyncio.Event(),
+            report_progress=_noop_progress,
+            client_factory=_ExplodingClient,
+        )
+
+    assert "模型清單條目無效" in str(exc_info.value)
+
+
+async def test_unverified_entry_never_tries_peer(tmp_path, monkeypatch):
+    """A peer can only be asked for bytes the platform already has a hash
+    for -- an unverified entry has none, so the peer source is skipped
+    outright rather than attempted and failed."""
+    signing_key, pubkey_hex = _keypair()
+    called = []
+
+    async def _no_peer(**kwargs):
+        called.append("peer")
+        return False
+
+    monkeypatch.setattr(fetcher, "_fetch_via_peer", _no_peer)
+    entry = _unverified_entry(signing_key)
+    entry["backup_url"] = "https://huggingface.co/x/backup"
+    recorded = []
+    client_cls = _client_factory([_StreamSpec(chunks=[b"hello"])], recorded)
+
+    out = await fetcher.fetch_and_verify_models(
+        entries=[entry],
+        platform_pubkey_hex=pubkey_hex,
+        models_dir=str(tmp_path),
+        max_fetch_gb=1,
+        cancel_event=asyncio.Event(),
+        report_progress=_noop_progress,
+        client_factory=client_cls,
+        platform_entry=_puller_platform_entry(),
+    )
+
+    assert called == []
+    assert recorded == [entry["url"]]
+    assert out[0]["sha256"] == hashlib.sha256(b"hello").hexdigest()
+
+
+async def test_unverified_entry_never_tries_backup_url(tmp_path):
+    """`backup_url` is a mirror the platform vouched for BY HASH; with no
+    hash there is nothing tying the mirror's bytes to the approved url, so an
+    unverified entry's failure must stop at its own url."""
+    signing_key, pubkey_hex = _keypair()
+    entry = _unverified_entry(signing_key)
+    entry["backup_url"] = "https://huggingface.co/x/backup"
+    recorded = []
+    client_cls = _client_factory(
+        [_StreamSpec(status_code=500), _StreamSpec(status_code=500)], recorded
+    )
+
+    with pytest.raises(fetcher.FetchError) as exc_info:
+        await fetcher.fetch_and_verify_models(
+            entries=[entry],
+            platform_pubkey_hex=pubkey_hex,
+            models_dir=str(tmp_path),
+            max_fetch_gb=1,
+            cancel_event=asyncio.Event(),
+            report_progress=_noop_progress,
+            client_factory=client_cls,
+        )
+
+    assert recorded == [entry["url"], entry["url"]]
+    assert entry["backup_url"] not in str(exc_info.value)
+
+
+async def test_verified_entries_still_return_their_verified_sha_in_order(tmp_path):
+    """The return value is what the server learns hashes from, so a verified
+    entry reports the sha it was verified against -- one result per entry, in
+    input order."""
+    signing_key, pubkey_hex = _keypair()
+    first = b"one" * 10
+    second = b"two" * 20
+    entry_a = _signed_entry(
+        signing_key,
+        name="a.safetensors",
+        directory="checkpoints",
+        content=first,
+        url="http://models.example/a.bin",
+    )
+    entry_b = _signed_entry(
+        signing_key,
+        name="b.safetensors",
+        directory="",
+        content=second,
+        url="http://models.example/b.bin",
+    )
+    recorded = []
+    client_cls = _client_factory(
+        [_StreamSpec(chunks=[first]), _StreamSpec(chunks=[second])], recorded
+    )
+
+    out = await fetcher.fetch_and_verify_models(
+        entries=[entry_a, entry_b],
+        platform_pubkey_hex=pubkey_hex,
+        models_dir=str(tmp_path),
+        max_fetch_gb=100,
+        cancel_event=asyncio.Event(),
+        report_progress=_noop_progress,
+        client_factory=client_cls,
+    )
+
+    assert out == [
+        {
+            "name": "a.safetensors",
+            "directory": "checkpoints",
+            "size_bytes": len(first),
+            "sha256": entry_a["sha256"],
+        },
+        {
+            "name": "b.safetensors",
+            "directory": "",
+            "size_bytes": len(second),
+            "sha256": entry_b["sha256"],
+        },
+    ]
+
+
+async def test_no_entries_returns_an_empty_list(tmp_path):
+    out = await fetcher.fetch_and_verify_models(
+        entries=[],
+        platform_pubkey_hex="00" * 32,
+        models_dir=str(tmp_path),
+        max_fetch_gb=1,
+        cancel_event=asyncio.Event(),
+        report_progress=_noop_progress,
+    )
+
+    assert out == []

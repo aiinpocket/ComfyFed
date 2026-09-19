@@ -325,15 +325,24 @@ class PlatformConnection:
             "backend": backend,
             "torch_version": torch_version,
             "node_classes": sorted(node_classes),
-            # Protocol 4 (Phase 3.1 P2P addendum): adds the optional
+            # Protocol 5 (Phase 3.5 面板下載鈕): this worker understands
+            # `unverified: true` fetch entries (a platform-approved url with
+            # no known sha256 -- see fetcher._validate_entry_shape) and
+            # `kind: "model_fetch"` job pushes, and reports what it landed
+            # back as `job_done`'s `fetched_models`. The server gates
+            # unverified dispatch on exactly this number
+            # (`_MIN_UNVERIFIED_FETCH_PROTOCOL = 5`), so a 4-era agent is
+            # simply never sent one.
+            #
+            # Still guarantees everything protocol 4 did: the optional
             # `peer_url` field below, advertised only when this worker's
-            # peer HTTP server is enabled (see peerserve.is_enabled). Still
-            # guarantees everything protocol 3 did: `auto_fetch` and lazy
-            # sha256/chunk hashes on inventory entries (hardware.scan_models),
+            # peer HTTP server is enabled (see peerserve.is_enabled); and
+            # everything protocol 3 did: `auto_fetch` and lazy sha256/chunk
+            # hashes on inventory entries (hardware.scan_models),
             # `exec_seconds` on job_done/job_failed, and job_cancelled
-            # pushes. A server that doesn't know protocol 4 yet just ignores
+            # pushes. A server that doesn't know protocol 5 yet just ignores
             # the unknown fields (see agentws.py).
-            "protocol": 4,
+            "protocol": 5,
             "auto_fetch": self.config.auto_fetch_models,
             # Optional (Phase 3.2 F1 fix): this worker's configured auto-fetch
             # budget (see AgentConfig.max_fetch_gb / fetcher._check_budget_and_
@@ -409,16 +418,31 @@ class PlatformConnection:
             resp.raise_for_status()
 
     async def send_job_done(
-        self, job_id: str, result_files: list[str], exec_seconds: Optional[float] = None
+        self,
+        job_id: str,
+        result_files: list[str],
+        exec_seconds: Optional[float] = None,
+        fetched_models: Optional[list] = None,
     ) -> None:
-        await self._send(
-            {
-                "type": "job_done",
-                "job_id": job_id,
-                "result_files": result_files,
-                "exec_seconds": exec_seconds,
-            }
-        )
+        """Report one finished job.
+
+        `fetched_models` (protocol 5, Phase 3.5) is the list of
+        `{name, directory, size_bytes, sha256}` dicts
+        `fetcher.fetch_and_verify_models` just landed -- how the platform
+        learns the sha256 of a model it had approved by url but never hashed
+        (spec §9). Present ONLY when given (a `model_fetch` job, even with an
+        empty list), so an ordinary job_done's wire shape is byte-identical
+        to protocol 4's and an older server sees nothing new.
+        """
+        message = {
+            "type": "job_done",
+            "job_id": job_id,
+            "result_files": result_files,
+            "exec_seconds": exec_seconds,
+        }
+        if fetched_models is not None:
+            message["fetched_models"] = fetched_models
+        await self._send(message)
 
     async def send_job_failed(
         self, job_id: str, error: str, exec_seconds: Optional[float] = None
@@ -1185,6 +1209,14 @@ class AgentLoop:
                 raise_if_cancelled()
 
                 fetch_models = list(job_msg.get("fetch_models") or [])
+                # Phase 3.5（面板下載鈕）: a `model_fetch` job exists ONLY to put
+                # a model on this worker's disk -- there is no workflow to
+                # run (its `workflow_json` is a placeholder `{}`), no inputs,
+                # no outputs. Everything below the fetch phase is skipped for
+                # it, and it completes with `exec_seconds=0.0` so the server
+                # mints an unbillable receipt (spec §9).
+                is_model_fetch = job_msg.get("kind") == "model_fetch"
+                fetched: list[dict] = []
                 if fetch_models and self.config.auto_fetch_models:
                     # The very first busy heartbeat must already carry the
                     # fetch stage: a stage-less busy beat is the server's
@@ -1232,7 +1264,7 @@ class AgentLoop:
                             fetch_model=model_name,
                         )
 
-                    await fetcher.fetch_and_verify_models(
+                    fetched = await fetcher.fetch_and_verify_models(
                         entries=fetch_models,
                         platform_pubkey_hex=conn.entry.platform_pubkey,
                         models_dir=self.config.models_dir,
@@ -1259,49 +1291,68 @@ class AgentLoop:
                     await self.refresh_model_inventory(conn)
                     await self.broadcast_heartbeat("busy", progress=0.0, job_id=job_id)
 
-                workflow = comfy.namespace_outputs(json.loads(job_msg["workflow_json"]), job_id)
-                # allowed_classes does a blocking HTTP call to ComfyUI's
-                # /object_info; running it inline would stall this connection's
-                # heartbeats (and every other platform's, they share the loop).
-                allowed = await asyncio.to_thread(
-                    whitelist.allowed_classes,
-                    self.config.node_policy,
-                    self.config.comfy_url,
-                    self.config.whitelist_extra,
-                )
-                whitelist.check(workflow, allowed)
-
-                for filename in input_filenames:
-                    content = await self._download_input(conn.entry, job_id, filename)
-                    await asyncio.to_thread(comfy.upload_input, self.config.comfy_url, filename, content)
-
-                loop = asyncio.get_running_loop()
-
-                def on_progress(p: float) -> None:
-                    fut = asyncio.run_coroutine_threadsafe(
-                        self.broadcast_heartbeat("busy", progress=p, job_id=job_id), loop
+                if is_model_fetch:
+                    # The whole job WAS the fetch. Never touch the whitelist,
+                    # the inputs, ComfyUI, or the output directories: there is
+                    # no workflow behind this `workflow_json`, and treating it
+                    # as one would fail a job that has already done its work.
+                    if not fetch_models:
+                        # No `fetch_models` means the platform found this
+                        # worker already HAD the model, so nothing was
+                        # downloaded and the fetch block's own rescan never
+                        # ran -- still push a fresh inventory (cheap, and it
+                        # is the one signal the platform gets from this job
+                        # when there is no hash to learn).
+                        await self.refresh_model_inventory(conn)
+                    exec_seconds = 0.0
+                    await self._report_completion(
+                        conn, handle, [], exec_seconds, fetched_models=fetched or []
                     )
-                    try:
-                        fut.result(timeout=10)
-                    except Exception:
-                        logger.exception("runner: failed to report job progress")
+                    success = True
+                else:
+                    workflow = comfy.namespace_outputs(json.loads(job_msg["workflow_json"]), job_id)
+                    # allowed_classes does a blocking HTTP call to ComfyUI's
+                    # /object_info; running it inline would stall this connection's
+                    # heartbeats (and every other platform's, they share the loop).
+                    allowed = await asyncio.to_thread(
+                        whitelist.allowed_classes,
+                        self.config.node_policy,
+                        self.config.comfy_url,
+                        self.config.whitelist_extra,
+                    )
+                    whitelist.check(workflow, allowed)
 
-                raise_if_cancelled()
+                    for filename in input_filenames:
+                        content = await self._download_input(conn.entry, job_id, filename)
+                        await asyncio.to_thread(comfy.upload_input, self.config.comfy_url, filename, content)
 
-                files, exec_seconds = await asyncio.to_thread(
-                    comfy.run_workflow,
-                    self.config.comfy_url,
-                    workflow,
-                    on_progress,
-                    cancel_event=handle.cancel_event,
-                    on_prompt_id=handle.set_prompt_id,
-                )
-                output_files = [
-                    {"filename": filename, "subfolder": subfolder} for filename, _content, subfolder in files
-                ]
+                    loop = asyncio.get_running_loop()
 
-                await self._report_completion(conn, handle, files, exec_seconds)
-                success = True
+                    def on_progress(p: float) -> None:
+                        fut = asyncio.run_coroutine_threadsafe(
+                            self.broadcast_heartbeat("busy", progress=p, job_id=job_id), loop
+                        )
+                        try:
+                            fut.result(timeout=10)
+                        except Exception:
+                            logger.exception("runner: failed to report job progress")
+
+                    raise_if_cancelled()
+
+                    files, exec_seconds = await asyncio.to_thread(
+                        comfy.run_workflow,
+                        self.config.comfy_url,
+                        workflow,
+                        on_progress,
+                        cancel_event=handle.cancel_event,
+                        on_prompt_id=handle.set_prompt_id,
+                    )
+                    output_files = [
+                        {"filename": filename, "subfolder": subfolder} for filename, _content, subfolder in files
+                    ]
+
+                    await self._report_completion(conn, handle, files, exec_seconds)
+                    success = True
             except asyncio.CancelledError:
                 # Almost always shutdown reaching a job whose result was
                 # never handed over. Say so loudly and leave every file
@@ -1388,7 +1439,12 @@ class AgentLoop:
         await conn.send_job_failed(job_id, error, exec_seconds)
 
     async def _report_completion(
-        self, conn: PlatformConnection, handle: _JobHandle, files: list, exec_seconds
+        self,
+        conn: PlatformConnection,
+        handle: _JobHandle,
+        files: list,
+        exec_seconds,
+        fetched_models: Optional[list] = None,
     ) -> None:
         """Hand a finished job's artifacts and `job_done` to the platform,
         surviving a connection blip.
@@ -1409,6 +1465,13 @@ class AgentLoop:
         server accepts the retry through `try_readopt`, and re-uploading an
         artifact it already has is idempotent (same job, same filename,
         hash-verified).
+
+        `fetched_models` (Phase 3.5) rides along on the `job_done` for a
+        `model_fetch` job -- see `PlatformConnection.send_job_done`. That job
+        has no artifacts, so the upload loop below is simply empty for it and
+        the retry logic reduces to "keep trying to deliver the completion",
+        which is exactly what it needs: the hash learned here is the only
+        product of the job, and losing it to a blip would waste the download.
 
         A platform that ANSWERS and rejects is a different thing entirely
         and propagates untouched to the failure path. So does a cancel
@@ -1432,7 +1495,10 @@ class AgentLoop:
                     raise comfy.JobCancelled()
                 try:
                     await conn.send_job_done(
-                        job_id, [filename for filename, _content, _subfolder in files], exec_seconds
+                        job_id,
+                        [filename for filename, _content, _subfolder in files],
+                        exec_seconds,
+                        fetched_models=fetched_models,
                     )
                 except Exception as exc:  # the socket, not the job
                     raise PlatformUnavailable(str(exc)) from exc
