@@ -1193,14 +1193,23 @@ app.post("/comfy/api/comfyfed/model-fetch", async (c) => {
 
   let result: { jobId: string; reused: boolean };
   try {
-    result = await modelFetch.createFetchJob(c.env, {
-      name: fields.name,
-      // Python reads `body.get("directory", "")`: a MISSING key defaults to
-      // the models root, an explicit null/non-string is a bad_request.
-      directory: "directory" in fields ? fields.directory : "",
-      url: fields.url,
-      userId: user.uid,
-    });
+    result = await modelFetch.createFetchJob(
+      c.env,
+      {
+        name: fields.name,
+        // Python reads `body.get("directory", "")`: a MISSING key defaults to
+        // the models root, an explicit null/non-string is a bad_request.
+        directory: "directory" in fields ? fields.directory : "",
+        url: fields.url,
+        userId: user.uid,
+      },
+      // Read off the module namespace on every request rather than captured
+      // once at import: comfyapi.py's route likewise leaves `head` unset so
+      // `create_fetch_job` resolves the module attribute at call time. That
+      // late lookup is the whole test seam -- `core/model_fetch.ts` ships no
+      // mutable override of its own.
+      { head: modelFetch.headSizeBytes }
+    );
   } catch (err) {
     if (err instanceof modelFetch.FetchRequestError) return modelFetchError(err.code, err.message);
     throw err;

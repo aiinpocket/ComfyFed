@@ -1,4 +1,4 @@
-import { afterEach, describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 import { env } from "cloudflare:test";
 import { call, db, SETUP_TOKEN } from "./helpers/http";
 import * as modelFetch from "../src/core/model_fetch";
@@ -14,7 +14,10 @@ import golden from "./fixtures/golden.json";
 // `POST`/`GET /comfy/api/comfyfed/model-fetch` routes.
 
 afterEach(async () => {
-  modelFetch.setHeadForTests(null);
+  // `stubHead` below spies on the module namespace; restore it so the pure
+  // `headSizeBytes` tests in this file (and every other file) see the real
+  // implementation.
+  vi.restoreAllMocks();
   await db().prepare("DELETE FROM jobs").run();
   await db().prepare("DELETE FROM workers").run();
   await db().prepare("DELETE FROM model_hashes").run();
@@ -221,7 +224,18 @@ function post(session: { cookie: string | null } | null, body: unknown) {
   return call("/comfy/api/comfyfed/model-fetch", { json: body, cookie: session?.cookie ?? null });
 }
 
-function headRaising(code: string): modelFetch.HeadFn {
+/** Point the route's HEAD probe at `impl` for this test.
+ *
+ * The route calls `modelFetch.headSizeBytes` through the module namespace on
+ * every request precisely so this works -- the same `vi.spyOn` seam this
+ * suite already uses for `peerhealth.probePeerHealth`, and the twin of the
+ * Python suite's `monkeypatch.setattr(model_fetch, "head_size_bytes", ...)`.
+ * Nothing mutable is exported from the production module. */
+function stubHead(impl: (url: string) => Promise<number>): void {
+  vi.spyOn(modelFetch, "headSizeBytes").mockImplementation(impl as typeof modelFetch.headSizeBytes);
+}
+
+function headRaising(code: string): (url: string) => Promise<number> {
   return async () => {
     throw new modelFetch.HeadError(code);
   };
@@ -310,17 +324,17 @@ describe("POST /comfy/api/comfyfed/model-fetch", () => {
     const session = await loginSession();
     await registerWorker(session);
 
-    modelFetch.setHeadForTests(headRaising("gated"));
+    stubHead(headRaising("gated"));
     expect((await post(session, BODY)).body.error).toBe("model_fetch.gated");
 
-    modelFetch.setHeadForTests(headRaising("size_unknown"));
+    stubHead(headRaising("size_unknown"));
     expect((await post(session, BODY)).body.error).toBe("model_fetch.size_unknown");
   });
 
   it("refuses no_worker when the only candidate is protocol 4", async () => {
     const session = await loginSession();
     await registerWorker(session, { protocol: 4 });
-    modelFetch.setHeadForTests(async () => 335_000_000);
+    stubHead(async () => 335_000_000);
     const res = await post(session, BODY);
     expect(res.status).toBe(400);
     expect(res.body.error).toBe("model_fetch.no_worker");
@@ -329,7 +343,7 @@ describe("POST /comfy/api/comfyfed/model-fetch", () => {
   it("creates a job, then reuses it, and serves its status", async () => {
     const session = await loginSession();
     await registerWorker(session, { protocol: 5, maxFetchGb: 30 });
-    modelFetch.setHeadForTests(async () => 335_000_000);
+    stubHead(async () => 335_000_000);
 
     const first = await post(session, BODY);
     expect(first.status, JSON.stringify(first.body)).toBe(201);
@@ -373,7 +387,7 @@ describe("POST /comfy/api/comfyfed/model-fetch", () => {
   it("signs the stored entry with the platform key", async () => {
     const session = await loginSession();
     await registerWorker(session, { protocol: 5, maxFetchGb: 30 });
-    modelFetch.setHeadForTests(async () => 335_000_000);
+    stubHead(async () => 335_000_000);
 
     const jobId = (await post(session, BODY)).body.job_id;
     const entry = JSON.parse((await jobRow(jobId)).fetch_entry);
@@ -399,7 +413,7 @@ describe("POST /comfy/api/comfyfed/model-fetch", () => {
       // spec says `dispatched`.
       const session = await loginSession();
       await registerWorker(session, { protocol: 5, maxFetchGb: 30 });
-      modelFetch.setHeadForTests(async () => 335_000_000);
+      stubHead(async () => 335_000_000);
       const jobId = (await post(session, BODY)).body.job_id;
       await db().prepare("UPDATE jobs SET status = ? WHERE id = ?").bind(status, jobId).run();
 
@@ -435,7 +449,7 @@ describe("POST /comfy/api/comfyfed/model-fetch", () => {
     // is issued at all (the injected probe would blow up if it were).
     const session = await loginSession();
     await registerWorker(session, { protocol: 3, maxFetchGb: 30 });
-    modelFetch.setHeadForTests(async () => {
+    stubHead(async () => {
       throw new Error("HEAD must not be probed for a manifest-covered name");
     });
     const res = await post(session, {
@@ -459,7 +473,7 @@ describe("no_worker message (spec §5.1 row 7)", () => {
     // apart from "nobody has the disk for it".
     const session = await loginSession();
     await registerWorker(session, { protocol: 4 });
-    modelFetch.setHeadForTests(async () => 335_000_000);
+    stubHead(async () => 335_000_000);
 
     const res = await post(session, BODY);
     expect(res.status).toBe(400);
@@ -471,7 +485,7 @@ describe("no_worker message (spec §5.1 row 7)", () => {
   it("reports a DIFFERENT reason for a protocol-5 worker with no budget", async () => {
     const session = await loginSession();
     await registerWorker(session, { protocol: 5, maxFetchGb: 0.001, freeDiskGb: 0.01 });
-    modelFetch.setHeadForTests(async () => 335_000_000);
+    stubHead(async () => 335_000_000);
 
     const res = await post(session, BODY);
     expect(res.status).toBe(400);
@@ -482,7 +496,7 @@ describe("no_worker message (spec §5.1 row 7)", () => {
   it("stands alone (no dangling colon) when nothing is online", async () => {
     const session = await loginSession();
     await registerWorker(session, { protocol: 5, status: "offline" });
-    modelFetch.setHeadForTests(async () => 335_000_000);
+    stubHead(async () => 335_000_000);
 
     const res = await post(session, BODY);
     expect(res.status).toBe(400);

@@ -238,7 +238,7 @@ export class FetchRequestError extends Error {
  * same payload into the worker's filesystem. `model_manifest.ts` already
  * refuses `|` in its own entry builders for exactly this reason; this is the
  * same guard at the other place entries are minted. */
-const FORBIDDEN_FIELD_CHARS = /[| -]/;
+const FORBIDDEN_FIELD_CHARS = /[|\u0000-\u001f\u007f]/;
 
 /** The server-side twin of the agent's `fetcher._is_safe_relative_path` --
  * ports model_fetch.py's `_safe_relative`. An empty directory is fine (the
@@ -332,29 +332,33 @@ export interface FetchJobRequest {
 
 export type HeadFn = (url: string) => Promise<number>;
 
-/** Test-only seam, the twin of the Python suite's
- * `monkeypatch.setattr(model_fetch, "head_size_bytes", ...)`: the HTTP route
- * has nowhere to thread an injected probe through, and a route-level test
- * must be able to make HEAD answer `gated`/`size_unknown`/a fixed size
- * without reaching the real huggingface.co. NOT for production use; pass
- * `null` to restore. */
-let headOverride: HeadFn | null = null;
-
-export function setHeadForTests(fn: HeadFn | null): void {
-  headOverride = fn;
+export interface CreateFetchJobOptions {
+  /** The HEAD size probe to use, the twin of `create_fetch_job`'s `head=`
+   * keyword argument. Omitted (production's meaning) resolves to this
+   * module's `headSizeBytes`.
+   *
+   * There is deliberately no module-level override behind this: an exported
+   * mutable seam would let anything that can import this module redirect the
+   * probe for the whole isolate -- i.e. switch off the `gated`/`size_unknown`
+   * gate and let an arbitrary `size_bytes` be signed into an entry. The route
+   * passes `modelFetch.headSizeBytes` through the module namespace on every
+   * request instead, which is what makes it interceptable from a test
+   * (`vi.spyOn(modelFetch, "headSizeBytes")`, the same pattern this suite
+   * already uses for `peerhealth.probePeerHealth`) while leaving the shipped
+   * Worker with no writable switch at all. */
+  head?: HeadFn;
 }
 
 /** Run §5.1's decision sequence and, if it survives, create the job -- ports
  * model_fetch.py's `create_fetch_job`. Returns `{jobId, reused}`; throws
- * `FetchRequestError` for every refusal row. `head` is injectable purely for
- * tests (see `setHeadForTests`); production resolves to `headSizeBytes`. */
+ * `FetchRequestError` for every refusal row. */
 export async function createFetchJob(
   env: Env,
   req: FetchJobRequest,
-  head?: HeadFn
+  options: CreateFetchJobOptions = {}
 ): Promise<{ jobId: string; reused: boolean }> {
   const db = env.DB;
-  const probe: HeadFn = head ?? headOverride ?? ((url) => headSizeBytes(url));
+  const probe: HeadFn = options.head ?? headSizeBytes;
 
   const { name, directory, url } = req;
   if (!(safeName(name) && typeof directory === "string" && safeRelative(directory) && typeof url === "string")) {
