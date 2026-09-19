@@ -567,6 +567,38 @@ describe('Settings page: API tokens card', () => {
     expect(
       await screen.findByText('You already have the maximum of 10 active tokens. Revoke one first.'),
     ).toBeInTheDocument();
+    expect(screen.getByText('Could not create the token')).toBeInTheDocument();
     expect(screen.queryByTestId('api-token-plaintext')).not.toBeInTheDocument();
+  });
+
+  it('surfaces auth.bad_token_name (400) and leaves the form usable', async () => {
+    const { posted } = stubTokenFetch({
+      tokens: [],
+      createStatus: 400,
+      createBody: { error: { code: 'auth.bad_token_name', message: 'name too long' } },
+    });
+    renderSettings('user');
+
+    await generateToken('x'.repeat(80));
+
+    expect(
+      await screen.findByText('That token name is too long (64 characters at most).'),
+    ).toBeInTheDocument();
+    expect(screen.getByText('Could not create the token')).toBeInTheDocument();
+    expect(screen.queryByTestId('api-token-plaintext')).not.toBeInTheDocument();
+
+    // The form stays usable: the rejected name is still editable and a second
+    // attempt goes out (the input is not disabled and the button is not stuck
+    // in its loading state).
+    const nameInput = screen.getByLabelText('Token name') as HTMLInputElement;
+    expect(nameInput).toBeEnabled();
+    fireEvent.change(nameInput, { target: { value: 'shorter' } });
+    expect(nameInput.value).toBe('shorter');
+
+    const generate = screen.getByRole('button', { name: 'Generate' });
+    expect(generate).toBeEnabled();
+    fireEvent.click(generate);
+    await waitFor(() => expect(posted).toHaveLength(2));
+    expect(posted[1]).toEqual({ name: 'shorter' });
   });
 });

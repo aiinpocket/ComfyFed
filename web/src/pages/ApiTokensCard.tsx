@@ -204,7 +204,13 @@ export function ApiTokensCard({ platformUrl }: { platformUrl: string }) {
         </form>
 
         {createError && (
-          <Alert color="red" variant="light" p="sm" icon={<IconAlertTriangle size={16} />}>
+          <Alert
+            color="red"
+            variant="light"
+            p="sm"
+            icon={<IconAlertTriangle size={16} />}
+            title={t('settings.token_create_failed')}
+          >
             <Text size="sm">{createError}</Text>
           </Alert>
         )}
