@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "comfyfed"
-version = "0.1.14"
+version = "0.1.15"
 requires-python = ">=3.12"
 license = "AGPL-3.0-only"
 dependencies = [
@@ -14,6 +14,10 @@ dependencies = [
 ]
 [project.optional-dependencies]
 dev = ["pytest>=8", "pytest-asyncio>=0.24", "httpx>=0.27"]
+# MCP 入口（spec §6.1）：刻意是「選配」，不是硬依賴 -- agent 自更新走
+# `pip install --no-deps`，硬依賴根本裝不到，所以 `comfyfed_agent.mcp_server`
+# 模組層不 import mcp，缺套件時 `comfyfed-mcp` 印指引並 exit 2。
+mcp = ["mcp>=2.0,<3"]
 [project.scripts]
 comfyfed-server = "comfyfed_server.main:cli"
 comfyfed-agent = "comfyfed_agent.main:cli"
@@ -21,6 +25,8 @@ comfyfed-agent = "comfyfed_agent.main:cli"
 # (`comfyfed pause` / `resume` / `status` / `stop`) and what the installers
 # put on PATH.
 comfyfed = "comfyfed_agent.main:cli"
+# MCP server（`pip install "comfyfed[mcp]"` 後才跑得起來）。
+comfyfed-mcp = "comfyfed_agent.mcp_server:cli"
 [tool.setuptools.packages.find]
 where = ["server", "agent"]
 [tool.setuptools]
