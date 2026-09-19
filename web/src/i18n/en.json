@@ -179,7 +179,10 @@
     "cancel_success": "Job cancelled",
     "cancel_failed": "Could not cancel this job",
     "split_badge": "Split ×{{count}}",
-    "split_badge_tooltip": "This job was split into {{count}} parts running on different workers at the same time."
+    "split_badge_tooltip": "This job was split into {{count}} parts running on different workers at the same time.",
+    "kind_model_fetch": "Model fetch",
+    "fetch_entry_title": "Model fetch details",
+    "fetch_unverified": "Unverified source (hash learned on landing)"
   },
   "job_detail": {
     "back": "Back to jobs",
@@ -238,7 +241,12 @@
     "dispatch_fetch_seconds": "Predicted model download",
     "dispatch_candidates": "Eligible workers at the time",
     "yes": "Yes",
-    "no": "No"
+    "no": "No",
+    "fetch_name": "Model name",
+    "fetch_directory": "Directory",
+    "fetch_url": "Source URL",
+    "fetch_size": "File size",
+    "fetch_sha256": "SHA-256"
   },
   "workers": {
     "title": "Workers",

@@ -682,6 +682,11 @@ function JobsTable({
                   <Table.Td>
                     <Group gap={6} wrap="nowrap">
                       <JobStatusBadge status={job.status} />
+                      {job.kind === 'model_fetch' && (
+                        <Badge size="sm" variant="light" color="blue" tt="none" fw={500}>
+                          {t('jobs.kind_model_fetch')}
+                        </Badge>
+                      )}
                       {job.split_count > 0 && (
                         <Tooltip label={t('jobs.split_badge_tooltip', { count: job.split_count })}>
                           <Badge size="sm" variant="light" color="grape">
@@ -832,11 +837,9 @@ function AssessmentPanel({ jobId, estVram }: { jobId: string; estVram: number | 
         <Text size="sm" fw={600}>
           {t('jobs.assessment')}
         </Text>
-        {estVram !== null && (
-          <Badge variant="default" tt="none" fw={400} size="sm">
-            {t('jobs.est_vram', { value: formatGb(estVram) })}
-          </Badge>
-        )}
+        <Badge variant="default" tt="none" fw={400} size="sm">
+          {t('jobs.est_vram', { value: formatGb(estVram) })}
+        </Badge>
       </Group>
 
       {failed ? (

@@ -314,6 +314,57 @@ export function JobDetail({ role }: JobDetailProps) {
             </Card>
           )}
 
+          {job.kind === 'model_fetch' && job.fetch_entry && (
+            <Card style={cardStyle}>
+              <Stack gap="sm">
+                <Text fw={600}>{t('jobs.fetch_entry_title')}</Text>
+                <SimpleGrid cols={2} spacing="xs">
+                  <Text size="xs" c="dimmed">
+                    {t('job_detail.fetch_name')}
+                  </Text>
+                  <Text size="sm" ff="monospace">
+                    {job.fetch_entry.name}
+                  </Text>
+
+                  <Text size="xs" c="dimmed">
+                    {t('job_detail.fetch_directory')}
+                  </Text>
+                  <Text size="sm" ff="monospace">
+                    {job.fetch_entry.directory}
+                  </Text>
+
+                  <Text size="xs" c="dimmed">
+                    {t('job_detail.fetch_url')}
+                  </Text>
+                  <Anchor href={job.fetch_entry.url} target="_blank" rel="noopener noreferrer" size="sm">
+                    {job.fetch_entry.url}
+                  </Anchor>
+
+                  <Text size="xs" c="dimmed">
+                    {t('job_detail.fetch_size')}
+                  </Text>
+                  <Text size="sm">{(job.fetch_entry.size_bytes / 1024 / 1024 / 1024).toFixed(2)} GB</Text>
+
+                  {job.fetch_entry.sha256 && (
+                    <>
+                      <Text size="xs" c="dimmed">
+                        {t('job_detail.fetch_sha256')}
+                      </Text>
+                      <Text size="sm" ff="monospace">
+                        {job.fetch_entry.sha256}
+                      </Text>
+                    </>
+                  )}
+                </SimpleGrid>
+                {job.fetch_entry.unverified && (
+                  <Alert color="yellow" variant="light" icon={<IconAlertTriangle size={16} />}>
+                    {t('jobs.fetch_unverified')}
+                  </Alert>
+                )}
+              </Stack>
+            </Card>
+          )}
+
           <Card style={cardStyle}>
             <Stack gap="sm">
               <Text fw={600}>{t('job_detail.section_inputs')}</Text>

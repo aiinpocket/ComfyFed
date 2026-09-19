@@ -297,6 +297,34 @@ export interface Job {
   stage?: 'fetching_models' | string;
   fetch_pct?: number;
   fetch_model?: string;
+  /**
+   * Phase: panel Download button -> model_fetch job. `prompt` is every
+   * ordinary job; `model_fetch` is a worker-side model download with no
+   * workflow to run (see `fetch_entry`).
+   */
+  kind: 'prompt' | 'model_fetch';
+  /**
+   * Present (non-null) only on a `kind: "model_fetch"` job: the signed
+   * manifest entry the job was created with. `null`/absent on a `prompt`
+   * job.
+   */
+  fetch_entry?: FetchEntry | null;
+}
+
+/** A `model_fetch` job's manifest entry (design doc §6): either a hit against
+ * an already-signed/curated manifest entry, or an `unverified` entry whose
+ * hash is learned once the worker's download lands. */
+export interface FetchEntry {
+  name: string;
+  directory: string;
+  url: string;
+  backup_url?: string | null;
+  sha256?: string | null;
+  size_bytes: number;
+  /** True only for a not-yet-verified entry (hash unknown until landing). */
+  unverified?: true;
+  sig?: string | null;
+  peer?: string | null;
 }
 
 /** Dual-signed job receipt summary, embedded in `GET /api/jobs/{id}` once one exists. */

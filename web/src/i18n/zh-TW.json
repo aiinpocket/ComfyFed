@@ -179,7 +179,10 @@
     "cancel_success": "任務已取消",
     "cancel_failed": "無法取消這個任務",
     "split_badge": "拆分 ×{{count}}",
-    "split_badge_tooltip": "這個任務被拆成 {{count}} 份，同時交給多台 worker 跑。"
+    "split_badge_tooltip": "這個任務被拆成 {{count}} 份，同時交給多台 worker 跑。",
+    "kind_model_fetch": "模型下載",
+    "fetch_entry_title": "模型下載內容",
+    "fetch_unverified": "未驗證來源（落地後學習雜湊）"
   },
   "job_detail": {
     "back": "回到任務列表",
@@ -238,7 +241,12 @@
     "dispatch_fetch_seconds": "預估模型下載",
     "dispatch_candidates": "當時合格的 worker 數",
     "yes": "是",
-    "no": "否"
+    "no": "否",
+    "fetch_name": "模型名稱",
+    "fetch_directory": "存放目錄",
+    "fetch_url": "來源網址",
+    "fetch_size": "檔案大小",
+    "fetch_sha256": "SHA-256"
   },
   "workers": {
     "title": "Worker",

@@ -61,6 +61,7 @@ const BASE_JOB: JobDetailType = {
   result_files: [],
   input_assets: ['ref.png'],
   est_vram_gb: null,
+  kind: 'prompt',
   workflow_json: {},
   requirements: {},
   required_nodes: [],
@@ -367,5 +368,70 @@ describe('JobDetail: dispatch reasoning (Phase 3.3 Task 8)', () => {
 
     await screen.findByText(LONG_ERROR);
     expect(screen.queryByText('Why this worker')).not.toBeInTheDocument();
+  });
+});
+
+describe('JobDetail: model_fetch jobs (panel Download button)', () => {
+  afterEach(() => {
+    cleanup();
+    vi.unstubAllGlobals();
+  });
+
+  it('shows the model name, directory, url, and unverified line for a model_fetch job', async () => {
+    const fetchJob: JobDetailType = {
+      ...BASE_JOB,
+      id: 'job-fetch-0008',
+      status: 'running',
+      error: null,
+      kind: 'model_fetch',
+      required_models: ['sd_xl_base_1.0.safetensors'],
+      fetch_entry: {
+        name: 'sd_xl_base_1.0.safetensors',
+        directory: 'checkpoints',
+        url: 'https://huggingface.co/example/sd_xl_base_1.0.safetensors',
+        size_bytes: 6_938_078_331,
+        unverified: true,
+      },
+    };
+    stubFetch(fetchJob);
+    renderDetail(fetchJob.id);
+
+    expect(await screen.findByText('Model fetch details')).toBeInTheDocument();
+    expect(screen.getByText('sd_xl_base_1.0.safetensors')).toBeInTheDocument();
+    expect(screen.getByText('checkpoints')).toBeInTheDocument();
+    expect(screen.getByText('https://huggingface.co/example/sd_xl_base_1.0.safetensors')).toBeInTheDocument();
+    expect(screen.getByText('Unverified source (hash learned on landing)')).toBeInTheDocument();
+  });
+
+  it('shows the sha256 once verified and no unverified line', async () => {
+    const fetchJob: JobDetailType = {
+      ...BASE_JOB,
+      id: 'job-fetch-0009',
+      status: 'done',
+      error: null,
+      kind: 'model_fetch',
+      required_models: ['lora.safetensors'],
+      receipt: { gpu_seconds: 0, kind: 'model_fetch', billable: false, basis: 'model_fetch', acked: true },
+      fetch_entry: {
+        name: 'lora.safetensors',
+        directory: 'loras',
+        url: 'https://civitai.com/models/example',
+        size_bytes: 123_456_789,
+        sha256: 'a'.repeat(64),
+      },
+    };
+    stubFetch(fetchJob);
+    renderDetail(fetchJob.id);
+
+    expect(await screen.findByText('a'.repeat(64))).toBeInTheDocument();
+    expect(screen.queryByText('Unverified source (hash learned on landing)')).not.toBeInTheDocument();
+  });
+
+  it('shows no model fetch card for an ordinary prompt job', async () => {
+    stubFetch(BASE_JOB);
+    renderDetail();
+
+    await screen.findByText(LONG_ERROR);
+    expect(screen.queryByText('Model fetch details')).not.toBeInTheDocument();
   });
 });

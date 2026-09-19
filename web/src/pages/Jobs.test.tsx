@@ -57,6 +57,7 @@ const RUNNING_JOB: Job = {
   est_vram_gb: null,
   split_count: 0,
   dispatch_info: {},
+  kind: 'prompt',
 };
 
 const DONE_JOB: Job = {
@@ -72,6 +73,7 @@ const DONE_JOB: Job = {
   est_vram_gb: null,
   split_count: 0,
   dispatch_info: {},
+  kind: 'prompt',
 };
 
 const CANCELLED_JOB: Job = {
@@ -87,6 +89,7 @@ const CANCELLED_JOB: Job = {
   est_vram_gb: null,
   split_count: 0,
   dispatch_info: {},
+  kind: 'prompt',
 };
 
 const WORKER: Worker = {
@@ -136,6 +139,9 @@ function stubFetch(jobsSequence: Job[][], role: 'admin' | 'user' = 'user') {
     const url = typeof input === 'string' ? input : input.toString();
     const method = init?.method ?? 'GET';
 
+    if (/\/api\/jobs\/[^/]+\/assessment$/.test(url) && method === 'GET') {
+      return jsonResponse({ workers: [] });
+    }
     if (url.startsWith('/api/jobs') && method === 'GET') {
       const jobs = jobsSequence[Math.min(call, jobsSequence.length - 1)];
       call += 1;
@@ -172,6 +178,7 @@ const FETCHING_JOB: Job = {
   fetch_model: 'sd_xl_base_1.0.safetensors',
   split_count: 0,
   dispatch_info: {},
+  kind: 'prompt',
 };
 
 describe('Jobs page: model auto-fetch progress', () => {
@@ -331,5 +338,45 @@ describe('Jobs page: split badge (Phase 3.3 Task 8)', () => {
 
     await screen.findByText('Running');
     expect(screen.queryByText(/Split ×/)).not.toBeInTheDocument();
+  });
+});
+
+describe('Jobs page: model_fetch jobs (panel Download button)', () => {
+  afterEach(() => {
+    cleanup();
+    vi.unstubAllGlobals();
+  });
+
+  const MODEL_FETCH_JOB: Job = {
+    ...RUNNING_JOB,
+    id: 'job-fetch-0007',
+    kind: 'model_fetch',
+    est_vram_gb: null,
+  };
+
+  it('shows a "Model fetch" badge for a kind: model_fetch job', async () => {
+    stubFetch([[MODEL_FETCH_JOB]]);
+    renderJobs();
+
+    expect(await screen.findByText('Model fetch')).toBeInTheDocument();
+  });
+
+  it('shows no "Model fetch" badge for an ordinary prompt job', async () => {
+    stubFetch([[RUNNING_JOB]]);
+    renderJobs();
+
+    await screen.findByText('Running');
+    expect(screen.queryByText('Model fetch')).not.toBeInTheDocument();
+  });
+
+  it('shows a dash for VRAM (no estimate) on a queued model_fetch job\'s assessment panel', async () => {
+    const queuedFetchJob: Job = { ...MODEL_FETCH_JOB, status: 'queued', progress: 0 };
+    stubFetch([[queuedFetchJob]]);
+    renderJobs();
+
+    const expandButton = await screen.findByRole('button', { name: 'Worker assessment' });
+    fireEvent.click(expandButton);
+
+    expect(await screen.findByText('Estimated VRAM: —')).toBeInTheDocument();
   });
 });
