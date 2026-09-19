@@ -187,7 +187,7 @@ Alembic 新 head；D1 `0013_api_tokens.sql`；push main → 手動 `npm run depl
 
 參數：
 - `chroma-t2i`：`prompt`（必填）、`negative`（預設 = 官方範本的負向句）、`width`/`height`（預設 1024，256–2048，step 16）、`steps`（預設 26，1–60）、`cfg`（預設 3.5，0–20）、`seed`（-1 隨機）。
-- `h3-t2v`：`prompt`（必填）、`seconds`（預設 5，1–10，number）、`width`/`height`（預設 1280×720，step 32，256–1536）、`steps`（預設 8，1–20）、`seed`（-1 隨機）。渲染時新增衍生值 `length`（依上式）；`params` 回傳裡也帶 `length`。
+- `h3-t2v`：`prompt`（必填）、`seconds`（預設 5，1–10，number）、`width`/`height`（預設 1280×704，step 32，256–1536；720 不是 32 的倍數，官方節點的 step 就是 32）、`steps`（預設 8，1–20）、`seed`（-1 隨機）。渲染時新增衍生值 `length`（依上式）；`params` 回傳裡也帶 `length`。
 
 ### 12.2 缺模型自動下載（`model_sources`）
 
