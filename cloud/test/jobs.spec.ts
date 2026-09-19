@@ -773,6 +773,38 @@ describe("POST /api/jobs/{id}/retry", () => {
     expect(detail.body.attempt_errors).toEqual({});
   });
 
+  it("keeps the attempts API shape flat whatever the column holds", async () => {
+    // 契約測試，不是實作細節測試：`jobs.attempts` 的**儲存**形狀在 fix round 1
+    // 為了 per-job 的最後錯誤改成巢狀，但 **API 形狀不變** -- `attempts` 永遠
+    // 是扁平的 `{worker_id: 次數}`，錯誤另外放在 `attempt_errors`。web console
+    // 是照 API 形狀寫的，所以這裡釘死，免得哪天有人「順手」把儲存形狀直接吐
+    // 出去。Ports tests/server/test_jobs.py's `_job_dict` attempts block.
+    const { cookie, csrf } = await adminSession();
+    const submit = await submitJob(cookie, csrf, SIMPLE_WORKFLOW);
+    const jobId = submit.body.job_id;
+
+    const withAttempts = async (raw: string) => {
+      await db().prepare("UPDATE jobs SET attempts = ? WHERE id = ?").bind(raw, jobId).run();
+      return (await call(`/api/jobs/${jobId}`, { method: "GET", cookie })).body;
+    };
+
+    const nested = await withAttempts(JSON.stringify({ w1: { failures: 2, last_error: "boom" } }));
+    expect(nested.attempts).toEqual({ w1: 2 });
+    expect(nested.attempt_errors).toEqual({ w1: "boom" });
+
+    // 新舊混在同一列：兩種都讀得出次數，只有巢狀那一筆有錯誤字串。
+    const mixed = await withAttempts(JSON.stringify({ w1: { failures: 2, last_error: "boom" }, w2: 1 }));
+    expect(mixed.attempts).toEqual({ w1: 2, w2: 1 });
+    expect(mixed.attempt_errors).toEqual({ w1: "boom" });
+
+    // 空值與壞 JSON 都退回空 map，不是 500。
+    for (const raw of ["{}", "not json"]) {
+      const degraded = await withAttempts(raw);
+      expect(degraded.attempts).toEqual({});
+      expect(degraded.attempt_errors).toEqual({});
+    }
+  });
+
   it("requeues a failed job, clearing the previous attempt's outcome", async () => {
     const { cookie, csrf } = await adminSession();
     const submit = await submitJob(cookie, csrf, SIMPLE_WORKFLOW);
