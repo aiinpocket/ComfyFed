@@ -220,6 +220,12 @@ def _job_dict(job: db.Job) -> dict:
         "parent_id": job.parent_id,
         "split_index": job.split_index,
         "dispatch_info": _json_dict(job.dispatch_info),
+        # 2026-09-19 model_fetch: "prompt"（一切既有的單）或 "model_fetch"
+        # （面板下載鈕建的純下載單）。`fetch_entry` 只有後者非 None，值是建單
+        # 當下簽好的 manifest 項目（console 的 JobDetail 讀它顯示模型名、來源
+        # url、是否 unverified）。
+        "kind": job.kind or "prompt",
+        "fetch_entry": _json_dict(job.fetch_entry) if job.fetch_entry else None,
     }
     # Phase 2.1: transient model-auto-fetch progress (stage/fetch_pct/
     # fetch_model), NOT a Job column -- see agentws._fetch_progress's

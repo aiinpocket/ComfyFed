@@ -1420,3 +1420,18 @@ def test_job_dict_exposes_dispatch_info(client):
     assert body["dispatch_info"]["basis"] == "signature"
     assert body["dispatch_info"]["predicted_seconds"] == pytest.approx(41.2)
     assert client.get("/api/jobs").json()[0]["dispatch_info"]["candidates"] == 3
+
+
+def test_job_dict_carries_kind_and_parsed_fetch_entry():
+    """2026-09-19 model_fetch: the console's job payload exposes `kind` and
+    the signed `fetch_entry` as a parsed object (so `JobDetail` can show the
+    model name / source url / unverified flag without re-parsing JSON)."""
+    job = db.Job(workflow_json="{}", kind="model_fetch", fetch_entry='{"name":"a"}')
+    d = jobs_module._job_dict(job)
+    assert d["kind"] == "model_fetch" and d["fetch_entry"] == {"name": "a"}
+
+
+def test_job_dict_defaults_kind_to_prompt_and_fetch_entry_to_none():
+    job = db.Job(workflow_json="{}")
+    d = jobs_module._job_dict(job)
+    assert d["kind"] == "prompt" and d["fetch_entry"] is None

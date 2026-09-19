@@ -239,6 +239,10 @@ class Job(Base):
     split_index: Mapped[Optional[int]] = mapped_column(Integer, nullable=True)
     split_count: Mapped[int] = mapped_column(Integer, default=0, server_default="0")
     split_plan: Mapped[Optional[str]] = mapped_column(String, nullable=True)
+    # 2026-09-19 model_fetch: "prompt"（既有一切）或 "model_fetch"（面板下載鈕
+    # 建的純下載單，workflow_json="{}"，fetch_entry 存簽章 manifest 項目）。
+    kind: Mapped[str] = mapped_column(String, default="prompt", server_default="prompt")
+    fetch_entry: Mapped[Optional[str]] = mapped_column(String, nullable=True)
 
 
 class Receipt(Base):
