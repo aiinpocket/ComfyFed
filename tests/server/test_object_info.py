@@ -210,6 +210,7 @@ def test_heartbeat_with_no_hash_drift_does_not_trigger_resend(client):
 
     class _FakeConn:
         state = "idle"
+        idle_no_job_beats = 0
 
     result = asyncio.run(
         agentws._handle_heartbeat(
