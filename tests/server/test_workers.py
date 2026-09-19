@@ -409,3 +409,143 @@ def test_delete_worker_twice_404(client):
     second = client.delete(f"/api/workers/{worker_id}", headers={"X-CSRF": csrf})
     assert second.status_code == 404
     assert second.json()["error"]["code"] == "workers.not_found"
+
+
+# --- 2026-09-19 job-retry §8：worker 的不適任任務清單與清除 -----------------
+
+
+def _seed_failure(worker_id, task_key, failures, days_ago=0, error="boom", job_id="j-old"):
+    from datetime import datetime, timedelta, timezone
+
+    now = datetime.now(timezone.utc).replace(tzinfo=None)
+    with db.get_session() as session:
+        session.add(
+            db.WorkerTaskFailure(
+                worker_id=worker_id,
+                task_key=task_key,
+                failures=failures,
+                last_error=error,
+                last_job_id=job_id,
+                updated_at=now - timedelta(days=days_ago),
+            )
+        )
+        session.commit()
+
+
+def test_list_workers_reports_unsuitable_tasks_with_active_flags(client):
+    """每台 worker 多帶 `unsuitable`：達門檻且未過 TTL -> active True；
+    未達門檻或已過 TTL 的列照樣列出來（管理員要看得到歷史），只是 False。"""
+    csrf = _login(client)
+    worker_id = _register(client, csrf, "worker-unsuitable", "61" * 32)
+    other_id = _register(client, csrf, "worker-other", "62" * 32)
+    _seed_failure(worker_id, "sig-active", failures=2, error="CUDA OOM", job_id="j-1")
+    _seed_failure(worker_id, "sig-expired", failures=3, days_ago=9)
+    _seed_failure(worker_id, "sig-once", failures=1)
+    _seed_failure(other_id, "sig-elsewhere", failures=2)
+
+    listed = client.get("/api/workers", headers={"X-CSRF": csrf}).json()
+    worker = next(w for w in listed if w["id"] == worker_id)
+    by_key = {row["task_key"]: row for row in worker["unsuitable"]}
+
+    assert set(by_key) == {"sig-active", "sig-expired", "sig-once"}
+    assert by_key["sig-active"]["active"] is True
+    assert by_key["sig-active"]["failures"] == 2
+    assert by_key["sig-active"]["last_error"] == "CUDA OOM"
+    assert by_key["sig-active"]["last_job_id"] == "j-1"
+    assert by_key["sig-active"]["updated_at"]
+    assert by_key["sig-expired"]["active"] is False
+    assert by_key["sig-once"]["active"] is False
+
+    other = next(w for w in listed if w["id"] == other_id)
+    assert [row["task_key"] for row in other["unsuitable"]] == ["sig-elsewhere"]
+
+
+def test_list_workers_unsuitable_is_empty_for_a_clean_worker(client):
+    csrf = _login(client)
+    worker_id = _register(client, csrf, "worker-clean", "63" * 32)
+    listed = client.get("/api/workers", headers={"X-CSRF": csrf}).json()
+    assert next(w for w in listed if w["id"] == worker_id)["unsuitable"] == []
+
+
+def test_clear_one_unsuitable_task_key(client):
+    csrf = _login(client)
+    worker_id = _register(client, csrf, "worker-clear-one", "64" * 32)
+    _seed_failure(worker_id, "sig-a", failures=2)
+    _seed_failure(worker_id, "sig-b", failures=2)
+
+    r = client.delete(
+        "/api/workers/%s/unsuitable/sig-a" % worker_id, headers={"X-CSRF": csrf}
+    )
+    assert r.status_code == 200
+    assert r.json() == {"cleared": 1}
+
+    listed = client.get("/api/workers", headers={"X-CSRF": csrf}).json()
+    worker = next(w for w in listed if w["id"] == worker_id)
+    assert [row["task_key"] for row in worker["unsuitable"]] == ["sig-b"]
+
+    # 再清一次就是 0 列 -- 冪等，不是 404。
+    again = client.delete(
+        "/api/workers/%s/unsuitable/sig-a" % worker_id, headers={"X-CSRF": csrf}
+    )
+    assert again.status_code == 200
+    assert again.json() == {"cleared": 0}
+
+
+def test_clear_all_unsuitable_tasks_for_one_worker(client):
+    csrf = _login(client)
+    worker_id = _register(client, csrf, "worker-clear-all", "65" * 32)
+    other_id = _register(client, csrf, "worker-untouched", "66" * 32)
+    _seed_failure(worker_id, "sig-a", failures=2)
+    _seed_failure(worker_id, "sig-b", failures=1)
+    _seed_failure(other_id, "sig-a", failures=2)
+
+    r = client.delete("/api/workers/%s/unsuitable" % worker_id, headers={"X-CSRF": csrf})
+    assert r.status_code == 200
+    assert r.json() == {"cleared": 2}
+
+    listed = client.get("/api/workers", headers={"X-CSRF": csrf}).json()
+    assert next(w for w in listed if w["id"] == worker_id)["unsuitable"] == []
+    # 別台的紀錄一動也沒動。
+    assert len(next(w for w in listed if w["id"] == other_id)["unsuitable"]) == 1
+
+
+def test_clear_unsuitable_for_an_unknown_worker_is_404(client):
+    csrf = _login(client)
+    assert client.delete("/api/workers/nope/unsuitable", headers={"X-CSRF": csrf}).status_code == 404
+    r = client.delete("/api/workers/nope/unsuitable/sig-a", headers={"X-CSRF": csrf})
+    assert r.status_code == 404
+    assert r.json()["error"]["code"] == "workers.not_found"
+
+
+def test_clear_unsuitable_requires_csrf(client):
+    csrf = _login(client)
+    worker_id = _register(client, csrf, "worker-csrf", "67" * 32)
+    r = client.delete("/api/workers/%s/unsuitable" % worker_id)
+    assert r.status_code == 403
+    assert r.json()["error"]["code"] == "auth.csrf"
+
+
+def test_clear_unsuitable_requires_admin_role(client):
+    """清除是 admin-only：登入的一般使用者帶著有效 CSRF 也是 403。"""
+    csrf = _login(client)
+    worker_id = _register(client, csrf, "worker-role", "68" * 32)
+    _seed_failure(worker_id, "sig-a", failures=2)
+    user_csrf = _login_as_new_user(client, csrf, "reader-unsuitable")
+
+    assert (
+        client.delete(
+            "/api/workers/%s/unsuitable" % worker_id, headers={"X-CSRF": user_csrf}
+        ).status_code
+        == 403
+    )
+    assert (
+        client.delete(
+            "/api/workers/%s/unsuitable/sig-a" % worker_id, headers={"X-CSRF": user_csrf}
+        ).status_code
+        == 403
+    )
+    # 一般使用者讀得到清單（workers 是共用基礎設施），只是不能清。
+    listed = client.get("/api/workers")
+    assert listed.status_code == 200
+    worker = next(w for w in listed.json() if w["id"] == worker_id)
+    assert [row["task_key"] for row in worker["unsuitable"]] == ["sig-a"]

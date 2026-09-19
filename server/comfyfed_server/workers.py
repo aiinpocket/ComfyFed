@@ -9,6 +9,7 @@ import os
 import secrets
 import time
 import zlib
+from datetime import datetime, timezone
 from typing import Optional
 
 from fastapi import APIRouter, Depends, Header, HTTPException, Request
@@ -18,7 +19,7 @@ from nacl.signing import VerifyKey
 from pydantic import BaseModel
 from sqlalchemy import update
 
-from . import auth, db, metrics, security, storage
+from . import auth, db, metrics, retry, security, storage
 
 _PLATFORM_URL_KEY = "platform_url"
 
@@ -52,6 +53,11 @@ _MAX_TS_SKEW_SECONDS = 120
 # expiry. Pruned opportunistically on each check. Not shared across processes;
 # fine for a single-process server.
 _seen_nonces: dict[tuple[str, str], float] = {}
+
+
+def _utcnow() -> datetime:
+    """Timezone-naive UTC now -- the same shape every DateTime column stores."""
+    return datetime.now(timezone.utc).replace(tzinfo=None)
 
 
 def _error(status_code: int, code: str, message: str = "") -> HTTPException:
@@ -404,6 +410,7 @@ def create_router(data_dir: str) -> APIRouter:
             # surface is concerned (see `db.Worker.deleted`); only the
             # reports/payout endpoints still resolve them, by id.
             workers = session.query(db.Worker).filter(db.Worker.deleted == False).all()  # noqa: E712
+            now = _utcnow()
             return [
                 {
                     "id": w.id,
@@ -437,6 +444,14 @@ def create_router(data_dir: str) -> APIRouter:
                     "peer_lan_url": w.peer_lan_url,
                     "peer_nat": w.peer_nat,
                     "peer_reachable": w.peer_reachable,
+                    # 2026-09-19 job-retry §8：這台 worker 在哪些「類」任務上
+                    # 翻過車。`active` = 達門檻且未過 TTL（也就是真的在擋派
+                    # 工）；未達門檻或已過期的列照樣帶出來，Workers 頁畫成灰
+                    # 字 -- 管理員要看得到歷史才決定要不要手動清除。和
+                    # `peer_url` 同一個理由對任何登入使用者可讀：worker 是共
+                    # 用基礎設施，這是艦隊 metadata，不是誰的私人資料。清除
+                    # 才是 admin-only（見下面兩條 DELETE）。
+                    "unsuitable": retry.unsuitable_rows_for_worker(session, w.id, now),
                 }
                 for w in workers
             ]
@@ -493,6 +508,53 @@ def create_router(data_dir: str) -> APIRouter:
             session.commit()
 
         return {"ok": True}
+
+    @r.delete("/api/workers/{worker_id}/unsuitable")
+    def clear_all_unsuitable(
+        worker_id: str,
+        _payload: dict = Depends(auth.require_csrf),
+    ):
+        """2026-09-19 job-retry §7：清空這台 worker 的全部不適任紀錄。
+
+        管理員的手動解除通道（自動解除是跑成功一次同類任務，見
+        `agentws._clear_unsuitable_for_job`）：換了顯卡、修好了驅動、或者那
+        兩次失敗根本是平台這邊的問題 -- 不該讓這台等滿七天的 TTL。
+
+        同一個 admin＋CSRF 閘門（`require_csrf` 本身就掛在 `require_admin`
+        下）跟 disable／delete 一樣。回 `{"cleared": n}`；已經是空的就是
+        `{"cleared": 0}`，不是 404 -- 404 只保留給「沒有這台 worker」。
+        """
+        with db.get_session() as session:
+            worker = session.get(db.Worker, worker_id)
+            if worker is None or worker.deleted:
+                raise _error(404, "workers.not_found", "Worker not found.")
+            cleared = retry.clear_worker_failures(session, worker_id)
+            session.commit()
+        return {"cleared": cleared}
+
+    @r.delete("/api/workers/{worker_id}/unsuitable/{task_key:path}")
+    def clear_one_unsuitable(
+        worker_id: str,
+        task_key: str,
+        _payload: dict = Depends(auth.require_csrf),
+    ):
+        """如上，但只清一個 `task_key`。
+
+        `:path` 轉換器：`task_key` 可能是 `model_fetch:<模型名>`，而模型名
+        含目錄分隔（`loras/foo.safetensors`）-- 預設的路徑參數在第一個 `/`
+        就斷掉，那種 key 會永遠清不掉。
+        """
+        with db.get_session() as session:
+            worker = session.get(db.Worker, worker_id)
+            if worker is None or worker.deleted:
+                raise _error(404, "workers.not_found", "Worker not found.")
+            row = session.get(db.WorkerTaskFailure, (worker_id, task_key))
+            cleared = 0
+            if row is not None:
+                session.delete(row)
+                cleared = 1
+            session.commit()
+        return {"cleared": cleared}
 
     @r.delete("/api/workers/{worker_id}")
     # MUST stay a sync `def` (review L9): `agentws.kick_worker` below blocks on
