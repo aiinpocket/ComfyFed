@@ -33,15 +33,28 @@ const comfyfedExtJsSource = readFileSync("../server/comfyfed_server/panel_ext/co
 // workerd) and thread them in as base64, which survives the JSON round-trip
 // through `define` without any encoding guesswork.
 // test/recipes.spec.ts decodes both and compares with `Buffer.equals`.
-const recipeFluxServer = readFileSync("../server/comfyfed_server/recipes/flux-t2i.json", "base64");
-const recipeFluxCloud = readFileSync("./src/core/recipes/flux-t2i.json", "base64");
+//
+// 2026-09-20 spec §12 added `chroma-t2i`/`h3-t2v`, so the pairs are read from
+// ONE list rather than a hand-written constant per file: a fourth recipe that
+// is copied into `src/core/recipes/` but forgotten here would otherwise ship
+// with no parity check at all. `RECIPE_IDS` is also what the test asserts the
+// bundle's own id set against, so "copied but never imported" fails too.
+const RECIPE_IDS = ["chroma-t2i", "flux-t2i", "h3-t2v"];
+const recipeParityB64 = Object.fromEntries(
+  RECIPE_IDS.map((id) => [
+    id,
+    {
+      server: readFileSync(`../server/comfyfed_server/recipes/${id}.json`, "base64"),
+      cloud: readFileSync(`./src/core/recipes/${id}.json`, "base64"),
+    },
+  ])
+);
 
 export default defineConfig({
   define: {
     __D1_MIGRATIONS__: JSON.stringify(migrations),
     __COMFYFED_EXT_JS_SOURCE__: JSON.stringify(comfyfedExtJsSource),
-    __RECIPE_FLUX_SERVER_B64__: JSON.stringify(recipeFluxServer),
-    __RECIPE_FLUX_CLOUD_B64__: JSON.stringify(recipeFluxCloud),
+    __RECIPE_PARITY_B64__: JSON.stringify(recipeParityB64),
   },
   test: {
     // Node-side, once for the whole run (unlike `setupFiles` below, which

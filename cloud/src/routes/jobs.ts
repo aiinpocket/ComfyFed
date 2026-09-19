@@ -361,14 +361,29 @@ export class JobCreationError extends Error {
  * one. `POST /api/jobs` passes the exact multipart string it received so the
  * stored `workflow_json` stays byte-for-byte what the submitter sent; a
  * caller that only has an object (the recipe runner, whose graph is rendered
- * in memory) omits it and gets a plain `JSON.stringify`. */
+ * in memory) omits it and gets a plain `JSON.stringify`.
+ *
+ * `opts.fetching` 是「這次送單已經替它排好下載的模型名」（2026-09-20 spec
+ * §12.2，配方的 `model_sources`）。這些名字現在確實沒有任何 worker 有，但已經
+ * 有一筆 `kind=model_fetch` job 在路上，所以它們不算「整個聯邦都拿不到」——
+ * 少了這個豁免，自動下載的配方會在建單這一關被自己剛排好的下載擋下來。
+ * `fetching` is the set of model names this submission has ALREADY queued a
+ * `kind=model_fetch` job for; they are missing right now but not unobtainable,
+ * so they must not trip the fleet-wide refusal below.
+ *
+ * 它是一個**具名選項**，只有 `routes/recipes.ts` 傳：`POST /api/jobs` 建的
+ * options 物件裡沒有這個欄位，multipart 表單上也沒有任何欄位會流進來，所以送
+ * 件端無法自己宣告「這個模型正在下載中」來繞過 `jobs.missing_models`。
+ * It is a KEYWORD option only `routes/recipes.ts` passes. The multipart route
+ * builds its options object literally and never puts a request-derived value
+ * in it, so a submitter cannot claim an exemption of their own. */
 export async function createJobFromWorkflow(
   env: Env,
   user: { uid: string },
   workflow: Record<string, unknown>,
   requirements: Record<string, unknown>,
   assetFiles: File[],
-  opts: { workflowJsonText?: string } = {}
+  opts: { workflowJsonText?: string; fetching?: ReadonlySet<string> } = {}
 ): Promise<string> {
   const workflowJsonText = opts.workflowJsonText ?? JSON.stringify(workflow);
 
@@ -404,6 +419,7 @@ export async function createJobFromWorkflow(
   }
 
   const unfetchable = await unfetchableMissingModels(env, needs);
+  for (const name of opts.fetching ?? []) unfetchable.delete(name);
   if (unfetchable.size > 0) {
     const names = [...unfetchable].sort();
     throw new JobCreationError(400, "jobs.missing_models", await modelGuide.guidanceMessage(names, env.STORE));

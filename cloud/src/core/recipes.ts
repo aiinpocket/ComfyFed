@@ -25,7 +25,13 @@
  * 「這次要跑的值」永遠是分開的兩件事，檔案本身不會偷偷夾帶預設值。
  */
 
+import chromaT2I from "./recipes/chroma-t2i.json";
 import fluxT2I from "./recipes/flux-t2i.json";
+import h3T2V from "./recipes/h3-t2v.json";
+import * as assess from "./assess";
+import * as modelFetch from "./model_fetch";
+import * as queries from "../db/queries";
+import type { Env } from "../env";
 
 export type Recipe = Record<string, any>;
 
@@ -34,7 +40,11 @@ export type Recipe = Record<string, any>;
 const RANDOM_SEED_SENTINEL = -1;
 const SEED_SPACE = 2 ** 32;
 
-const BUNDLED: Recipe[] = [fluxT2I as Recipe];
+/** 這個陣列的順序不決定端點的順序 —— 對外的順序由 `sortedRecipes()` 依
+ * `order` 決定（§12.1）。新增配方 = `cp` 一份 Python 那側的檔案過來、加一個
+ * `import`、把它加進這裡（`test/recipes.spec.ts` 的 parity 測試會同時檢查
+ * 「兩份檔案逐位元相同」與「檔案有沒有真的被 import 進 bundle」）。 */
+const BUNDLED: Recipe[] = [chromaT2I as Recipe, fluxT2I as Recipe, h3T2V as Recipe];
 
 /** 配方層的錯誤，帶著要送進錯誤信封的 `code`／`message`。
  *
@@ -93,6 +103,10 @@ export function publicView(recipe: Recipe, includeWorkflow: boolean): Record<str
     // 子丟 TypeError 變成 500。
     title: { ...(recipe.title || {}) },
     description: { ...(recipe.description || {}) },
+    order: recipeOrder(recipe),
+    // `=== true`（不是 truthy）：`nsfw_ok` 是對外的承諾，一個手改成 `"yes"`
+    // 的配方檔不該因此被宣告成「可以出 NSFW」。同 Python 的 `is True`。
+    nsfw_ok: recipe.nsfw_ok === true,
     params: [...(recipe.params || [])],
     required_models: [...(recipe.required_models || [])],
   };
@@ -258,4 +272,211 @@ function render(value: unknown, params: Record<string, unknown>): unknown {
  * 下一次 run 還要拿到原封不動的標記）。 */
 export function renderWorkflow(recipe: Recipe, params: Record<string, unknown>): Record<string, unknown> {
   return render(recipe.workflow || {}, params) as Record<string, unknown>;
+}
+
+// --- spec §12：順序／NSFW 旗標／衍生參數／缺模型自動下載 -------------------
+// Parity source: `server/comfyfed_server/recipes.py`'s matching section.
+
+/** 沒寫 `order` 的配方排在所有有寫的後面（spec §12.1 只要求「依 `order` 升
+ * 冪」，沒說沒寫的怎麼辦 —— 排最後，因為 AI 端把第一個當預設，而一個忘了標
+ * 順序的配方絕不該因為檔名剛好靠前就變成預設。 */
+const DEFAULT_ORDER = 10_000;
+
+/** 配方在 `GET /api/recipes` 的排序鍵（spec §12.1）。
+ *
+ * `Number.isInteger` 同時擋掉 Python 那側另外點名的 `bool`（JS 的 `true` 本
+ * 來就不是 number）與浮點數，行為與 `isinstance(order, int)` 一致。 */
+export function recipeOrder(recipe: Recipe): number {
+  const order = recipe.order;
+  return typeof order === "number" && Number.isInteger(order) ? order : DEFAULT_ORDER;
+}
+
+/** `[[id, recipe]]`，依 `order` 升冪、同 order 再依 id。
+ *
+ * AI 客戶端把第一個當預設（§12.3），所以這個順序是對外的承諾，不是排版。
+ * id 當第二鍵只是為了「同 order 時每次回一樣的順序」—— 一個會抖動的預設比
+ * 一個錯的預設更難查。 */
+export function sortedRecipes(): Array<[string, Recipe]> {
+  return Object.entries(loadRecipes()).sort(([idA, a], [idB, b]) => {
+    const byOrder = recipeOrder(a) - recipeOrder(b);
+    if (byOrder !== 0) return byOrder;
+    return idA < idB ? -1 : idA > idB ? 1 : 0;
+  });
+}
+
+/** 配方宣告的「缺了可以去哪裡抓」一筆（§12.2）。 */
+export interface ModelSource {
+  name: string;
+  directory: string;
+  url: string;
+}
+
+/** 配方宣告的「缺了可以去哪裡抓」清單（§12.2），只留形狀合法的項目。
+ *
+ * 形狀壞掉的項目在這裡就丟掉並留一行 log，而不是讓它一路走到
+ * `createFetchJob` 再被 `bad_request` 擋下來：那條路徑的錯誤訊息是寫給
+ * 「按了面板下載鈕的人」看的，對一個配方檔的打字錯誤毫無幫助。 */
+export function modelSources(recipe: Recipe): ModelSource[] {
+  const raw = recipe.model_sources;
+  if (!Array.isArray(raw)) return [];
+  const out: ModelSource[] = [];
+  for (const source of raw) {
+    if (source === null || typeof source !== "object" || Array.isArray(source)) continue;
+    const name = source.name;
+    // `directory` 可以不寫（模型落在 models 根目錄），但寫了就必須是字串 ——
+    // 同 Python 的 `source.get("directory", "")`：**缺鍵**才退回空字串，寫成
+    // `null` 是壞掉的項目，不是「不寫」。
+    const directory = "directory" in source ? source.directory : "";
+    const url = source.url;
+    if (!(typeof name === "string" && name && typeof directory === "string" && typeof url === "string" && url)) {
+      console.warn(`recipes: ${recipe.id} has a malformed model_sources entry`, source);
+      continue;
+    }
+    out.push({ name, directory, url });
+  }
+  return out;
+}
+
+/** worker inventory 用的名字：`<directory>/<name>`（agent 的 `scan_models`
+ * 回報的就是相對 models 根目錄的路徑）。 */
+function inventoryPath(source: ModelSource): string {
+  const directory = source.directory.replace(/^\/+|\/+$/g, "");
+  return directory ? `${directory}/${source.name}` : source.name;
+}
+
+/** `model_sources` 裡「聯邦內沒有任何活著的 worker 持有」的那些 name。
+ *
+ * 「活著」= 未軟刪除且未停用（§12.2）。停用與刪除的差別在這裡刻意抹平：兩者
+ * 都不會被派工，所以它們手上的檔案不能算數 —— 這跟 `model_fetch` 的
+ * `fleetHasModel`「連離線的都算」是不同的問題（那個問的是「要不要再抓一
+ * 份」，這個問的是「現在派得出這張圖嗎」）。
+ *
+ * 比對交給 `assess.findModel`／`matchesModelName`，也就是派工時用的同一把尺；
+ * 自己寫一次字串比對遲早會跟派工的答案打架。
+ *
+ * `workers` 由呼叫端給（`queries.getAllWorkers` 的結果，軟刪除已在 SQL 濾
+ * 掉），停用在這裡濾。這是 Python 的 `missing_models(session, recipe)` 改成
+ * 「共用一次查詢」的形狀：清單端點有三個配方，每筆各查一次 worker 表會把一個
+ * O(1) 的查詢變成 O(配方數)。 */
+export function missingModels(workers: queries.Worker[], recipe: Recipe): string[] {
+  const sources = modelSources(recipe);
+  if (sources.length === 0) return [];
+
+  const inventories = workers.filter((w) => !w.disabled).map((w) => w.modelInventory);
+  return sources
+    .filter((source) => {
+      const needed = inventoryPath(source);
+      return !inventories.some((inventory) => assess.findModel(inventory, needed)[0]);
+    })
+    .map((source) => source.name);
+}
+
+/** `ensureModelFetches` 回報的一筆（§12.2 的 `model_fetch_jobs`）。欄位名是
+ * 對外的 wire shape，所以是 snake_case 的 `job_id`，與 Python 同字。 */
+export interface ModelFetchStarted {
+  name: string;
+  job_id: string;
+  reused: boolean;
+}
+
+/** 對每個「缺」的 `model_sources` 項目建一筆 `kind=model_fetch` job。
+ *
+ * 回 `[{name, job_id, reused}]`（§12.2）。去重、HEAD 探測、白名單、「有沒有
+ * worker 接得住」全部交給 `model_fetch.createFetchJob` —— 那是面板下載鈕走的
+ * 同一條路，所以配方觸發的下載與人手動觸發的下載不可能有兩套規則。
+ *
+ * `FetchRequestError` 一律吞掉只留 log：下載排不出來（來源要登入、沒有夠格的
+ * worker、網域不在白名單）是「這張圖會等久一點」，不是「這次送單不合法」。送
+ * 單本身照常成功，job 排在佇列裡，等模型到位就派得出去。
+ *
+ * `head` 每次都從模組命名空間上現讀（`modelFetch.headSizeBytes`），與
+ * `routes/comfyapi.ts` 的下載鈕同一個寫法：那個晚綁定就是測試的唯一接縫
+ * （`vi.spyOn(modelFetch, "headSizeBytes")`），production 這側則沒有任何可寫
+ * 的開關。 */
+export async function ensureModelFetches(
+  env: Env,
+  recipe: Recipe,
+  userId: string | null
+): Promise<ModelFetchStarted[]> {
+  const sources = modelSources(recipe);
+  if (sources.length === 0) return [];
+
+  let missing: Set<string>;
+  try {
+    missing = new Set(missingModels(await queries.getAllWorkers(env.DB), recipe));
+  } catch (err) {
+    // DB 出事不該讓送單整條掛掉。
+    console.error(`recipes: could not compute missing models for ${recipe.id}`, err);
+    return [];
+  }
+
+  const started: ModelFetchStarted[] = [];
+  for (const source of sources) {
+    if (!missing.has(source.name)) continue;
+    try {
+      const { jobId, reused } = await modelFetch.createFetchJob(
+        env,
+        { name: source.name, directory: source.directory, url: source.url, userId },
+        { head: modelFetch.headSizeBytes }
+      );
+      started.push({ name: source.name, job_id: jobId, reused });
+    } catch (err) {
+      if (err instanceof modelFetch.FetchRequestError) {
+        console.warn(
+          `recipes: ${recipe.id} -- no auto-fetch for ${source.name} (${err.code}): ${err.message}`
+        );
+        continue;
+      }
+      throw err;
+    }
+  }
+  return started;
+}
+
+/** `h3-t2v` 的 `length`（幀數），由 `seconds` 依 §12.1 的式子算出。
+ *
+ * 模型只吃 17k+5 的幀數格點（object_info 的 `length` 也寫 `step: 17`、
+ * `min: 5`），所以秒數先換算成 24 fps 的幀數，再往上補到最近的格點：
+ * `seconds=5` → 120 → 124（＝官方範本的值）。官方範本用一顆
+ * `ComfyMathExpression` 節點算，配方不搬那顆節點 —— 圖裡只放算好的整數，因為
+ * AI 端送的是秒數，而「秒數怎麼變成幀數」是平台該負責的事。
+ *
+ * 型別不對就丟 `recipes.bad_params`（400），不是回一個空物件：回空物件會讓
+ * `{"$param": "length"}` 變成「配方引用了未宣告的參數」→ `bad_recipe` → 500，
+ * 而那是使用者送錯型別，不是配方壞了。正常路徑上 `validateParams` 早就擋下
+ * 來了（`seconds` 宣告為 `number`），所以這條只在有人直接呼叫這個模組時才會
+ * 走到 —— 它仍然必須給出「使用者的錯」那個答案。 */
+function h3Length(params: Record<string, unknown>): Record<string, unknown> {
+  const seconds = params.seconds;
+  if (typeof seconds !== "number" || !Number.isFinite(seconds)) {
+    throw badParams("seconds: expected a number.");
+  }
+  const frames = Math.max(5, Math.round(seconds * 24));
+  // `%` 在 JS 是餘數不是模：`(5 - 24 % 17) % 17` 給 -2（Python 給 15），那會
+  // 把 length 算成 22 —— 一個不在 17k+5 格點上的幀數，模型直接拒收。所以取模
+  // 走 `((x % n) + n) % n`，與 Python 的 `%` 同號。
+  const pad = (((5 - (frames % 17)) % 17) + 17) % 17;
+  return { length: frames + pad };
+}
+
+/** `{recipe_id: 算衍生值的函式}`。衍生值刻意不寫成配方檔裡的運算式：配方檔是
+ * 資料，不是程式碼，一個能在檔裡寫運算式的格式就是一個可以被塞進任意運算的
+ * 格式。要加新的衍生值就在這裡加一個具名函式。
+ *
+ * `Object.create(null)` 的理由同 `loadRecipes()`：查的鍵是配方 id，而字面量
+ * 物件上 `DERIVED["constructor"]` 不是 `undefined`。 */
+const DERIVED: Record<string, (params: Record<string, unknown>) => Record<string, unknown>> =
+  Object.assign(Object.create(null), { "h3-t2v": h3Length });
+
+/** 在已驗證的參數上疊出衍生值，回傳「渲染真正要用的」那份。
+ *
+ * 順序是固定的：先 `validateParams`（宣告過的參數），再這裡（衍生值），最後
+ * `renderWorkflow`。所以 `{"$param": "length"}` 在 `h3-t2v` 裡合法，即使
+ * `length` 不是宣告的參數 —— 但使用者仍然送不進 `length`（`validateParams`
+ * 會把它當未知參數擋掉），衍生值只能由伺服器算。 */
+export function derivedParams(recipe: Recipe, params: Record<string, unknown>): Record<string, unknown> {
+  const resolved = { ...(params ?? {}) };
+  const compute = DERIVED[String(recipe.id)];
+  if (compute === undefined) return resolved;
+  return { ...resolved, ...compute(resolved) };
 }

@@ -1,0 +1,271 @@
+{
+  "id": "h3-t2v",
+  "title": {
+    "zh-TW": "MiniMax H3 文生影片（含音訊）",
+    "en": "MiniMax H3 text-to-video (with audio)"
+  },
+  "description": {
+    "zh-TW": "用 MiniMax H3 依文字提示產生一段帶音訊的影片（8 步 turbo LoRA，24 fps）。文字編碼器用無審查的 heretic 版。",
+    "en": "Generate a short video with audio from a text prompt with MiniMax H3 (8-step turbo LoRA, 24 fps), using the uncensored heretic text encoder."
+  },
+  "order": 20,
+  "nsfw_ok": true,
+  "params": [
+    {
+      "name": "prompt",
+      "type": "string",
+      "required": true,
+      "description": {
+        "zh-TW": "影片描述（英文效果最好；可寫時間軸與音訊指示）",
+        "en": "What to film (English works best; a timeline and audio notes help)"
+      }
+    },
+    {
+      "name": "seconds",
+      "type": "number",
+      "default": 5,
+      "min": 1,
+      "max": 10,
+      "description": {
+        "zh-TW": "長度（秒）；實際幀數由伺服器換算成模型的 17k+5 格點",
+        "en": "Length in seconds; the server snaps it to the model's 17k+5 frame grid"
+      }
+    },
+    {
+      "name": "width",
+      "type": "integer",
+      "default": 1280,
+      "min": 256,
+      "max": 1536,
+      "step": 32,
+      "description": {
+        "zh-TW": "寬度，32 的倍數",
+        "en": "Width, a multiple of 32"
+      }
+    },
+    {
+      "name": "height",
+      "type": "integer",
+      "default": 704,
+      "min": 256,
+      "max": 1536,
+      "step": 32,
+      "description": {
+        "zh-TW": "高度，32 的倍數",
+        "en": "Height, a multiple of 32"
+      }
+    },
+    {
+      "name": "steps",
+      "type": "integer",
+      "default": 8,
+      "min": 1,
+      "max": 20,
+      "description": {
+        "zh-TW": "取樣步數（turbo LoRA 為 8 步）",
+        "en": "Sampling steps (the turbo LoRA wants 8)"
+      }
+    },
+    {
+      "name": "seed",
+      "type": "integer",
+      "default": -1,
+      "min": -1,
+      "max": 4294967295,
+      "description": {
+        "zh-TW": "-1 = 隨機",
+        "en": "-1 = random"
+      }
+    }
+  ],
+  "required_models": [
+    "minimax_h3_fl2va_pruned_int8_convrot.safetensors",
+    "minimax_h3_fl2v_turbo_8step_v1.0_comfyui_bf16.safetensors",
+    "qwen3vl_32b_heretic_minimax_h3_nvfp4.safetensors",
+    "minimax_h3_video_vae_fp16.safetensors",
+    "minimax_h3_audio_vae_fp32.safetensors"
+  ],
+  "workflow": {
+    "1": {
+      "class_type": "UNETLoader",
+      "inputs": {
+        "unet_name": "minimax_h3_fl2va_pruned_int8_convrot.safetensors",
+        "weight_dtype": "default"
+      }
+    },
+    "2": {
+      "class_type": "LoraLoaderModelOnly",
+      "inputs": {
+        "model": [
+          "1",
+          0
+        ],
+        "lora_name": "minimax_h3_fl2v_turbo_8step_v1.0_comfyui_bf16.safetensors",
+        "strength_model": 1
+      }
+    },
+    "3": {
+      "class_type": "CLIPLoader",
+      "inputs": {
+        "clip_name": "qwen3vl_32b_heretic_minimax_h3_nvfp4.safetensors",
+        "type": "minimax",
+        "device": "default"
+      }
+    },
+    "4": {
+      "class_type": "VAELoader",
+      "inputs": {
+        "vae_name": "minimax_h3_video_vae_fp16.safetensors"
+      }
+    },
+    "5": {
+      "class_type": "VAELoader",
+      "inputs": {
+        "vae_name": "minimax_h3_audio_vae_fp32.safetensors"
+      }
+    },
+    "6": {
+      "class_type": "MiniMaxH3ImageToVideo",
+      "inputs": {
+        "clip": [
+          "3",
+          0
+        ],
+        "vae": [
+          "4",
+          0
+        ],
+        "prompt": {
+          "$param": "prompt"
+        },
+        "width": {
+          "$param": "width"
+        },
+        "height": {
+          "$param": "height"
+        },
+        "length": {
+          "$param": "length"
+        }
+      }
+    },
+    "7": {
+      "class_type": "BasicGuider",
+      "inputs": {
+        "model": [
+          "2",
+          0
+        ],
+        "conditioning": [
+          "6",
+          0
+        ]
+      }
+    },
+    "8": {
+      "class_type": "KSamplerSelect",
+      "inputs": {
+        "sampler_name": "res_multistep"
+      }
+    },
+    "9": {
+      "class_type": "BasicScheduler",
+      "inputs": {
+        "model": [
+          "2",
+          0
+        ],
+        "scheduler": "simple",
+        "steps": {
+          "$param": "steps"
+        },
+        "denoise": 1
+      }
+    },
+    "10": {
+      "class_type": "RandomNoise",
+      "inputs": {
+        "noise_seed": {
+          "$param": "seed"
+        }
+      }
+    },
+    "11": {
+      "class_type": "SamplerCustomAdvanced",
+      "inputs": {
+        "noise": [
+          "10",
+          0
+        ],
+        "guider": [
+          "7",
+          0
+        ],
+        "sampler": [
+          "8",
+          0
+        ],
+        "sigmas": [
+          "9",
+          0
+        ],
+        "latent_image": [
+          "6",
+          1
+        ]
+      }
+    },
+    "12": {
+      "class_type": "VAEDecode",
+      "inputs": {
+        "samples": [
+          "11",
+          0
+        ],
+        "vae": [
+          "4",
+          0
+        ]
+      }
+    },
+    "13": {
+      "class_type": "VAEDecodeAudio",
+      "inputs": {
+        "samples": [
+          "11",
+          0
+        ],
+        "vae": [
+          "5",
+          0
+        ]
+      }
+    },
+    "14": {
+      "class_type": "CreateVideo",
+      "inputs": {
+        "images": [
+          "12",
+          0
+        ],
+        "fps": 24,
+        "audio": [
+          "13",
+          0
+        ]
+      }
+    },
+    "15": {
+      "class_type": "SaveVideo",
+      "inputs": {
+        "video": [
+          "14",
+          0
+        ],
+        "filename_prefix": "video/comfyfed_recipe",
+        "format": "auto",
+        "codec": "auto"
+      }
+    }
+  }
+}

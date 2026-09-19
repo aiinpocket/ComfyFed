@@ -1294,3 +1294,38 @@ describe("split families × ownership (final review)", () => {
     expect(row.split_count).toBe(0);
   });
 });
+
+// ---------------------------------------------------------------------------
+// 2026-09-20 spec §12.2: `createJobFromWorkflow`'s `fetching` exemption is a
+// keyword option only `routes/recipes.ts` passes (it knows which names it just
+// queued a `kind=model_fetch` job for). The console's multipart submit must
+// not be able to claim one -- otherwise any submitter could name a model and
+// walk straight past the `jobs.missing_models` gate.
+
+describe("POST /api/jobs fetching exemption", () => {
+  it("cannot be claimed from the multipart body", async () => {
+    const { cookie, csrf } = await adminSession();
+    await registerWorker();
+
+    // Baseline: one online worker, no inventory -> the model is fleet-wide
+    // missing and not in the signed manifest, so the gate refuses.
+    const refused = await submitJob(cookie, csrf, SIMPLE_WORKFLOW);
+    expect(refused.status).toBe(400);
+    expect(refused.body.error.code).toBe("jobs.missing_models");
+
+    // The same submit with every spelling of an exemption the wire could
+    // carry still gets the same 400.
+    for (const fields of [
+      { fetching: "sd15.safetensors" },
+      { fetching: JSON.stringify(["sd15.safetensors"]) },
+    ]) {
+      const form = multipartBody({ workflow_json: JSON.stringify(SIMPLE_WORKFLOW), ...fields });
+      const r = await raw("/api/jobs", { method: "POST", body: form, cookie, headers: { "X-CSRF": csrf } });
+      expect(r.status).toBe(400);
+      expect(r.body.error.code).toBe("jobs.missing_models");
+    }
+
+    const rows = await db().prepare("SELECT COUNT(*) AS n FROM jobs").first<{ n: number }>();
+    expect(rows!.n).toBe(0);
+  });
+});
