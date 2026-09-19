@@ -1232,3 +1232,111 @@ def test_assign_jobs_bounds_the_matrix_when_the_whole_queue_is_starved(_db, monk
     assert seen, "scheduler.build_matrix was never called"
     assert max(seen) <= 2 * limit
     assert [j.id for _w, j in assignments] == ["j000"]
+
+
+# --- 2026-09-19 job-retry：requeue_for_retry 與派工排除 ----------------------
+
+
+def test_requeue_for_retry_applies_the_spec_fields(_db):
+    """§5 的 requeue 欄位：回 queued、放開 worker、記 last_worker_id、
+    進度歸零、時間戳清掉、`error` 留著當「最後錯誤」、`retry_count += 1`。"""
+    worker_id = _make_worker("w1")
+    job_id = _make_job("j1", status="running", worker_id=worker_id)
+    with db.get_session() as session:
+        job = session.get(db.Job, job_id)
+        job.started_at = _utcnow()
+        job.progress = 0.75
+        job.dispatch_info = json.dumps({"candidates": 3})
+        job.signature = "sig-a"
+        session.commit()
+
+    assert dispatch.requeue_for_retry(job_id, worker_id, "boom") is True
+
+    with db.get_session() as session:
+        job = session.get(db.Job, job_id)
+        assert job.status == "queued"
+        assert job.worker_id is None
+        assert job.last_worker_id == worker_id
+        assert job.progress == 0
+        assert job.started_at is None
+        assert job.finished_at is None
+        assert job.error == "boom"
+        assert job.retry_count == 1
+        # 簽章留著 -- 它是工作本身的指紋，和哪台跑無關。
+        assert job.signature == "sig-a"
+
+
+def test_requeue_for_retry_increments_retry_count_each_time(_db):
+    worker_id = _make_worker("w1")
+    job_id = _make_job("j1", status="running", worker_id=worker_id)
+    assert dispatch.requeue_for_retry(job_id, worker_id, "one") is True
+
+    with db.get_session() as session:
+        session.execute(
+            update(db.Job).where(db.Job.id == job_id).values(status="running", worker_id=worker_id)
+        )
+        session.commit()
+    assert dispatch.requeue_for_retry(job_id, worker_id, "two") is True
+
+    with db.get_session() as session:
+        job = session.get(db.Job, job_id)
+        assert job.retry_count == 2
+        assert job.error == "two"
+
+
+def test_requeue_for_retry_refuses_a_job_this_worker_does_not_own(_db):
+    """owned 判定和 `mark_failed` 同一道閘門 -- 別台的 job、不存在的 job、
+    已經終局的 job 一律 False 且什麼都不動。"""
+    worker_a = _make_worker("w-a")
+    worker_b = _make_worker("w-b")
+    job_id = _make_job("j1", status="running", worker_id=worker_a)
+
+    assert dispatch.requeue_for_retry(job_id, worker_b, "sabotage") is False
+    assert dispatch.requeue_for_retry("nope", worker_a, "boom") is False
+
+    with db.get_session() as session:
+        job = session.get(db.Job, job_id)
+        assert job.status == "running" and job.worker_id == worker_a
+        assert job.error is None and job.retry_count == 0
+
+    done_id = _make_job("j2", status="done", worker_id=worker_a)
+    assert dispatch.requeue_for_retry(done_id, worker_a, "late") is False
+    with db.get_session() as session:
+        assert session.get(db.Job, done_id).status == "done"
+
+
+def test_assign_jobs_skips_a_worker_excluded_for_this_job(_db):
+    """`exclusions` 帶 `(worker, job_id)` -> 這一輪不派給它。"""
+    worker_id = _make_worker("w1", dynamic={"free_vram_gb": 24})
+    job_id = _make_signed_job("j1")
+
+    assert dispatch.assign_jobs([worker_id], exclusions=frozenset({(worker_id, job_id)})) == []
+    with db.get_session() as session:
+        assert session.get(db.Job, job_id).status == "queued"
+
+    assignments = dispatch.assign_jobs([worker_id])
+    assert [(w, j.id) for w, j in assignments] == [(worker_id, job_id)]
+
+
+def test_assign_jobs_skips_a_worker_unsuitable_for_this_task_key(_db):
+    """`exclusions` 帶 `(worker, task_key)` -- 同一類任務的別張 job 也擋。"""
+    worker_id = _make_worker("w1", dynamic={"free_vram_gb": 24})
+    job_id = _make_signed_job("j1")
+    with db.get_session() as session:
+        key = session.get(db.Job, job_id).signature
+    assert key
+
+    assert dispatch.assign_jobs([worker_id], exclusions=frozenset({(worker_id, key)})) == []
+    with db.get_session() as session:
+        assert session.get(db.Job, job_id).status == "queued"
+
+
+def test_assign_jobs_prefers_the_worker_that_is_not_excluded(_db):
+    worker_a = _make_worker("w-a", dynamic={"free_vram_gb": 24})
+    worker_b = _make_worker("w-b", dynamic={"free_vram_gb": 24})
+    job_id = _make_signed_job("j1")
+
+    assignments = dispatch.assign_jobs(
+        [worker_a, worker_b], exclusions=frozenset({(worker_a, job_id)})
+    )
+    assert [(w, j.id) for w, j in assignments] == [(worker_b, job_id)]

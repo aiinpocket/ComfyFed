@@ -133,6 +133,7 @@ from . import (
     model_manifest,
     panelws,
     peerhealth,
+    retry,
     security,
     split,
     stats,
@@ -532,31 +533,7 @@ async def _handle_message(worker_id: str, conn: _Connection, message: dict) -> N
         elif msg_type == "job_done":
             await _handle_job_done(worker_id, conn, message)
         elif msg_type == "job_failed":
-            job_id = message.get("job_id")
-            error = message.get("error") or ""
-            # Phase 3.3 §3.6：這件 job 如果是子 job，它的失敗會連坐取消還在
-            # 跑的兄弟；那些 worker 要立刻收到 `job_cancelled`，否則得等到
-            # 下一次心跳落在 not-owned 路徑才停下來。
-            cascade_cancelled: list = []
-            if dispatch.mark_failed(
-                job_id,
-                worker_id,
-                error,
-                resolve_warn_level=lambda jid: _resolve_warn_level(conn, jid),
-                cancelled_owners=cascade_cancelled,
-            ):
-                await _push_cascade_cancellations(cascade_cancelled)
-                # 一致性：被失敗連坐取消的兄弟和被 admin 取消的子 job 一樣真的
-                # 燒過 GPU，所以取消當下在跑的那些照樣拿一張 cancelled 收據。
-                await _mint_cascade_cancelled_receipts(cascade_cancelled)
-                _clear_fetch_progress(job_id)
-                await panelws.job_failed(job_id, error)
-                exec_seconds = message.get("exec_seconds")
-                if not _is_valid_exec_seconds(exec_seconds):
-                    exec_seconds = None
-                await _create_and_push_failure_receipt(worker_id, conn, job_id, exec_seconds)
-            elif job_id and _job_not_owned_by(job_id, worker_id):
-                await _send_job_cancelled(conn, job_id)
+            await _handle_job_failed(worker_id, conn, message)
         elif msg_type == "receipt_ack":
             _handle_receipt_ack(worker_id, message)
         else:
@@ -872,6 +849,9 @@ async def _handle_job_done(worker_id: str, conn: "_Connection", message: dict) -
         # 雜湊 -- 放在 `if done:` 最前面，就和收據一樣，worker 不能靠送別人
         # 的 job_id 來教平台任何東西。
         job_kind = _learn_fetched_models(worker_id, job_id, message.get("fetched_models"))
+        # 2026-09-19 job-retry §7：跑成功就是最強的反證 -- 這台對這一類任務
+        # 的不適任紀錄自動解除。同樣在 `if done:` 之內，理由和上面一樣。
+        _clear_unsuitable_for_job(worker_id, job_id)
         _clear_fetch_progress(job_id)
         await _notify_panel_job_done(job_id)
         exec_seconds = message.get("exec_seconds")
@@ -884,6 +864,306 @@ async def _handle_job_done(worker_id: str, conn: "_Connection", message: dict) -
         if job_kind != "model_fetch":
             _record_job_stats(worker_id, job_id, exec_seconds)
         await _create_and_push_receipt(worker_id, conn, job_id, exec_seconds)
+
+
+@dataclass
+class _FailedAttempt:
+    """What `_record_failed_attempt` learned about one applied failure."""
+
+    attempts: dict[str, int]
+    total: int
+    task_key: Optional[str]
+    started_at: Optional[datetime]
+
+
+def _record_failed_attempt(
+    worker_id: str, job_id: Optional[str], error: str, resolve_warn_level
+) -> Optional[_FailedAttempt]:
+    """2026-09-19 job-retry §5：把這一次失敗記進 `jobs.attempts` 與
+    `worker_task_failures`，回傳決定「requeue 還是終局」所需的快照。
+
+    `None` = 這個 worker 此刻並不擁有這張 job（或它已經終局）-- 和
+    `mark_failed` 完全同一道閘門（`dispatch.owned_job`），所以一個 worker 不
+    可能靠送別人的 job_id 去灌別人的失敗次數。
+
+    兩筆寫入在同一個 session、同一次 commit：少了任何一邊都會讓後續的判定
+    看到半套狀態（attempts 進了但不適任沒記 -> 這台還會被派同類任務；反過來
+    -> 這張 job 的次數永遠追不上上限）。
+
+    `started_at` 一併帶回來，因為 `requeue_for_retry` 會把它清掉，而失敗收據
+    的 wall-clock 基準要算的是「這一次嘗試」跑了多久（見
+    `_create_and_push_failure_receipt`）。
+    """
+    if not job_id:
+        return None
+    now = _utcnow()
+    with db.get_session() as session:
+        job = dispatch.owned_job(session, job_id, worker_id, resolve_warn_level=resolve_warn_level)
+        if job is None:
+            return None
+        key = retry.task_key(job)
+        started_at = job.started_at
+        new_attempts, _mine, total = retry.bump_attempts(job.attempts, worker_id)
+        job.attempts = new_attempts
+        retry.record_failure(session, worker_id, key, error, job_id, now)
+        session.commit()
+    return _FailedAttempt(
+        attempts=retry.attempts_dict(new_attempts),
+        total=total,
+        task_key=key,
+        started_at=started_at,
+    )
+
+
+def _final_error_summary(attempt: _FailedAttempt, worker_id: str, error: str) -> str:
+    """終局失敗時寫進 `jobs.error` 的彙整訊息（`retry.summarize_final_error`）。
+
+    每台 worker 的「最後錯誤」來自 `worker_task_failures[W, task_key]`：那張
+    表是平台唯一存過去每台錯誤的地方（`jobs.attempts` 只存次數）。正在回報
+    的這一台用它手上這個 `error`，因為那就是最新的一筆，不必再讀一次。
+
+    顯示名取 `db.Worker.name`；worker 列不見了（或這張 job 的 attempts 裡有
+    已經被硬刪的 id）就退回 id 前 8 字 -- 一個認不出來的 id 也好過整段訊息
+    發不出來。`task_key` 是 None 的舊 job 沒有紀錄可查，其他台就只剩空字串。
+    """
+    worker_ids = list(attempt.attempts)
+    last_errors: dict[str, str] = {}
+    names: dict[str, str] = {}
+    if worker_ids:
+        with db.get_session() as session:
+            if attempt.task_key:
+                rows = (
+                    session.query(db.WorkerTaskFailure)
+                    .filter(
+                        db.WorkerTaskFailure.task_key == attempt.task_key,
+                        db.WorkerTaskFailure.worker_id.in_(worker_ids),
+                    )
+                    .all()
+                )
+                last_errors = {row.worker_id: row.last_error or "" for row in rows}
+            names = {
+                w.id: (w.name or "")
+                for w in session.query(db.Worker).filter(db.Worker.id.in_(worker_ids)).all()
+            }
+
+    pairs = [
+        (
+            names.get(wid) or wid[:8],
+            error if wid == worker_id else last_errors.get(wid, ""),
+        )
+        for wid in worker_ids
+    ]
+    return retry.summarize_final_error(pairs, attempt.total)
+
+
+def _fetch_inputs_for_job(job) -> tuple[dict[str, int], frozenset[str], frozenset[str]]:
+    """`(fetchable_models, peer_only_models, unverified_models)` for ONE job --
+    the same inputs `dispatch_tick` compiles for the whole sweep, narrowed to
+    the single job `_any_possible_worker` is asking about.
+
+    The signed manifest plus, for a `model_fetch` job, that job's OWN signed
+    entry (minted when the panel's download button was pressed, for a model
+    the real manifest may know nothing about -- see `dispatch_tick`'s merge).
+    The real manifest always wins a name collision, exactly as it does there.
+    """
+    fetchable: dict[str, int] = {}
+    peer_only: frozenset[str] = frozenset()
+    unverified: set[str] = set()
+
+    if _data_dir is not None:
+        try:
+            entries = model_manifest.entries(_data_dir)
+            fetchable = {e["name"]: e["size_bytes"] for e in entries}
+            peer_only = model_manifest.peer_only_names(entries)
+        except Exception:
+            logger.exception("agentws: failed to build the fetch manifest for a retry decision")
+
+    if getattr(job, "kind", "prompt") == "model_fetch" and job.fetch_entry:
+        try:
+            entry = json.loads(job.fetch_entry)
+        except (TypeError, ValueError):
+            entry = None
+        if isinstance(entry, dict):
+            name = entry.get("name")
+            size_bytes = entry.get("size_bytes")
+            if (
+                isinstance(name, str)
+                and name
+                and name not in fetchable
+                and isinstance(size_bytes, int)
+                and not isinstance(size_bytes, bool)
+                and size_bytes > 0
+            ):
+                fetchable[name] = size_bytes
+                if model_fetch.is_unverified_entry(entry):
+                    unverified.add(name)
+
+    return fetchable, peer_only, frozenset(unverified)
+
+
+def _any_possible_worker(job) -> bool:
+    """2026-09-19 job-retry §6：這艘艦隊裡還有任何一台**有可能**跑得動這張 job 嗎？
+
+    「有可能」刻意比「現在可以」寬得多：掃的是每一台未刪除、未停用的 worker
+    -- 不論 online／offline／paused，也不論此刻在不在忙。線上那一刻的狀態不
+    是重點，重點是「等下去到底有沒有希望」：這整個功能的起因就是唯一在線的
+    那台（無 GPU 的 Mac）一直失敗，而真正跑得動的 RTX 卡當時是暫停中。離線
+    worker 的 `dynamic`（free_disk 之類）可能過期，就照它最後回報的值判 --
+    寧可讓 job 多等一輪，也不要因為一個過期的數字把它判死。
+
+    `eligible_after_fetch` 同樣算數（spec §2 目標 1：「不因為別台沒有模型就
+    放棄」），所以缺模型但有開 auto_fetch 的 worker 會讓 job 繼續等下去。
+
+    排除集合和派工那邊同一份定義：這張 job 自己的 `attempts` 達門檻的
+    worker，加上生效中的不適任紀錄。全部被排除、或全艦隊本來就沒人跑得動
+    （缺節點、VRAM 不夠、模型哪裡都抓不到）-> False -> 立刻終局失敗，不必
+    等 `MAX_JOB_ATTEMPTS`。
+    """
+    # `jobs` imports this module at load time, so this has to stay lazy.
+    from . import jobs as jobs_module
+
+    now = _utcnow()
+    try:
+        requirements_override = json.loads(job.requirements or "{}")
+    except (TypeError, ValueError):
+        requirements_override = {}
+    needs = assess.needs_from_job(job)
+    key = retry.task_key(job)
+
+    with db.get_session() as session:
+        # `_live_workers` = 未刪除；再濾掉 `disabled`（admin 停用的那台在
+        # spec §6 的定義裡不算「已註冊、未停用」的候選）。
+        workers = [w for w in jobs_module._live_workers(session) if not w.disabled]
+        exclusions = set(retry.active_unsuitable(session, now))
+
+    for candidate_id, failures in retry.attempts_dict(job.attempts).items():
+        if failures >= retry.MAX_FAILURES_PER_WORKER_PER_JOB:
+            exclusions.add((candidate_id, job.id))
+    frozen = frozenset(exclusions)
+
+    fetchable, peer_only, unverified = _fetch_inputs_for_job(job)
+    is_model_fetch = getattr(job, "kind", "prompt") == "model_fetch"
+
+    for worker in workers:
+        # `dispatch.assign_jobs` 的 kind 閘門：model_fetch 單只有 protocol>=5
+        # 的 agent 跑得動，舊 agent 會去跑 `{}` 佔位工作流然後失敗。
+        if is_model_fetch and not assess.model_fetch_protocol_ok(worker):
+            continue
+        v = assess.verdict(
+            worker,
+            needs,
+            requirements_override,
+            [],
+            fetchable,
+            peer_only,
+            unverified,
+            job_id=job.id,
+            task_key=key,
+            exclusions=frozen,
+        )
+        if v.kind in ("eligible", "eligible_after_fetch"):
+            return True
+    return False
+
+
+async def _handle_job_failed(worker_id: str, conn: "_Connection", message: dict) -> None:
+    """Handle a `job_failed` message: retry on another worker, or give up.
+
+    2026-09-19 job-retry §5. `job_failed` used to be terminal, full stop --
+    one refusal from the only worker that happened to be online killed the
+    job even when a paused GPU box could have run it. Now every applied
+    failure is counted, and the count decides:
+
+    * total attempts >= `retry.MAX_JOB_ATTEMPTS`, or no worker in the whole
+      fleet could ever run it (`_any_possible_worker`) -> TERMINAL, through
+      the existing `dispatch.mark_failed` path with a summarized error, so
+      the split cascade, the panel's `job_failed` and the failure receipt all
+      behave exactly as they did before;
+    * otherwise -> `dispatch.requeue_for_retry`, and the panel is told
+      `job_requeued` (the same event a stale-worker requeue sends).
+
+    BOTH paths mint the same non-billable failure receipt they always did:
+    the worker really did burn that time, and whether the platform decided to
+    retry afterwards is none of the receipt's business.
+    """
+    job_id = message.get("job_id")
+    error = message.get("error") or ""
+
+    def _resolve(jid: Optional[str]) -> int:
+        return _resolve_warn_level(conn, jid)
+
+    attempt = _record_failed_attempt(worker_id, job_id, error, _resolve)
+    if attempt is None:
+        if job_id and _job_not_owned_by(job_id, worker_id):
+            await _send_job_cancelled(conn, job_id)
+        return
+
+    exec_seconds = message.get("exec_seconds")
+    if not _is_valid_exec_seconds(exec_seconds):
+        exec_seconds = None
+
+    is_final = attempt.total >= retry.MAX_JOB_ATTEMPTS
+    if not is_final:
+        with db.get_session() as session:
+            job = session.get(db.Job, job_id)
+            is_final = job is None or not _any_possible_worker(job)
+
+    if not is_final and dispatch.requeue_for_retry(job_id, worker_id, error):
+        # 面板本來以為這張 job 正在跑，而這一次嘗試的 done/failed 事件再也不
+        # 會來了 -- 和 `requeue_stale` 一樣要清掉 executing 標記。
+        _clear_fetch_progress(job_id)
+        await panelws.job_requeued(job_id)
+        await _create_and_push_failure_receipt(
+            worker_id, conn, job_id, exec_seconds, started_at=attempt.started_at
+        )
+        return
+
+    # 終局。Phase 3.3 §3.6：這件 job 如果是子 job，它的失敗會連坐取消還在
+    # 跑的兄弟；那些 worker 要立刻收到 `job_cancelled`，否則得等到下一次心跳
+    # 落在 not-owned 路徑才停下來。連坐只發生在這裡，不發生在上面的 requeue。
+    cascade_cancelled: list = []
+    summary = _final_error_summary(attempt, worker_id, error)
+    if dispatch.mark_failed(
+        job_id,
+        worker_id,
+        summary,
+        resolve_warn_level=_resolve,
+        cancelled_owners=cascade_cancelled,
+    ):
+        await _push_cascade_cancellations(cascade_cancelled)
+        # 一致性：被失敗連坐取消的兄弟和被 admin 取消的子 job 一樣真的
+        # 燒過 GPU，所以取消當下在跑的那些照樣拿一張 cancelled 收據。
+        await _mint_cascade_cancelled_receipts(cascade_cancelled)
+        _clear_fetch_progress(job_id)
+        await panelws.job_failed(job_id, summary)
+        await _create_and_push_failure_receipt(worker_id, conn, job_id, exec_seconds)
+
+
+def _clear_unsuitable_for_job(worker_id: str, job_id: Optional[str]) -> None:
+    """§7：這台 worker 成功跑完這一類任務 -> 自動解除它對這一類的不適任紀錄。
+
+    只在 `job_done` 且 transition 真的套用時呼叫（和收據、統計同一個閘門）。
+    吞掉例外只記 log -- 解除失敗最壞就是那台多被冷落幾天，絕不能因此少發一
+    張收據或讓整條 job_done 路徑炸掉。
+    """
+    if not job_id:
+        return
+    try:
+        with db.get_session() as session:
+            job = session.get(db.Job, job_id)
+            if job is None:
+                return
+            key = retry.task_key(job)
+            if not key:
+                return
+            retry.clear_failure(session, worker_id, key)
+            session.commit()
+    except Exception:
+        logger.exception(
+            "agentws: failed to clear the unsuitable record for worker %s job %s",
+            worker_id,
+            job_id,
+        )
 
 
 def _learn_fetched_models(worker_id: str, job_id: Optional[str], fetched) -> str:
@@ -1742,7 +2022,11 @@ def _is_valid_exec_seconds(exec_seconds) -> bool:
 
 
 async def _create_and_push_failure_receipt(
-    worker_id: str, conn: "_Connection", job_id: Optional[str], exec_seconds: Optional[float] = None
+    worker_id: str,
+    conn: "_Connection",
+    job_id: Optional[str],
+    exec_seconds: Optional[float] = None,
+    started_at: Optional[datetime] = None,
 ) -> None:
     """Mint a non-billable `kind=failed` receipt for a job the worker just
     reported `job_failed` for, and push it for counter-signature exactly
@@ -1772,19 +2056,32 @@ async def _create_and_push_failure_receipt(
         if job is None:
             return
 
-        if _is_valid_exec_seconds(exec_seconds) and job.started_at is not None:
+        # 2026-09-19 job-retry: on the REQUEUE path the row has already been
+        # reset (`started_at=NULL`, spec §5) by the time this runs, so the
+        # caller hands over the value it captured before the reset. Every
+        # other caller passes None and reads the row exactly as before.
+        run_started_at = started_at if started_at is not None else job.started_at
+
+        if _is_valid_exec_seconds(exec_seconds) and run_started_at is not None:
             # A job that never started has no run to have measured -- an
             # exec_seconds claim for it is meaningless, so it falls through to
             # the wall branch below (which measures 0.0 for started_at=None).
             gpu_seconds = exec_seconds
-            if job.finished_at is not None:
-                gpu_seconds = min(gpu_seconds, (job.finished_at - job.started_at).total_seconds())
+            # 2026-09-19 job-retry: the cap used to key off `finished_at`,
+            # which `mark_failed` always stamps -- but the REQUEUE path never
+            # does (a requeued job has no end, it goes back in the queue). Cap
+            # against "now" in that case, or an agent could inflate
+            # `unbilled_gpu_seconds` without bound simply by failing a job
+            # that is going to be retried anyway. The terminal path is
+            # unchanged: `finished_at` is set by then and still wins.
+            span_end = job.finished_at or _utcnow()
+            gpu_seconds = min(gpu_seconds, (span_end - run_started_at).total_seconds())
             basis = "exec"
         else:
             wall_seconds = 0.0
-            if job.started_at is not None:
+            if run_started_at is not None:
                 end = job.finished_at or _utcnow()
-                wall_seconds = (end - job.started_at).total_seconds()
+                wall_seconds = (end - run_started_at).total_seconds()
                 if conn.protocol >= _CURRENT_PROTOCOL:
                     logger.error(
                         "agentws: protocol violation: job %s from worker %s (protocol %s) "
@@ -2076,9 +2373,33 @@ async def dispatch_tick() -> None:
         except Exception:
             logger.exception("agentws: failed to merge model_fetch job entries")
 
+    # 2026-09-19 job-retry §6：排除集合一個 tick 建一次，整批傳進
+    # `assign_jobs`。兩種來源：生效中的 (worker, task_key) 不適任紀錄，加上
+    # 每張 queued job 自己的 `attempts` 裡已達門檻的 (worker, job_id)。和
+    # 上面的 manifest 一樣掛在 `has_queued_work` 之下 —— 沒活可派的時候多掃
+    # 兩張表是純粹的浪費（背景迴圈每 5 秒跑一次）。
+    exclusions: frozenset[tuple[str, str]] = frozenset()
+    if idle_worker_ids and has_queued_work:
+        try:
+            pairs: set[tuple[str, str]] = set()
+            with db.get_session() as session:
+                pairs |= retry.active_unsuitable(session, _utcnow())
+                queued = (
+                    session.query(db.Job.id, db.Job.attempts)
+                    .filter(db.Job.status == "queued", db.Job.split_count == 0)
+                    .all()
+                )
+            for job_row_id, attempts_json in queued:
+                for candidate_id, failures in retry.attempts_dict(attempts_json).items():
+                    if failures >= retry.MAX_FAILURES_PER_WORKER_PER_JOB:
+                        pairs.add((candidate_id, job_row_id))
+            exclusions = frozenset(pairs)
+        except Exception:
+            logger.exception("agentws: failed to build the dispatch exclusion set")
+
     try:
         assignments = dispatch.assign_jobs(
-            idle_worker_ids, fetchable_models, peer_only_models, unverified_models
+            idle_worker_ids, fetchable_models, peer_only_models, unverified_models, exclusions
         )
     except Exception:
         logger.exception("agentws: assign_jobs failed")

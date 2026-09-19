@@ -10,7 +10,19 @@ from typing import Optional
 from fastapi import APIRouter, Depends, File, Form, HTTPException, Request, UploadFile
 from fastapi.responses import FileResponse, JSONResponse
 
-from . import agentws, assess, auth, db, dispatch, limits, model_guide, model_manifest, split, storage
+from . import (
+    agentws,
+    assess,
+    auth,
+    db,
+    dispatch,
+    limits,
+    model_guide,
+    model_manifest,
+    retry,
+    split,
+    storage,
+)
 from .workers import verify_agent
 
 _JOB_INPUTS_DIRNAME = "job_inputs"
@@ -226,6 +238,12 @@ def _job_dict(job: db.Job) -> dict:
         # url、是否 unverified）。
         "kind": job.kind or "prompt",
         "fetch_entry": _json_dict(job.fetch_entry) if job.fetch_entry else None,
+        # 2026-09-19 job-retry §8：`{worker_id: 失敗次數}` 與被送回佇列的
+        # 次數。JobDetail 用它畫「嘗試紀錄」；一張 `queued` 但
+        # `retry_count > 0` 的 job，`error` 的意思是「上次錯誤」而不是
+        # 「死因」（見 `dispatch.requeue_for_retry`）。
+        "attempts": retry.attempts_dict(job.attempts),
+        "retry_count": job.retry_count or 0,
     }
     # Phase 2.1: transient model-auto-fetch progress (stage/fetch_pct/
     # fetch_model), NOT a Job column -- see agentws._fetch_progress's

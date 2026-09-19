@@ -107,6 +107,15 @@ _MIN_MODEL_FETCH_PROTOCOL = _MIN_UNVERIFIED_FETCH_PROTOCOL
 # the console's assessment list, exactly like `missing_models_*`.
 MODEL_FETCH_PROTOCOL_REASON = "model_fetch_protocol"
 
+# 2026-09-19 job-retry §6：`exclusions` 命中時的兩種理由字串（兩棧逐字相同，
+# console 的評估面板直接顯示）。故意在這裡重寫一份字面值而不是 import
+# `retry` -- 這個模組是純判定層，刻意不依賴任何碰 DB 的模組（`stats.py` 對
+# `is_valid_exec_seconds` 也是同一個取捨）。`retry.py` 那份才是規格來源，
+# 兩邊由 test_assess.py 的逐字斷言釘住。
+_FAILED_TWICE_REASON = "failed_twice_on_job"
+_UNSUITABLE_REASON_PREFIX = "unsuitable:"
+_UNSUITABLE_KEY_CHARS = 12
+
 _BYTES_PER_GB = 1024**3
 
 
@@ -382,6 +391,10 @@ def verdict(
     fetchable_models: dict[str, int] | None = None,
     peer_only_models: frozenset[str] | None = None,
     unverified_models: frozenset[str] | None = None,
+    *,
+    job_id: str | None = None,
+    task_key: str | None = None,
+    exclusions: frozenset[tuple[str, str]] | None = None,
 ) -> Verdict:
     """Judge whether `worker` can run a job needing `needs`.
 
@@ -417,10 +430,33 @@ def verdict(
     to leave unproven than an offload is. When any missing model is
     peer-only (Phase 3.1 P2P, `peer_only_models` -- see `_eligible_after_fetch`),
     `worker.protocol >= 4` is additionally required for that model.
+
+    2026-09-19 job-retry §6: `exclusions` is a set of `(worker_id, job_id)`
+    and `(worker_id, task_key)` pairs compiled ONCE per dispatch tick (see
+    `retry.active_unsuitable` and `agentws.dispatch_tick`). A hit on either
+    makes this worker `ineligible` with a verbatim reason --
+    `failed_twice_on_job` (this worker already failed THIS job
+    `retry.MAX_FAILURES_PER_WORKER_PER_JOB` times) or
+    `unsuitable:<task_key[:12]>` (this worker has a live unsuitable record
+    for this CLASS of job). `job_id`/`task_key` are what the pairs are
+    matched against; all three default to None, so every caller that predates
+    this feature keeps its exact previous behavior.
     """
     reasons: list[str] = []
     warnings: list[str] = []
     requirements_override = requirements_override or {}
+
+    # 2026-09-19 job-retry §6: checked FIRST, and it is a hard reason like
+    # nodes/vram/override -- a worker that has already failed this job twice
+    # must not come back as `eligible_after_fetch` either (downloading the
+    # model again would only earn the same failure a third time).
+    if exclusions:
+        worker_id = getattr(worker, "id", None)
+        if worker_id is not None:
+            if job_id is not None and (worker_id, job_id) in exclusions:
+                reasons.append(_FAILED_TWICE_REASON)
+            if task_key and (worker_id, task_key) in exclusions:
+                reasons.append(f"{_UNSUITABLE_REASON_PREFIX}{task_key[:_UNSUITABLE_KEY_CHARS]}")
 
     hardware = _worker_hardware(worker)
     dynamic = _worker_dynamic(worker)

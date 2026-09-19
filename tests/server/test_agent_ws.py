@@ -589,9 +589,14 @@ def test_job_push_never_sent_to_a_protocol_2_worker_even_when_manifest_covers_it
 
 
 def test_job_failed_marks_job_failed(client):
+    """2026-09-19 job-retry：`job_failed` 只有在「再重試也沒有意義」時才終局。
+    這裡先把 `attempts` 撐到上限，所以這一次失敗走的是既有的 `mark_failed`
+    路徑 -- `error` 換成彙整訊息（非終局的那一次留原始錯誤，見
+    test_job_failed_requeues_instead_of_failing）。"""
     csrf = _login(client)
     worker_id, sk = _register_worker(client, csrf, "w1")
     job_id = _submit(client, csrf)
+    _exhaust_attempts(job_id)
 
     with client.websocket_connect("/api/agent/ws") as ws:
         challenge = ws.receive_json()
@@ -609,7 +614,7 @@ def test_job_failed_marks_job_failed(client):
         with db.get_session() as session:
             job = session.get(db.Job, job_id)
             assert job.status == "failed"
-            assert job.error == "boom"
+            assert "w1: boom" in job.error
 
 
 def _connect(client, worker_id, sk):
@@ -3216,6 +3221,10 @@ def test_a_failed_child_cancels_its_sibling_and_tells_that_worker(client):
     worker_a, sk_a = _register_worker(client, csrf, "wa")
     worker_b, sk_b = _register_worker(client, csrf, "wb")
     child_ids = _make_split_family("p_fail", [worker_a, worker_b])
+    # 2026-09-19 job-retry：連坐只在**終局**失敗時發生，所以先把這個子 job
+    # 的 attempts 撐到上限。「第一次失敗不連坐」由
+    # test_a_failed_child_is_retried_before_cascading 釘。
+    _exhaust_attempts(child_ids[0])
 
     ws_a = _connect(client, worker_a, sk_a)
     ws_b = _connect(client, worker_b, sk_b)
@@ -3237,7 +3246,8 @@ def test_a_failed_child_cancels_its_sibling_and_tells_that_worker(client):
         parent = session.get(db.Job, "p_fail")
         sibling = session.get(db.Job, child_ids[1])
     assert parent.status == "failed"
-    assert parent.error == "子任務 1/2：CUDA OOM"
+    assert parent.error.startswith("子任務 1/2：已在 ")
+    assert "wa: CUDA OOM" in parent.error
     assert sibling.status == "cancelled"
     assert sibling.error == "sibling failed"
     assert sibling.worker_id is None
@@ -3256,6 +3266,8 @@ def test_a_failed_childs_cascaded_sibling_gets_a_cancelled_receipt(client):
     # 「真的燒過 GPU」，收據語意就不成立。
     for child_id in child_ids:
         _backdate_started_at(child_id, hours=1)
+    # 連坐只在終局失敗時發生（見上一個測試）。
+    _exhaust_attempts(child_ids[0])
 
     ws_a = _connect(client, worker_a, sk_a)
     ws_b = _connect(client, worker_b, sk_b)
@@ -4538,3 +4550,311 @@ def test_job_done_fetched_models_ignored_for_a_prompt_job(client):
         assert s.query(db.ModelHash).count() == 0
         rec = s.query(db.Receipt).filter_by(job_id=job_id).one()
         assert rec.kind == "completed" and rec.billable is True
+
+
+# --- 2026-09-19 job-retry：失敗改派＋不適任紀錄 -----------------------------
+
+
+def _exhaust_attempts(job_id, spent=None, spender="ghost-worker"):
+    """把 `jobs.attempts` 先撐到「再失敗一次就達 `MAX_JOB_ATTEMPTS`」。
+
+    釘「終局」行為的測試用它跳過前面幾輪 requeue -- 那幾輪由本節自己的
+    requeue 測試覆蓋，重跑一遍只是讓別的測試又長又脆。
+    """
+    from comfyfed_server import retry
+
+    spent = retry.MAX_JOB_ATTEMPTS - 1 if spent is None else spent
+    with db.get_session() as session:
+        session.get(db.Job, job_id).attempts = json.dumps({spender: spent})
+        session.commit()
+
+
+def _job_row(job_id):
+    with db.get_session() as session:
+        job = session.get(db.Job, job_id)
+        session.expunge(job)
+        return job
+
+
+def _seed_unsuitable(worker_id, key, failures, error="earlier boom", job_id="j-old"):
+    now = datetime.now(timezone.utc).replace(tzinfo=None)
+    with db.get_session() as session:
+        session.add(
+            db.WorkerTaskFailure(
+                worker_id=worker_id, task_key=key, failures=failures,
+                last_error=error, last_job_id=job_id, updated_at=now,
+            )
+        )
+        session.commit()
+
+
+def _failure_rows():
+    with db.get_session() as session:
+        return {
+            (r.worker_id, r.task_key): r.failures
+            for r in session.query(db.WorkerTaskFailure).all()
+        }
+
+
+def test_job_failed_requeues_instead_of_failing(client, monkeypatch):
+    """§5：一次失敗不再是終局。job 回 `queued`、放開 worker、記 attempts 與
+    `retry_count`，錯誤留在 `error` 當「最後錯誤」，失敗收據照發，面板收到
+    `job_requeued`。"""
+    requeued: list = []
+
+    async def _spy(job_id):
+        requeued.append(job_id)
+
+    monkeypatch.setattr(agentws.panelws, "job_requeued", _spy)
+
+    csrf = _login(client)
+    worker_id, sk = _register_worker(client, csrf, "wa")
+    job_id = _submit(client, csrf)
+
+    ws = _connect(client, worker_id, sk)
+    try:
+        ws.send_json({"type": "heartbeat", "state": "idle", "progress": 0.0, "job_id": None, "dynamic": {}})
+        agentws.dispatch_once(worker_id)
+        assert ws.receive_json()["type"] == "job"
+
+        ws.send_json({"type": "job_failed", "job_id": job_id, "error": "boom"})
+        agentws.dispatch_once(worker_id)
+    finally:
+        ws.close()
+
+    job = _job_row(job_id)
+    assert job.status == "queued"
+    assert job.worker_id is None
+    assert job.last_worker_id == worker_id
+    assert job.error == "boom"
+    assert job.retry_count == 1
+    assert json.loads(job.attempts) == {worker_id: 1}
+
+    with db.get_session() as session:
+        receipts = session.query(db.Receipt).all()
+    assert len(receipts) == 1
+    assert (receipts[0].kind, receipts[0].billable) == ("failed", False)
+
+    assert requeued == [job_id]
+
+
+def test_two_failures_on_one_worker_send_the_job_to_another(client):
+    """頭條情境：唯一在線的那台一直失敗，另一台（註冊了但從來沒連過線、
+    在平台眼中是 offline）其實才跑得動。A 失敗兩次後這張 job 只能給 B。"""
+    csrf = _login(client)
+    worker_a, sk_a = _register_worker(client, csrf, "wa")
+    worker_b, sk_b = _register_worker(client, csrf, "wb")
+    job_id = _submit(client, csrf)
+
+    ws_a = _connect(client, worker_a, sk_a)
+    try:
+        for expected in (1, 2):
+            ws_a.send_json(
+                {"type": "heartbeat", "state": "idle", "progress": 0.0, "job_id": None, "dynamic": {}}
+            )
+            agentws.dispatch_once(worker_a)
+            assert ws_a.receive_json()["type"] == "job"
+            ws_a.send_json({"type": "job_failed", "job_id": job_id, "error": "boom %d" % expected})
+            agentws.dispatch_once(worker_a)
+            ws_a.receive_json()  # failure receipt
+            job = _job_row(job_id)
+            assert job.status == "queued", "attempt %d must not be terminal" % expected
+            assert json.loads(job.attempts) == {worker_a: expected}
+            assert job.retry_count == expected
+
+        # A 現在對這張 job 出局。A 仍然 idle 且連著線，但下一輪只能給 B。
+        ws_b = _connect(client, worker_b, sk_b)
+        try:
+            ws_a.send_json(
+                {"type": "heartbeat", "state": "idle", "progress": 0.0, "job_id": None, "dynamic": {}}
+            )
+            ws_b.send_json(
+                {"type": "heartbeat", "state": "idle", "progress": 0.0, "job_id": None, "dynamic": {}}
+            )
+            agentws.dispatch_once(worker_b)
+
+            job_msg = ws_b.receive_json()
+            assert job_msg["type"] == "job" and job_msg["job_id"] == job_id
+            assert _job_row(job_id).worker_id == worker_b
+
+            # B 跑完 -> B 自己的不適任紀錄清空，A 的那一列原封不動。
+            ws_b.send_json({"type": "job_done", "job_id": job_id, "result_files": ["out.png"]})
+            agentws.dispatch_once(worker_b)
+        finally:
+            ws_b.close()
+    finally:
+        ws_a.close()
+
+    job = _job_row(job_id)
+    assert job.status == "done"
+    key = job.signature
+    assert key
+    assert _failure_rows() == {(worker_a, key): 2}
+
+
+def test_job_done_clears_this_workers_unsuitable_row(client):
+    """§7：成功跑完同類任務 -> 自動解除那一台對那一類的不適任紀錄。"""
+    csrf = _login(client)
+    worker_id, sk = _register_worker(client, csrf, "wa")
+    job_id = _submit(client, csrf)
+    key = _job_row(job_id).signature
+    assert key
+    _seed_unsuitable(worker_id, key, failures=1)
+    _seed_unsuitable("someone-else", key, failures=2)
+
+    ws = _connect(client, worker_id, sk)
+    try:
+        ws.send_json({"type": "heartbeat", "state": "idle", "progress": 0.0, "job_id": None, "dynamic": {}})
+        agentws.dispatch_once(worker_id)
+        assert ws.receive_json()["type"] == "job"
+        ws.send_json({"type": "job_done", "job_id": job_id, "result_files": ["out.png"]})
+        agentws.dispatch_once(worker_id)
+    finally:
+        ws.close()
+
+    assert _failure_rows() == {("someone-else", key): 2}
+
+
+def test_reaching_the_attempt_cap_fails_the_job_with_a_summary(client):
+    """§5：總失敗次數達 `MAX_JOB_ATTEMPTS` -> 終局，`error` 換成彙整訊息
+    （zh-TW 先、en 後，每台 worker 的最後錯誤）。艦隊裡還有一台完全合格的
+    wc，所以這裡走的一定是次數上限那條路，不是「沒人跑得動」。"""
+    csrf = _login(client)
+    worker_a, sk_a = _register_worker(client, csrf, "wa")
+    worker_b, _sk_b = _register_worker(client, csrf, "wb")
+    _register_worker(client, csrf, "wc")
+    job_id = _submit(client, csrf)
+    key = _job_row(job_id).signature
+    _exhaust_attempts(job_id, spent=5, spender=worker_b)
+    _seed_unsuitable(worker_b, key, failures=5, error="wb exploded")
+
+    ws = _connect(client, worker_a, sk_a)
+    try:
+        ws.send_json({"type": "heartbeat", "state": "idle", "progress": 0.0, "job_id": None, "dynamic": {}})
+        agentws.dispatch_once(worker_a)
+        assert ws.receive_json()["type"] == "job"
+        ws.send_json({"type": "job_failed", "job_id": job_id, "error": "wa exploded"})
+        agentws.dispatch_once(worker_a)
+    finally:
+        ws.close()
+
+    job = _job_row(job_id)
+    assert job.status == "failed"
+    assert "已在 2 台 worker 嘗試 6 次全部失敗" in job.error
+    assert "failed on 2 workers after 6 attempts" in job.error
+    assert "wb: wb exploded" in job.error
+    assert "wa: wa exploded" in job.error
+
+
+def test_the_only_worker_being_excluded_fails_the_job_immediately(client):
+    """§5：沒有任何一台有可能跑它 -> 不等次數上限，立刻終局。"""
+    csrf = _login(client)
+    worker_id, sk = _register_worker(client, csrf, "wa")
+    job_id = _submit(client, csrf)
+
+    ws = _connect(client, worker_id, sk)
+    try:
+        for index in (1, 2):
+            ws.send_json(
+                {"type": "heartbeat", "state": "idle", "progress": 0.0, "job_id": None, "dynamic": {}}
+            )
+            agentws.dispatch_once(worker_id)
+            assert ws.receive_json()["type"] == "job"
+            ws.send_json({"type": "job_failed", "job_id": job_id, "error": "boom %d" % index})
+            agentws.dispatch_once(worker_id)
+            ws.receive_json()  # failure receipt
+    finally:
+        ws.close()
+
+    job = _job_row(job_id)
+    assert job.status == "failed"
+    assert "已在 1 台 worker 嘗試 2 次全部失敗" in job.error
+    assert "wa: boom 2" in job.error
+    # 每一次嘗試都有一張非計費失敗收據，包含被 requeue 的那一次。
+    with db.get_session() as session:
+        receipts = session.query(db.Receipt).all()
+    assert len(receipts) == 2
+    assert all((r.kind, r.billable) == ("failed", False) for r in receipts)
+
+
+def test_a_disabled_worker_is_not_a_possible_worker(client):
+    """§6：「有可能跑它」只算未刪除、未停用的 worker；admin 停用的那台不算，
+    所以唯一另一台被停用時第二次失敗就終局。"""
+    csrf = _login(client)
+    worker_a, sk_a = _register_worker(client, csrf, "wa")
+    worker_b, _sk_b = _register_worker(client, csrf, "wb")
+    disabled = client.post("/api/workers/%s/disable" % worker_b, headers={"X-CSRF": csrf})
+    assert disabled.status_code == 200
+    job_id = _submit(client, csrf)
+
+    ws = _connect(client, worker_a, sk_a)
+    try:
+        for index in (1, 2):
+            ws.send_json(
+                {"type": "heartbeat", "state": "idle", "progress": 0.0, "job_id": None, "dynamic": {}}
+            )
+            agentws.dispatch_once(worker_a)
+            assert ws.receive_json()["type"] == "job"
+            ws.send_json({"type": "job_failed", "job_id": job_id, "error": "boom %d" % index})
+            agentws.dispatch_once(worker_a)
+            ws.receive_json()
+    finally:
+        ws.close()
+
+    assert _job_row(job_id).status == "failed"
+
+
+def test_a_failed_child_is_retried_before_cascading(client):
+    """§5 最後一段：分批子 job 也先重試 -- 第一次失敗不得連坐取消兄弟，
+    也不得把父 job 打成 failed。"""
+    csrf = _login(client)
+    worker_a, sk_a = _register_worker(client, csrf, "wa")
+    worker_b, sk_b = _register_worker(client, csrf, "wb")
+    child_ids = _make_split_family("p_retry", [worker_a, worker_b])
+
+    ws_a = _connect(client, worker_a, sk_a)
+    ws_b = _connect(client, worker_b, sk_b)
+    try:
+        _send_hello_v2(ws_a)
+        _send_hello_v2(ws_b)
+        ws_b.send_json(
+            {"type": "heartbeat", "state": "busy", "progress": 0.1, "job_id": child_ids[1], "dynamic": {}}
+        )
+        ws_a.send_json({"type": "job_failed", "job_id": child_ids[0], "error": "CUDA OOM"})
+        assert client.get("/api/jobs/p_retry", headers={"X-CSRF": csrf}).status_code == 200
+
+        assert child_ids[1] not in agentws._connections[worker_b].cancelled_jobs_sent
+    finally:
+        ws_a.close()
+        ws_b.close()
+
+    child = _job_row(child_ids[0])
+    sibling = _job_row(child_ids[1])
+    parent = _job_row("p_retry")
+    assert child.status == "queued"
+    assert child.retry_count == 1
+    assert sibling.status == "running"
+    assert parent.status != "failed"
+
+
+def test_jobs_api_exposes_attempts_and_retry_count(client):
+    """§8：`/api/jobs` 與 `/api/jobs/{id}` 多帶 `attempts`（dict）與
+    `retry_count`，JobDetail 才畫得出「嘗試紀錄」。"""
+    csrf = _login(client)
+    worker_id, _sk = _register_worker(client, csrf, "wa")
+    job_id = _submit(client, csrf)
+    with db.get_session() as session:
+        job = session.get(db.Job, job_id)
+        job.attempts = json.dumps({worker_id: 2})
+        job.retry_count = 2
+        session.commit()
+
+    listed = client.get("/api/jobs", headers={"X-CSRF": csrf}).json()
+    rows = listed["jobs"] if isinstance(listed, dict) else listed
+    row = next(j for j in rows if j["id"] == job_id)
+    assert row["attempts"] == {worker_id: 2}
+    assert row["retry_count"] == 2
+
+    detail = client.get("/api/jobs/%s" % job_id, headers={"X-CSRF": csrf}).json()
+    assert detail["attempts"] == {worker_id: 2}
+    assert detail["retry_count"] == 2

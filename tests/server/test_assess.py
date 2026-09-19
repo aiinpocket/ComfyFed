@@ -1096,3 +1096,87 @@ def test_unverified_models_default_none_matches_previous_behavior():
         {"whatever.safetensors"}, fetchable, [w3]
     )
     assert fetchable_set == {"whatever.safetensors"} and unfetchable == set()
+
+
+# --- 2026-09-19 job-retry §6：派工排除 ---------------------------------------
+
+
+def test_exclusions_by_job_id_make_the_worker_ineligible():
+    """同一台對同一張 job 失敗兩次 -> `(worker.id, job_id)` 進排除集合，
+    理由逐字 `failed_twice_on_job`。"""
+    worker = _worker("w1", node_classes=["KSampler"])
+    needs = assess.JobNeeds(nodes={"KSampler"})
+
+    clean = assess.verdict(worker, needs, {}, [], job_id="j1")
+    assert clean.kind == "eligible"
+
+    v = assess.verdict(
+        worker, needs, {}, [], job_id="j1", exclusions=frozenset({("w1", "j1")})
+    )
+    assert v.kind == "ineligible"
+    assert v.reasons == ["failed_twice_on_job"]
+
+
+def test_exclusions_by_task_key_make_the_worker_ineligible():
+    """(worker, task_key) 的不適任紀錄 -> 理由 `unsuitable:<key 前 12 字>`。"""
+    worker = _worker("w1", node_classes=["KSampler"])
+    needs = assess.JobNeeds(nodes={"KSampler"})
+    key = "0123456789abcdef"
+
+    v = assess.verdict(
+        worker, needs, {}, [], job_id="j9", task_key=key,
+        exclusions=frozenset({("w1", key)}),
+    )
+    assert v.kind == "ineligible"
+    assert v.reasons == ["unsuitable:0123456789ab"]
+
+
+def test_exclusions_only_hit_the_named_worker():
+    worker = _worker("w2", node_classes=["KSampler"])
+    needs = assess.JobNeeds(nodes={"KSampler"})
+    v = assess.verdict(
+        worker, needs, {}, [], job_id="j1", task_key="sig",
+        exclusions=frozenset({("w1", "j1"), ("w1", "sig")}),
+    )
+    assert v.kind == "eligible"
+
+
+def test_exclusions_beat_eligible_after_fetch():
+    """排除是硬理由：連「下載後就能跑」也不再成立 -- 派給它只會再失敗一次。"""
+    worker = _fetch_ready_worker(
+        "w1", node_classes=["KSampler"], dynamic={"free_disk_gb": 500.0}
+    )
+    needs = assess.JobNeeds(nodes={"KSampler"}, models={"flux.safetensors"})
+    fetchable = {"flux.safetensors": 1_000_000}
+
+    without = assess.verdict(worker, needs, {}, [], fetchable, job_id="j1")
+    assert without.kind == "eligible_after_fetch"
+
+    v = assess.verdict(
+        worker, needs, {}, [], fetchable, job_id="j1",
+        exclusions=frozenset({("w1", "j1")}),
+    )
+    assert v.kind == "ineligible"
+    assert v.reasons == ["failed_twice_on_job"]
+    # 缺哪些模型照樣回報，console 的評估面板還要顯示。
+    assert v.missing_models == ["flux.safetensors"]
+
+
+def test_exclusions_default_none_matches_previous_behavior():
+    """既有呼叫端一行都不必改：不傳 `exclusions`/`job_id`/`task_key` 的
+    verdict 和這個功能出現以前一模一樣。"""
+    worker = _worker("w1", node_classes=["KSampler"])
+    needs = assess.JobNeeds(nodes={"KSampler"})
+    assert assess.verdict(worker, needs, {}, []).kind == "eligible"
+
+
+def test_exclusion_reasons_are_reported_together_with_other_hard_reasons():
+    """排除理由和既有硬理由（缺節點）並存，不互相蓋掉。"""
+    worker = _worker("w1", node_classes=["KSampler"])
+    needs = assess.JobNeeds(nodes={"KSampler", "NotThere"})
+    v = assess.verdict(
+        worker, needs, {}, [], job_id="j1", exclusions=frozenset({("w1", "j1")})
+    )
+    assert v.kind == "ineligible"
+    assert "failed_twice_on_job" in v.reasons
+    assert any(r.startswith("missing_nodes:") for r in v.reasons)

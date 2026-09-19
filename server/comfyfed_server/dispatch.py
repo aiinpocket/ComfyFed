@@ -9,7 +9,7 @@ from typing import Optional
 
 from sqlalchemy import update
 
-from . import assess, db, metrics, scheduler, split, stats
+from . import assess, db, metrics, retry, scheduler, split, stats
 
 logger = logging.getLogger(__name__)
 
@@ -89,6 +89,7 @@ def assign_jobs(
     fetchable_models: Optional[dict[str, int]] = None,
     peer_only_models: Optional[frozenset[str]] = None,
     unverified_models: Optional[frozenset[str]] = None,
+    exclusions: Optional[frozenset[tuple[str, str]]] = None,
 ) -> list[tuple[str, db.Job]]:
     """Phase 3.3 §2.5：一次把整批 queued job 和整批 idle worker 做整體配對。
 
@@ -113,6 +114,13 @@ def assign_jobs(
     `fetchable_models` / `peer_only_models` 一如既往直接傳給 `assess.verdict`；
     `None`（預設）代表「沒有東西可下載」。回傳實際 claim 成功的
     `(worker_id, job)`，供 `agentws.dispatch_tick` 推送。
+
+    2026-09-19 job-retry §6：`exclusions` 是 `(worker_id, job_id)` 與
+    `(worker_id, task_key)` 的集合，由 `agentws.dispatch_tick` 一個 tick 建
+    一次（見 `retry.active_unsuitable`），這裡只負責對每一對 (job, worker)
+    把 job 自己的 `job_id`／`task_key` 一起傳給 `assess.verdict`。命中就是
+    `ineligible`，於是那一對在 `scheduler.match` 的成本矩陣裡是 ∞，永遠不會
+    被選中。
     """
     if not idle_worker_ids:
         return []
@@ -209,6 +217,7 @@ def assign_jobs(
                 requirements_override = {}
 
             needs = assess.needs_from_job(job)
+            job_task_key = retry.task_key(job)
             is_light = not needs.models and not (needs.est_vram_gb or 0)
             job_candidates.append(
                 scheduler.JobCandidate(
@@ -229,6 +238,9 @@ def assign_jobs(
                     fetchable_models,
                     peer_only_models,
                     unverified_models,
+                    job_id=job.id,
+                    task_key=job_task_key,
+                    exclusions=exclusions,
                 )
                 # 2026-09-19 model_fetch (final-review I1): EVERY model_fetch
                 # job needs protocol>=5, not just one whose entry happens to
@@ -600,6 +612,24 @@ def _owned_job(
     return job
 
 
+def owned_job(session, job_id: Optional[str], worker_id: str, statuses=None, resolve_warn_level=None):
+    """Public wrapper around `_owned_job` for callers that need the ownership
+    gate WITHOUT a status transition.
+
+    `agentws`'s `job_failed` handling is the one such caller (2026-09-19
+    job-retry §5): it has to read and update `jobs.attempts` /
+    `worker_task_failures` for an attempt BEFORE it can decide whether that
+    attempt ends in a requeue or in a terminal failure -- and that
+    bookkeeping must be behind exactly the same gate every transition is, or
+    a worker could inflate another worker's failure counts by sending
+    someone else's job_id. Defaults to `_OWNED_STATUSES`, the set
+    `mark_failed` uses.
+    """
+    return _owned_job(
+        session, job_id, worker_id, statuses or _OWNED_STATUSES, resolve_warn_level
+    )
+
+
 def mark_running(job_id: str, worker_id: str, resolve_warn_level=None) -> bool:
     """Move an assigned job of `worker_id` to running. Returns whether it acted."""
     with db.get_session() as session:
@@ -631,6 +661,54 @@ def mark_done(job_id: str, worker_id: str, result_files: list, resolve_warn_leve
         metrics.get_metrics().job_run_seconds.observe(max(run_seconds, 0.0))
     # Phase 3.3 §3.4：子 job 動了就重算父 job（不是子 job 的話是 no-op）。
     # 最後一個子 job 完成時父 job 才會翻成 done。
+    split.child_status_changed(job_id)
+    return True
+
+
+def requeue_for_retry(job_id: str, worker_id: str, error: str) -> bool:
+    """2026-09-19 job-retry §5：非終局失敗 -- 把 `worker_id` 的 job 送回佇列。
+
+    `mark_failed` 的重試孿生：同一道 `_owned_job` 閘門（一個 worker 永遠只能
+    轉移它此刻真的擁有、而且還沒終局的 job），但套的是 §5 的 requeue 欄位而
+    不是 `failed`：
+
+        status=queued, worker_id=NULL, last_worker_id=W, progress=0,
+        started_at=NULL, finished_at=NULL, error=E, retry_count += 1
+
+    `error` 是刻意留著的：那一欄的語意從「這張 job 死於什麼」擴成「最後一次
+    嘗試死於什麼」，console 在 `retry_count > 0` 的 queued job 上顯示成「上次
+    錯誤」。`started_at` 清掉是因為下一台 worker 會重新開始跑，留著舊的會讓
+    收據的 wall-clock 基準橫跨兩次嘗試。`signature` 保留 -- 它是工作本身的
+    指紋，和哪台跑無關；`dispatch_info` 歸零，因為那是「上一次選誰、憑什麼」
+    的紀錄，下一輪會重寫。
+
+    `attempts` 不在這裡動：計次在 `agentws` 的 `job_failed` 分流裡跟
+    `worker_task_failures` 一起做完，這個函式只負責「怎麼放回佇列」，好讓終
+    局／非終局兩條路的計次邏輯只有一份。
+
+    回傳有沒有真的動作（和 `mark_failed` 一樣），呼叫端據此決定要不要發收據
+    與面板事件。
+
+    §3.4：子 job 被送回佇列後父 job 要跟著重算（可能從 running 退回
+    assigned/queued）-- 和 `requeue_stale` 同一個呼叫，而且因為這條路從不產
+    生 `failed`/`cancelled`，兄弟永遠不會被連坐取消。連坐只發生在真的終局的
+    `mark_failed` 上。
+    """
+    with db.get_session() as session:
+        job = _owned_job(session, job_id, worker_id, _OWNED_STATUSES)
+        if job is None:
+            return False
+        job.status = "queued"
+        job.last_worker_id = worker_id
+        job.worker_id = None
+        job.progress = 0
+        job.started_at = None
+        job.finished_at = None
+        job.error = error
+        job.retry_count = (job.retry_count or 0) + 1
+        job.dispatch_info = "{}"
+        session.commit()
+
     split.child_status_changed(job_id)
     return True
 
