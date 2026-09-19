@@ -333,6 +333,34 @@ class WorkerTaskFailure(Base):
     updated_at: Mapped[datetime] = mapped_column(DateTime, default=_utcnow)
 
 
+class ApiToken(Base):
+    """2026-09-19 §4.1：一枚長效 bearer 憑證，供 AI／MCP 代替使用者打 API。
+
+    明文只在建立的那一次回應裡出現，伺服器只留 sha256（`token_hash`）與前
+    12 字（`prefix`，供使用者在清單裡認出是哪一枚）。`epoch` 是建立當下的
+    `users.session_epoch`：改密碼／停用／重設密碼會把 epoch 往上加，於是這
+    個使用者的所有舊 token 一次全部失效 —— 與 session cookie 完全同一套機
+    制（見 `auth._session_user_from_payload`）。
+
+    撤銷是軟的（`revoked_at` 打時間戳，列不刪），使用者才看得到「這枚是我
+    什麼時候撤掉的」。`last_used_at` 最多每 `API_TOKEN_TOUCH_SECONDS` 秒寫
+    回一次 —— 它只是給人看的，不值得讓每一個 bearer 請求都多一次寫入。
+    """
+
+    __tablename__ = "api_tokens"
+
+    id: Mapped[str] = mapped_column(String, primary_key=True, default=_uuid_hex)
+    user_id: Mapped[str] = mapped_column(String)
+    name: Mapped[str] = mapped_column(String, default="", server_default="")
+    token_hash: Mapped[str] = mapped_column(String, unique=True)
+    prefix: Mapped[str] = mapped_column(String)
+    epoch: Mapped[int] = mapped_column(Integer, default=0, server_default="0")
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=_utcnow)
+    expires_at: Mapped[datetime] = mapped_column(DateTime)
+    last_used_at: Mapped[Optional[datetime]] = mapped_column(DateTime, nullable=True)
+    revoked_at: Mapped[Optional[datetime]] = mapped_column(DateTime, nullable=True)
+
+
 class LoginAttempt(Base):
     __tablename__ = "login_attempts"
 

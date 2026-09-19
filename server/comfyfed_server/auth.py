@@ -14,13 +14,13 @@ import math
 import secrets
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
-from typing import Optional
+from typing import Literal, Optional
 
 from fastapi import APIRouter, Cookie, Depends, Header, HTTPException, Response
 from itsdangerous import BadSignature, SignatureExpired, URLSafeTimedSerializer
 from pydantic import BaseModel
 
-from . import db, limits, panelws, security, split
+from . import api_tokens, db, limits, panelws, security, split
 
 _SESSION_SECRET_KEY = "session_secret"
 _LANG_KEY = "lang"
@@ -114,6 +114,11 @@ class ChangePasswordBody(BaseModel):
     new: str
 
 
+def _utcnow() -> datetime:
+    """Timezone-naive UTC now, matching how every timestamp in `db` is stored."""
+    return datetime.now(timezone.utc).replace(tzinfo=None)
+
+
 def _error(status_code: int, code: str, message: str = "") -> HTTPException:
     return HTTPException(status_code=status_code, detail={"code": code, "message": message or code})
 
@@ -149,11 +154,24 @@ def read_session_payload(session_cookie: Optional[str]) -> Optional[dict]:
 
 @dataclass
 class SessionUser:
-    """The authenticated principal behind a validated session cookie."""
+    """The authenticated principal behind a validated session cookie -- or,
+    since 2026-09-19 (spec §4.3), behind an `Authorization: Bearer cft_...`
+    API token, which is equivalent everywhere a session is accepted except
+    the token-management / change-password / logout routes.
+
+    `auth` says which of the two it was, so `/api/auth/me` can report it and
+    so the CSRF-enforcing dependencies know to skip the header check (a
+    bearer token is never sent cross-site by a browser). `token_expires_at`
+    is the ISO timestamp of the token behind a `auth == "token"` principal,
+    `None` for a cookie session -- the MCP client shows it to the user so an
+    expiry is not a surprise 401.
+    """
 
     uid: str
     username: str
     role: str
+    auth: Literal["session", "token"] = "session"
+    token_expires_at: Optional[str] = None
 
 
 def _session_user_from_payload(db_session, payload: Optional[dict]) -> Optional[SessionUser]:
@@ -196,12 +214,48 @@ def resolve_session_user(db_session, request) -> Optional[SessionUser]:
     return _session_user_from_payload(db_session, payload)
 
 
+def _bearer_user(authorization: Optional[str]) -> SessionUser:
+    """`Authorization` header -> `SessionUser`, or 401 (spec §4.3).
+
+    Every failure reason -- malformed header, unknown/revoked/expired token,
+    stale epoch, disabled user -- answers the SAME 401 as a missing cookie
+    does. Telling a caller WHICH of those it was would hand an attacker an
+    oracle over other people's tokens, and the honest caller cannot act on
+    the distinction anyway: get a new token.
+    """
+    with db.get_session() as db_session:
+        resolved = api_tokens.resolve_bearer_token(
+            db_session, authorization, _utcnow()
+        )
+        if resolved is None:
+            raise _error(401, "auth.required", "Login required.")
+        row, user = resolved
+        return SessionUser(
+            uid=user.id,
+            username=user.username,
+            role=user.role,
+            auth="token",
+            token_expires_at=row.expires_at.isoformat(),
+        )
+
+
 async def require_user(
     cf_session: Optional[str] = Cookie(default=None),
+    authorization: Optional[str] = Header(default=None),
 ) -> SessionUser:
-    """FastAPI dependency: any logged-in, enabled user with a current-epoch
-    session cookie. 401 if the cookie is absent/invalid/missing uid, or if
-    the referenced user is missing, disabled, or stale-epoch."""
+    """FastAPI dependency: any logged-in, enabled user -- via a current-epoch
+    session cookie, or via an API token (spec §4.3). 401 if the cookie is
+    absent/invalid/missing uid, if the referenced user is missing, disabled,
+    or stale-epoch, or if the bearer token fails any of its own checks.
+
+    An `Authorization` header present at all means bearer-ONLY: no fallback
+    to the cookie, even a valid one. Mixing the two would make "which
+    identity is this request?" depend on which credential happened to be
+    better -- a browser tab with a stale token would silently act as its
+    cookie user instead of failing.
+    """
+    if authorization is not None:
+        return _bearer_user(authorization)
     payload = read_session_payload(cf_session)
     if payload is None:
         raise _error(401, "auth.required", "Login required.")
@@ -240,9 +294,15 @@ async def require_csrf(
     state-changing route (POST/PUT/DELETE), and on `require_admin` alone for
     read-only admin routes. (`change-password` below is CSRF-protected too,
     but any logged-in user -- not just admin -- may change their own
-    password, so it checks CSRF itself against `require_user` rather than
-    going through this admin-only dependency.)
+    password, so it hangs off the cookie-only `require_csrf_session` rather
+    than going through this admin-only dependency.)
+
+    A bearer-authenticated caller skips the CSRF check entirely (spec §4.3):
+    CSRF exists because a browser attaches cookies to cross-site requests by
+    itself, and it never attaches an `Authorization` header by itself.
     """
+    if user.auth == "token":
+        return user
     _payload_and_csrf(cf_session, x_csrf)
     return user
 
@@ -259,8 +319,35 @@ async def require_csrf_user(
     but still need the same CSRF enforcement any state-changing,
     cookie-authenticated route gets. `require_csrf` can't be reused as-is
     because it hangs off `require_admin`.
+
+    Bearer callers skip CSRF -- same reasoning as `require_csrf`.
     """
+    if user.auth == "token":
+        return user
     _payload_and_csrf(cf_session, x_csrf)
+    return user
+
+
+async def require_csrf_session(
+    cf_session: Optional[str] = Cookie(default=None),
+    x_csrf: Optional[str] = Header(default=None, alias="X-CSRF"),
+) -> SessionUser:
+    """Cookie-ONLY, CSRF-enforcing dependency: an API token can never satisfy
+    it (spec §4.3's exception list).
+
+    The routes behind this are the ones a token must not be able to reach
+    even though it otherwise speaks for its user: minting/listing/revoking
+    tokens (a stolen token must not be able to mint itself a successor that
+    outlives revocation), changing the password, and logging out. It
+    deliberately does NOT take an `Authorization` header at all -- a bearer
+    request simply has no cookie to check, so it gets the same 401 as an
+    anonymous one.
+    """
+    payload = _payload_and_csrf(cf_session, x_csrf)
+    with db.get_session() as db_session:
+        user = _session_user_from_payload(db_session, payload)
+    if user is None:
+        raise _error(401, "auth.required", "Login required.")
     return user
 
 
@@ -328,7 +415,9 @@ def login(body: LoginBody, response: Response):
 
 
 @router.post("/logout")
-def logout(response: Response):
+def logout(response: Response, _user: SessionUser = Depends(require_csrf_session)):
+    """Cookie-only (spec §4.3): there is no cookie for a bearer caller to drop,
+    so an API token gets the same 401 here as an anonymous request."""
     response.delete_cookie(SESSION_COOKIE_NAME)
     return {"ok": True}
 
@@ -341,13 +430,29 @@ _ME_CACHE_CONTROL = "private, no-store"
 
 
 @router.get("/me")
-def me(response: Response, cf_session: Optional[str] = Cookie(default=None)):
+def me(
+    response: Response,
+    cf_session: Optional[str] = Cookie(default=None),
+    authorization: Optional[str] = Header(default=None),
+):
+    """Who am I, and (spec §4.3) by which credential.
+
+    Anonymous callers still get the public `{authenticated: false, lang,
+    platform_url}` shape -- the console reads this before login. A bearer
+    caller is the exception: a present-but-invalid `Authorization` header is
+    a 401, not an anonymous 200, because this is the route the MCP client
+    calls to check its token is still good (spec §6.3 `platform_status`),
+    and "your token died" must not look like "the platform is fine".
+    """
     response.headers["Cache-Control"] = _ME_CACHE_CONTROL
-    payload = read_session_payload(cf_session)
+
+    token_user = _bearer_user(authorization) if authorization is not None else None
+    payload = None if token_user is not None else read_session_payload(cf_session)
+
     with db.get_session() as db_session:
         lang = _get_setting(db_session, _LANG_KEY) or "en"
         platform_url = _get_setting(db_session, _PLATFORM_URL_KEY) or ""
-        user = _session_user_from_payload(db_session, payload)
+        user = token_user or _session_user_from_payload(db_session, payload)
 
     if user is None:
         return {"authenticated": False, "lang": lang, "platform_url": platform_url}
@@ -359,6 +464,8 @@ def me(response: Response, cf_session: Optional[str] = Cookie(default=None)):
         "lang": lang,
         "platform_url": platform_url,
         "csrf": payload.get("csrf") if payload else None,
+        "auth": user.auth,
+        "token_expires_at": user.token_expires_at,
     }
 
 
@@ -366,8 +473,7 @@ def me(response: Response, cf_session: Optional[str] = Cookie(default=None)):
 def change_password(
     body: ChangePasswordBody,
     response: Response,
-    cf_session: Optional[str] = Cookie(default=None),
-    x_csrf: Optional[str] = Header(default=None, alias="X-CSRF"),
+    user: SessionUser = Depends(require_csrf_session),
 ):
     """Any logged-in user may change their own password (CSRF-protected).
 
@@ -376,17 +482,15 @@ def change_password(
     too. Bumps `session_epoch` so every OTHER session for this account stops
     validating, then immediately re-issues a fresh cookie at the new epoch so
     the caller's own session stays logged in.
-    """
-    payload = _payload_and_csrf(cf_session, x_csrf)
 
+    Cookie-only (`require_csrf_session`, spec §4.3): an API token must not be
+    able to rotate the password of the account it belongs to -- especially
+    since doing so would bump `session_epoch` and kill every OTHER token.
+    """
     if len(body.new) < 8:
         raise _error(400, "auth.password_too_short", "New password must be at least 8 characters.")
 
     with db.get_session() as db_session:
-        user = _session_user_from_payload(db_session, payload)
-        if user is None:
-            raise _error(401, "auth.required", "Login required.")
-
         db_user = db_session.get(db.User, user.uid)
         if db_user is None or not security.verify_password(body.old, db_user.password_hash):
             raise _error(401, "auth.required", "Old password is incorrect.")
@@ -407,6 +511,78 @@ def change_password(
     panelws.close_for_uid(uid)
 
     return {"ok": True, "csrf": csrf}
+
+
+class CreateTokenBody(BaseModel):
+    name: Optional[str] = None
+
+
+# 2026-09-19 spec §4.2：三條 token 管理端點。全部走 `require_csrf_session`
+# —— cookie＋CSRF，bearer 一律 401（token 不能再生 token）。
+@router.post("/tokens", status_code=201)
+def create_api_token(
+    user: SessionUser = Depends(require_csrf_session),
+    body: Optional[CreateTokenBody] = None,
+):
+    """Mint an API token for the caller. The plaintext appears in THIS
+    response and nowhere else, ever -- the server keeps only its sha256.
+
+    The body (and `name` within it) is optional -- spec §4.2 -- so a caller
+    that just wants a token need not invent a label for it.
+    """
+    with db.get_session() as db_session:
+        db_user = db_session.get(db.User, user.uid)
+        if db_user is None:
+            raise _error(401, "auth.required", "Login required.")
+        try:
+            row, plaintext = api_tokens.create_token(
+                db_session,
+                db_user,
+                ((body.name if body else None) or "").strip(),
+                _utcnow(),
+            )
+        except api_tokens.BadName:
+            raise _error(
+                400,
+                "auth.bad_token_name",
+                f"Token name must be at most {api_tokens.API_TOKEN_NAME_MAX} characters."
+                f" / 名稱最多 {api_tokens.API_TOKEN_NAME_MAX} 字。",
+            )
+        except api_tokens.TooManyTokens:
+            raise _error(
+                409,
+                "auth.too_many_tokens",
+                f"At most {api_tokens.API_TOKEN_MAX_ACTIVE_PER_USER} active tokens;"
+                f" revoke one first. / 最多 {api_tokens.API_TOKEN_MAX_ACTIVE_PER_USER}"
+                f" 枚有效 token，請先撤銷一枚。",
+            )
+
+        return {
+            "id": row.id,
+            "name": row.name,
+            "token": plaintext,
+            "prefix": row.prefix,
+            "created_at": row.created_at.isoformat(),
+            "expires_at": row.expires_at.isoformat(),
+        }
+
+
+@router.get("/tokens")
+def list_api_tokens(user: SessionUser = Depends(require_csrf_session)):
+    """The caller's own tokens, newest first. Never includes any plaintext."""
+    with db.get_session() as db_session:
+        return api_tokens.list_tokens(db_session, user.uid, _utcnow())
+
+
+@router.delete("/tokens/{token_id}")
+def revoke_api_token(token_id: str, user: SessionUser = Depends(require_csrf_session)):
+    """Revoke one of the caller's tokens. Idempotent; someone else's token
+    (or one that never existed) is a 404 -- the two are deliberately
+    indistinguishable, so this cannot be used to probe for token ids."""
+    with db.get_session() as db_session:
+        if not api_tokens.revoke_token(db_session, user.uid, token_id, _utcnow()):
+            raise _error(404, "auth.token_not_found", "No such token.")
+    return {"revoked": True}
 
 
 class SettingsBody(BaseModel):
