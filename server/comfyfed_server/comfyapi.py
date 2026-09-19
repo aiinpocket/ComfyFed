@@ -79,6 +79,7 @@ from . import (
     db,
     jobs,
     limits,
+    model_fetch,
     model_guide,
     model_manifest,
     panelws,
@@ -259,6 +260,16 @@ def _safe_userdata_subdir(value: str) -> str:
 def _userdata_path(data_dir: str, uid: str, relpath: str) -> str:
     """Absolute filesystem path for an ALREADY-sanitized relative path."""
     return os.path.join(userdata_dir(data_dir, uid), *relpath.split("/")) if relpath else userdata_dir(data_dir, uid)
+
+
+def _model_fetch_error(code: str, message: str) -> JSONResponse:
+    """§5.1's flat refusal envelope: `{"error": "model_fetch.<code>",
+    "message": "<zh-TW> / <English>"}`. Flat rather than ComfyUI's nested
+    `{"error": {...}}` because this endpoint is ComfyFed's own, read only by
+    `panel_ext/comfyfed.js`, not by the stock frontend."""
+    return JSONResponse(
+        status_code=400, content={"error": f"model_fetch.{code}", "message": message}
+    )
 
 
 def _limit_error(status: int, code: str, message: str) -> JSONResponse:
@@ -1796,6 +1807,58 @@ def create_router(
     # forgets on every reload is worse than useless. They persist to one JSON
     # file next to the database -- ComfyFed has a single admin, so upstream's
     # per-user split buys nothing.
+
+    # --- 2026-09-19：面板「下載」鈕改派 worker 下載（spec §5）--------------
+    #
+    # 官方前端的「下載 {model}」鈕原本是把模型抓到使用者自己的瀏覽器，和
+    # 聯邦的設計正好相反。`panel_ext/comfyfed.js` 攔下那顆鈕，改打這兩條。
+    # 掛在 `/comfy/api/comfyfed/` 底下（不是 ComfyUI 原生路徑），所以永遠不會
+    # 和上游新增的端點相撞。
+
+    @r.post("/comfyfed/model-fetch")
+    async def model_fetch_create(
+        request: Request, user: auth.SessionUser = Depends(auth.require_user)
+    ) -> Response:
+        try:
+            body = await request.json()
+        except Exception:
+            body = None
+        if not isinstance(body, dict):
+            return _model_fetch_error("bad_request", model_fetch._MESSAGES["bad_request"])
+
+        try:
+            job_id, reused = model_fetch.create_fetch_job(
+                name=body.get("name"),
+                directory=body.get("directory", ""),
+                url=body.get("url"),
+                user_id=user.uid,
+                data_dir=data_dir,
+            )
+        except model_fetch.FetchRequestError as exc:
+            return _model_fetch_error(exc.code, exc.message)
+
+        return JSONResponse(
+            status_code=200 if reused else 201,
+            content={"job_id": job_id, "reused": reused},
+        )
+
+    @r.get("/comfyfed/model-fetch/{job_id}")
+    def model_fetch_status(
+        job_id: str, user: auth.SessionUser = Depends(auth.require_user)
+    ) -> Response:
+        # Readable by any logged-in user: the payload is a model name and a
+        # download percentage, nothing user-scoped -- and "全部下載" from one
+        # browser must be able to watch a job another one already created.
+        status = model_fetch.fetch_status(job_id)
+        if status is None:
+            return JSONResponse(
+                status_code=404,
+                content={
+                    "error": "model_fetch.not_found",
+                    "message": "找不到下載任務 / fetch job not found",
+                },
+            )
+        return JSONResponse(content=status)
 
     @r.get("/features")
     def features() -> Response:
