@@ -246,7 +246,12 @@
     "fetch_directory": "存放目錄",
     "fetch_url": "來源網址",
     "fetch_size": "檔案大小",
-    "fetch_sha256": "SHA-256"
+    "fetch_sha256": "SHA-256",
+    "section_attempts": "嘗試紀錄",
+    "requeued_count": "已重派 {{count}} 次",
+    "attempts_worker": "Worker",
+    "attempts_failures": "失敗次數",
+    "last_error": "上次錯誤"
   },
   "workers": {
     "title": "Worker",
@@ -301,7 +306,18 @@
     "delete_confirm_hint": "此動作無法復原。",
     "deleted_title": "已刪除 Worker",
     "deleted_message": "「{{name}}」已從列表移除，帳務紀錄仍然保留。",
-    "delete_failed": "無法刪除這台 Worker"
+    "delete_failed": "無法刪除這台 Worker",
+    "unsuitable_heading": "不適任任務",
+    "unsuitable_col_key": "任務類別",
+    "unsuitable_col_failures": "失敗次數",
+    "unsuitable_col_last_error": "最後錯誤",
+    "unsuitable_col_updated": "更新時間",
+    "unsuitable_expired": "已過期",
+    "unsuitable_clear": "清除",
+    "unsuitable_clear_all": "全部清除",
+    "unsuitable_clear_failed": "無法清除不適任紀錄",
+    "unsuitable_cleared": "已清除不適任紀錄",
+    "unsuitable_last_job_link": "查看任務"
   },
   "users": {
     "title": "使用者",

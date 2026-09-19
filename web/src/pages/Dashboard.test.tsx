@@ -57,6 +57,7 @@ const WORKER: Worker = {
   peer_lan_url: null,
   peer_nat: 'none',
   peer_reachable: null,
+  unsuitable: [],
 };
 
 function jsonResponse(body: unknown, status = 200): Response {

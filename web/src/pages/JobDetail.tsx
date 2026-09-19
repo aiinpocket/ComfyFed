@@ -289,6 +289,59 @@ export function JobDetail({ role }: JobDetailProps) {
             </Card>
           </SimpleGrid>
 
+          {(job.retry_count > 0 || Object.keys(job.attempts).length > 0) && (
+            <Card style={cardStyle}>
+              <Stack gap="sm">
+                <Text fw={600}>{t('job_detail.section_attempts')}</Text>
+                <Text size="sm">{t('job_detail.requeued_count', { count: job.retry_count })}</Text>
+                {Object.keys(job.attempts).length > 0 && (
+                  <Table verticalSpacing="xs" horizontalSpacing="md">
+                    <Table.Thead>
+                      <Table.Tr>
+                        <Table.Th>{t('job_detail.attempts_worker')}</Table.Th>
+                        <Table.Th>{t('job_detail.attempts_failures')}</Table.Th>
+                      </Table.Tr>
+                    </Table.Thead>
+                    <Table.Tbody>
+                      {Object.entries(job.attempts).map(([workerId, failures]) => (
+                        <Table.Tr key={workerId}>
+                          <Table.Td>
+                            <Text size="sm">{workerName.get(workerId) ?? shortId(workerId)}</Text>
+                          </Table.Td>
+                          <Table.Td>
+                            <Text size="sm">{failures}</Text>
+                          </Table.Td>
+                        </Table.Tr>
+                      ))}
+                    </Table.Tbody>
+                  </Table>
+                )}
+                {job.status === 'queued' && job.retry_count > 0 && job.error && (
+                  <Stack gap={4}>
+                    <Text size="xs" c="dimmed">
+                      {t('job_detail.last_error')}
+                    </Text>
+                    <Box
+                      style={{
+                        maxHeight: 200,
+                        overflow: 'auto',
+                        borderRadius: theme.radius.md,
+                        border: `1px solid ${theme.other.surfaces.border}`,
+                      }}
+                    >
+                      <Code
+                        block
+                        style={{ background: theme.other.surfaces.raised, fontSize: 12, whiteSpace: 'pre-wrap' }}
+                      >
+                        {job.error}
+                      </Code>
+                    </Box>
+                  </Stack>
+                )}
+              </Stack>
+            </Card>
+          )}
+
           {job.error && (
             <Card style={cardStyle}>
               <Stack gap="sm">

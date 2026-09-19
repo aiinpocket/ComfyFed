@@ -218,6 +218,24 @@ export interface Worker {
    * 兩套後端都把它序列化成整數 1/0（SQLite / D1 沒有原生 boolean），
    * 所以型別要同時容納 number 與 boolean —— 判讀一律走 `peerReachable()`。 */
   peer_reachable: number | boolean | null;
+  /**
+   * Job-retry design (2026-09-19) §8: tasks this worker has repeatedly
+   * failed and is currently excluded from (`task_key` = job.signature, or
+   * `model_fetch:<name>` for a model-fetch job). `active` is false once the
+   * row has aged past the server's TTL -- it stays in the list (informational)
+   * but no longer affects dispatch.
+   */
+  unsuitable: UnsuitableTask[];
+}
+
+/** One row of `Worker.unsuitable` (design §7/§8). */
+export interface UnsuitableTask {
+  task_key: string;
+  failures: number;
+  last_error: string | null;
+  last_job_id: string | null;
+  updated_at: string | null;
+  active: boolean;
 }
 
 /** `peer_reachable` 的三態判讀。後端（Python SQLite / Cloud D1）都把它存成
@@ -270,6 +288,19 @@ export interface Job {
   result_files: string[];
   input_assets: string[];
   est_vram_gb: number | null;
+  /**
+   * Job-retry design (2026-09-19) §4/§8: failures per worker for this job
+   * (`{worker_id: failure_count}`); each worker gets excluded from this job
+   * once its count reaches the server's per-job threshold.
+   */
+  attempts: Record<string, number>;
+  /**
+   * How many times this job has been requeued after a non-final failure.
+   * While `status === 'queued'` and `retry_count > 0`, `error` holds the
+   * most recent attempt's failure (design §5 -- the field's meaning shifts
+   * from "the failure" to "the last failure" once requeued).
+   */
+  retry_count: number;
   /**
    * Phase 3.3 batch splitting: how many children this job was split into (0
    * = an ordinary job, not split). The list only shows parents/ordinary jobs
@@ -577,6 +608,17 @@ export const api = {
    * or already-deleted worker. */
   deleteWorker(workerId: string): Promise<{ ok: boolean }> {
     return deleteJson(`/api/workers/${encodeURIComponent(workerId)}`);
+  },
+
+  /**
+   * Admin: clear a worker's unsuitable-task record(s) (design §7). With
+   * `taskKey`, `DELETE /api/workers/{id}/unsuitable/{task_key}` drops just
+   * that row; without one, `DELETE /api/workers/{id}/unsuitable` clears
+   * every row for the worker. Either way the server answers `{cleared: n}`.
+   */
+  clearUnsuitable(workerId: string, taskKey?: string): Promise<{ cleared: number }> {
+    const base = `/api/workers/${encodeURIComponent(workerId)}/unsuitable`;
+    return deleteJson(taskKey ? `${base}/${encodeURIComponent(taskKey)}` : base);
   },
 
   listJobs(statuses?: string[]): Promise<Job[]> {

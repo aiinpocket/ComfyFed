@@ -57,6 +57,8 @@ const RUNNING_JOB: Job = {
   est_vram_gb: null,
   split_count: 0,
   dispatch_info: {},
+  attempts: {},
+  retry_count: 0,
   kind: 'prompt',
 };
 
@@ -73,6 +75,8 @@ const DONE_JOB: Job = {
   est_vram_gb: null,
   split_count: 0,
   dispatch_info: {},
+  attempts: {},
+  retry_count: 0,
   kind: 'prompt',
 };
 
@@ -89,6 +93,8 @@ const CANCELLED_JOB: Job = {
   est_vram_gb: null,
   split_count: 0,
   dispatch_info: {},
+  attempts: {},
+  retry_count: 0,
   kind: 'prompt',
 };
 
@@ -107,6 +113,7 @@ const WORKER: Worker = {
   peer_lan_url: null,
   peer_nat: 'none',
   peer_reachable: null,
+  unsuitable: [],
 };
 
 function jsonResponse(body: unknown, status = 200): Response {
@@ -178,6 +185,8 @@ const FETCHING_JOB: Job = {
   fetch_model: 'sd_xl_base_1.0.safetensors',
   split_count: 0,
   dispatch_info: {},
+  attempts: {},
+  retry_count: 0,
   kind: 'prompt',
 };
 

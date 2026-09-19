@@ -56,6 +56,7 @@ const BASE_WORKER: Worker = {
   peer_nat: 'natpmp',
   // 後端（SQLite / D1）把 boolean 存成整數，JSON 出來就是 1/0——fixture 照實寫。
   peer_reachable: 1,
+  unsuitable: [],
 };
 
 const QUIET_WORKER: Worker = {
@@ -281,6 +282,112 @@ describe('Workers page: role-gated mutation controls', () => {
     expect(screen.getByRole('button', { name: 'Add worker' })).toBeInTheDocument();
     expect(screen.getByRole('button', { name: 'Disable' })).toBeInTheDocument();
     expect(screen.getByRole('button', { name: 'Delete' })).toBeInTheDocument();
+  });
+});
+
+describe('Workers page: unsuitable tasks (job-retry design 2026-09-19)', () => {
+  afterEach(() => {
+    cleanup();
+    vi.unstubAllGlobals();
+  });
+
+  const UNSUITABLE_WORKER: Worker = {
+    ...BASE_WORKER,
+    id: 'w-0000000003',
+    name: 'runner-unsuitable',
+    unsuitable: [
+      {
+        task_key: 'sig-abcdef0123456789',
+        failures: 2,
+        last_error: 'CUDA out of memory. Tried to allocate 2.00 GiB.',
+        last_job_id: 'job-aaaaaaaa-1111',
+        updated_at: '2026-09-18T00:00:00Z',
+        active: true,
+      },
+      {
+        task_key: 'model_fetch:old-lora.safetensors',
+        failures: 2,
+        last_error: 'download failed',
+        last_job_id: null,
+        updated_at: '2026-09-01T00:00:00Z',
+        active: false,
+      },
+    ],
+  };
+
+  function stubFetchWithClear(workers: Worker[]) {
+    let list = [...workers];
+    const fetchMock = vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+      const url = typeof input === 'string' ? input : input.toString();
+      const method = init?.method ?? 'GET';
+      const clearMatch = /^\/api\/workers\/([^/]+)\/unsuitable(?:\/([^/]+))?$/.exec(url);
+      if (clearMatch && method === 'DELETE') {
+        const [, workerId, taskKey] = clearMatch;
+        list = list.map((w) =>
+          w.id === workerId
+            ? { ...w, unsuitable: taskKey ? w.unsuitable.filter((u) => u.task_key !== decodeURIComponent(taskKey)) : [] }
+            : w,
+        );
+        return jsonResponse({ cleared: 1 });
+      }
+      if (url.startsWith('/api/workers')) return jsonResponse(list);
+      return jsonResponse({ error: { code: 'http_error', message: 'not stubbed' } }, 404);
+    });
+    vi.stubGlobal('fetch', fetchMock);
+    return fetchMock;
+  }
+
+  it('renders the unsuitable block with key prefix, failures, last error and expired badge', async () => {
+    stubFetch([UNSUITABLE_WORKER]);
+    renderWorkers();
+
+    expect(await screen.findByText('Unsuitable tasks')).toBeInTheDocument();
+    expect(screen.getByText('sig-abcdef01')).toBeInTheDocument();
+    expect(screen.getByText(/CUDA out of memory/)).toBeInTheDocument();
+    expect(screen.getByText('Expired')).toBeInTheDocument();
+    expect(screen.getByRole('link', { name: 'View job' })).toHaveAttribute(
+      'href',
+      '/jobs/job-aaaaaaaa-1111',
+    );
+  });
+
+  it('hides the unsuitable block for a worker with an empty list', async () => {
+    stubFetch([BASE_WORKER]);
+    renderWorkers();
+
+    await screen.findByText('runner-sharing');
+    expect(screen.queryByText('Unsuitable tasks')).not.toBeInTheDocument();
+  });
+
+  it('an admin sees Clear buttons and clicking one calls the DELETE route', async () => {
+    const fetchMock = stubFetchWithClear([UNSUITABLE_WORKER]);
+    renderWorkers('admin');
+
+    await screen.findByText('Unsuitable tasks');
+    const clearButtons = screen.getAllByRole('button', { name: 'Clear' });
+    expect(clearButtons.length).toBeGreaterThan(0);
+    fireEvent.click(clearButtons[0]!);
+
+    await waitFor(() => {
+      expect(
+        fetchMock.mock.calls.some(([reqUrl, reqInit]) => {
+          const url = typeof reqUrl === 'string' ? reqUrl : String(reqUrl);
+          return (
+            url === `/api/workers/${UNSUITABLE_WORKER.id}/unsuitable/sig-abcdef0123456789` &&
+            (reqInit as RequestInit | undefined)?.method === 'DELETE'
+          );
+        }),
+      ).toBe(true);
+    });
+  });
+
+  it('a non-admin user does not see Clear buttons', async () => {
+    stubFetch([UNSUITABLE_WORKER]);
+    renderWorkers('user');
+
+    await screen.findByText('Unsuitable tasks');
+    expect(screen.queryByRole('button', { name: 'Clear' })).not.toBeInTheDocument();
+    expect(screen.queryByRole('button', { name: 'Clear all' })).not.toBeInTheDocument();
   });
 });
 

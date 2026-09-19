@@ -73,6 +73,8 @@ const BASE_JOB: JobDetailType = {
   dispatch_info: {},
   children: [],
   gpu_seconds_total: 0,
+  attempts: {},
+  retry_count: 0,
 };
 
 const WORKER: Worker = {
@@ -90,6 +92,7 @@ const WORKER: Worker = {
   peer_lan_url: null,
   peer_nat: 'none',
   peer_reachable: null,
+  unsuitable: [],
 };
 
 function jsonResponse(body: unknown, status = 200): Response {
@@ -277,6 +280,68 @@ describe('JobDetail', () => {
 
     expect(await screen.findByText(LONG_ERROR)).toBeInTheDocument();
     expect(screen.queryByText('Could not load this job.')).not.toBeInTheDocument();
+  });
+});
+
+describe('JobDetail: attempts (job-retry design 2026-09-19)', () => {
+  afterEach(() => {
+    cleanup();
+    vi.unstubAllGlobals();
+  });
+
+  it('renders a worker row with its failure count and the requeued-count line', async () => {
+    const requeuedJob: JobDetailType = {
+      ...BASE_JOB,
+      status: 'queued',
+      error: 'CUDA out of memory',
+      attempts: { w1: 2 },
+      retry_count: 1,
+    };
+    stubFetch(requeuedJob, { workers: [WORKER], role: 'admin' });
+    renderDetail(requeuedJob.id, 'admin');
+
+    expect(await screen.findByText('Attempts')).toBeInTheDocument();
+    expect(screen.getAllByText('runner-1').length).toBeGreaterThan(0);
+    expect(screen.getByText('2')).toBeInTheDocument();
+    expect(screen.getByText('Requeued 1 times')).toBeInTheDocument();
+  });
+
+  it('shows the last error line for a queued, retried job', async () => {
+    const requeuedJob: JobDetailType = {
+      ...BASE_JOB,
+      status: 'queued',
+      error: 'CUDA out of memory',
+      attempts: { w1: 2 },
+      retry_count: 1,
+    };
+    stubFetch(requeuedJob);
+    renderDetail(requeuedJob.id);
+
+    expect(await screen.findByText('Last error')).toBeInTheDocument();
+    expect(screen.getAllByText('CUDA out of memory').length).toBeGreaterThan(0);
+  });
+
+  it('falls back to the id prefix when the worker is unknown (non-admin, no workers list)', async () => {
+    const requeuedJob: JobDetailType = {
+      ...BASE_JOB,
+      status: 'queued',
+      error: 'boom',
+      attempts: { 'w-unknown-000000001': 1 },
+      retry_count: 1,
+    };
+    stubFetch(requeuedJob, { role: 'user' });
+    renderDetail(requeuedJob.id, 'user');
+
+    expect(await screen.findByText('Attempts')).toBeInTheDocument();
+    expect(screen.getByText('w-unknow…')).toBeInTheDocument();
+  });
+
+  it('shows no attempts card when retry_count is 0 and attempts is empty', async () => {
+    stubFetch(BASE_JOB);
+    renderDetail();
+
+    await screen.findByText(LONG_ERROR);
+    expect(screen.queryByText('Attempts')).not.toBeInTheDocument();
   });
 });
 

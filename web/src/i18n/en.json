@@ -246,7 +246,12 @@
     "fetch_directory": "Directory",
     "fetch_url": "Source URL",
     "fetch_size": "File size",
-    "fetch_sha256": "SHA-256"
+    "fetch_sha256": "SHA-256",
+    "section_attempts": "Attempts",
+    "requeued_count": "Requeued {{count}} times",
+    "attempts_worker": "Worker",
+    "attempts_failures": "Failures",
+    "last_error": "Last error"
   },
   "workers": {
     "title": "Workers",
@@ -301,7 +306,18 @@
     "delete_confirm_hint": "This cannot be undone.",
     "deleted_title": "Worker deleted",
     "deleted_message": "\"{{name}}\" is gone from the list; its billing records are kept.",
-    "delete_failed": "Could not delete the worker"
+    "delete_failed": "Could not delete the worker",
+    "unsuitable_heading": "Unsuitable tasks",
+    "unsuitable_col_key": "Task",
+    "unsuitable_col_failures": "Failures",
+    "unsuitable_col_last_error": "Last error",
+    "unsuitable_col_updated": "Updated",
+    "unsuitable_expired": "Expired",
+    "unsuitable_clear": "Clear",
+    "unsuitable_clear_all": "Clear all",
+    "unsuitable_clear_failed": "Could not clear the unsuitable record",
+    "unsuitable_cleared": "Unsuitable record cleared",
+    "unsuitable_last_job_link": "View job"
   },
   "users": {
     "title": "Users",

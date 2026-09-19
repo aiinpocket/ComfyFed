@@ -1,6 +1,7 @@
 import {
   Accordion,
   Alert,
+  Anchor,
   Badge,
   Box,
   Button,
@@ -28,13 +29,14 @@ import {
   IconTrash,
   IconX,
 } from '@tabler/icons-react';
-import { useCallback, useState, useEffect } from 'react';
+import { Fragment, useCallback, useState, useEffect } from 'react';
 import { useTranslation } from 'react-i18next';
+import { Link } from 'react-router-dom';
 
 import { ApiError, api, peerReachable, type Role, type TokenBundle, type Worker } from '../api';
 import { EmptyState, Mono, SectionHeader, TableSkeleton } from '../components/Primitives';
 import { WorkerStatusBadge } from '../components/StatusBadge';
-import { formatGb, formatRelative, shortId } from '../lib/format';
+import { formatAbsolute, formatGb, formatRelative, shortId } from '../lib/format';
 import { usePolling } from '../lib/usePolling';
 
 const POLL_MS = 10000;
@@ -82,6 +84,160 @@ function P2pCell({ worker }: { worker: Worker }) {
       <Badge color={reach.color} variant="light" size="sm" tt="none" fw={500}>
         {reach.label}
       </Badge>
+    </Stack>
+  );
+}
+
+/**
+ * Job-retry design (2026-09-19) §7/§8: the tasks this worker has been
+ * repeatedly excluded from. `task_key` is a hash (job.signature, or
+ * `model_fetch:<name>`) so only its first 12 characters are shown, with the
+ * full value in a `title` tooltip; same idea for `last_error` at 120 chars.
+ * A row past its TTL (`active: false`) renders dimmed with an "Expired"
+ * badge rather than disappearing outright -- it's informational only, no
+ * longer affects dispatch. Admin-only clear buttons call the DELETE routes
+ * and refresh the worker list on success.
+ */
+function UnsuitableBlock({
+  worker,
+  isAdmin,
+  onCleared,
+}: {
+  worker: Worker;
+  isAdmin: boolean;
+  onCleared: () => void | Promise<void>;
+}) {
+  const { t } = useTranslation();
+  const [clearingKey, setClearingKey] = useState<string | null>(null);
+  const [clearingAll, setClearingAll] = useState(false);
+
+  const notifyFailure = (caught: unknown) =>
+    notifications.show({
+      color: 'red',
+      icon: <IconX size={16} />,
+      title: t('workers.unsuitable_clear_failed'),
+      message:
+        caught instanceof ApiError
+          ? t(`errors.${caught.code}`, { defaultValue: caught.message })
+          : t('errors.network'),
+    });
+
+  const clearOne = async (taskKey: string) => {
+    setClearingKey(taskKey);
+    try {
+      await api.clearUnsuitable(worker.id, taskKey);
+      notifications.show({
+        color: 'teal',
+        icon: <IconCheck size={16} />,
+        title: t('workers.unsuitable_cleared'),
+        message: worker.name,
+      });
+      await onCleared();
+    } catch (caught) {
+      notifyFailure(caught);
+    } finally {
+      setClearingKey(null);
+    }
+  };
+
+  const clearAll = async () => {
+    setClearingAll(true);
+    try {
+      await api.clearUnsuitable(worker.id);
+      notifications.show({
+        color: 'teal',
+        icon: <IconCheck size={16} />,
+        title: t('workers.unsuitable_cleared'),
+        message: worker.name,
+      });
+      await onCleared();
+    } catch (caught) {
+      notifyFailure(caught);
+    } finally {
+      setClearingAll(false);
+    }
+  };
+
+  return (
+    <Stack gap="xs" py={4}>
+      <Group justify="space-between" gap="sm">
+        <Text size="xs" fw={600} c="dimmed">
+          {t('workers.unsuitable_heading')}
+        </Text>
+        {isAdmin && (
+          <Button
+            size="compact-xs"
+            variant="subtle"
+            color="red"
+            loading={clearingAll}
+            onClick={() => void clearAll()}
+          >
+            {t('workers.unsuitable_clear_all')}
+          </Button>
+        )}
+      </Group>
+      <Table verticalSpacing={4} horizontalSpacing="sm">
+        <Table.Thead>
+          <Table.Tr>
+            <Table.Th>{t('workers.unsuitable_col_key')}</Table.Th>
+            <Table.Th>{t('workers.unsuitable_col_failures')}</Table.Th>
+            <Table.Th>{t('workers.unsuitable_col_last_error')}</Table.Th>
+            <Table.Th>{t('workers.unsuitable_col_updated')}</Table.Th>
+            {isAdmin && <Table.Th />}
+          </Table.Tr>
+        </Table.Thead>
+        <Table.Tbody>
+          {worker.unsuitable.map((entry) => (
+            <Table.Tr key={entry.task_key} opacity={entry.active ? 1 : 0.55}>
+              <Table.Td>
+                <Group gap={6} wrap="nowrap">
+                  <Mono size="xs" title={entry.task_key}>
+                    {entry.task_key.slice(0, 12)}
+                  </Mono>
+                  {!entry.active && (
+                    <Badge color="gray" variant="light" size="sm" tt="none" fw={500}>
+                      {t('workers.unsuitable_expired')}
+                    </Badge>
+                  )}
+                </Group>
+              </Table.Td>
+              <Table.Td>
+                <Text size="xs">{entry.failures}</Text>
+              </Table.Td>
+              <Table.Td>
+                <Stack gap={2}>
+                  <Text size="xs" title={entry.last_error ?? undefined} lineClamp={2}>
+                    {entry.last_error ? entry.last_error.slice(0, 120) : '—'}
+                  </Text>
+                  {entry.last_job_id && (
+                    <Anchor component={Link} to={`/jobs/${entry.last_job_id}`} size="xs">
+                      {t('workers.unsuitable_last_job_link')}
+                    </Anchor>
+                  )}
+                </Stack>
+              </Table.Td>
+              <Table.Td>
+                <Text size="xs" c="dimmed">
+                  {formatAbsolute(entry.updated_at)}
+                </Text>
+              </Table.Td>
+              {isAdmin && (
+                <Table.Td>
+                  <Button
+                    size="compact-xs"
+                    variant="subtle"
+                    color="red"
+                    loading={clearingKey === entry.task_key}
+                    onClick={() => void clearOne(entry.task_key)}
+                  >
+                    {t('workers.unsuitable_clear')}
+                  </Button>
+                </Table.Td>
+              )}
+            </Table.Tr>
+          ))}
+        </Table.Tbody>
+      </Table>
     </Stack>
   );
 }
@@ -258,7 +414,8 @@ export function Workers({ role }: WorkersProps) {
               </Table.Thead>
               <Table.Tbody>
                 {workers.map((worker) => (
-                  <Table.Tr key={worker.id} opacity={worker.disabled ? 0.55 : 1}>
+                  <Fragment key={worker.id}>
+                  <Table.Tr opacity={worker.disabled ? 0.55 : 1}>
                     <Table.Td>
                       <Stack gap={1}>
                         <Group gap={6} wrap="nowrap">
@@ -351,6 +508,14 @@ export function Workers({ role }: WorkersProps) {
                       </Table.Td>
                     )}
                   </Table.Tr>
+                  {worker.unsuitable.length > 0 && (
+                    <Table.Tr>
+                      <Table.Td colSpan={isAdmin ? 8 : 7} style={{ background: theme.other.surfaces.raised }}>
+                        <UnsuitableBlock worker={worker} isAdmin={isAdmin} onCleared={refresh} />
+                      </Table.Td>
+                    </Table.Tr>
+                  )}
+                  </Fragment>
                 ))}
               </Table.Tbody>
             </Table>
