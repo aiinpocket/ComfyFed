@@ -59,6 +59,7 @@ class FakeConnection:
         self.state = "idle"
         self.heartbeats: list[dict] = []
         self.job_done = None
+        self.job_done_heartbeats: list[dict] = []
         self.job_done_fetched_models = None
         self.job_failed = None
         self.object_info_hash = ""
@@ -104,6 +105,10 @@ class FakeConnection:
 
     async def send_job_done(self, job_id, result_files, exec_seconds=None, fetched_models=None):
         self.job_done = (job_id, result_files, exec_seconds)
+        # Every heartbeat that went out BEFORE the completion -- what the
+        # server would have seen while it still considered this job in
+        # flight (a stage-less busy beat in here is what sets `started_at`).
+        self.job_done_heartbeats = list(self.heartbeats)
         # Kept off the `job_done` tuple on purpose: every pre-existing
         # assertion compares that 3-tuple, and an ordinary job never carries
         # this field at all (see PlatformConnection.send_job_done).
@@ -3814,3 +3819,95 @@ async def test_ordinary_job_done_carries_no_fetched_models_key():
     await conn.send_job_done("j2", [], 0.0, fetched_models=[{"name": "ae.safetensors"}])
     payload = json.loads(conn.ws.sent[1])
     assert payload["fetched_models"] == [{"name": "ae.safetensors"}]
+
+
+def _stage_less_busy_beats(heartbeats: list[dict]) -> list[dict]:
+    """Busy beats with NO `stage` -- the server reads exactly these as "the
+    run started" and stamps `started_at` (agentws -> dispatch.mark_running).
+    A model_fetch job must never produce one (spec §8: started_at 永不設)."""
+    return [hb for hb in heartbeats if hb["state"] == "busy" and hb.get("stage") is None]
+
+
+async def test_model_fetch_job_never_sends_a_stage_less_busy_heartbeat(
+    two_platform_loop, monkeypatch
+):
+    """Review fix (round 1): a stage-less busy beat before `job_done` would
+    have the server mark this job RUNNING -- and a cancel landing after that
+    mints a cancelled receipt plus a `panelws.job_running` for a job that
+    never ran anything."""
+    loop = two_platform_loop
+    loop.config.auto_fetch_models = True
+    loop.config.models_dir = "/fake/models"
+    conn_a = loop.connections["worker-a"]
+
+    async def _fake_fetch(**kwargs):
+        await kwargs["report_progress"](50.0, "ae.safetensors")
+        return [{"name": "ae.safetensors", "directory": "vae", "size_bytes": 5, "sha256": "ab" * 32}]
+
+    monkeypatch.setattr(runner_module.fetcher, "fetch_and_verify_models", _fake_fetch)
+    monkeypatch.setattr(hardware, "scan_models", lambda *a, **k: [])
+
+    await loop.handle_job(conn_a, _model_fetch_job_message("job-mf-4", [{"name": "ae.safetensors"}]))
+
+    assert conn_a.job_done is not None
+    assert _stage_less_busy_beats(conn_a.job_done_heartbeats) == []
+    assert conn_a.job_done_heartbeats[0]["stage"] == "fetching_models"
+    assert conn_a.job_done_heartbeats[0]["fetch_pct"] == 0.0
+
+
+async def test_model_fetch_job_without_fetch_models_still_stages_every_beat(
+    two_platform_loop, monkeypatch
+):
+    """Same guarantee when there is nothing to download at all: the initial
+    beat still carries `fetching_models` with `fetch_pct=0.0`, and
+    `handle.fetch_status` stays set (so the PERIODIC heartbeat path carries
+    the stage too) right up to job_done."""
+    loop = two_platform_loop
+    loop.config.models_dir = "/fake/models"
+    conn_a = loop.connections["worker-a"]
+
+    # `refresh_model_inventory` runs inside the model_fetch branch, just
+    # before the completion -- a convenient point to read what a periodic
+    # beat fired right then would have carried.
+    seen_status = []
+
+    def _scan(*a, **k):
+        seen_status.append(loop._fetch_status_for(conn_a))
+        return []
+
+    monkeypatch.setattr(hardware, "scan_models", _scan)
+
+    await loop.handle_job(conn_a, _model_fetch_job_message("job-mf-5"))
+
+    assert conn_a.job_done is not None
+    assert _stage_less_busy_beats(conn_a.job_done_heartbeats) == []
+    assert conn_a.job_done_heartbeats[0]["stage"] == "fetching_models"
+    assert conn_a.job_done_heartbeats[0]["fetch_pct"] == 0.0
+    assert seen_status == [{"stage": "fetching_models", "fetch_pct": 0.0, "fetch_model": None}]
+
+
+async def test_prompt_job_with_fetch_models_still_sends_the_stage_less_beat(
+    two_platform_loop, monkeypatch
+):
+    """Regression lock: for an ORDINARY (prompt) job the stage-less busy beat
+    after the fetch phase is exactly how the server learns the run is
+    starting -- unchanged by the model_fetch handling."""
+    loop = two_platform_loop
+    loop.config.auto_fetch_models = True
+    loop.config.models_dir = "/fake/models"
+    conn_a = loop.connections["worker-a"]
+
+    async def _fake_fetch(**kwargs):
+        await kwargs["report_progress"](50.0, "m.safetensors")
+        return []
+
+    monkeypatch.setattr(runner_module.fetcher, "fetch_and_verify_models", _fake_fetch)
+    monkeypatch.setattr(hardware, "scan_models", lambda *a, **k: [])
+    monkeypatch.setattr(comfy, "run_workflow", lambda *a, **k: ([], 1.0))
+
+    await loop.handle_job(conn_a, _fetch_job_message("job-prompt-fetch", [{"name": "m.safetensors"}]))
+
+    assert conn_a.job_done == ("job-prompt-fetch", [], 1.0)
+    assert conn_a.job_done_fetched_models is None
+    stage_less = _stage_less_busy_beats(conn_a.job_done_heartbeats)
+    assert len(stage_less) == 1, "the post-fetch 'run is starting' beat must still go out"

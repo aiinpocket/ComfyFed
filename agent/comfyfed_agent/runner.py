@@ -1217,11 +1217,22 @@ class AgentLoop:
                 # mints an unbillable receipt (spec §9).
                 is_model_fetch = job_msg.get("kind") == "model_fetch"
                 fetched: list[dict] = []
-                if fetch_models and self.config.auto_fetch_models:
+                if is_model_fetch or (fetch_models and self.config.auto_fetch_models):
                     # The very first busy heartbeat must already carry the
                     # fetch stage: a stage-less busy beat is the server's
                     # signal that the RUN started (started_at / billing
                     # clock), and the download phase is never billed.
+                    #
+                    # For a `model_fetch` job that holds for EVERY beat up to
+                    # job_done, `fetch_models` or not (spec §8: started_at
+                    # 永不設). There is no run to start, so a stage-less beat
+                    # would have the server mark this job running -- and a
+                    # cancel landing after that would mint a spurious
+                    # cancelled receipt and a `panelws.job_running` for a job
+                    # that never ran a thing. `handle.fetch_status` therefore
+                    # stays set until the `finally` clears it, so the
+                    # PERIODIC heartbeat path (see broadcast_heartbeat's
+                    # fetch_status merge) keeps carrying the stage too.
                     handle.fetch_status = {
                         "stage": "fetching_models",
                         "fetch_pct": 0.0,
@@ -1278,10 +1289,13 @@ class AgentLoop:
                         platform_entry=conn.entry,
                     )
 
-                    # Fetch phase over: from here on heartbeats go back to
-                    # the plain busy shape, and the first such stage-less
-                    # beat is what tells the server the run is starting.
-                    handle.fetch_status = None
+                    if not is_model_fetch:
+                        # Fetch phase over: from here on heartbeats go back to
+                        # the plain busy shape, and the first such stage-less
+                        # beat is what tells the server the run is starting.
+                        # A model_fetch job has no run to start, so it keeps
+                        # the stage pinned instead (see the initial beat).
+                        handle.fetch_status = None
 
                     # The manifest models just landed on disk -- push the
                     # updated inventory now rather than waiting for the
@@ -1289,7 +1303,8 @@ class AgentLoop:
                     # so the server learns immediately that this worker no
                     # longer has a gap for this job (or the next one).
                     await self.refresh_model_inventory(conn)
-                    await self.broadcast_heartbeat("busy", progress=0.0, job_id=job_id)
+                    if not is_model_fetch:
+                        await self.broadcast_heartbeat("busy", progress=0.0, job_id=job_id)
 
                 if is_model_fetch:
                     # The whole job WAS the fetch. Never touch the whitelist,
@@ -1306,7 +1321,7 @@ class AgentLoop:
                         await self.refresh_model_inventory(conn)
                     exec_seconds = 0.0
                     await self._report_completion(
-                        conn, handle, [], exec_seconds, fetched_models=fetched or []
+                        conn, handle, [], exec_seconds, fetched_models=fetched
                     )
                     success = True
                 else:
