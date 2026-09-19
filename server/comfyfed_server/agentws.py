@@ -2093,9 +2093,17 @@ async def dispatch_tick() -> None:
         # 2026-09-19 model_fetch (final-review I1): last line of defence for
         # the protocol>=5 floor every model_fetch job carries. `assign_jobs`
         # already refused this pair, so reaching here means that gate
-        # regressed -- the job stays queued for a worker that can actually
-        # run it rather than being handed to one that would run the `{}`
-        # placeholder workflow and fail it.
+        # regressed -- better to drop the push than hand the job to a worker
+        # that would run the `{}` placeholder workflow and fail it.
+        # 注意這裡的 job 並不會「留在 queued」：`assign_jobs` 已經把它 claim 成
+        # `assigned` 並寫上 worker_id，只是沒人收到 `job` frame。要等這個 worker
+        # 超過 90 秒沒心跳、被 `dispatch.requeue_stale` 掃回 `queued` 才救得回來
+        # （worker 一直在線的話就會卡著）。
+        # The job does NOT stay queued: `assign_jobs` already claimed the row
+        # to `assigned` with `worker_id` set, and skipping the push just means
+        # nobody received the `job` frame. It is recovered only when that
+        # worker goes stale (>90 s without a check-in) and
+        # `dispatch.requeue_stale` moves it back to `queued`.
         if job.kind == "model_fetch" and (
             worker is None or not assess.model_fetch_protocol_ok(worker)
         ):

@@ -59,6 +59,42 @@ describe("isTrustedUrl", () => {
   });
 });
 
+describe("isSafeRedirectTarget", () => {
+  const cases: [string, boolean][] = [
+    // The CDN hosts real HF / Civitai downloads actually hand off to.
+    ["https://cdn-lfs-us-1.hf.co/repos/x/ae.safetensors", true],
+    ["https://cas-bridge.xethub.hf.co/xet-bridge-us/abc", true],
+    ["https://civitai-delivery-worker-prod.abc.r2.cloudflarestorage.com/x", true],
+    ["https://huggingface.co/a", true], // hop 0's origin is safe too
+    ["https://evil.example/x", true], // off-allowlist but not internal
+    ["http://cdn-lfs.hf.co/x", false], // plaintext
+    ["https://cdn-lfs.hf.co:8443/x", false], // non-443 port
+    ["https://user:pw@cdn-lfs.hf.co/x", false], // userinfo
+    ["https://127.0.0.1/x", false], // IPv4 literal / loopback
+    ["https://10.0.0.5/x", false], // IPv4 literal / LAN
+    ["https://169.254.169.254/latest/meta-data/", false], // link-local metadata
+    ["https://[::1]/x", false], // IPv6 literal, bracketed
+    ["https://[fd00::1]/x", false], // IPv6 ULA
+    ["https://localhost/x", false],
+    ["https://foo.localhost/x", false],
+    ["https://printer.local/x", false],
+    ["https://foo.internal/x", false],
+    ["https://FOO.INTERNAL./x", false], // case + absolute-FQDN dot
+    ["https://box.home.arpa/x", false],
+    ["not a url", false],
+    ["", false],
+  ];
+  for (const [url, ok] of cases) {
+    it(`${JSON.stringify(url)} -> ${ok}`, () => {
+      expect(modelFetch.isSafeRedirectTarget(url)).toBe(ok);
+    });
+  }
+
+  it("accepts a spelled-out :443 on a CDN host", () => {
+    expect(modelFetch.isSafeRedirectTarget("https://cdn-lfs.hf.co:443/x")).toBe(true);
+  });
+});
+
 describe("unverified entry signature", () => {
   it("has the exact payload shape both stacks and the agent sign", () => {
     expect(modelFetch.unverifiedPayload("ae.safetensors", "vae", "https://huggingface.co/x", 335)).toBe(
@@ -156,19 +192,73 @@ describe("headSizeBytes", () => {
     expect(asked).toEqual(["https://huggingface.co/a", "https://huggingface.co/b"]);
   });
 
-  const offAllowlist = [
-    "http://127.0.0.1:6379/",
-    "https://192.168.1.10:8080/x",
-    "https://evil.example/x",
-    "https://huggingface.co.evil.com/x",
-    "https://huggingface.co:8443/x",
+  // Final-fix N1: the real download paths. HF `…/resolve/…` 302s to a CDN
+  // host, Civitai 302s to its R2 delivery host -- neither is on the origin
+  // allowlist, and refusing them meant the feature's main path could never
+  // create a job.
+  const cdnHandOffs: [string, string][] = [
+    [
+      "https://huggingface.co/org/repo/resolve/main/ae.safetensors",
+      "https://cdn-lfs-us-1.hf.co/repos/x/ae.safetensors?download=true",
+    ],
+    [
+      "https://civitai.com/api/download/models/123",
+      "https://civitai-delivery-worker-prod.abc.r2.cloudflarestorage.com/model/x.safetensors",
+    ],
   ];
-  for (const location of offAllowlist) {
+  for (const [first, location] of cdnHandOffs) {
+    it(`follows the CDN hand-off ${first} -> ${location}`, async () => {
+      const asked: string[] = [];
+      const size = await modelFetch.headSizeBytes(
+        first,
+        fakeFetch((url) => {
+          asked.push(url);
+          return url === first
+            ? headerResponse(302, { location })
+            : headerResponse(200, { "content-length": "4242" });
+        })
+      );
+      expect(size).toBe(4242);
+      expect(asked).toEqual([first, location]);
+    });
+  }
+
+  it("refuses a CDN host as hop 0", async () => {
+    // The looser rule is for LATER hops only: a CDN host the user supplies
+    // directly is still off the origin allowlist, because hop 0 is the url
+    // that gets signed into the unverified entry.
+    const asked: string[] = [];
+    await expect(
+      modelFetch.headSizeBytes(
+        "https://cdn-lfs.hf.co/x",
+        fakeFetch((url) => {
+          asked.push(url);
+          throw new Error(`hop 0 was actually requested: ${url}`);
+        })
+      )
+    ).rejects.toMatchObject({ code: "untrusted_url" });
+    expect(asked).toEqual([]);
+  });
+
+  const unsafeHops = [
+    "http://cdn-lfs.hf.co/x", // plaintext hop
+    "http://127.0.0.1:6379/", // SSRF / internal port oracle
+    "https://127.0.0.1/x", // loopback, default port
+    "https://[::1]/x", // IPv6 loopback
+    "https://192.168.1.10:8080/x", // LAN address
+    "https://169.254.169.254/x", // link-local metadata service
+    "https://foo.internal/x", // internal name
+    "https://box.home.arpa/x",
+    "https://printer.local/x",
+    "https://evil.example:8443/x", // off-443 endpoint
+    "https://huggingface.co:8443/x", // right host, different endpoint
+  ];
+  for (const location of unsafeHops) {
     it(`refuses a redirect to ${location}`, async () => {
-      // Final-review I4: the allowlist is checked BEFORE the first request,
-      // but a redirect would otherwise carry the probe anywhere -- SSRF / a
-      // port oracle on the self-hosted twin. The off-allowlist hop is never
-      // requested at all.
+      // Final-review I4 / final-fix N1: hop 0 clears the strict allowlist and
+      // every LATER hop must clear `isSafeRedirectTarget`, so a redirect can
+      // no longer carry the probe at loopback/LAN/internal names. The unsafe
+      // hop is never requested at all.
       const asked: string[] = [];
       await expect(
         modelFetch.headSizeBytes(

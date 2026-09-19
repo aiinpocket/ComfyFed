@@ -9,6 +9,7 @@ worker reports the real sha256 on completion so the platform learns it.
 """
 from __future__ import annotations
 
+import ipaddress
 import json
 import logging
 import re
@@ -54,6 +55,71 @@ def is_trusted_url(url: str) -> bool:
     return origin in TRUSTED_ORIGINS
 
 
+# 轉址第二跳之後只看這組「內網禁區」尾碼，不看白名單（見
+# `is_safe_redirect_target`）。Suffixes of names that never belong to a public
+# CDN; a redirect hop landing on one is refused.
+_INTERNAL_HOST_SUFFIXES = (".localhost", ".local", ".internal", ".home.arpa")
+
+
+def is_safe_redirect_target(url: str) -> bool:
+    """Whether a redirect hop AFTER hop 0 may be requested (final-fix N1).
+
+    為什麼第二跳之後放寬：HuggingFace 的 `…/resolve/…` 一定會 302 到
+    `cdn-lfs*.hf.co` / `cas-bridge.xethub.hf.co`，Civitai 的下載連結會 302 到
+    R2 派送網域。對每一跳都套嚴格白名單 = 真實下載網址一個都過不了，
+    unverified 來源（這顆按鈕存在的理由）永遠建不出 job。
+    Why later hops are looser: real HuggingFace `…/resolve/…` urls always hand
+    off to a `cdn-lfs*.hf.co` / `cas-bridge.xethub.hf.co` CDN host, and Civitai
+    downloads hand off to an R2 delivery host. Applying the strict origin
+    allowlist to every hop refuses every real download url, so the
+    unverified-source path could never create a job.
+
+    放寬的只是「網域」，SSRF 規則一步都沒讓：仍然只准 https、只准 443（或不寫
+    port）、不准帶 userinfo、不准 IP 字面值（v4/v6，含中括號）、不准 localhost
+    或 `.localhost/.local/.internal/.home.arpa` 結尾。也就是說還是打不到本機、
+    LAN、link-local 或任何內網名稱 —— 那才是 I4 真正要擋的東西。信任並沒有被稀
+    釋：簽章裡釘的仍然是 hop 0 那個白名單網址，後面的跳躍只提供 `Content-Length`。
+    Only the *hostname* rule is relaxed; the SSRF rule is not. A later hop must
+    still be https, on port 443 (or no explicit port), carry no userinfo, and
+    have a hostname that is neither an IP literal (v4 or v6, bracketed or not)
+    nor `localhost` nor anything under `.localhost/.local/.internal/.home.arpa`
+    -- so loopback, LAN, link-local and internal names are still refused, which
+    is what I4 was actually defending. Trust is not diluted: the signed entry
+    still pins hop 0's allowlisted url, and later hops only supply a
+    `Content-Length`.
+    """
+    if not isinstance(url, str) or not url:
+        return False
+    try:
+        parts = urlsplit(url)
+        port = parts.port
+    except ValueError:
+        return False
+    if parts.scheme.lower() != "https":
+        return False
+    if port not in (None, 443):
+        return False
+    if parts.username is not None or parts.password is not None:
+        return False
+    # A trailing dot is a legal absolute-FQDN spelling of the same name, so
+    # `foo.internal.` must not slip past the suffix test.
+    host = (parts.hostname or "").lower().rstrip(".")
+    if not host:
+        return False
+    if host == "localhost" or host.endswith(_INTERNAL_HOST_SUFFIXES):
+        return False
+    # `urlsplit`已經把 v6 的中括號拆掉了，所以這裡只要能被 ipaddress 解析就是
+    # IP 字面值。純數字與點的主機名同樣當成 IP（`01.2.3.4` 這種非標準寫法
+    # `ip_address` 會拒收，但它絕不是真的 DNS 名稱）—— 與 cloud 端同規則。
+    if re.fullmatch(r"[0-9.]+", host):
+        return False
+    try:
+        ipaddress.ip_address(host)
+    except ValueError:
+        return True
+    return False
+
+
 class HeadError(Exception):
     """`code` is "gated" (401/403), "untrusted_url" (a redirect hop left the
     allowlist -- deliberately the SAME code the pre-HEAD allowlist check
@@ -83,10 +149,17 @@ def head_size_bytes(url: str, *, client_factory=httpx.Client) -> int:
     server at `http://127.0.0.1:…` or a LAN address -- an SSRF / port oracle
     that any logged-in user could aim, and one that the 400's own codes
     (`gated` for 401/403 vs `size_unknown` for everything else) would answer.
-    So every hop, INCLUDING the final url, must clear `is_trusted_url` before
-    it is requested, and the chain is capped at `_HEAD_MAX_REDIRECTS` hops so
-    a redirect loop cannot spin here. The cloud stack's `headSizeBytes` does
-    the identical thing with `redirect: "manual"`.
+    So every hop is checked before it is requested, and the chain is capped at
+    `_HEAD_MAX_REDIRECTS` hops so a redirect loop cannot spin here. The cloud
+    stack's `headSizeBytes` does the identical thing with `redirect: "manual"`.
+
+    Hop 0（使用者給的網址）走嚴格白名單 `is_trusted_url`；之後每一跳走
+    `is_safe_redirect_target`（HF/Civitai 一定會轉到 CDN 網域，見該函式的說明），
+    兩者都用同一個 `untrusted_url` 代碼。
+    Hop 0 (the user-supplied url) is checked with the strict origin allowlist
+    `is_trusted_url`; every later hop is checked with `is_safe_redirect_target`
+    (HF/Civitai always hand off to a CDN host -- see that function), both
+    refusing with the same `untrusted_url` code.
 
     `client_factory` exists so tests can inject an `httpx.MockTransport`
     client; production passes the default `httpx.Client`.
@@ -96,8 +169,9 @@ def head_size_bytes(url: str, *, client_factory=httpx.Client) -> int:
             timeout=httpx.Timeout(_HEAD_TIMEOUT_SECONDS), follow_redirects=False
         ) as client:
             current = url
-            for _hop in range(_HEAD_MAX_REDIRECTS + 1):
-                if not is_trusted_url(current):
+            for hop in range(_HEAD_MAX_REDIRECTS + 1):
+                ok = is_trusted_url(current) if hop == 0 else is_safe_redirect_target(current)
+                if not ok:
                     raise HeadError("untrusted_url", f"redirect to {current}")
                 resp = client.head(current)
                 if not (300 <= resp.status_code < 400):

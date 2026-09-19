@@ -79,6 +79,63 @@ export function isTrustedUrl(url: unknown): boolean {
   return TRUSTED_ORIGINS.has(`https://${parsed.hostname.toLowerCase()}`);
 }
 
+/** 轉址第二跳之後只看這組「內網禁區」尾碼，不看白名單。Suffixes of names that
+ * never belong to a public CDN; a redirect hop landing on one is refused.
+ * Mirrors model_fetch.py's `_INTERNAL_HOST_SUFFIXES`. */
+const INTERNAL_HOST_SUFFIXES = [".localhost", ".local", ".internal", ".home.arpa"];
+
+/** Whether a redirect hop AFTER hop 0 may be requested (final-fix N1) --
+ * ports model_fetch.py's `is_safe_redirect_target`.
+ *
+ * 為什麼第二跳之後放寬：HuggingFace 的 `…/resolve/…` 一定會 302 到
+ * `cdn-lfs*.hf.co` / `cas-bridge.xethub.hf.co`，Civitai 的下載連結會 302 到 R2
+ * 派送網域。對每一跳都套嚴格白名單 = 真實下載網址一個都過不了，unverified 來源
+ * （這顆按鈕存在的理由）永遠建不出 job。
+ * Why later hops are looser: real HuggingFace `…/resolve/…` urls always hand
+ * off to a `cdn-lfs*.hf.co` / `cas-bridge.xethub.hf.co` CDN host, and Civitai
+ * downloads hand off to an R2 delivery host. Applying the strict origin
+ * allowlist to every hop refuses every real download url, so the
+ * unverified-source path could never create a job.
+ *
+ * 放寬的只是「網域」，SSRF 規則一步都沒讓：仍然只准 https、只准 443（或不寫
+ * port）、不准帶 userinfo、不准 IP 字面值（v4/v6，含中括號）、不准 localhost 或
+ * `.localhost/.local/.internal/.home.arpa` 結尾。信任沒有被稀釋：簽章裡釘的仍然
+ * 是 hop 0 那個白名單網址，後面的跳躍只提供 `Content-Length`。
+ * Only the *hostname* rule is relaxed; the SSRF rule is not. A later hop must
+ * still be https, on port 443 (or no explicit port), carry no userinfo, and
+ * have a hostname that is neither an IP literal (v4 or v6, bracketed or not)
+ * nor `localhost` nor anything under `.localhost/.local/.internal/.home.arpa`
+ * -- so loopback, LAN, link-local and internal names are still refused. Trust
+ * is not diluted: the signed entry still pins hop 0's allowlisted url, and
+ * later hops only supply a `Content-Length`. */
+export function isSafeRedirectTarget(url: unknown): boolean {
+  if (typeof url !== "string" || !url) return false;
+  let parsed: URL;
+  try {
+    parsed = new URL(url);
+  } catch {
+    return false;
+  }
+  if (parsed.protocol !== "https:") return false;
+  // `new URL` strips an explicit `:443` from an https url, so `port === ""`
+  // covers both "no port" and "the default port spelled out" -- the same
+  // equivalence `isTrustedUrl` relies on, matching Python's `in (None, 443)`.
+  if (parsed.port !== "") return false;
+  if (parsed.username !== "" || parsed.password !== "") return false;
+  // A trailing dot is a legal absolute-FQDN spelling of the same name, so
+  // `foo.internal.` must not slip past the suffix test.
+  const host = parsed.hostname.toLowerCase().replace(/\.+$/, "");
+  if (!host) return false;
+  if (host === "localhost") return false;
+  if (INTERNAL_HOST_SUFFIXES.some((suffix) => host.endsWith(suffix))) return false;
+  // WHATWG `hostname` keeps the brackets on an IPv6 literal and normalizes an
+  // IPv4 one to dotted-quad; a host of only digits and dots is never a real
+  // DNS name either. Same rule as the Python twin's `ipaddress` test.
+  if (host.startsWith("[") || host.includes(":")) return false;
+  if (/^[0-9.]+$/.test(host)) return false;
+  return true;
+}
+
 /** `code` is "gated" (401/403), "untrusted_url" (a redirect hop left the
  * allowlist -- deliberately the SAME code the pre-HEAD allowlist check
  * throws, since it is the same refusal and the panel's message table already
@@ -113,8 +170,16 @@ export class HeadError extends Error {
  * everything else) would answer. The Workers stack has no internal network to
  * reach, so this is parity with the self-hosted stack more than a live
  * exposure -- but it is the same code on both sides, which is the point. Every
- * hop, INCLUDING the final url, must clear `isTrustedUrl` before it is
- * requested, and the chain is capped at `HEAD_MAX_REDIRECTS`.
+ * hop is checked before it is requested and the chain is capped at
+ * `HEAD_MAX_REDIRECTS`.
+ *
+ * Hop 0（使用者給的網址）走嚴格白名單 `isTrustedUrl`；之後每一跳走
+ * `isSafeRedirectTarget`（HF/Civitai 一定會轉到 CDN 網域，見該函式的說明），兩者
+ * 都用同一個 `untrusted_url` 代碼。
+ * Hop 0 (the user-supplied url) is checked with the strict origin allowlist
+ * `isTrustedUrl`; every later hop is checked with `isSafeRedirectTarget` (HF/
+ * Civitai always hand off to a CDN host -- see that function), both refusing
+ * with the same `untrusted_url` code.
  *
  * `fetchImpl` exists so tests can inject a fake (the Python twin injects an
  * `httpx.MockTransport` client factory for the same reason); production uses
@@ -126,7 +191,8 @@ export async function headSizeBytes(
   let resp: Response | undefined;
   let current = url;
   for (let hop = 0; hop <= HEAD_MAX_REDIRECTS; hop++) {
-    if (!isTrustedUrl(current)) {
+    const ok = hop === 0 ? isTrustedUrl(current) : isSafeRedirectTarget(current);
+    if (!ok) {
       throw new HeadError("untrusted_url", `redirect to ${current}`);
     }
     try {

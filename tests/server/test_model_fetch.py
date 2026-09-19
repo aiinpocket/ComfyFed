@@ -26,6 +26,34 @@ def test_is_trusted_url(url, ok):
     assert model_fetch.is_trusted_url(url) is ok
 
 
+@pytest.mark.parametrize("url,ok", [
+    # The CDN hosts real HF / Civitai downloads actually hand off to.
+    ("https://cdn-lfs-us-1.hf.co/repos/x/ae.safetensors", True),
+    ("https://cas-bridge.xethub.hf.co/xet-bridge-us/abc", True),
+    ("https://civitai-delivery-worker-prod.abc.r2.cloudflarestorage.com/x", True),
+    ("https://huggingface.co/a", True),          # hop 0's origin is safe too
+    ("https://evil.example/x", True),            # off-allowlist but not internal
+    ("http://cdn-lfs.hf.co/x", False),           # plaintext
+    ("https://cdn-lfs.hf.co:8443/x", False),     # non-443 port
+    ("https://user:pw@cdn-lfs.hf.co/x", False),  # userinfo
+    ("https://127.0.0.1/x", False),              # IPv4 literal / loopback
+    ("https://10.0.0.5/x", False),               # IPv4 literal / LAN
+    ("https://169.254.169.254/latest/meta-data/", False),  # link-local metadata
+    ("https://[::1]/x", False),                  # IPv6 literal, bracketed
+    ("https://[fd00::1]/x", False),              # IPv6 ULA
+    ("https://localhost/x", False),
+    ("https://foo.localhost/x", False),
+    ("https://printer.local/x", False),
+    ("https://foo.internal/x", False),
+    ("https://FOO.INTERNAL./x", False),          # case + absolute-FQDN dot
+    ("https://box.home.arpa/x", False),
+    ("not a url", False),
+    ("", False),
+])
+def test_is_safe_redirect_target(url, ok):
+    assert model_fetch.is_safe_redirect_target(url) is ok
+
+
 def test_unverified_payload_shape():
     assert (
         model_fetch.unverified_payload("ae.safetensors", "vae", "https://huggingface.co/x", 335)
@@ -72,18 +100,47 @@ def test_head_size_bytes_follows_a_relative_redirect():
     assert model_fetch.head_size_bytes("https://huggingface.co/a", client_factory=_client(handler)) == 777
 
 
+@pytest.mark.parametrize("first,location", [
+    # Final-fix N1: the real download paths. HF `…/resolve/…` 302s to a CDN
+    # host, Civitai 302s to its R2 delivery host -- neither is on the origin
+    # allowlist, and refusing them meant the feature's main path could never
+    # create a job.
+    ("https://huggingface.co/org/repo/resolve/main/ae.safetensors",
+     "https://cdn-lfs-us-1.hf.co/repos/x/ae.safetensors?download=true"),
+    ("https://civitai.com/api/download/models/123",
+     "https://civitai-delivery-worker-prod.abc.r2.cloudflarestorage.com/model/x.safetensors"),
+])
+def test_head_size_bytes_follows_a_cdn_hand_off(first, location):
+    asked = []
+
+    def handler(request):
+        asked.append(str(request.url))
+        if str(request.url) == first:
+            return httpx.Response(302, headers={"location": location})
+        return httpx.Response(200, headers={"content-length": "4242"})
+
+    assert model_fetch.head_size_bytes(first, client_factory=_client(handler)) == 4242
+    assert asked == [first, location]
+
+
 @pytest.mark.parametrize("location", [
+    "http://cdn-lfs.hf.co/x",          # plaintext hop
     "http://127.0.0.1:6379/",          # SSRF / internal port oracle
+    "https://127.0.0.1/x",             # loopback, default port
+    "https://[::1]/x",                 # IPv6 loopback
     "https://192.168.1.10:8080/x",     # LAN address
-    "https://evil.example/x",          # simply off the allowlist
-    "https://huggingface.co.evil.com/x",  # the prefix-match trap, one hop later
+    "https://169.254.169.254/x",       # link-local metadata service
+    "https://foo.internal/x",          # internal name
+    "https://box.home.arpa/x",
+    "https://printer.local/x",
+    "https://evil.example:8443/x",     # off-443 endpoint
     "https://huggingface.co:8443/x",   # right host, different endpoint
 ])
-def test_head_size_bytes_refuses_a_redirect_off_the_allowlist(location):
-    """Final-review I4: the allowlist is checked BEFORE the first request,
-    but a redirect would otherwise carry the probe anywhere. Every hop must
-    clear `is_trusted_url`, and the off-allowlist hop is never requested at
-    all (the handler asserts it is not)."""
+def test_head_size_bytes_refuses_an_unsafe_redirect(location):
+    """Final-review I4 / final-fix N1: hop 0 clears the strict allowlist and
+    every LATER hop must clear `is_safe_redirect_target`, so a redirect can no
+    longer carry the probe at loopback/LAN/internal names. The unsafe hop is
+    never requested at all (the handler asserts it is not)."""
     requested = []
 
     def handler(request):
@@ -98,6 +155,18 @@ def test_head_size_bytes_refuses_a_redirect_off_the_allowlist(location):
     # `model_fetch.untrusted_url` 400 and its existing message.
     assert exc.value.code == "untrusted_url"
     assert requested == ["https://huggingface.co/a"]
+
+
+def test_head_size_bytes_refuses_a_cdn_host_as_hop_zero():
+    """The looser rule is for LATER hops only: a CDN host the user supplies
+    directly is still off the origin allowlist, because hop 0 is the url that
+    gets signed into the unverified entry."""
+    def handler(request):
+        raise AssertionError(f"hop 0 was actually requested: {request.url}")
+
+    with pytest.raises(model_fetch.HeadError) as exc:
+        model_fetch.head_size_bytes("https://cdn-lfs.hf.co/x", client_factory=_client(handler))
+    assert exc.value.code == "untrusted_url"
 
 
 def test_head_size_bytes_refuses_more_than_five_redirect_hops():
