@@ -5063,3 +5063,65 @@ def test_attempt_errors_are_recorded_per_job_and_exposed_by_the_api(client):
     detail = client.get("/api/jobs/%s" % job_id, headers={"X-CSRF": csrf}).json()
     assert detail["attempts"] == {worker_id: 1}
     assert detail["attempt_errors"] == {worker_id: "boom"}
+
+
+# --- Fix round 2 / Minor 11：只有「真的失敗」才計次 -------------------------
+
+
+def test_admin_cancel_does_not_count_as_an_attempt(client):
+    """spec §5 的保證：`cancelled` 不是失敗。admin 取消一張正在跑的 job，
+    `jobs.attempts` 與 `worker_task_failures` 都不得被碰到 -- 不然使用者自己
+    取消幾次就能把一台 worker 推進不適任名單，而且下一次真的失敗會從錯的基
+    數起算。之前兩個 stack 都沒有測試釘這條。"""
+    csrf = _login(client)
+    worker_id, sk = _register_worker(client, csrf, "wa")
+    job_id = _submit(client, csrf)
+
+    ws = _connect(client, worker_id, sk)
+    _send_hello_v2(ws)
+    try:
+        ws.send_json({"type": "heartbeat", "state": "idle", "progress": 0.0, "job_id": None, "dynamic": {}})
+        agentws.dispatch_once(worker_id)
+        assert ws.receive_json()["type"] == "job"
+
+        assert client.post(f"/api/jobs/{job_id}/cancel", headers={"X-CSRF": csrf}).status_code == 200
+        assert ws.receive_json() == {"type": "job_cancelled", "job_id": job_id}
+    finally:
+        ws.close()
+
+    from comfyfed_server import retry as _retry
+
+    job = _job_row(job_id)
+    assert job.status == "cancelled"
+    assert _retry.attempts_dict(job.attempts) == {}
+    assert (job.retry_count or 0) == 0
+    assert _failure_rows() == {}
+
+
+def test_requeue_stale_does_not_count_as_an_attempt(client):
+    """spec §5：`requeue_stale`（worker 失聯 90 秒被掃回佇列）也不是失敗。
+    它和 `requeue_for_retry` 寫出來的狀態很像（queued + last_worker_id），所以
+    兩條路真的被折在一起的話，這個斷言是第一個會紅的。"""
+    csrf = _login(client)
+    worker_id, sk = _register_worker(client, csrf, "wa")
+    job_id = _submit(client, csrf)
+
+    ws = _connect(client, worker_id, sk)
+    try:
+        ws.send_json({"type": "heartbeat", "state": "idle", "progress": 0.0, "job_id": None, "dynamic": {}})
+        agentws.dispatch_once(worker_id)
+        assert ws.receive_json()["type"] == "job"
+    finally:
+        ws.close()
+
+    future = datetime.now(timezone.utc).replace(tzinfo=None) + timedelta(seconds=10_000)
+    assert dispatch.requeue_stale(future) == [job_id]
+
+    from comfyfed_server import retry as _retry
+
+    job = _job_row(job_id)
+    assert job.status == "queued"
+    assert job.last_worker_id == worker_id
+    assert _retry.attempts_dict(job.attempts) == {}
+    assert (job.retry_count or 0) == 0
+    assert _failure_rows() == {}

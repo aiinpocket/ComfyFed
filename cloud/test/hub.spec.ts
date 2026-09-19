@@ -9,6 +9,7 @@ import * as modelFetch from "../src/core/model_fetch";
 import * as modelGuide from "../src/core/model_guide";
 import * as modelManifest from "../src/core/model_manifest";
 import * as retry from "../src/core/retry";
+import * as dispatch from "../src/core/dispatch";
 import { resolvePlatformSeed } from "../src/db/queries";
 import golden from "./fixtures/golden.json";
 
@@ -2042,6 +2043,64 @@ describe("job retry + unsuitable workers (spec §5-§7)", () => {
     expect(child.retryCount).toBe(1);
     expect(sibling.status).toBe("running");
     expect(parent.status).not.toBe("failed");
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Fix round 2 / Minor 11：只有「真的失敗」才計次 -- ports the block appended to
+// tests/server/test_agent_ws.py.
+
+describe("job retry: cancelled and requeue_stale are not attempts (spec §5)", () => {
+  async function failureRowCount(): Promise<number> {
+    const row = await db()
+      .prepare("SELECT COUNT(*) AS n FROM worker_task_failures")
+      .first<{ n: number }>();
+    return row!.n;
+  }
+
+  it("an admin cancel does not bump attempts or worker_task_failures", async () => {
+    // `cancelled` 不是失敗。不然使用者自己取消幾次就能把一台 worker 推進不適
+    // 任名單，而且下一次真的失敗會從錯的基數起算。
+    const kp = KEYPAIRS[0]!;
+    const workerId = await makeWorker({ pubkeyHex: kp.pubkey_hex });
+    const jobId = await makeJob({
+      status: "running",
+      workerId,
+      startedAt: new Date(),
+      signature: "sig-cancel",
+    });
+
+    const res = await hub().fetch("http://hub.internal/internal/cancel", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ job_id: jobId, reason: "cancelled by admin" }),
+    });
+    expect(res.ok).toBe(true);
+
+    const job = (await getJobById(db(), jobId))!;
+    expect(job.status).toBe("cancelled");
+    expect(retry.attemptsDict(job.attempts)).toEqual({});
+    expect(job.retryCount).toBe(0);
+    expect(await failureRowCount()).toBe(0);
+  });
+
+  it("requeueStale does not bump attempts or worker_task_failures", async () => {
+    // `requeueStale`（worker 失聯 90 秒被掃回佇列）寫出來的狀態和
+    // `requeueForRetry` 很像（queued + last_worker_id），所以兩條路真的被折在
+    // 一起的話，這個斷言是第一個會紅的。
+    const kp = KEYPAIRS[0]!;
+    const workerId = await makeWorker({ pubkeyHex: kp.pubkey_hex });
+    const jobId = await makeJob({ status: "assigned", workerId, signature: "sig-stale" });
+
+    const future = new Date(Date.now() + 10_000 * 1000);
+    expect(await dispatch.requeueStale(db(), future)).toEqual([jobId]);
+
+    const job = (await getJobById(db(), jobId))!;
+    expect(job.status).toBe("queued");
+    expect(job.lastWorkerId).toBe(workerId);
+    expect(retry.attemptsDict(job.attempts)).toEqual({});
+    expect(job.retryCount).toBe(0);
+    expect(await failureRowCount()).toBe(0);
   });
 });
 
