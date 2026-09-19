@@ -405,15 +405,26 @@ def wait_for_job(
     經過時間用 `poll_seconds` 自行累加而不是 `time.monotonic()`：注入假的
     `sleep` 就能在測試裡走完整條逾時路徑，不必真的睡。
     """
+    # 兩個數字都是 AI 客戶端給的：`poll_seconds` 夾到至少 1 秒（0 或負數會變成
+    # 不睡覺的熱迴圈，一直打平台），`timeout_seconds` 夾到非負（負數等同 0，
+    # 也就是只查一次就回逾時）。
+    try:
+        poll = max(1.0, float(poll_seconds))
+    except (TypeError, ValueError):
+        poll = 3.0
+    try:
+        budget = max(0.0, float(timeout_seconds))
+    except (TypeError, ValueError):
+        budget = 600.0
     elapsed = 0.0
     while True:
         state = job_status(c, job_id)
         if state.get("status") in TERMINAL_STATUSES:
             return state
-        if elapsed + poll_seconds > timeout_seconds:
+        if elapsed + poll > budget:
             return {"timed_out": True, **state}
-        sleep(poll_seconds)
-        elapsed += poll_seconds
+        sleep(poll)
+        elapsed += poll
 
 
 def _safe_filename(name: str) -> Optional[str]:

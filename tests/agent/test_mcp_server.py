@@ -479,6 +479,34 @@ def test_wait_for_job_times_out():
     assert slept == [3, 3, 3]
 
 
+@pytest.mark.parametrize("poll", [0, -5, "0"])
+def test_wait_for_job_clamps_poll_seconds_so_it_cannot_hot_loop(poll):
+    """final review I1：`poll_seconds` 是 AI 給的；0／負數不能變成不睡覺的熱迴圈。"""
+    fake = FakePlatform()
+    fake.json_route("GET", "/api/jobs/j1", {**DETAIL, "status": "running"})
+    slept: list[float] = []
+
+    out = mcp_server.wait_for_job(
+        fake.client(), "j1", timeout_seconds=2, poll_seconds=poll, sleep=slept.append
+    )
+
+    assert out["timed_out"] is True
+    assert slept == [1.0, 1.0]
+    assert len(fake.requests) == 3
+
+
+def test_wait_for_job_negative_timeout_checks_once():
+    fake = FakePlatform()
+    fake.json_route("GET", "/api/jobs/j1", {**DETAIL, "status": "running"})
+    slept: list[float] = []
+
+    out = mcp_server.wait_for_job(fake.client(), "j1", timeout_seconds=-1, sleep=slept.append)
+
+    assert out["timed_out"] is True
+    assert slept == []
+    assert len(fake.requests) == 1
+
+
 # --------------------------------------------------------------------------
 # download_results
 # --------------------------------------------------------------------------
