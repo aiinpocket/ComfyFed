@@ -362,6 +362,7 @@ async def create_job_from_workflow(
     data_dir: str,
     *,
     workflow_json_text: Optional[str] = None,
+    fetching: frozenset[str] = frozenset(),
 ) -> str:
     """建單：檢查上傳資產、擋掉整個聯邦都拿不到的模型、寫 Job 列、落地資產。
 
@@ -384,6 +385,14 @@ async def create_job_from_workflow(
     the stored `workflow_json` stays byte-for-byte what the submitter sent;
     a caller that only has a dict (the recipe runner, whose graph is rendered
     in memory) omits it and gets a plain `json.dumps`.
+
+    `fetching` 是「這次送單已經替它排好下載的模型名」（2026-09-20 spec §12.2，
+    配方的 `model_sources`）。這些名字現在確實沒有任何 worker 有，但已經有一筆
+    `kind=model_fetch` job 在路上，所以它們不算「整個聯邦都拿不到」-- 少了這個
+    豁免，自動下載的配方會在建單這一關被自己剛排好的下載擋下來。
+    `fetching` is the set of model names this submission has ALREADY queued a
+    `kind=model_fetch` job for; they are missing right now but not unobtainable,
+    so they must not trip the fleet-wide refusal below.
     """
     workflow_json = workflow_json_text if workflow_json_text is not None else json.dumps(workflow)
 
@@ -410,7 +419,7 @@ async def create_job_from_workflow(
         uploaded_names.append(filename)
 
     needs = assess.extract(workflow)
-    unfetchable = unfetchable_missing_models(needs, data_dir)
+    unfetchable = unfetchable_missing_models(needs, data_dir) - set(fetching or ())
     if unfetchable:
         names = sorted(unfetchable)
         raise _error(

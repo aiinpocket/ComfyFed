@@ -1,15 +1,15 @@
 {
-  "id": "flux-t2i",
+  "id": "chroma-t2i",
   "title": {
-    "zh-TW": "Flux 文生圖",
-    "en": "Flux text-to-image"
+    "zh-TW": "Chroma 文生圖（預設）",
+    "en": "Chroma text-to-image (default)"
   },
   "description": {
-    "zh-TW": "用 Flux.1-dev 依文字提示產生一張圖；需要 flux1-dev、clip_l、t5xxl_fp16 與 ae 四個模型。",
-    "en": "Generate one image from a text prompt with Flux.1-dev; needs the flux1-dev, clip_l, t5xxl_fp16 and ae models."
+    "zh-TW": "用 Chroma1-HD 依文字提示產生一張圖；權重本身不做內容審查。需要 Chroma1-HD-fp8mixed、t5xxl_fp16 與 ae 三個模型，缺的會自動下載。",
+    "en": "Generate one image from a text prompt with Chroma1-HD, an uncensored Flux-architecture checkpoint. Needs the Chroma1-HD-fp8mixed, t5xxl_fp16 and ae models; a missing one is fetched automatically."
   },
-  "order": 30,
-  "nsfw_ok": false,
+  "order": 10,
+  "nsfw_ok": true,
   "params": [
     {
       "name": "prompt",
@@ -21,9 +21,18 @@
       }
     },
     {
+      "name": "negative",
+      "type": "string",
+      "default": "This low quality greyscale unfinished sketch is inaccurate and flawed. The image is very blurred and lacks detail with excessive chromatic aberrations and artifacts. The image is overly saturated with excessive bloom. It has a toony aesthetic with bold outlines and flat colors. ",
+      "description": {
+        "zh-TW": "負向提示（預設為官方範本的句子）",
+        "en": "Negative prompt (defaults to the official template's sentence)"
+      }
+    },
+    {
       "name": "width",
       "type": "integer",
-      "default": 768,
+      "default": 1024,
       "min": 256,
       "max": 2048,
       "step": 16,
@@ -35,7 +44,7 @@
     {
       "name": "height",
       "type": "integer",
-      "default": 768,
+      "default": 1024,
       "min": 256,
       "max": 2048,
       "step": 16,
@@ -47,23 +56,23 @@
     {
       "name": "steps",
       "type": "integer",
-      "default": 8,
+      "default": 26,
       "min": 1,
-      "max": 50,
+      "max": 60,
       "description": {
         "zh-TW": "取樣步數",
         "en": "Sampling steps"
       }
     },
     {
-      "name": "guidance",
+      "name": "cfg",
       "type": "number",
       "default": 3.5,
       "min": 0,
       "max": 20,
       "description": {
-        "zh-TW": "Flux guidance 強度",
-        "en": "Flux guidance strength"
+        "zh-TW": "CFG 強度",
+        "en": "CFG scale"
       }
     },
     {
@@ -79,25 +88,30 @@
     }
   ],
   "required_models": [
-    "flux1-dev.safetensors",
-    "clip_l.safetensors",
+    "Chroma1-HD-fp8mixed.safetensors",
     "t5xxl_fp16.safetensors",
     "ae.safetensors"
+  ],
+  "model_sources": [
+    {
+      "name": "Chroma1-HD-fp8mixed.safetensors",
+      "directory": "diffusion_models",
+      "url": "https://huggingface.co/Comfy-Org/Chroma1-HD_repackaged/resolve/main/split_files/diffusion_models/Chroma1-HD-fp8mixed.safetensors"
+    }
   ],
   "workflow": {
     "1": {
       "class_type": "UNETLoader",
       "inputs": {
-        "unet_name": "flux1-dev.safetensors",
+        "unet_name": "Chroma1-HD-fp8mixed.safetensors",
         "weight_dtype": "default"
       }
     },
     "2": {
-      "class_type": "DualCLIPLoader",
+      "class_type": "CLIPLoader",
       "inputs": {
-        "clip_name1": "clip_l.safetensors",
-        "clip_name2": "t5xxl_fp16.safetensors",
-        "type": "flux",
+        "clip_name": "t5xxl_fp16.safetensors",
+        "type": "chroma",
         "device": "default"
       }
     },
@@ -108,63 +122,91 @@
       }
     },
     "4": {
+      "class_type": "T5TokenizerOptions",
+      "inputs": {
+        "clip": [
+          "2",
+          0
+        ],
+        "min_padding": 1,
+        "min_length": 0
+      }
+    },
+    "5": {
       "class_type": "CLIPTextEncode",
       "inputs": {
         "text": {
           "$param": "prompt"
         },
         "clip": [
-          "2",
+          "4",
           0
         ]
       }
     },
-    "5": {
-      "class_type": "FluxGuidance",
-      "inputs": {
-        "conditioning": [
-          "4",
-          0
-        ],
-        "guidance": {
-          "$param": "guidance"
-        }
-      }
-    },
     "6": {
-      "class_type": "BasicGuider",
+      "class_type": "CLIPTextEncode",
       "inputs": {
-        "model": [
-          "1",
-          0
-        ],
-        "conditioning": [
-          "5",
+        "text": {
+          "$param": "negative"
+        },
+        "clip": [
+          "4",
           0
         ]
       }
     },
     "7": {
-      "class_type": "KSamplerSelect",
-      "inputs": {
-        "sampler_name": "euler"
-      }
-    },
-    "8": {
-      "class_type": "BasicScheduler",
+      "class_type": "ModelSamplingAuraFlow",
       "inputs": {
         "model": [
           "1",
           0
         ],
-        "scheduler": "simple",
+        "shift": 1
+      }
+    },
+    "8": {
+      "class_type": "CFGGuider",
+      "inputs": {
+        "model": [
+          "7",
+          0
+        ],
+        "positive": [
+          "5",
+          0
+        ],
+        "negative": [
+          "6",
+          0
+        ],
+        "cfg": {
+          "$param": "cfg"
+        }
+      }
+    },
+    "9": {
+      "class_type": "KSamplerSelect",
+      "inputs": {
+        "sampler_name": "euler"
+      }
+    },
+    "10": {
+      "class_type": "BasicScheduler",
+      "inputs": {
+        "model": [
+          "7",
+          0
+        ],
+        "scheduler": "beta",
         "steps": {
           "$param": "steps"
         },
         "denoise": 1
       }
     },
-    "9": {
+    "11": {
       "class_type": "RandomNoise",
       "inputs": {
         "noise_seed": {
@@ -172,7 +214,7 @@
         }
       }
     },
-    "10": {
+    "12": {
       "class_type": "EmptySD3LatentImage",
       "inputs": {
         "width": {
@@ -184,36 +226,36 @@
         "batch_size": 1
       }
     },
-    "11": {
+    "13": {
       "class_type": "SamplerCustomAdvanced",
       "inputs": {
         "noise": [
-          "9",
+          "11",
           0
         ],
         "guider": [
-          "6",
-          0
-        ],
-        "sampler": [
-          "7",
-          0
-        ],
-        "sigmas": [
           "8",
           0
         ],
-        "latent_image": [
+        "sampler": [
+          "9",
+          0
+        ],
+        "sigmas": [
           "10",
+          0
+        ],
+        "latent_image": [
+          "12",
           0
         ]
       }
     },
-    "12": {
+    "14": {
       "class_type": "VAEDecode",
       "inputs": {
         "samples": [
-          "11",
+          "13",
           0
         ],
         "vae": [
@@ -222,11 +264,11 @@
         ]
       }
     },
-    "13": {
+    "15": {
       "class_type": "SaveImage",
       "inputs": {
         "images": [
-          "12",
+          "14",
           0
         ],
         "filename_prefix": "comfyfed_recipe"

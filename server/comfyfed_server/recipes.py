@@ -46,11 +46,16 @@ from fastapi import APIRouter, Depends, HTTPException
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel
 
-from . import auth, jobs
+from . import assess, auth, db, jobs, model_fetch
 
 logger = logging.getLogger(__name__)
 
 _DATA_DIRNAME = "recipes"
+
+#: 沒寫 `order` 的配方排在所有有寫的後面（spec §12.1 只要求「依 `order` 升冪」，
+#: 沒說沒寫的怎麼辦 -- 排最後，因為 AI 端把第一個當預設，而一個忘了標順序的
+#: 配方絕不該因為檔名剛好靠前就變成預設。
+_DEFAULT_ORDER = 10_000
 
 #: `seed` 的哨兵值：使用者要「隨機」時送 -1，伺服器換成一個真的隨機值，並把
 #: 換好的值回報給呼叫端（回應的 `params`），這樣同一張圖才重現得出來。
@@ -145,6 +150,8 @@ def public_view(recipe: dict, include_workflow: bool) -> dict:
         "id": recipe.get("id"),
         "title": dict(recipe.get("title") or {}),
         "description": dict(recipe.get("description") or {}),
+        "order": recipe_order(recipe),
+        "nsfw_ok": recipe.get("nsfw_ok") is True,
         "params": list(recipe.get("params") or []),
         "required_models": list(recipe.get("required_models") or []),
     }
@@ -276,6 +283,166 @@ def render_workflow(recipe: dict, params: dict) -> dict:
     return _render(recipe.get("workflow") or {}, params)
 
 
+# --- spec §12：順序／NSFW 旗標／衍生參數／缺模型自動下載 -------------------
+
+
+def recipe_order(recipe: dict) -> int:
+    """配方在 `GET /api/recipes` 的排序鍵（spec §12.1）。"""
+    order = recipe.get("order")
+    if isinstance(order, bool) or not isinstance(order, int):
+        return _DEFAULT_ORDER
+    return order
+
+
+def sorted_recipes() -> list[tuple[str, dict]]:
+    """`[(id, recipe)]`，依 `order` 升冪、同 order 再依 id。
+
+    AI 客戶端把第一個當預設（§12.3），所以這個順序是對外的承諾，不是排版。
+    id 當第二鍵只是為了「同 order 時每次回一樣的順序」-- 一個會抖動的預設比
+    一個錯的預設更難查。
+    """
+    return sorted(load_recipes().items(), key=lambda kv: (recipe_order(kv[1]), kv[0]))
+
+
+def model_sources(recipe: dict) -> list[dict]:
+    """配方宣告的「缺了可以去哪裡抓」清單（§12.2），只留形狀合法的項目。
+
+    形狀壞掉的項目在這裡就丟掉並留一行 log，而不是讓它一路走到
+    `create_fetch_job` 再被 `bad_request` 擋下來：那條路徑的錯誤訊息是寫給
+    「按了面板下載鈕的人」看的，對一個配方檔的打字錯誤毫無幫助。
+    """
+    raw = recipe.get("model_sources")
+    if not isinstance(raw, list):
+        return []
+    out: list[dict] = []
+    for source in raw:
+        if not isinstance(source, dict):
+            continue
+        name = source.get("name")
+        directory = source.get("directory", "")
+        url = source.get("url")
+        if not (isinstance(name, str) and name and isinstance(directory, str)
+                and isinstance(url, str) and url):
+            logger.warning(
+                "recipes: %s has a malformed model_sources entry: %r",
+                recipe.get("id"), source,
+            )
+            continue
+        out.append({"name": name, "directory": directory, "url": url})
+    return out
+
+
+def _inventory_path(source: dict) -> str:
+    """worker inventory 用的名字：`<directory>/<name>`（agent 的 `scan_models`
+    回報的就是相對 models 根目錄的路徑）。"""
+    directory = source["directory"].strip("/")
+    return f"{directory}/{source['name']}" if directory else source["name"]
+
+
+def missing_models(session, recipe: dict) -> list[str]:
+    """`model_sources` 裡「聯邦內沒有任何活著的 worker 持有」的那些 name。
+
+    「活著」= 未軟刪除且未停用（§12.2）。停用與刪除的差別在這裡刻意抹平：
+    兩者都不會被派工，所以它們手上的檔案不能算數 -- 這跟 `model_fetch.
+    _fleet_has_model` 的「連離線的都算」是不同的問題（那個問的是「要不要再
+    抓一份」，這個問的是「現在派得出這張圖嗎」）。
+
+    比對交給 `assess.find_model`／`matches_model_name`，也就是派工時用的同一把
+    尺；自己寫一次字串比對遲早會跟派工的答案打架。
+    """
+    sources = model_sources(recipe)
+    if not sources:
+        return []
+
+    workers = [w for w in jobs._live_workers(session) if not w.disabled]
+    inventories = [assess.model_inventory(worker) for worker in workers]
+
+    missing: list[str] = []
+    for source in sources:
+        needed = _inventory_path(source)
+        if not any(assess.find_model(inventory, needed)[0] for inventory in inventories):
+            missing.append(source["name"])
+    return missing
+
+
+def ensure_model_fetches(recipe: dict, user_id, data_dir: str) -> list[dict]:
+    """對每個「缺」的 `model_sources` 項目建一筆 `kind=model_fetch` job。
+
+    回 `[{"name", "job_id", "reused"}]`（§12.2）。去重、HEAD 探測、白名單、
+    「有沒有 worker 接得住」全部交給 `model_fetch.create_fetch_job` -- 那是面板
+    下載鈕走的同一條路，所以配方觸發的下載與人手動觸發的下載不可能有兩套規則。
+
+    `FetchRequestError` 一律吞掉只留 log：下載排不出來（來源要登入、沒有夠格的
+    worker、網域不在白名單）是「這張圖會等久一點」，不是「這次送單不合法」。
+    送單本身照常成功，job 排在佇列裡，等模型到位就派得出去。
+    """
+    try:
+        with db.get_session() as session:
+            missing = set(missing_models(session, recipe))
+    except Exception:  # pragma: no cover - DB 出事不該讓送單整條掛掉
+        logger.exception("recipes: could not compute missing models for %s", recipe.get("id"))
+        return []
+
+    started: list[dict] = []
+    for source in model_sources(recipe):
+        if source["name"] not in missing:
+            continue
+        try:
+            job_id, reused = model_fetch.create_fetch_job(
+                name=source["name"],
+                directory=source["directory"],
+                url=source["url"],
+                user_id=user_id,
+                data_dir=data_dir,
+            )
+        except model_fetch.FetchRequestError as exc:
+            logger.warning(
+                "recipes: %s -- no auto-fetch for %s (%s): %s",
+                recipe.get("id"), source["name"], exc.code, exc.message,
+            )
+            continue
+        started.append({"name": source["name"], "job_id": job_id, "reused": reused})
+    return started
+
+
+def _h3_length(params: dict) -> dict:
+    """`h3-t2v` 的 `length`（幀數），由 `seconds` 依 §12.1 的式子算出。
+
+    模型只吃 17k+5 的幀數格點（object_info 的 `length` 也寫 `step: 17`、
+    `min: 5`），所以秒數先換算成 24 fps 的幀數，再往上補到最近的格點：
+    `seconds=5` → 120 → 124（＝官方範本的值）。官方範本用一顆
+    `ComfyMathExpression` 節點算，配方不搬那顆節點 -- 圖裡只放算好的整數，
+    因為 AI 端送的是秒數，而「秒數怎麼變成幀數」是平台該負責的事。
+    """
+    seconds = params.get("seconds")
+    if isinstance(seconds, bool) or not isinstance(seconds, (int, float)):
+        return {}
+    frames = max(5, round(seconds * 24))
+    return {"length": frames + (5 - (frames % 17)) % 17}
+
+
+#: `{recipe_id: 算衍生值的函式}`。衍生值刻意不寫成配方檔裡的運算式：配方檔是
+#: 資料，不是程式碼，一個能在檔裡寫運算式的格式就是一個可以被塞進任意運算的
+#: 格式。要加新的衍生值就在這裡加一個具名函式。
+_DERIVED: dict[str, Any] = {"h3-t2v": _h3_length}
+
+
+def derived_params(recipe: dict, params: dict) -> dict:
+    """在已驗證的參數上疊出衍生值，回傳「渲染真正要用的」那份。
+
+    順序是固定的：先 `validate_params`（宣告過的參數），再這裡（衍生值），最後
+    `render_workflow`。所以 `{"$param": "length"}` 在 `h3-t2v` 裡合法，即使
+    `length` 不是宣告的參數 -- 但使用者仍然送不進 `length`（`validate_params`
+    會把它當未知參數擋掉），衍生值只能由伺服器算。
+    """
+    resolved = dict(params or {})
+    compute = _DERIVED.get(str(recipe.get("id")))
+    if compute is None:
+        return resolved
+    resolved.update(compute(resolved))
+    return resolved
+
+
 class RunRequest(BaseModel):
     params: dict = {}
 
@@ -289,13 +456,24 @@ def create_router(data_dir: str) -> APIRouter:
             raise _error(404, "recipes.not_found", f"No such recipe: {recipe_id}")
         return recipe
 
+    def _with_missing(recipes_to_view: list[tuple[dict, bool]]) -> list[dict]:
+        """加上 `missing_models`（§12.2），整批共用**一個** session -- 清單端點
+        每筆都開一次 session 會把一個 O(1) 的查詢變成 O(配方數)。"""
+        with db.get_session() as session:
+            views = []
+            for recipe, include_workflow in recipes_to_view:
+                view = public_view(recipe, include_workflow)
+                view["missing_models"] = missing_models(session, recipe)
+                views.append(view)
+        return views
+
     @r.get("/api/recipes")
     def list_recipes(user: auth.SessionUser = Depends(auth.require_user)):
-        return [public_view(recipe, False) for _id, recipe in sorted(load_recipes().items())]
+        return _with_missing([(recipe, False) for _id, recipe in sorted_recipes()])
 
     @r.get("/api/recipes/{recipe_id}")
     def get_recipe(recipe_id: str, user: auth.SessionUser = Depends(auth.require_user)):
-        return public_view(_get(recipe_id), True)
+        return _with_missing([(_get(recipe_id), True)])[0]
 
     @r.post("/api/recipes/{recipe_id}/run")
     async def run_recipe(
@@ -305,20 +483,31 @@ def create_router(data_dir: str) -> APIRouter:
     ):
         recipe = _get(recipe_id)
         try:
-            params = validate_params(recipe, body.params)
+            params = derived_params(recipe, validate_params(recipe, body.params))
             workflow = render_workflow(recipe, params)
         except RecipeError as exc:
             status = 400 if exc.code == "recipes.bad_params" else 500
             raise _error(status, exc.code, exc.message)
 
+        # 建單**之前**先排下載（§12.2）：先建 job 再排下載也能跑，但那樣一個
+        # 在這中間失敗的請求會留下一筆永遠等不到模型的 job，而先排下載最壞只是
+        # 多一筆 model_fetch job -- 那筆有去重，下一次 run 會直接重用。
+        fetch_jobs = ensure_model_fetches(recipe, user.uid, data_dir)
+
         job_id = await jobs.create_job_from_workflow(
-            None, user, workflow, {}, [], data_dir
+            None, user, workflow, {}, [], data_dir,
+            fetching=frozenset(entry["name"] for entry in fetch_jobs),
         )
         # 201：這個端點的產物是一筆新的 job（`POST /api/jobs` 歷史上回 200，
         # 不動它以免既有 console／e2e 破）。
         return JSONResponse(
             status_code=201,
-            content={"job_id": job_id, "recipe_id": recipe_id, "params": params},
+            content={
+                "job_id": job_id,
+                "recipe_id": recipe_id,
+                "params": params,
+                "model_fetch_jobs": fetch_jobs,
+            },
         )
 
     return r

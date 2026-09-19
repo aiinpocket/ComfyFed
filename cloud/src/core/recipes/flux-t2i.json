@@ -8,6 +8,8 @@
     "zh-TW": "用 Flux.1-dev 依文字提示產生一張圖；需要 flux1-dev、clip_l、t5xxl_fp16 與 ae 四個模型。",
     "en": "Generate one image from a text prompt with Flux.1-dev; needs the flux1-dev, clip_l, t5xxl_fp16 and ae models."
   },
+  "order": 30,
+  "nsfw_ok": false,
   "params": [
     {
       "name": "prompt",
