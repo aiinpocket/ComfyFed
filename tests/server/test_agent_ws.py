@@ -4216,3 +4216,266 @@ def test_hello_with_a_changed_peer_url_resets_the_verdict_and_reprobes(client, m
         "http://203.0.113.7:8850/peer/health",
         "http://198.51.100.9:8850/peer/health",
     ]
+
+
+# --- 2026-09-19 model_fetch: 面板下載鈕建的純下載單 ------------------------
+
+
+def _make_model_fetch_job(name, *, directory="vae", size_bytes=335_000_000, unverified=True):
+    """Create a queued `kind=model_fetch` job the way `model_fetch.
+    create_fetch_job` does, and return `(job_id, fetch_entry)`.
+
+    Signed with the platform key so the entry that comes back out of the
+    push is byte-identical to the one stored -- the agent verifies it.
+    """
+    from comfyfed_server import model_fetch, security
+
+    signing_key, _vk = security.load_platform_keys(agentws._data_dir)
+    if unverified:
+        entry = model_fetch.sign_unverified_entry(
+            signing_key,
+            name=name,
+            directory=directory,
+            url=f"https://huggingface.co/x/resolve/main/{name}",
+            size_bytes=size_bytes,
+        )
+    else:
+        payload = f"{name}|{directory}|{'ab' * 32}|{size_bytes}"
+        entry = {
+            "name": name,
+            "directory": directory,
+            "url": f"https://huggingface.co/x/resolve/main/{name}",
+            "backup_url": None,
+            "sha256": "ab" * 32,
+            "size_bytes": size_bytes,
+            "sig": signing_key.sign(payload.encode()).signature.hex(),
+        }
+
+    with db.get_session() as session:
+        job = db.Job(
+            workflow_json="{}",
+            kind="model_fetch",
+            fetch_entry=json.dumps(entry),
+            required_models=json.dumps([name]),
+            required_nodes="[]",
+            input_assets="[]",
+            origin="panel",
+        )
+        session.add(job)
+        session.commit()
+        return job.id, entry
+
+
+def _fetch_ready_worker(client, csrf, name, *, protocol):
+    worker_id, sk = _register_worker(client, csrf, name)
+    with db.get_session() as session:
+        worker = session.get(db.Worker, worker_id)
+        worker.status = "online"
+        worker.protocol = protocol
+        worker.auto_fetch = True
+        worker.dynamic = json.dumps({"free_disk_gb": 100.0})
+        worker.hardware = json.dumps({"max_fetch_gb": 100})
+        session.commit()
+    return worker_id, sk
+
+
+def _hello_and_idle(ws, protocol):
+    ws.send_json(
+        {
+            "type": "hello",
+            "hardware": {"max_fetch_gb": 100},
+            "backend": "cuda",
+            "torch_version": "",
+            "node_classes": [],
+            "protocol": protocol,
+            "auto_fetch": True,
+        }
+    )
+    ws.send_json(
+        {
+            "type": "heartbeat",
+            "state": "idle",
+            "progress": 0.0,
+            "job_id": None,
+            "dynamic": {"free_disk_gb": 100.0},
+        }
+    )
+
+
+def test_model_fetch_job_is_pushed_with_kind_and_unverified_entry(client):
+    csrf = _login(client)
+    worker_id, sk = _fetch_ready_worker(client, csrf, "w1", protocol=5)
+    job_id, entry = _make_model_fetch_job("unknown_vae.safetensors")
+
+    with client.websocket_connect("/api/agent/ws") as ws:
+        challenge = ws.receive_json()
+        sig = sk.sign(challenge["nonce"].encode()).signature.hex()
+        ws.send_json({"type": "auth", "worker_id": worker_id, "sig": sig})
+        assert ws.receive_json()["type"] == "ready"
+        _hello_and_idle(ws, 5)
+        agentws.dispatch_once(worker_id)
+
+        frame = ws.receive_json()
+        assert frame["type"] == "job"
+        assert frame["job_id"] == job_id
+        assert frame["kind"] == "model_fetch"
+        assert frame["workflow_json"] == "{}"
+        assert frame["input_assets"] == []
+        assert frame["fetch_models"] == [entry]
+
+
+def test_prompt_job_push_still_carries_no_kind_key(client):
+    """純加法：普通 prompt 單的推送形狀一個位元都不能變。"""
+    csrf = _login(client)
+    worker_id, sk = _register_worker(client, csrf, "w1")
+    job_id = _submit(client, csrf)
+
+    with client.websocket_connect("/api/agent/ws") as ws:
+        challenge = ws.receive_json()
+        sig = sk.sign(challenge["nonce"].encode()).signature.hex()
+        ws.send_json({"type": "auth", "worker_id": worker_id, "sig": sig})
+        assert ws.receive_json()["type"] == "ready"
+        ws.send_json({"type": "heartbeat", "state": "idle", "progress": 0.0, "job_id": None, "dynamic": {}})
+        agentws.dispatch_once(worker_id)
+
+        frame = ws.receive_json()
+        assert frame["job_id"] == job_id
+        assert "kind" not in frame
+
+
+def test_model_fetch_not_pushed_to_protocol_4(client):
+    """未驗證來源項目要 protocol>=5；舊 agent 連被派工都不該發生，單子留在
+    queued。"""
+    csrf = _login(client)
+    worker_id, sk = _fetch_ready_worker(client, csrf, "w4", protocol=4)
+    job_id, _entry = _make_model_fetch_job("unknown_vae.safetensors")
+
+    with client.websocket_connect("/api/agent/ws") as ws:
+        challenge = ws.receive_json()
+        sig = sk.sign(challenge["nonce"].encode()).signature.hex()
+        ws.send_json({"type": "auth", "worker_id": worker_id, "sig": sig})
+        assert ws.receive_json()["type"] == "ready"
+        _hello_and_idle(ws, 4)
+        agentws.dispatch_once(worker_id)
+
+    with db.get_session() as session:
+        assert session.get(db.Job, job_id).status == "queued"
+
+
+def test_real_manifest_entry_wins_over_job_entry(client):
+    """`ae.safetensors` 是 curated（有官方核可的 sha256），所以就算單子上存的
+    是未驗證項目，派工時合併仍以真 manifest 為準。"""
+    csrf = _login(client)
+    worker_id, sk = _fetch_ready_worker(client, csrf, "w1", protocol=5)
+    job_id, job_entry = _make_model_fetch_job("ae.safetensors")
+
+    with client.websocket_connect("/api/agent/ws") as ws:
+        challenge = ws.receive_json()
+        sig = sk.sign(challenge["nonce"].encode()).signature.hex()
+        ws.send_json({"type": "auth", "worker_id": worker_id, "sig": sig})
+        assert ws.receive_json()["type"] == "ready"
+        _hello_and_idle(ws, 5)
+        agentws.dispatch_once(worker_id)
+
+        frame = ws.receive_json()
+        assert frame["job_id"] == job_id
+        entry = frame["fetch_models"][0]
+        assert entry != job_entry
+        assert entry.get("unverified") is not True
+        assert len(entry["sha256"]) == 64
+
+
+def test_job_done_learns_hash_and_mints_unbilled_receipt(client):
+    csrf = _login(client)
+    worker_id, sk = _fetch_ready_worker(client, csrf, "w1", protocol=5)
+    job_id, entry = _make_model_fetch_job("unknown_vae.safetensors")
+
+    with client.websocket_connect("/api/agent/ws") as ws:
+        challenge = ws.receive_json()
+        sig = sk.sign(challenge["nonce"].encode()).signature.hex()
+        ws.send_json({"type": "auth", "worker_id": worker_id, "sig": sig})
+        assert ws.receive_json()["type"] == "ready"
+        _hello_and_idle(ws, 5)
+        agentws.dispatch_once(worker_id)
+        assert ws.receive_json()["job_id"] == job_id
+
+        ws.send_json(
+            {
+                "type": "job_done",
+                "job_id": job_id,
+                "result_files": [],
+                "exec_seconds": 0,
+                "fetched_models": [
+                    {
+                        "name": "unknown_vae.safetensors",
+                        "directory": "vae",
+                        "size_bytes": entry["size_bytes"],
+                        "sha256": "ab" * 32,
+                    },
+                    # Not in this job's required_models -- a worker must not
+                    # be able to teach the platform hashes for anything it
+                    # likes just because it finished one fetch.
+                    {"name": "not-in-job", "directory": "", "size_bytes": 1, "sha256": "cd" * 32},
+                    {"name": "unknown_vae.safetensors", "size_bytes": -1, "sha256": "zz" * 32},
+                    # Untrusted shapes that must be dropped, not crash the
+                    # handler (an unhashable name, a bool size, a bad hex).
+                    {"name": ["unknown_vae.safetensors"], "size_bytes": 1, "sha256": "ab" * 32},
+                    {"name": "unknown_vae.safetensors", "size_bytes": True, "sha256": "ab" * 32},
+                    {"name": "unknown_vae.safetensors", "size_bytes": 5, "sha256": "AB" * 32},
+                    "not-even-a-dict",
+                ],
+            }
+        )
+        agentws.dispatch_once(worker_id)
+
+    with db.get_session() as s:
+        rows = s.query(db.ModelHash).all()
+        assert len(rows) == 1
+        assert rows[0].name == "unknown_vae.safetensors"
+        assert rows[0].sha256 == "ab" * 32
+        assert rows[0].size_bytes == entry["size_bytes"]
+
+        rec = s.query(db.Receipt).filter_by(job_id=job_id).one()
+        assert rec.kind == "model_fetch"
+        assert rec.billable is False
+        assert rec.basis == "model_fetch"
+        assert rec.gpu_seconds == 0
+
+        assert s.get(db.Job, job_id).status == "done"
+        # signature 為 NULL 的單不進執行時間統計。
+        assert s.query(db.WorkerJobStats).count() == 0
+
+
+def test_job_done_fetched_models_ignored_for_a_prompt_job(client):
+    """普通 prompt 單就算回報 fetched_models 也不學 -- 只有 model_fetch 單
+    的回報算數（spec §9）。"""
+    csrf = _login(client)
+    worker_id, sk = _register_worker(client, csrf, "w1")
+    job_id = _submit(client, csrf)
+
+    with client.websocket_connect("/api/agent/ws") as ws:
+        challenge = ws.receive_json()
+        sig = sk.sign(challenge["nonce"].encode()).signature.hex()
+        ws.send_json({"type": "auth", "worker_id": worker_id, "sig": sig})
+        assert ws.receive_json()["type"] == "ready"
+        ws.send_json({"type": "heartbeat", "state": "idle", "progress": 0.0, "job_id": None, "dynamic": {}})
+        agentws.dispatch_once(worker_id)
+        assert ws.receive_json()["job_id"] == job_id
+
+        ws.send_json(
+            {
+                "type": "job_done",
+                "job_id": job_id,
+                "result_files": [],
+                "exec_seconds": 1.0,
+                "fetched_models": [
+                    {"name": "whatever.safetensors", "size_bytes": 1, "sha256": "ab" * 32}
+                ],
+            }
+        )
+        agentws.dispatch_once(worker_id)
+
+    with db.get_session() as s:
+        assert s.query(db.ModelHash).count() == 0
+        rec = s.query(db.Receipt).filter_by(job_id=job_id).one()
+        assert rec.kind == "completed" and rec.billable is True

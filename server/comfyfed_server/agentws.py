@@ -112,6 +112,7 @@ import json
 import logging
 import math
 import os
+import re
 import secrets
 from collections import OrderedDict
 from urllib.parse import urlsplit
@@ -128,6 +129,7 @@ from . import (
     db,
     dispatch,
     metrics,
+    model_fetch,
     model_manifest,
     panelws,
     peerhealth,
@@ -866,6 +868,10 @@ async def _handle_job_done(worker_id: str, conn: "_Connection", message: dict) -
             await _send_job_cancelled(conn, job_id)
 
     if done:
+        # 2026-09-19 model_fetch (spec §9): 只有「transition 真的套用」才學
+        # 雜湊 -- 放在 `if done:` 最前面，就和收據一樣，worker 不能靠送別人
+        # 的 job_id 來教平台任何東西。
+        job_kind = _learn_fetched_models(worker_id, job_id, message.get("fetched_models"))
         _clear_fetch_progress(job_id)
         await _notify_panel_job_done(job_id)
         exec_seconds = message.get("exec_seconds")
@@ -873,8 +879,80 @@ async def _handle_job_done(worker_id: str, conn: "_Connection", message: dict) -
             exec_seconds = None
         # Phase 3.3 §2.3：只有真的完成、且 exec_seconds 有效才進統計。
         # 放在收據之前，因為它自己吞例外 -- 統計壞掉絕不能少發一張收據。
-        _record_job_stats(worker_id, job_id, exec_seconds)
+        # model_fetch 單沒有 signature（也沒有 workflow 可執行），進統計只會
+        # 汙染執行時間預測，所以跳過（spec §9）。
+        if job_kind != "model_fetch":
+            _record_job_stats(worker_id, job_id, exec_seconds)
         await _create_and_push_receipt(worker_id, conn, job_id, exec_seconds)
+
+
+def _learn_fetched_models(worker_id: str, job_id: Optional[str], fetched) -> str:
+    """Learn the sha256 a worker measured for the models it just fetched, and
+    return the job's `kind` so the caller can skip the stats path.
+
+    Only a `kind=model_fetch` job teaches anything, and only for names in
+    that job's own `required_models`: an unverified-source entry has no hash
+    for the agent to verify against, so the digest it reports here is the
+    platform's FIRST evidence of what the file actually is. `record_hash`'s
+    existing first-seen-wins/conflict rules then apply exactly as they do to
+    an ordinary inventory report -- a second worker disagreeing poisons the
+    name rather than overwriting it.
+
+    Anything malformed (wrong type, a name this job never asked for, a
+    non-positive size, a sha256 that isn't 64 lowercase hex) is dropped with
+    a WARNING rather than rejecting the whole message: the fetch itself
+    genuinely completed, and one bad list entry must not cost the worker its
+    receipt.
+    """
+    if not job_id:
+        return "prompt"
+    with db.get_session() as session:
+        job = session.get(db.Job, job_id)
+        if job is None:
+            return "prompt"
+        kind = job.kind or "prompt"
+        if kind != "model_fetch":
+            return kind
+        try:
+            allowed = set(json.loads(job.required_models or "[]"))
+        except (TypeError, ValueError):
+            allowed = set()
+
+    if not isinstance(fetched, list):
+        return kind
+
+    for item in fetched:
+        if not isinstance(item, dict):
+            logger.warning(
+                "agentws: ignoring malformed fetched_models item from %s for job %s: %r",
+                worker_id, job_id, item,
+            )
+            continue
+        name = item.get("name")
+        size_bytes = item.get("size_bytes")
+        sha256 = item.get("sha256")
+        if (
+            # `isinstance` FIRST: `name` is untrusted agent input, and an
+            # unhashable one (a list, say) would raise from the `in` test.
+            not isinstance(name, str)
+            or name not in allowed
+            or not isinstance(size_bytes, int)
+            or isinstance(size_bytes, bool)
+            or size_bytes <= 0
+            or not isinstance(sha256, str)
+            or not re.fullmatch(r"[0-9a-f]{64}", sha256)
+        ):
+            logger.warning(
+                "agentws: ignoring malformed fetched_models item from %s for job %s: %r",
+                worker_id, job_id, item,
+            )
+            continue
+        try:
+            model_manifest.record_hash(worker_id, name, size_bytes, sha256)
+        except Exception:
+            logger.exception("agentws: record_hash failed for %s", name)
+
+    return kind
 
 
 async def _notify_panel_job_done(job_id: Optional[str]) -> None:
@@ -1579,6 +1657,14 @@ async def _create_and_push_receipt(
     a `< 0` comparison, which `NaN` also slips past). The final value is
     clamped to zero so a negative wall clock (clock skew between `started_at`
     and `finished_at`) can never reach a signed receipt.
+
+    2026-09-19 model_fetch (spec §4/§9): a `kind=model_fetch` job runs no
+    workflow at all -- the agent spends the whole job in `fetching_models`
+    and never sets `started_at` -- so it short-circuits every measurement
+    above to `gpu_seconds=0.0`, `kind="model_fetch"`, `basis="model_fetch"`,
+    `billable=False`. The protocol-violation ERROR is deliberately NOT
+    logged for it: "no exec_seconds despite having started" is the contract
+    for this kind, not an agent breaking one.
     """
     if not job_id or _signing_key is None:
         return
@@ -1587,11 +1673,19 @@ async def _create_and_push_receipt(
         job = session.get(db.Job, job_id)
         if job is None:
             return
+        # 2026-09-19 model_fetch (spec §4/§9)：純下載單不執行任何 workflow，
+        # agent 整段都帶 stage=fetching_models、`started_at` 永不設，所以
+        # 0 GPU 秒、不計費。這也是為什麼下面的 protocol 違規 log 要跳過：
+        # 這種單「沒有 exec_seconds」是契約本身，不是 agent 違約。
+        is_model_fetch = (job.kind or "prompt") == "model_fetch"
+
         wall_seconds = 0.0
         if job.started_at is not None and job.finished_at is not None:
             wall_seconds = (job.finished_at - job.started_at).total_seconds()
 
-        if _is_valid_exec_seconds(exec_seconds):
+        if is_model_fetch:
+            gpu_seconds, basis, kind, billable = 0.0, "model_fetch", "model_fetch", False
+        elif _is_valid_exec_seconds(exec_seconds):
             gpu_seconds = min(exec_seconds, wall_seconds)
             basis = "exec"
         else:
@@ -1618,14 +1712,16 @@ async def _create_and_push_receipt(
                 )
 
         gpu_seconds = max(0.0, gpu_seconds)
+        if not is_model_fetch:
+            kind, billable = "completed", True
 
         receipt_id, payload, platform_sig = _sign_and_store_receipt(
-            session, job_id, worker_id, gpu_seconds, kind="completed", billable=True, basis=basis
+            session, job_id, worker_id, gpu_seconds, kind=kind, billable=billable, basis=basis
         )
 
     await _push_receipt_frame(
         worker_id, receipt_id, payload, platform_sig,
-        kind="completed", billable=True, basis=basis, conn=conn,
+        kind=kind, billable=billable, basis=basis, conn=conn,
     )
 
 
@@ -1783,6 +1879,7 @@ def _fetch_models_for_push(
     fetchable_models: dict[str, int],
     manifest_by_name: dict[str, dict],
     peer_only_models: frozenset[str] | None = None,
+    unverified_models: frozenset[str] | None = None,
 ) -> list[dict]:
     """The `fetch_models` manifest entries to embed in this job's push to
     `worker`, or `[]` when nothing needs fetching.
@@ -1811,7 +1908,10 @@ def _fetch_models_for_push(
         requirements_override = {}
 
     needs = assess.needs_from_job(job)
-    v = assess.verdict(worker, needs, requirements_override, [], fetchable_models, peer_only_models)
+    v = assess.verdict(
+        worker, needs, requirements_override, [], fetchable_models,
+        peer_only_models, unverified_models,
+    )
     if v.kind != "eligible_after_fetch":
         return []
 
@@ -1894,6 +1994,7 @@ async def dispatch_tick() -> None:
                 )
         except Exception:
             logger.exception("agentws: failed to check for queued work")
+    unverified_models: frozenset[str] = frozenset()
     if has_queued_work and _data_dir is not None:
         try:
             manifest_entries = model_manifest.entries(_data_dir)
@@ -1902,8 +2003,69 @@ async def dispatch_tick() -> None:
             peer_only_models = model_manifest.peer_only_names(manifest_entries)
         except Exception:
             logger.exception("agentws: failed to build fetch manifest for dispatch tick")
+
+    # 2026-09-19 model_fetch (spec §7): a panel-download job carries its OWN
+    # signed entry, minted when the button was pressed for a model the real
+    # manifest knows nothing about. Merge those in so `assess` can see the
+    # name as fetchable at all. Deliberately OUTSIDE the `_data_dir is not
+    # None` guard above -- the job entry is self-contained (it was signed at
+    # creation time and is stored on the row), so it must still dispatch on
+    # an install/test where no router registered a data dir and the real
+    # manifest is therefore empty.
+    #
+    # The real manifest ALWAYS wins on a name collision: a verified,
+    # content-addressed entry (curated hash or learned consensus) is strictly
+    # better than an unverified-source one, and by the time a model_fetch job
+    # reaches dispatch the platform may well have learned the hash from some
+    # other worker's inventory report.
+    if has_queued_work:
+        try:
+            with db.get_session() as session:
+                fetch_jobs = (
+                    session.query(db.Job)
+                    .filter(db.Job.status == "queued", db.Job.kind == "model_fetch")
+                    .all()
+                )
+                job_entries = []
+                for j in fetch_jobs:
+                    if not j.fetch_entry:
+                        continue
+                    try:
+                        job_entries.append(json.loads(j.fetch_entry))
+                    except (TypeError, ValueError):
+                        logger.warning(
+                            "agentws: model_fetch job %s has an unparseable fetch_entry", j.id
+                        )
+            unverified: set[str] = set()
+            for entry in job_entries:
+                if not isinstance(entry, dict):
+                    continue
+                name = entry.get("name")
+                size_bytes = entry.get("size_bytes")
+                if (
+                    not isinstance(name, str)
+                    or not name
+                    or name in manifest_by_name
+                    or not isinstance(size_bytes, int)
+                    or isinstance(size_bytes, bool)
+                    or size_bytes <= 0
+                ):
+                    # One unusable row must not cost every OTHER queued
+                    # model_fetch job its dispatch, so this skips rather than
+                    # letting the whole merge fall into the except below.
+                    continue
+                manifest_by_name[name] = entry
+                fetchable_models[name] = size_bytes
+                if model_fetch.is_unverified_entry(entry):
+                    unverified.add(name)
+            unverified_models = frozenset(unverified)
+        except Exception:
+            logger.exception("agentws: failed to merge model_fetch job entries")
+
     try:
-        assignments = dispatch.assign_jobs(idle_worker_ids, fetchable_models, peer_only_models)
+        assignments = dispatch.assign_jobs(
+            idle_worker_ids, fetchable_models, peer_only_models, unverified_models
+        )
     except Exception:
         logger.exception("agentws: assign_jobs failed")
         assignments = []
@@ -1919,12 +2081,18 @@ async def dispatch_tick() -> None:
                 "workflow_json": job.workflow_json,
                 "input_assets": json.loads(job.input_assets or "[]"),
             }
+            # Only a model_fetch job carries this key: a `prompt` push keeps
+            # its exact existing shape, and an old agent ignores unknown
+            # fields anyway (spec §7).
+            if job.kind == "model_fetch":
+                frame["kind"] = "model_fetch"
             if fetchable_models:
                 with db.get_session() as session:
                     worker = session.get(db.Worker, worker_id)
                 if worker is not None:
                     fetch_models = _fetch_models_for_push(
-                        job, worker, fetchable_models, manifest_by_name, peer_only_models
+                        job, worker, fetchable_models, manifest_by_name,
+                        peer_only_models, unverified_models,
                     )
                     if fetch_models:
                         frame["fetch_models"] = fetch_models
