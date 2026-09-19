@@ -434,6 +434,10 @@ async def job_done(job: "db.Job") -> None:
     """Emit one `executed` per output node, then the completion `executing`
     signal, then a refreshed `status`.
 
+    Exception (2026-09-19 model_fetch, spec §9): a `kind=model_fetch` job has
+    no output nodes at all and emits NO `executed`/`executing` -- only the
+    `status` refresh. See the early return below.
+
     Upstream's `executed` message carries exactly ONE node's UI dict in
     `data.output`, keyed by `data.node`/`data.display_node` -- never the whole
     `{node_id: {...}}` map (see `ComfyApp.addApiUpdateHandlers` in the pinned
@@ -449,6 +453,16 @@ async def job_done(job: "db.Job") -> None:
     avoid a module-import cycle (comfyapi imports this module to serve
     `/comfy/api/ws`).
     """
+    # 2026-09-19 model_fetch (spec §9)：純下載單沒有任何輸出節點，所以一個
+    # `executed` 都不該發。不擋的話 `job_outputs` 會回空 dict，下面的
+    # `FALLBACK_OUTPUT_KEY` 退路會憑空生一則 `executed`，再補一則
+    # `executing{node: null}` —— 而官方前端把後者當成「這張 prompt 跑完了」，
+    # 會把同一個分頁裡真正在跑的 prompt 的執行中指示清掉。只送佇列徽章的
+    # status 更新（面板靠輪詢 `GET model-fetch/{id}` 看下載進度，不靠這裡）。
+    if (job.kind or "prompt") == "model_fetch":
+        await post_event({"type": "status", "data": {"status": queue_status()}})
+        return
+
     from . import comfyapi
 
     # Phase 3.3 §3.7: what the panel must see when a CHILD finishes is the

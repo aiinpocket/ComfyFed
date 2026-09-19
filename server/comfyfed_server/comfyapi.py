@@ -1824,7 +1824,10 @@ def create_router(
         except Exception:
             body = None
         if not isinstance(body, dict):
-            return _model_fetch_error("bad_request", model_fetch._MESSAGES["bad_request"])
+            # Same envelope as every other refusal: build the error through
+            # the public exception rather than reading its message table.
+            exc = model_fetch.FetchRequestError("bad_request")
+            return _model_fetch_error(exc.code, exc.message)
 
         try:
             job_id, reused = model_fetch.create_fetch_job(

@@ -10,6 +10,7 @@ worker reports the real sha256 on completion so the platform learns it.
 from __future__ import annotations
 
 import json
+import logging
 import re
 from typing import Optional
 from urllib.parse import urlsplit
@@ -17,6 +18,8 @@ from urllib.parse import urlsplit
 import httpx
 
 from . import assess, db, model_manifest, security
+
+logger = logging.getLogger(__name__)
 
 TRUSTED_ORIGINS: frozenset[str] = frozenset({"https://huggingface.co", "https://civitai.com"})
 _HEAD_TIMEOUT_SECONDS = 10.0
@@ -149,12 +152,29 @@ _MESSAGES = {
 class FetchRequestError(Exception):
     """One of §5.1's refusal rows. `code` is the bare reason
     (`bad_request|already_present|untrusted_url|gated|size_unknown|no_worker`);
-    the route prefixes it with `model_fetch.` for the wire."""
+    the route prefixes it with `model_fetch.` for the wire.
 
-    def __init__(self, code: str) -> None:
+    `detail` appends machine-readable specifics to the generic sentence --
+    used by `no_worker`, which §5.1 row 7 requires to LIST why (the raw
+    `assess` reason strings, so the panel and the console say the same thing
+    about the same refusal).
+    """
+
+    def __init__(self, code: str, detail: str = "") -> None:
         super().__init__(code)
         self.code = code
-        self.message = _MESSAGES[code]
+        self.message = f"{_MESSAGES[code]}：{detail}" if detail else _MESSAGES[code]
+
+
+# Characters that must never reach a signed field. `|` is the payload's own
+# delimiter (`name|directory|url|size_bytes|unverified`) -- allowing it makes
+# the concatenation non-injective across field boundaries, so two different
+# (name, directory) pairs could produce one payload and therefore share a
+# signature. Control characters (including NUL and newline) would ride the
+# same payload into the worker's filesystem. `model_manifest` already refuses
+# `|` in its own entry builders for exactly this reason; this is the same
+# guard at the other place entries are minted.
+_FORBIDDEN_FIELD_CHARS = re.compile(r"[|\x00-\x1f\x7f]")
 
 
 def _safe_relative(path: str) -> bool:
@@ -165,6 +185,8 @@ def _safe_relative(path: str) -> bool:
     server never depends on the agent package."""
     if not isinstance(path, str):
         return False
+    if _FORBIDDEN_FIELD_CHARS.search(path):
+        return False
     if path == "":
         return True
     if path.startswith(("/", "\\")) or re.match(r"^[A-Za-z]:", path):
@@ -174,11 +196,13 @@ def _safe_relative(path: str) -> bool:
 
 def _safe_name(name) -> bool:
     """A bare model filename: no path separators at all (the `directory`
-    field is the only place a path may appear), no `.`/`..`, bounded."""
+    field is the only place a path may appear), no `.`/`..`, no payload
+    delimiter or control characters, bounded."""
     return (
         isinstance(name, str)
         and 0 < len(name) < 256
         and not re.search(r"[\\/]", name)
+        and not _FORBIDDEN_FIELD_CHARS.search(name)
         and name not in (".", "..")
     )
 
@@ -215,6 +239,42 @@ def _active_fetch_job_id(name: str) -> Optional[str]:
             if required == [name]:
                 return job.id
     return None
+
+
+def _no_worker_detail(
+    name: str,
+    fetchable: dict[str, int],
+    online_enabled_workers: list,
+    peer_only: frozenset[str],
+    unverified: frozenset[str],
+) -> str:
+    """§5.1 row 7's "message 列出原因": the distinct `assess` reason strings
+    from re-judging this one model against every online, enabled worker.
+
+    `partition_fleet_fetchable` answers only yes/no, so the per-candidate
+    reasons are re-derived here with `assess.verdict` -- the SAME judge, so
+    what the panel is told can never contradict why dispatch actually
+    refused. Deliberately the raw reason strings (`missing_models_unverified_
+    protocol:<name>`, `missing_models_unavailable:<name>`, the override/vram
+    ones) rather than a prose translation: the console shows these verbatim
+    already, and a second wording would be a second thing to keep in sync.
+
+    Empty when nothing is online at all -- there is no candidate to have a
+    reason about, and the generic sentence already says "needs an online
+    worker".
+    """
+    needs = assess.JobNeeds(models={name}, nodes=set())
+    reasons: list[str] = []
+    for worker in online_enabled_workers:
+        try:
+            v = assess.verdict(worker, needs, {}, [], fetchable, peer_only, unverified)
+        except Exception:  # pragma: no cover - a judge crash must not mask the 400
+            logger.exception("model_fetch: verdict failed while explaining no_worker")
+            continue
+        for reason in v.reasons:
+            if reason not in reasons:
+                reasons.append(reason)
+    return "；".join(reasons)
 
 
 def create_fetch_job(
@@ -280,7 +340,9 @@ def create_fetch_job(
         {name}, fetchable, online, peer_only, unverified
     )
     if blocked:
-        raise FetchRequestError("no_worker")
+        raise FetchRequestError(
+            "no_worker", _no_worker_detail(name, fetchable, online, peer_only, unverified)
+        )
 
     with db.get_session() as session:
         job = db.Job(

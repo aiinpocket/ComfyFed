@@ -344,3 +344,90 @@ def test_model_fetch_curated_name_ignores_the_requested_url(logged_in_client, mo
         entry = _json.loads(s.get(db.Job, r.json()["job_id"]).fetch_entry)
     assert entry.get("unverified") is not True
     assert entry["url"] == "https://huggingface.co/black-forest-labs/FLUX.1-dev/resolve/main/ae.safetensors"
+
+
+# --- Fix round 1 ---------------------------------------------------------
+
+
+def test_model_fetch_rejects_payload_delimiter_and_control_chars(logged_in_client):
+    """`|` is the signature payload's own delimiter and control characters
+    would ride it onto the worker's filesystem -- neither may reach a signed
+    field, in `name` or in `directory`."""
+    bad_bodies = [
+        {**BODY, "name": "a|b.safetensors"},
+        {**BODY, "name": "a" + chr(10) + "b.safetensors"},
+        {**BODY, "name": "a" + chr(0) + "b.safetensors"},
+        {**BODY, "name": "a" + chr(127) + "b.safetensors"},
+        {**BODY, "directory": "va|e"},
+        {**BODY, "directory": "vae" + chr(9)},
+    ]
+    for bad in bad_bodies:
+        r = _post(logged_in_client, **bad)
+        assert r.status_code == 400, (bad, r.text)
+        assert r.json()["error"] == "model_fetch.bad_request"
+
+
+def test_model_fetch_rejects_non_object_bodies(logged_in_client):
+    """The route bypasses FastAPI's `Body(...)` precisely so a non-object
+    body lands in ComfyFed's own 400 envelope, not a 422."""
+    for raw in ([], "x", 5, None):
+        r = logged_in_client.post("/comfy/api/comfyfed/model-fetch", json=raw)
+        assert r.status_code == 400, (raw, r.text)
+        assert r.json()["error"] == "model_fetch.bad_request"
+        assert r.json()["message"]
+
+
+def test_model_fetch_no_worker_message_lists_the_real_reason(logged_in_client, monkeypatch):
+    """§5.1 row 7: the 400 must say WHY, using `assess`'s own reason strings
+    -- "your agent is too old for an unverified source" has to be tellable
+    apart from "nobody has the disk for it"."""
+    _register_worker(logged_in_client, protocol=4)
+    monkeypatch.setattr(model_fetch, "head_size_bytes", lambda url, **k: 335_000_000)
+    r = _post(logged_in_client, **BODY)
+    assert r.status_code == 400
+    assert r.json()["error"] == "model_fetch.no_worker"
+    message = r.json()["message"]
+    assert "missing_models_unverified_protocol:unknown_vae.safetensors" in message
+    # 通用句子仍在前面（zh-TW 先、English 後）。
+    assert message.startswith("目前沒有可下載的 worker")
+
+
+def test_model_fetch_no_worker_message_reports_the_disk_reason(logged_in_client, monkeypatch):
+    """A protocol-5 worker that simply hasn't the budget gets a DIFFERENT
+    reason than the protocol one -- which is the whole point of listing them."""
+    _register_worker(logged_in_client, protocol=5, max_fetch_gb=0.001, free_disk_gb=0.01)
+    monkeypatch.setattr(model_fetch, "head_size_bytes", lambda url, **k: 335_000_000)
+    r = _post(logged_in_client, **BODY)
+    assert r.status_code == 400
+    message = r.json()["message"]
+    assert "missing_models_unverified_protocol" not in message
+    assert "unknown_vae.safetensors" in message
+
+
+def test_model_fetch_no_worker_message_is_generic_with_nobody_online(logged_in_client, monkeypatch):
+    """No online candidate at all = no per-candidate reason to report; the
+    generic sentence stands alone rather than ending in a dangling colon."""
+    _register_worker(logged_in_client, protocol=5, status="offline")
+    monkeypatch.setattr(model_fetch, "head_size_bytes", lambda url, **k: 335_000_000)
+    r = _post(logged_in_client, **BODY)
+    assert r.status_code == 400
+    assert r.json()["error"] == "model_fetch.no_worker"
+    assert not r.json()["message"].rstrip().endswith("：")
+
+
+@pytest.mark.parametrize("status", ["assigned", "running"])
+def test_model_fetch_reuses_an_in_flight_job(logged_in_client, monkeypatch, status):
+    """The reuse row covers every live status, not just `queued` -- this
+    stack calls the claimed-but-not-started state `assigned`, where the spec
+    says `dispatched`."""
+    _register_worker(logged_in_client, protocol=5, max_fetch_gb=30)
+    monkeypatch.setattr(model_fetch, "head_size_bytes", lambda url, **k: 335_000_000)
+    job_id = _post(logged_in_client, **BODY).json()["job_id"]
+
+    with db.get_session() as s:
+        s.get(db.Job, job_id).status = status
+        s.commit()
+
+    r = _post(logged_in_client, **BODY)
+    assert r.status_code == 200
+    assert r.json() == {"job_id": job_id, "reused": True}

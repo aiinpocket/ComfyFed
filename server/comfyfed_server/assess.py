@@ -516,6 +516,26 @@ def verdict(
             missing_models=missing_models,
         )
 
+    # 2026-09-19 model_fetch: the same distinguishability argument one notch
+    # up. A worker blocked purely because a missing model's entry is an
+    # unverified-source one its protocol cannot validate is NOT "this model
+    # exists nowhere" -- and `model_fetch.create_fetch_job` renders these
+    # reason strings verbatim into the panel's `no_worker` 400 (spec §5.1
+    # row 7), so the button must be able to say "your agent is too old"
+    # rather than "no worker can fetch right now".
+    _unverified = unverified_models or frozenset()
+    blocked_by_unverified_protocol = (
+        all(name in _fetchable for name in missing_models)
+        and any(name in _unverified for name in missing_models)
+        and _worker_protocol(worker) < _MIN_UNVERIFIED_FETCH_PROTOCOL
+    )
+    if blocked_by_unverified_protocol:
+        return Verdict(
+            kind="ineligible",
+            reasons=[f"missing_models_unverified_protocol:{','.join(missing_models)}"],
+            missing_models=missing_models,
+        )
+
     return Verdict(
         kind="ineligible",
         reasons=[f"missing_models_unavailable:{','.join(missing_models)}"],

@@ -1128,3 +1128,75 @@ async def test_an_event_for_a_vanished_job_is_still_dropped(client):
     _sid, ws = _register_on_current_loop()
     await panelws.job_progress("nope", 0.5)
     assert ws.sent == []
+
+
+# --- 2026-09-19 model_fetch: 純下載單不發 executed（spec §9）----------------
+
+
+def _make_model_fetch_job(client, name="unknown_vae.safetensors"):
+    """A `kind=model_fetch` job owned by the logged-in panel user, the shape
+    `model_fetch.create_fetch_job` produces."""
+    with db.get_session() as session:
+        uid = session.query(db.User).filter(db.User.username == "admin").one().id
+        job = db.Job(
+            workflow_json="{}",
+            kind="model_fetch",
+            fetch_entry=json.dumps({"name": name, "directory": "vae"}),
+            required_models=json.dumps([name]),
+            required_nodes="[]",
+            input_assets="[]",
+            origin="panel",
+            user_id=uid,
+            status="done",
+        )
+        session.add(job)
+        session.commit()
+        return job.id
+
+
+def test_model_fetch_job_done_emits_no_executed_event(client):
+    """A model_fetch job has no output nodes, so `job_outputs` is empty and
+    the FALLBACK_OUTPUT_KEY path would otherwise invent an `executed` plus an
+    `executing{node: null}` -- which the stock frontend reads as "the prompt
+    finished" and uses to clear the running indicator of an UNRELATED real
+    prompt in the same tab. Only the queue-badge `status` may go out."""
+    _login(client)
+    job_id = _make_model_fetch_job(client)
+
+    with db.get_session() as session:
+        job = session.get(db.Job, job_id)
+        with client.websocket_connect("/comfy/api/ws") as ws:
+            ws.receive_json()  # initial status
+            ws.receive_json()  # feature_flags
+
+            relay(panelws.job_done(job))
+
+            evt = ws.receive_json()
+            assert evt["type"] == "status"
+            assert evt["data"]["status"] == {"exec_info": {"queue_remaining": 0}}
+
+            # Nothing else: prove it by sending a marker the relay CANNOT
+            # have queued ahead of, then asserting it is the very next frame.
+            relay(panelws.post_event({"type": "comfyfed_marker", "data": {}}))
+            assert ws.receive_json()["type"] == "comfyfed_marker"
+
+
+def test_prompt_job_done_still_emits_executed(client):
+    """Guard the other side of the branch: an ordinary prompt job's three
+    events are untouched."""
+    csrf = _login(client)
+    job_id = _post_prompt(client)
+    worker_id = _register_worker(client, csrf, "runner")
+    _pick_job_for(worker_id)
+    dispatch.mark_running(job_id, worker_id)
+    dispatch.mark_done(job_id, worker_id, ["out_00001_.png"])
+
+    with db.get_session() as session:
+        job = session.get(db.Job, job_id)
+        with client.websocket_connect("/comfy/api/ws") as ws:
+            ws.receive_json()
+            ws.receive_json()
+            relay(panelws.job_done(job))
+            assert ws.receive_json()["type"] == "executed"
+            assert ws.receive_json()["type"] == "executing"
+            assert ws.receive_json()["type"] == "status"
