@@ -3,3 +3,8 @@
 server/comfyfed_server/installers/install.sh text eol=lf
 server/comfyfed_server/installers/install.cmd text eol=crlf
 server/comfyfed_server/installers/install.ps1 text eol=lf
+
+# Recipe JSON (spec §5.1) is byte-compared between the server package and its
+# cloud twin, so both copies must keep LF regardless of the checkout platform.
+server/comfyfed_server/recipes/*.json text eol=lf
+cloud/src/core/recipes/*.json text eol=lf

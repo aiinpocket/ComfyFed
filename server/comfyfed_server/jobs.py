@@ -353,6 +353,99 @@ def _require_owner_or_admin(job: db.Job, user: auth.SessionUser) -> None:
         raise _error(404, "jobs.not_found", "Job not found.")
 
 
+async def create_job_from_workflow(
+    session_or_none,
+    user: auth.SessionUser,
+    workflow: dict,
+    requirements: dict,
+    assets: list,
+    data_dir: str,
+    *,
+    workflow_json_text: Optional[str] = None,
+) -> str:
+    """建單：檢查上傳資產、擋掉整個聯邦都拿不到的模型、寫 Job 列、落地資產。
+
+    The console's `POST /api/jobs` body, lifted out verbatim so a second
+    caller can reuse it -- 2026-09-19 spec §5.2 wants `POST
+    /api/recipes/{id}/run` to go down "完全相同的建單路徑" (same
+    `origin="console"`, same signature/requirements derivation, same
+    dispatch), and the only way to guarantee that is for there to be exactly
+    one such path. Raises the same `HTTPException`s the route always did
+    (`jobs.bad_asset_name` / `jobs.asset_too_large` / `jobs.missing_models` /
+    `jobs.missing_assets`), so callers need no error handling of their own.
+
+    `session_or_none` is accepted for callers that already hold an open DB
+    session; `create_job` opens and commits its own (it has always done so),
+    so nothing is done with it today -- it exists so a future transactional
+    caller does not have to change every call site.
+
+    `workflow_json_text` is the caller's ORIGINAL serialization, when it has
+    one. `POST /api/jobs` passes the exact multipart string it received so
+    the stored `workflow_json` stays byte-for-byte what the submitter sent;
+    a caller that only has a dict (the recipe runner, whose graph is rendered
+    in memory) omits it and gets a plain `json.dumps`.
+    """
+    workflow_json = workflow_json_text if workflow_json_text is not None else json.dumps(workflow)
+
+    uploaded_names = []
+    # Same admin-configured per-file cap the panel's uploads obey
+    # (`upload_max_file_mb`, default 50) -- an asset submitted with a job
+    # is user bytes like any other, and this route had no ceiling at all.
+    # Checked BEFORE the job row is inserted, so a refused submit leaves
+    # nothing behind. The per-user QUOTA deliberately does not apply here:
+    # these bytes land in `job_inputs/<job_id>/`, which (like artifacts)
+    # is job-scoped result storage outside the quota -- see limits.py.
+    upload_limits = limits.read_limits()
+    for upload in assets:
+        try:
+            filename = storage.sanitize_path_component(
+                upload.filename or "", what="asset filename"
+            )
+        except ValueError:
+            raise _error(400, "jobs.bad_asset_name", f"Invalid asset filename: {upload.filename!r}")
+        if limits.file_cap_exceeded(_upload_size(upload), upload_limits):
+            raise _error(
+                413, "jobs.asset_too_large", limits.too_large_message(upload_limits)
+            )
+        uploaded_names.append(filename)
+
+    needs = assess.extract(workflow)
+    unfetchable = unfetchable_missing_models(needs, data_dir)
+    if unfetchable:
+        names = sorted(unfetchable)
+        raise _error(
+            400,
+            "jobs.missing_models",
+            model_guide.guidance_message(names, data_dir),
+        )
+
+    try:
+        job_id = create_job(
+            workflow_json,
+            workflow,
+            requirements=requirements or {},
+            available_assets=set(uploaded_names),
+            origin="console",
+            user_id=user.uid,
+        )
+    except MissingAssetsError as exc:
+        raise _error(
+            400,
+            "jobs.missing_assets",
+            f"Workflow references assets that were not uploaded: {', '.join(exc.missing)}",
+        )
+
+    job_dir = job_inputs_dir(data_dir, job_id)
+    os.makedirs(job_dir, exist_ok=True)
+    for upload, filename in zip(assets, uploaded_names):
+        dest = os.path.join(job_dir, filename)
+        content = await upload.read()
+        with open(dest, "wb") as f:
+            f.write(content)
+
+    return job_id
+
+
 def create_router(data_dir: str) -> APIRouter:
     r = APIRouter()
 
@@ -375,62 +468,15 @@ def create_router(data_dir: str) -> APIRouter:
             except (TypeError, ValueError):
                 raise _error(400, "jobs.invalid_workflow", "requirements is not valid JSON.")
 
-        uploaded_names = []
-        # Same admin-configured per-file cap the panel's uploads obey
-        # (`upload_max_file_mb`, default 50) -- an asset submitted with a job
-        # is user bytes like any other, and this route had no ceiling at all.
-        # Checked BEFORE the job row is inserted, so a refused submit leaves
-        # nothing behind. The per-user QUOTA deliberately does not apply here:
-        # these bytes land in `job_inputs/<job_id>/`, which (like artifacts)
-        # is job-scoped result storage outside the quota -- see limits.py.
-        upload_limits = limits.read_limits()
-        for upload in assets:
-            try:
-                filename = storage.sanitize_path_component(
-                    upload.filename or "", what="asset filename"
-                )
-            except ValueError:
-                raise _error(400, "jobs.bad_asset_name", f"Invalid asset filename: {upload.filename!r}")
-            if limits.file_cap_exceeded(_upload_size(upload), upload_limits):
-                raise _error(
-                    413, "jobs.asset_too_large", limits.too_large_message(upload_limits)
-                )
-            uploaded_names.append(filename)
-
-        needs = assess.extract(workflow)
-        unfetchable = unfetchable_missing_models(needs, data_dir)
-        if unfetchable:
-            names = sorted(unfetchable)
-            raise _error(
-                400,
-                "jobs.missing_models",
-                model_guide.guidance_message(names, data_dir),
-            )
-
-        try:
-            job_id = create_job(
-                workflow_json,
-                workflow,
-                requirements=requirements_dict,
-                available_assets=set(uploaded_names),
-                origin="console",
-                user_id=user.uid,
-            )
-        except MissingAssetsError as exc:
-            raise _error(
-                400,
-                "jobs.missing_assets",
-                f"Workflow references assets that were not uploaded: {', '.join(exc.missing)}",
-            )
-
-        job_dir = job_inputs_dir(data_dir, job_id)
-        os.makedirs(job_dir, exist_ok=True)
-        for upload, filename in zip(assets, uploaded_names):
-            dest = os.path.join(job_dir, filename)
-            content = await upload.read()
-            with open(dest, "wb") as f:
-                f.write(content)
-
+        job_id = await create_job_from_workflow(
+            None,
+            user,
+            workflow,
+            requirements_dict,
+            assets,
+            data_dir,
+            workflow_json_text=workflow_json,
+        )
         return {"job_id": job_id}
 
     @r.get("/api/jobs")

@@ -32,6 +32,9 @@ include-package-data = true
 comfyfed_server = [
   "templates_data/*.json", "templates_data/*.webp", "templates_data/assets/*",
   "installers/*",
+  # The packaged recipes (spec §5.1) -- `recipes.py` locates `recipes/` with
+  # importlib.resources, same as the template library above.
+  "recipes/*.json",
 ]
 # `panel_ext/` has its own `__init__.py` (unlike `templates_data/`, which has
 # none), so setuptools treats it as the subpackage `comfyfed_server.panel_ext`
