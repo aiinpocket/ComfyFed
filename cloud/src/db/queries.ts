@@ -1191,6 +1191,28 @@ export async function updateJobDone(
     .run();
 }
 
+/** 2026-09-19 job-retry：已經 requeue 過（`retry_count > 0`）、此刻仍在排隊的
+ * 單 -- `do/hub.ts`'s `sweepHopelessRetries` 每個 tick 對它們重問一次「還有
+ * 人可能跑嗎」。`split_count = 0` 與 `getQueuedJobsForDispatch` 對齊：已拆的
+ * 父 job 不派工，也不歸掃描管。 */
+export async function getRequeuedQueuedJobs(db: D1Database): Promise<Job[]> {
+  const { results } = await db
+    .prepare("SELECT * FROM jobs WHERE status = 'queued' AND retry_count > 0 AND split_count = 0 ORDER BY created_at ASC, id ASC")
+    .all<JobRow>();
+  return results.map(rowToJob);
+}
+
+/** 終局失敗一張**沒人擁有**的 `queued` job；回傳是否真的動了列。狀態謂詞
+ * 就是閘門：派出去了（assigned/running）就交回 `markFailed` 的 owned 路徑。
+ * Ports dispatch.py's `fail_queued`（不含 split 連坐 -- 呼叫端接著做）。 */
+export async function failQueuedJob(db: D1Database, jobId: string, error: string, finishedAt: string): Promise<boolean> {
+  const result = await db
+    .prepare("UPDATE jobs SET status = 'failed', error = ?, finished_at = ? WHERE id = ? AND status = 'queued'")
+    .bind(error, finishedAt, jobId)
+    .run();
+  return (result.meta.changes ?? 0) > 0;
+}
+
 export async function updateJobFailed(
   db: D1Database,
   jobId: string,

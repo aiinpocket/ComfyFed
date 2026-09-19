@@ -18,7 +18,7 @@
 
 import { exclusionKey, type ExclusionSet } from "./assess";
 import type { Job } from "../db/queries";
-import { sqliteTimestampToIsoformat, toSqliteTimestamp } from "../db/queries";
+import { sqliteTimestampToEpochMs, sqliteTimestampToIsoformat, toSqliteTimestamp } from "../db/queries";
 
 /** 同一台 worker 對同一張 job 失敗這麼多次 -> 這張 job 不再派給它。 */
 export const MAX_FAILURES_PER_WORKER_PER_JOB = 2;
@@ -28,6 +28,22 @@ export const MAX_JOB_ATTEMPTS = 6;
 export const UNSUITABLE_THRESHOLD = 2;
 /** 不適任紀錄的有效期；過期的列不刪，只是查詢時不再生效。 */
 export const UNSUITABLE_TTL_DAYS = 7;
+/** 2026-09-19 線上實例：兩筆 9/14 之後再也沒上線的舊註冊（rtx5080-main／
+ * rtx5080-fresh）讓 `anyPossibleWorker` 一直回 true，一張兩台在線 worker 都
+ * 跑掛的 job 就永遠 queued 等它們。超過這麼多天沒有心跳（從未心跳就看
+ * created_at）的 worker 不再算「有可能」跑得動任何 job。 */
+export const POSSIBLE_WORKER_STALE_DAYS = 7;
+
+/** 這台 worker 是否已經太久沒露面，不該再被當成「有可能」的候選。基準 =
+ * `last_seen`，從未心跳過就退回 `created_at`（和 `dispatch.requeueStale` 的
+ * `COALESCE(last_seen, created_at)` 同一個定義）。兩者都缺視為不 stale --
+ * 寧可多等一輪，不要因為一個空欄位把 job 判死。Ports retry.py's
+ * `is_stale_worker`. */
+export function isStaleWorker(worker: { lastSeen: string | null; createdAt: string | null }, now: Date): boolean {
+  const reference = worker.lastSeen || worker.createdAt;
+  if (!reference) return false;
+  return sqliteTimestampToEpochMs(reference) < now.getTime() - POSSIBLE_WORKER_STALE_DAYS * 86_400_000;
+}
 
 /** 排除理由字串（console 的 assessment 面板直接顯示，兩棧逐字相同）。
  * `core/assess.ts` 刻意另外重寫一份同樣的字面值 -- 見那裡的註解。 */

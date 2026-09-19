@@ -1031,7 +1031,13 @@ def _any_possible_worker(job) -> bool:
     with db.get_session() as session:
         # `_live_workers` = 未刪除；再濾掉 `disabled`（admin 停用的那台在
         # spec §6 的定義裡不算「已註冊、未停用」的候選）。
-        workers = [w for w in jobs_module._live_workers(session) if not w.disabled]
+        # 再濾掉太久沒心跳的（`retry.POSSIBLE_WORKER_STALE_DAYS`）：一筆再也
+        # 不會回來的舊註冊不能讓 job 永遠 queued（線上 2026-09-19 就是這樣卡住）。
+        workers = [
+            w
+            for w in jobs_module._live_workers(session)
+            if not w.disabled and not retry.is_stale_worker(w, now)
+        ]
         exclusions = set(retry.active_unsuitable(session, now))
 
     for candidate_id, failures in retry.attempts_dict(job.attempts).items():
@@ -1062,6 +1068,56 @@ def _any_possible_worker(job) -> bool:
         if v.kind in ("eligible", "eligible_after_fetch"):
             return True
     return False
+
+
+async def _sweep_hopeless_retries() -> None:
+    """每個 tick：把「已經 requeue 過、但現在全艦隊沒人可能跑」的 job 終局。
+
+    `_handle_job_failed` 的「還有人可能嗎」只在失敗當下問一次；之後最後那
+    台可能的 worker 變 stale／被刪／被停用，這張 job 不會再收到任何事件來
+    重問。只掃 `retry_count > 0` 的 queued 單（沒失敗過的 job 本來就會等
+    worker 上線，不歸這裡管），對每張用同一個 `_any_possible_worker` 判定，
+    False 就走 `dispatch.fail_queued` + 同樣的彙整訊息（沒有「正在回報的那
+    台」，所以 worker_id 給空字串，每台的錯誤都取 attempts 裡存的）。
+    """
+    with db.get_session() as session:
+        candidates = (
+            session.query(db.Job)
+            .filter(db.Job.status == "queued", db.Job.retry_count > 0, db.Job.split_count == 0)
+            .all()
+        )
+        for job in candidates:
+            session.expunge(job)
+    if not candidates:
+        return
+
+    failed_any = False
+    for job in candidates:
+        if _any_possible_worker(job):
+            continue
+        attempts = retry.attempts_dict(job.attempts)
+        attempt = _FailedAttempt(
+            attempts=attempts,
+            errors=retry.attempt_errors(job.attempts),
+            total=sum(attempts.values()),
+            task_key=retry.task_key(job),
+            started_at=None,
+        )
+        summary = _final_error_summary(attempt, "", "")
+        if not dispatch.fail_queued(job.id, summary):
+            continue
+        failed_any = True
+        logger.warning("agentws: job %s has no possible worker left; failed: %s", job.id, summary)
+        _clear_fetch_progress(job.id)
+        try:
+            await panelws.job_failed(job.id, summary)
+        except Exception:
+            logger.exception("agentws: failed to relay sweep failure of job %s to the panel", job.id)
+    if failed_any:
+        try:
+            await panelws.job_status_refresh()
+        except Exception:
+            logger.exception("agentws: failed to refresh the panel queue after the sweep")
 
 
 async def _handle_job_failed(worker_id: str, conn: "_Connection", message: dict) -> None:
@@ -2267,6 +2323,11 @@ async def dispatch_tick() -> None:
             await panelws.job_status_refresh()
         except Exception:
             logger.exception("agentws: failed to relay requeued jobs to the panel")
+
+    try:
+        await _sweep_hopeless_retries()
+    except Exception:
+        logger.exception("agentws: hopeless-retry sweep failed")
 
     idle_worker_ids = [worker_id for worker_id, conn in _connections.items() if conn.state == "idle"]
 

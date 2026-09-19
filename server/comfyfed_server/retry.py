@@ -27,6 +27,11 @@ MAX_JOB_ATTEMPTS = 6
 UNSUITABLE_THRESHOLD = 2
 # 不適任紀錄的有效期；過期的列不刪，只是查詢時不再生效。
 UNSUITABLE_TTL_DAYS = 7
+# 2026-09-19 線上實例：兩筆 9/14 之後再也沒上線的舊註冊（rtx5080-main／
+# rtx5080-fresh）讓 `_any_possible_worker` 一直回 True，一張兩台在線 worker
+# 都跑掛的 job 就永遠 queued 等它們。超過這麼多天沒有心跳（從未心跳就看
+# created_at）的 worker 不再算「有可能」跑得動任何 job。
+POSSIBLE_WORKER_STALE_DAYS = 7
 
 # 排除理由字串（console 的 assessment 面板直接顯示，兩棧逐字相同）。
 FAILED_TWICE_REASON = "failed_twice_on_job"
@@ -42,6 +47,20 @@ LAST_ERROR_CHARS = 500
 
 
 # --- 純函式層 --------------------------------------------------------------
+
+
+def is_stale_worker(worker, now: datetime) -> bool:
+    """這台 worker 是否已經太久沒露面，不該再被當成「有可能」的候選。
+
+    基準 = `last_seen`，從未心跳過就退回 `created_at`（和
+    `dispatch.requeue_stale` 的 `COALESCE(last_seen, created_at)` 同一個定義）。
+    兩者都缺（理論上不會）視為不 stale -- 寧可多等一輪，不要因為一個空欄位
+    把 job 判死。
+    """
+    reference = worker.last_seen or getattr(worker, "created_at", None)
+    if reference is None:
+        return False
+    return reference < now - timedelta(days=POSSIBLE_WORKER_STALE_DAYS)
 
 
 def _attempt_entries(attempts_json):

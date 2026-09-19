@@ -760,6 +760,29 @@ def requeue_for_retry(job_id: str, worker_id: str, error: str) -> bool:
     return True
 
 
+def fail_queued(job_id: str, error: str) -> bool:
+    """終局失敗一張**沒人擁有**的 `queued` job。Returns whether it acted.
+
+    2026-09-19 job-retry：`_handle_job_failed` 只在 worker 回報失敗的那一刻
+    問「還有人可能跑嗎」；答案之後會變（最後那台可能的 worker 變 stale、被
+    刪、被停用），而一張已無人能跑的 retry 單不會再收到任何 job_failed 來
+    重新判定。`agentws._sweep_hopeless_retries` 每個 tick 補問一次，用這條
+    路徑收尾。只動 `queued` 列（派出去了就交回 `mark_failed` 的 owned 路
+    徑）；沒有 worker、沒有這一次嘗試的收據可發。
+    """
+    with db.get_session() as session:
+        job = session.get(db.Job, job_id)
+        if job is None or job.status != "queued":
+            return False
+        job.status = "failed"
+        job.error = error
+        job.finished_at = _utcnow()
+        session.commit()
+    # Phase 3.3 §3.4：子 job 終局失敗 -> 父 job 失敗 + 其他子 job 一起取消。
+    split.child_status_changed(job_id)
+    return True
+
+
 def mark_failed(
     job_id: str,
     worker_id: str,

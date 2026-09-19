@@ -63,22 +63,39 @@ async function makeWorker(opts: {
   disabled?: boolean;
   deleted?: boolean;
   id?: string;
+  /** Backdates BOTH `last_seen` and `created_at` by this many days -- the
+   * fixture for `retry.isStaleWorker`. */
+  ageDays?: number;
 }): Promise<string> {
   const id = opts.id ?? uniqueId("w");
+  const ageMs = (opts.ageDays ?? 0) * 86_400_000;
   await db()
     .prepare(
-      "INSERT INTO workers (id, name, pubkey, created_at, disabled, deleted) VALUES (?, ?, ?, ?, ?, ?)"
+      "INSERT INTO workers (id, name, pubkey, created_at, last_seen, disabled, deleted) VALUES (?, ?, ?, ?, ?, ?, ?)"
     )
     .bind(
       id,
       id,
       opts.pubkeyHex,
-      toSqliteTimestamp(new Date()),
+      toSqliteTimestamp(new Date(Date.now() - ageMs - 86_400_000)),
+      opts.ageDays === undefined ? null : toSqliteTimestamp(new Date(Date.now() - ageMs)),
       opts.disabled ? 1 : 0,
       opts.deleted ? 1 : 0
     )
     .run();
   return id;
+}
+
+async function ageWorker(workerId: string, days: number): Promise<void> {
+  const ms = days * 86_400_000;
+  await db()
+    .prepare("UPDATE workers SET last_seen = ?, created_at = ? WHERE id = ?")
+    .bind(
+      toSqliteTimestamp(new Date(Date.now() - ms)),
+      toSqliteTimestamp(new Date(Date.now() - ms - 86_400_000)),
+      workerId
+    )
+    .run();
 }
 
 async function makeJob(opts: {
@@ -2278,5 +2295,106 @@ describe("job retry fix round 1 (I1 re-adoption / I2 per-job errors)", () => {
     const job = (await getJobById(db(), jobId))!;
     expect(retry.attemptsDict(job.attempts)).toEqual({ [workerId]: 1 });
     expect(retry.attemptErrors(job.attempts)).toEqual({ [workerId]: "boom" });
+  });
+});
+
+// ---------------------------------------------------------------------------
+// 2026-09-19 線上修正：stale worker 不算「有可能」＋ tick 掃描終局 -- ports
+// the four tests appended to tests/server/test_agent_ws.py.
+
+describe("job retry: stale workers and the hopeless-retry sweep", () => {
+  async function failTwice(ws: WebSocket, jobId: string): Promise<void> {
+    for (const index of [1, 2]) {
+      ws.send(JSON.stringify({ type: "heartbeat", state: "idle", progress: 0.0, job_id: null, dynamic: {} }));
+      await new Promise((r) => setTimeout(r, 50));
+      const pushed = nextMessage(ws);
+      await runDurableObjectAlarm(hub());
+      expect((await pushed).type).toBe("job");
+      const receipt = nextMessage(ws);
+      ws.send(JSON.stringify({ type: "job_failed", job_id: jobId, error: `boom ${index}` }));
+      expect((await receipt).type).toBe("receipt");
+    }
+  }
+
+  it("a stale worker does not keep a failed job alive", async () => {
+    const kp = KEYPAIRS[0]!;
+    const workerId = await makeWorker({ pubkeyHex: kp.pubkey_hex });
+    await makeWorker({ pubkeyHex: KEYPAIRS[1]!.pubkey_hex, ageDays: 8 });
+    const jobId = await makeJob({ status: "queued", signature: "sig-stale" });
+
+    const ws = await connectAgent(workerId, kp.seed_hex);
+    try {
+      await failTwice(ws, jobId);
+    } finally {
+      ws.close();
+    }
+
+    const job = (await getJobById(db(), jobId))!;
+    expect(job.status).toBe("failed");
+    expect(job.error).toContain("已在 1 台 worker 嘗試 2 次全部失敗");
+    expect(job.error).toContain(`${workerId}: boom 2`);
+  });
+
+  it("a recently seen offline worker still keeps the job alive", async () => {
+    const kp = KEYPAIRS[0]!;
+    const workerId = await makeWorker({ pubkeyHex: kp.pubkey_hex });
+    await makeWorker({ pubkeyHex: KEYPAIRS[1]!.pubkey_hex, ageDays: 6 });
+    const jobId = await makeJob({ status: "queued", signature: "sig-recent" });
+
+    const ws = await connectAgent(workerId, kp.seed_hex);
+    try {
+      await failTwice(ws, jobId);
+    } finally {
+      ws.close();
+    }
+    expect((await getJobById(db(), jobId))!.status).toBe("queued");
+  });
+
+  it("the dispatch tick finalizes a requeued job nobody can run anymore", async () => {
+    const kp = KEYPAIRS[0]!;
+    const workerId = await makeWorker({ pubkeyHex: kp.pubkey_hex });
+    const otherId = await makeWorker({ pubkeyHex: KEYPAIRS[1]!.pubkey_hex });
+    const jobId = await makeJob({ status: "queued", signature: "sig-sweep" });
+
+    const ws = await connectAgent(workerId, kp.seed_hex);
+    try {
+      await failTwice(ws, jobId);
+      const mid = (await getJobById(db(), jobId))!;
+      expect(mid.status).toBe("queued");
+      expect(mid.retryCount).toBe(2);
+
+      // 時間過去：另一台再也沒回來。
+      await ageWorker(otherId, 8);
+      await runDurableObjectAlarm(hub());
+    } finally {
+      ws.close();
+    }
+
+    const job = (await getJobById(db(), jobId))!;
+    expect(job.status).toBe("failed");
+    expect(job.workerId).toBeNull();
+    expect(job.finishedAt).not.toBeNull();
+    expect(job.error).toContain("已在 1 台 worker 嘗試 2 次全部失敗");
+    expect(job.error).toContain(`${workerId}: boom 2`);
+    const receipts = await getReceiptsForJob(db(), jobId);
+    expect(receipts.map((r) => [r.kind, r.billable])).toEqual([
+      ["failed", false],
+      ["failed", false],
+    ]);
+  });
+
+  it("the sweep ignores queued jobs that never failed", async () => {
+    const kp = KEYPAIRS[0]!;
+    const workerId = await makeWorker({ pubkeyHex: kp.pubkey_hex, ageDays: 8 });
+    const jobId = await makeJob({ status: "queued", signature: "sig-never-failed" });
+    const ws = await connectAgent(workerId, kp.seed_hex);
+    try {
+      ws.send(JSON.stringify({ type: "heartbeat", state: "busy", progress: 0.5, job_id: null, dynamic: {} }));
+      await new Promise((r) => setTimeout(r, 50));
+      await runDurableObjectAlarm(hub());
+    } finally {
+      ws.close();
+    }
+    expect((await getJobById(db(), jobId))!.status).toBe("queued");
   });
 });

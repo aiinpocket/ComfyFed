@@ -5125,3 +5125,111 @@ def test_requeue_stale_does_not_count_as_an_attempt(client):
     assert _retry.attempts_dict(job.attempts) == {}
     assert (job.retry_count or 0) == 0
     assert _failure_rows() == {}
+
+
+# --- 2026-09-19 線上修正：stale worker 不算「有可能」＋ tick 掃描終局 ---------
+
+
+def _age_worker(worker_id, days):
+    from datetime import timedelta
+
+    with db.get_session() as session:
+        w = session.get(db.Worker, worker_id)
+        w.last_seen = agentws._utcnow() - timedelta(days=days)
+        w.created_at = agentws._utcnow() - timedelta(days=days + 1)
+        session.commit()
+
+
+def _fail_twice(ws, worker_id, job_id):
+    for index in (1, 2):
+        ws.send_json({"type": "heartbeat", "state": "idle", "progress": 0.0, "job_id": None, "dynamic": {}})
+        agentws.dispatch_once(worker_id)
+        assert ws.receive_json()["type"] == "job"
+        ws.send_json({"type": "job_failed", "job_id": job_id, "error": "boom %d" % index})
+        agentws.dispatch_once(worker_id)
+        assert ws.receive_json()["type"] == "receipt"
+
+
+def test_a_stale_worker_does_not_keep_a_failed_job_alive(client):
+    """線上 2026-09-19：兩筆 9/14 之後再沒上線的舊註冊讓 `_any_possible_worker`
+    一直回 True，一張兩台在線 worker 都跑掛的 job 永遠 queued。超過
+    `POSSIBLE_WORKER_STALE_DAYS` 沒心跳的 worker 不再算候選 -> 第二次失敗
+    就終局。"""
+    csrf = _login(client)
+    worker_id, sk = _register_worker(client, csrf, "wa")
+    stale_id, _ = _register_worker(client, csrf, "wb-stale")
+    _age_worker(stale_id, days=8)
+    job_id = _submit(client, csrf)
+
+    ws = _connect(client, worker_id, sk)
+    try:
+        _fail_twice(ws, worker_id, job_id)
+    finally:
+        ws.close()
+
+    job = _job_row(job_id)
+    assert job.status == "failed"
+    assert "已在 1 台 worker 嘗試 2 次全部失敗" in job.error
+    assert "wa: boom 2" in job.error
+
+
+def test_a_recently_seen_offline_worker_still_keeps_the_job_alive(client):
+    """對照組：6 天前有心跳的離線 worker 仍算「有可能」，job 留在 queued。"""
+    csrf = _login(client)
+    worker_id, sk = _register_worker(client, csrf, "wa")
+    other_id, _ = _register_worker(client, csrf, "wb-recent")
+    _age_worker(other_id, days=6)
+    job_id = _submit(client, csrf)
+
+    ws = _connect(client, worker_id, sk)
+    try:
+        _fail_twice(ws, worker_id, job_id)
+    finally:
+        ws.close()
+
+    assert _job_row(job_id).status == "queued"
+
+
+def test_dispatch_tick_finalizes_a_requeued_job_nobody_can_run_anymore(client):
+    """失敗當下還有一台可能的 worker（所以 requeue），之後那台變 stale：
+    沒有任何 job_failed 會再來重問，改由 tick 的掃描終局它，訊息沿用同一
+    份彙整格式，且不會多發收據。"""
+    csrf = _login(client)
+    worker_id, sk = _register_worker(client, csrf, "wa")
+    other_id, _ = _register_worker(client, csrf, "wb")
+    job_id = _submit(client, csrf)
+
+    ws = _connect(client, worker_id, sk)
+    try:
+        _fail_twice(ws, worker_id, job_id)
+        job = _job_row(job_id)
+        assert job.status == "queued"
+        assert job.retry_count == 2
+
+        # 時間過去：wb 再也沒回來。
+        _age_worker(other_id, days=8)
+        agentws.dispatch_once(worker_id)
+    finally:
+        ws.close()
+
+    job = _job_row(job_id)
+    assert job.status == "failed"
+    assert job.worker_id is None
+    assert job.finished_at is not None
+    assert "已在 1 台 worker 嘗試 2 次全部失敗" in job.error
+    assert "wa: boom 2" in job.error
+    with db.get_session() as session:
+        receipts = session.query(db.Receipt).all()
+    assert [(r.kind, r.billable) for r in receipts] == [("failed", False), ("failed", False)]
+
+
+def test_sweep_ignores_queued_jobs_that_never_failed(client):
+    """沒失敗過的 queued 單（retry_count 0）不歸掃描管：就算此刻全艦隊都
+    stale，它照樣等 worker 上線。"""
+    csrf = _login(client)
+    worker_id, sk = _register_worker(client, csrf, "wa")
+    _age_worker(worker_id, days=8)
+    job_id = _submit(client, csrf)
+
+    agentws.dispatch_once()
+    assert _job_row(job_id).status == "queued"

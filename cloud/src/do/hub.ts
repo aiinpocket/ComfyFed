@@ -1684,6 +1684,49 @@ export class Hub extends DurableObject<Env> {
    * worker 的列舉順序是 `attempts` 的插入順序，和 Python 的 `list(dict)` 一樣
    * （worker id 都是 uuid，不是 JS 會重排的整數式 key）。
    */
+  /**
+   * 每個 tick：把「已經 requeue 過、但現在全艦隊沒人可能跑」的 job 終局。
+   * Ports agentws.py's `_sweep_hopeless_retries`.
+   *
+   * `handleJobFailed` 的「還有人可能嗎」只在失敗當下問一次；之後最後那台
+   * 可能的 worker 變 stale／被刪／被停用，這張 job 不會再收到任何事件來重
+   * 問。只掃 `retry_count > 0` 的 queued 單（沒失敗過的 job 本來就會等
+   * worker 上線，不歸這裡管），對每張用同一個 `anyPossibleWorker` 判定，
+   * false 就 `failQueuedJob` + 同樣的彙整訊息（沒有「正在回報的那台」，
+   * 所以 workerId 給空字串，每台的錯誤都取 attempts 裡存的）。沒有 worker、
+   * 沒有這一次嘗試的收據可發。
+   */
+  private async sweepHopelessRetries(now: Date): Promise<void> {
+    const db = this.env.DB;
+    const candidates = await queries.getRequeuedQueuedJobs(db);
+    if (candidates.length === 0) return;
+
+    let failedAny = false;
+    for (const job of candidates) {
+      if (await this.anyPossibleWorker(job)) continue;
+      const attempts = retry.attemptsDict(job.attempts);
+      const attempt: FailedAttempt = {
+        attempts,
+        errors: retry.attemptErrors(job.attempts),
+        total: Object.values(attempts).reduce((a, b) => a + b, 0),
+        taskKey: retry.taskKey(job),
+        startedAt: null,
+      };
+      const summary = await this.finalErrorSummary(attempt, "", "");
+      if (!(await queries.failQueuedJob(db, job.id, summary, toSqliteTimestamp(now)))) continue;
+      failedAny = true;
+      console.warn(`hub: job ${job.id} has no possible worker left; failed: ${summary}`);
+      // Phase 3.3 §3.4：子 job 終局失敗 -> 父 job 失敗 + 其他子 job 一起取消。
+      const cascadeCancelled: split.CascadeCancelled[] = [];
+      await split.childStatusChanged(db, job.id, now, cascadeCancelled);
+      await this.pushCascadeCancellations(cascadeCancelled);
+      await this.mintCascadeCancelledReceipts(cascadeCancelled, now);
+      this.fetchProgress.delete(job.id);
+      await this.panelJobFailed(job.id, summary);
+    }
+    if (failedAny) await this.panelJobStatusRefresh();
+  }
+
   private async finalErrorSummary(attempt: FailedAttempt, workerId: string, error: string): Promise<string> {
     const db = this.env.DB;
     const workerIds = Object.keys(attempt.attempts);
@@ -1792,7 +1835,10 @@ export class Hub extends DurableObject<Env> {
     // `getAllWorkers` = 未刪除（Python 的 `jobs._live_workers`）；再濾掉
     // `disabled`（admin 停用的那台在 spec §6 的定義裡不算「已註冊、未停用」的
     // 候選）。`status`／`last_seen` 一律不看。
-    const workers = (await queries.getAllWorkers(db)).filter((w) => !w.disabled);
+    // `last_seen` 另外用來剔除太久沒心跳的（`retry.POSSIBLE_WORKER_STALE_DAYS`）：
+    // 一筆再也不會回來的舊註冊不能讓 job 永遠 queued（線上 2026-09-19 就是這
+    // 樣卡住）。
+    const workers = (await queries.getAllWorkers(db)).filter((w) => !w.disabled && !retry.isStaleWorker(w, now));
     const exclusions = await retry.activeUnsuitable(db, now);
     retry.addJobAttemptExclusions(exclusions, job.id, job.attempts);
 
@@ -2207,6 +2253,12 @@ export class Hub extends DurableObject<Env> {
       } catch (err) {
         console.error("hub: failed to relay requeued jobs to the panel", err);
       }
+    }
+
+    try {
+      await this.sweepHopelessRetries(now);
+    } catch (err) {
+      console.error("hub: hopeless-retry sweep failed", err);
     }
 
     const idleWorkerIds: string[] = [];
