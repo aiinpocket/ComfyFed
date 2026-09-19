@@ -243,6 +243,16 @@ class Job(Base):
     # 建的純下載單，workflow_json="{}"，fetch_entry 存簽章 manifest 項目）。
     kind: Mapped[str] = mapped_column(String, default="prompt", server_default="prompt")
     fetch_entry: Mapped[Optional[str]] = mapped_column(String, nullable=True)
+    # 2026-09-19 job-retry §4：`{worker_id: failures}` 的 JSON，每次那台
+    # worker 對這張 job 回報 `job_failed`（而且 transition 真的套用了）就 +1。
+    # 同一台達 `retry.MAX_FAILURES_PER_WORKER_PER_JOB` 就對這張 job 出局；
+    # 全部加總達 `retry.MAX_JOB_ATTEMPTS` 就終局失敗。
+    # `cancelled`（管理員取消）與 `requeue_stale`（worker 斷線）不計入 --
+    # 那兩者都不是「這台跑不動這個工作」的證據。
+    attempts: Mapped[str] = mapped_column(String, default="{}", server_default="{}")
+    # 這張 job 被非終局失敗送回 `queued` 的次數。`attempts` 的總和是「失敗
+    # 幾次」，這個是「重排隊幾次」，終局那一次不算，所以兩者差 1。
+    retry_count: Mapped[int] = mapped_column(Integer, default=0, server_default="0")
 
 
 class Receipt(Base):
@@ -295,6 +305,31 @@ class WorkerJobStats(Base):
     signature: Mapped[str] = mapped_column(String, primary_key=True)
     ewma_seconds: Mapped[float] = mapped_column(Float)
     samples: Mapped[int] = mapped_column(Integer, default=0, server_default="0")
+    updated_at: Mapped[datetime] = mapped_column(DateTime, default=_utcnow)
+
+
+class WorkerTaskFailure(Base):
+    """2026-09-19 job-retry §4：每個 (worker, task_key) 的累計失敗次數。
+
+    `WorkerJobStats`（同一台跑同一種簽章有多快）的失敗面對照組，形狀刻意
+    一樣：複合主鍵、每次事件 upsert 一列。差別在分類鍵 --
+    `WorkerJobStats.signature` 只認 `assess.signature`，這裡的 `task_key` 還
+    涵蓋 `model_fetch:<模型名>` 的下載單（見 `retry.task_key`）。
+
+    達 `retry.UNSUITABLE_THRESHOLD` 次且 `updated_at` 在
+    `retry.UNSUITABLE_TTL_DAYS` 內 -> 這台 worker 對這類任務不適任，同類的
+    新 job 不會再派給它。成功跑完同類任務（`job_done` 且 transition 套用）
+    會刪掉這一列，管理員也可以手動清（`DELETE /api/workers/{id}/unsuitable`）。
+    TTL 到期的列不刪，只是查詢時不再生效 -- 它還是管理員要看的歷史。
+    """
+
+    __tablename__ = "worker_task_failures"
+
+    worker_id: Mapped[str] = mapped_column(String, primary_key=True)
+    task_key: Mapped[str] = mapped_column(String, primary_key=True)
+    failures: Mapped[int] = mapped_column(Integer, default=0, server_default="0")
+    last_error: Mapped[Optional[str]] = mapped_column(String, nullable=True)
+    last_job_id: Mapped[Optional[str]] = mapped_column(String, nullable=True)
     updated_at: Mapped[datetime] = mapped_column(DateTime, default=_utcnow)
 
 

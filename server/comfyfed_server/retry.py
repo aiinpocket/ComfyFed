@@ -1,0 +1,241 @@
+"""2026-09-19 job-retry：失敗計次、門檻判定、終局訊息彙整與不適任紀錄。
+
+模組分兩層，和 `stats.py` 同一個形狀：上半是完全不碰 DB 的純函式（計次、
+門檻、`task_key`、訊息彙整），兩棧逐行對照 `cloud/src/core/retry.ts`；下半是
+薄薄的 `worker_task_failures` adapter（upsert／清除／TTL 查詢）。
+
+設計見 `docs/superpowers/specs/2026-09-19-job-retry-unsuitable-worker-design.md`。
+一句話：worker 回報 `job_failed` 不再是終局 -- 同一台對同一張 job 失敗
+`MAX_FAILURES_PER_WORKER_PER_JOB` 次就對那張 job 出局，job 回 `queued` 等別台
+（包含現在離線／暫停、之後才上線、甚至還得先下載模型的）；累積到
+`MAX_JOB_ATTEMPTS` 次、或全艦隊沒有任何一台有可能跑它，才真的終局失敗。
+"""
+
+from __future__ import annotations
+
+import json
+from datetime import datetime, timedelta
+from typing import Optional
+
+from . import db
+
+# 同一台 worker 對同一張 job 失敗這麼多次 -> 這張 job 不再派給它。
+MAX_FAILURES_PER_WORKER_PER_JOB = 2
+# 一張 job 所有 worker 加總的失敗次數上限；到了就終局失敗。
+MAX_JOB_ATTEMPTS = 6
+# (worker, task_key) 累積這麼多次失敗 -> 這台對這「類」任務算不適任。
+UNSUITABLE_THRESHOLD = 2
+# 不適任紀錄的有效期；過期的列不刪，只是查詢時不再生效。
+UNSUITABLE_TTL_DAYS = 7
+
+# 排除理由字串（console 的 assessment 面板直接顯示，兩棧逐字相同）。
+FAILED_TWICE_REASON = "failed_twice_on_job"
+UNSUITABLE_REASON_PREFIX = "unsuitable:"
+# `unsuitable:<task_key 前 N 字>` -- 簽章是 64 字雜湊，全寫進理由字串沒有
+# 可讀性，前 12 字已足以辨識。
+UNSUITABLE_KEY_CHARS = 12
+
+# 終局訊息裡每台 worker 的錯誤截這麼長；`worker_task_failures.last_error`
+# 存得長一點（下面的 500），因為它是給管理員診斷用的，不是給 job 列表顯示的。
+FINAL_ERROR_CHARS = 200
+LAST_ERROR_CHARS = 500
+
+
+# --- 純函式層 --------------------------------------------------------------
+
+
+def attempts_dict(attempts_json: Optional[str]) -> dict[str, int]:
+    """`jobs.attempts` 的防禦式解析：`{worker_id: failures}`。
+
+    壞掉的 JSON、不是物件、值不是正整數的 key，一律當「沒有那一筆」。一列壞
+    資料絕不能讓 `job_failed` 整條路徑炸掉 -- 那會讓 job 卡在 `running` 永遠
+    等不到任何轉移。
+    """
+    try:
+        value = json.loads(attempts_json or "{}")
+    except (TypeError, ValueError):
+        return {}
+    if not isinstance(value, dict):
+        return {}
+    result: dict[str, int] = {}
+    for key, count in value.items():
+        if not isinstance(key, str):
+            continue
+        if not isinstance(count, int) or isinstance(count, bool) or count < 0:
+            continue
+        result[key] = count
+    return result
+
+
+def bump_attempts(attempts_json: Optional[str], worker_id: str) -> tuple[str, int, int]:
+    """`worker_id` 對這張 job 再失敗一次。
+
+    回 `(new_json, this_worker_failures, total)`：新的 JSON 字串（直接寫回
+    `jobs.attempts`）、這台 worker 現在的失敗次數、以及所有 worker 的總失敗
+    次數（拿去和 `MAX_JOB_ATTEMPTS` 比）。
+    """
+    attempts = attempts_dict(attempts_json)
+    attempts[worker_id] = attempts.get(worker_id, 0) + 1
+    total = sum(attempts.values())
+    return json.dumps(attempts), attempts[worker_id], total
+
+
+def is_excluded_for_job(attempts_json: Optional[str], worker_id: str) -> bool:
+    """這台 worker 對這張 job 是不是已經出局（失敗達 `MAX_FAILURES_...`）。"""
+    return attempts_dict(attempts_json).get(worker_id, 0) >= MAX_FAILURES_PER_WORKER_PER_JOB
+
+
+def unsuitable_reason(key: str) -> str:
+    """`unsuitable:<task_key 前 12 字>` -- 兩棧逐字相同的排除理由字串。"""
+    return f"{UNSUITABLE_REASON_PREFIX}{(key or '')[:UNSUITABLE_KEY_CHARS]}"
+
+
+def summarize_final_error(attempt_errors: list[tuple[str, str]], total: int) -> str:
+    """終局失敗時寫進 `jobs.error` 的彙整訊息。
+
+    `attempt_errors` 是 `[(worker 顯示名, 那台的最後一個錯誤)]`，`total` 是
+    總嘗試次數。zh-TW 先、en 後（平台其他雙語訊息的慣例），每台的錯誤截
+    `FINAL_ERROR_CHARS` 字 -- 一段 CUDA traceback 可以有好幾 KB，六台份塞進
+    一個 job 列會讓 console 的 job 列表整個爛掉。
+    """
+    n = len(attempt_errors)
+    detail = "；".join(f"{name}: {(error or '')[:FINAL_ERROR_CHARS]}" for name, error in attempt_errors)
+    return (
+        f"已在 {n} 台 worker 嘗試 {total} 次全部失敗 / "
+        f"failed on {n} workers after {total} attempts：{detail}"
+    )
+
+
+def task_key(job) -> Optional[str]:
+    """這張 job 屬於哪一「類」任務 -- 不適任紀錄的分類鍵。
+
+    1. `job.signature`（`assess.signature` 算的工作指紋：工作流結構＋需求）
+       非空就是它；
+    2. 否則 `kind == "model_fetch"` 的下載單用 `model_fetch:<模型名>`；
+    3. 都沒有（舊的、沒補簽章的 job）-> None，代表「不分類、不記錄」。
+       這條 job 照樣重試，只是不會留下跨 job 的不適任紀錄。
+    """
+    signature = getattr(job, "signature", None)
+    if signature:
+        return signature
+
+    if getattr(job, "kind", "prompt") != "model_fetch":
+        return None
+
+    try:
+        entry = json.loads(getattr(job, "fetch_entry", None) or "{}")
+    except (TypeError, ValueError):
+        return None
+    if not isinstance(entry, dict):
+        return None
+    name = entry.get("name")
+    if not isinstance(name, str) or not name:
+        return None
+    return f"model_fetch:{name}"
+
+
+# --- DB adapter 層 ----------------------------------------------------------
+
+
+def record_failure(
+    session, worker_id: str, key: Optional[str], error: Optional[str], job_id: Optional[str],
+    now: datetime,
+) -> None:
+    """`worker_task_failures[worker_id, key].failures += 1`（不存在就建）。
+
+    `key` 為 None 是合法的 no-op：`task_key` 分不出類別的 job（舊的、沒簽章
+    的）照樣重試，只是不留跨 job 的紀錄。不自己 commit -- 由呼叫端連同
+    `jobs.attempts` 的更新一起 commit，免得留下「計次進了、attempts 沒進」
+    的半套狀態。
+    """
+    if not key:
+        return
+    truncated = (error or "")[:LAST_ERROR_CHARS]
+    row = session.get(db.WorkerTaskFailure, (worker_id, key))
+    if row is None:
+        session.add(
+            db.WorkerTaskFailure(
+                worker_id=worker_id,
+                task_key=key,
+                failures=1,
+                last_error=truncated,
+                last_job_id=job_id,
+                updated_at=now,
+            )
+        )
+        return
+    row.failures = (row.failures or 0) + 1
+    row.last_error = truncated
+    row.last_job_id = job_id
+    row.updated_at = now
+
+
+def clear_failure(session, worker_id: str, key: Optional[str]) -> None:
+    """成功跑完同類任務 -> 刪掉那一列（自動解除不適任）。不自己 commit。"""
+    if not key:
+        return
+    row = session.get(db.WorkerTaskFailure, (worker_id, key))
+    if row is not None:
+        session.delete(row)
+
+
+def clear_worker_failures(session, worker_id: str) -> int:
+    """清掉這台 worker 的全部不適任紀錄，回傳刪了幾列。不自己 commit。"""
+    rows = (
+        session.query(db.WorkerTaskFailure)
+        .filter(db.WorkerTaskFailure.worker_id == worker_id)
+        .all()
+    )
+    for row in rows:
+        session.delete(row)
+    return len(rows)
+
+
+def _is_active(row, now: datetime) -> bool:
+    """達門檻、且 `updated_at` 還在 TTL 內。
+
+    `updated_at` 是 None（理論上不會有，欄位 NOT NULL）就當過期 -- 無法證明
+    它還新鮮的紀錄不該拿來擋派工。
+    """
+    if (row.failures or 0) < UNSUITABLE_THRESHOLD:
+        return False
+    if row.updated_at is None:
+        return False
+    return row.updated_at >= now - timedelta(days=UNSUITABLE_TTL_DAYS)
+
+
+def active_unsuitable(session, now: datetime) -> frozenset[tuple[str, str]]:
+    """現在生效中的 `(worker_id, task_key)` 排除集合。
+
+    一個 dispatch tick 只查一次，整批傳給 `assess.verdict`（見
+    `dispatch.assign_jobs` 的 `exclusions`）。過期的列留著不刪 -- 它是管理員
+    診斷「這台過去在這類任務上翻過車」的歷史，只是不再擋派工。
+    """
+    rows = session.query(db.WorkerTaskFailure).all()
+    return frozenset((row.worker_id, row.task_key) for row in rows if _is_active(row, now))
+
+
+def unsuitable_rows_for_worker(session, worker_id: str, now: datetime) -> list[dict]:
+    """`GET /api/workers` 每台 worker 的 `unsuitable` 陣列。
+
+    門檻未達／TTL 已過的列照樣列出來，只是 `active: False`（console 畫成灰
+    字）-- 管理員要看得到「這台失敗過一次」和「這台上個月不適任過」，那是
+    決定要不要手動清除的依據。
+    """
+    rows = (
+        session.query(db.WorkerTaskFailure)
+        .filter(db.WorkerTaskFailure.worker_id == worker_id)
+        .order_by(db.WorkerTaskFailure.updated_at.desc(), db.WorkerTaskFailure.task_key.asc())
+        .all()
+    )
+    return [
+        {
+            "task_key": row.task_key,
+            "failures": row.failures or 0,
+            "last_error": row.last_error,
+            "last_job_id": row.last_job_id,
+            "updated_at": row.updated_at.isoformat() if row.updated_at else None,
+            "active": _is_active(row, now),
+        }
+        for row in rows
+    ]
