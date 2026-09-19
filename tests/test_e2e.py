@@ -30,7 +30,7 @@ from nacl.signing import SigningKey
 
 from comfyfed_agent import comfy, identity, signing
 from comfyfed_server import agentws, app as app_module
-from comfyfed_server import bootstrap, db, dispatch, security
+from comfyfed_server import bootstrap, db, dispatch, retry, security
 
 WORKFLOW = {
     "1": {"class_type": "LoadImage", "inputs": {"image": "ref.png"}},
@@ -375,7 +375,14 @@ def _job_snapshot(job_id):
         return {
             "status": job.status,
             "worker_id": job.worker_id,
-            "attempts": json.loads(job.attempts or "{}"),
+            # `jobs.attempts` 存的是嵌套型別
+            # (`{worker: {"failures": n, "last_error": s}}`)，因為每台的最後
+            # 錯誤必須是 per-job 的（跨 job 累計的那一個在
+            # `worker_task_failures`）。這裡要的是和 API 相同的扁平
+            # `{worker_id: 次數}`，所以走 `retry.attempts_dict` 而不是直接
+            # `json.loads` 原始欄位 -- 否則這個 helper 會把「儲存形狀」
+            # 當成「API 形狀」來斷言。
+            "attempts": retry.attempts_dict(job.attempts),
             "retry_count": job.retry_count,
             "signature": job.signature,
             "error": job.error,
