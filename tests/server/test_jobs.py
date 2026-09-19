@@ -1435,3 +1435,59 @@ def test_job_dict_defaults_kind_to_prompt_and_fetch_entry_to_none():
     job = db.Job(workflow_json="{}")
     d = jobs_module._job_dict(job)
     assert d["kind"] == "prompt" and d["fetch_entry"] is None
+
+
+# --- 2026-09-19 job-retry：`_job_dict` 的 attempts 契約 ---------------------
+#
+# 這一組是**契約測試**，不是實作細節測試：`jobs.attempts` 這個欄位的**儲存**
+# 形狀在 fix round 1 為了 per-job 的最後錯誤改成了巢狀
+# （`{worker: {"failures": n, "last_error": s}}`），但 **API 形狀不變** --
+# `attempts` 永遠是扁平的 `{worker_id: 次數}`，錯誤另外放在 `attempt_errors`。
+# web console 與 cloud twin 都是照 API 形狀寫的，所以這裡釘死，免得哪天有人
+# 「順手」把儲存形狀直接吐出去。
+
+
+def _job_with_attempts(raw):
+    with db.get_session() as session:
+        job = db.Job(workflow_json="{}", attempts=raw)
+        session.add(job)
+        session.commit()
+        return jobs_module._job_dict(job)
+
+
+def test_job_dict_flattens_the_nested_attempts_shape(client):
+    d = _job_with_attempts(json.dumps({"w1": {"failures": 2, "last_error": "boom"}}))
+    assert d["attempts"] == {"w1": 2}
+    assert d["attempt_errors"] == {"w1": "boom"}
+
+
+def test_job_dict_keeps_the_same_attempts_shape_for_a_legacy_row(client):
+    """這個功能第一版寫進去的純數字列（`{"w1": 2}`）照樣吐出同一個扁平
+    map，只是沒有錯誤字串可帶 -- 不需要資料 migration。"""
+    d = _job_with_attempts(json.dumps({"w1": 2}))
+    assert d["attempts"] == {"w1": 2}
+    assert d["attempt_errors"] == {}
+
+
+def test_job_dict_attempts_defaults_and_survives_garbage(client):
+    assert _job_with_attempts("{}")["attempts"] == {}
+    assert _job_with_attempts("{}")["attempt_errors"] == {}
+    assert _job_with_attempts("not json")["attempts"] == {}
+    assert _job_with_attempts("not json")["attempt_errors"] == {}
+
+
+def test_job_detail_api_returns_the_flat_attempts_map(client):
+    """走真的 HTTP：`GET /api/jobs/{id}` 的 `attempts` 是扁平 int map。"""
+    csrf = _login(client)
+    # 這個檔案的 `_submit` 回的是 Response，不是 job_id。
+    job_id = _submit(client, csrf).json()["job_id"]
+    with db.get_session() as session:
+        job = session.get(db.Job, job_id)
+        job.attempts = json.dumps(
+            {"w1": {"failures": 2, "last_error": "boom"}, "w2": 1}
+        )
+        session.commit()
+
+    detail = client.get("/api/jobs/%s" % job_id, headers={"X-CSRF": csrf}).json()
+    assert detail["attempts"] == {"w1": 2, "w2": 1}
+    assert detail["attempt_errors"] == {"w1": "boom"}
