@@ -212,6 +212,42 @@ describe('Jobs page: model auto-fetch progress', () => {
   });
 });
 
+describe('Jobs page: read-only console (design §8)', () => {
+  afterEach(() => {
+    cleanup();
+    vi.unstubAllGlobals();
+  });
+
+  it('shows the hint that submissions come from the AI (MCP) or the ComfyUI panel', async () => {
+    stubFetch([[RUNNING_JOB]]);
+    renderJobs();
+
+    const hint = await screen.findByTestId('jobs-submit-hint');
+    expect(hint).toHaveTextContent(/AI assistant \(MCP\)/);
+    expect(hint).toHaveTextContent(/ComfyUI/);
+  });
+
+  it('has no submit panel: no paste box, no advanced override, no submit button', async () => {
+    stubFetch([[RUNNING_JOB]]);
+    renderJobs();
+
+    await screen.findByText('Running');
+    expect(screen.queryByTestId('submit-panel')).not.toBeInTheDocument();
+    expect(screen.queryByRole('button', { name: 'Submit job' })).not.toBeInTheDocument();
+    expect(screen.queryByText('Paste API JSON instead')).not.toBeInTheDocument();
+    expect(screen.queryByText('Advanced override')).not.toBeInTheDocument();
+    expect(screen.queryByRole('textbox')).not.toBeInTheDocument();
+  });
+
+  it('keeps the ComfyUI editor link as the panel entry point', async () => {
+    stubFetch([[RUNNING_JOB]]);
+    renderJobs();
+
+    const link = await screen.findByRole('link', { name: /Open workflow editor/ });
+    expect(link).toHaveAttribute('href', '/comfy');
+  });
+});
+
 describe('Jobs page: cancellation', () => {
   afterEach(() => {
     cleanup();

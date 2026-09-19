@@ -37,6 +37,7 @@ import { ApiError, api, type ObjectInfoMode, type Role, type StagingFile } from 
 import { Mono, SectionHeader } from '../components/Primitives';
 import { persistLang, type Lang } from '../i18n';
 import { formatBytes } from '../lib/format';
+import { ApiTokensCard } from './ApiTokensCard';
 
 interface SettingsProps {
   platformUrl: string;
@@ -342,6 +343,7 @@ export function Settings({ platformUrl, role }: SettingsProps) {
       <SectionHeader title={t('settings.title')} description={t('settings.subtitle')} />
 
       <SimpleGrid cols={{ base: 1, lg: 2 }} spacing="md">
+        <Stack gap="md">
         <Card style={cardStyle}>
           <form onSubmit={changePassword}>
             <Stack gap="md">
@@ -383,6 +385,11 @@ export function Settings({ platformUrl, role }: SettingsProps) {
             </Stack>
           </form>
         </Card>
+
+        {/* API token / AI access (design §4.4) -- every role, not just admins:
+            a plain user drives their own jobs through the MCP server too. */}
+        <ApiTokensCard platformUrl={platformUrl} />
+        </Stack>
 
         <Stack gap="md">
           {isAdmin && (

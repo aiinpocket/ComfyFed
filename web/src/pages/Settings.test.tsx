@@ -14,7 +14,7 @@ import { cleanup, fireEvent, render, screen, waitFor, within } from '@testing-li
 import { MemoryRouter } from 'react-router-dom';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 
-import type { StagingFile } from '../api';
+import type { ApiToken, StagingFile } from '../api';
 import '../i18n';
 import { theme } from '../theme';
 import { Settings } from './Settings';
@@ -326,5 +326,247 @@ describe('Settings page: split_batches switch (Phase 3.3 Task 8)', () => {
 
     await screen.findByText('You have not uploaded any files yet.');
     expect(screen.queryByLabelText(/Split batches automatically/)).not.toBeInTheDocument();
+  });
+});
+
+/* --------------------------------------------- API tokens (design §4.4) */
+
+const ACTIVE_TOKEN: ApiToken = {
+  id: 'tok-active-1',
+  name: 'Claude desktop',
+  prefix: 'cft_ab12cd34',
+  created_at: '2026-09-19T00:00:00Z',
+  expires_at: '2026-10-19T00:00:00Z',
+  last_used_at: '2026-09-20T01:00:00Z',
+  revoked_at: null,
+  active: true,
+};
+
+const REVOKED_TOKEN: ApiToken = {
+  id: 'tok-revoked-2',
+  name: 'Old laptop',
+  prefix: 'cft_ef56gh78',
+  created_at: '2026-09-01T00:00:00Z',
+  expires_at: '2026-10-01T00:00:00Z',
+  last_used_at: null,
+  revoked_at: '2026-09-18T00:00:00Z',
+  active: false,
+};
+
+const EXPIRED_TOKEN: ApiToken = {
+  id: 'tok-expired-3',
+  name: 'Last month',
+  prefix: 'cft_ij90kl12',
+  created_at: '2026-07-20T00:00:00Z',
+  expires_at: '2026-08-19T00:00:00Z',
+  last_used_at: '2026-08-01T00:00:00Z',
+  revoked_at: null,
+  active: false,
+};
+
+const CREATED_TOKEN = {
+  id: 'tok-new-9',
+  name: 'Claude desktop',
+  token: 'cft_ab12cd34ZZZZZZZZZZZZZZZZZZZZZZZZ',
+  prefix: 'cft_ab12cd34',
+  created_at: '2026-09-20T00:00:00Z',
+  expires_at: '2026-10-20T00:00:00Z',
+};
+
+/**
+ * `fetch` stub for the token card: `GET /api/auth/tokens` answers from a
+ * mutable list, so a create/revoke can be seen to refresh it. The other
+ * endpoints the Settings page touches on mount are stubbed out quietly.
+ */
+function stubTokenFetch(options: {
+  tokens?: ApiToken[];
+  createStatus?: number;
+  createBody?: unknown;
+}) {
+  const state = { tokens: options.tokens ?? [] };
+  const posted: unknown[] = [];
+  const deleted: string[] = [];
+  const fetchMock = vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+    const url = typeof input === 'string' ? input : input.toString();
+    const method = init?.method ?? 'GET';
+    if (url === '/api/auth/tokens' && method === 'GET') return jsonResponse(state.tokens);
+    if (url === '/api/auth/tokens' && method === 'POST') {
+      posted.push(JSON.parse(String(init?.body)));
+      if (options.createStatus && options.createStatus >= 400) {
+        return jsonResponse(options.createBody, options.createStatus);
+      }
+      const created = CREATED_TOKEN;
+      state.tokens = [
+        ...state.tokens,
+        {
+          id: created.id,
+          name: created.name,
+          prefix: created.prefix,
+          created_at: created.created_at,
+          expires_at: created.expires_at,
+          last_used_at: null,
+          revoked_at: null,
+          active: true,
+        },
+      ];
+      return jsonResponse(created, 201);
+    }
+    const revokeMatch = /^\/api\/auth\/tokens\/([^/]+)$/.exec(url);
+    if (revokeMatch && method === 'DELETE') {
+      deleted.push(revokeMatch[1]);
+      state.tokens = state.tokens.map((token) =>
+        token.id === revokeMatch[1]
+          ? { ...token, revoked_at: '2026-09-20T02:00:00Z', active: false }
+          : token,
+      );
+      return jsonResponse({ revoked: true });
+    }
+    if (url === '/api/staging') {
+      return jsonResponse({ files: [], total_bytes: 0, quota_bytes: 0, userdata_bytes: 0 });
+    }
+    if (url === '/api/settings' && method === 'GET') return jsonResponse(SETTINGS_STATE);
+    return jsonResponse({ error: { code: 'http_error', message: 'not stubbed' } }, 404);
+  });
+  vi.stubGlobal('fetch', fetchMock);
+  return { fetchMock, posted, deleted };
+}
+
+async function generateToken(name = 'Claude desktop') {
+  const nameInput = await screen.findByLabelText('Token name');
+  fireEvent.change(nameInput, { target: { value: name } });
+  fireEvent.click(screen.getByRole('button', { name: 'Generate' }));
+}
+
+describe('Settings page: API tokens card', () => {
+  afterEach(() => {
+    cleanup();
+    vi.unstubAllGlobals();
+    vi.restoreAllMocks();
+  });
+
+  it('lists the caller’s tokens with prefix and a status per row', async () => {
+    stubTokenFetch({ tokens: [ACTIVE_TOKEN, REVOKED_TOKEN, EXPIRED_TOKEN] });
+    renderSettings('user');
+
+    expect(await screen.findByText('Claude desktop')).toBeInTheDocument();
+    expect(screen.getByText('cft_ab12cd34')).toBeInTheDocument();
+    expect(screen.getByText('Active')).toBeInTheDocument();
+    expect(screen.getByText('Revoked')).toBeInTheDocument();
+    expect(screen.getByText('Expired')).toBeInTheDocument();
+    // A token that was never used shows "Never" rather than an empty cell.
+    expect(screen.getByText('Never')).toBeInTheDocument();
+  });
+
+  it('shows the empty state when the caller has no tokens', async () => {
+    stubTokenFetch({ tokens: [] });
+    renderSettings('user');
+
+    expect(await screen.findByText('No API tokens yet.')).toBeInTheDocument();
+  });
+
+  it('creates a token, shows the plaintext exactly once, and refreshes the list', async () => {
+    const { posted } = stubTokenFetch({ tokens: [] });
+    renderSettings('user');
+
+    await generateToken();
+
+    const plaintext = await screen.findByTestId('api-token-plaintext');
+    expect(plaintext).toHaveTextContent(CREATED_TOKEN.token);
+    expect(posted).toContainEqual({ name: 'Claude desktop' });
+
+    // The new row lands in the list underneath.
+    await waitFor(() => expect(screen.getByText('cft_ab12cd34')).toBeInTheDocument());
+
+    // Dismissing it removes the plaintext for good -- it is never re-rendered.
+    fireEvent.click(screen.getByRole('button', { name: 'I have saved it' }));
+    await waitFor(() => expect(screen.queryByTestId('api-token-plaintext')).not.toBeInTheDocument());
+    expect(screen.queryByText(CREATED_TOKEN.token)).not.toBeInTheDocument();
+  });
+
+  it('downloads comfyfed-mcp.json with platform_url, token and expires_at', async () => {
+    stubTokenFetch({ tokens: [] });
+    const blobs: Blob[] = [];
+    const createObjectURL = vi.fn((blob: Blob) => {
+      blobs.push(blob);
+      return 'blob:mock-url';
+    });
+    const revokeObjectURL = vi.fn();
+    // jsdom implements neither method, so they are defined (not spied) here
+    // and removed again below.
+    Object.defineProperty(URL, 'createObjectURL', { value: createObjectURL, configurable: true });
+    Object.defineProperty(URL, 'revokeObjectURL', { value: revokeObjectURL, configurable: true });
+    // jsdom cannot follow a `blob:` download, and letting the anchor click
+    // through prints a "navigation not implemented" error -- the assertions
+    // below look at the anchor element itself instead.
+    const clickSpy = vi
+      .spyOn(HTMLAnchorElement.prototype, 'click')
+      .mockImplementation(() => undefined);
+
+    renderSettings('user');
+    await generateToken();
+
+    fireEvent.click(await screen.findByTestId('api-token-download'));
+
+    await waitFor(() => expect(createObjectURL).toHaveBeenCalled());
+    expect(blobs).toHaveLength(1);
+    expect(blobs[0].type).toBe('application/json');
+    expect(JSON.parse(await blobs[0].text())).toEqual({
+      platform_url: 'https://example.test',
+      token: CREATED_TOKEN.token,
+      expires_at: CREATED_TOKEN.expires_at,
+    });
+
+    const anchor = clickSpy.mock.instances[0] as HTMLAnchorElement;
+    expect(anchor.download).toBe('comfyfed-mcp.json');
+    expect(revokeObjectURL).toHaveBeenCalledWith('blob:mock-url');
+
+    Reflect.deleteProperty(URL, 'createObjectURL');
+    Reflect.deleteProperty(URL, 'revokeObjectURL');
+  });
+
+  it('revokes a token after the confirm dialog and shows it as revoked', async () => {
+    const { deleted } = stubTokenFetch({ tokens: [ACTIVE_TOKEN] });
+    renderSettings('user');
+
+    await screen.findByText('Claude desktop');
+    fireEvent.click(screen.getByTestId(`api-token-revoke-${ACTIVE_TOKEN.id}`));
+
+    const dialog = await screen.findByRole('dialog');
+    expect(within(dialog).getByText(/Claude desktop/)).toBeInTheDocument();
+    fireEvent.click(within(dialog).getByRole('button', { name: 'Revoke' }));
+
+    await waitFor(() => expect(deleted).toEqual([ACTIVE_TOKEN.id]));
+    await waitFor(() => expect(screen.getByText('Revoked')).toBeInTheDocument());
+    expect(screen.queryByText('Active')).not.toBeInTheDocument();
+  });
+
+  it('dismissing the confirm dialog does not revoke anything', async () => {
+    const { deleted } = stubTokenFetch({ tokens: [ACTIVE_TOKEN] });
+    renderSettings('user');
+
+    await screen.findByText('Claude desktop');
+    fireEvent.click(screen.getByTestId(`api-token-revoke-${ACTIVE_TOKEN.id}`));
+
+    const dialog = await screen.findByRole('dialog');
+    fireEvent.click(within(dialog).getByRole('button', { name: 'Cancel' }));
+
+    await waitFor(() => expect(screen.queryByRole('dialog')).not.toBeInTheDocument());
+    expect(deleted).toEqual([]);
+  });
+
+  it('surfaces auth.too_many_tokens instead of a plaintext panel', async () => {
+    stubTokenFetch({
+      tokens: [],
+      createStatus: 409,
+      createBody: { error: { code: 'auth.too_many_tokens', message: 'too many' } },
+    });
+    renderSettings('user');
+
+    await generateToken();
+
+    expect(
+      await screen.findByText('You already have the maximum of 10 active tokens. Revoke one first.'),
+    ).toBeInTheDocument();
+    expect(screen.queryByTestId('api-token-plaintext')).not.toBeInTheDocument();
   });
 });

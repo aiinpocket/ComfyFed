@@ -169,6 +169,34 @@ export interface MeResponse {
   csrf?: string;
 }
 
+/**
+ * One row of `GET /api/auth/tokens` (API token design §4.2): a bearer token
+ * the caller minted for an AI/MCP client. The plaintext is never in this
+ * shape -- only `POST /api/auth/tokens` ever returns it, exactly once.
+ * `active` is the server's own verdict (not revoked AND not expired); the
+ * console splits "revoked" from "expired" by looking at `revoked_at`.
+ */
+export interface ApiToken {
+  id: string;
+  name: string;
+  prefix: string;
+  created_at: string | null;
+  expires_at: string | null;
+  last_used_at: string | null;
+  revoked_at: string | null;
+  active: boolean;
+}
+
+/** `POST /api/auth/tokens` echoes the plaintext `token` exactly once. */
+export interface CreatedApiToken {
+  id: string;
+  name: string;
+  token: string;
+  prefix: string;
+  created_at: string | null;
+  expires_at: string | null;
+}
+
 export interface WorkerHardware {
   gpu_name?: string | null;
   vram_gb?: number | null;
@@ -591,6 +619,27 @@ export const api = {
     });
     setCsrf(result.csrf);
     return result;
+  },
+
+  /**
+   * API tokens (design §4.2). All three routes are **cookie-session only** --
+   * a bearer token can never manage tokens -- so they ride the console's
+   * ordinary session + CSRF path like every other call here.
+   */
+  listTokens(): Promise<ApiToken[]> {
+    return getJson<ApiToken[]>('/api/auth/tokens');
+  },
+
+  /** 201 with the plaintext `token`, which is shown to the user once and
+   * never retrievable again. 409 `auth.too_many_tokens` past the per-user
+   * cap; 400 `auth.bad_token_name` for a name over 64 characters. */
+  createToken(name: string): Promise<CreatedApiToken> {
+    return postJson<CreatedApiToken>('/api/auth/tokens', { name });
+  },
+
+  /** Idempotent: an already-revoked token still answers `{revoked: true}`. */
+  revokeToken(tokenId: string): Promise<{ revoked: boolean }> {
+    return deleteJson(`/api/auth/tokens/${encodeURIComponent(tokenId)}`);
   },
 
   agentVersion(): Promise<AgentVersion> {

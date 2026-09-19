@@ -7,27 +7,18 @@ import {
   Button,
   Card,
   Collapse,
-  Divider,
-  FileInput,
   Group,
   Loader,
   Modal,
-  NumberInput,
-  Select,
-  SimpleGrid,
   Stack,
   Table,
   Text,
-  Textarea,
-  TextInput,
   ThemeIcon,
   Tooltip,
-  UnstyledButton,
   useMantineTheme,
 } from '@mantine/core';
 import { notifications } from '@mantine/notifications';
 import {
-  IconAdjustments,
   IconAlertTriangle,
   IconCheck,
   IconChevronDown,
@@ -35,17 +26,15 @@ import {
   IconCircleCheck,
   IconCircleX,
   IconClipboardText,
-  IconCode,
   IconDownload,
   IconExternalLink,
-  IconFileUpload,
   IconInbox,
+  IconInfoCircle,
   IconRefresh,
-  IconSend,
   IconSitemap,
   IconX,
 } from '@tabler/icons-react';
-import { Fragment, useCallback, useEffect, useMemo, useState } from 'react';
+import { Fragment, useCallback, useEffect, useState } from 'react';
 import { useTranslation } from 'react-i18next';
 import { Link } from 'react-router-dom';
 
@@ -54,9 +43,7 @@ import {
   api,
   artifactUrl,
   type Assessment,
-  type Backend,
   type Job,
-  type RequirementsOverride,
   type Role,
   type Worker,
 } from '../api';
@@ -65,7 +52,6 @@ import { JobStatusBadge } from '../components/StatusBadge';
 import { formatAbsolute, formatGb, formatRelative, shortId } from '../lib/format';
 import { translateReason, parseReason } from '../lib/reasons';
 import { usePolling } from '../lib/usePolling';
-import { parseWorkflow, WorkflowParseError, type WorkflowSummary } from '../lib/workflow';
 import { ProgressCell } from './Dashboard';
 
 const POLL_MS = 5000;
@@ -103,9 +89,16 @@ export function Jobs({ role }: JobsProps) {
     <Stack gap="lg">
       <SectionHeader title={t('jobs.title')} description={t('jobs.subtitle')} />
 
-      <EditorPanel />
+      <Alert
+        data-testid="jobs-submit-hint"
+        variant="light"
+        color="federation"
+        icon={<IconInfoCircle size={16} />}
+      >
+        {t('jobs.readonly_hint')}
+      </Alert>
 
-      <SubmitPanel onSubmitted={refresh} />
+      <EditorPanel />
 
       <Stack gap="sm">
         <Text fw={600} fz="md">
@@ -186,326 +179,6 @@ function EditorPanel() {
           {t('jobs.open_editor')}
         </Button>
       </Group>
-    </Card>
-  );
-}
-
-/* ------------------------------------------------------------ submit panel */
-
-/** Secondary path: paste an already-exported API-format workflow.
- *
- * Collapsed by default since Phase 1.5 — the editor above is the primary way
- * in, and this whole panel is the escape hatch for a workflow that already
- * exists as JSON.
- */
-function SubmitPanel({ onSubmitted }: { onSubmitted: () => void }) {
-  const { t } = useTranslation();
-  const theme = useMantineTheme();
-
-  const [text, setText] = useState('');
-  const [parseError, setParseError] = useState<string | null>(null);
-  const [summary, setSummary] = useState<WorkflowSummary | null>(null);
-  const [assetFiles, setAssetFiles] = useState<Record<string, File | null>>({});
-  const [pasteOpen, setPasteOpen] = useState(false);
-  const [advancedOpen, setAdvancedOpen] = useState(false);
-  const [minVram, setMinVram] = useState<number | ''>('');
-  const [minDisk, setMinDisk] = useState<number | ''>('');
-  const [gpuContains, setGpuContains] = useState('');
-  const [backend, setBackend] = useState<string | null>(null);
-  const [submitting, setSubmitting] = useState(false);
-
-  // Re-parse whenever the pasted JSON changes; asset slots follow the parse.
-  useEffect(() => {
-    if (!text.trim()) {
-      setSummary(null);
-      setParseError(null);
-      setAssetFiles({});
-      return;
-    }
-    try {
-      const parsed = parseWorkflow(text);
-      setSummary(parsed);
-      setParseError(null);
-      setAssetFiles((previous) => {
-        const next: Record<string, File | null> = {};
-        for (const name of parsed.assets) next[name] = previous[name] ?? null;
-        return next;
-      });
-    } catch (caught) {
-      setSummary(null);
-      setAssetFiles({});
-      setParseError(caught instanceof WorkflowParseError ? caught.message : 'invalid_json');
-    }
-  }, [text]);
-
-  const missingAssets = useMemo(
-    () => (summary?.assets ?? []).filter((name) => !assetFiles[name]),
-    [summary, assetFiles],
-  );
-
-  const canSubmit = Boolean(summary) && missingAssets.length === 0 && !submitting;
-
-  const readFile = async (file: File) => {
-    const content = await file.text();
-    setText(content);
-  };
-
-  const submit = async () => {
-    if (!summary || !canSubmit) return;
-    setSubmitting(true);
-
-    const overrides: RequirementsOverride = {};
-    if (minVram !== '') overrides.min_vram_gb = Number(minVram);
-    if (minDisk !== '') overrides.min_free_disk_gb = Number(minDisk);
-    if (gpuContains.trim()) overrides.gpu_name_contains = gpuContains.trim();
-    if (backend) overrides.backend = backend as Backend;
-
-    const files = summary.assets
-      .map((name) => assetFiles[name])
-      .filter((file): file is File => file instanceof File);
-
-    try {
-      const result = await api.submitJob(text, overrides, files);
-      notifications.show({
-        color: 'teal',
-        icon: <IconCheck size={16} />,
-        title: t('jobs.submit_success'),
-        message: result.job_id,
-      });
-      setText('');
-      setMinVram('');
-      setMinDisk('');
-      setGpuContains('');
-      setBackend(null);
-      setAdvancedOpen(false);
-      onSubmitted();
-    } catch (caught) {
-      notifications.show({
-        color: 'red',
-        icon: <IconX size={16} />,
-        title: t('jobs.submit_failed'),
-        message:
-          caught instanceof ApiError
-            ? t(`errors.${caught.code}`, { defaultValue: caught.message })
-            : t('errors.network'),
-      });
-    } finally {
-      setSubmitting(false);
-    }
-  };
-
-  return (
-    <Card
-      style={{ background: theme.other.surfaces.card, borderColor: theme.other.surfaces.border }}
-    >
-      <Stack gap="md">
-        <UnstyledButton onClick={() => setPasteOpen((open) => !open)}>
-          <Group gap={8} wrap="nowrap">
-            {pasteOpen ? <IconChevronDown size={16} /> : <IconChevronRight size={16} />}
-            <IconCode size={16} />
-            <Text fw={600} size="sm">
-              {t('jobs.paste_section')}
-            </Text>
-            <Text size="xs" c="dimmed">
-              {t('jobs.paste_section_hint')}
-            </Text>
-          </Group>
-        </UnstyledButton>
-
-        <Collapse in={pasteOpen}>
-          <Stack gap="md">
-            <Group justify="space-between" align="flex-start" wrap="wrap" gap="sm">
-              <Stack gap={2}>
-                <Text fw={600}>{t('jobs.submit_heading')}</Text>
-                <Text size="sm" c="dimmed">
-                  {t('jobs.submit_hint')}
-                </Text>
-              </Stack>
-              <FileInput
-                placeholder={t('jobs.upload_json')}
-                leftSection={<IconFileUpload size={16} />}
-                accept="application/json,.json"
-                clearable
-                w={230}
-                value={null}
-                onChange={(file) => {
-                  if (file) void readFile(file);
-                }}
-              />
-            </Group>
-
-            <Textarea
-              placeholder={t('jobs.paste_placeholder')}
-              value={text}
-              onChange={(event) => setText(event.currentTarget.value)}
-              autosize
-              minRows={5}
-              maxRows={12}
-              styles={{
-                input: {
-                  fontFamily: theme.fontFamilyMonospace,
-                  fontSize: 12,
-                  background: theme.other.surfaces.raised,
-                },
-              }}
-            />
-
-            {parseError && (
-              <Alert color="red" variant="light" p="sm" icon={<IconAlertTriangle size={16} />}>
-                <Text size="sm">{t(`jobs.parse_${parseError}`, { defaultValue: t('jobs.parse_invalid_json') })}</Text>
-              </Alert>
-            )}
-
-            {summary && (
-              <Stack gap="sm">
-                <Group gap="xs" wrap="wrap">
-                  <Badge variant="light" color="federation" tt="none" fw={500}>
-                    {t('jobs.chip_nodes', { count: summary.nodeCount })}
-                  </Badge>
-                  <Badge variant="light" color="grape" tt="none" fw={500}>
-                    {t('jobs.chip_classes', { count: summary.nodeClasses.length })}
-                  </Badge>
-                  <Badge variant="light" color="teal" tt="none" fw={500}>
-                    {t('jobs.chip_models', { count: summary.models.length })}
-                  </Badge>
-                  <Badge variant="light" color="blue" tt="none" fw={500}>
-                    {t('jobs.chip_assets', { count: summary.assets.length })}
-                  </Badge>
-                </Group>
-
-                {summary.models.length > 0 && (
-                  <Box
-                    p="sm"
-                    style={{
-                      background: theme.other.surfaces.raised,
-                      borderRadius: theme.radius.md,
-                      border: `1px solid ${theme.other.surfaces.border}`,
-                    }}
-                  >
-                    <Text size="xs" c="dimmed" fw={600} tt="uppercase" mb={6} style={{ letterSpacing: '0.06em' }}>
-                      {t('jobs.detected_models')}
-                    </Text>
-                    <Group gap={6} wrap="wrap">
-                      {summary.models.map((model) => (
-                        <Mono key={model} size="xs" c="">
-                          {model}
-                        </Mono>
-                      ))}
-                    </Group>
-                  </Box>
-                )}
-
-                {summary.assets.length > 0 && (
-                  <Stack gap="xs">
-                    <Group gap="xs">
-                      <Text size="sm" fw={600}>
-                        {t('jobs.assets_heading')}
-                      </Text>
-                      {missingAssets.length > 0 && (
-                        <Badge color="yellow" variant="light" size="sm" tt="none" fw={500}>
-                          {t('jobs.assets_missing_count', { count: missingAssets.length })}
-                        </Badge>
-                      )}
-                    </Group>
-                    <Text size="xs" c="dimmed">
-                      {t('jobs.assets_hint')}
-                    </Text>
-                    <SimpleGrid cols={{ base: 1, sm: 2 }} spacing="xs">
-                      {summary.assets.map((name) => (
-                        <FileInput
-                          key={name}
-                          label={<Mono size="xs">{name}</Mono>}
-                          placeholder={t('jobs.asset_choose')}
-                          value={assetFiles[name] ?? null}
-                          error={!assetFiles[name] ? t('jobs.asset_required') : undefined}
-                          clearable
-                          leftSection={<IconFileUpload size={15} />}
-                          onChange={(file) => setAssetFiles((prev) => ({ ...prev, [name]: file }))}
-                        />
-                      ))}
-                    </SimpleGrid>
-                  </Stack>
-                )}
-              </Stack>
-            )}
-
-            <Divider variant="dashed" />
-
-            <Box>
-              <UnstyledButton onClick={() => setAdvancedOpen((open) => !open)}>
-                <Group gap={6}>
-                  {advancedOpen ? <IconChevronDown size={15} /> : <IconChevronRight size={15} />}
-                  <IconAdjustments size={15} />
-                  <Text size="sm" fw={500}>
-                    {t('jobs.advanced')}
-                  </Text>
-                  <Text size="xs" c="dimmed">
-                    {t('jobs.advanced_hint')}
-                  </Text>
-                </Group>
-              </UnstyledButton>
-              <Collapse in={advancedOpen}>
-                <SimpleGrid cols={{ base: 1, sm: 3 }} spacing="sm" mt="sm">
-                  <NumberInput
-                    label={t('jobs.min_vram')}
-                    placeholder={t('jobs.auto')}
-                    value={minVram}
-                    onChange={(value) => setMinVram(value === '' ? '' : Number(value))}
-                    min={0}
-                    step={1}
-                    suffix=" GB"
-                  />
-                  <NumberInput
-                    label={t('jobs.min_disk')}
-                    placeholder={t('jobs.auto')}
-                    value={minDisk}
-                    onChange={(value) => setMinDisk(value === '' ? '' : Number(value))}
-                    min={0}
-                    step={1}
-                    suffix=" GB"
-                  />
-                  <TextInput
-                    label={t('jobs.gpu_contains')}
-                    placeholder="RTX 5080"
-                    value={gpuContains}
-                    onChange={(event) => setGpuContains(event.currentTarget.value)}
-                  />
-                  <Select
-                    label={t('jobs.backend')}
-                    placeholder={t('jobs.auto')}
-                    description={t('jobs.backend_hint')}
-                    value={backend}
-                    onChange={setBackend}
-                    clearable
-                    data={[
-                      { value: 'cuda', label: 'CUDA (NVIDIA)' },
-                      { value: 'rocm', label: 'ROCm (AMD)' },
-                      { value: 'mps', label: 'MPS (Apple)' },
-                      { value: 'cpu', label: 'CPU' },
-                    ]}
-                  />
-                </SimpleGrid>
-              </Collapse>
-            </Box>
-
-            <Group justify="flex-end" gap="sm">
-              {missingAssets.length > 0 && (
-                <Text size="xs" c="yellow">
-                  {t('jobs.blocked_by_assets')}
-                </Text>
-              )}
-              <Button
-                leftSection={<IconSend size={16} />}
-                onClick={submit}
-                disabled={!canSubmit}
-                loading={submitting}
-              >
-                {t('jobs.submit')}
-              </Button>
-            </Group>
-          </Stack>
-        </Collapse>
-      </Stack>
     </Card>
   );
 }
