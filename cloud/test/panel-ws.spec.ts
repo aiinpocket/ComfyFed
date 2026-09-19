@@ -101,12 +101,17 @@ async function makeJob(opts: {
    * with its submitter's uid). */
   origin?: string;
   userId?: string | null;
+  /** 2026-09-19 model_fetch (spec §4/§9): `"model_fetch"` marks a
+   * download-only job, whose completion must emit NO `executed` event. */
+  kind?: string;
+  fetchEntry?: string | null;
 }): Promise<string> {
   const id = uniqueId("job");
   await d1()
     .prepare(
-      `INSERT INTO jobs (id, workflow_json, status, worker_id, created_at, started_at, input_assets, origin, user_id)
-       VALUES (?, ?, ?, ?, ?, ?, '[]', ?, ?)`
+      `INSERT INTO jobs (id, workflow_json, status, worker_id, created_at, started_at, input_assets, origin, user_id,
+                         kind, fetch_entry)
+       VALUES (?, ?, ?, ?, ?, ?, '[]', ?, ?, ?, ?)`
     )
     .bind(
       id,
@@ -116,7 +121,9 @@ async function makeJob(opts: {
       toSqliteTimestamp(new Date()),
       opts.startedAt ? toSqliteTimestamp(opts.startedAt) : null,
       opts.origin ?? "panel",
-      opts.userId ?? null
+      opts.userId ?? null,
+      opts.kind ?? "prompt",
+      opts.fetchEntry ?? null
     )
     .run();
   return id;
@@ -352,6 +359,60 @@ describe("job_done relay", () => {
       type: "executed",
       data: { prompt_id: jobId, output: {}, node: "comfyfed", display_node: "comfyfed" },
     });
+
+    agent.close();
+    panel.close();
+  });
+});
+
+// ---------------------------------------------------------------------------
+// 2026-09-19 model_fetch (spec §9): a download-only job emits NO `executed`.
+// Ports tests/server/test_comfy_panel_ws.py's
+// `test_model_fetch_job_done_emits_no_executed_event`.
+
+describe("model_fetch job_done relay", () => {
+  it("emits only the status refresh -- no executed, no executing:null", async () => {
+    // A model_fetch job has no output nodes, so `jobOutputs` is empty and the
+    // FALLBACK_OUTPUT_KEY path would otherwise invent an `executed` plus an
+    // `executing{node: null}` -- which the stock frontend reads as "the
+    // prompt finished" and uses to clear the running indicator of an
+    // UNRELATED real prompt in the same tab. Only the queue-badge `status`
+    // may go out.
+    const kp = KEYPAIRS[0]!;
+    const workerId = await makeWorker({ pubkeyHex: kp.pubkey_hex });
+    const { cookie, uid } = await loginCookie();
+    const jobId = await makeJob({
+      status: "running",
+      workerId,
+      userId: uid,
+      kind: "model_fetch",
+      fetchEntry: JSON.stringify({ name: "unknown_vae.safetensors", directory: "vae" }),
+    });
+
+    const panel = await connectPanel(cookie);
+    await collectMessages(panel, 2);
+
+    const agent = await connectAgent(workerId, kp.seed_hex);
+    agent.send(JSON.stringify({ type: "hello", protocol: 5 }));
+
+    // Two frames only: the `status` this job_done is allowed to emit, then a
+    // marker that CANNOT have been queued ahead of it. If an `executed` (or
+    // an `executing`) were emitted it would be the first of these instead.
+    const eventsPromise = collectMessages(panel, 2);
+    agent.send(JSON.stringify({ type: "job_done", job_id: jobId, result_files: [], exec_seconds: 0 }));
+    // Give the job_done relay a beat to flush before the marker is posted.
+    await new Promise((r) => setTimeout(r, 100));
+    await hub().fetch(
+      new Request("http://do/internal/event", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ type: "comfyfed_marker", data: {} }),
+      })
+    );
+
+    const [first, second] = await eventsPromise;
+    expect(first.type).toBe("status");
+    expect(second.type).toBe("comfyfed_marker");
 
     agent.close();
     panel.close();

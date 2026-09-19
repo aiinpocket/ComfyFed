@@ -5,6 +5,10 @@ import { signHex } from "../src/lib/ed25519";
 import { collectMessages, connectAgent, expectNoMessage, hub, nextMessage, openAgentWs, waitFor, waitForClose } from "./helpers/ws";
 import * as peerhealth from "../src/core/peerhealth";
 import * as split from "../src/core/split";
+import * as modelFetch from "../src/core/model_fetch";
+import * as modelGuide from "../src/core/model_guide";
+import * as modelManifest from "../src/core/model_manifest";
+import { resolvePlatformSeed } from "../src/db/queries";
 import golden from "./fixtures/golden.json";
 
 // Ports the core assertions of tests/server/test_agent_ws.py against the
@@ -37,6 +41,10 @@ afterEach(async () => {
   await db().prepare("DELETE FROM workers").run();
   await db().prepare("DELETE FROM receipts").run();
   await db().prepare("DELETE FROM nonces").run();
+  await db().prepare("DELETE FROM model_hashes").run();
+  await db().prepare("DELETE FROM worker_job_stats").run();
+  modelGuide.clearHarvestCacheForTests();
+  modelManifest.clearMismatchLogForTests();
 });
 
 let idCounter = 0;
@@ -78,13 +86,16 @@ async function makeJob(opts: {
   signature?: string | null;
   parentId?: string | null;
   splitIndex?: number | null;
+  kind?: string;
+  fetchEntry?: string | null;
+  requiredModels?: string[];
 }): Promise<string> {
   const id = uniqueId("job");
   await db()
     .prepare(
       `INSERT INTO jobs (id, workflow_json, status, worker_id, last_worker_id, created_at, started_at, input_assets,
-                         signature, parent_id, split_index)
-       VALUES (?, '{}', ?, ?, ?, ?, ?, '[]', ?, ?, ?)`
+                         signature, parent_id, split_index, kind, fetch_entry, required_models)
+       VALUES (?, '{}', ?, ?, ?, ?, ?, '[]', ?, ?, ?, ?, ?, ?)`
     )
     .bind(
       id,
@@ -95,11 +106,262 @@ async function makeJob(opts: {
       opts.startedAt ? toSqliteTimestamp(opts.startedAt) : null,
       opts.signature ?? null,
       opts.parentId ?? null,
-      opts.splitIndex ?? null
+      opts.splitIndex ?? null,
+      opts.kind ?? "prompt",
+      opts.fetchEntry ?? null,
+      JSON.stringify(opts.requiredModels ?? [])
     )
     .run();
   return id;
 }
+
+// ---------------------------------------------------------------------------
+// 2026-09-19 model_fetch (spec §7/§9) -- ports the model_fetch cases from
+// tests/server/test_agent_ws.py.
+
+/** Create a queued `kind=model_fetch` job the way `model_fetch.createFetchJob`
+ * does, and return `[jobId, fetchEntry]`. Signed with the platform key so the
+ * entry that comes back out of the push is byte-identical to the one stored
+ * -- the agent verifies it. */
+async function makeModelFetchJob(
+  name: string,
+  opts: { directory?: string; sizeBytes?: number; unverified?: boolean } = {}
+): Promise<[string, Record<string, unknown>]> {
+  const directory = opts.directory ?? "vae";
+  const sizeBytes = opts.sizeBytes ?? 335_000_000;
+  const url = `https://huggingface.co/x/resolve/main/${name}`;
+  const seed = await resolvePlatformSeed(db(), (env as any).PLATFORM_ED25519_SEED);
+
+  let entry: Record<string, unknown>;
+  if (opts.unverified === false) {
+    const sha256 = "ab".repeat(32);
+    entry = {
+      name,
+      directory,
+      url,
+      backup_url: null,
+      sha256,
+      size_bytes: sizeBytes,
+      sig: await signHex(seed, new TextEncoder().encode(`${name}|${directory}|${sha256}|${sizeBytes}`)),
+    };
+  } else {
+    entry = (await modelFetch.signUnverifiedEntry(seed, {
+      name,
+      directory,
+      url,
+      sizeBytes,
+    })) as unknown as Record<string, unknown>;
+  }
+
+  const jobId = await makeJob({
+    status: "queued",
+    kind: "model_fetch",
+    fetchEntry: JSON.stringify(entry),
+    requiredModels: [name],
+  });
+  return [jobId, entry];
+}
+
+/** A connected, idle, fetch-capable agent -- the cloud twin of
+ * test_agent_ws.py's `_fetch_ready_worker` + `_hello_and_idle`. */
+async function connectFetchReadyAgent(protocol: number): Promise<{ ws: WebSocket; workerId: string }> {
+  const kp = KEYPAIRS[0]!;
+  const workerId = await makeWorker({ pubkeyHex: kp.pubkey_hex });
+  const ws = await connectAgent(workerId, kp.seed_hex);
+  ws.send(
+    JSON.stringify({
+      type: "hello",
+      hardware: { max_fetch_gb: 100 },
+      backend: "cuda",
+      torch_version: "",
+      node_classes: [],
+      protocol,
+      auto_fetch: true,
+    })
+  );
+  ws.send(
+    JSON.stringify({
+      type: "heartbeat",
+      state: "idle",
+      progress: 0.0,
+      job_id: null,
+      dynamic: { free_disk_gb: 100.0 },
+    })
+  );
+  // Let the hello/heartbeat writes land before the alarm reads the row.
+  await new Promise((r) => setTimeout(r, 50));
+  return { ws, workerId };
+}
+
+describe("model_fetch dispatch (spec §7)", () => {
+  it("pushes the job with kind=model_fetch and its own unverified entry", async () => {
+    const { ws } = await connectFetchReadyAgent(5);
+    const [jobId, entry] = await makeModelFetchJob("unknown_vae.safetensors");
+
+    const pushedPromise = nextMessage(ws);
+    expect(await runDurableObjectAlarm(hub())).toBe(true);
+
+    const pushed = await pushedPromise;
+    expect(pushed.type).toBe("job");
+    expect(pushed.job_id).toBe(jobId);
+    expect(pushed.kind).toBe("model_fetch");
+    expect(pushed.workflow_json).toBe("{}");
+    expect(pushed.input_assets).toEqual([]);
+    expect(pushed.fetch_models).toEqual([entry]);
+    ws.close();
+  });
+
+  it("leaves a prompt job's push shape untouched (no kind key)", async () => {
+    // 純加法：普通 prompt 單的推送形狀一個位元都不能變。
+    const kp = KEYPAIRS[0]!;
+    const workerId = await makeWorker({ pubkeyHex: kp.pubkey_hex });
+    const ws = await connectAgent(workerId, kp.seed_hex);
+    const jobId = await makeJob({ status: "queued" });
+
+    const pushedPromise = nextMessage(ws);
+    await runDurableObjectAlarm(hub());
+
+    const pushed = await pushedPromise;
+    expect(pushed.job_id).toBe(jobId);
+    expect("kind" in pushed).toBe(false);
+    ws.close();
+  });
+
+  it("does not dispatch an unverified entry to a protocol-4 agent", async () => {
+    // 未驗證來源項目要 protocol>=5；舊 agent 連被派工都不該發生，單子留在 queued。
+    const { ws } = await connectFetchReadyAgent(4);
+    const [jobId] = await makeModelFetchJob("unknown_vae.safetensors");
+
+    await runDurableObjectAlarm(hub());
+    await expectNoMessage(ws, 100);
+
+    expect((await getJobById(db(), jobId))!.status).toBe("queued");
+    ws.close();
+  });
+
+  it("prefers the real manifest entry over the job's own on a name collision", async () => {
+    // `ae.safetensors` 是 curated（有官方核可的 sha256），所以就算單子上存的
+    // 是未驗證項目，派工時合併仍以真 manifest 為準。
+    const { ws } = await connectFetchReadyAgent(5);
+    const [jobId, jobEntry] = await makeModelFetchJob("ae.safetensors");
+
+    const pushedPromise = nextMessage(ws);
+    await runDurableObjectAlarm(hub());
+
+    const pushed = await pushedPromise;
+    expect(pushed.job_id).toBe(jobId);
+    const entry = pushed.fetch_models[0];
+    expect(entry).not.toEqual(jobEntry);
+    expect(entry.unverified).not.toBe(true);
+    expect(entry.sha256).toHaveLength(64);
+    ws.close();
+  });
+});
+
+describe("model_fetch job_done (spec §9)", () => {
+  it("learns the reported hash, mints an unbilled receipt, and records no stats", async () => {
+    const kp = KEYPAIRS[0]!;
+    const workerId = await makeWorker({ pubkeyHex: kp.pubkey_hex });
+    const ws = await connectAgent(workerId, kp.seed_hex);
+    ws.send(JSON.stringify({ type: "hello", protocol: 5 }));
+
+    const seed = await resolvePlatformSeed(db(), (env as any).PLATFORM_ED25519_SEED);
+    const entry = await modelFetch.signUnverifiedEntry(seed, {
+      name: "unknown_vae.safetensors",
+      directory: "vae",
+      url: "https://huggingface.co/x/resolve/main/unknown_vae.safetensors",
+      sizeBytes: 335_000_000,
+    });
+    // The agent never sets `started_at` for a model_fetch job (the whole job
+    // is spent in `fetching_models`), so this row has none either.
+    const jobId = await makeJob({
+      status: "running",
+      workerId,
+      kind: "model_fetch",
+      fetchEntry: JSON.stringify(entry),
+      requiredModels: ["unknown_vae.safetensors"],
+    });
+
+    const receiptMsg = nextMessage(ws);
+    ws.send(
+      JSON.stringify({
+        type: "job_done",
+        job_id: jobId,
+        result_files: [],
+        exec_seconds: 0,
+        fetched_models: [
+          {
+            name: "unknown_vae.safetensors",
+            directory: "vae",
+            size_bytes: entry.size_bytes,
+            sha256: "ab".repeat(32),
+          },
+          // Not in this job's required_models -- a worker must not be able to
+          // teach the platform hashes for anything it likes just because it
+          // finished one fetch.
+          { name: "not-in-job", directory: "", size_bytes: 1, sha256: "cd".repeat(32) },
+          { name: "unknown_vae.safetensors", size_bytes: -1, sha256: "zz".repeat(32) },
+          // Untrusted shapes that must be dropped, not crash the handler.
+          { name: ["unknown_vae.safetensors"], size_bytes: 1, sha256: "ab".repeat(32) },
+          { name: "unknown_vae.safetensors", size_bytes: true, sha256: "ab".repeat(32) },
+          { name: "unknown_vae.safetensors", size_bytes: 5, sha256: "AB".repeat(32) },
+          "not-even-a-dict",
+        ],
+      })
+    );
+
+    const receipt = await receiptMsg;
+    expect(receipt.type).toBe("receipt");
+    expect(receipt.kind).toBe("model_fetch");
+    expect(receipt.billable).toBe(false);
+    expect(receipt.basis).toBe("model_fetch");
+    expect(receipt.payload).toBe(`${jobId}|${workerId}|0.0`);
+
+    const hashes = await db().prepare("SELECT * FROM model_hashes").all<any>();
+    expect(hashes.results).toHaveLength(1);
+    expect(hashes.results[0].name).toBe("unknown_vae.safetensors");
+    expect(hashes.results[0].sha256).toBe("ab".repeat(32));
+    expect(hashes.results[0].size_bytes).toBe(entry.size_bytes);
+
+    const receipts = await getReceiptsForJob(db(), jobId);
+    expect(receipts).toHaveLength(1);
+    expect(receipts[0]!.gpuSeconds).toBe(0);
+
+    expect((await getJobById(db(), jobId))!.status).toBe("done");
+    const stats = await db().prepare("SELECT COUNT(*) AS n FROM worker_job_stats").first<any>();
+    expect(stats.n).toBe(0);
+    ws.close();
+  });
+
+  it("ignores fetched_models reported for an ordinary prompt job", async () => {
+    // 普通 prompt 單就算回報 fetched_models 也不學 -- 只有 model_fetch 單的
+    // 回報算數（spec §9）。
+    const kp = KEYPAIRS[0]!;
+    const workerId = await makeWorker({ pubkeyHex: kp.pubkey_hex });
+    const ws = await connectAgent(workerId, kp.seed_hex);
+    ws.send(JSON.stringify({ type: "hello", protocol: 5 }));
+
+    const jobId = await makeJob({ status: "running", workerId, startedAt: new Date(Date.now() - 10_000) });
+    const receiptMsg = nextMessage(ws);
+    ws.send(
+      JSON.stringify({
+        type: "job_done",
+        job_id: jobId,
+        result_files: [],
+        exec_seconds: 1.0,
+        fetched_models: [{ name: "whatever.safetensors", size_bytes: 1, sha256: "ab".repeat(32) }],
+      })
+    );
+
+    const receipt = await receiptMsg;
+    expect(receipt.kind).toBe("completed");
+    expect(receipt.billable).toBe(true);
+
+    const hashes = await db().prepare("SELECT COUNT(*) AS n FROM model_hashes").first<any>();
+    expect(hashes.n).toBe(0);
+    ws.close();
+  });
+});
 
 // ---------------------------------------------------------------------------
 // Handshake

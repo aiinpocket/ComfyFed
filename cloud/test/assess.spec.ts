@@ -238,6 +238,74 @@ describe("verdict eligible_after_fetch", () => {
 });
 
 // ---------------------------------------------------------------------------
+// 2026-09-19 model_fetch: unverified-source entries require protocol>=5.
+// Ports tests/server/test_assess.py's three `unverified_models` cases.
+
+describe("unverifiedModels (spec §7)", () => {
+  it("gates verdict and partitionFleetFetchable at protocol 5", () => {
+    // 未驗證來源項目（sha256=null，信任根是「平台核可了這個 url」）只有
+    // protocol>=5 的 agent 看得懂：舊 agent 的 `_validate_entry_shape` 會因
+    // sha256 為 null 直接拒收，所以派工端一開始就不能把它算進 eligible。
+    const w4 = fetchReadyWorker("w4", {
+      protocol: 4,
+      dynamic: { free_disk_gb: 100 },
+      hardware: { max_fetch_gb: 30 },
+    });
+    const w5 = fetchReadyWorker("w5", {
+      protocol: 5,
+      dynamic: { free_disk_gb: 100 },
+      hardware: { max_fetch_gb: 30 },
+    });
+    const fetchable = { "ae.safetensors": 335_000_000 };
+    const unv = new Set(["ae.safetensors"]);
+
+    const v4 = verdict(w4, needs(["ae.safetensors"]), {}, [w4], fetchable, null, unv);
+    expect(v4.kind).toBe("ineligible");
+    expect(v4.reasons).toEqual(["missing_models_unverified_protocol:ae.safetensors"]);
+    expect(verdict(w5, needs(["ae.safetensors"]), {}, [w5], fetchable, null, unv).kind).toBe(
+      "eligible_after_fetch"
+    );
+
+    const [f4, u4] = partitionFleetFetchable(new Set(["ae.safetensors"]), fetchable, [w4], null, unv);
+    expect(f4).toEqual(new Set());
+    expect(u4).toEqual(new Set(["ae.safetensors"]));
+
+    const [f5, u5] = partitionFleetFetchable(new Set(["ae.safetensors"]), fetchable, [w5], null, unv);
+    expect(f5).toEqual(new Set(["ae.safetensors"]));
+    expect(u5).toEqual(new Set());
+  });
+
+  it("only gates names actually in the set", () => {
+    // 和 `peerOnlyModels` 同樣的分寸：集合非空但不含這個缺少的模型時，
+    // protocol 3 的 worker 一切照舊。
+    const w3 = fetchReadyWorker("w3", { dynamic: { free_disk_gb: 100 } });
+    const v = verdict(
+      w3,
+      needs(["url_only.safetensors"]),
+      {},
+      [w3],
+      { "url_only.safetensors": 1 * GB },
+      null,
+      new Set(["something_else.safetensors"])
+    );
+    expect(v.kind).toBe("eligible_after_fetch");
+  });
+
+  it("defaults to \"nothing is unverified\" when the argument is omitted", () => {
+    // 不傳 `unverifiedModels`（所有既有呼叫端）＝行為與這個參數存在之前
+    // 一模一樣。
+    const w3 = fetchReadyWorker("w3", { dynamic: { free_disk_gb: 100 } });
+    const fetchable = { "whatever.safetensors": 1 * GB };
+    expect(verdict(w3, needs(["whatever.safetensors"]), {}, [w3], fetchable).kind).toBe(
+      "eligible_after_fetch"
+    );
+    const [f, u] = partitionFleetFetchable(new Set(["whatever.safetensors"]), fetchable, [w3]);
+    expect(f).toEqual(new Set(["whatever.safetensors"]));
+    expect(u).toEqual(new Set());
+  });
+});
+
+// ---------------------------------------------------------------------------
 // partitionFleetFetchable -- the submission-relaxation combined gate.
 
 describe("partitionFleetFetchable", () => {

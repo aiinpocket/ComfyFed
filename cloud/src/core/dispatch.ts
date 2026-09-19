@@ -83,7 +83,13 @@ export async function assignJobs(
   idleWorkerIds: string[],
   fetchableModels?: FetchableModels | null,
   peerOnlyModels?: ReadonlySet<string> | null,
-  now: Date = new Date()
+  now: Date = new Date(),
+  /** 2026-09-19 model_fetch (spec §7): 未驗證來源項目的名字集合，原封不動
+   * 透傳給 `verdict` 當 protocol>=5 門檻 -- ports `dispatch.assign_jobs`'s
+   * `unverified_models`. 刻意排在 `now` 後面而不是 Python 的參數位置：
+   * `now` 是這一棧多出來的可注入時鐘，既有呼叫端都用位置參數傳它，插隊會
+   * 悄悄把時鐘餵成集合。 */
+  unverifiedModels?: ReadonlySet<string> | null
 ): Promise<Assignment[]> {
   if (idleWorkerIds.length === 0) return [];
 
@@ -152,7 +158,15 @@ export async function assignJobs(
     });
 
     for (const worker of idleWorkers) {
-      const v = verdict(worker, needs, job.requirements, allWorkers, fetchableModels, peerOnlyModels);
+      const v = verdict(
+        worker,
+        needs,
+        job.requirements,
+        allWorkers,
+        fetchableModels,
+        peerOnlyModels,
+        unverifiedModels
+      );
       const totalFetchBytes =
         v.kind === "eligible_after_fetch"
           ? v.missingModels.reduce((sum, name) => sum + (fetchableModels?.[name] ?? 0), 0)

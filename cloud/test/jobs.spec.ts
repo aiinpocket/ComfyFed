@@ -701,6 +701,27 @@ describe("POST /api/jobs/{id}/retry", () => {
     expect(r.body.error.code).toBe("jobs.not_retryable");
   });
 
+  it("carries kind/fetch_entry in the job JSON (2026-09-19 model_fetch, spec §4)", async () => {
+    // Console's Jobs/JobDetail reads these to show the model name, the source
+    // url and whether the entry is unverified -- ports jobs.py's `_job_dict`.
+    const { cookie, csrf } = await adminSession();
+    const submit = await submitJob(cookie, csrf, SIMPLE_WORKFLOW);
+    const promptId = submit.body.job_id;
+
+    const promptDetail = await call(`/api/jobs/${promptId}`, { method: "GET", cookie });
+    expect(promptDetail.body.kind).toBe("prompt");
+    expect(promptDetail.body.fetch_entry).toBeNull();
+
+    const entry = { name: "unknown_vae.safetensors", directory: "vae", unverified: true };
+    await db()
+      .prepare("UPDATE jobs SET kind = 'model_fetch', fetch_entry = ? WHERE id = ?")
+      .bind(JSON.stringify(entry), promptId)
+      .run();
+    const fetchDetail = await call(`/api/jobs/${promptId}`, { method: "GET", cookie });
+    expect(fetchDetail.body.kind).toBe("model_fetch");
+    expect(fetchDetail.body.fetch_entry).toEqual(entry);
+  });
+
   it("requeues a failed job, clearing the previous attempt's outcome", async () => {
     const { cookie, csrf } = await adminSession();
     const submit = await submitJob(cookie, csrf, SIMPLE_WORKFLOW);

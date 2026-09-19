@@ -281,6 +281,56 @@ describe("tryReadopt", () => {
   });
 });
 
+// --- assignJobs: unverifiedModels passthrough (2026-09-19 model_fetch) -------
+
+describe("assignJobs (unverifiedModels, spec §7)", () => {
+  it("does not assign a job whose missing model is unverified to a protocol-4 worker", async () => {
+    // `assignJobs` only threads the set into `verdict`; this pins that the
+    // thread actually exists, end to end through a real claim attempt.
+    const w4 = await makeWorker("w4", {
+      protocol: 4,
+      autoFetch: true,
+      dynamic: { free_disk_gb: 100 },
+      hardware: { max_fetch_gb: 100 },
+    });
+    const jobId = await makeJob({ requiredModels: ["unknown_vae.safetensors"] });
+    const fetchable = { "unknown_vae.safetensors": 335_000_000 };
+    const unverified = new Set(["unknown_vae.safetensors"]);
+
+    expect(await dispatch.assignJobs(db(), [w4], fetchable, null, now(), unverified)).toHaveLength(0);
+    expect((await getJobRow(jobId)).status).toBe("queued");
+
+    // Same worker, same job, same manifest -- only the unverified flag
+    // differs, so this is the control that proves the refusal above is the
+    // protocol gate and not something else.
+    const assignments = await dispatch.assignJobs(db(), [w4], fetchable, null, now());
+    expect(assignments).toHaveLength(1);
+    expect(assignments[0]!.job.id).toBe(jobId);
+  });
+
+  it("assigns it to a protocol-5 worker", async () => {
+    const w5 = await makeWorker("w5", {
+      protocol: 5,
+      autoFetch: true,
+      dynamic: { free_disk_gb: 100 },
+      hardware: { max_fetch_gb: 100 },
+    });
+    const jobId = await makeJob({ requiredModels: ["unknown_vae.safetensors"] });
+
+    const assignments = await dispatch.assignJobs(
+      db(),
+      [w5],
+      { "unknown_vae.safetensors": 335_000_000 },
+      null,
+      now(),
+      new Set(["unknown_vae.safetensors"])
+    );
+    expect(assignments).toHaveLength(1);
+    expect(assignments[0]!.job.id).toBe(jobId);
+    expect((await getJobRow(jobId)).status).toBe("assigned");
+  });
+});
+
 // --- assignJobs: heavy-job ranking -------------------------------------------
 
 describe("assignJobs (heavy job ranking)", () => {

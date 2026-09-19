@@ -48,6 +48,29 @@ describe("D1 migration 0001_initial", () => {
     }
   });
 
+  it("jobs has kind and fetch_entry with the declared default (migration 0011)", async () => {
+    // 2026-09-19 model_fetch (spec §4): `kind` must default to 'prompt' so a
+    // pre-migration row -- and every INSERT that does not name the column --
+    // keeps its existing meaning; `fetch_entry` is NULL for anything that is
+    // not a model_fetch job.
+    const db = (env as any).DB as D1Database;
+    const cols = await db.prepare("PRAGMA table_info(jobs)").all<{ name: string; dflt_value: string | null }>();
+    const byName = new Map(cols.results.map((c) => [c.name, c]));
+    expect(byName.has("kind"), "jobs.kind missing").toBe(true);
+    expect(byName.has("fetch_entry"), "jobs.fetch_entry missing").toBe(true);
+
+    await db
+      .prepare("INSERT INTO jobs (id, workflow_json, created_at) VALUES (?, ?, ?)")
+      .bind("job-model-fetch-default", "{}", new Date().toISOString())
+      .run();
+    const row = await db
+      .prepare("SELECT kind, fetch_entry FROM jobs WHERE id = ?")
+      .bind("job-model-fetch-default")
+      .first<{ kind: string; fetch_entry: string | null }>();
+    expect(row?.kind).toBe("prompt");
+    expect(row?.fetch_entry).toBeNull();
+  });
+
   it("workers has protocol and object_info_hash", async () => {
     const db = (env as any).DB as D1Database;
     const cols = await db.prepare("PRAGMA table_info(workers)").all<{ name: string }>();

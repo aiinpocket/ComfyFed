@@ -58,6 +58,8 @@ import * as dispatch from "../core/dispatch";
 import * as assess from "../core/assess";
 import type { FetchableModels } from "../core/assess";
 import * as modelManifest from "../core/model_manifest";
+import * as modelFetch from "../core/model_fetch";
+import type { FetchEntry } from "../core/model_fetch";
 import * as stats from "../core/stats";
 import * as split from "../core/split";
 import * as peerhealth from "../core/peerhealth";
@@ -1422,6 +1424,11 @@ export class Hub extends DurableObject<Env> {
     }
 
     if (done) {
+      // 2026-09-19 model_fetch (spec §9): only a transition that ACTUALLY
+      // applied teaches the platform anything -- placed first inside `if
+      // (done)`, exactly like the receipt, so a worker cannot educate the
+      // platform by sending someone else's job_id.
+      const jobKind = await this.learnFetchedModels(workerId, jobId!, msg.fetched_models);
       this.fetchProgress.delete(jobId!);
       // Separate lookup rather than reusing the row `updateJobDone` already
       // touched -- mirrors agentws.py's `_notify_panel_job_done`: `jobOutputs`
@@ -1439,11 +1446,76 @@ export class Hub extends DurableObject<Env> {
       // TODO（後續）：幫子 job 算一個含切片長度的自己的簽章（per-child
       // signature including slice length），子 job 就能在自己的簽章下正常計統。
       // Python 端的對應點在 `agentws._record_job_stats`。
-      if (!freshJob?.parentId) {
+      //
+      // 2026-09-19 model_fetch (spec §9)：model_fetch 單沒有 signature（也沒有
+      // workflow 可執行），進統計只會汙染執行時間預測，所以跳過。
+      if (jobKind !== "model_fetch" && !freshJob?.parentId) {
         await stats.recordCompletion(db, workerId, freshJob?.signature ?? null, execSeconds, now);
       }
       await this.createAndPushReceipt(ws, attachment, jobId!, execSeconds, now);
     }
+  }
+
+  /** Learn the sha256 a worker measured for the models it just fetched, and
+   * return the job's `kind` so the caller can skip the stats path -- ports
+   * agentws.py's `_learn_fetched_models`.
+   *
+   * Only a `kind=model_fetch` job teaches anything, and only for names in
+   * that job's own `required_models`: an unverified-source entry has no hash
+   * for the agent to verify against, so the digest it reports here is the
+   * platform's FIRST evidence of what the file actually is. `recordHash`'s
+   * existing first-seen-wins/conflict rules then apply exactly as they do to
+   * an ordinary inventory report -- a second worker disagreeing poisons the
+   * name rather than overwriting it.
+   *
+   * Anything malformed (wrong type, a name this job never asked for, a
+   * non-positive size, a sha256 that isn't 64 lowercase hex) is dropped with
+   * a warning rather than rejecting the whole message: the fetch itself
+   * genuinely completed, and one bad list entry must not cost the worker its
+   * receipt. */
+  private async learnFetchedModels(workerId: string, jobId: string | null, fetched: unknown): Promise<string> {
+    if (!jobId) return "prompt";
+    const job = await queries.getJobById(this.env.DB, jobId);
+    if (job === null) return "prompt";
+    const kind = job.kind || "prompt";
+    if (kind !== "model_fetch") return kind;
+    const allowed = new Set(job.requiredModels);
+
+    if (!Array.isArray(fetched)) return kind;
+
+    for (const item of fetched) {
+      if (typeof item !== "object" || item === null || Array.isArray(item)) {
+        console.warn(
+          `hub: ignoring malformed fetched_models item from ${workerId} for job ${jobId}: ${JSON.stringify(item)}`
+        );
+        continue;
+      }
+      const entry = item as Record<string, unknown>;
+      const name = entry.name;
+      const sizeBytes = entry.size_bytes;
+      const sha256 = entry.sha256;
+      if (
+        typeof name !== "string" ||
+        !allowed.has(name) ||
+        typeof sizeBytes !== "number" ||
+        !Number.isInteger(sizeBytes) ||
+        sizeBytes <= 0 ||
+        typeof sha256 !== "string" ||
+        !/^[0-9a-f]{64}$/.test(sha256)
+      ) {
+        console.warn(
+          `hub: ignoring malformed fetched_models item from ${workerId} for job ${jobId}: ${JSON.stringify(item)}`
+        );
+        continue;
+      }
+      try {
+        await modelManifest.recordHash(this.env.DB, workerId, name, sizeBytes, sha256, null);
+      } catch (err) {
+        console.error(`hub: recordHash failed for ${name}`, err);
+      }
+    }
+
+    return kind;
   }
 
   /** Ports agentws.py's `job_failed` branch of `_handle_message` +
@@ -1590,7 +1662,15 @@ export class Hub extends DurableObject<Env> {
     return { receiptId, payload, platformSig: signatureHex };
   }
 
-  /** Ports agentws.py's `_create_and_push_receipt`. */
+  /** Ports agentws.py's `_create_and_push_receipt`.
+   *
+   * 2026-09-19 model_fetch (spec §4/§9): a `kind=model_fetch` job runs no
+   * workflow at all -- the agent spends the whole job in `fetching_models`
+   * and never sets `started_at` -- so it short-circuits every measurement
+   * below to `gpuSeconds=0`, `kind="model_fetch"`, `basis="model_fetch"`,
+   * `billable=false`. The protocol-violation error is deliberately NOT logged
+   * for it: "no exec_seconds despite having started" is the contract for this
+   * kind, not an agent breaking one. */
   private async createAndPushReceipt(
     ws: WebSocket,
     attachment: AgentAttachment,
@@ -1601,12 +1681,17 @@ export class Hub extends DurableObject<Env> {
     const job = await queries.getJobById(this.env.DB, jobId);
     if (!job) return;
 
+    const isModelFetch = (job.kind || "prompt") === "model_fetch";
+
     let wallSeconds = 0;
     if (job.startedAt && job.finishedAt) wallSeconds = secondsBetween(job.startedAt, job.finishedAt);
 
     let gpuSeconds: number;
-    let basis: "exec" | "wall";
-    if (execSeconds !== null) {
+    let basis: string;
+    if (isModelFetch) {
+      gpuSeconds = 0;
+      basis = "model_fetch";
+    } else if (execSeconds !== null) {
       gpuSeconds = Math.min(execSeconds, wallSeconds);
       basis = "exec";
     } else {
@@ -1627,16 +1712,19 @@ export class Hub extends DurableObject<Env> {
     }
     gpuSeconds = Math.max(0, gpuSeconds);
 
+    const kind = isModelFetch ? "model_fetch" : "completed";
+    const billable = !isModelFetch;
+
     const { receiptId, payload, platformSig } = await this.mintReceipt(
       jobId,
       attachment.workerId!,
       gpuSeconds,
-      "completed",
-      true,
+      kind,
+      billable,
       basis,
       now
     );
-    this.pushReceiptFrame(attachment.workerId!, receiptId, payload, platformSig, "completed", true, basis, ws);
+    this.pushReceiptFrame(attachment.workerId!, receiptId, payload, platformSig, kind, billable, basis, ws);
   }
 
   /** Ports agentws.py's `_create_and_push_failure_receipt`. */
@@ -1847,8 +1935,9 @@ export class Hub extends DurableObject<Env> {
     // building the manifest (a source/harvest R2 scan plus a D1 read) would
     // be pure waste -- a cloud-only efficiency note, not a behavior change.
     let fetchableModels: FetchableModels = {};
-    let manifestByName = new Map<string, modelManifest.ManifestEntry>();
+    let manifestByName = new Map<string, FetchEntry>();
     let peerOnlyModels: ReadonlySet<string> = new Set();
+    let unverifiedModels: ReadonlySet<string> = new Set();
     const hasQueuedWork = idleWorkerIds.length > 0 && (await queries.getQueuedJobsForDispatch(db)).length > 0;
     if (hasQueuedWork) {
       try {
@@ -1867,9 +1956,68 @@ export class Hub extends DurableObject<Env> {
       }
     }
 
+    // 2026-09-19 model_fetch (spec §7): a panel-download job carries its OWN
+    // signed entry, minted when the button was pressed for a model the real
+    // manifest knows nothing about. Merge those in so `assess` can see the
+    // name as fetchable at all. Deliberately OUTSIDE the manifest `try` above
+    // -- the job entry is self-contained (it was signed at creation time and
+    // is stored on the row), so it must still dispatch when the real manifest
+    // build failed or simply came back empty.
+    //
+    // The real manifest ALWAYS wins on a name collision: a verified,
+    // content-addressed entry (curated hash or learned consensus) is strictly
+    // better than an unverified-source one, and by the time a model_fetch job
+    // reaches dispatch the platform may well have learned the hash from some
+    // other worker's inventory report.
+    if (hasQueuedWork) {
+      try {
+        const unverified = new Set<string>();
+        for (const j of await queries.getQueuedModelFetchJobs(db)) {
+          if (!j.fetchEntry) continue;
+          let parsed: unknown;
+          try {
+            parsed = JSON.parse(j.fetchEntry);
+          } catch {
+            console.warn(`hub: model_fetch job ${j.id} has an unparseable fetch_entry`);
+            continue;
+          }
+          if (typeof parsed !== "object" || parsed === null || Array.isArray(parsed)) continue;
+          const entry = parsed as Record<string, unknown>;
+          const name = entry.name;
+          const sizeBytes = entry.size_bytes;
+          if (
+            typeof name !== "string" ||
+            !name ||
+            manifestByName.has(name) ||
+            typeof sizeBytes !== "number" ||
+            !Number.isInteger(sizeBytes) ||
+            sizeBytes <= 0
+          ) {
+            // One unusable row must not cost every OTHER queued model_fetch
+            // job its dispatch, so this skips rather than letting the whole
+            // merge fall into the catch below.
+            continue;
+          }
+          manifestByName.set(name, entry as unknown as FetchEntry);
+          fetchableModels[name] = sizeBytes;
+          if (modelFetch.isUnverifiedEntry(entry)) unverified.add(name);
+        }
+        unverifiedModels = unverified;
+      } catch (err) {
+        console.error("hub: failed to merge model_fetch job entries", err);
+      }
+    }
+
     let assignments: dispatch.Assignment[] = [];
     try {
-      assignments = await dispatch.assignJobs(db, idleWorkerIds, fetchableModels, peerOnlyModels, now);
+      assignments = await dispatch.assignJobs(
+        db,
+        idleWorkerIds,
+        fetchableModels,
+        peerOnlyModels,
+        now,
+        unverifiedModels
+      );
     } catch (err) {
       console.error("hub: assignJobs failed", err);
     }
@@ -1884,10 +2032,21 @@ export class Hub extends DurableObject<Env> {
           workflow_json: job.workflowJson,
           input_assets: job.inputAssets,
         };
+        // Only a model_fetch job carries this key: a `prompt` push keeps its
+        // exact existing shape, and an old agent ignores unknown fields
+        // anyway (spec §7).
+        if (job.kind === "model_fetch") frame.kind = "model_fetch";
         if (Object.keys(fetchableModels).length > 0) {
           const worker = await queries.getWorkerById(db, workerId);
           if (worker) {
-            const fetchModels = await this.fetchModelsForPush(job, worker, fetchableModels, manifestByName, peerOnlyModels);
+            const fetchModels = await this.fetchModelsForPush(
+              job,
+              worker,
+              fetchableModels,
+              manifestByName,
+              peerOnlyModels,
+              unverifiedModels
+            );
             if (fetchModels.length > 0) frame.fetch_models = fetchModels;
           }
         }
@@ -1912,14 +2071,23 @@ export class Hub extends DurableObject<Env> {
     job: queries.Job,
     worker: queries.Worker,
     fetchableModels: FetchableModels,
-    manifestByName: Map<string, modelManifest.ManifestEntry>,
-    peerOnlyModels?: ReadonlySet<string> | null
-  ): Promise<modelManifest.ManifestEntry[]> {
+    manifestByName: Map<string, FetchEntry>,
+    peerOnlyModels?: ReadonlySet<string> | null,
+    unverifiedModels?: ReadonlySet<string> | null
+  ): Promise<FetchEntry[]> {
     if (Object.keys(fetchableModels).length === 0) return [];
 
     const allWorkers = await queries.getAllWorkers(this.env.DB);
     const needs = assess.needsFromJob(job);
-    const v = assess.verdict(worker, needs, job.requirements, allWorkers, fetchableModels, peerOnlyModels);
+    const v = assess.verdict(
+      worker,
+      needs,
+      job.requirements,
+      allWorkers,
+      fetchableModels,
+      peerOnlyModels,
+      unverifiedModels
+    );
     if (v.kind !== "eligible_after_fetch") return [];
 
     // Defensive: `eligible_after_fetch` already requires protocol >= 3 (see
@@ -1935,7 +2103,7 @@ export class Hub extends DurableObject<Env> {
       return [];
     }
 
-    return v.missingModels.map((name) => manifestByName.get(name)).filter((e): e is modelManifest.ManifestEntry => !!e);
+    return v.missingModels.map((name) => manifestByName.get(name)).filter((e): e is FetchEntry => !!e);
   }
 
   async alarm(): Promise<void> {
@@ -2189,8 +2357,18 @@ export class Hub extends DurableObject<Env> {
    * `Job` row) -- unlike the jobId-only panel* methods above, no extra
    * `jobOwner` lookup is needed to scope this event's delivery. */
   private async panelJobDone(
-    job: JobOutputsInput & PanelOwner & { parentId?: string | null; splitCount?: number }
+    job: JobOutputsInput & PanelOwner & { parentId?: string | null; splitCount?: number; kind?: string | null }
   ): Promise<void> {
+    // 2026-09-19 model_fetch (spec §9)：純下載單沒有任何輸出節點，所以一個
+    // `executed` 都不該發。不擋的話 `jobOutputs` 會回空物件，下面的
+    // `FALLBACK_OUTPUT_KEY` 退路會憑空生一則 `executed`，再補一則
+    // `executing{node: null}` —— 而官方前端把後者當成「這張 prompt 跑完了」，
+    // 會把同一個分頁裡真正在跑的 prompt 的執行中指示清掉。只送佇列徽章的
+    // status 更新（面板靠輪詢 `GET model-fetch/{id}` 看下載進度，不靠這裡）。
+    if ((job.kind || "prompt") === "model_fetch") {
+      await this.panelJobStatusRefresh();
+      return;
+    }
     // Phase 3.3 §3.7: what the panel must see when a CHILD finishes is the
     // parent's `executed` -- and only once the whole family is done. Until
     // then nothing goes out but a queue refresh (the progress events are

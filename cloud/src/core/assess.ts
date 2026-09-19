@@ -235,6 +235,19 @@ const MIN_AUTO_FETCH_PROTOCOL = 3;
  * `eligibleAfterFetch`/`partitionFleetFetchable`'s `peerOnlyModels` param. */
 const MIN_PEER_FETCH_PROTOCOL = 4;
 
+/** 2026-09-19 model_fetch (spec §6/§7): hello.protocol below which an agent
+ * cannot be handed an UNVERIFIED-SOURCE manifest entry at all -- ports
+ * assess.py's `_MIN_UNVERIFIED_FETCH_PROTOCOL`. Such an entry carries
+ * `sha256: null` and a `name|directory|url|size_bytes|unverified` signature
+ * payload; a protocol<=4 agent's `fetcher._validate_entry_shape` rejects a
+ * null sha256 outright and its `_verify_entry_signature` only knows the
+ * verified payload, so pushing one to it can only ever produce a refused
+ * fetch. Same shape as `MIN_PEER_FETCH_PROTOCOL`: only required when a
+ * missing model's entry actually IS unverified (see `eligibleAfterFetch`/
+ * `partitionFleetFetchable`'s `unverifiedModels` parameter) -- every
+ * ordinary manifest entry keeps its existing floor. */
+export const MIN_UNVERIFIED_FETCH_PROTOCOL = 5;
+
 /** `worker.protocol`, normalized the same way every fetch-eligibility gate
  * here needs it: missing/non-integer degrades to 1 (the oldest,
  * least-capable value), never throws -- ports assess.py's `_worker_protocol`.
@@ -304,19 +317,35 @@ function workerFetchCapacityOk(worker: Worker, dynamic: Record<string, unknown>,
  * (peer-pull capable) -- a protocol-3 worker can auto-fetch a URL-sourced
  * model fine, but has no way to speak the peer-grant/chunk-pull protocol for
  * a peer-only one. Undefined/empty (every pre-3.1 caller) means "nothing is
- * peer-only", identical to the pre-Task-6 behavior. */
+ * peer-only", identical to the pre-Task-6 behavior.
+ *
+ * `unverifiedModels` (2026-09-19 model_fetch; likewise a subset of
+ * `fetchableModels`'s keys) names missing models whose entry is an
+ * unverified-source one (`sha256: null`, url-in-signature). Those need
+ * protocol>=5 for the same reason peer-only ones need >=4: an older agent
+ * cannot even validate the entry's shape or signature. Undefined/empty means
+ * "nothing is unverified", identical to the pre-2026-09-19 behavior. */
 function eligibleAfterFetch(
   worker: Worker,
   missingModels: string[],
   fetchableModels: FetchableModels | null | undefined,
   dynamic: Record<string, unknown>,
-  peerOnlyModels?: ReadonlySet<string> | null
+  peerOnlyModels?: ReadonlySet<string> | null,
+  unverifiedModels?: ReadonlySet<string> | null
 ): boolean {
   const map = fetchableModels ?? {};
   if (!missingModels.every((name) => Object.prototype.hasOwnProperty.call(map, name))) return false;
 
   const peerOnly = peerOnlyModels ?? new Set<string>();
   if (missingModels.some((name) => peerOnly.has(name)) && workerProtocol(worker) < MIN_PEER_FETCH_PROTOCOL) {
+    return false;
+  }
+
+  const unverified = unverifiedModels ?? new Set<string>();
+  if (
+    missingModels.some((name) => unverified.has(name)) &&
+    workerProtocol(worker) < MIN_UNVERIFIED_FETCH_PROTOCOL
+  ) {
     return false;
   }
 
@@ -334,12 +363,17 @@ function eligibleAfterFetch(
  * when the manifest-covered subset includes any name with no URL source at
  * all, a candidate worker must ALSO be protocol>=4 -- same rule
  * `eligibleAfterFetch` applies per-candidate, evaluated once here against
- * the combined subset. */
+ * the combined subset.
+ *
+ * `unverifiedModels` (2026-09-19 model_fetch) is the same idea one notch
+ * higher: an unverified-source entry in the combined subset requires a
+ * candidate at protocol>=5. Undefined/empty means "nothing is unverified". */
 export function partitionFleetFetchable(
   missingModels: ReadonlySet<string>,
   fetchableModels: FetchableModels | null | undefined,
   onlineEnabledWorkers: Worker[],
-  peerOnlyModels?: ReadonlySet<string> | null
+  peerOnlyModels?: ReadonlySet<string> | null,
+  unverifiedModels?: ReadonlySet<string> | null
 ): [fetchable: Set<string>, unfetchable: Set<string>] {
   const map = fetchableModels ?? {};
   const manifestCovered = new Set([...missingModels].filter((name) => Object.prototype.hasOwnProperty.call(map, name)));
@@ -349,12 +383,15 @@ export function partitionFleetFetchable(
 
   const peerOnly = peerOnlyModels ?? new Set<string>();
   const requiresPeerProtocol = [...manifestCovered].some((name) => peerOnly.has(name));
+  const unverified = unverifiedModels ?? new Set<string>();
+  const requiresUnverifiedProtocol = [...manifestCovered].some((name) => unverified.has(name));
 
   const totalMissingGb = [...manifestCovered].reduce((sum, name) => sum + map[name]!, 0) / BYTES_PER_GB;
   const canFetch = onlineEnabledWorkers.some(
     (worker) =>
       workerFetchCapacityOk(worker, worker.dynamic, totalMissingGb) &&
-      (!requiresPeerProtocol || workerProtocol(worker) >= MIN_PEER_FETCH_PROTOCOL)
+      (!requiresPeerProtocol || workerProtocol(worker) >= MIN_PEER_FETCH_PROTOCOL) &&
+      (!requiresUnverifiedProtocol || workerProtocol(worker) >= MIN_UNVERIFIED_FETCH_PROTOCOL)
   );
   if (canFetch) return [manifestCovered, notInManifest];
 
@@ -399,14 +436,19 @@ export function fleetWideGaps(
  *
  * `peerOnlyModels` (Phase 3.1 P2P, `model_manifest.peerOnlyNames`'s shape):
  * see `eligibleAfterFetch`'s docstring. Undefined/null means "nothing is
- * peer-only", identical to the pre-3.1 behavior. */
+ * peer-only", identical to the pre-3.1 behavior.
+ *
+ * `unverifiedModels` (2026-09-19 model_fetch): see `eligibleAfterFetch`'s
+ * docstring. Undefined/null means "nothing is unverified", identical to the
+ * pre-2026-09-19 behavior. */
 export function verdict(
   worker: Worker,
   needs: JobNeeds,
   requirementsOverride: Record<string, unknown>,
   allWorkers: Worker[],
   fetchableModels?: FetchableModels | null,
-  peerOnlyModels?: ReadonlySet<string> | null
+  peerOnlyModels?: ReadonlySet<string> | null,
+  unverifiedModels?: ReadonlySet<string> | null
 ): Verdict {
   const reasons: string[] = [];
   const warnings: string[] = [];
@@ -487,7 +529,7 @@ export function verdict(
     return { kind: "eligible", reasons: [], missingModels: [], warnings };
   }
 
-  if (eligibleAfterFetch(worker, missingModels, fetchableModels, dynamic, peerOnlyModels)) {
+  if (eligibleAfterFetch(worker, missingModels, fetchableModels, dynamic, peerOnlyModels, unverifiedModels)) {
     return {
       kind: "eligible_after_fetch",
       reasons: [`missing_models:${missingModels.join(",")}`],
@@ -513,6 +555,28 @@ export function verdict(
     return {
       kind: "ineligible",
       reasons: [`missing_models_peer_protocol:${missingModels.join(",")}`],
+      missingModels,
+      warnings: [],
+    };
+  }
+
+  // 2026-09-19 model_fetch (ports assess.py's verdict): the same
+  // distinguishability argument one notch up. A worker blocked purely because
+  // a missing model's entry is an unverified-source one its protocol cannot
+  // validate is NOT "this model exists nowhere" -- and
+  // `model_fetch.createFetchJob` renders these reason strings verbatim into
+  // the panel's `no_worker` 400 (spec §5.1 row 7), so the button must be able
+  // to say "your agent is too old" rather than "no worker can fetch right
+  // now".
+  const unverifiedSet = unverifiedModels || new Set<string>();
+  const blockedByUnverifiedProtocol =
+    missingModels.every((name) => name in fetchable) &&
+    missingModels.some((name) => unverifiedSet.has(name)) &&
+    workerProtocol(worker) < MIN_UNVERIFIED_FETCH_PROTOCOL;
+  if (blockedByUnverifiedProtocol) {
+    return {
+      kind: "ineligible",
+      reasons: [`missing_models_unverified_protocol:${missingModels.join(",")}`],
       missingModels,
       warnings: [],
     };

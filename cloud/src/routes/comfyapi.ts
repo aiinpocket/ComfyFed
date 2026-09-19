@@ -70,6 +70,7 @@ import {
 import { boundedGunzip } from "../lib/gzip";
 import { requireUser, errorJson, SESSION_VAR } from "../lib/guard";
 import { COMFYFED_EXT_JS } from "../core/comfyfed_ext";
+import * as modelFetch from "../core/model_fetch";
 
 const RUNNING_STATUSES = ["assigned", "running"];
 const PENDING_STATUSES = ["queued"];
@@ -109,6 +110,18 @@ async function cancelJobViaHub(env: Env, jobId: string, reason: string): Promise
     method: "POST",
     headers: { "content-type": "application/json" },
     body: JSON.stringify({ job_id: jobId, reason }),
+  });
+}
+
+/** §5.1's flat refusal envelope: `{"error": "model_fetch.<code>", "message":
+ * "<zh-TW> / <English>"}` -- ports comfyapi.py's `_model_fetch_error`. Flat
+ * rather than ComfyUI's nested `{"error": {...}}` because this endpoint is
+ * ComfyFed's own, read only by `core/comfyfed_ext.ts`'s panel extension, not
+ * by the stock frontend. */
+function modelFetchError(code: string, message: string): Response {
+  return new Response(JSON.stringify({ error: `model_fetch.${code}`, message }), {
+    status: 400,
+    headers: { "content-type": "application/json" },
   });
 }
 
@@ -1152,6 +1165,69 @@ app.delete("/comfy/api/userdata/:path{.+}", async (c) => {
   if (!existing) return userdataError(c, 404, "userdata.not_found", USERDATA_NOT_FOUND_MESSAGE);
   await c.env.STORE.delete(key);
   return c.body(null, 204);
+});
+
+// --- 2026-09-19: panel "Download" button -> model_fetch job (spec §5) ------
+//
+// The stock frontend's "Download {model}" button pulls the model into the
+// USER's own browser, which is the exact opposite of what a federation wants.
+// `core/comfyfed_ext.ts`'s panel extension intercepts it and calls these two
+// instead. Mounted under `/comfy/api/comfyfed/` (not a native ComfyUI path)
+// so they can never collide with an endpoint upstream adds later.
+
+app.post("/comfy/api/comfyfed/model-fetch", async (c) => {
+  const user = c.get(SESSION_VAR).user;
+  let body: unknown;
+  try {
+    body = await c.req.json();
+  } catch {
+    body = null;
+  }
+  if (typeof body !== "object" || body === null || Array.isArray(body)) {
+    // Same envelope as every other refusal: build the error through the
+    // public exception rather than reading its message table.
+    const exc = new modelFetch.FetchRequestError("bad_request");
+    return modelFetchError(exc.code, exc.message);
+  }
+  const fields = body as Record<string, unknown>;
+
+  let result: { jobId: string; reused: boolean };
+  try {
+    result = await modelFetch.createFetchJob(c.env, {
+      name: fields.name,
+      // Python reads `body.get("directory", "")`: a MISSING key defaults to
+      // the models root, an explicit null/non-string is a bad_request.
+      directory: "directory" in fields ? fields.directory : "",
+      url: fields.url,
+      userId: user.uid,
+    });
+  } catch (err) {
+    if (err instanceof modelFetch.FetchRequestError) return modelFetchError(err.code, err.message);
+    throw err;
+  }
+
+  // Cloud-only (no Python twin needed): the Hub DO's 5 s dispatch alarm is
+  // not armed while nothing is connected/queued, so a freshly-created job
+  // would otherwise sit until something else woke it. Same fire-and-forget
+  // call `POST /comfy/api/prompt` makes after its insert. Skipped on a reuse:
+  // that job already went through this once.
+  if (!result.reused) await wakeHub(c.env);
+
+  return c.json({ job_id: result.jobId, reused: result.reused }, result.reused ? 200 : 201);
+});
+
+app.get("/comfy/api/comfyfed/model-fetch/:job_id", async (c) => {
+  // Readable by any logged-in user: the payload is a model name and a
+  // download percentage, nothing user-scoped -- and "全部下載" from one
+  // browser must be able to watch a job another one already created.
+  const status = await modelFetch.fetchStatus(c.env, c.req.param("job_id"));
+  if (status === null) {
+    return c.json(
+      { error: "model_fetch.not_found", message: "找不到下載任務 / fetch job not found" },
+      404
+    );
+  }
+  return c.json(status);
 });
 
 // --- panel bootstrap ----------------------------------------------------------

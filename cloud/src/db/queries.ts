@@ -655,6 +655,17 @@ export interface Job {
    * `null` = 不可拆。刻意保留字串而不是解析後的物件：只有 split.ts 需要
    * 它，rowToJob 不該替每一列付這個解析成本。 */
   splitPlan: string | null;
+  /** 2026-09-19 model_fetch (spec §4): `"prompt"`（既有一切）或
+   * `"model_fetch"`（面板下載鈕建的純下載單，`workflowJson === "{}"`）--
+   * mirrors `db.Job.kind`. Migration 0011 declares the DEFAULT, so a row
+   * inserted before it (or by any INSERT that omits the column) reads back
+   * as `"prompt"`. */
+  kind: string;
+  /** 2026-09-19 model_fetch: 建單當下簽好的 manifest 項目 JSON 原文，只有
+   * `kind === "model_fetch"` 的單非 null。刻意保留字串而不是解析後的物件：
+   * 只有 `core/model_fetch.ts` 與 dispatch tick 的合併需要它，`rowToJob`
+   * 不該替每一列付這個解析成本（同 `splitPlan` 的理由）。 */
+  fetchEntry: string | null;
 }
 
 interface JobRow {
@@ -684,6 +695,8 @@ interface JobRow {
   split_index: number | null;
   split_count: number;
   split_plan: string | null;
+  kind: string;
+  fetch_entry: string | null;
 }
 
 function rowToJob(row: JobRow): Job {
@@ -714,6 +727,12 @@ function rowToJob(row: JobRow): Job {
     splitIndex: row.split_index,
     splitCount: row.split_count ?? 0,
     splitPlan: row.split_plan,
+    // Migration 0011 declares `kind TEXT NOT NULL DEFAULT 'prompt'`, but a
+    // test that inserts through a hand-written INSERT on an older schema
+    // snapshot could still read back undefined -- degrade to "prompt", the
+    // same thing Python's `job.kind or "prompt"` does at every read site.
+    kind: row.kind || "prompt",
+    fetchEntry: row.fetch_entry ?? null,
   };
 }
 
@@ -742,6 +761,12 @@ export interface NewJob {
   /** Phase 3.3 §3.2: 送件時判定出的拆分計畫 JSON（`split.planForJob`），
    * 不可拆時 null/省略。 */
   splitPlan?: string | null;
+  /** 2026-09-19 model_fetch (spec §4): `"model_fetch"` 只有
+   * `core/model_fetch.ts` 的建單路徑會傳；省略 = `"prompt"`，與這個欄位
+   * 存在之前的每個呼叫端一模一樣。 */
+  kind?: string | null;
+  /** 2026-09-19 model_fetch: 建單當下簽好的 manifest 項目 JSON。 */
+  fetchEntry?: string | null;
 }
 
 /** Inserts a freshly-assessed queued job row -- mirrors `jobs.create_job`'s
@@ -752,8 +777,8 @@ export async function insertJob(db: D1Database, job: NewJob): Promise<void> {
   await db
     .prepare(
       `INSERT INTO jobs (id, workflow_json, requirements, required_nodes, required_models, est_vram_gb,
-                          input_assets, origin, created_at, user_id, signature, split_plan)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+                          input_assets, origin, created_at, user_id, signature, split_plan, kind, fetch_entry)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
     )
     .bind(
       job.id,
@@ -767,9 +792,52 @@ export async function insertJob(db: D1Database, job: NewJob): Promise<void> {
       job.createdAt,
       job.userId ?? null,
       job.signature ?? null,
-      job.splitPlan ?? null
+      job.splitPlan ?? null,
+      job.kind ?? "prompt",
+      job.fetchEntry ?? null
     )
     .run();
+}
+
+// --- 2026-09-19 model_fetch (spec §5.1/§7) --------------------------------
+
+/** Every queued `kind=model_fetch` job -- the dispatch tick's merge source
+ * for the self-contained signed entry each one carries (ports the
+ * `status == "queued", kind == "model_fetch"` query inside agentws.py's
+ * `dispatch_tick`). */
+export async function getQueuedModelFetchJobs(db: D1Database): Promise<Job[]> {
+  const { results } = await db
+    .prepare(
+      "SELECT * FROM jobs WHERE status = 'queued' AND kind = 'model_fetch' ORDER BY created_at ASC, id ASC"
+    )
+    .all<JobRow>();
+  return results.map(rowToJob);
+}
+
+/** The oldest still-live `model_fetch` job whose `required_models` is exactly
+ * `[name]` -- §5.1 row 3's reuse lookup, ports model_fetch.py's
+ * `_active_fetch_job_id`. "Still live" is this stack's own status vocabulary
+ * (`queued`/`assigned`/`running`; the spec writes the middle one as
+ * `dispatched`). The `required_models` comparison is done in JS, not SQL, for
+ * the same reason Python does it in Python: the column is a JSON text blob
+ * and `'["a"]' = ?` would depend on the writer's exact separator spelling.
+ *
+ * `ORDER BY created_at ASC, id ASC` rather than Python's `created_at` alone:
+ * D1 timestamps are second-resolution, so two jobs created in the same second
+ * need a tiebreak for this lookup to be deterministic -- the same tiebreak
+ * every other ordered jobs query in this file already uses. */
+export async function findActiveModelFetchJob(db: D1Database, name: string): Promise<string | null> {
+  const { results } = await db
+    .prepare(
+      `SELECT * FROM jobs WHERE kind = 'model_fetch' AND status IN ('queued', 'assigned', 'running')
+       ORDER BY created_at ASC, id ASC`
+    )
+    .all<JobRow>();
+  for (const row of results) {
+    const required = safeParse<unknown>(row.required_models, []);
+    if (Array.isArray(required) && required.length === 1 && required[0] === name) return row.id;
+  }
+  return null;
 }
 
 // --- Phase 3.3 §3.3-§3.4: 子 job ------------------------------------------

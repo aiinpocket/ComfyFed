@@ -161,6 +161,12 @@ async function jobDict(job: Job, hub?: DurableObjectNamespace): Promise<Record<s
     parent_id: job.parentId,
     split_index: job.splitIndex,
     dispatch_info: job.dispatchInfo,
+    // 2026-09-19 model_fetch: "prompt"（一切既有的單）或 "model_fetch"
+    // （面板下載鈕建的純下載單）。`fetch_entry` 只有後者非 null，值是建單
+    // 當下簽好的 manifest 項目（console 的 JobDetail 讀它顯示模型名、來源
+    // url、是否 unverified）。Ports jobs.py's `_job_dict`.
+    kind: job.kind || "prompt",
+    fetch_entry: job.fetchEntry ? parseJsonObject(job.fetchEntry) : null,
   };
   if (hub) {
     const progress = await queries.getFetchProgress(hub, job.id);
