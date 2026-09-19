@@ -59,6 +59,14 @@ function flux(): any {
   return recipes.loadRecipes()["flux-t2i"];
 }
 
+function loadedRecipeIds(): string[] {
+  return Object.keys(recipes.loadRecipes());
+}
+
+/** Keys that live on `Object.prototype` and therefore "resolve" on any
+ * object-literal map -- the I1 regression's whole surface. */
+const PROTOTYPE_KEYS = ["constructor", "toString", "hasOwnProperty", "valueOf", "__proto__"];
+
 async function run(
   opts: { cookie?: string | null; headers?: Record<string, string> },
   params: unknown,
@@ -252,6 +260,23 @@ describe("GET /api/recipes", () => {
     expect(r.status).toBe(404);
     expect(r.body.error.code).toBe("recipes.not_found");
   });
+
+  // Fix round 1 / I1 regression: the recipe map used to be an object
+  // literal, so `loadRecipes()["constructor"]` was NOT undefined and this
+  // route answered 200 with an empty recipe body. Python's
+  // `load_recipes().get(recipe_id)` returns None for these, so 404 is the
+  // parity answer.
+  it.each(PROTOTYPE_KEYS)("404s the Object.prototype key %j", async (recipeId) => {
+    const session = await adminSession();
+    const r = await call(`/api/recipes/${recipeId}`, { method: "GET", cookie: session.cookie });
+    expect(r.status).toBe(404);
+    expect(r.body.error.code).toBe("recipes.not_found");
+  });
+
+  it.each(PROTOTYPE_KEYS)("does not treat %j as a loaded recipe", (recipeId) => {
+    expect(loadedRecipeIds()).not.toContain(recipeId);
+    expect(recipes.loadRecipes()[recipeId]).toBeUndefined();
+  });
 });
 
 // --- run ----------------------------------------------------------------
@@ -358,6 +383,22 @@ describe("POST /api/recipes/{id}/run", () => {
     );
     expect(r.status).toBe(404);
     expect(r.body.error.code).toBe("recipes.not_found");
+  });
+
+  // Fix round 1 / I1 regression: `POST /api/recipes/toString/run` used to
+  // resolve `Object.prototype.toString` as a "recipe", see no declared
+  // params and no workflow, and actually CREATE a job with an empty
+  // workflow (201). It must 404 before anything is inserted.
+  it.each(PROTOTYPE_KEYS)("404s a run against the Object.prototype key %j, creating no job", async (recipeId) => {
+    const session = await adminSession();
+    // 空 params 是原始災情的形狀：沒有宣告參數可驗、沒有 workflow 可渲染，
+    // 於是整條路一路通到 `createJobFromWorkflow` 並回 201。
+    const r = await run({ cookie: session.cookie, headers: { "X-CSRF": session.csrf } }, {}, recipeId);
+    expect(r.status).toBe(404);
+    expect(r.body.error.code).toBe("recipes.not_found");
+
+    const jobs = await db().prepare("SELECT COUNT(*) AS n FROM jobs").first<{ n: number }>();
+    expect(jobs!.n).toBe(0);
   });
 
   it("gives two runs different random seeds", async () => {

@@ -59,9 +59,18 @@ export function statusForCode(code: string): number {
   return code === "recipes.bad_params" ? 400 : 500;
 }
 
-/** `{recipe_id: 配方檔內容}`，依檔內 `id` 建索引。 */
+/** `{recipe_id: 配方檔內容}`，依檔內 `id` 建索引。
+ *
+ * **`Object.create(null)`，不是 `{}`**：這張表唯一的用途就是拿使用者送來的
+ * `recipeId` 查值，而字面量物件繼承 `Object.prototype`，於是
+ * `loadRecipes()["constructor"]` 不是 `undefined`——`GET /api/recipes/constructor`
+ * 會 200、`POST /api/recipes/toString/run` 甚至會建出一筆空 workflow 的 job。
+ * Python 那側 `dict.get(recipe_id)` 對這些 id 一律 `None` → 404，所以有原型
+ * 的表是 parity 破綻。沒有原型 = 查不到就是 `undefined`，呼叫端的
+ * `=== undefined` 判斷才成立（`routes/recipes.ts` 另外再用 `Object.hasOwn`
+ * 把這件事釘死一次，深度防禦）。 */
 export function loadRecipes(): Record<string, Recipe> {
-  const loaded: Record<string, Recipe> = {};
+  const loaded: Record<string, Recipe> = Object.create(null);
   for (const recipe of BUNDLED) {
     loaded[String(recipe.id)] = recipe;
   }
@@ -79,13 +88,16 @@ export function loadRecipes(): Record<string, Recipe> {
 export function publicView(recipe: Recipe, includeWorkflow: boolean): Record<string, unknown> {
   const view: Record<string, unknown> = {
     id: recipe.id,
-    title: { ...(recipe.title ?? {}) },
-    description: { ...(recipe.description ?? {}) },
-    params: [...(recipe.params ?? [])],
-    required_models: [...(recipe.required_models ?? [])],
+    // `||`（不是 `??`）與 Python 的 `dict(recipe.get("title") or {})` 同強度：
+    // 手改壞的配方檔裡 `"params": 0` 這種純量也退回空容器，而不是讓展開運算
+    // 子丟 TypeError 變成 500。
+    title: { ...(recipe.title || {}) },
+    description: { ...(recipe.description || {}) },
+    params: [...(recipe.params || [])],
+    required_models: [...(recipe.required_models || [])],
   };
   if (includeWorkflow) {
-    view.workflow = { ...(recipe.workflow ?? {}) };
+    view.workflow = { ...(recipe.workflow || {}) };
   }
   return view;
 }
@@ -154,7 +166,7 @@ function coerce(spec: Recipe, name: string, value: unknown): unknown {
   }
 
   if (kind === "enum") {
-    const values: unknown[] = spec.values ?? [];
+    const values: unknown[] = spec.values || [];
     if (!values.includes(value)) {
       throw badParams(`${name}: must be one of [${values.map(pyRepr).join(", ")}].`);
     }
@@ -169,7 +181,7 @@ function coerce(spec: Recipe, name: string, value: unknown): unknown {
  * 回傳的物件是解析完的結果：預設值已填、`seed == -1` 已換成真的隨機值，所以
  * 呼叫端（渲染、回應的 `params`）拿到的就是跑這張圖的全部事實。 */
 export function validateParams(recipe: Recipe, params: Record<string, unknown>): Record<string, unknown> {
-  const specs: Recipe[] = recipe.params ?? [];
+  const specs: Recipe[] = recipe.params || [];
   const byName = new Map<string, Recipe>();
   for (const spec of specs) {
     if (spec !== null && typeof spec === "object" && !Array.isArray(spec)) {
@@ -245,5 +257,5 @@ function render(value: unknown, params: Record<string, unknown>): unknown {
  * 回傳的是一份新的結構，bundle 裡的配方檔不會被就地改寫（同一個 isolate 的
  * 下一次 run 還要拿到原封不動的標記）。 */
 export function renderWorkflow(recipe: Recipe, params: Record<string, unknown>): Record<string, unknown> {
-  return render(recipe.workflow ?? {}, params) as Record<string, unknown>;
+  return render(recipe.workflow || {}, params) as Record<string, unknown>;
 }

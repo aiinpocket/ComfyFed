@@ -14,10 +14,23 @@
 import { Hono } from "hono";
 import type { Env } from "../env";
 import { errorJson, requireUser, requireCsrfUser, SESSION_VAR } from "../lib/guard";
-import { loadRecipes, publicView, renderWorkflow, statusForCode, validateParams, RecipeError } from "../core/recipes";
+import { loadRecipes, publicView, renderWorkflow, statusForCode, validateParams, RecipeError, type Recipe } from "../core/recipes";
 import { createJobFromWorkflow, JobCreationError } from "./jobs";
 
 const app = new Hono<{ Bindings: Env }>();
+
+/** 查一個使用者送來的 `recipeId`，查不到回 `null`。
+ *
+ * `Object.hasOwn` 是這裡的重點：`recipeId` 完全由呼叫端決定，而
+ * `constructor`／`toString`／`__proto__` 這些 `Object.prototype` 上的鍵在字面量
+ * 物件上「查得到值」。`loadRecipes()` 已經改用 `Object.create(null)` 讓它們查
+ * 不到，這一層是深度防禦：就算哪天有人把那張表改回字面量物件，這三條 route
+ * 仍然只認「配方檔真的宣告過的 id」，其餘一律 404 `recipes.not_found`，與
+ * Python `load_recipes().get(recipe_id)` 的行為一致。 */
+function findRecipe(recipeId: string): Recipe | null {
+  const all = loadRecipes();
+  return Object.hasOwn(all, recipeId) ? all[recipeId]! : null;
+}
 
 app.get("/api/recipes", requireUser, (c) => {
   const entries = Object.entries(loadRecipes()).sort(([a], [b]) => (a < b ? -1 : a > b ? 1 : 0));
@@ -26,8 +39,8 @@ app.get("/api/recipes", requireUser, (c) => {
 
 app.get("/api/recipes/:recipeId", requireUser, (c) => {
   const recipeId = c.req.param("recipeId");
-  const recipe = loadRecipes()[recipeId];
-  if (recipe === undefined) {
+  const recipe = findRecipe(recipeId);
+  if (recipe === null) {
     return errorJson(c, 404, "recipes.not_found", `No such recipe: ${recipeId}`);
   }
   return c.json(publicView(recipe, true));
@@ -35,8 +48,8 @@ app.get("/api/recipes/:recipeId", requireUser, (c) => {
 
 app.post("/api/recipes/:recipeId/run", requireCsrfUser, async (c) => {
   const recipeId = c.req.param("recipeId");
-  const recipe = loadRecipes()[recipeId];
-  if (recipe === undefined) {
+  const recipe = findRecipe(recipeId);
+  if (recipe === null) {
     return errorJson(c, 404, "recipes.not_found", `No such recipe: ${recipeId}`);
   }
 

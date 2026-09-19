@@ -2408,9 +2408,11 @@ export async function countActiveApiTokens(db: D1Database, userId: string, now: 
   return row?.n ?? 0;
 }
 
-/** Stamps `revoked_at` on a token that isn't already revoked -- the `AND
- * revoked_at IS NULL` makes a repeat revoke idempotent in SQL rather than
- * needing a read-then-write (api_tokens.py's `if row.revoked_at is None`). */
+/** Stamps `revoked_at` on a token that isn't already revoked. The `AND
+ * revoked_at IS NULL` enforces idempotency at the SQL layer too, so
+ * `core/api_tokens.ts`'s `revokeToken` reads the row only for the OWNERSHIP
+ * check (not-mine and never-existed both answer 404) -- never to decide
+ * whether a repeat revoke should write. */
 export async function revokeApiTokenRow(db: D1Database, id: string, now: string): Promise<void> {
   await db
     .prepare("UPDATE api_tokens SET revoked_at = ? WHERE id = ? AND revoked_at IS NULL")
@@ -2419,7 +2421,7 @@ export async function revokeApiTokenRow(db: D1Database, id: string, now: string)
 }
 
 /** `last_used_at` write-back (throttled by the caller -- core/api_tokens.ts's
- * `shouldTouch`). */
+ * `touch`, which only calls this past `API_TOKEN_TOUCH_SECONDS`). */
 export async function touchApiToken(db: D1Database, id: string, now: string): Promise<void> {
   await db.prepare("UPDATE api_tokens SET last_used_at = ? WHERE id = ?").bind(now, id).run();
 }
