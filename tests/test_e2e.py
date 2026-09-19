@@ -575,3 +575,186 @@ def test_failed_job_is_retried_then_dispatched_to_a_fetching_worker(server, mock
 
     rows = {w["id"]: w for w in server.get("/api/workers", headers={"X-CSRF": csrf}).json()}
     assert rows[entry_a.worker_id]["unsuitable"] == []
+
+
+# --- 2026-09-19 API token ＋ 配方：AI 客戶端走的那條路 e2e --------------------
+
+#: `flux-t2i` 的節點類別（配方檔 `workflow` 每個節點的 `class_type`）。假
+#: worker 的 hello 必須宣告這一整組，否則派工在「缺自訂節點」那關就擋下來，
+#: 而這個測試要釘的是配方→派工→取檔那條路，不是節點評估。
+FLUX_NODE_CLASSES = sorted(
+    {
+        "UNETLoader",
+        "DualCLIPLoader",
+        "VAELoader",
+        "CLIPTextEncode",
+        "FluxGuidance",
+        "BasicGuider",
+        "KSamplerSelect",
+        "BasicScheduler",
+        "RandomNoise",
+        "EmptySD3LatentImage",
+        "SamplerCustomAdvanced",
+        "VAEDecode",
+        "SaveImage",
+    }
+)
+
+#: inventory 是相對 models **根目錄**的路徑（`assess.matches_model_name` 的
+#: 契約），所以四個模型都帶上各自的分類目錄前綴 -- 少了前綴也仍然會 match，
+#: 但那就不是真 agent（`hardware.scan_models`）回報的形狀。`size` 刻意報小：
+#: 真的 flux1-dev 有 23 GB，照實報會讓 VRAM 估算超過這台假 worker 的 24 GB
+#: 而派不出去，而這個測試要驗的不是 VRAM 估算。
+FLUX_INVENTORY = [
+    {"name": "diffusion_models/flux1-dev.safetensors", "size": 2.0},
+    {"name": "text_encoders/clip_l.safetensors", "size": 0.2},
+    {"name": "text_encoders/t5xxl_fp16.safetensors", "size": 1.0},
+    {"name": "vae/ae.safetensors", "size": 0.1},
+]
+
+RECIPE_PROMPT = "a red fox sitting in falling snow, cinematic lighting"
+
+
+def _create_api_token(server, csrf, name: str = "mcp") -> str:
+    """spec §4.2：cookie＋CSRF 建 token，明文只在這一次回應出現。"""
+    r = server.post("/api/auth/tokens", json={"name": name}, headers={"X-CSRF": csrf})
+    assert r.status_code == 201, r.text
+    body = r.json()
+    assert body["token"].startswith(body["prefix"][:4])
+    return body["token"]
+
+
+def test_api_token_runs_a_recipe_end_to_end(server, mock_comfy, tmp_path):
+    """spec §10 的 e2e 那一條：console 建 token → AI 客戶端（bearer，無 CSRF）
+    跑 `flux-t2i` 配方 → 假 worker 收到的 push 裡 workflow 已經渲染好 prompt →
+    worker 回 done → 同一枚 bearer 查得到 job、下載得到產出檔。
+
+    用 `flux-t2i` 而不是預設的 `chroma-t2i`：後者宣告 `model_sources`，worker
+    沒有那顆 9 GB 的權重時 `run` 會順手排一筆 model_fetch job，那條路徑屬於
+    §12.2 的單元測試，混進來只會讓這個測試在「派工」以外的地方失敗。
+    """
+    mock_client, _mock_state = mock_comfy
+    csrf = _login(server)
+
+    # 1. 使用者在 console（cookie session）產一枚 30 天的 API token。
+    token = _create_api_token(server, csrf)
+    bearer = {"Authorization": f"Bearer {token}"}
+
+    # bearer 看得到自己是誰，且平台明說這是 token 認證（spec §4.3）。
+    me = server.get("/api/auth/me", headers=bearer)
+    assert me.status_code == 200
+    assert me.json()["auth"] == "token"
+
+    entry, sk = _register_agent(server, csrf, "worker-flux", tmp_path)
+
+    with server.websocket_connect("/api/agent/ws") as ws:
+        _handshake(ws, entry, sk)
+        ws.send_json(
+            {
+                "type": "hello",
+                "hardware": {"vram_gb": 24.0, "gpu_name": "Mock GPU", "max_fetch_gb": 30},
+                "backend": "cuda",
+                "torch_version": "2.4.0",
+                "node_classes": FLUX_NODE_CLASSES,
+                "protocol": 5,
+                "auto_fetch": True,
+            }
+        )
+        _beat(ws)
+        ws.send_json({"type": "inventory", "models": FLUX_INVENTORY})
+
+        # 2. AI 客戶端（MCP 的 `run_recipe`）以 bearer 送單：沒有 X-CSRF。
+        run = server.post(
+            "/api/recipes/flux-t2i/run",
+            json={"params": {"prompt": RECIPE_PROMPT}},
+            headers=bearer,
+        )
+        assert run.status_code == 201, run.text
+        run_body = run.json()
+        job_id = run_body["job_id"]
+        assert run_body["recipe_id"] == "flux-t2i"
+        # 預設值已套用、`seed` 已由伺服器換成真的隨機值（-1 不會外流）。
+        assert run_body["params"]["prompt"] == RECIPE_PROMPT
+        assert run_body["params"]["steps"] == 8
+        assert run_body["params"]["seed"] != -1
+        # `flux-t2i` 沒有 `model_sources`，而且 worker 四個模型都有 -> 不抓東西。
+        assert run_body["model_fetch_jobs"] == []
+
+        # 3. 派工：假 worker 收到的 push，其 workflow 已經是渲染完的圖。
+        agentws.dispatch_once(entry.worker_id)
+        job_msg = ws.receive_json()
+        assert job_msg["type"] == "job"
+        assert job_msg["job_id"] == job_id
+        assert job_msg["input_assets"] == []
+        workflow = json.loads(job_msg["workflow_json"])
+        assert workflow["4"]["class_type"] == "CLIPTextEncode"
+        assert workflow["4"]["inputs"]["text"] == RECIPE_PROMPT
+        # `{"$param": ...}` 標記一個都不該留在線上。
+        assert "$param" not in job_msg["workflow_json"]
+
+        dispatch.mark_running(job_id, entry.worker_id)
+
+        # 4. worker 跑完（對假 ComfyUI），把產出檔傳回平台再回報 job_done。
+        results, exec_seconds = comfy.run_workflow(
+            "http://mockcomfy", workflow, client=mock_client
+        )
+        filename, content, _subfolder = results[0]
+
+        artifact_path = f"/api/agent/jobs/{job_id}/artifacts"
+        prebuilt = httpx.Request(
+            "POST",
+            f"http://testserver{artifact_path}",
+            files={"file": (filename, content, "application/octet-stream")},
+        )
+        body = prebuilt.read()
+        sig_headers = signing.signed_headers(entry, "POST", artifact_path, body)
+        artifact_resp = server.post(
+            artifact_path,
+            content=body,
+            headers={**sig_headers, "Content-Type": prebuilt.headers["content-type"]},
+        )
+        assert artifact_resp.status_code == 200
+
+        ws.send_json(
+            {
+                "type": "job_done",
+                "job_id": job_id,
+                "result_files": [filename],
+                "exec_seconds": exec_seconds,
+            }
+        )
+        receipt_msg = ws.receive_json()
+        assert receipt_msg["type"] == "receipt"
+        ws.send_json(
+            {
+                "type": "receipt_ack",
+                "receipt_id": receipt_msg["receipt_id"],
+                "worker_sig": sk.sign(receipt_msg["payload"].encode()).signature.hex(),
+            }
+        )
+        agentws.dispatch_once(entry.worker_id)
+
+    # --- Assertions -----------------------------------------------------
+
+    # 5. 同一枚 bearer 查單（MCP 的 `job_status` / `wait_for_job`）。
+    detail = server.get(f"/api/jobs/{job_id}", headers=bearer)
+    assert detail.status_code == 200
+    assert detail.json()["status"] == "done"
+    assert detail.json()["result_files"] == [filename]
+
+    # 6. 同一枚 bearer 取檔（MCP 的 `download_results`）。
+    artifact = server.get(f"/api/jobs/{job_id}/artifacts/{filename}", headers=bearer)
+    assert artifact.status_code == 200
+    assert artifact.content == content
+
+    # 7. 撤銷後同一枚 token 立刻失效（401 `auth.required`，spec §4.3）。
+    listed = server.get("/api/auth/tokens", headers={"X-CSRF": csrf})
+    assert listed.status_code == 200
+    token_id = listed.json()[0]["id"]
+    revoked = server.request(
+        "DELETE", f"/api/auth/tokens/{token_id}", headers={"X-CSRF": csrf}
+    )
+    assert revoked.status_code == 200
+    denied = server.get(f"/api/jobs/{job_id}", headers=bearer)
+    assert denied.status_code == 401
+    assert denied.json()["error"]["code"] == "auth.required"

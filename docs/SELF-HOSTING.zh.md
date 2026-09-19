@@ -518,6 +518,39 @@ ComfyFed 內建十支**實戰跑過**的工作流，每一支都在畫布上用�
 
 **不用重啟**：放好檔案後不必重啟 ComfyUI 或 agent——agent 每 10 分鐘會自動重掃本機模型庫存並回報平台，工作評估之後就會自動轉綠。真的等不及的話，手動重啟 agent 可以讓它立刻生效。
 
+### API token／AI 存取
+
+使用者可以在 **Console →「設定」→「API token／AI 存取」** 自己產生一枚 bearer token，交給 AI 客戶端（MCP）長期驅動平台。詳細用法見 **[用 AI 驅動 ComfyFed（API token ＋ MCP）](MCP.zh.md)**。
+
+- **明文只出現一次**：產生當下顯示（`cft_` 前綴＋32 bytes 的亂數），伺服器只存它的 sha256，之後任何地方都拿不回明文。旁邊的「下載設定檔」按鈕在瀏覽器端直接產出 `comfyfed-mcp.json`（`{"platform_url", "token", "expires_at"}`），存成 `~/.comfyfed/mcp.json` 就是 `comfyfed-mcp` 的預設設定檔。
+- **有效期 30 天**，每人最多 **10 枚**有效 token（超過要先撤銷一枚，否則 409 `auth.too_many_tokens`）。清單顯示名稱、前綴、建立／到期／最後使用時間與狀態，隨時可「撤銷」。
+- **權限等於本人**：`Authorization: Bearer cft_...` 在 session 能用的每條 API 上等價於該使用者（角色即時從 `users` 讀），而且**跳過 CSRF**（CSRF 防的是瀏覽器跨站帶 cookie，header 不會被跨站帶）。有 `Authorization` header 時就只看 header，不回退 cookie。
+- **token 不能自我繁殖**：產生／列出／撤銷 token、改密碼、登出這幾條**只收 cookie**，bearer 一律 401。
+- **改密碼即全部失效**：token 記著建立當下的 `session_epoch`，改密碼讓 epoch 前進，所有既有 token 與登入一起作廢。過期、撤銷、使用者被停用也都是 401 `auth.required`（不區分原因，避免變成探測 token 的預言機）。
+- 命中時最多每 5 分鐘更新一次 `last_used_at`，所以清單上的「最後使用」有最多 5 分鐘的誤差，這是刻意的（不讓每個請求都多一次寫入）。
+
+### 配方（recipe）
+
+配方是**平台端內建、實測跑得動**的固定工作流加上少數幾個參數——給 AI（與任何不想拼節點圖的呼叫端）用的送單入口：只挑配方、填參數，平台負責驗參數、渲染 workflow，再走與 `POST /api/jobs` **完全相同**的建單與派工路徑。配方是套件內的檔案（`server/comfyfed_server/recipes/<id>.json`，cloud 端有逐位元相同的副本），改配方等於發版，不能線上編輯。
+
+端點（皆需登入；`run` 走 `require_csrf_user`，所以 bearer token 可以直接送）：
+
+- `GET /api/recipes` → 清單（不含 workflow），依 `order` 升冪，**第一個就是預設配方**，每筆多一個 `missing_models`。
+- `GET /api/recipes/{id}` → 同上一筆加 `workflow`。
+- `POST /api/recipes/{id}/run` body `{"params": {...}}` → `201 {"job_id", "recipe_id", "params", "model_fetch_jobs"}`。`params` 是套完預設、把 `seed: -1` 換成真隨機值之後**實際跑的那一組**。參數型別／範圍／step 不對 → 400 `recipes.bad_params`，訊息點名第一個出錯的參數。
+
+內建三支：
+
+| 順序 | id | 用途 | 模型 | `nsfw_ok` |
+| --- | --- | --- | --- | --- |
+| 1 | **`chroma-t2i`**（預設） | 文生圖，1024×1024／26 步／cfg 3.5 | `Chroma1-HD-fp8mixed`（9.2 GB，**缺了會自動下載**）、`t5xxl_fp16`、`ae` | ✅ |
+| 2 | **`h3-t2v`** | 文生影片（含音訊），24 fps、8 步 turbo LoRA、預設 5 秒 | MiniMax H3 全套＋無審查的 heretic 文字編碼器 | ✅ |
+| 3 | **`flux-t2i`** | 文生圖，官方 Flux.1-dev 權重（保留供對照） | `flux1-dev`、`clip_l`、`t5xxl_fp16`、`ae` | ❌ |
+
+`nsfw_ok` 記的是**權重本身會不會迴避露骨內容**：官方 Flux dev 會，所以 `flux-t2i` 標 false，也因此不是預設；兩支預設配方用的是不審查的權重。平台不因這個旗標改變任何行為。
+
+**預設配方第一次跑會先下載模型。** `chroma-t2i` 宣告了 `model_sources`，聯邦內沒有任何活著的 worker 持有 `Chroma1-HD-fp8mixed.safetensors`（9 193 379 316 bytes）時，`run` 會在建單**之前**先呼叫與面板「下載」鈕同一條 `create_fetch_job`（同樣去重、同樣白名單、同樣 HEAD 探測），回應的 `model_fetch_jobs` 因此非空。圖照樣建單並排進佇列，等 worker 抓完、回報庫存就派得出去——在一般家用頻寬上這 9.2 GB 可能要十幾分鐘。下載排不出來（例如沒有合格的 worker）只會留一行 log，不會擋下送單。
+
 ### 發布 agent 新版本
 
 伺服器端有一個發布指令，會把 wheel 複製到 `<data-dir>/releases/`、算好 sha256、用平台金鑰簽章，並把 `agent_*` 設定一次寫好：

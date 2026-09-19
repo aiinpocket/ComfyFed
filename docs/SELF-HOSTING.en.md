@@ -518,6 +518,39 @@ Everything together is about **80.3 GB**; the two Flux templates (wuxia, charact
 
 **No restart required**: once the files are in place you do not need to restart ComfyUI or the agent — it rescans its local model inventory every 10 minutes and reports back, and the job assessment turns green on its own. Restart the agent if you want that to happen immediately instead of waiting.
 
+### API tokens / AI access
+
+Any user can mint a bearer token for themselves under **Console → Settings → API token / AI access** and hand it to an AI client over MCP. The full walkthrough is in **[Driving ComfyFed from an AI client](MCP.en.md)**.
+
+- **The plaintext appears exactly once**, at creation (a `cft_` prefix plus 32 random bytes); the server stores only its sha256, so it can never be shown again. The neighbouring "download config" button builds `comfyfed-mcp.json` (`{"platform_url", "token", "expires_at"}`) in the browser; saved as `~/.comfyfed/mcp.json` it is exactly what `comfyfed-mcp` reads by default.
+- **Valid 30 days**, at most **10** active tokens per user (an eleventh answers 409 `auth.too_many_tokens` — revoke one first). The list shows name, prefix, created/expires/last-used and status, with a revoke button.
+- **A token is equivalent to its owner**: `Authorization: Bearer cft_...` works on every API a session can use (role is read live from `users`) and **skips CSRF** — CSRF protects against a browser attaching cookies cross-site, and headers are never attached cross-site. When an `Authorization` header is present it is the only thing consulted; there is no fallback to the cookie.
+- **A token cannot breed**: creating, listing and revoking tokens, changing the password and logging out are **cookie-only** — a bearer call gets 401.
+- **Changing the password invalidates every token**: a token records the `session_epoch` it was minted under, and a password change advances that epoch, retiring tokens and sessions together. Expiry, revocation and a disabled user all answer the same 401 `auth.required`, deliberately without distinguishing the reason (otherwise the endpoint becomes an oracle about other people's tokens).
+- `last_used_at` is written at most once every 5 minutes, so the "last used" column can lag by that much — the alternative is a database write on every single request.
+
+### Recipes
+
+A recipe is a fixed, **known-good** workflow that ships with the platform, exposed as a handful of parameters. It is the submission path for an AI client (or anyone who does not want to assemble a node graph): pick a recipe, fill parameters, and the platform validates them, renders the workflow and then goes down **exactly the same** job-creation and dispatch path as `POST /api/jobs`. Recipes are package files (`server/comfyfed_server/recipes/<id>.json`, with a byte-identical copy on the cloud stack), so changing one means shipping a release — there is no online editor.
+
+Endpoints (all require a login; `run` uses `require_csrf_user`, so a bearer token can submit directly):
+
+- `GET /api/recipes` → the list without workflows, ascending by `order`, so **the first entry is the default**; each carries a `missing_models` array.
+- `GET /api/recipes/{id}` → the same entry plus its `workflow`.
+- `POST /api/recipes/{id}/run` with `{"params": {...}}` → `201 {"job_id", "recipe_id", "params", "model_fetch_jobs"}`. The returned `params` is what actually ran: defaults applied and `seed: -1` replaced by a real random value. A bad type, range or step answers 400 `recipes.bad_params`, naming the first offending parameter.
+
+The three built-ins:
+
+| Order | id | What | Models | `nsfw_ok` |
+| --- | --- | --- | --- | --- |
+| 1 | **`chroma-t2i`** (default) | Text-to-image, 1024×1024 / 26 steps / cfg 3.5 | `Chroma1-HD-fp8mixed` (9.2 GB, **auto-fetched when missing**), `t5xxl_fp16`, `ae` | ✅ |
+| 2 | **`h3-t2v`** | Text-to-video with audio, 24 fps, 8-step turbo LoRA, 5 seconds by default | The MiniMax H3 set plus the uncensored heretic text encoder | ✅ |
+| 3 | **`flux-t2i`** | Text-to-image with the official Flux.1-dev weights, kept for comparison | `flux1-dev`, `clip_l`, `t5xxl_fp16`, `ae` | ❌ |
+
+`nsfw_ok` records whether the **weights themselves** avoid explicit content: the official Flux dev weights do, which is why `flux-t2i` is flagged false and is not the default, while both defaults use uncensored weights. The platform changes no behaviour based on the flag.
+
+**The default recipe downloads a model on its first run.** `chroma-t2i` declares `model_sources`, so when no live worker holds `Chroma1-HD-fp8mixed.safetensors` (9,193,379,316 bytes), `run` calls the very same `create_fetch_job` the panel's Download button uses (same de-duplication, same allowlist, same HEAD probe) **before** creating the job, and the response's `model_fetch_jobs` is non-empty. The image job is created and queued as usual and becomes dispatchable once a worker has the file and reports its inventory — on a home connection those 9.2 GB can take 10+ minutes. If the download cannot be scheduled at all (no capable worker, say), that is only logged; it never blocks the submission.
+
 ### Publishing an agent release
 
 The server ships a publish command that copies the wheel into `<data-dir>/releases/`, computes its sha256, signs it with the platform key, and writes all five `agent_*` settings in one go:

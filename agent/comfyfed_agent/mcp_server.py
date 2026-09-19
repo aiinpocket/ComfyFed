@@ -44,14 +44,22 @@ ComfyFed runs ComfyUI jobs on a federation of shared GPU workers.
 
 用法順序 / How to use:
 1. 先 `list_recipes`；能用配方就用 `run_recipe`（參數已驗證、workflow 由平台渲染）。
-   Start with `list_recipes`; prefer `run_recipe` whenever a recipe fits.
+   清單**第一個就是預設配方**，沒有特別理由就推薦它。
+   Start with `list_recipes`; prefer `run_recipe` whenever a recipe fits, and
+   recommend the FIRST recipe in the list as the default.
 2. 配方不夠用時才 `submit_workflow`（傳完整的 ComfyUI API-format workflow JSON）。
    Only fall back to `submit_workflow` when no recipe covers the request.
-3. 送單後用 `wait_for_job` 等結果，再用 `download_results` 取檔。
+3. `run_recipe` 回的 `model_fetch_jobs` 非空 = 平台正在幫你下載缺的模型：先用
+   `model_fetch_status` 追每一筆的進度（9 GB 可能要十幾分鐘），下載完成後再
+   `wait_for_job`；這段期間工作會一直排在佇列裡，不是卡住。
+   If `run_recipe` returns a non-empty `model_fetch_jobs`, the fleet is still
+   downloading a missing model: poll `model_fetch_status` for each entry FIRST
+   (a 9 GB download can take 10+ minutes), and only then `wait_for_job`.
+4. 送單後用 `wait_for_job` 等結果，再用 `download_results` 取檔。
    After submitting, poll with `wait_for_job`, then fetch files with `download_results`.
-4. 失敗時看 `job_status` 的 `attempt_errors`（每次重試在哪台 worker 出了什麼錯）。
+5. 失敗時看 `job_status` 的 `attempt_errors`（每次重試在哪台 worker 出了什麼錯）。
    On failure, read `attempt_errors` from `job_status` to see what each attempt hit.
-5. 缺模型用 `request_model`（只接受 huggingface.co / civitai.com 的網址），
+6. 缺模型用 `request_model`（只接受 huggingface.co / civitai.com 的網址），
    再用 `model_fetch_status` 追進度。
    If a model is missing, call `request_model` (huggingface.co / civitai.com URLs
    only) and track it with `model_fetch_status`.
