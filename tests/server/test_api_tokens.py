@@ -85,7 +85,7 @@ def test_plaintext_never_appears_again_in_the_listing(client):
     csrf = _login(client)
     plaintext = _create_token(client, csrf).json()["token"]
 
-    listed = client.get("/api/auth/tokens", headers={"X-CSRF": csrf})
+    listed = client.get("/api/auth/tokens")
     assert listed.status_code == 200
     rows = listed.json()
     assert len(rows) == 1
@@ -123,22 +123,26 @@ def test_eleventh_active_token_is_rejected_until_one_is_revoked(client):
 # --- 撤銷 ---------------------------------------------------------------
 
 
-def test_token_routes_require_the_csrf_header(client):
-    """spec §4.2：三條端點「皆需 cookie session＋CSRF」，含那條 GET。
-
-    console 因此必須在列出 token 的 GET 上自己帶 `X-CSRF`（它的泛用
-    `getJson` 只在非 GET 上帶）。
-    """
+def test_state_changing_token_routes_require_the_csrf_header(client):
+    """建與撤是改狀態的，要 `X-CSRF`。"""
     csrf = _login(client)
     token_id = _create_token(client, csrf).json()["id"]
 
     assert client.post("/api/auth/tokens", json={"name": "x"}).status_code == 403
-    assert client.get("/api/auth/tokens").status_code == 403
     assert client.delete(f"/api/auth/tokens/{token_id}").status_code == 403
 
 
-def test_token_routes_reject_the_anonymous(client):
-    assert client.get("/api/auth/tokens", headers={"X-CSRF": "nope"}).status_code == 401
+def test_listing_is_cookie_only_without_csrf(client):
+    """清單是只讀的：cookie 就夠，**不**要 `X-CSRF`（console 的 fetch
+    包裝只在非 GET 上帶那個 header）—— 但 bearer 還是 401。"""
+    csrf = _login(client)
+    token = _create_token(client, csrf).json()["token"]
+
+    assert client.get("/api/auth/tokens").status_code == 200
+
+    client.cookies.clear()
+    assert client.get("/api/auth/tokens", headers=_bearer(token)).status_code == 401
+    assert client.get("/api/auth/tokens").status_code == 401
 
 
 def test_revoke_unknown_token_is_404(client):
@@ -157,7 +161,7 @@ def test_revoke_is_idempotent_and_flips_active(client):
     assert again.status_code == 200
     assert again.json() == {"revoked": True}
 
-    row = client.get("/api/auth/tokens", headers={"X-CSRF": csrf}).json()[0]
+    row = client.get("/api/auth/tokens").json()[0]
     assert row["active"] is False
     assert row["revoked_at"] is not None
 
@@ -176,7 +180,7 @@ def test_listing_only_shows_your_own_tokens(client):
     other_csrf = _login_as(client, "someone", "s3cret-password")
     theirs = _create_token(client, other_csrf, name="their-token").json()["id"]
 
-    rows = client.get("/api/auth/tokens", headers={"X-CSRF": other_csrf}).json()
+    rows = client.get("/api/auth/tokens").json()
     assert [r["id"] for r in rows] == [theirs]
 
     # 也不能撤銷別人的
@@ -349,7 +353,7 @@ def test_listing_surfaces_last_used_at(client):
     token = _create_token(client, csrf).json()["token"]
     assert client.get("/api/jobs", headers=_bearer(token)).status_code == 200
 
-    row = client.get("/api/auth/tokens", headers={"X-CSRF": csrf}).json()[0]
+    row = client.get("/api/auth/tokens").json()[0]
     assert row["last_used_at"] is not None
 
 

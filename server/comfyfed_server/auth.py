@@ -328,6 +328,34 @@ async def require_csrf_user(
     return user
 
 
+async def require_session(
+    cf_session: Optional[str] = Cookie(default=None),
+) -> SessionUser:
+    """Cookie-ONLY dependency with no CSRF compare: the read-only half of
+    spec §4.3's exception list.
+
+    `require_csrf_session`'s sibling for SAFE methods. `GET
+    /api/auth/tokens` must still be closed to API tokens (a token must not
+    be able to enumerate its owner's other tokens), but demanding an
+    `X-CSRF` header on a GET buys nothing -- CSRF protects state changes,
+    and the console's fetch wrapper only sends that header on non-GET
+    requests (`web/src/api.ts`), so requiring it here would just 403 the
+    console's own listing.
+
+    Like `require_csrf_session` it never looks at `Authorization`: a bearer
+    caller simply has no cookie, so it gets the same 401 as anyone else
+    without one.
+    """
+    payload = read_session_payload(cf_session)
+    if payload is None:
+        raise _error(401, "auth.required", "Login required.")
+    with db.get_session() as db_session:
+        user = _session_user_from_payload(db_session, payload)
+    if user is None:
+        raise _error(401, "auth.required", "Login required.")
+    return user
+
+
 async def require_csrf_session(
     cf_session: Optional[str] = Cookie(default=None),
     x_csrf: Optional[str] = Header(default=None, alias="X-CSRF"),
@@ -335,10 +363,11 @@ async def require_csrf_session(
     """Cookie-ONLY, CSRF-enforcing dependency: an API token can never satisfy
     it (spec §4.3's exception list).
 
-    The routes behind this are the ones a token must not be able to reach
-    even though it otherwise speaks for its user: minting/listing/revoking
-    tokens (a stolen token must not be able to mint itself a successor that
-    outlives revocation), changing the password, and logging out. It
+    The routes behind this are the state-changing ones a token must not be
+    able to reach even though it otherwise speaks for its user: minting and
+    revoking tokens (a stolen token must not be able to mint itself a
+    successor that outlives revocation), changing the password, and logging
+    out. The read-only listing uses `require_session` instead. It
     deliberately does NOT take an `Authorization` header at all -- a bearer
     request simply has no cookie to check, so it gets the same 401 as an
     anonymous one.
@@ -517,8 +546,10 @@ class CreateTokenBody(BaseModel):
     name: Optional[str] = None
 
 
-# 2026-09-19 spec §4.2：三條 token 管理端點。全部走 `require_csrf_session`
-# —— cookie＋CSRF，bearer 一律 401（token 不能再生 token）。
+# 2026-09-19 spec §4.2：三條 token 管理端點，全部只收 cookie（bearer 一律
+# 401 —— token 不能再生 token）。改狀態的那兩條另外要 CSRF
+# （`require_csrf_session`）；只讀的清單走 `require_session`，GET 本來就
+# 不是 CSRF 防的對象，console 的 fetch 包裝也不會在 GET 上帶 `X-CSRF`。
 @router.post("/tokens", status_code=201)
 def create_api_token(
     user: SessionUser = Depends(require_csrf_session),
@@ -568,7 +599,7 @@ def create_api_token(
 
 
 @router.get("/tokens")
-def list_api_tokens(user: SessionUser = Depends(require_csrf_session)):
+def list_api_tokens(user: SessionUser = Depends(require_session)):
     """The caller's own tokens, newest first. Never includes any plaintext."""
     with db.get_session() as db_session:
         return api_tokens.list_tokens(db_session, user.uid, _utcnow())
