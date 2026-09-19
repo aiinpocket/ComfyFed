@@ -252,6 +252,262 @@ function comfyfedShowQueuedToast() {
   };
 })();
 
+// 中文：接管官方前端「缺少模型」卡片上的「下載」鈕。官方 1.52.7 的實作是純瀏覽器端的
+// \`<a href download>\` 再 click，把模型檔抓進使用者自己的電腦，從頭到尾不碰伺服器；
+// ComfyFed 是聯邦，模型只該落在 worker 的磁碟上，所以這顆鈕的原始行為跟設計相反。
+// 這裡用 capture 階段的 click 監聽攔下它——必須趕在官方 handler 建出那個 <a> 之前，
+// 所以是 \`preventDefault()\` ＋ \`stopImmediatePropagation()\`——改成 POST
+// \`api/comfyfed/model-fetch\` 請平台派一台合適的 worker 去抓，再每 2 秒輪詢進度。
+// 模型的 \`{name, url, directory}\` 從 \`window.app.graph\` 遞迴收集（含 subgraph 節點的
+// \`properties.models[]\`）；單顆鈕靠它的 aria-label（i18n 是「下載 {model}」／
+// 「Download {model}」，model 名是子字串）比對是哪一個模型，比不到就只顯示
+// 「無法辨識模型」而不亂送單。「全部下載」＝對卡片上每一顆下載鈕各送一張單。
+//
+// English: Take over the stock "Download" button on the missing-models card.
+// Upstream 1.52.7 implements it as a purely browser-side \`<a href download>\`
+// that is clicked to pull the file onto the user's own machine, never touching
+// the server -- but in ComfyFed models belong on worker disks, so that stock
+// behaviour is backwards here. A capture-phase click listener intercepts it
+// (it has to win the race before the stock handler builds that <a>, hence
+// \`preventDefault()\` + \`stopImmediatePropagation()\`) and instead POSTs to
+// \`api/comfyfed/model-fetch\`, asking the platform to dispatch a suitable
+// worker, then polls the job every 2 seconds. Model \`{name, url, directory}\`
+// triples are collected recursively from \`window.app.graph\` (including
+// \`properties.models[]\` on subgraph nodes); a single button is matched to its
+// model by which name its aria-label contains (the i18n strings are
+// "下載 {model}" / "Download {model}", with the name as a substring). No match
+// means we say so and submit nothing. "Download all" = one job per download
+// button on the card.
+const FETCH_API = "api/comfyfed/model-fetch";
+const FETCH_POLL_MS = 2000;
+const FETCH_BANNER_ID = "comfyfed-model-fetch-banner";
+
+const FETCH_TEXT = {
+  starting: "下載中 0% / Fetching 0%",
+  pct: (p) => \`下載中 \${p}% / Fetching \${p}%\`,
+  ready: "已就緒 / Ready",
+  unknown: "無法辨識模型，請重新整理面板後再試 / Could not identify the model; reload the panel and retry",
+  done: (n) =>
+    \`模型 \${n} 已下載到 worker，請重新整理以載入 / Model \${n} landed on a worker; reload to use it\`,
+  failed: (n, e) => \`模型 \${n} 下載失敗：\${e} / Fetch of \${n} failed: \${e}\`,
+  unknownError: "未知錯誤 / unknown error",
+  reload: "重新整理 / Reload",
+  dismiss: "關閉 / Dismiss",
+};
+
+// 中文：遞迴走訪圖上每個節點的 \`properties.models[]\`，子圖節點（\`node.subgraph\`）也要
+// 進去；同名只留第一筆。圖還沒建好時 \`window.app\` 可能不存在，吞掉例外回空表即可，
+// 呼叫端會顯示「無法辨識模型」。
+//
+// English: Walk every node's \`properties.models[]\` recursively, descending
+// into subgraph nodes (\`node.subgraph\`); first entry wins on duplicate names.
+// \`window.app\` may not exist yet before the graph is built -- swallow that and
+// return an empty map; the caller then reports "could not identify".
+function comfyfedCollectGraphModels() {
+  const found = new Map();
+  const walk = (graph) => {
+    if (!graph) return;
+    for (const node of graph._nodes || graph.nodes || []) {
+      const models = (node && node.properties && node.properties.models) || [];
+      for (const m of models) {
+        if (m && typeof m.name === "string" && !found.has(m.name)) {
+          found.set(m.name, {
+            name: m.name,
+            url: typeof m.url === "string" ? m.url : "",
+            directory: typeof m.directory === "string" ? m.directory : "",
+          });
+        }
+      }
+      if (node && node.subgraph) walk(node.subgraph);
+    }
+  };
+  try {
+    walk(window.app && window.app.graph);
+  } catch (_e) {
+    // 圖尚未就緒 / graph not ready yet
+  }
+  return found;
+}
+
+// 中文：沿用零 worker 橫幅的視覺語彙（置頂、固定、同字體），成功用綠底、失敗用同一個
+// 紅底。文字一律走 textContent，模型名與伺服器 message 都是外部資料，不能當 HTML 插。
+//
+// English: Reuses the zero-worker banner's visual language (pinned to the top,
+// same font); green for success, the same red for failure. Text always goes in
+// via textContent -- model names and server messages are outside data and must
+// never be injected as HTML.
+function comfyfedFetchBanner(text, options) {
+  const opts = options || {};
+  let el = document.getElementById(FETCH_BANNER_ID);
+  if (!el) {
+    el = document.createElement("div");
+    el.id = FETCH_BANNER_ID;
+    document.body.appendChild(el);
+  }
+  el.style.cssText =
+    "position:fixed;top:0;left:0;right:0;z-index:10002;" +
+    "color:#fff;padding:8px 16px;display:flex;gap:12px;align-items:center;" +
+    "justify-content:center;font:13px/1.5 system-ui,sans-serif;" +
+    (opts.error ? "background:#7c2d2d;" : "background:#1f5c33;");
+  el.textContent = text;
+
+  const button = (label, onClick) => {
+    const b = document.createElement("button");
+    b.type = "button";
+    b.textContent = label;
+    b.style.cssText =
+      "background:rgba(255,255,255,0.15);border:1px solid rgba(255,255,255,0.4);" +
+      "color:#fff;border-radius:4px;padding:2px 8px;cursor:pointer;font:inherit;";
+    b.addEventListener("click", onClick);
+    el.appendChild(b);
+  };
+
+  if (opts.reload) button(FETCH_TEXT.reload, () => location.reload());
+  button(FETCH_TEXT.dismiss, () => el.remove());
+}
+
+function comfyfedRestoreFetchButton(button) {
+  button.disabled = false;
+  if (typeof button.dataset.comfyfedLabel === "string") {
+    button.textContent = button.dataset.comfyfedLabel;
+  }
+}
+
+// 中文：每 2 秒問一次單子狀態。\`queued\`／\`assigned\`／\`running\` 都算進行中，只有在
+// \`stage === "fetching_models"\` 且有 \`fetch_pct\` 時才更新百分比（其他階段沒有進度可報）。
+// 輪詢過程中的網路錯誤不算失敗——面板可能只是暫時斷線——下一輪再試。
+//
+// English: Poll the job every 2 seconds. \`queued\`/\`assigned\`/\`running\` all
+// count as in flight; the percentage is only updated while
+// \`stage === "fetching_models"\` with a \`fetch_pct\` (other stages have no
+// progress to report). A network error mid-poll is not a failure -- the panel
+// may just be briefly offline -- so it simply retries on the next tick.
+async function comfyfedPollFetchJob(jobId, button, name) {
+  for (;;) {
+    await new Promise((resolve) => setTimeout(resolve, FETCH_POLL_MS));
+    let status;
+    try {
+      const r = await fetch(\`\${FETCH_API}/\${encodeURIComponent(jobId)}\`, {
+        credentials: "same-origin",
+      });
+      if (!r.ok) continue;
+      status = await r.json();
+    } catch (_e) {
+      continue;
+    }
+    if (!status) continue;
+    if (status.status === "done") {
+      button.textContent = FETCH_TEXT.ready;
+      comfyfedFetchBanner(FETCH_TEXT.done(name), { reload: true });
+      return;
+    }
+    if (status.status === "failed" || status.status === "cancelled") {
+      comfyfedRestoreFetchButton(button);
+      comfyfedFetchBanner(FETCH_TEXT.failed(name, status.error || FETCH_TEXT.unknownError), {
+        error: true,
+      });
+      return;
+    }
+    if (status.stage === "fetching_models" && typeof status.fetch_pct === "number") {
+      button.textContent = FETCH_TEXT.pct(Math.floor(status.fetch_pct));
+    }
+  }
+}
+
+// 中文：送出下載單。伺服器回 201（新單）或 200（\`reused: true\`，同一個模型已經有人按過）
+// 都照樣輪詢那張單；400 帶 \`{error, message}\`，直接把伺服器的中英雙語 message 顯示出來。
+//
+// English: Submit the fetch job. The server answers 201 (fresh job) or 200
+// (\`reused: true\` -- someone already asked for this model); either way we poll
+// that job. A 400 carries \`{error, message}\`, and the server's own bilingual
+// message is what gets shown.
+async function comfyfedRequestModelFetch(model, button) {
+  if (typeof button.dataset.comfyfedLabel !== "string") {
+    button.dataset.comfyfedLabel = button.textContent || "";
+  }
+  button.disabled = true;
+  button.textContent = FETCH_TEXT.starting;
+
+  let ok = false;
+  let body = null;
+  try {
+    const r = await fetch(FETCH_API, {
+      method: "POST",
+      credentials: "same-origin",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        name: model.name,
+        directory: model.directory || "",
+        url: model.url || "",
+      }),
+    });
+    ok = r.ok;
+    body = await r.json();
+  } catch (e) {
+    ok = false;
+    body = { message: String(e) };
+  }
+
+  if (!ok || !body || !body.job_id) {
+    comfyfedRestoreFetchButton(button);
+    const detail = (body && body.message) || FETCH_TEXT.unknownError;
+    comfyfedFetchBanner(FETCH_TEXT.failed(model.name, detail), { error: true });
+    return;
+  }
+  comfyfedPollFetchJob(body.job_id, button, model.name);
+}
+
+// 中文：aria-label 是「下載 {model}」／「Download {model}」，所以是找「label 裡包含哪個
+// 模型名」。同時命中多個時取最長的那個名字——短名有可能是長名的子字串。
+//
+// English: The aria-label reads "下載 {model}" / "Download {model}", so the
+// match is "which model name does this label contain". On multiple hits the
+// longest name wins, since a short name can be a substring of a longer one.
+function comfyfedModelForButton(button, models) {
+  const label = button.getAttribute("aria-label") || button.textContent || "";
+  let best = null;
+  for (const m of models.values()) {
+    if (label.includes(m.name) && (!best || m.name.length > best.name.length)) best = m;
+  }
+  return best;
+}
+
+document.addEventListener(
+  "click",
+  (ev) => {
+    const target = ev.target instanceof Element ? ev.target : null;
+    if (!target) return;
+    const single = target.closest('[data-testid="missing-model-download"]');
+    const all = single ? null : target.closest('[data-testid="missing-model-actions"] button');
+    if (!single && !all) return;
+
+    ev.preventDefault();
+    ev.stopImmediatePropagation();
+
+    const models = comfyfedCollectGraphModels();
+    if (single) {
+      const model = comfyfedModelForButton(single, models);
+      if (!model) {
+        comfyfedFetchBanner(FETCH_TEXT.unknown, { error: true });
+        return;
+      }
+      comfyfedRequestModelFetch(model, single);
+      return;
+    }
+    // 中文：「全部下載」＝卡片上每一列的下載鈕各來一張單 / English: "download
+    // all" = one job per download button on the card.
+    let matched = 0;
+    for (const b of document.querySelectorAll('[data-testid="missing-model-download"]')) {
+      const model = comfyfedModelForButton(b, models);
+      if (!model) continue;
+      matched += 1;
+      comfyfedRequestModelFetch(model, b);
+    }
+    if (matched === 0) comfyfedFetchBanner(FETCH_TEXT.unknown, { error: true });
+  },
+  true
+);
+
 // 中文：ComfyUI 的擴充模組是以 ES module 動態 import 的，匯出物件本身內容不重要，
 // 但需要是個有效模組；副作用（插入 <style>、零 worker 橫幅）已經在上面完成了。
 //

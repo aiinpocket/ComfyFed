@@ -1886,6 +1886,17 @@ def test_panel_extension_js_is_served(client):
     assert "display:none" in body.replace(" ", "")
 
 
+def test_panel_extension_js_intercepts_download_button(client):
+    # The stock missing-models card downloads the file to the *user's* browser;
+    # the extension takes that button over and dispatches a model_fetch job to a
+    # worker instead, so its selector must actually ship in the served module.
+    _login(client)
+    r = client.get("/comfy/api/comfyfed-ext/comfyfed.js")
+    assert r.status_code == 200
+    assert "missing-model-download" in r.text
+    assert "api/comfyfed/model-fetch" in r.text
+
+
 def test_panel_extension_js_requires_a_session(client):
     assert client.get("/comfy/api/comfyfed-ext/comfyfed.js").status_code == 401
 
