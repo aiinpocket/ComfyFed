@@ -379,4 +379,19 @@ describe('Jobs page: model_fetch jobs (panel Download button)', () => {
 
     expect(await screen.findByText('Estimated VRAM: —')).toBeInTheDocument();
   });
+
+  // Regression lock (review round 1): the VRAM badge must stay hidden for an
+  // ordinary prompt job with a null estimate -- only a model_fetch job's
+  // (always-null) estimate should render as a "—" badge.
+  it('shows no VRAM badge on a queued ordinary prompt job with a null estimate', async () => {
+    const queuedPromptJob: Job = { ...RUNNING_JOB, id: 'job-queued-0010', status: 'queued', progress: 0, est_vram_gb: null };
+    stubFetch([[queuedPromptJob]]);
+    renderJobs();
+
+    const expandButton = await screen.findByRole('button', { name: 'Worker assessment' });
+    fireEvent.click(expandButton);
+
+    await screen.findByText('Worker assessment');
+    expect(screen.queryByText(/Estimated VRAM/)).not.toBeInTheDocument();
+  });
 });

@@ -765,7 +765,13 @@ function JobsTable({
                       style={{ borderBottom: isOpen ? undefined : 'none' }}
                     >
                       <Collapse in={isOpen}>
-                        {isOpen && <AssessmentPanel jobId={job.id} estVram={job.est_vram_gb} />}
+                        {isOpen && (
+                          <AssessmentPanel
+                            jobId={job.id}
+                            estVram={job.est_vram_gb}
+                            isModelFetch={job.kind === 'model_fetch'}
+                          />
+                        )}
                       </Collapse>
                     </Table.Td>
                   </Table.Tr>
@@ -808,7 +814,19 @@ const VERDICT_META: Record<string, { color: string; icon: typeof IconCircleCheck
   ineligible: { color: 'red', icon: IconCircleX },
 };
 
-function AssessmentPanel({ jobId, estVram }: { jobId: string; estVram: number | null }) {
+function AssessmentPanel({
+  jobId,
+  estVram,
+  isModelFetch,
+}: {
+  jobId: string;
+  estVram: number | null;
+  /** `model_fetch` jobs always have `est_vram_gb: null` (design doc §4) and
+   * still show the badge as "—" -- an ordinary `prompt` job can also have a
+   * null estimate (see `assess.estimate_vram`), and for those the badge
+   * stays hidden entirely, matching pre-model_fetch behaviour. */
+  isModelFetch: boolean;
+}) {
   const { t } = useTranslation();
   const theme = useMantineTheme();
   const [assessment, setAssessment] = useState<Assessment | null>(null);
@@ -837,9 +855,11 @@ function AssessmentPanel({ jobId, estVram }: { jobId: string; estVram: number | 
         <Text size="sm" fw={600}>
           {t('jobs.assessment')}
         </Text>
-        <Badge variant="default" tt="none" fw={400} size="sm">
-          {t('jobs.est_vram', { value: formatGb(estVram) })}
-        </Badge>
+        {(estVram !== null || isModelFetch) && (
+          <Badge variant="default" tt="none" fw={400} size="sm">
+            {t('jobs.est_vram', { value: formatGb(estVram) })}
+          </Badge>
+        )}
       </Group>
 
       {failed ? (
