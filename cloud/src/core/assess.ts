@@ -248,6 +248,39 @@ const MIN_PEER_FETCH_PROTOCOL = 4;
  * ordinary manifest entry keeps its existing floor. */
 export const MIN_UNVERIFIED_FETCH_PROTOCOL = 5;
 
+/** 2026-09-19 model_fetch (final-review I1): hello.protocol below which an
+ * agent cannot be handed a `kind=model_fetch` JOB at all -- ports assess.py's
+ * `_MIN_MODEL_FETCH_PROTOCOL`. Distinct from `MIN_UNVERIFIED_FETCH_PROTOCOL`
+ * in WHAT it keys off: that one gates an unverified *entry*, this one gates
+ * the *job kind*, whatever its entry.
+ *
+ * The entry-keyed gate is not enough on its own. Spec §5.1 row 4 dispatches a
+ * name the manifest already covers as its VERIFIED entry, which leaves
+ * `unverifiedModels` empty -- and a worker that has meanwhile learned the
+ * model itself has no missing model at all, so no model-name-keyed gate can
+ * ever fire. A protocol 3/4 agent does not know the `kind` field, so it
+ * treats such a push as an ordinary prompt: it sends a stage-less busy
+ * heartbeat (setting `started_at`, which spec §8 says is never set) and then
+ * runs the `{}` placeholder workflow, which fails. */
+export const MIN_MODEL_FETCH_PROTOCOL = MIN_UNVERIFIED_FETCH_PROTOCOL;
+
+/** The `reasons` string a model_fetch job's refusal carries when the ONLY
+ * thing wrong with a candidate is its protocol version -- ports assess.py's
+ * `MODEL_FETCH_PROTOCOL_REASON`. */
+export const MODEL_FETCH_PROTOCOL_REASON = "model_fetch_protocol";
+
+/** Whether `worker` may be handed a `kind=model_fetch` job at all -- ports
+ * assess.py's `model_fetch_protocol_ok`.
+ *
+ * Deliberately exported and deliberately NOT folded into `verdict`: `verdict`
+ * judges a job's *needs* (`JobNeeds`), which carry no kind, so the two callers
+ * that do know the job row -- `dispatch.assignJobs` (the per-worker verdict
+ * path) and `model_fetch.createFetchJob` (the submission-time `no_worker`
+ * decision) -- apply it themselves against the same single predicate. */
+export function modelFetchProtocolOk(worker: Worker): boolean {
+  return workerProtocol(worker) >= MIN_MODEL_FETCH_PROTOCOL;
+}
+
 /** `worker.protocol`, normalized the same way every fetch-eligibility gate
  * here needs it: missing/non-integer degrades to 1 (the oldest,
  * least-capable value), never throws -- ports assess.py's `_worker_protocol`.

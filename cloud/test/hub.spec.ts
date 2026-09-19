@@ -239,6 +239,32 @@ describe("model_fetch dispatch (spec §7)", () => {
     ws.close();
   });
 
+  for (const [protocol, pushed] of [[3, false], [4, false], [5, true]] as [number, boolean][]) {
+    it(`${pushed ? "dispatches" : "refuses"} a VERIFIED-entry model_fetch job at protocol ${protocol}`, async () => {
+      // Final-review I1: a model_fetch job whose entry is VERIFIED leaves the
+      // tick's `unverifiedModels` empty, so the entry-keyed gate cannot fire
+      // and the floor would fall back to the protocol>=3 auto-fetch one. A
+      // protocol 3/4 agent does not know the `kind` field: it would set
+      // `started_at` (spec §8 says never) and run the `{}` placeholder
+      // workflow. The job kind is therefore its own gate.
+      const { ws } = await connectFetchReadyAgent(protocol);
+      const [jobId] = await makeModelFetchJob("unknown_vae.safetensors", { unverified: false });
+
+      if (pushed) {
+        const pushedPromise = nextMessage(ws);
+        await runDurableObjectAlarm(hub());
+        const frame = await pushedPromise;
+        expect(frame.job_id).toBe(jobId);
+        expect(frame.kind).toBe("model_fetch");
+      } else {
+        await runDurableObjectAlarm(hub());
+        await expectNoMessage(ws, 100);
+      }
+      expect((await getJobById(db(), jobId))!.status).toBe(pushed ? "assigned" : "queued");
+      ws.close();
+    });
+  }
+
   it("prefers the real manifest entry over the job's own on a name collision", async () => {
     // `ae.safetensors` 是 curated（有官方核可的 sha256），所以就算單子上存的
     // 是未驗證項目，派工時合併仍以真 manifest 為準。

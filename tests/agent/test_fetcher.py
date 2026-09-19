@@ -56,8 +56,14 @@ class _StreamSpec:
 
 
 class _FakeStreamCtx:
-    def __init__(self, spec: _StreamSpec):
+    def __init__(self, spec: _StreamSpec, url: str = "http://models.example/f.bin"):
         self._spec = spec
+        # `url`/`history` mirror what a real `httpx.Response` exposes; the
+        # unverified-entry redirect-scheme guard (`_redirect_scheme_violation`)
+        # reads both, and a fake that omitted them would let the guard pass on
+        # an attribute error instead of on the actual scheme.
+        self.url = httpx.URL(url)
+        self.history = []
 
     async def __aenter__(self):
         if self._spec.raise_exc is not None:
@@ -102,7 +108,7 @@ def _client_factory(specs_by_call: list[_StreamSpec], recorded_urls: list):
 
         def stream(self, method, url, timeout=None):
             recorded_urls.append(url)
-            return _FakeStreamCtx(specs_by_call.pop(0))
+            return _FakeStreamCtx(specs_by_call.pop(0), url)
 
     return _FakeAsyncClient
 
@@ -1768,6 +1774,120 @@ async def test_unverified_entry_never_tries_backup_url(tmp_path):
 
     assert recorded == [entry["url"], entry["url"]]
     assert entry["backup_url"] not in str(exc_info.value)
+
+
+async def test_unverified_entry_refuses_an_https_to_http_redirect(tmp_path):
+    """Final-review I2: an unverified entry has NO sha256, so "https to a
+    platform-approved origin" is its entire integrity story -- a redirect
+    chain that drops to plaintext voids it silently. The fetch must fail
+    before a single body byte is consumed, name the scheme, and leave no
+    `.part` behind."""
+    signing_key, pubkey_hex = _keypair()
+    entry = _unverified_entry(
+        signing_key, url="https://huggingface.co/x/ae.safetensors", size_bytes=5
+    )
+    served = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        served.append(str(request.url))
+        if request.url.scheme == "https":
+            return httpx.Response(302, headers={"Location": "http://huggingface.co/x/ae.safetensors"})
+        return httpx.Response(200, content=b"hello")
+
+    transport = httpx.MockTransport(handler)
+
+    def client_factory(**kwargs):
+        return httpx.AsyncClient(transport=transport, **kwargs)
+
+    with pytest.raises(fetcher.FetchError) as exc_info:
+        await fetcher.fetch_and_verify_models(
+            entries=[entry],
+            platform_pubkey_hex=pubkey_hex,
+            models_dir=str(tmp_path),
+            max_fetch_gb=1,
+            cancel_event=asyncio.Event(),
+            report_progress=_noop_progress,
+            client_factory=client_factory,
+        )
+
+    assert "scheme=http" in str(exc_info.value)
+    assert not (tmp_path / "vae" / "ae.safetensors").exists()
+    assert not (tmp_path / "vae" / "ae.safetensors.part").exists()
+    # Refused outright, not retried: a retry walks the same chain into the
+    # same plaintext hop (and an unverified entry has no second source).
+    assert served == [
+        "https://huggingface.co/x/ae.safetensors",
+        "http://huggingface.co/x/ae.safetensors",
+    ]
+
+
+async def test_unverified_entry_allows_an_https_to_https_redirect(tmp_path):
+    """The guard is about the SCHEME, not about redirects: an https chain is
+    followed exactly as before."""
+    signing_key, pubkey_hex = _keypair()
+    entry = _unverified_entry(
+        signing_key, url="https://huggingface.co/x/ae.safetensors", size_bytes=5
+    )
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.host == "huggingface.co":
+            return httpx.Response(302, headers={"Location": "https://cdn.example/final"})
+        return httpx.Response(200, content=b"hello")
+
+    transport = httpx.MockTransport(handler)
+
+    def client_factory(**kwargs):
+        return httpx.AsyncClient(transport=transport, **kwargs)
+
+    out = await fetcher.fetch_and_verify_models(
+        entries=[entry],
+        platform_pubkey_hex=pubkey_hex,
+        models_dir=str(tmp_path),
+        max_fetch_gb=1,
+        cancel_event=asyncio.Event(),
+        report_progress=_noop_progress,
+        client_factory=client_factory,
+    )
+
+    assert out[0]["sha256"] == hashlib.sha256(b"hello").hexdigest()
+    assert (tmp_path / "vae" / "ae.safetensors").read_bytes() == b"hello"
+
+
+async def test_verified_entry_is_unaffected_by_an_https_to_http_redirect(tmp_path):
+    """A VERIFIED entry keeps following redirects wherever they go: its
+    sha256 catches substituted bytes whatever the transport did, and this
+    path predates the guard."""
+    signing_key, pubkey_hex = _keypair()
+    content = b"verified-weights"
+    entry = _signed_entry(
+        signing_key,
+        name="model.safetensors",
+        directory="checkpoints",
+        content=content,
+        url="https://models.example/start",
+    )
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/start":
+            return httpx.Response(302, headers={"Location": "http://models.example/final"})
+        return httpx.Response(200, content=content)
+
+    transport = httpx.MockTransport(handler)
+
+    def client_factory(**kwargs):
+        return httpx.AsyncClient(transport=transport, **kwargs)
+
+    await fetcher.fetch_and_verify_models(
+        entries=[entry],
+        platform_pubkey_hex=pubkey_hex,
+        models_dir=str(tmp_path),
+        max_fetch_gb=100,
+        cancel_event=asyncio.Event(),
+        report_progress=_noop_progress,
+        client_factory=client_factory,
+    )
+
+    assert (tmp_path / "checkpoints" / "model.safetensors").read_bytes() == content
 
 
 async def test_verified_entries_still_return_their_verified_sha_in_order(tmp_path):

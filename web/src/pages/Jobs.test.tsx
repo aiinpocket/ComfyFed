@@ -369,7 +369,11 @@ describe('Jobs page: model_fetch jobs (panel Download button)', () => {
     expect(screen.queryByText('Model fetch')).not.toBeInTheDocument();
   });
 
-  it('shows a dash for VRAM (no estimate) on a queued model_fetch job\'s assessment panel', async () => {
+  // Spec §11: a model_fetch job shows the "Model fetch" label and NO VRAM
+  // column -- not even as a "—". It runs no inference, so an estimated-VRAM
+  // figure is not a fact about it at all. (Final-review I3: the Task 9 fix
+  // round scoped the badge TO model_fetch jobs instead of away from them.)
+  it('shows no VRAM badge on a queued model_fetch job assessment panel', async () => {
     const queuedFetchJob: Job = { ...MODEL_FETCH_JOB, status: 'queued', progress: 0 };
     stubFetch([[queuedFetchJob]]);
     renderJobs();
@@ -377,12 +381,26 @@ describe('Jobs page: model_fetch jobs (panel Download button)', () => {
     const expandButton = await screen.findByRole('button', { name: 'Worker assessment' });
     fireEvent.click(expandButton);
 
-    expect(await screen.findByText('Estimated VRAM: —')).toBeInTheDocument();
+    await screen.findByText('Worker assessment');
+    expect(screen.queryByText(/Estimated VRAM/)).not.toBeInTheDocument();
+  });
+
+  // ...and a model_fetch job with a (spurious) non-null estimate still shows
+  // nothing: the gate is the job kind, not the value.
+  it('shows no VRAM badge on a model_fetch job even with a non-null estimate', async () => {
+    const queuedFetchJob: Job = { ...MODEL_FETCH_JOB, status: 'queued', progress: 0, est_vram_gb: 12 };
+    stubFetch([[queuedFetchJob]]);
+    renderJobs();
+
+    const expandButton = await screen.findByRole('button', { name: 'Worker assessment' });
+    fireEvent.click(expandButton);
+
+    await screen.findByText('Worker assessment');
+    expect(screen.queryByText(/Estimated VRAM/)).not.toBeInTheDocument();
   });
 
   // Regression lock (review round 1): the VRAM badge must stay hidden for an
-  // ordinary prompt job with a null estimate -- only a model_fetch job's
-  // (always-null) estimate should render as a "—" badge.
+  // ordinary prompt job with a null estimate.
   it('shows no VRAM badge on a queued ordinary prompt job with a null estimate', async () => {
     const queuedPromptJob: Job = { ...RUNNING_JOB, id: 'job-queued-0010', status: 'queued', progress: 0, est_vram_gb: null };
     stubFetch([[queuedPromptJob]]);
@@ -393,5 +411,18 @@ describe('Jobs page: model_fetch jobs (panel Download button)', () => {
 
     await screen.findByText('Worker assessment');
     expect(screen.queryByText(/Estimated VRAM/)).not.toBeInTheDocument();
+  });
+
+  // ...and is still SHOWN for an ordinary prompt job that HAS an estimate,
+  // the pre-model_fetch behaviour this feature must not disturb.
+  it('shows the VRAM badge on a queued ordinary prompt job with an estimate', async () => {
+    const queuedPromptJob: Job = { ...RUNNING_JOB, id: 'job-queued-0011', status: 'queued', progress: 0, est_vram_gb: 8.5 };
+    stubFetch([[queuedPromptJob]]);
+    renderJobs();
+
+    const expandButton = await screen.findByRole('button', { name: 'Worker assessment' });
+    fireEvent.click(expandButton);
+
+    expect(await screen.findByText(/Estimated VRAM/)).toBeInTheDocument();
   });
 });

@@ -821,10 +821,11 @@ function AssessmentPanel({
 }: {
   jobId: string;
   estVram: number | null;
-  /** `model_fetch` jobs always have `est_vram_gb: null` (design doc §4) and
-   * still show the badge as "—" -- an ordinary `prompt` job can also have a
-   * null estimate (see `assess.estimate_vram`), and for those the badge
-   * stays hidden entirely, matching pre-model_fetch behaviour. */
+  /** Spec §11: a `kind=model_fetch` job does NOT show the VRAM column at
+   * all -- it runs no inference, so "estimated VRAM" is not a fact about it,
+   * not even as a "—". A `prompt` job is unchanged: the badge is hidden when
+   * the estimate is null (see `assess.estimate_vram`) and shown when it is
+   * not, exactly as before model_fetch existed. */
   isModelFetch: boolean;
 }) {
   const { t } = useTranslation();
@@ -855,7 +856,7 @@ function AssessmentPanel({
         <Text size="sm" fw={600}>
           {t('jobs.assessment')}
         </Text>
-        {(estVram !== null || isModelFetch) && (
+        {estVram !== null && !isModelFetch && (
           <Badge variant="default" tt="none" fw={400} size="sm">
             {t('jobs.est_vram', { value: formatGb(estVram) })}
           </Badge>

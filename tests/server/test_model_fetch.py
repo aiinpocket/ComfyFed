@@ -52,11 +52,72 @@ def _client(handler):
 
 
 def test_head_size_bytes_follows_redirect_and_reads_content_length():
+    """An allowlisted -> allowlisted redirect is followed by hand and the
+    final hop's Content-Length is what comes back."""
     def handler(request):
         if request.url.path == "/a":
-            return httpx.Response(302, headers={"location": "https://cdn.example/b"})
+            return httpx.Response(302, headers={"location": "https://civitai.com/b"})
         return httpx.Response(200, headers={"content-length": "12345"})
     assert model_fetch.head_size_bytes("https://huggingface.co/a", client_factory=_client(handler)) == 12345
+
+
+def test_head_size_bytes_follows_a_relative_redirect():
+    """A relative Location resolves against the hop that issued it, so it
+    stays on the allowlisted origin rather than failing the origin check."""
+    def handler(request):
+        if request.url.path == "/a":
+            return httpx.Response(302, headers={"location": "/b"})
+        assert request.url.host == "huggingface.co"
+        return httpx.Response(200, headers={"content-length": "777"})
+    assert model_fetch.head_size_bytes("https://huggingface.co/a", client_factory=_client(handler)) == 777
+
+
+@pytest.mark.parametrize("location", [
+    "http://127.0.0.1:6379/",          # SSRF / internal port oracle
+    "https://192.168.1.10:8080/x",     # LAN address
+    "https://evil.example/x",          # simply off the allowlist
+    "https://huggingface.co.evil.com/x",  # the prefix-match trap, one hop later
+    "https://huggingface.co:8443/x",   # right host, different endpoint
+])
+def test_head_size_bytes_refuses_a_redirect_off_the_allowlist(location):
+    """Final-review I4: the allowlist is checked BEFORE the first request,
+    but a redirect would otherwise carry the probe anywhere. Every hop must
+    clear `is_trusted_url`, and the off-allowlist hop is never requested at
+    all (the handler asserts it is not)."""
+    requested = []
+
+    def handler(request):
+        requested.append(str(request.url))
+        if request.url.path == "/a":
+            return httpx.Response(302, headers={"location": location})
+        raise AssertionError(f"off-allowlist hop was actually requested: {request.url}")
+
+    with pytest.raises(model_fetch.HeadError) as exc:
+        model_fetch.head_size_bytes("https://huggingface.co/a", client_factory=_client(handler))
+    # Reuses the pre-HEAD allowlist code so the panel gets the existing
+    # `model_fetch.untrusted_url` 400 and its existing message.
+    assert exc.value.code == "untrusted_url"
+    assert requested == ["https://huggingface.co/a"]
+
+
+def test_head_size_bytes_refuses_more_than_five_redirect_hops():
+    """A redirect loop (or a very long chain) must not spin here."""
+    def handler(request):
+        n = int(request.url.path.lstrip("/") or 0)
+        return httpx.Response(302, headers={"location": f"https://huggingface.co/{n + 1}"})
+
+    with pytest.raises(model_fetch.HeadError) as exc:
+        model_fetch.head_size_bytes("https://huggingface.co/0", client_factory=_client(handler))
+    assert exc.value.code == "size_unknown"
+    assert "too many redirects" in str(exc.value)
+
+
+def test_head_size_bytes_redirect_without_location_is_size_unknown():
+    def handler(request):
+        return httpx.Response(302)
+    with pytest.raises(model_fetch.HeadError) as exc:
+        model_fetch.head_size_bytes("https://huggingface.co/a", client_factory=_client(handler))
+    assert exc.value.code == "size_unknown"
 
 
 @pytest.mark.parametrize("status", [401, 403])
@@ -293,9 +354,13 @@ def test_model_fetch_entry_signature_verifies_with_the_platform_key(logged_in_cl
 def test_model_fetch_uses_verified_manifest_entry_when_known(logged_in_client):
     """`RealESRGAN_x4plus.pth` is curated with an operator-vouched sha256, so
     `model_manifest.entries()` signs a zero-holder VERIFIED entry for it --
-    the url in the request is ignored entirely (no allowlist check, no HEAD)
-    and a plain protocol-3 worker is enough."""
-    _register_worker(logged_in_client, protocol=3, max_fetch_gb=30)
+    the url in the request is ignored entirely (no allowlist check, no HEAD).
+
+    Final-review I1: the entry being verified does NOT relax the protocol
+    floor. The spec's §5.1 row-4 carve-out ("沿用既有 >=3") was wrong -- a
+    protocol-3/4 agent ignores the `kind` field entirely and would run the
+    `{}` placeholder workflow -- so protocol 5 is required here too."""
+    _register_worker(logged_in_client, protocol=5, max_fetch_gb=30)
     r = _post(
         logged_in_client,
         name="RealESRGAN_x4plus.pth",
@@ -308,6 +373,28 @@ def test_model_fetch_uses_verified_manifest_entry_when_known(logged_in_client):
     assert entry.get("unverified") is not True
     assert len(entry["sha256"]) == 64
     assert entry["url"] != "https://evil.example/ignored"
+
+
+@pytest.mark.parametrize("protocol", [3, 4])
+def test_model_fetch_verified_entry_still_needs_protocol_5(logged_in_client, protocol):
+    """Final-review I1: a curated (VERIFIED) entry leaves `unverified` empty,
+    so the entry-keyed protocol gate cannot fire -- and without the kind-keyed
+    one a protocol 3/4 worker would be offered a `kind=model_fetch` job it
+    does not understand, set `started_at` (spec §8 says never) and fail the
+    `{}` placeholder workflow. The refusal names the protocol as the reason,
+    not "nobody has the disk"."""
+    _register_worker(logged_in_client, protocol=protocol, max_fetch_gb=30)
+    r = _post(
+        logged_in_client,
+        name="RealESRGAN_x4plus.pth",
+        directory="upscale_models",
+        url="https://huggingface.co/x/resolve/main/RealESRGAN_x4plus.pth",
+    )
+    assert r.status_code == 400, r.text
+    assert r.json()["error"] == "model_fetch.no_worker"
+    assert "model_fetch_protocol:RealESRGAN_x4plus.pth" in r.json()["message"]
+    with db.get_session() as s:
+        assert s.query(db.Job).filter(db.Job.kind == "model_fetch").count() == 0
 
 
 def test_model_fetch_status_404_for_prompt_jobs(logged_in_client):
@@ -332,7 +419,7 @@ def test_model_fetch_curated_name_ignores_the_requested_url(logged_in_client, mo
         raise AssertionError("HEAD must not be probed for a manifest-covered name")
 
     monkeypatch.setattr(model_fetch, "head_size_bytes", _explode)
-    _register_worker(logged_in_client, protocol=3, max_fetch_gb=30)
+    _register_worker(logged_in_client, protocol=5, max_fetch_gb=30)
     r = _post(
         logged_in_client,
         name="ae.safetensors",
@@ -379,15 +466,21 @@ def test_model_fetch_rejects_non_object_bodies(logged_in_client):
 
 def test_model_fetch_no_worker_message_lists_the_real_reason(logged_in_client, monkeypatch):
     """§5.1 row 7: the 400 must say WHY, using `assess`'s own reason strings
-    -- "your agent is too old for an unverified source" has to be tellable
-    apart from "nobody has the disk for it"."""
+    -- "your agent is too old" has to be tellable apart from "nobody has the
+    disk for it".
+
+    Final-review I1: at protocol 4 the KIND gate is what refuses now, and it
+    refuses before `verdict` is ever consulted, so the reason is
+    `model_fetch_protocol:` rather than `missing_models_unverified_protocol:`.
+    The distinguishability the row asks for is unchanged -- and the reason is
+    now true for a verified entry too, which the entry-keyed one never was."""
     _register_worker(logged_in_client, protocol=4)
     monkeypatch.setattr(model_fetch, "head_size_bytes", lambda url, **k: 335_000_000)
     r = _post(logged_in_client, **BODY)
     assert r.status_code == 400
     assert r.json()["error"] == "model_fetch.no_worker"
     message = r.json()["message"]
-    assert "missing_models_unverified_protocol:unknown_vae.safetensors" in message
+    assert "model_fetch_protocol:unknown_vae.safetensors" in message
     # 通用句子仍在前面（zh-TW 先、English 後）。
     assert message.startswith("目前沒有可下載的 worker")
 
@@ -401,6 +494,7 @@ def test_model_fetch_no_worker_message_reports_the_disk_reason(logged_in_client,
     assert r.status_code == 400
     message = r.json()["message"]
     assert "missing_models_unverified_protocol" not in message
+    assert "model_fetch_protocol:" not in message
     assert "unknown_vae.safetensors" in message
 
 

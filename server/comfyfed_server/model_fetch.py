@@ -23,6 +23,9 @@ logger = logging.getLogger(__name__)
 
 TRUSTED_ORIGINS: frozenset[str] = frozenset({"https://huggingface.co", "https://civitai.com"})
 _HEAD_TIMEOUT_SECONDS = 10.0
+# Redirect hops `head_size_bytes` will follow by hand before giving up
+# (final-review I4). Mirrored by the cloud stack's `HEAD_MAX_REDIRECTS`.
+_HEAD_MAX_REDIRECTS = 5
 
 
 def is_trusted_url(url: str) -> bool:
@@ -52,7 +55,11 @@ def is_trusted_url(url: str) -> bool:
 
 
 class HeadError(Exception):
-    """`code` is "gated" (401/403) or "size_unknown" (anything else)."""
+    """`code` is "gated" (401/403), "untrusted_url" (a redirect hop left the
+    allowlist -- deliberately the SAME code the pre-HEAD allowlist check
+    raises, since it is the same refusal and the panel's message table
+    already says exactly the right thing) or "size_unknown" (anything else).
+    """
 
     def __init__(self, code: str, detail: str = "") -> None:
         super().__init__(detail or code)
@@ -61,7 +68,8 @@ class HeadError(Exception):
 
 def head_size_bytes(url: str, *, client_factory=httpx.Client) -> int:
     """The exact byte length `url` advertises via `Content-Length`, probed
-    with a redirect-following HEAD and a 10 s timeout.
+    with a HEAD (10 s timeout) whose redirects are followed BY HAND so that
+    every hop can be allowlist-checked before it is requested.
 
     The signed entry pins `size_bytes` (§6) and an unverified entry has no
     sha256 for the agent to check instead -- so a source that will not state
@@ -69,14 +77,42 @@ def head_size_bytes(url: str, *, client_factory=httpx.Client) -> int:
     that demands a login (401/403) is `gated` and reported as such rather
     than being retried by a worker that has no credentials either.
 
+    Redirects are NOT followed by httpx (final-review I4). The caller checks
+    the allowlist before the first request, but `follow_redirects=True` would
+    then let an attacker-influenced huggingface/civitai url bounce this
+    server at `http://127.0.0.1:…` or a LAN address -- an SSRF / port oracle
+    that any logged-in user could aim, and one that the 400's own codes
+    (`gated` for 401/403 vs `size_unknown` for everything else) would answer.
+    So every hop, INCLUDING the final url, must clear `is_trusted_url` before
+    it is requested, and the chain is capped at `_HEAD_MAX_REDIRECTS` hops so
+    a redirect loop cannot spin here. The cloud stack's `headSizeBytes` does
+    the identical thing with `redirect: "manual"`.
+
     `client_factory` exists so tests can inject an `httpx.MockTransport`
     client; production passes the default `httpx.Client`.
     """
     try:
         with client_factory(
-            timeout=httpx.Timeout(_HEAD_TIMEOUT_SECONDS), follow_redirects=True
+            timeout=httpx.Timeout(_HEAD_TIMEOUT_SECONDS), follow_redirects=False
         ) as client:
-            resp = client.head(url)
+            current = url
+            for _hop in range(_HEAD_MAX_REDIRECTS + 1):
+                if not is_trusted_url(current):
+                    raise HeadError("untrusted_url", f"redirect to {current}")
+                resp = client.head(current)
+                if not (300 <= resp.status_code < 400):
+                    break
+                location = resp.headers.get("location")
+                if not location:
+                    raise HeadError(
+                        "size_unknown", f"HTTP {resp.status_code} without Location"
+                    )
+                # Relative Locations are legal and common; resolve against
+                # the hop that issued them so the allowlist sees the real
+                # absolute url on the next pass.
+                current = str(httpx.URL(current).join(location))
+            else:
+                raise HeadError("size_unknown", "too many redirects")
     except httpx.HTTPError as exc:
         raise HeadError("size_unknown", str(exc)) from exc
     if resp.status_code in (401, 403):
@@ -266,6 +302,17 @@ def _no_worker_detail(
     needs = assess.JobNeeds(models={name}, nodes=set())
     reasons: list[str] = []
     for worker in online_enabled_workers:
+        # 2026-09-19 final-review I1: the kind gate is not something
+        # `verdict` can see (it judges `JobNeeds`, which carries no kind), so
+        # a candidate excluded purely for being too old to understand
+        # `kind=model_fetch` gets its reason stated here -- otherwise the
+        # panel would be told "no worker has the disk" about a fleet whose
+        # only problem is its agent version.
+        if not assess.model_fetch_protocol_ok(worker):
+            reason = f"{assess.MODEL_FETCH_PROTOCOL_REASON}:{name}"
+            if reason not in reasons:
+                reasons.append(reason)
+            continue
         try:
             v = assess.verdict(worker, needs, {}, [], fetchable, peer_only, unverified)
         except Exception:  # pragma: no cover - a judge crash must not mask the 400
@@ -336,8 +383,17 @@ def create_fetch_job(
     fetchable = {name: int(entry["size_bytes"])}
     with db.get_session() as session:
         online = jobs._online_enabled_workers(session)
+    # 2026-09-19 final-review I1: EVERY model_fetch job needs a protocol>=5
+    # agent, not just one carrying an unverified entry -- row 4 above hands
+    # out a VERIFIED entry, which leaves `unverified` empty and would let the
+    # fleet-wide gate fall back to the protocol>=3 auto-fetch floor. Older
+    # candidates are dropped before the gate rather than inside it so the
+    # same single predicate (`assess.model_fetch_protocol_ok`) decides here
+    # and at dispatch; `_no_worker_detail` still sees the FULL online list so
+    # it can say "your agent is too old" about them.
+    capable = [w for w in online if assess.model_fetch_protocol_ok(w)]
     _ok, blocked = assess.partition_fleet_fetchable(
-        {name}, fetchable, online, peer_only, unverified
+        {name}, fetchable, capable, peer_only, unverified
     )
     if blocked:
         raise FetchRequestError(

@@ -112,7 +112,7 @@ function headerResponse(status: number, headers?: Record<string, string>): Respo
 }
 
 describe("headSizeBytes", () => {
-  it("issues a redirect-following HEAD and reads Content-Length", async () => {
+  it("issues a manual-redirect HEAD and reads Content-Length", async () => {
     const seen: { url?: string; init?: RequestInit } = {};
     const size = await modelFetch.headSizeBytes(
       "https://huggingface.co/a",
@@ -120,11 +120,88 @@ describe("headSizeBytes", () => {
     );
     expect(size).toBe(12345);
     expect(seen.init?.method).toBe("HEAD");
-    // Redirect following is the runtime's job here (Python asks httpx for it
-    // with `follow_redirects=True`), so what this stack can assert is that it
-    // is actually requested -- the default is "follow" but relying on a
-    // default would silently regress if a caller ever changed it.
-    expect(seen.init?.redirect).toBe("follow");
+    // Final-review I4: redirects are followed BY HAND so every hop can be
+    // allowlist-checked before it is requested. `redirect: "follow"` would
+    // hand the runtime a chain this code never sees.
+    expect(seen.init?.redirect).toBe("manual");
+  });
+
+  it("follows an allowlisted -> allowlisted redirect", async () => {
+    const asked: string[] = [];
+    const size = await modelFetch.headSizeBytes(
+      "https://huggingface.co/a",
+      fakeFetch((url) => {
+        asked.push(url);
+        return url.endsWith("/a")
+          ? headerResponse(302, { location: "https://civitai.com/b" })
+          : headerResponse(200, { "content-length": "12345" });
+      })
+    );
+    expect(size).toBe(12345);
+    expect(asked).toEqual(["https://huggingface.co/a", "https://civitai.com/b"]);
+  });
+
+  it("resolves a relative Location against the hop that issued it", async () => {
+    const asked: string[] = [];
+    const size = await modelFetch.headSizeBytes(
+      "https://huggingface.co/a",
+      fakeFetch((url) => {
+        asked.push(url);
+        return url.endsWith("/a")
+          ? headerResponse(302, { location: "/b" })
+          : headerResponse(200, { "content-length": "777" });
+      })
+    );
+    expect(size).toBe(777);
+    expect(asked).toEqual(["https://huggingface.co/a", "https://huggingface.co/b"]);
+  });
+
+  const offAllowlist = [
+    "http://127.0.0.1:6379/",
+    "https://192.168.1.10:8080/x",
+    "https://evil.example/x",
+    "https://huggingface.co.evil.com/x",
+    "https://huggingface.co:8443/x",
+  ];
+  for (const location of offAllowlist) {
+    it(`refuses a redirect to ${location}`, async () => {
+      // Final-review I4: the allowlist is checked BEFORE the first request,
+      // but a redirect would otherwise carry the probe anywhere -- SSRF / a
+      // port oracle on the self-hosted twin. The off-allowlist hop is never
+      // requested at all.
+      const asked: string[] = [];
+      await expect(
+        modelFetch.headSizeBytes(
+          "https://huggingface.co/a",
+          fakeFetch((url) => {
+            asked.push(url);
+            if (url.endsWith("/a")) return headerResponse(302, { location });
+            throw new Error(`off-allowlist hop was actually requested: ${url}`);
+          })
+        )
+        // Reuses the pre-HEAD allowlist code so the panel gets the existing
+        // `model_fetch.untrusted_url` 400 and its existing message.
+      ).rejects.toMatchObject({ code: "untrusted_url" });
+      expect(asked).toEqual(["https://huggingface.co/a"]);
+    });
+  }
+
+  it("refuses more than five redirect hops", async () => {
+    let n = 0;
+    await expect(
+      modelFetch.headSizeBytes(
+        "https://huggingface.co/0",
+        fakeFetch(() => headerResponse(302, { location: `https://huggingface.co/${++n}` }))
+      )
+    ).rejects.toMatchObject({ code: "size_unknown" });
+    // 1 initial request + 5 followed hops, then it gives up.
+    expect(n).toBe(6);
+  });
+
+  it("treats a redirect without a Location as size_unknown", async () => {
+    await expect(
+      modelFetch.headSizeBytes("https://huggingface.co/a", fakeFetch(() => headerResponse(302)))
+    ).rejects.toMatchObject({ code: "size_unknown" });
   });
 
   for (const status of [401, 403]) {
@@ -427,9 +504,12 @@ describe("POST /comfy/api/comfyfed/model-fetch", () => {
     // `RealESRGAN_x4plus.pth` is curated with an operator-vouched sha256, so
     // `modelManifest.entries()` signs a zero-holder VERIFIED entry for it --
     // the url in the request is ignored entirely (no allowlist check, no
-    // HEAD) and a plain protocol-3 worker is enough.
+    // HEAD). Final-review I1: the entry being verified does NOT relax the
+    // protocol floor -- a protocol 3/4 agent ignores the `kind` field and
+    // would run the `{}` placeholder workflow -- so protocol 5 is needed here
+    // too.
     const session = await loginSession();
-    await registerWorker(session, { protocol: 3, maxFetchGb: 30 });
+    await registerWorker(session, { protocol: 5, maxFetchGb: 30 });
     const res = await post(session, {
       name: "RealESRGAN_x4plus.pth",
       directory: "upscale_models",
@@ -448,7 +528,7 @@ describe("POST /comfy/api/comfyfed/model-fetch", () => {
     // allowlisted request url never reaches the signed entry -- and no HEAD
     // is issued at all (the injected probe would blow up if it were).
     const session = await loginSession();
-    await registerWorker(session, { protocol: 3, maxFetchGb: 30 });
+    await registerWorker(session, { protocol: 5, maxFetchGb: 30 });
     stubHead(async () => {
       throw new Error("HEAD must not be probed for a manifest-covered name");
     });
@@ -468,9 +548,11 @@ describe("POST /comfy/api/comfyfed/model-fetch", () => {
 });
 
 describe("no_worker message (spec §5.1 row 7)", () => {
-  it("names the unverified-protocol reason verbatim", async () => {
-    // "your agent is too old for an unverified source" has to be tellable
-    // apart from "nobody has the disk for it".
+  it("names the protocol reason verbatim", async () => {
+    // "your agent is too old" has to be tellable apart from "nobody has the
+    // disk for it". Final-review I1: at protocol 4 the KIND gate refuses
+    // before `verdict` is consulted, so the reason is `model_fetch_protocol:`
+    // -- and unlike the entry-keyed one it is also true for a verified entry.
     const session = await loginSession();
     await registerWorker(session, { protocol: 4 });
     stubHead(async () => 335_000_000);
@@ -478,7 +560,7 @@ describe("no_worker message (spec §5.1 row 7)", () => {
     const res = await post(session, BODY);
     expect(res.status).toBe(400);
     expect(res.body.error).toBe("model_fetch.no_worker");
-    expect(res.body.message).toContain("missing_models_unverified_protocol:unknown_vae.safetensors");
+    expect(res.body.message).toContain("model_fetch_protocol:unknown_vae.safetensors");
     expect(res.body.message.startsWith("目前沒有可下載的 worker")).toBe(true);
   });
 
@@ -490,6 +572,7 @@ describe("no_worker message (spec §5.1 row 7)", () => {
     const res = await post(session, BODY);
     expect(res.status).toBe(400);
     expect(res.body.message).not.toContain("missing_models_unverified_protocol");
+    expect(res.body.message).not.toContain("model_fetch_protocol:");
     expect(res.body.message).toContain("unknown_vae.safetensors");
   });
 

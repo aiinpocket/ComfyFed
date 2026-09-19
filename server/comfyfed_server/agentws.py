@@ -1902,6 +1902,20 @@ def _fetch_models_for_push(
     if not fetchable_models:
         return []
 
+    # 2026-09-19 model_fetch (final-review I1): a model_fetch job is only
+    # ever pushed to a protocol>=5 agent -- `dispatch.assign_jobs` refuses
+    # the pair and `dispatch_tick` refuses the push. Repeated here because
+    # this function is what actually hands an agent the entries to download,
+    # and an older agent given them would fetch the model and then run the
+    # `{}` placeholder workflow.
+    if job.kind == "model_fetch" and not assess.model_fetch_protocol_ok(worker):
+        logger.error(
+            "agentws: refusing fetch_models for model_fetch job %s to worker %s "
+            "(protocol=%r) -- the assign_jobs kind gate should have excluded it",
+            job.id, worker.id, getattr(worker, "protocol", None),
+        )
+        return []
+
     try:
         requirements_override = json.loads(job.requirements or "{}")
     except (TypeError, ValueError):
@@ -2074,6 +2088,22 @@ async def dispatch_tick() -> None:
         conn = _connections.get(worker_id)
         if conn is None:
             continue
+        with db.get_session() as session:
+            worker = session.get(db.Worker, worker_id)
+        # 2026-09-19 model_fetch (final-review I1): last line of defence for
+        # the protocol>=5 floor every model_fetch job carries. `assign_jobs`
+        # already refused this pair, so reaching here means that gate
+        # regressed -- the job stays queued for a worker that can actually
+        # run it rather than being handed to one that would run the `{}`
+        # placeholder workflow and fail it.
+        if job.kind == "model_fetch" and (
+            worker is None or not assess.model_fetch_protocol_ok(worker)
+        ):
+            logger.error(
+                "agentws: refusing to push model_fetch job %s to worker %s (protocol=%r)",
+                job.id, worker_id, getattr(worker, "protocol", None),
+            )
+            continue
         try:
             frame = {
                 "type": "job",
@@ -2087,8 +2117,6 @@ async def dispatch_tick() -> None:
             if job.kind == "model_fetch":
                 frame["kind"] = "model_fetch"
             if fetchable_models:
-                with db.get_session() as session:
-                    worker = session.get(db.Worker, worker_id)
                 if worker is not None:
                     fetch_models = _fetch_models_for_push(
                         job, worker, fetchable_models, manifest_by_name,

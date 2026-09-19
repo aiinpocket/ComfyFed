@@ -328,8 +328,8 @@ ComfyUI 原生前端在「缺模型」卡片上給的那顆 **Download** 鈕，�
 2. **已經有一張還在跑的同名下載單** → 不重複建單，回原本那張單的 `job_id`（`reused: true`）。
 3. **平台認得這個模型** → 走**已簽章下載清單**那條既有的路（curated 的 11 個內建模型，或聯邦已經學到共識雜湊的模型）：用清單裡那個帶 sha256 的正式項目，**完全忽略請求裡的網址**，連白名單與 HEAD 都不做。
 4. **平台不認得** → 才走「未驗證來源」：網址的**來源站**必須是 `https://huggingface.co` 或 `https://civitai.com`（比對解析後的 scheme＋host，不是字串開頭，所以 `https://huggingface.co.evil.com/...` 不會過；也只收 https 與預設埠）。
-5. **HEAD 探檔案大小** → 對網址發一次會跟隨轉址的 HEAD（10 秒逾時），必須讀得到 `Content-Length`；讀不到就是 `size_unknown`，回 401／403 就是 `gated`（需要登入的模型，例如 FLUX.1-dev 那幾個，平台與 worker 都沒有憑證，直接拒絕比讓 worker 下載到一半失敗好）。
-6. **挑 worker** → 必須**在線**、開了 `auto_fetch_models`、agent **0.1.14 以上**（protocol 5，才聽得懂未驗證項目）、磁碟餘裕**超過檔案大小的 1.2 倍**、而且檔案大小在它自己的 `max_fetch_gb` 額度內。一台都沒有就回 `no_worker`，訊息會列出**真正的原因**（是沒人夠新、還是沒人有磁碟／額度），不是一句籠統的「沒有 worker」。
+5. **HEAD 探檔案大小** → 對網址發 HEAD（10 秒逾時），必須讀得到 `Content-Length`；讀不到就是 `size_unknown`，回 401／403 就是 `gated`（需要登入的模型，例如 FLUX.1-dev 那幾個，平台與 worker 都沒有憑證，直接拒絕比讓 worker 下載到一半失敗好）。轉址是**平台自己一跳一跳跟**的，每一跳（含最後那個網址）都要再過一次第 4 步的白名單，否則當 `untrusted_url` 拒絕；最多跟 5 跳。這是為了不讓一個白名單內的網址把自架伺服器彈到 `http://127.0.0.1:…` 或內網位址去（SSRF／內部埠探測）。
+6. **挑 worker** → 必須**在線**、開了 `auto_fetch_models`、agent **0.1.14 以上**（protocol 5，第一個聽得懂 `kind=model_fetch` 的版本）、磁碟餘裕**超過檔案大小的 1.2 倍**、而且檔案大小在它自己的 `max_fetch_gb` 額度內。agent 版本這關**不分第 3 步還是第 4 步**：就算是平台認得、帶 sha256 的正式項目，舊 agent 也不會收到這張單——它根本不認得 `kind` 這個欄位，會把純下載單當成一般工作去跑那個空的 `{}` workflow，然後失敗。一台都沒有就回 `no_worker`，訊息會列出**真正的原因**（是沒人夠新、還是沒人有磁碟／額度），不是一句籠統的「沒有 worker」。
 
 **未驗證來源項目的信任模型**：平台不認得的模型沒有 sha256 可以給 agent 核對，所以簽章改簽**網址本身**——payload 是 `name|directory|url|size_bytes|unverified`，用平台金鑰（Ed25519）簽。agent 收到後驗簽章、只從這個網址下載、只接受這個大小，**不會**去試 P2P（沒有雜湊就沒有內容定址，找不到「同一個檔案」），下載完把自己量到的 sha256 隨 `job_done` 回報給平台。平台把它當成第一筆證據記進 `model_hashes`（既有的先到先贏／衝突規則照舊適用），從此這個模型對**其他** worker 就是一個正常的、帶雜湊的已驗證項目，可以走 P2P、可以被自動下載。換句話說：未驗證只有第一次。
 
@@ -338,6 +338,8 @@ ComfyUI 原生前端在「缺模型」卡片上給的那顆 **Download** 鈕，�
 **下載完要重新整理面板**：編輯器的節點定義（`/object_info`，模型下拉選單就是從這裡來的）**每次載入頁面只抓一次**，所以下載完成之後新模型不會自己出現在下拉選單裡——按 F5 重新整理一次就有了。另外 worker 端也要等下一輪（最多 10 分鐘）的本機模型掃描，伺服器才會正式把「這台也有了」記進庫存。
 
 **在主控台看得到**：這張單跟其他工作一樣出現在 Console 的「工作」頁，帶一個「**模型下載**」徽章；工作詳情頁會顯示模型名、來源網址，以及它是不是未驗證來源。
+
+**雲端版部署順序**：`jobs` 資料表的 `kind` 欄位是 D1 migration `0011` 加的，**Worker 程式碼一上線就會在每一筆建單 SQL 裡點名這個欄位**，所以 `0011` 必須在那份 Worker 部署**之前**套用，否則連普通的 prompt 送單都會壞（`no such column: kind`）。`npm run deploy` 就是照這個順序做的（先 `wrangler d1 migrations apply comfyfed --remote`，再 `wrangler deploy`），而 Workers Builds 的 Deploy command 也應該設成 `npm run deploy`，不要用面板預設的 `npx wrangler deploy`。
 
 ### 成員間 P2P 分塊傳輸
 

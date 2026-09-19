@@ -84,6 +84,29 @@ _MIN_PEER_FETCH_PROTOCOL = 4
 # parameter) -- every ordinary manifest entry keeps its existing floor.
 _MIN_UNVERIFIED_FETCH_PROTOCOL = 5
 
+# hello.protocol below which an agent cannot be handed a `kind=model_fetch`
+# JOB at all (2026-09-19 model_fetch, final-review I1). Distinct from
+# `_MIN_UNVERIFIED_FETCH_PROTOCOL` in WHAT it keys off: that one gates an
+# unverified *entry*, this one gates the *job kind*, whatever its entry.
+#
+# The entry-keyed gate is not enough on its own. Spec §5.1 row 4 dispatches
+# a name the manifest already covers as its VERIFIED entry, which leaves
+# `unverified_models` empty -- and a worker that has meanwhile learned the
+# model itself has no missing model at all, so no model-name-keyed gate can
+# ever fire. A protocol 3/4 agent does not know the `kind` field, so it
+# treats such a push as an ordinary prompt: it sends a stage-less busy
+# heartbeat (setting `started_at`, which spec §8 says is never set) and then
+# runs the `{}` placeholder workflow, which fails. Protocol 5 is the first
+# version that understands `kind=model_fetch`, so that is the floor for
+# every model_fetch job regardless of how its entry is sourced.
+_MIN_MODEL_FETCH_PROTOCOL = _MIN_UNVERIFIED_FETCH_PROTOCOL
+
+# The `reasons` string a model_fetch job's refusal carries when the ONLY
+# thing wrong with a candidate is its protocol version. Rendered verbatim
+# into the panel's `no_worker` 400 (`model_fetch._no_worker_detail`) and into
+# the console's assessment list, exactly like `missing_models_*`.
+MODEL_FETCH_PROTOCOL_REASON = "model_fetch_protocol"
+
 _BYTES_PER_GB = 1024**3
 
 
@@ -554,6 +577,22 @@ def _worker_protocol(worker) -> int:
     if not isinstance(protocol, int) or isinstance(protocol, bool):
         return 1
     return protocol
+
+
+def model_fetch_protocol_ok(worker) -> bool:
+    """Whether `worker` may be handed a `kind=model_fetch` job at all
+    (2026-09-19 model_fetch, final-review I1 -- see
+    `_MIN_MODEL_FETCH_PROTOCOL` for why this is keyed off the job kind and
+    not off the entry or the missing-model set).
+
+    Deliberately public and deliberately NOT folded into `verdict`: `verdict`
+    judges a job's *needs* (`JobNeeds`), which carry no kind, so the two
+    callers that do know the job row -- `dispatch.assign_jobs` (the
+    per-worker verdict path) and `model_fetch.create_fetch_job` (the
+    submission-time `no_worker` decision) -- apply it themselves against the
+    same single predicate, so the two can never drift.
+    """
+    return _worker_protocol(worker) >= _MIN_MODEL_FETCH_PROTOCOL
 
 
 def _worker_max_fetch_gb(worker) -> float:

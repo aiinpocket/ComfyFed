@@ -412,6 +412,35 @@ def _is_verified_mismatch(error: str) -> bool:
     return "size mismatch (" in error or error.endswith("sha256 mismatch")
 
 
+class _InsecureRedirect(Exception):
+    """Internal: a redirect hop of an UNVERIFIED entry's download left https.
+
+    Never retried and never folded into `_download_one`'s generic
+    network-error path -- retrying the same url just walks the same chain
+    into the same plaintext hop. `str()` is the offending scheme.
+    """
+
+
+def _redirect_scheme_violation(resp) -> Optional[str]:
+    """The first non-https scheme anywhere in `resp`'s redirect chain
+    (`resp.history` plus the final response's own url), or None when every
+    hop stayed on https.
+
+    Phase 3.5 final-review I2: the client follows redirects, and an
+    UNVERIFIED entry has no sha256 -- its entire integrity story is "https to
+    a platform-approved origin" (see `_validate_entry_shape`: plaintext would
+    let anyone on the path swap the bytes undetected). A chain that ends on
+    `http://` voids exactly that guarantee, silently, so it is refused before
+    a single body byte is consumed. A VERIFIED entry is unaffected: its hash
+    catches substituted bytes whatever the transport did.
+    """
+    for hop in list(getattr(resp, "history", []) or []) + [resp]:
+        scheme = (getattr(hop.url, "scheme", "") or "").lower()
+        if scheme != "https":
+            return scheme or "(none)"
+    return None
+
+
 async def _download_one(
     *,
     entry: dict,
@@ -443,7 +472,8 @@ async def _download_one(
     # mirror's bytes to the approved download, so it is not a fallback here.
     # (The server already sends `backup_url: null` for these; this makes the
     # agent side fail closed rather than trust that it always will.)
-    backup = None if entry.get("unverified") is True else (entry.get("backup_url") or None)
+    is_unverified = entry.get("unverified") is True
+    backup = None if is_unverified else (entry.get("backup_url") or None)
     sources = [u for u in (primary, backup) if u]
     if not sources:
         raise FetchError(f"模型 {name} 沒有可用的下載網址 / model {name} has no download url")
@@ -472,6 +502,13 @@ async def _download_one(
             written = 0
             try:
                 async with client.stream("GET", url, timeout=timeout) as resp:
+                    if is_unverified:
+                        # Before `raise_for_status`, before the body: a
+                        # downgraded chain must not be judged on its status
+                        # code, and nothing may be written to `.part`.
+                        bad_scheme = _redirect_scheme_violation(resp)
+                        if bad_scheme is not None:
+                            raise _InsecureRedirect(bad_scheme)
                     resp.raise_for_status()
                     if resp.is_redirect or 300 <= resp.status_code < 400:
                         # Belt-and-suspenders: the client is constructed with
@@ -491,6 +528,17 @@ async def _download_one(
             except JobCancelled:
                 _safe_unlink(part_path)
                 raise
+            except _InsecureRedirect as exc:
+                # Fail the whole fetch, not just this attempt: there is no
+                # second source for an unverified entry (`backup` is forced
+                # to None above) and a retry would follow the same chain.
+                _safe_unlink(part_path)
+                raise FetchError(
+                    f"模型 {name} 的下載被轉址到非 https 位址（scheme={exc}），"
+                    f"未驗證來源不接受這種降級 / model {name} was redirected to a "
+                    f"non-https url (scheme={exc}); an unverified-source download "
+                    f"refuses the scheme downgrade"
+                ) from exc
             except Exception as exc:
                 last_error = f"{url} -> {exc}"
                 logger.warning("fetcher: download attempt for %r from %s failed: %s", name, url, exc)

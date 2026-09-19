@@ -4362,6 +4362,65 @@ def test_model_fetch_not_pushed_to_protocol_4(client):
         assert session.get(db.Job, job_id).status == "queued"
 
 
+@pytest.mark.parametrize("protocol,pushed", [(3, False), (4, False), (5, True)])
+def test_model_fetch_with_a_verified_entry_still_needs_protocol_5(client, protocol, pushed):
+    """Final-review I1: a model_fetch job whose entry is VERIFIED leaves the
+    dispatch tick's `unverified_models` empty, so the entry-keyed gate cannot
+    fire and the floor would fall back to the protocol>=3 auto-fetch one. A
+    protocol 3/4 agent does not know the `kind` field: it would set
+    `started_at` (spec §8 says never) and run the `{}` placeholder workflow.
+    The job kind is therefore its own gate."""
+    csrf = _login(client)
+    worker_id, sk = _fetch_ready_worker(client, csrf, f"w{protocol}", protocol=protocol)
+    job_id, _entry = _make_model_fetch_job("unknown_vae.safetensors", unverified=False)
+
+    with client.websocket_connect("/api/agent/ws") as ws:
+        challenge = ws.receive_json()
+        sig = sk.sign(challenge["nonce"].encode()).signature.hex()
+        ws.send_json({"type": "auth", "worker_id": worker_id, "sig": sig})
+        assert ws.receive_json()["type"] == "ready"
+        _hello_and_idle(ws, protocol)
+        agentws.dispatch_once(worker_id)
+        if pushed:
+            frame = ws.receive_json()
+            assert frame["job_id"] == job_id and frame["kind"] == "model_fetch"
+
+    with db.get_session() as session:
+        assert session.get(db.Job, job_id).status == ("assigned" if pushed else "queued")
+
+
+@pytest.mark.parametrize("protocol,pushed", [(4, False), (5, True)])
+def test_model_fetch_needs_protocol_5_even_with_nothing_to_fetch(client, protocol, pushed):
+    """The hardest case for any model-name-keyed gate: the worker ALREADY
+    holds the model (it learned it since the button was pressed), so there is
+    no missing model for `unverified_models`/`peer_only_models` to be checked
+    against and `verdict` returns a plain `eligible`. Only the kind gate can
+    keep a protocol-4 agent away from the `{}` placeholder workflow."""
+    csrf = _login(client)
+    worker_id, sk = _fetch_ready_worker(client, csrf, f"w{protocol}", protocol=protocol)
+    job_id, _entry = _make_model_fetch_job("unknown_vae.safetensors")
+    with db.get_session() as session:
+        worker = session.get(db.Worker, worker_id)
+        worker.model_inventory = json.dumps(
+            [{"name": "vae/unknown_vae.safetensors", "size_bytes": 335_000_000}]
+        )
+        session.commit()
+
+    with client.websocket_connect("/api/agent/ws") as ws:
+        challenge = ws.receive_json()
+        sig = sk.sign(challenge["nonce"].encode()).signature.hex()
+        ws.send_json({"type": "auth", "worker_id": worker_id, "sig": sig})
+        assert ws.receive_json()["type"] == "ready"
+        _hello_and_idle(ws, protocol)
+        agentws.dispatch_once(worker_id)
+        if pushed:
+            frame = ws.receive_json()
+            assert frame["job_id"] == job_id and frame["kind"] == "model_fetch"
+
+    with db.get_session() as session:
+        assert session.get(db.Job, job_id).status == ("assigned" if pushed else "queued")
+
+
 def test_real_manifest_entry_wins_over_job_entry(client):
     """`ae.safetensors` 是 curated（有官方核可的 sha256），所以就算單子上存的
     是未驗證項目，派工時合併仍以真 manifest 為準。"""

@@ -28,6 +28,9 @@ export const TRUSTED_ORIGINS: ReadonlySet<string> = new Set([
 ]);
 
 const HEAD_TIMEOUT_MS = 10_000;
+/** Redirect hops `headSizeBytes` will follow by hand before giving up
+ * (final-review I4). Mirrors model_fetch.py's `_HEAD_MAX_REDIRECTS`. */
+const HEAD_MAX_REDIRECTS = 5;
 
 /** An unverified-source manifest entry (spec §6): no content hash exists yet,
  * so `sha256`/`backup_url` are explicit nulls and the `unverified` flag is
@@ -76,7 +79,10 @@ export function isTrustedUrl(url: unknown): boolean {
   return TRUSTED_ORIGINS.has(`https://${parsed.hostname.toLowerCase()}`);
 }
 
-/** `code` is "gated" (401/403) or "size_unknown" (anything else) -- ports
+/** `code` is "gated" (401/403), "untrusted_url" (a redirect hop left the
+ * allowlist -- deliberately the SAME code the pre-HEAD allowlist check
+ * throws, since it is the same refusal and the panel's message table already
+ * says exactly the right thing) or "size_unknown" (anything else) -- ports
  * model_fetch.py's `HeadError`. */
 export class HeadError extends Error {
   readonly code: string;
@@ -88,8 +94,9 @@ export class HeadError extends Error {
   }
 }
 
-/** Probes `url` with a redirect-following HEAD (10 s timeout) and returns the
- * exact byte length it advertises via `Content-Length` -- ports
+/** Probes `url` with a HEAD (10 s timeout) whose redirects are followed BY
+ * HAND so that every hop can be allowlist-checked before it is requested, and
+ * returns the exact byte length it advertises via `Content-Length` -- ports
  * model_fetch.py's `head_size_bytes`.
  *
  * The signed entry pins `size_bytes` (§6) and an unverified entry has no
@@ -98,6 +105,17 @@ export class HeadError extends Error {
  * demands a login (401/403) is `gated` and reported as such rather than being
  * retried by a worker that has no credentials either.
  *
+ * Redirects use `redirect: "manual"` (final-review I4). The caller checks the
+ * allowlist before the first request, but `redirect: "follow"` would then let
+ * an attacker-influenced huggingface/civitai url bounce the platform at an
+ * arbitrary origin -- an SSRF / port oracle that any logged-in user could aim,
+ * and one that the 400's own codes (`gated` for 401/403 vs `size_unknown` for
+ * everything else) would answer. The Workers stack has no internal network to
+ * reach, so this is parity with the self-hosted stack more than a live
+ * exposure -- but it is the same code on both sides, which is the point. Every
+ * hop, INCLUDING the final url, must clear `isTrustedUrl` before it is
+ * requested, and the chain is capped at `HEAD_MAX_REDIRECTS`.
+ *
  * `fetchImpl` exists so tests can inject a fake (the Python twin injects an
  * `httpx.MockTransport` client factory for the same reason); production uses
  * the Workers runtime's global `fetch`. */
@@ -105,18 +123,40 @@ export async function headSizeBytes(
   url: string,
   fetchImpl: typeof fetch = fetch
 ): Promise<number> {
-  let resp: Response;
-  try {
-    resp = await fetchImpl(url, {
-      method: "HEAD",
-      redirect: "follow",
-      signal: AbortSignal.timeout(HEAD_TIMEOUT_MS),
-    });
-  } catch (err) {
-    // Network error, DNS failure, TLS failure, or the 10 s abort -- all of
-    // them are "this source would not tell us its length", same as Python's
-    // single `httpx.HTTPError` catch (which covers its timeout too).
-    throw new HeadError("size_unknown", String(err));
+  let resp: Response | undefined;
+  let current = url;
+  for (let hop = 0; hop <= HEAD_MAX_REDIRECTS; hop++) {
+    if (!isTrustedUrl(current)) {
+      throw new HeadError("untrusted_url", `redirect to ${current}`);
+    }
+    try {
+      resp = await fetchImpl(current, {
+        method: "HEAD",
+        redirect: "manual",
+        signal: AbortSignal.timeout(HEAD_TIMEOUT_MS),
+      });
+    } catch (err) {
+      // Network error, DNS failure, TLS failure, or the 10 s abort -- all of
+      // them are "this source would not tell us its length", same as Python's
+      // single `httpx.HTTPError` catch (which covers its timeout too).
+      throw new HeadError("size_unknown", String(err));
+    }
+    if (!(resp.status >= 300 && resp.status < 400)) break;
+    const location = resp.headers.get("location");
+    if (!location) {
+      throw new HeadError("size_unknown", `HTTP ${resp.status} without Location`);
+    }
+    // Relative Locations are legal and common; resolve against the hop that
+    // issued them so the allowlist sees the real absolute url next pass.
+    try {
+      current = new URL(location, current).toString();
+    } catch {
+      throw new HeadError("size_unknown", `unparseable Location ${location}`);
+    }
+    resp = undefined;
+  }
+  if (resp === undefined) {
+    throw new HeadError("size_unknown", "too many redirects");
   }
   if (resp.status === 401 || resp.status === 403) {
     throw new HeadError("gated", `HTTP ${resp.status}`);
@@ -308,6 +348,17 @@ function noWorkerDetail(
   };
   const reasons: string[] = [];
   for (const worker of onlineEnabledWorkers) {
+    // 2026-09-19 final-review I1: the kind gate is not something `verdict`
+    // can see (it judges `JobNeeds`, which carries no kind), so a candidate
+    // excluded purely for being too old to understand `kind=model_fetch`
+    // gets its reason stated here -- otherwise the panel would be told "no
+    // worker has the disk" about a fleet whose only problem is its agent
+    // version.
+    if (!assess.modelFetchProtocolOk(worker)) {
+      const reason = `${assess.MODEL_FETCH_PROTOCOL_REASON}:${name}`;
+      if (!reasons.includes(reason)) reasons.push(reason);
+      continue;
+    }
     let v: assess.Verdict;
     try {
       v = assess.verdict(worker, needs, {}, [], fetchable, peerOnly, unverified);
@@ -406,10 +457,19 @@ export async function createFetchJob(
   // can never drift apart.
   const fetchable: assess.FetchableModels = { [name]: entry.size_bytes };
   const online = await queries.getOnlineEnabledWorkers(db);
+  // 2026-09-19 final-review I1: EVERY model_fetch job needs a protocol>=5
+  // agent, not just one carrying an unverified entry -- row 4 above hands out
+  // a VERIFIED entry, which leaves `unverified` empty and would let the
+  // fleet-wide gate fall back to the protocol>=3 auto-fetch floor. Older
+  // candidates are dropped before the gate rather than inside it so the same
+  // single predicate (`assess.modelFetchProtocolOk`) decides here and at
+  // dispatch; `noWorkerDetail` still sees the FULL online list so it can say
+  // "your agent is too old" about them.
+  const capable = online.filter((w) => assess.modelFetchProtocolOk(w));
   const [, blocked] = assess.partitionFleetFetchable(
     new Set([name]),
     fetchable,
-    online,
+    capable,
     peerOnly,
     unverified
   );

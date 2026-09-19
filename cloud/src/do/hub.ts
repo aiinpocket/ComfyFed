@@ -2025,6 +2025,20 @@ export class Hub extends DurableObject<Env> {
     for (const { workerId, job } of assignments) {
       const ws = this.findWsForWorker(workerId);
       if (!ws) continue;
+      const pushWorker = await queries.getWorkerById(db, workerId);
+      // 2026-09-19 model_fetch (final-review I1): last line of defence for the
+      // protocol>=5 floor every model_fetch job carries. `assignJobs` already
+      // refused this pair, so reaching here means that gate regressed -- the
+      // job stays queued for a worker that can actually run it rather than
+      // being handed to one that would run the `{}` placeholder workflow and
+      // fail it. Ports the same block in agentws.py's `dispatch_tick`.
+      if (job.kind === "model_fetch" && (!pushWorker || !assess.modelFetchProtocolOk(pushWorker))) {
+        console.error(
+          `hub: refusing to push model_fetch job ${job.id} to worker ${workerId} ` +
+            `(protocol=${pushWorker?.protocol})`
+        );
+        continue;
+      }
       try {
         const frame: Record<string, unknown> = {
           type: "job",
@@ -2037,11 +2051,10 @@ export class Hub extends DurableObject<Env> {
         // anyway (spec §7).
         if (job.kind === "model_fetch") frame.kind = "model_fetch";
         if (Object.keys(fetchableModels).length > 0) {
-          const worker = await queries.getWorkerById(db, workerId);
-          if (worker) {
+          if (pushWorker) {
             const fetchModels = await this.fetchModelsForPush(
               job,
-              worker,
+              pushWorker,
               fetchableModels,
               manifestByName,
               peerOnlyModels,
@@ -2076,6 +2089,20 @@ export class Hub extends DurableObject<Env> {
     unverifiedModels?: ReadonlySet<string> | null
   ): Promise<FetchEntry[]> {
     if (Object.keys(fetchableModels).length === 0) return [];
+
+    // 2026-09-19 model_fetch (final-review I1): a model_fetch job is only ever
+    // pushed to a protocol>=5 agent -- `dispatch.assignJobs` refuses the pair
+    // and `tick` refuses the push. Repeated here because this function is what
+    // actually hands an agent the entries to download, and an older agent
+    // given them would fetch the model and then run the `{}` placeholder
+    // workflow.
+    if (job.kind === "model_fetch" && !assess.modelFetchProtocolOk(worker)) {
+      console.error(
+        `hub: refusing fetch_models for model_fetch job ${job.id} to worker ${worker.id} ` +
+          `(protocol=${worker.protocol}) -- the assignJobs kind gate should have excluded it`
+      );
+      return [];
+    }
 
     const allWorkers = await queries.getAllWorkers(this.env.DB);
     const needs = assess.needsFromJob(job);

@@ -230,6 +230,22 @@ def assign_jobs(
                     peer_only_models,
                     unverified_models,
                 )
+                # 2026-09-19 model_fetch (final-review I1): EVERY model_fetch
+                # job needs protocol>=5, not just one whose entry happens to
+                # be unverified. `verdict` only sees `JobNeeds`, which carries
+                # no kind, and its model-keyed gates cannot fire at all for a
+                # verified entry (row 4) or for a worker that already holds
+                # the model -- so the kind gate is applied here, where the job
+                # row is in hand. An older agent ignores the `kind` field and
+                # would run the `{}` placeholder workflow instead of fetching.
+                if getattr(job, "kind", "prompt") == "model_fetch" and not assess.model_fetch_protocol_ok(
+                    worker
+                ):
+                    v = assess.Verdict(
+                        kind="ineligible",
+                        reasons=[f"{assess.MODEL_FETCH_PROTOCOL_REASON}:{job.id}"],
+                        missing_models=list(v.missing_models),
+                    )
                 total_fetch_bytes = 0
                 if v.kind == "eligible_after_fetch":
                     total_fetch_bytes = sum(

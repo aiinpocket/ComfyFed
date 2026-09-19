@@ -15,7 +15,14 @@
 import * as queries from "../db/queries";
 import type { Job } from "../db/queries";
 import { toSqliteTimestamp } from "../db/queries";
-import { freeVramGb, needsFromJob, verdict, type FetchableModels } from "./assess";
+import {
+  freeVramGb,
+  modelFetchProtocolOk,
+  needsFromJob,
+  verdict,
+  MODEL_FETCH_PROTOCOL_REASON,
+  type FetchableModels,
+} from "./assess";
 import * as scheduler from "./scheduler";
 import * as split from "./split";
 import * as stats from "./stats";
@@ -158,7 +165,7 @@ export async function assignJobs(
     });
 
     for (const worker of idleWorkers) {
-      const v = verdict(
+      let v = verdict(
         worker,
         needs,
         job.requirements,
@@ -167,6 +174,21 @@ export async function assignJobs(
         peerOnlyModels,
         unverifiedModels
       );
+      // 2026-09-19 model_fetch (final-review I1): EVERY model_fetch job needs
+      // protocol>=5, not just one whose entry happens to be unverified.
+      // `verdict` only sees `JobNeeds`, which carries no kind, and its
+      // model-keyed gates cannot fire at all for a verified entry (row 4) or
+      // for a worker that already holds the model -- so the kind gate is
+      // applied here, where the job row is in hand. Ports the same block in
+      // dispatch.py's `assign_jobs`.
+      if (job.kind === "model_fetch" && !modelFetchProtocolOk(worker)) {
+        v = {
+          kind: "ineligible",
+          reasons: [`${MODEL_FETCH_PROTOCOL_REASON}:${job.id}`],
+          missingModels: v.missingModels,
+          warnings: [],
+        };
+      }
       const totalFetchBytes =
         v.kind === "eligible_after_fetch"
           ? v.missingModels.reduce((sum, name) => sum + (fetchableModels?.[name] ?? 0), 0)
