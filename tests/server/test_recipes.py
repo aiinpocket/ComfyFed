@@ -5,6 +5,8 @@ client fixture 與 `_login` 沿用 `test_jobs.py`／`test_api_tokens.py` 的寫�
 """
 
 import json
+import logging
+import os
 
 import pytest
 from fastapi.testclient import TestClient
@@ -249,12 +251,13 @@ def test_run_accepts_a_bearer_token(client):
 
 
 def test_run_rejects_bad_params_with_the_error_envelope(client):
+    """兩個錯（缺 prompt、width 非 16 倍數）時，回報的是宣告順序上的第一個。"""
     csrf = _login(client)
     r = _run(client, {"X-CSRF": csrf}, {"width": 300})
     assert r.status_code == 400
     error = r.json()["error"]
     assert error["code"] == "recipes.bad_params"
-    assert "prompt" in error["message"] or "width" in error["message"]
+    assert "prompt" in error["message"]
 
 
 def test_run_rejects_a_non_multiple_width(client):
@@ -301,3 +304,123 @@ def test_two_runs_get_different_random_seeds(client):
         for _ in range(6)
     }
     assert len(seeds) > 1
+
+
+# --- loader 的故障模式（I2）與合成配方（I1／M2） -------------------------
+
+
+@pytest.fixture()
+def clean_recipe_cache():
+    """`load_recipes()` 有 `lru_cache`；動過 `recipes_dir` 的測試前後都要清掉，
+    否則假目錄的結果會外流到別的測試。"""
+    recipes.load_recipes.cache_clear()
+    yield
+    recipes.load_recipes.cache_clear()
+
+
+def test_packaged_recipe_resolves_through_importlib_resources(clean_recipe_cache):
+    """wheel 用的就是這條路徑：`recipes_dir()` 必須指到真的存在的
+    `flux-t2i.json`，而 `load_recipes()` 絕不能是空的 -- 打包漏檔時，症狀只會
+    是 `GET /api/recipes` 安靜地回 `[]`。"""
+    directory = recipes_dir_as_resource()
+    assert os.path.isfile(os.path.join(directory, "flux-t2i.json"))
+    assert "flux-t2i" in recipes.load_recipes()
+
+
+def recipes_dir_as_resource() -> str:
+    from importlib import resources
+
+    return str(resources.files("comfyfed_server").joinpath("recipes"))
+
+
+def test_broken_recipe_file_is_skipped_with_a_warning(tmp_path, monkeypatch, caplog, clean_recipe_cache):
+    (tmp_path / "broken.json").write_text("{not json", encoding="utf-8")
+    (tmp_path / "ok.json").write_text('{"id": "ok", "params": [], "workflow": {}}', encoding="utf-8")
+    monkeypatch.setattr(recipes, "recipes_dir", lambda: str(tmp_path))
+
+    with caplog.at_level(logging.WARNING, logger="comfyfed_server.recipes"):
+        loaded = recipes.load_recipes()
+
+    assert set(loaded) == {"ok"}
+    assert any("broken.json" in record.getMessage() for record in caplog.records)
+
+
+def test_missing_recipe_directory_is_logged(tmp_path, monkeypatch, caplog, clean_recipe_cache):
+    monkeypatch.setattr(recipes, "recipes_dir", lambda: str(tmp_path / "nope"))
+
+    with caplog.at_level(logging.WARNING, logger="comfyfed_server.recipes"):
+        assert recipes.load_recipes() == {}
+
+    assert any("no recipe directory" in record.getMessage() for record in caplog.records)
+
+
+SYNTHETIC = {
+    "id": "synthetic",
+    "params": [
+        {"name": "orphan", "type": "string"},
+        {"name": "flag", "type": "boolean", "default": False},
+        {"name": "mode", "type": "enum", "values": ["fast", "slow"], "default": "fast"},
+        {"name": "ratio", "type": "number", "default": 1.0, "min": 0.5, "step": 0.25},
+    ],
+    "workflow": {"1": {"class_type": "X", "inputs": {"flag": {"$param": "flag"}}}},
+}
+
+
+def _synthetic(**overrides):
+    recipe = json.loads(json.dumps(SYNTHETIC))
+    recipe.update(overrides)
+    return recipe
+
+
+def test_param_without_default_or_required_is_a_400_not_a_500():
+    """配方作者漏寫 default 是配方的 bug，但使用者的請求不該因此收到 5xx。"""
+    with pytest.raises(recipes.RecipeError) as excinfo:
+        recipes.validate_params(_synthetic(), {})
+    assert excinfo.value.code == "recipes.bad_params"
+    assert "orphan" in excinfo.value.message
+
+
+def test_boolean_enum_and_float_step_are_validated():
+    resolved = recipes.validate_params(
+        _synthetic(), {"orphan": "x", "flag": True, "mode": "slow", "ratio": 1.75}
+    )
+    assert resolved == {"orphan": "x", "flag": True, "mode": "slow", "ratio": 1.75}
+
+    for bad, needle in [
+        ({"flag": 1}, "flag"),
+        ({"mode": "medium"}, "mode"),
+        ({"ratio": 1.1}, "ratio"),
+        ({"ratio": 0.25}, "ratio"),
+    ]:
+        params = {"orphan": "x"}
+        params.update(bad)
+        with pytest.raises(recipes.RecipeError) as excinfo:
+            recipes.validate_params(_synthetic(), params)
+        assert excinfo.value.code == "recipes.bad_params"
+        assert needle in excinfo.value.message
+
+
+def test_unknown_param_type_is_a_recipe_fault_not_a_user_fault():
+    recipe = _synthetic(params=[{"name": "weird", "type": "colour", "default": "red"}])
+    with pytest.raises(recipes.RecipeError) as excinfo:
+        recipes.validate_params(recipe, {})
+    assert excinfo.value.code == "recipes.bad_recipe"
+
+
+def test_workflow_marker_for_an_undeclared_param_is_a_recipe_fault():
+    recipe = _synthetic(
+        workflow={"1": {"class_type": "X", "inputs": {"a": {"$param": "nowhere"}}}}
+    )
+    params = recipes.validate_params(recipe, {"orphan": "x"})
+    with pytest.raises(recipes.RecipeError) as excinfo:
+        recipes.render_workflow(recipe, params)
+    assert excinfo.value.code == "recipes.bad_recipe"
+
+
+def test_public_view_does_not_hand_out_the_cached_containers():
+    recipe = _flux()
+    view = recipes.public_view(recipe, True)
+    view["params"].append({"name": "injected"})
+    view["required_models"].append("evil.safetensors")
+    assert len(_flux()["params"]) == 6
+    assert "evil.safetensors" not in _flux()["required_models"]

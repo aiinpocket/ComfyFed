@@ -35,6 +35,7 @@ Python 的 import 順序永遠優先，namespace package 不會把它蓋掉）�
 from __future__ import annotations
 
 import json
+import logging
 import os
 import secrets
 from functools import lru_cache
@@ -46,6 +47,8 @@ from fastapi.responses import JSONResponse
 from pydantic import BaseModel
 
 from . import auth, jobs
+
+logger = logging.getLogger(__name__)
 
 _DATA_DIRNAME = "recipes"
 
@@ -92,13 +95,19 @@ def load_recipes() -> dict[str, dict]:
     """`{recipe_id: 配方檔內容}`，依檔名 stem 建索引。
 
     配方是 package data，程序存活期間不會變，所以讀一次就快取（`lru_cache`）。
-    壞掉／讀不到的檔案直接跳過：一個手改壞的 JSON 不該讓整個 `/api/recipes`
-    掛掉，而缺了它的清單本身就是最直白的回報。
+    壞掉／讀不到的檔案直接跳過（一個手改壞的 JSON 不該讓整個 `/api/recipes`
+    掛掉），但**每一次跳過都留一行 log**：這個模組最現實的故障模式是
+    `recipes/*.json` 沒被打包進 wheel，而那個症狀是 `GET /api/recipes` 安靜地
+    回 `[]`、AI 端下結論說「這個平台沒有配方」。沒有 log 就沒有人會發現。
     """
     directory = recipes_dir()
     try:
         filenames = sorted(os.listdir(directory))
     except OSError:
+        logger.warning(
+            "recipes: no recipe directory at %s -- none will be served "
+            "(packaging problem? see pyproject package-data)", directory,
+        )
         return {}
 
     loaded: dict[str, dict] = {}
@@ -110,11 +119,15 @@ def load_recipes() -> dict[str, dict]:
             with open(path, "r", encoding="utf-8") as f:
                 data = json.load(f)
         except (OSError, ValueError):
+            logger.exception("recipes: skipping unreadable/malformed recipe %s", path)
             continue
         if not isinstance(data, dict):
+            logger.warning("recipes: skipping %s -- top level is not a JSON object", path)
             continue
         recipe_id = data.get("id") or filename[: -len(".json")]
         loaded[str(recipe_id)] = data
+    if not loaded:
+        logger.warning("recipes: %s contains no usable recipe files", directory)
     return loaded
 
 
@@ -123,16 +136,20 @@ def public_view(recipe: dict, include_workflow: bool) -> dict:
 
     清單不帶 `workflow`：節點圖比其他所有欄位加起來還大好幾倍，而挑配方的人
     只需要看得懂的那幾個欄位；要圖的人再打單筆端點。
+
+    回傳的容器是淺複本：`load_recipes()` 的結果被 `lru_cache` 全程重用，讓
+    呼叫端拿到指向快取的同一個 list 遲早會有人就地改到它，而那會污染整個
+    process 的配方定義。
     """
     view = {
         "id": recipe.get("id"),
-        "title": recipe.get("title") or {},
-        "description": recipe.get("description") or {},
-        "params": recipe.get("params") or [],
-        "required_models": recipe.get("required_models") or [],
+        "title": dict(recipe.get("title") or {}),
+        "description": dict(recipe.get("description") or {}),
+        "params": list(recipe.get("params") or []),
+        "required_models": list(recipe.get("required_models") or []),
     }
     if include_workflow:
-        view["workflow"] = recipe.get("workflow") or {}
+        view["workflow"] = dict(recipe.get("workflow") or {})
     return view
 
 
@@ -220,7 +237,13 @@ def validate_params(recipe: dict, params: dict) -> dict:
         elif spec.get("required"):
             raise _bad_params(f"{name}: required.")
         else:
-            continue
+            # 宣告了、沒給、也沒有 default：配方檔的 bug（作者漏了 default），
+            # 但那是**這一次請求**沒辦法完成的原因，所以回 400 點名該參數，而
+            # 不是讓它一路漏到渲染階段變成 500 -- 一個合法的請求永遠不該因為
+            # 配方作者的疏忽收到 5xx。
+            raise _bad_params(
+                f"{name}: no value given and the recipe declares no default."
+            )
         resolved[name] = _coerce(spec, name, value)
 
     if resolved.get("seed") == _RANDOM_SEED_SENTINEL:
