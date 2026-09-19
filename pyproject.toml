@@ -13,7 +13,10 @@ dependencies = [
   "python-multipart>=0.0.9", "itsdangerous>=2.2", "psutil>=6.0", "prometheus-client>=0.20",
 ]
 [project.optional-dependencies]
-dev = ["pytest>=8", "pytest-asyncio>=0.24", "httpx>=0.27"]
+# `mcp` 也放進 dev：`test_build_server_registers_twelve_tools` 是唯一證明 12 個
+# 工具真的註冊上去的測試，沒裝 mcp 它會 importorskip 靜靜跳過。測試用安裝，
+# 不影響 agent 自更新的 `--no-deps` 路徑。
+dev = ["pytest>=8", "pytest-asyncio>=0.24", "httpx>=0.27", "mcp>=2.0,<3"]
 # MCP 入口（spec §6.1）：刻意是「選配」，不是硬依賴 -- agent 自更新走
 # `pip install --no-deps`，硬依賴根本裝不到，所以 `comfyfed_agent.mcp_server`
 # 模組層不 import mcp，缺套件時 `comfyfed-mcp` 印指引並 exit 2。

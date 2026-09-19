@@ -18,6 +18,8 @@ import importlib
 import json
 import sys
 
+from pathlib import Path
+
 import httpx
 import pytest
 
@@ -107,7 +109,9 @@ def test_resolve_settings_from_token_file_env(tmp_path):
         {"COMFYFED_TOKEN_FILE": str(other)}, str(tmp_path)
     )
     assert (s.platform_url, s.token) == (PLATFORM, TOKEN)
-    assert "mcp.json" in s.source
+    # 自訂路徑要標成 token_file，不能謊稱是 ~/.comfyfed/mcp.json ——
+    # 這是使用者查「撿到哪個 token」時唯一的線索。
+    assert s.source == "token_file"
 
 
 def test_resolve_settings_env_overrides_file(tmp_path):
@@ -314,13 +318,13 @@ def test_submit_workflow_without_requirements_omits_field():
     assert 'name="requirements"' not in fake.last.content.decode("utf-8")
 
 
-def _job_row(job_id: str, status: str = "queued") -> dict:
+def _job_row(job_id: str, status: str = "queued", hour: int = 0) -> dict:
     return {
         "id": job_id,
         "status": status,
         "origin": "api",
         "progress": 0.5,
-        "created_at": "2026-09-20T00:00:00+00:00",
+        "created_at": f"2026-09-20T{hour:02d}:00:00+00:00",
         "worker_id": "w1",
         "error": None,
         "result_files": ["a.png"],
@@ -329,7 +333,8 @@ def _job_row(job_id: str, status: str = "queued") -> dict:
 
 
 def test_list_jobs_filters_and_truncates():
-    rows = [_job_row(f"j{i}") for i in range(5)]
+    # 平台是 created_at 升冪回的（jobs.py），所以 j4 是「剛送的那張」。
+    rows = [_job_row(f"j{i}", hour=i) for i in range(5)]
     fake = FakePlatform()
     fake.json_route("GET", "/api/jobs", rows)
 
@@ -338,7 +343,8 @@ def test_list_jobs_filters_and_truncates():
     assert fake.last.url.path == "/api/jobs"
     assert dict(fake.last.url.params) == {"status": "queued,running"}
     assert_bearer(fake.last)
-    assert len(out) == 2
+    # 最新的在前，而且剛送的那張一定在裡面（切前 N 筆會變成最舊的 N 筆）。
+    assert [r["id"] for r in out] == ["j4", "j3"]
     assert set(out[0]) == {
         "id",
         "status",
@@ -348,6 +354,36 @@ def test_list_jobs_filters_and_truncates():
         "worker_id",
         "error",
     }
+
+
+def test_list_jobs_orders_newest_first_regardless_of_server_order():
+    rows = [_job_row("old", hour=1), _job_row("new", hour=9), _job_row("mid", hour=5)]
+    fake = FakePlatform()
+    fake.json_route("GET", "/api/jobs", rows)
+
+    out = mcp_server.list_jobs(fake.client(), limit=10)
+
+    assert [r["id"] for r in out] == ["new", "mid", "old"]
+
+
+def test_list_jobs_tolerates_missing_created_at():
+    rows = [_job_row("a", hour=3), {**_job_row("b"), "created_at": None}]
+    fake = FakePlatform()
+    fake.json_route("GET", "/api/jobs", rows)
+
+    out = mcp_server.list_jobs(fake.client())
+
+    assert [r["id"] for r in out] == ["a", "b"]  # 缺 created_at 排最後
+
+
+def test_list_jobs_bad_limit_falls_back_to_default():
+    rows = [_job_row(f"j{i}", hour=i) for i in range(3)]
+    fake = FakePlatform()
+    fake.json_route("GET", "/api/jobs", rows)
+
+    out = mcp_server.list_jobs(fake.client(), limit="not a number")  # type: ignore[arg-type]
+
+    assert [r["id"] for r in out] == ["j2", "j1", "j0"]
 
 
 def test_list_jobs_without_status_sends_no_param():
@@ -453,6 +489,7 @@ def _artifact_platform(files: list[str]) -> FakePlatform:
     fake.json_route("GET", "/api/jobs/j1", {**DETAIL, "result_files": files})
 
     def art(request):
+        assert_bearer(request)  # 下載也走 bearer，不帶 CSRF
         return httpx.Response(200, content=b"PNGDATA")
 
     for name in files:
@@ -483,6 +520,34 @@ def test_download_results_explicit_dest_dir(tmp_path):
 
     assert (dest / "out.png").exists()
     assert out["files"] == [str(dest / "out.png")]
+
+
+def test_download_results_dest_dir_is_made_absolute(tmp_path, monkeypatch):
+    """spec §6.3 承諾 `files` 是絕對路徑，相對的 dest_dir 也不例外。"""
+    fake = _artifact_platform(["out.png"])
+    monkeypatch.chdir(tmp_path)
+
+    out = mcp_server.download_results(
+        fake.client(), "j1", dest_dir="pics", home=str(tmp_path)
+    )
+
+    assert Path(out["files"][0]).is_absolute()
+    assert (tmp_path / "pics" / "out.png").exists()
+
+
+def test_download_results_percent_encodes_filename(tmp_path):
+    """`#` 沒編碼的話 httpx 會把它當 fragment，路徑被截短而抓錯檔。
+
+    （測試只用 `#`：`?` 在 Windows 檔名裡是非法字元，開檔就先炸了。）
+    """
+    fake = _artifact_platform(["a#b.png"])
+
+    out = mcp_server.download_results(fake.client(), "j1", home=str(tmp_path))
+
+    # 假平台是照「解碼後的 path」路由的：沒編碼就會變成 /artifacts/a 而 404。
+    assert fake.paths()[-1] == "/api/jobs/j1/artifacts/a#b.png"
+    assert out["skipped"] == []
+    assert Path(out["files"][0]).name == "a#b.png"
 
 
 @pytest.mark.parametrize(
@@ -700,6 +765,8 @@ def test_cli_flags_override_env(monkeypatch, tmp_path):
         json.dumps({"platform_url": "https://ignored.example", "token": TOKEN}),
         encoding="utf-8",
     )
+    for var in ("COMFYFED_TOKEN", "COMFYFED_TOKEN_FILE", "COMFYFED_PLATFORM_URL"):
+        monkeypatch.delenv(var, raising=False)  # cli() 會複製 os.environ
     monkeypatch.setattr(mcp_server, "_home_dir", lambda: str(tmp_path))
     monkeypatch.setattr(mcp_server, "_import_mcp_server", lambda: object())
     seen: dict = {}

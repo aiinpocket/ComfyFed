@@ -25,6 +25,7 @@ import time
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Callable, Mapping, Optional
+from urllib.parse import quote
 
 import httpx
 
@@ -137,7 +138,9 @@ def resolve_settings(env: Mapping[str, str], home: str) -> McpSettings:
             platform_url = str(data.get("platform_url") or "").strip()
             token = str(data.get("token") or "").strip()
             if platform_url or token:
-                sources.append("mcp.json")
+                # 標對來源：使用者拿到的唯一診斷就是啟動那行 `settings: ...`，
+                # 自訂路徑被寫成 "mcp.json" 會讓「撿到錯 token」變得很難查。
+                sources.append("token_file" if token_file_env else "mcp.json")
     elif token_file_env:
         print(
             f"comfyfed-mcp: COMFYFED_TOKEN_FILE 指向的檔案不存在 / file not "
@@ -287,6 +290,7 @@ class Client:
 def platform_status(c: Client) -> dict:
     """平台與艦隊概況：我是誰、token 何時過期、有哪些 worker 與 GPU。"""
     me = c.get("/api/auth/me")
+    me = me if isinstance(me, dict) else {}
     workers = c.get("/api/workers")
     summary = []
     for w in workers if isinstance(workers, list) else []:
@@ -342,12 +346,24 @@ def submit_workflow(
 
 
 def list_jobs(c: Client, status: Optional[str] = None, limit: int = 20) -> list:
-    """列出工作。`status` 可用逗號分隔（例：`queued,running`）；預設只回前 20 筆。"""
+    """列出工作（**最新的在前**）。`status` 可逗號分隔（例：`queued,running`）。
+
+    平台的 `GET /api/jobs` 是 `created_at` **升冪**（jobs.py），所以直接切前
+    N 筆會拿到最舊的 N 筆 —— AI 永遠看不到自己剛送的那張單。這裡先照
+    `created_at` 降冪排，再切 `limit`。`created_at` 是 ISO-8601 字串，同一個
+    時區下字典序就是時間序；缺值排到最後。
+    """
     params = {"status": status} if status else {}
     rows = c.get("/api/jobs", params=params)
     rows = rows if isinstance(rows, list) else []
+    # 模型可能傳來字串或垃圾值；壞掉就退回預設，別讓一個 ValueError 冒出去。
+    try:
+        count = max(0, int(limit))
+    except (TypeError, ValueError):
+        count = 20
+    newest_first = sorted(rows, key=lambda r: r.get("created_at") or "", reverse=True)
     keys = ("id", "status", "origin", "progress", "created_at", "worker_id", "error")
-    return [{k: row.get(k) for k in keys} for row in rows[: max(0, int(limit))]]
+    return [{k: row.get(k) for k in keys} for row in newest_first[:count]]
 
 
 def job_status(c: Client, job_id: str) -> dict:
@@ -415,10 +431,11 @@ def download_results(
     names = detail.get("result_files") or []
 
     if dest_dir:
-        target = Path(dest_dir)
+        # spec §6.3 承諾回傳絕對路徑；相對的 dest_dir 要先攤平。
+        target = Path(dest_dir).resolve()
     else:
         base_home = Path(home) if home else Path(_home_dir())
-        target = base_home / ".comfyfed" / "results" / job_id
+        target = (base_home / ".comfyfed" / "results" / job_id).resolve()
     target.mkdir(parents=True, exist_ok=True)
 
     files: list[str] = []
@@ -429,7 +446,11 @@ def download_results(
             skipped.append(name)
             continue
         dest = target / safe
-        c.download(f"/api/jobs/{job_id}/artifacts/{safe}", dest)
+        # 百分比編碼整個檔名：`_safe_filename` 擋掉了分隔符，但 `#`／`?` 仍會
+        # 被 httpx 當成 fragment／query 而把路徑截短（抓錯檔或 404）。
+        c.download(
+            f"/api/jobs/{job_id}/artifacts/{quote(safe, safe='')}", dest
+        )
         files.append(str(dest))
     return {"job_id": job_id, "files": files, "skipped": skipped}
 
