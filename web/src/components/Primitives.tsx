@@ -10,7 +10,7 @@ import {
   Tooltip,
   useMantineTheme,
 } from '@mantine/core';
-import type { ReactNode } from 'react';
+import type { CSSProperties, ReactNode } from 'react';
 
 /** Monospace inline text for ids, hashes and filenames. */
 export function Mono({
@@ -18,14 +18,23 @@ export function Mono({
   title,
   c = 'dimmed',
   size = 'sm',
+  style,
 }: {
   children: ReactNode;
   title?: string;
   c?: string;
   size?: string;
+  style?: CSSProperties;
 }) {
   return (
-    <Text component="span" ff="monospace" size={size} c={c} title={title} style={{ letterSpacing: '-0.01em' }}>
+    <Text
+      component="span"
+      ff="monospace"
+      size={size}
+      c={c}
+      title={title}
+      style={{ letterSpacing: '-0.01em', ...style }}
+    >
       {children}
     </Text>
   );

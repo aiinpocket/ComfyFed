@@ -516,7 +516,7 @@ describe('Settings page: API tokens card', () => {
       expires_at: CREATED_TOKEN.expires_at,
     });
 
-    const anchor = clickSpy.mock.instances[0] as HTMLAnchorElement;
+    const anchor = clickSpy.mock.instances[0] as unknown as HTMLAnchorElement;
     expect(anchor.download).toBe('comfyfed-mcp.json');
     expect(revokeObjectURL).toHaveBeenCalledWith('blob:mock-url');
 
