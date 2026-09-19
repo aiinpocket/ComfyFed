@@ -304,6 +304,27 @@ export async function requeueStale(db: D1Database, now: Date): Promise<string[]>
   return requeued;
 }
 
+// 2026-09-19 線上實例：部署當下 job 被派給一台 worker，推送落在斷線的舊
+// socket 上，agent 重連後一直回報 idle（沒有 job_id），而 `requeueStale`
+// 只看 worker 心跳 -- worker 明明在心跳，job 就永遠 `assigned`。連續這麼多
+// 次「idle 且沒有 job_id」的心跳（心跳間隔 30s，所以至少隔了一個週期；一次
+// 就收會撞上「推送剛送出、agent 的週期心跳還在路上」和「job_done 與 idle
+// 心跳前後腳」這兩種正常時序）之後，這台名下仍 assigned/running 的 job 全
+// 部收回排隊。Ports dispatch.py's `ORPHAN_IDLE_BEATS`.
+export const ORPHAN_IDLE_BEATS = 2;
+
+/** 把 `workerId` 名下仍 assigned/running、但它自己說閒著的 job 收回 `queued`。
+ * 欄位變化與 `requeueStale` 完全相同（`requeueJobsForWorker`），不算失敗嘗
+ * 試、不發收據、不動 worker 狀態（它在線）。Ports dispatch.py's
+ * `requeue_orphaned`. */
+export async function requeueOrphaned(db: D1Database, workerId: string, now: Date): Promise<string[]> {
+  const jobIds = await queries.requeueJobsForWorker(db, workerId);
+  for (const jobId of jobIds) {
+    await split.childStatusChanged(db, jobId, now);
+  }
+  return jobIds;
+}
+
 // ---------------------------------------------------------------------------
 // cancelJob
 

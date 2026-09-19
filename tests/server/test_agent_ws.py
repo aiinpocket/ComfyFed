@@ -5233,3 +5233,69 @@ def test_sweep_ignores_queued_jobs_that_never_failed(client):
 
     agentws.dispatch_once()
     assert _job_row(job_id).status == "queued"
+
+
+# --- 2026-09-19 線上修正：推送掉了、agent 一直回報 idle 的 assigned job 要收回 ---
+
+
+def _idle_beat(ws, worker_id):
+    ws.send_json({"type": "heartbeat", "state": "idle", "progress": 0.0, "job_id": None, "dynamic": {}})
+    agentws.dispatch_once(worker_id)
+
+
+def test_an_assigned_job_whose_worker_keeps_reporting_idle_is_requeued(client):
+    """部署當下推送落在斷線的舊 socket 上：job `assigned`，agent 重連後回報
+    idle 且沒有 job_id。`requeue_stale` 看的是 worker 心跳（它在跳），所以
+    要靠連續 `ORPHAN_IDLE_BEATS` 次 idle-無-job 心跳把 job 收回排隊。"""
+    csrf = _login(client)
+    worker_id, sk = _register_worker(client, csrf, "wa")
+    job_id = _submit(client, csrf)
+
+    ws = _connect(client, worker_id, sk)
+    try:
+        _idle_beat(ws, worker_id)
+        assert ws.receive_json()["type"] == "job"  # 推送出去了，conn.state = dispatched
+        assert _job_row(job_id).status == "assigned"
+
+        # 第一次 idle 心跳（前一狀態 dispatched）：只計一次，不收回。
+        _idle_beat(ws, worker_id)
+        assert _job_row(job_id).status == "assigned"
+
+        # 第二次：收回排隊，且同一個 tick 重派給這台（它 idle）。
+        _idle_beat(ws, worker_id)
+        job = _job_row(job_id)
+        assert job.last_worker_id == worker_id
+        assert job.retry_count == 0  # 不算失敗嘗試
+        assert job.status in ("queued", "assigned")
+    finally:
+        ws.close()
+
+    with db.get_session() as session:
+        assert session.query(db.Receipt).count() == 0
+
+
+def test_a_busy_heartbeat_resets_the_idle_counter(client):
+    """正常流程：推送 -> busy 心跳（running）-> 一次 idle-無-job 心跳（例如
+    job_done 前後腳）不會收回；要連續兩次才會。"""
+    csrf = _login(client)
+    worker_id, sk = _register_worker(client, csrf, "wa")
+    job_id = _submit(client, csrf)
+
+    ws = _connect(client, worker_id, sk)
+    try:
+        _idle_beat(ws, worker_id)
+        assert ws.receive_json()["type"] == "job"
+        ws.send_json({"type": "heartbeat", "state": "busy", "progress": 0.2, "job_id": job_id, "dynamic": {}})
+        agentws.dispatch_once(worker_id)
+        assert _job_row(job_id).status == "running"
+
+        _idle_beat(ws, worker_id)
+        assert _job_row(job_id).status == "running"
+
+        # agent 跑到一半重啟：再一次 idle -> 收回。
+        _idle_beat(ws, worker_id)
+        job = _job_row(job_id)
+        assert job.status in ("queued", "assigned")
+        assert job.last_worker_id == worker_id
+    finally:
+        ws.close()

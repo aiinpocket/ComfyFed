@@ -760,6 +760,42 @@ def requeue_for_retry(job_id: str, worker_id: str, error: str) -> bool:
     return True
 
 
+# 2026-09-19 線上實例：部署當下 job 被派給一台 worker，推送落在斷線的舊
+# socket 上，agent 重連後一直回報 idle（沒有 job_id），而 `requeue_stale`
+# 只看 worker 心跳 -- worker 明明在心跳，job 就永遠 `assigned`。連續這麼多
+# 次「idle 且沒有 job_id」的心跳（心跳間隔 30s，所以至少隔了一個週期；一次
+# 就收會撞上「推送剛送出、agent 的週期心跳還在路上」和「job_done 與 idle
+# 心跳前後腳」這兩種正常時序）之後，這台名下仍 assigned/running 的 job 全
+# 部收回排隊。
+ORPHAN_IDLE_BEATS = 2
+
+
+def requeue_orphaned(worker_id: str) -> list[str]:
+    """把 `worker_id` 名下仍 assigned/running、但它自己說閒著的 job 收回 `queued`。
+
+    欄位變化與 `requeue_stale` 完全相同（`last_worker_id` 記下、`worker_id`
+    清掉、進度歸零），不算失敗嘗試、不發收據、不動 worker 狀態（它在線）。
+    回傳真的收回的 job id。
+    """
+    requeued: list[str] = []
+    with db.get_session() as session:
+        jobs = (
+            session.query(db.Job)
+            .filter(db.Job.worker_id == worker_id, db.Job.status.in_(_OWNED_STATUSES))
+            .all()
+        )
+        for job in jobs:
+            job.status = "queued"
+            job.last_worker_id = worker_id
+            job.worker_id = None
+            job.progress = 0
+            requeued.append(job.id)
+        session.commit()
+    for job_id in requeued:
+        split.child_status_changed(job_id)
+    return requeued
+
+
 def fail_queued(job_id: str, error: str) -> bool:
     """終局失敗一張**沒人擁有**的 `queued` job。Returns whether it acted.
 

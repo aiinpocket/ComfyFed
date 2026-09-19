@@ -294,6 +294,11 @@ class _Connection:
     worker_id: str
     loop: asyncio.AbstractEventLoop
     state: str = "idle"  # idle | busy | dispatched | paused
+    # 連續幾次「idle 且沒有 job_id」的心跳 -- 達 `dispatch.ORPHAN_IDLE_BEATS`
+    # 就把這台名下仍 assigned/running 的 job 收回排隊（推送掉在斷線的舊
+    # socket 上、或 agent 跑到一半重啟）。任何其他形狀的心跳、或一次推送，
+    # 都歸零。
+    idle_no_job_beats: int = 0
     # Agent protocol version from `hello.protocol`, defaulting to 1 (never
     # sent a hello, or an old agent that doesn't send the field at all) --
     # see `_handle_hello` and `_send_job_cancelled`.
@@ -1596,11 +1601,18 @@ async def _handle_heartbeat(worker_id: str, conn: _Connection, message: dict) ->
     worker has on record, or the stored snapshot file has gone missing.
     """
     state = message.get("state")
+    prev_state = conn.state
     if state in ("idle", "busy", "paused"):
         conn.state = state
 
     dynamic = message.get("dynamic") or {}
     job_id = message.get("job_id")
+    # 「閒著、沒有 job」的心跳連續計數；前一個狀態是 `dispatched`（推送剛出
+    # 去）的那一次也算第一次 -- 要再等一整個心跳週期才會收回。
+    if state == "idle" and not job_id:
+        conn.idle_no_job_beats = conn.idle_no_job_beats + 1 if prev_state == "idle" else 1
+    else:
+        conn.idle_no_job_beats = 0
     job_not_owned = False
     progress_written = False
     with db.get_session() as session:
@@ -1714,6 +1726,24 @@ async def _handle_heartbeat(worker_id: str, conn: _Connection, message: dict) ->
             job_id, worker_id, resolve_warn_level=lambda jid: _resolve_warn_level(conn, jid)
         ):
             await panelws.job_running(job_id)
+
+    # 這台說自己閒著、也沒在跑任何 job，已經連續 `ORPHAN_IDLE_BEATS` 次 --
+    # 它名下若還有 assigned/running 的 job，那推送一定沒送到（或 agent 跑到
+    # 一半重啟了），收回排隊讓下一個 tick 重派；見 `dispatch.requeue_orphaned`。
+    if conn.idle_no_job_beats >= dispatch.ORPHAN_IDLE_BEATS:
+        conn.idle_no_job_beats = 0
+        orphaned = dispatch.requeue_orphaned(worker_id)
+        if orphaned:
+            logger.warning(
+                "agentws: worker %s reports idle but still owned %d job(s); requeued: %s",
+                worker_id,
+                len(orphaned),
+                ", ".join(orphaned),
+            )
+            for orphan_id in orphaned:
+                _clear_fetch_progress(orphan_id)
+                await panelws.job_requeued(orphan_id)
+            await panelws.job_status_refresh()
 
     try:
         m = metrics.get_metrics()

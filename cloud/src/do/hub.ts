@@ -176,6 +176,11 @@ interface AgentAttachment {
   workerId: string | null;
   protocol: number;
   state: "idle" | "busy" | "dispatched" | "paused";
+  /** 連續幾次「idle 且沒有 job_id」的心跳 -- 達 `dispatch.ORPHAN_IDLE_BEATS`
+   * 就把這台名下仍 assigned/running 的 job 收回排隊（推送掉在斷線的舊
+   * socket 上、或 agent 跑到一半重啟）。任何其他形狀的心跳、或一次推送，都
+   * 歸零。Durable（和 `state` 一起）：hibernation 醒來後計數不能歸零重數。 */
+  idleNoJobBeats?: number;
   /** Phase 3.4 §2：upgrade 請求的 `CF-Connecting-IP`（Cloudflare 提供，
    * 權威，不可偽造）。存在 attachment 裡是因為 hello 是後續的一個訊息，
    * 那時已經沒有原始 `Request` 可以再讀一次 header 了。 */
@@ -1246,13 +1251,15 @@ export class Hub extends DurableObject<Env> {
       this.schedulePeerCheck(ws, workerId, worker.peerUrl, { notifyOnChangeOnly: true });
     }
 
-    let currentAttachment = attachment;
-    if (state) {
-      currentAttachment = { ...attachment, state };
-      ws.serializeAttachment(currentAttachment);
-    }
-
     const jobId = typeof msg.job_id === "string" ? msg.job_id : null;
+    // 「閒著、沒有 job」的心跳連續計數；前一個狀態是 `dispatched`（推送剛出
+    // 去）的那一次也算第一次 -- 要再等一整個心跳週期才會收回。
+    const idleNoJobBeats =
+      state === "idle" && !jobId ? (attachment.state === "idle" ? (attachment.idleNoJobBeats ?? 0) + 1 : 1) : 0;
+    let currentAttachment: AgentAttachment = { ...attachment, idleNoJobBeats };
+    if (state) currentAttachment = { ...currentAttachment, state };
+    ws.serializeAttachment(currentAttachment);
+
     let jobNotOwned = false;
     if (jobId) {
       const job = await queries.getJobById(db, jobId);
@@ -1327,6 +1334,25 @@ export class Hub extends DurableObject<Env> {
         await split.childStatusChanged(db, jobId, now);
         await this.panelJobRunning(jobId);
       });
+    }
+
+    // 這台說自己閒著、也沒在跑任何 job，已經連續 `ORPHAN_IDLE_BEATS` 次 --
+    // 它名下若還有 assigned/running 的 job，那推送一定沒送到（或 agent 跑到
+    // 一半重啟了），收回排隊讓下一個 tick 重派；見 `dispatch.requeueOrphaned`。
+    if (idleNoJobBeats >= dispatch.ORPHAN_IDLE_BEATS) {
+      currentAttachment = { ...currentAttachment, idleNoJobBeats: 0 };
+      ws.serializeAttachment(currentAttachment);
+      const orphaned = await dispatch.requeueOrphaned(db, workerId, now);
+      if (orphaned.length > 0) {
+        console.warn(
+          `hub: worker ${workerId} reports idle but still owned ${orphaned.length} job(s); requeued: ${orphaned.join(", ")}`
+        );
+        for (const orphanId of orphaned) {
+          this.fetchProgress.delete(orphanId);
+          await this.panelJobRequeued(orphanId);
+        }
+        await this.panelJobStatusRefresh();
+      }
     }
 
     const reportedHash = typeof msg.object_info_hash === "string" ? msg.object_info_hash : "";

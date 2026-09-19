@@ -2398,3 +2398,70 @@ describe("job retry: stale workers and the hopeless-retry sweep", () => {
     expect((await getJobById(db(), jobId))!.status).toBe("queued");
   });
 });
+
+// ---------------------------------------------------------------------------
+// 2026-09-19 線上修正：推送掉了、agent 一直回報 idle 的 assigned job 要收回 --
+// ports the two tests appended to tests/server/test_agent_ws.py.
+
+describe("orphaned assignment: idle heartbeats without a job requeue it", () => {
+  async function idleBeat(ws: WebSocket): Promise<void> {
+    ws.send(JSON.stringify({ type: "heartbeat", state: "idle", progress: 0.0, job_id: null, dynamic: {} }));
+    await new Promise((r) => setTimeout(r, 80));
+  }
+
+  it("an assigned job whose worker keeps reporting idle is requeued", async () => {
+    const kp = KEYPAIRS[0]!;
+    const workerId = await makeWorker({ pubkeyHex: kp.pubkey_hex });
+    const jobId = await makeJob({ status: "queued", signature: "sig-orphan" });
+
+    const ws = await connectAgent(workerId, kp.seed_hex);
+    try {
+      const pushed = nextMessage(ws);
+      await runDurableObjectAlarm(hub());
+      expect((await pushed).type).toBe("job"); // 推送出去了，attachment.state = dispatched
+      expect((await getJobById(db(), jobId))!.status).toBe("assigned");
+
+      // 第一次 idle 心跳（前一狀態 dispatched）：只計一次，不收回。
+      await idleBeat(ws);
+      expect((await getJobById(db(), jobId))!.status).toBe("assigned");
+
+      // 第二次：收回排隊。
+      await idleBeat(ws);
+      const job = (await getJobById(db(), jobId))!;
+      expect(job.status).toBe("queued");
+      expect(job.workerId).toBeNull();
+      expect(job.lastWorkerId).toBe(workerId);
+      expect(job.retryCount).toBe(0); // 不算失敗嘗試
+    } finally {
+      ws.close();
+    }
+    expect(await getReceiptsForJob(db(), jobId)).toEqual([]);
+  });
+
+  it("a busy heartbeat resets the idle counter", async () => {
+    const kp = KEYPAIRS[0]!;
+    const workerId = await makeWorker({ pubkeyHex: kp.pubkey_hex });
+    const jobId = await makeJob({ status: "queued", signature: "sig-orphan-busy" });
+
+    const ws = await connectAgent(workerId, kp.seed_hex);
+    try {
+      const pushed = nextMessage(ws);
+      await runDurableObjectAlarm(hub());
+      expect((await pushed).type).toBe("job");
+      ws.send(JSON.stringify({ type: "heartbeat", state: "busy", progress: 0.2, job_id: jobId, dynamic: {} }));
+      await new Promise((r) => setTimeout(r, 80));
+      expect((await getJobById(db(), jobId))!.status).toBe("running");
+
+      await idleBeat(ws);
+      expect((await getJobById(db(), jobId))!.status).toBe("running");
+
+      // agent 跑到一半重啟：再一次 idle -> 收回。
+      await idleBeat(ws);
+      const job = (await getJobById(db(), jobId))!;
+      expect(job.status).toBe("queued");
+      expect(job.lastWorkerId).toBe(workerId);
+    } finally {
+      ws.close();
+    }
+  });
+});
