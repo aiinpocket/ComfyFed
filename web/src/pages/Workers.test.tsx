@@ -351,6 +351,36 @@ describe('Workers page: unsuitable tasks (job-retry design 2026-09-19)', () => {
     );
   });
 
+  it('renders a row whose last_error and last_job_id are null (non-admin payload)', async () => {
+    // final review I1: `GET /api/workers` now nulls both fields for a
+    // non-admin session. The row itself still arrives, so the block must
+    // render it with an em dash and no "View job" link rather than blowing up.
+    stubFetch([
+      {
+        ...BASE_WORKER,
+        id: 'w-0000000004',
+        name: 'runner-redacted',
+        unsuitable: [
+          {
+            task_key: 'sig-redacted00000',
+            failures: 2,
+            last_error: null,
+            last_job_id: null,
+            updated_at: '2026-09-18T00:00:00Z',
+            active: true,
+          },
+        ],
+      },
+    ]);
+    renderWorkers('user');
+
+    expect(await screen.findByText('Unsuitable tasks')).toBeInTheDocument();
+    expect(screen.getByText('sig-redacted')).toBeInTheDocument();
+    // 錯誤欄畫成破折號（頁面別處也有破折號，所以只確認它存在），連結整個不畫。
+    expect(screen.getAllByText('—').length).toBeGreaterThan(0);
+    expect(screen.queryByRole('link', { name: 'View job' })).not.toBeInTheDocument();
+  });
+
   it('hides the unsuitable block for a worker with an empty list', async () => {
     stubFetch([BASE_WORKER]);
     renderWorkers();

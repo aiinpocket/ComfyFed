@@ -460,6 +460,41 @@ def test_list_workers_reports_unsuitable_tasks_with_active_flags(client):
     assert [row["task_key"] for row in other["unsuitable"]] == ["sig-elsewhere"]
 
 
+def test_list_workers_hides_unsuitable_error_and_job_id_from_a_non_admin(client):
+    """final review I1：`worker_task_failures` 跨 job、跨使用者累積，所以
+    `last_error`（失敗原文，常含檔名／LoRA 名稱／絕對路徑）與 `last_job_id`
+    （別人的 job id）只有 admin 讀得到。非 admin 照樣拿得到那一列本身
+    （task_key / failures / updated_at / active）-- 那是艦隊 metadata。"""
+    csrf = _login(client)
+    worker_id = _register(client, csrf, "worker-leak", "65" * 32)
+    _seed_failure(
+        worker_id,
+        "sig-leaky",
+        failures=2,
+        error="C:/models/loras/private-style.safetensors not found",
+        job_id="job-of-someone-else",
+    )
+
+    admin_worker = next(
+        w for w in client.get("/api/workers", headers={"X-CSRF": csrf}).json() if w["id"] == worker_id
+    )
+    admin_row = admin_worker["unsuitable"][0]
+    assert admin_row["last_error"] == "C:/models/loras/private-style.safetensors not found"
+    assert admin_row["last_job_id"] == "job-of-someone-else"
+
+    _login_as_new_user(client, csrf, "unsuitable-reader")
+    listed = client.get("/api/workers")
+    assert listed.status_code == 200
+    user_row = next(w for w in listed.json() if w["id"] == worker_id)["unsuitable"][0]
+    assert user_row["last_error"] is None
+    assert user_row["last_job_id"] is None
+    # 該列本身還在，而且非私有欄位和 admin 看到的一致。
+    assert user_row["task_key"] == "sig-leaky"
+    assert user_row["failures"] == 2
+    assert user_row["active"] is True
+    assert user_row["updated_at"] == admin_row["updated_at"]
+
+
 def test_list_workers_unsuitable_is_empty_for_a_clean_worker(client):
     csrf = _login(client)
     worker_id = _register(client, csrf, "worker-clean", "63" * 32)

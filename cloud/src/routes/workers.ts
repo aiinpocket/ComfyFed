@@ -60,7 +60,7 @@ import { boundedGunzip, ObjectInfoTooLarge, InvalidGzip } from "../lib/gzip";
 import { sha256Hex } from "../lib/hex";
 import { bytesToBase64Url } from "../lib/base64";
 import { verifyAgentRequest, type VerifyAgentResult } from "../lib/verify_agent";
-import { requireAdmin, requireCsrf, requireUser, errorJson } from "../lib/guard";
+import { requireAdmin, requireCsrf, requireUser, errorJson, SESSION_VAR } from "../lib/guard";
 import * as modelManifest from "../core/model_manifest";
 import * as retry from "../core/retry";
 
@@ -258,6 +258,10 @@ app.post("/api/agent/object_info", async (c) => {
 app.get("/api/workers", requireUser, async (c) => {
   const workers = await getAllWorkers(c.env.DB);
   const now = new Date();
+  // final review I1：`unsuitable[].last_error` / `last_job_id` 是跨 job、跨使用
+  // 者累積的自由文字與別人 job 的 id，只給 admin（見
+  // `retry.unsuitableRowsForWorker` 的 docstring）。Parity: workers.py.
+  const isAdmin = c.get(SESSION_VAR).user.role === "admin";
   const rows = await Promise.all(
     workers.map(async (w) => ({
       id: w.id,
@@ -290,7 +294,8 @@ app.get("/api/workers", requireUser, async (c) => {
       // 手動清除。和 `peer_url` 同一個理由對任何登入使用者可讀：worker 是共用
       // 基礎設施，這是艦隊 metadata，不是誰的私人資料。清除才是 admin-only
       // （見下面兩條 DELETE）。Ports workers.py's `GET /api/workers`.
-      unsuitable: await retry.unsuitableRowsForWorker(c.env.DB, w.id, now),
+      // `last_error` 與 `last_job_id` 兩欄是例外，只有 admin 拿得到值（I1）。
+      unsuitable: await retry.unsuitableRowsForWorker(c.env.DB, w.id, now, isAdmin),
     }))
   );
   return c.json(rows);

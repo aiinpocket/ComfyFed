@@ -313,7 +313,7 @@ describe("worker_task_failures adapter", () => {
     // 別台的列不該出現。
     await retry.recordFailure(db(), "w2", "sig-other", "nope", "j6", t);
 
-    const rows = await retry.unsuitableRowsForWorker(db(), "w1", t);
+    const rows = await retry.unsuitableRowsForWorker(db(), "w1", t, true);
     const byKey = new Map(rows.map((r) => [r.task_key, r]));
     expect(new Set(byKey.keys())).toEqual(new Set(["sig-active", "sig-stale", "sig-once"]));
     expect(byKey.get("sig-active")!.active).toBe(true);
@@ -325,6 +325,27 @@ describe("worker_task_failures adapter", () => {
     expect(byKey.get("sig-once")!.active).toBe(false);
   });
 
+  it("hides the free-text fields from a non-admin reader", async () => {
+    // final review I1 -- ports test_retry.py's
+    // `test_unsuitable_rows_hide_the_free_text_fields_from_a_non_admin`.
+    const t = now();
+    const error = "C:/models/loras/private-style.safetensors not found";
+    await retry.recordFailure(db(), "w1", "sig-a", error, "j1", t);
+    await retry.recordFailure(db(), "w1", "sig-a", error, "j2", t);
+
+    const publicRows = await retry.unsuitableRowsForWorker(db(), "w1", t, false);
+    const privateRows = await retry.unsuitableRowsForWorker(db(), "w1", t, true);
+
+    expect(publicRows).toHaveLength(1);
+    expect(privateRows).toHaveLength(1);
+    expect(publicRows[0]!.last_error).toBeNull();
+    expect(publicRows[0]!.last_job_id).toBeNull();
+    expect(privateRows[0]!.last_error).toBe(error);
+    expect(privateRows[0]!.last_job_id).toBe("j2");
+    // 藏的只有那兩欄。
+    expect({ ...publicRows[0]!, last_error: error, last_job_id: "j2" }).toEqual(privateRows[0]!);
+  });
+
   it("clearWorkerFailures returns the number cleared", async () => {
     const t = now();
     await retry.recordFailure(db(), "w1", "sig-a", "boom", "j1", t);
@@ -332,8 +353,8 @@ describe("worker_task_failures adapter", () => {
     await retry.recordFailure(db(), "w2", "sig-a", "boom", "j3", t);
 
     expect(await retry.clearWorkerFailures(db(), "w1")).toBe(2);
-    expect(await retry.unsuitableRowsForWorker(db(), "w1", t)).toEqual([]);
-    expect(await retry.unsuitableRowsForWorker(db(), "w2", t)).toHaveLength(1);
+    expect(await retry.unsuitableRowsForWorker(db(), "w1", t, true)).toEqual([]);
+    expect(await retry.unsuitableRowsForWorker(db(), "w2", t, true)).toHaveLength(1);
     expect(await retry.clearWorkerFailures(db(), "w1")).toBe(0);
   });
 });

@@ -257,7 +257,7 @@ def test_unsuitable_rows_for_worker_reports_active_and_inactive(_db):
         retry.record_failure(session, "w2", "sig-other", "nope", "j6", now)
         session.commit()
 
-        rows = retry.unsuitable_rows_for_worker(session, "w1", now)
+        rows = retry.unsuitable_rows_for_worker(session, "w1", now, include_private=True)
 
     by_key = {r["task_key"]: r for r in rows}
     assert set(by_key) == {"sig-active", "sig-stale", "sig-once"}
@@ -270,6 +270,30 @@ def test_unsuitable_rows_for_worker_reports_active_and_inactive(_db):
     assert by_key["sig-once"]["active"] is False
 
 
+def test_unsuitable_rows_hide_the_free_text_fields_from_a_non_admin(_db):
+    """final review I1：`worker_task_failures` 跨 job、跨使用者累積，所以
+    `last_error`（最多 500 字的失敗原文，常含檔名與路徑）和 `last_job_id`
+    （別人的 job id）只給 admin。其餘欄位照樣回，非 admin 看得到「這台在這
+    類任務上被擋著」這件艦隊事實。"""
+    now = _utcnow()
+    with db.get_session() as session:
+        retry.record_failure(session, "w1", "sig-a", "C:/models/secret-lora.safetensors missing", "j1", now)
+        retry.record_failure(session, "w1", "sig-a", "C:/models/secret-lora.safetensors missing", "j2", now)
+        session.commit()
+
+        public = retry.unsuitable_rows_for_worker(session, "w1", now, include_private=False)
+        private = retry.unsuitable_rows_for_worker(session, "w1", now, include_private=True)
+
+    assert len(public) == 1 and len(private) == 1
+    assert public[0]["last_error"] is None
+    assert public[0]["last_job_id"] is None
+    assert private[0]["last_error"] == "C:/models/secret-lora.safetensors missing"
+    assert private[0]["last_job_id"] == "j2"
+    # 其餘欄位兩邊一模一樣 -- 藏的只有那兩欄。
+    for field in ("task_key", "failures", "updated_at", "active"):
+        assert public[0][field] == private[0][field]
+
+
 def test_clear_worker_failures_returns_the_number_cleared(_db):
     now = _utcnow()
     with db.get_session() as session:
@@ -280,7 +304,7 @@ def test_clear_worker_failures_returns_the_number_cleared(_db):
 
         assert retry.clear_worker_failures(session, "w1") == 2
         session.commit()
-        assert retry.unsuitable_rows_for_worker(session, "w1", now) == []
-        assert len(retry.unsuitable_rows_for_worker(session, "w2", now)) == 1
+        assert retry.unsuitable_rows_for_worker(session, "w1", now, include_private=True) == []
+        assert len(retry.unsuitable_rows_for_worker(session, "w2", now, include_private=True)) == 1
 
         assert retry.clear_worker_failures(session, "w1") == 0

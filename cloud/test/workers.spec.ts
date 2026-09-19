@@ -973,6 +973,37 @@ describe("GET /api/workers unsuitable[] (job-retry §8)", () => {
     expect(other.unsuitable.map((row: any) => row.task_key)).toEqual(["sig-elsewhere"]);
   });
 
+  it("hides last_error and last_job_id from a non-admin, keeping the row itself", async () => {
+    // final review I1：`worker_task_failures` 跨 job、跨使用者累積，所以
+    // `last_error`（失敗原文，常含檔名／模型名稱／絕對路徑）與 `last_job_id`
+    // （別人的 job id）只有 admin 讀得到。其餘欄位是艦隊 metadata，照樣回。
+    // Ports test_workers.py's
+    // `test_list_workers_hides_unsuitable_error_and_job_id_from_a_non_admin`.
+    const admin = await adminSession();
+    const worker = await registerWorker("worker-leak");
+    await seedFailure(worker.workerId, "sig-leaky", 2, {
+      error: "C:/models/loras/private-style.safetensors not found",
+      jobId: "job-of-someone-else",
+    });
+
+    const asAdmin = await call("/api/workers", { cookie: admin.cookie, headers: { "X-CSRF": admin.csrf } });
+    const adminRow = asAdmin.body.find((w: any) => w.id === worker.workerId).unsuitable[0];
+    expect(adminRow.last_error).toBe("C:/models/loras/private-style.safetensors not found");
+    expect(adminRow.last_job_id).toBe("job-of-someone-else");
+
+    const user = await userSession("leak-reader");
+    const asUser = await call("/api/workers", { cookie: user.cookie });
+    expect(asUser.status).toBe(200);
+    const userRow = asUser.body.find((w: any) => w.id === worker.workerId).unsuitable[0];
+    expect(userRow.last_error).toBeNull();
+    expect(userRow.last_job_id).toBeNull();
+    // 該列本身還在，非私有欄位和 admin 看到的一致。
+    expect(userRow.task_key).toBe("sig-leaky");
+    expect(userRow.failures).toBe(2);
+    expect(userRow.active).toBe(true);
+    expect(userRow.updated_at).toBe(adminRow.updated_at);
+  });
+
   it("is empty for a clean worker", async () => {
     const { cookie, csrf } = await adminSession();
     const worker = await registerWorker("worker-clean");

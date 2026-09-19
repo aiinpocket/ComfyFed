@@ -321,13 +321,24 @@ function isActive(row: FailureRow, now: Date): boolean {
  *
  * 一個 dispatch tick 只查一次，整批傳給 `assess.verdict`（見
  * `dispatch.assignJobs` 的 `exclusions`）。過期的列留著不刪 -- 它是管理員診斷
- * 「這台過去在這類任務上翻過車」的歷史，只是不再擋派工。Ports
- * `retry.active_unsuitable`. */
+ * 「這台過去在這類任務上翻過車」的歷史，只是不再擋派工。
+ *
+ * 門檻與 TTL 兩個條件都下在 SQL 裡（final review Minor 3）：這張表只增不
+ * 減，而 tick 每 5 秒有活可派就查一次，整表撈回來再用 JS 濾等於讓成本跟著
+ * 「歷史」長。`updated_at IS NULL` 的列在 SQL 三值邏輯裡不滿足 `>=`，自然
+ * 被濾掉 -- 和 `isActive` 一樣把無法證明新鮮的紀錄當過期。字串比較等價於
+ * 時間比較的理由見 `isActive`。Ports `retry.active_unsuitable`. */
 export async function activeUnsuitable(db: D1Database, now: Date): Promise<Set<string>> {
-  const { results } = await db.prepare("SELECT * FROM worker_task_failures").all<FailureRow>();
+  const cutoff = toSqliteTimestamp(new Date(now.getTime() - UNSUITABLE_TTL_DAYS * MS_PER_DAY));
+  const { results } = await db
+    .prepare(
+      "SELECT worker_id, task_key FROM worker_task_failures WHERE failures >= ? AND updated_at >= ?"
+    )
+    .bind(UNSUITABLE_THRESHOLD, cutoff)
+    .all<Pick<FailureRow, "worker_id" | "task_key">>();
   const pairs = new Set<string>();
   for (const row of results) {
-    if (isActive(row, now)) pairs.add(exclusionKey(row.worker_id, row.task_key));
+    pairs.add(exclusionKey(row.worker_id, row.task_key));
   }
   return pairs;
 }
@@ -336,11 +347,20 @@ export async function activeUnsuitable(db: D1Database, now: Date): Promise<Set<s
  *
  * 門檻未達／TTL 已過的列照樣列出來，只是 `active: false`（console 畫成灰字）
  * -- 管理員要看得到「這台失敗過一次」和「這台上個月不適任過」，那是決定要不要
- * 手動清除的依據。Ports `retry.unsuitable_rows_for_worker`. */
+ * 手動清除的依據。
+ *
+ * `includePrivate === false` 時 `last_error` 與 `last_job_id` 一律回 null
+ * （final review I1）：`worker_task_failures` 是**跨 job、跨使用者**累積的，
+ * 那兩欄一個是別人 job 的 id、一個是最多 500 字的失敗原文（常含檔名、模型
+ * 名稱與絕對路徑）。jobs 本身是 owner-or-admin 才看得到（`isOwnerOrAdmin`，
+ * 連存在與否都藏），這條 API 不能從側門漏同樣的東西給任何登入使用者。參數
+ * 刻意沒有預設值：新的呼叫端必須明講自己是哪一種讀者。Ports
+ * `retry.unsuitable_rows_for_worker`. */
 export async function unsuitableRowsForWorker(
   db: D1Database,
   workerId: string,
-  now: Date
+  now: Date,
+  includePrivate: boolean
 ): Promise<UnsuitableRow[]> {
   const { results } = await db
     .prepare(
@@ -351,8 +371,8 @@ export async function unsuitableRowsForWorker(
   return results.map((row) => ({
     task_key: row.task_key,
     failures: row.failures || 0,
-    last_error: row.last_error,
-    last_job_id: row.last_job_id,
+    last_error: includePrivate ? row.last_error : null,
+    last_job_id: includePrivate ? row.last_job_id : null,
     updated_at: row.updated_at ? sqliteTimestampToIsoformat(row.updated_at) : null,
     active: isActive(row, now),
   }));

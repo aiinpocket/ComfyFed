@@ -404,7 +404,12 @@ def create_router(data_dir: str) -> APIRouter:
         return {"ok": True}
 
     @r.get("/api/workers")
-    def list_workers(_user: auth.SessionUser = Depends(auth.require_user)):
+    def list_workers(user: auth.SessionUser = Depends(auth.require_user)):
+        # final review I1：`unsuitable[].last_error` / `last_job_id` 是跨 job、
+        # 跨使用者累積的自由文字與別人 job 的 id，只給 admin（見
+        # `retry.unsuitable_rows_for_worker` 的 docstring）。其餘欄位照舊對所有
+        # 登入使用者可讀。
+        is_admin = user.role == "admin"
         with db.get_session() as session:
             # Soft-deleted workers are gone as far as every user-visible
             # surface is concerned (see `db.Worker.deleted`); only the
@@ -450,8 +455,11 @@ def create_router(data_dir: str) -> APIRouter:
                     # 字 -- 管理員要看得到歷史才決定要不要手動清除。和
                     # `peer_url` 同一個理由對任何登入使用者可讀：worker 是共
                     # 用基礎設施，這是艦隊 metadata，不是誰的私人資料。清除
-                    # 才是 admin-only（見下面兩條 DELETE）。
-                    "unsuitable": retry.unsuitable_rows_for_worker(session, w.id, now),
+                    # 才是 admin-only（見下面兩條 DELETE）。`last_error` 與
+                    # `last_job_id` 兩欄是例外，只有 admin 拿得到值（I1）。
+                    "unsuitable": retry.unsuitable_rows_for_worker(
+                        session, w.id, now, include_private=is_admin
+                    ),
                 }
                 for w in workers
             ]
