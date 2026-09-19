@@ -350,7 +350,7 @@ class ApiToken(Base):
     __tablename__ = "api_tokens"
 
     id: Mapped[str] = mapped_column(String, primary_key=True, default=_uuid_hex)
-    user_id: Mapped[str] = mapped_column(String)
+    user_id: Mapped[str] = mapped_column(String, index=True)
     name: Mapped[str] = mapped_column(String, default="", server_default="")
     token_hash: Mapped[str] = mapped_column(String, unique=True)
     prefix: Mapped[str] = mapped_column(String)

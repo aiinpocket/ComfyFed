@@ -569,7 +569,7 @@ def create_api_token(
             row, plaintext = api_tokens.create_token(
                 db_session,
                 db_user,
-                ((body.name if body else None) or "").strip(),
+                (body.name if body else None) or "",
                 _utcnow(),
             )
         except api_tokens.BadName:

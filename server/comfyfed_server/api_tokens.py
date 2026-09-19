@@ -94,7 +94,9 @@ def create_token(
     Raises `BadName`（名稱過長）／`TooManyTokens`（有效 token 已達上限）。
     上限只數「有效」的：撤銷或過期的列留著當歷史，不佔額度。
     """
-    name = name or ""
+    # M3：strip 在長度檢查「之前」、而且在這裡做，長度規則才只有一份
+    # （呼叫端傳原值就好）。
+    name = (name or "").strip()
     if len(name) > API_TOKEN_NAME_MAX:
         raise BadName(name)
 

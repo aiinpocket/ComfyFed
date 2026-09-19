@@ -44,6 +44,7 @@ def _submit(client, headers):
     return client.post(
         "/api/jobs",
         data={"workflow_json": json.dumps(SIMPLE_WORKFLOW)},
+        files=[],
         headers=headers,
     )
 
@@ -232,6 +233,33 @@ def test_bearer_me_reports_token_auth(client):
     assert body["token_expires_at"]
 
 
+def test_invalid_bearer_on_me_is_401_not_an_anonymous_200(client):
+    """控制者裁示：`/me` 帶了 `Authorization` 但無效 -> 401。
+
+    §6.3 的 `platform_status` 靠這條路徑分辨「token 死了」與「平台好好
+    的」；`/me` 的 401 走的是跟 `require_user` 不同的分支（route 自己呼叫
+    `_bearer_user`），所以要獨立釘住。完全沒有憑證的匿名呼叫則照舊 200。
+    """
+    r = client.get("/api/auth/me", headers={"Authorization": "Bearer cft_bogus"})
+    assert r.status_code == 401
+    assert r.json()["error"]["code"] == "auth.required"
+
+    anon = client.get("/api/auth/me")
+    assert anon.status_code == 200
+    assert anon.json()["authenticated"] is False
+
+
+def test_revoked_token_on_me_is_401(client):
+    csrf = _login(client)
+    created = _create_token(client, csrf).json()
+    client.delete(f"/api/auth/tokens/{created['id']}", headers={"X-CSRF": csrf})
+    client.cookies.clear()
+
+    r = client.get("/api/auth/me", headers=_bearer(created["token"]))
+    assert r.status_code == 401
+    assert r.json()["error"]["code"] == "auth.required"
+
+
 def test_cookie_me_reports_session_auth(client):
     _login(client)
     body = client.get("/api/auth/me").json()
@@ -257,6 +285,9 @@ def test_bearer_cannot_manage_tokens_or_session(client, path, method, kwargs):
 
     r = getattr(client, method)(path, headers=_bearer(token), **kwargs)
     assert r.status_code == 401
+    # 這個碼是控制者的裁示（spec 寫的 `auth.unauthorized` 作廢），cloud 孿生
+    # 要跟著用同一個 —— 釘住它，免得兩棧各自漂移還都是綠的。
+    assert r.json()["error"]["code"] == "auth.required"
 
 
 def test_revoked_token_is_rejected(client):
@@ -318,6 +349,7 @@ def test_bad_authorization_header_never_falls_back_to_the_cookie(client, header)
 
     r = client.get("/api/jobs", headers={"Authorization": header})
     assert r.status_code == 401
+    assert r.json()["error"]["code"] == "auth.required"
 
 
 # --- last_used_at 節流 --------------------------------------------------
@@ -363,3 +395,33 @@ def test_create_token_without_a_body_uses_an_empty_name(client):
     r = client.post("/api/auth/tokens", headers={"X-CSRF": csrf})
     assert r.status_code == 201
     assert r.json()["name"] == ""
+
+
+def test_resolve_bearer_returns_the_user_or_none(client):
+    """`resolve_bearer` 是 brief 宣告的介面，但 `auth.py` 用的是回傳列的
+    `resolve_bearer_token`；直接測它，免得這個包裝爛掉沒人發現。"""
+    csrf = _login(client)
+    plaintext = _create_token(client, csrf).json()["token"]
+
+    with db.get_session() as session:
+        now = _utcnow()
+        user = api_tokens.resolve_bearer(session, f"Bearer {plaintext}", now)
+        assert user is not None and user.username == "admin"
+
+        assert api_tokens.resolve_bearer(session, None, now) is None
+        assert api_tokens.resolve_bearer(session, "Basic x", now) is None
+        assert api_tokens.resolve_bearer(session, "Bearer cft_nope", now) is None
+
+
+def test_logout_with_a_stale_session_is_401(client):
+    """logout 現在要 cookie＋CSRF（spec §4.3 的例外清單），所以 session 失效
+    之後按登出會拿到 401 —— 釘住它是 401，而不是 500 或默默成功。"""
+    csrf = _login(client)
+    with db.get_session() as session:
+        user = session.query(db.User).filter(db.User.username == "admin").one()
+        user.session_epoch += 1
+        session.commit()
+
+    r = client.post("/api/auth/logout", headers={"X-CSRF": csrf})
+    assert r.status_code == 401
+    assert r.json()["error"]["code"] == "auth.required"
