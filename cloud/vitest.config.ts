@@ -27,10 +27,21 @@ const migrations = await readD1Migrations("migrations");
 // test/comfyfed-ext.spec.ts compares the embedded TS constant against this.
 const comfyfedExtJsSource = readFileSync("../server/comfyfed_server/panel_ext/comfyfed.js", "utf8");
 
+// 2026-09-19 spec 5.1's byte-parity requirement for the recipe files: the
+// packaged Python copy and the bundled cloud copy must be identical BYTES.
+// Read both here at Node config time (same reason as above -- no `fs` inside
+// workerd) and thread them in as base64, which survives the JSON round-trip
+// through `define` without any encoding guesswork.
+// test/recipes.spec.ts decodes both and compares with `Buffer.equals`.
+const recipeFluxServer = readFileSync("../server/comfyfed_server/recipes/flux-t2i.json", "base64");
+const recipeFluxCloud = readFileSync("./src/core/recipes/flux-t2i.json", "base64");
+
 export default defineConfig({
   define: {
     __D1_MIGRATIONS__: JSON.stringify(migrations),
     __COMFYFED_EXT_JS_SOURCE__: JSON.stringify(comfyfedExtJsSource),
+    __RECIPE_FLUX_SERVER_B64__: JSON.stringify(recipeFluxServer),
+    __RECIPE_FLUX_CLOUD_B64__: JSON.stringify(recipeFluxCloud),
   },
   test: {
     // Node-side, once for the whole run (unlike `setupFiles` below, which

@@ -16,6 +16,7 @@ describe("D1 migration 0001_initial", () => {
     const names = rows.results.map((r) => r.name).filter((n) => !n.startsWith("sqlite_") && !n.startsWith("_cf_") && !n.startsWith("d1_"));
     expect(names.sort()).toEqual(
       [
+        "api_tokens",
         "jobs",
         "login_attempts",
         "model_hashes",
@@ -389,5 +390,35 @@ describe("D1 migration 0010_peer_nat", () => {
     expect(row.peer_checked_at).toBeNull();
     expect(row.remote_ip).toBeNull();
     await db.prepare("DELETE FROM workers WHERE id = 'w-0010'").run();
+  });
+});
+
+describe("D1 migration 0013_api_tokens", () => {
+  it("creates api_tokens with a UNIQUE token_hash and the user_id index", async () => {
+    const db = (env as any).DB as D1Database;
+    const cols = await db.prepare("PRAGMA table_info(api_tokens)").all<{ name: string; pk: number; notnull: number }>();
+    const byName = new Map(cols.results.map((c) => [c.name, c]));
+    expect(byName.get("id")!.pk).toBeGreaterThan(0);
+    for (const col of ["user_id", "name", "token_hash", "prefix", "epoch", "created_at", "expires_at", "last_used_at", "revoked_at"]) {
+      expect(byName.has(col), `api_tokens.${col} missing`).toBe(true);
+    }
+    expect(byName.get("last_used_at")!.notnull).toBe(0);
+    expect(byName.get("revoked_at")!.notnull).toBe(0);
+
+    const indexes = await db.prepare("PRAGMA index_list(api_tokens)").all<{ name: string }>();
+    expect(indexes.results.map((i) => i.name)).toContain("ix_api_tokens_user_id");
+
+    const insert = (id: string, hash: string) =>
+      db
+        .prepare(
+          "INSERT INTO api_tokens (id, user_id, name, token_hash, prefix, epoch, created_at, expires_at)"
+          + " VALUES (?, 'u1', '', ?, 'cft_abcdefg', 0, '2026-01-01 00:00:00.000000', '2026-02-01 00:00:00.000000')"
+        )
+        .bind(id, hash)
+        .run();
+    await insert("t-0013", "hash-0013");
+    // 同一個明文雜湊不可能存兩列 —— UNIQUE(token_hash)。
+    await expect(insert("t-0013-dup", "hash-0013")).rejects.toThrow();
+    await db.prepare("DELETE FROM api_tokens WHERE id = 't-0013'").run();
   });
 });

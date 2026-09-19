@@ -204,6 +204,11 @@ describe("GET /api/auth/me", () => {
       lang: "en",
       platform_url: "",
       csrf: loginRes.body.csrf,
+      // 2026-09-19 spec §4.3: cookie 與 bearer 回同一組 key，只是值相反
+      // （bearer 是 `auth: "token"`、`csrf: null`、有到期時間）。逐項斷
+      // 言在 test/api_tokens.spec.ts。
+      auth: "session",
+      token_expires_at: null,
     });
   });
 
@@ -246,9 +251,23 @@ describe("GET /api/auth/me", () => {
 
 describe("POST /api/auth/logout", () => {
   it("clears the session cookie", async () => {
-    const r = await call("/api/auth/logout", { method: "POST" });
+    await setup();
+    const loginRes = await login();
+    const r = await call("/api/auth/logout", {
+      method: "POST",
+      cookie: loginRes.setCookie,
+      headers: { "X-CSRF": loginRes.body.csrf },
+    });
     expect(r.status).toBe(200);
     expect(r.body).toEqual({ ok: true });
+  });
+
+  it("is cookie+CSRF gated (spec §4.3): an anonymous logout is a 401", async () => {
+    // 登出是改狀態的，而且在 §4.3 的例外清單上（bearer 一律 401，
+    // 見 test/api_tokens.spec.ts）—— 它以前是完全不認證的。
+    const r = await call("/api/auth/logout", { method: "POST" });
+    expect(r.status).toBe(401);
+    expect(r.body.error.code).toBe("auth.required");
   });
 });
 

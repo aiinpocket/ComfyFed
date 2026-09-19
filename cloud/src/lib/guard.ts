@@ -18,8 +18,9 @@
 import type { Context, MiddlewareHandler } from "hono";
 import type { Env } from "../env";
 import { readSessionCookie, type SessionPayload } from "./cookies";
-import { getOrCreateSessionSecret, getUserById } from "../db/queries";
+import { getOrCreateSessionSecret, getUserById, sqliteTimestampToIsoformat } from "../db/queries";
 import { MESSAGES } from "../core/auth";
+import { resolveBearerToken } from "../core/api_tokens";
 
 export const SESSION_COOKIE_NAME = "cf_session";
 
@@ -66,12 +67,24 @@ function extractCookie(cookieHeader: string | undefined, name: string): string |
   return null;
 }
 
-/** The authenticated principal behind a validated session cookie -- mirrors
- * auth.py's `SessionUser` dataclass. */
+/** The authenticated principal behind a validated session cookie -- or,
+ * since 2026-09-19 (spec §4.3), behind an `Authorization: Bearer cft_...`
+ * API token, which is equivalent everywhere a session is accepted except
+ * the token-management / change-password / logout routes. Mirrors auth.py's
+ * `SessionUser` dataclass.
+ *
+ * `auth` says which of the two it was, so `/api/auth/me` can report it and
+ * so the CSRF-enforcing middlewares know to skip the header check (a bearer
+ * token is never sent cross-site by a browser). `tokenExpiresAt` is the ISO
+ * timestamp of the token behind an `auth === "token"` principal, `null` for
+ * a cookie session -- the MCP client shows it to the user so an expiry is
+ * not a surprise 401. */
 export interface SessionUser {
   uid: string;
   username: string;
   role: string;
+  auth: "session" | "token";
+  tokenExpiresAt: string | null;
 }
 
 /** Validates a decoded cookie payload against the current `users` row.
@@ -95,7 +108,7 @@ export async function sessionUserFromPayload(
   const user = await getUserById(db, uid);
   if (!user || user.disabled) return null;
   if (payload.epoch !== user.sessionEpoch) return null;
-  return { uid: user.id, username: user.username, role: user.role };
+  return { uid: user.id, username: user.username, role: user.role, auth: "session", tokenExpiresAt: null };
 }
 
 /** Full cookie-to-`SessionUser` resolution for hand-checked call sites --
@@ -126,7 +139,63 @@ declare module "hono" {
   }
 }
 
+/** `Authorization` header -> `AuthedSession`, or `null` (spec §4.3) --
+ * mirrors auth.py's `_bearer_user`, except that it returns `null` on failure
+ * and lets the middlewares below answer the single shared 401 rather than
+ * raising its own.
+ *
+ * Every failure reason -- malformed header, unknown/revoked/expired token,
+ * stale epoch, disabled user -- answers the SAME 401 `auth.required` a
+ * missing cookie does. Telling a caller WHICH of those it was would hand an
+ * attacker an oracle over other people's tokens, and the honest caller
+ * cannot act on the distinction anyway: get a new token.
+ *
+ * `csrf` is the empty string: a bearer principal has no CSRF token, and
+ * `checkCsrf` is never reached for one (it returns early on `auth ===
+ * "token"`). `/api/auth/me` reports `csrf: null` for a token caller off
+ * `user.auth`, not off this field. */
+export async function resolveBearerSession(
+  c: Context<{ Bindings: Env }>,
+  authorization: string
+): Promise<AuthedSession | null> {
+  const resolved = await resolveBearerToken(c.env.DB, authorization, new Date());
+  if (!resolved) return null;
+  const { row, user } = resolved;
+  return {
+    user: {
+      uid: user.id,
+      username: user.username,
+      role: user.role,
+      auth: "token",
+      tokenExpiresAt: sqliteTimestampToIsoformat(row.expiresAt),
+    },
+    csrf: "",
+  };
+}
+
+/** The single choke point feeding `requireUser`/`requireAdmin`/
+ * `requireCsrf`/`requireCsrfUser` -- mirrors the head of auth.py's
+ * `require_user`.
+ *
+ * An `Authorization` header present at all means bearer-ONLY: no fallback to
+ * the cookie, even a valid one (spec §4.3). Mixing the two would make "which
+ * identity is this request?" depend on which credential happened to be
+ * better -- a browser tab with a stale token would silently act as its
+ * cookie user instead of failing. */
 async function resolveAuthedSession(c: Context<{ Bindings: Env }>): Promise<AuthedSession | null> {
+  const authorization = c.req.header("Authorization");
+  if (authorization !== undefined) {
+    return resolveBearerSession(c, authorization);
+  }
+  return resolveCookieSession(c);
+}
+
+/** Cookie-ONLY resolution with no `Authorization` path at all -- backs
+ * `requireSession`/`requireCsrfSession` (spec §4.3's exception list), and is
+ * also the cookie half of `resolveAuthedSession` above. A bearer caller
+ * simply has no cookie, so those routes give it the same 401 as anyone else
+ * without one. */
+async function resolveCookieSession(c: Context<{ Bindings: Env }>): Promise<AuthedSession | null> {
   const payload = await readSession(c);
   const user = await sessionUserFromPayload(c.env.DB, payload);
   if (!user || !payload) return null;
@@ -164,7 +233,12 @@ export const requireAdmin: MiddlewareHandler<{ Bindings: Env }> = async (c, next
   await next();
 };
 
+/** `null` when the request may proceed. A bearer-authenticated caller skips
+ * the check entirely (spec §4.3): CSRF exists because a browser attaches
+ * cookies to cross-site requests by itself, and it never attaches an
+ * `Authorization` header by itself. */
 function checkCsrf(c: Context, session: AuthedSession): Response | null {
+  if (session.user.auth === "token") return null;
   const xCsrf = c.req.header("X-CSRF");
   if (!xCsrf || xCsrf !== session.csrf) {
     return errorJson(c, 403, "auth.csrf", MESSAGES.csrfInvalid);
@@ -198,6 +272,44 @@ export const requireCsrf: MiddlewareHandler<{ Bindings: Env }> = async (c, next)
  * future task's per-user job submission/cancel) use this too. */
 export const requireCsrfUser: MiddlewareHandler<{ Bindings: Env }> = async (c, next) => {
   const session = await resolveAuthedSession(c);
+  if (!session) {
+    return errorJson(c, 401, "auth.required", MESSAGES.authRequired);
+  }
+  const csrfError = checkCsrf(c, session);
+  if (csrfError) return csrfError;
+  c.set(SESSION_VAR, session);
+  await next();
+};
+
+/** Cookie-ONLY middleware with no CSRF compare: the read-only half of spec
+ * §4.3's exception list -- mirrors auth.py's `require_session`, and guards
+ * `GET /api/auth/tokens`.
+ *
+ * `requireCsrfSession`'s sibling for SAFE methods. The token listing must
+ * still be closed to API tokens (a token must not be able to enumerate its
+ * owner's other tokens), but demanding an `X-CSRF` header on a GET buys
+ * nothing -- CSRF protects state changes, and the console's fetch wrapper
+ * only sends that header on non-GET requests (`web/src/api.ts`), so
+ * requiring it here would just 403 the console's own listing. */
+export const requireSession: MiddlewareHandler<{ Bindings: Env }> = async (c, next) => {
+  const session = await resolveCookieSession(c);
+  if (!session) {
+    return errorJson(c, 401, "auth.required", MESSAGES.authRequired);
+  }
+  c.set(SESSION_VAR, session);
+  await next();
+};
+
+/** Cookie-ONLY, CSRF-enforcing middleware: an API token can never satisfy it
+ * (spec §4.3's exception list) -- mirrors auth.py's `require_csrf_session`.
+ *
+ * The routes behind this are the state-changing ones a token must not be
+ * able to reach even though it otherwise speaks for its user: minting and
+ * revoking tokens (a stolen token must not be able to mint itself a
+ * successor that outlives revocation), changing the password, and logging
+ * out. The read-only listing uses `requireSession` instead. */
+export const requireCsrfSession: MiddlewareHandler<{ Bindings: Env }> = async (c, next) => {
+  const session = await resolveCookieSession(c);
   if (!session) {
     return errorJson(c, 401, "auth.required", MESSAGES.authRequired);
   }

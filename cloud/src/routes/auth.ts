@@ -35,6 +35,7 @@ import {
   getUserByUsername,
   insertUser,
   updateUserPasswordAndBumpEpoch,
+  sqliteTimestampToIsoformat,
 } from "../db/queries";
 import { hashPassword, verifyPassword } from "../lib/passwords";
 import { bytesToHex } from "../lib/hex";
@@ -47,7 +48,18 @@ import {
   SETUP_MESSAGES,
   bilingualMessage,
 } from "../core/auth";
-import { errorJson, requireCsrfUser, SESSION_COOKIE_NAME, readSession, sessionUserFromPayload } from "../lib/guard";
+import {
+  errorJson,
+  requireCsrfSession,
+  requireSession,
+  resolveBearerSession,
+  SESSION_COOKIE_NAME,
+  SESSION_VAR,
+  readSession,
+  sessionUserFromPayload,
+} from "../lib/guard";
+import * as apiTokens from "../core/api_tokens";
+import { getUserById } from "../db/queries";
 
 const LANG_KEY = "lang";
 const PLATFORM_URL_KEY = "platform_url";
@@ -242,7 +254,9 @@ app.post("/api/auth/login", async (c) => {
   return c.json({ csrf });
 });
 
-app.post("/api/auth/logout", async (c) => {
+// Cookie-only (spec §4.3): there is no cookie for a bearer caller to drop,
+// so an API token gets the same 401 here as an anonymous request.
+app.post("/api/auth/logout", requireCsrfSession, async (c) => {
   deleteCookie(c, SESSION_COOKIE_NAME, { path: "/" });
   return c.json({ ok: true });
 });
@@ -253,12 +267,44 @@ app.post("/api/auth/logout", async (c) => {
 // 「Cache Everything」規則（或任何中繼）就能把一個人的身分發給另一個人。
 const ME_CACHE_CONTROL = "private, no-store";
 
+// Copied verbatim from auth.py's token routes (bilingual there, so bilingual
+// here -- these are the only strings in this file the Python side writes in
+// both languages).
+const TOKEN_MESSAGES = {
+  badName:
+    `Token name must be at most ${apiTokens.API_TOKEN_NAME_MAX} characters.`
+    + ` / 名稱最多 ${apiTokens.API_TOKEN_NAME_MAX} 字。`,
+  tooMany:
+    `At most ${apiTokens.API_TOKEN_MAX_ACTIVE_PER_USER} active tokens;`
+    + ` revoke one first. / 最多 ${apiTokens.API_TOKEN_MAX_ACTIVE_PER_USER}`
+    + ` 枚有效 token，請先撤銷一枚。`,
+  notFound: "No such token.",
+} as const;
+
+// Who am I, and (spec §4.3) by which credential.
+//
+// Anonymous callers still get the public `{authenticated: false, lang,
+// platform_url}` shape -- the console reads this before login. A bearer
+// caller is the exception: a present-but-invalid `Authorization` header is a
+// 401, not an anonymous 200, because this is the route the MCP client calls
+// to check its token is still good (spec §6.3 `platform_status`), and "your
+// token died" must not look like "the platform is fine".
 app.get("/api/auth/me", async (c) => {
   c.header("Cache-Control", ME_CACHE_CONTROL);
-  const payload = await readSession(c);
+
+  const authorization = c.req.header("Authorization");
+  let tokenSession = null;
+  if (authorization !== undefined) {
+    tokenSession = await resolveBearerSession(c, authorization);
+    if (tokenSession === null) {
+      return errorJson(c, 401, "auth.required", MESSAGES.authRequired);
+    }
+  }
+
+  const payload = tokenSession !== null ? null : await readSession(c);
   const lang = (await getSetting(c.env.DB, LANG_KEY)) || "en";
   const platformUrl = (await getSetting(c.env.DB, PLATFORM_URL_KEY)) || "";
-  const user = await sessionUserFromPayload(c.env.DB, payload);
+  const user = tokenSession !== null ? tokenSession.user : await sessionUserFromPayload(c.env.DB, payload);
 
   if (user === null) {
     return c.json({ authenticated: false, lang, platform_url: platformUrl });
@@ -270,7 +316,11 @@ app.get("/api/auth/me", async (c) => {
     role: user.role,
     lang,
     platform_url: platformUrl,
-    csrf: payload?.csrf,
+    // 同一組 key 的 superset：cookie 呼叫回 csrf 與 `token_expires_at: null`，
+    // bearer 呼叫回 `csrf: null` 與到期時間 -- 兩棧同形狀（spec §4.3）。
+    csrf: payload?.csrf ?? null,
+    auth: user.auth,
+    token_expires_at: user.tokenExpiresAt,
   });
 });
 
@@ -280,7 +330,10 @@ app.get("/api/auth/me", async (c) => {
 // every OTHER session for this account stops validating, then immediately
 // re-issues a fresh cookie at the new epoch so the caller's own session
 // stays logged in.
-app.post("/api/auth/change-password", requireCsrfUser, async (c) => {
+// Cookie-only (`requireCsrfSession`, spec §4.3): an API token must not be
+// able to rotate the password of the account it belongs to -- especially
+// since doing so would bump `session_epoch` and kill every OTHER token.
+app.post("/api/auth/change-password", requireCsrfSession, async (c) => {
   const body = await c.req.json<{ old?: unknown; new?: unknown }>().catch(() => ({}) as any);
   const oldPassword = typeof body.old === "string" ? body.old : "";
   const newPassword = typeof body.new === "string" ? body.new : "";
@@ -302,6 +355,71 @@ app.post("/api/auth/change-password", requireCsrfUser, async (c) => {
   const csrf = await issueSessionCookie(c, c.env.DB, { id: user.id, role: user.role, sessionEpoch: user.sessionEpoch + 1 });
 
   return c.json({ ok: true, csrf });
+});
+
+// 2026-09-19 spec §4.2：三條 token 管理端點，全部只收 cookie（bearer 一律
+// 401 —— token 不能再生 token）。改狀態的那兩條另外要 CSRF
+// （`requireCsrfSession`）；只讀的清單走 `requireSession`，GET 本來就
+// 不是 CSRF 防的對象，console 的 fetch 包裝也不會在 GET 上帶 `X-CSRF`。
+
+/** Mint an API token for the caller. The plaintext appears in THIS response
+ * and nowhere else, ever -- the server keeps only its sha256. The body (and
+ * `name` within it) is optional (spec §4.2), so a caller that just wants a
+ * token need not invent a label for it. */
+app.post("/api/auth/tokens", requireCsrfSession, async (c) => {
+  const body = await c.req.json<{ name?: unknown }>().catch(() => ({}) as any);
+  const name = typeof body?.name === "string" ? body.name : "";
+
+  const session = c.get(SESSION_VAR);
+  const user = await getUserById(c.env.DB, session.user.uid);
+  if (user === null) {
+    return errorJson(c, 401, "auth.required", MESSAGES.authRequired);
+  }
+
+  const now = new Date();
+  let created;
+  try {
+    created = await apiTokens.createToken(c.env.DB, user, name, now);
+  } catch (err) {
+    if (err instanceof apiTokens.BadName) {
+      return errorJson(c, 400, "auth.bad_token_name", TOKEN_MESSAGES.badName);
+    }
+    if (err instanceof apiTokens.TooManyTokens) {
+      return errorJson(c, 409, "auth.too_many_tokens", TOKEN_MESSAGES.tooMany);
+    }
+    throw err;
+  }
+
+  const { row, plaintext } = created;
+  return c.json(
+    {
+      id: row.id,
+      name: row.name,
+      token: plaintext,
+      prefix: row.prefix,
+      created_at: sqliteTimestampToIsoformat(row.createdAt),
+      expires_at: sqliteTimestampToIsoformat(row.expiresAt),
+    },
+    201
+  );
+});
+
+/** The caller's own tokens, newest first. Never includes any plaintext. */
+app.get("/api/auth/tokens", requireSession, async (c) => {
+  const session = c.get(SESSION_VAR);
+  return c.json(await apiTokens.listTokens(c.env.DB, session.user.uid, new Date()));
+});
+
+/** Revoke one of the caller's tokens. Idempotent; someone else's token (or
+ * one that never existed) is a 404 -- the two are deliberately
+ * indistinguishable, so this cannot be used to probe for token ids. */
+app.delete("/api/auth/tokens/:tokenId", requireCsrfSession, async (c) => {
+  const session = c.get(SESSION_VAR);
+  const revoked = await apiTokens.revokeToken(c.env.DB, session.user.uid, c.req.param("tokenId"), new Date());
+  if (!revoked) {
+    return errorJson(c, 404, "auth.token_not_found", TOKEN_MESSAGES.notFound);
+  }
+  return c.json({ revoked: true });
 });
 
 export default app;

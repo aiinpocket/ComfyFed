@@ -2301,3 +2301,125 @@ export async function updateUserRoleAndDisabled(
   binds.push(id);
   await db.prepare(`UPDATE users SET ${sets.join(", ")} WHERE id = ?`).bind(...binds).run();
 }
+
+// ---------------------------------------------------------------------------
+// API tokens (2026-09-19 spec §4) -- parity source: server/comfyfed_server/
+// api_tokens.py's `db.ApiToken` reads/writes. See migrations/
+// 0013_api_tokens.sql for the table shape. Row SQL lives here (this file's
+// stated convention: "nothing outside this file should touch a raw D1 row
+// shape"); the token LOGIC -- hashing, the active/expiry rules, the touch
+// throttle -- lives in core/api_tokens.ts, same split auth.py/api_tokens.py
+// have on the Python side.
+
+export interface ApiToken {
+  id: string;
+  userId: string;
+  name: string;
+  tokenHash: string;
+  prefix: string;
+  epoch: number;
+  createdAt: string;
+  expiresAt: string;
+  lastUsedAt: string | null;
+  revokedAt: string | null;
+}
+
+interface ApiTokenRow {
+  id: string;
+  user_id: string;
+  name: string;
+  token_hash: string;
+  prefix: string;
+  epoch: number;
+  created_at: string;
+  expires_at: string;
+  last_used_at: string | null;
+  revoked_at: string | null;
+}
+
+function rowToApiToken(row: ApiTokenRow): ApiToken {
+  return {
+    id: row.id,
+    userId: row.user_id,
+    name: row.name,
+    tokenHash: row.token_hash,
+    prefix: row.prefix,
+    epoch: row.epoch,
+    createdAt: row.created_at,
+    expiresAt: row.expires_at,
+    lastUsedAt: row.last_used_at,
+    revokedAt: row.revoked_at,
+  };
+}
+
+export async function insertApiToken(db: D1Database, token: ApiToken): Promise<void> {
+  await db
+    .prepare(
+      `INSERT INTO api_tokens (id, user_id, name, token_hash, prefix, epoch, created_at, expires_at, last_used_at, revoked_at)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, NULL, NULL)`
+    )
+    .bind(
+      token.id,
+      token.userId,
+      token.name,
+      token.tokenHash,
+      token.prefix,
+      token.epoch,
+      token.createdAt,
+      token.expiresAt
+    )
+    .run();
+}
+
+export async function getApiTokenById(db: D1Database, id: string): Promise<ApiToken | null> {
+  const row = await db.prepare("SELECT * FROM api_tokens WHERE id = ?").bind(id).first<ApiTokenRow>();
+  return row ? rowToApiToken(row) : null;
+}
+
+/** The one query every bearer request runs -- an equality lookup on the
+ * UNIQUE `token_hash` (mirrors api_tokens.py's `.one_or_none()`). */
+export async function getApiTokenByHash(db: D1Database, tokenHash: string): Promise<ApiToken | null> {
+  const row = await db
+    .prepare("SELECT * FROM api_tokens WHERE token_hash = ?")
+    .bind(tokenHash)
+    .first<ApiTokenRow>();
+  return row ? rowToApiToken(row) : null;
+}
+
+/** Every token of one user (revoked and expired ones included), newest
+ * first -- mirrors api_tokens.py's `list_tokens` ordering. */
+export async function listApiTokensForUser(db: D1Database, userId: string): Promise<ApiToken[]> {
+  const { results } = await db
+    .prepare("SELECT * FROM api_tokens WHERE user_id = ? ORDER BY created_at DESC")
+    .bind(userId)
+    .all<ApiTokenRow>();
+  return results.map(rowToApiToken);
+}
+
+/** Count of this user's still-active tokens -- mirrors api_tokens.py's
+ * `_active_query(...).count()`, backing the per-user cap. `now` is a
+ * `toSqliteTimestamp` string; the format is fixed-width and zero-padded, so
+ * a plain `>` string compare sorts chronologically (see this file's header). */
+export async function countActiveApiTokens(db: D1Database, userId: string, now: string): Promise<number> {
+  const row = await db
+    .prepare("SELECT COUNT(*) AS n FROM api_tokens WHERE user_id = ? AND revoked_at IS NULL AND expires_at > ?")
+    .bind(userId, now)
+    .first<{ n: number }>();
+  return row?.n ?? 0;
+}
+
+/** Stamps `revoked_at` on a token that isn't already revoked -- the `AND
+ * revoked_at IS NULL` makes a repeat revoke idempotent in SQL rather than
+ * needing a read-then-write (api_tokens.py's `if row.revoked_at is None`). */
+export async function revokeApiTokenRow(db: D1Database, id: string, now: string): Promise<void> {
+  await db
+    .prepare("UPDATE api_tokens SET revoked_at = ? WHERE id = ? AND revoked_at IS NULL")
+    .bind(now, id)
+    .run();
+}
+
+/** `last_used_at` write-back (throttled by the caller -- core/api_tokens.ts's
+ * `shouldTouch`). */
+export async function touchApiToken(db: D1Database, id: string, now: string): Promise<void> {
+  await db.prepare("UPDATE api_tokens SET last_used_at = ? WHERE id = ?").bind(now, id).run();
+}

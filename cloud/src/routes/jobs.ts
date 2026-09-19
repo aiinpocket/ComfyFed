@@ -334,6 +334,111 @@ const app = new Hono<{ Bindings: Env }>();
 
 // --- POST /api/jobs -----------------------------------------------------
 
+/** The error a `createJobFromWorkflow` refusal raises -- carries exactly the
+ * status/code/message the route always answered with, so both callers turn
+ * it into the same `errorJson` envelope. Mirrors jobs.py's
+ * `create_job_from_workflow` raising the route's own `HTTPException`s. */
+export class JobCreationError extends Error {
+  constructor(
+    readonly status: number,
+    readonly code: string,
+    message: string
+  ) {
+    super(message);
+  }
+}
+
+/** 建單：檢查上傳資產、擋掉整個聯邦都拿不到的模型、寫 Job 列、落地資產。
+ *
+ * The console's `POST /api/jobs` body, lifted out verbatim so a second
+ * caller can reuse it -- 2026-09-19 spec §5.2 wants `POST
+ * /api/recipes/{id}/run` to go down "完全相同的建單路徑" (same
+ * `origin="console"`, same signature/requirements derivation, same
+ * dispatch), and the only way to guarantee that is for there to be exactly
+ * one such path. Same extraction jobs.py made on the Python side.
+ *
+ * `workflowJsonText` is the caller's ORIGINAL serialization, when it has
+ * one. `POST /api/jobs` passes the exact multipart string it received so the
+ * stored `workflow_json` stays byte-for-byte what the submitter sent; a
+ * caller that only has an object (the recipe runner, whose graph is rendered
+ * in memory) omits it and gets a plain `JSON.stringify`. */
+export async function createJobFromWorkflow(
+  env: Env,
+  user: { uid: string },
+  workflow: Record<string, unknown>,
+  requirements: Record<string, unknown>,
+  assetFiles: File[],
+  opts: { workflowJsonText?: string } = {}
+): Promise<string> {
+  const workflowJsonText = opts.workflowJsonText ?? JSON.stringify(workflow);
+
+  const uploadedNames: string[] = [];
+  // Same admin-configured per-file cap the panel's uploads obey
+  // (`upload_max_file_mb`, default 50) -- an asset submitted with a job is
+  // user bytes like any other, and this route had no ceiling at all. Checked
+  // BEFORE the job row is inserted, so a refused submit leaves nothing
+  // behind. The per-user QUOTA deliberately does not apply here: these bytes
+  // land in `job_inputs/<job_id>/`, job-scoped result storage outside the
+  // quota, exactly like artifacts (see lib/limits.ts).
+  const uploadLimits = await readLimits(env.DB);
+  for (const file of assetFiles) {
+    try {
+      uploadedNames.push(sanitizePathComponentOrThrow(file.name || "", "asset filename"));
+    } catch {
+      throw new JobCreationError(400, "jobs.bad_asset_name", `Invalid asset filename: ${JSON.stringify(file.name ?? "")}`);
+    }
+    if (fileCapExceeded(file.size, uploadLimits)) {
+      throw new JobCreationError(413, "jobs.asset_too_large", tooLargeMessage(uploadLimits));
+    }
+  }
+
+  const needs = extract(workflow);
+  const available = new Set(uploadedNames);
+  const missing = [...needs.assets].filter((name) => !available.has(name)).sort();
+  if (missing.length > 0) {
+    throw new JobCreationError(
+      400,
+      "jobs.missing_assets",
+      `Workflow references assets that were not uploaded: ${missing.join(", ")}`
+    );
+  }
+
+  const unfetchable = await unfetchableMissingModels(env, needs);
+  if (unfetchable.size > 0) {
+    const names = [...unfetchable].sort();
+    throw new JobCreationError(400, "jobs.missing_models", await modelGuide.guidanceMessage(names, env.STORE));
+  }
+
+  const allWorkers = await queries.getAllWorkers(env.DB);
+  const estVramGb = estimateVram(needs.models, allWorkers);
+
+  const jobId = crypto.randomUUID();
+  await queries.insertJob(env.DB, {
+    id: jobId,
+    workflowJson: workflowJsonText,
+    requirements,
+    requiredNodes: [...needs.nodes].sort(),
+    requiredModels: [...needs.models].sort(),
+    estVramGb,
+    inputAssets: [...available].sort(),
+    origin: "console",
+    createdAt: toSqliteTimestamp(new Date()),
+    userId: user.uid,
+    signature: await signature(workflow, needs),
+    // Phase 3.3 §3.2：送件時就判定可不可拆（含 requirements.split 與平台設定
+    // split_batches）；不可拆存 NULL。
+    splitPlan: split.planForJob(workflow, requirements, await split.splitBatchesEnabled(env.DB)),
+  });
+
+  for (const [file, filename] of assetFiles.map((f, i) => [f, uploadedNames[i]!] as const)) {
+    await env.STORE.put(jobInputKey(jobId, filename), await file.arrayBuffer());
+  }
+
+  await wakeHub(env);
+
+  return jobId;
+}
+
 app.post("/api/jobs", requireCsrfUser, async (c) => {
   const user = c.get(SESSION_VAR).user;
   const contentType = c.req.header("content-type") ?? "";
@@ -371,72 +476,21 @@ app.post("/api/jobs", requireCsrfUser, async (c) => {
       ? [rawAssets]
       : [];
 
-  const uploadedNames: string[] = [];
-  // Same admin-configured per-file cap the panel's uploads obey
-  // (`upload_max_file_mb`, default 50) -- an asset submitted with a job is
-  // user bytes like any other, and this route had no ceiling at all. Checked
-  // BEFORE the job row is inserted, so a refused submit leaves nothing
-  // behind. The per-user QUOTA deliberately does not apply here: these bytes
-  // land in `job_inputs/<job_id>/`, job-scoped result storage outside the
-  // quota, exactly like artifacts (see lib/limits.ts).
-  const uploadLimits = await readLimits(c.env.DB);
-  for (const file of assetFiles) {
-    try {
-      uploadedNames.push(sanitizePathComponentOrThrow(file.name || "", "asset filename"));
-    } catch {
-      return errorJson(c, 400, "jobs.bad_asset_name", `Invalid asset filename: ${JSON.stringify(file.name ?? "")}`);
+  // Everything from here on is shared with `POST /api/recipes/{id}/run` --
+  // see `createJobFromWorkflow` above. The ORIGINAL multipart string is
+  // passed through so the stored `workflow_json` stays byte-for-byte what
+  // the submitter sent.
+  try {
+    const jobId = await createJobFromWorkflow(c.env, user, workflow, requirements, assetFiles, {
+      workflowJsonText,
+    });
+    return c.json({ job_id: jobId });
+  } catch (err) {
+    if (err instanceof JobCreationError) {
+      return errorJson(c, err.status, err.code, err.message);
     }
-    if (fileCapExceeded(file.size, uploadLimits)) {
-      return errorJson(c, 413, "jobs.asset_too_large", tooLargeMessage(uploadLimits));
-    }
+    throw err;
   }
-
-  const needs = extract(workflow);
-  const available = new Set(uploadedNames);
-  const missing = [...needs.assets].filter((name) => !available.has(name)).sort();
-  if (missing.length > 0) {
-    return errorJson(
-      c,
-      400,
-      "jobs.missing_assets",
-      `Workflow references assets that were not uploaded: ${missing.join(", ")}`
-    );
-  }
-
-  const unfetchable = await unfetchableMissingModels(c.env, needs);
-  if (unfetchable.size > 0) {
-    const names = [...unfetchable].sort();
-    return errorJson(c, 400, "jobs.missing_models", await modelGuide.guidanceMessage(names, c.env.STORE));
-  }
-
-  const allWorkers = await queries.getAllWorkers(c.env.DB);
-  const estVramGb = estimateVram(needs.models, allWorkers);
-
-  const jobId = crypto.randomUUID();
-  await queries.insertJob(c.env.DB, {
-    id: jobId,
-    workflowJson: workflowJsonText,
-    requirements,
-    requiredNodes: [...needs.nodes].sort(),
-    requiredModels: [...needs.models].sort(),
-    estVramGb,
-    inputAssets: [...available].sort(),
-    origin: "console",
-    createdAt: toSqliteTimestamp(new Date()),
-    userId: user.uid,
-    signature: await signature(workflow, needs),
-    // Phase 3.3 §3.2：送件時就判定可不可拆（含 requirements.split 與平台設定
-    // split_batches）；不可拆存 NULL。
-    splitPlan: split.planForJob(workflow, requirements, await split.splitBatchesEnabled(c.env.DB)),
-  });
-
-  for (const [file, filename] of assetFiles.map((f, i) => [f, uploadedNames[i]!] as const)) {
-    await c.env.STORE.put(jobInputKey(jobId, filename), await file.arrayBuffer());
-  }
-
-  await wakeHub(c.env);
-
-  return c.json({ job_id: jobId });
 });
 
 // --- GET /api/jobs -------------------------------------------------------
