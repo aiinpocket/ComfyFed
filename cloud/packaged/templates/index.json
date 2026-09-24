@@ -1,0 +1,214 @@
+[
+  {
+    "moduleName": "default",
+    "title": "ComfyFed",
+    "type": "image",
+    "isEssential": true,
+    "category": "ComfyFed",
+    "templates": [
+      {
+        "name": "comfyfed-wuxia-t2i",
+        "title": "文生圖 / Text-to-image",
+        "mediaType": "image",
+        "mediaSubtype": "webp",
+        "description": "Chroma1-HD text-to-image, 768x768 at 26 steps, uncensored weights. Type your idea in Chinese (or English) into the red node; a local uncensored Qwen3-VL-4B Heretic model writes the English prompt and feeds it straight into the graph. Press Run.",
+        "tags": [
+          "chroma",
+          "text-to-image",
+          "wuxia",
+          "nsfw",
+          "中文",
+          "prompt",
+          "comfyfed"
+        ],
+        "models": [
+          "Chroma1-HD-fp8mixed.safetensors",
+          "qwen3-vl-4b-heretic.safetensors"
+        ]
+      },
+      {
+        "name": "comfyfed-character-portrait",
+        "title": "角色立繪 / Character portrait",
+        "mediaType": "image",
+        "mediaSubtype": "webp",
+        "description": "Chroma1-HD character reference sheet, 896x1152 at 26 steps, uncensored weights. Feed its output into the reference-to-video template.",
+        "tags": [
+          "chroma",
+          "portrait",
+          "character",
+          "nsfw",
+          "comfyfed"
+        ],
+        "models": [
+          "Chroma1-HD-fp8mixed.safetensors"
+        ]
+      },
+      {
+        "name": "comfyfed-ref2v-video",
+        "title": "參考圖生影片 / Reference to video",
+        "mediaType": "image",
+        "mediaSubtype": "webp",
+        "description": "MiniMax H3 reference-to-video with audio, 1152x640, 141 frames at 8 steps via the turbo LoRA. Ships with a reference image. Describe the shot in Chinese (or English); a local uncensored Qwen3-VL-4B Heretic model writes the English prompt, adds the <Picture 1> tag and feeds it in.",
+        "tags": [
+          "minimax",
+          "video",
+          "reference",
+          "audio",
+          "nsfw",
+          "中文",
+          "prompt",
+          "comfyfed"
+        ],
+        "models": [
+          "minimax_h3_ref2va_pruned_int8_convrot.safetensors",
+          "qwen3-vl-4b-heretic.safetensors"
+        ]
+      },
+      {
+        "name": "comfyfed-nsfw-i2v",
+        "title": "NSFW 圖生影片 / NSFW image-to-video",
+        "mediaType": "image",
+        "mediaSubtype": "webp",
+        "description": "MiniMax H3 reference-to-video with audio, fully uncensored: one photo of an adult plus an explicit scene written in Chinese (or English). A local Qwen3-VL-4B Heretic model writes the English prompt and adds the <Picture 1> tag. 1152x640, 141 frames, 8 steps via the turbo LoRA. Promoted from the admin's shared \"(NSFW)圖生影片\" template; ships with its sample photo.",
+        "tags": [
+          "minimax",
+          "video",
+          "reference",
+          "audio",
+          "nsfw",
+          "adult",
+          "中文",
+          "prompt",
+          "comfyfed"
+        ],
+        "models": [
+          "minimax_h3_ref2va_pruned_int8_convrot.safetensors",
+          "qwen3-vl-4b-heretic.safetensors"
+        ]
+      },
+      {
+        "name": "comfyfed-video-concat",
+        "title": "多影片串接 / Video concat",
+        "mediaType": "image",
+        "mediaSubtype": "webp",
+        "description": "Join two video clips end-to-end, picture and audio both concatenated. Needs zero models -- runs on a brand-new worker.",
+        "tags": [
+          "video",
+          "concat",
+          "no-model",
+          "無需模型",
+          "comfyfed"
+        ],
+        "models": []
+      },
+      {
+        "name": "comfyfed-image-intro-video",
+        "title": "圖片開場＋影片 / Image intro + video",
+        "mediaType": "image",
+        "mediaSubtype": "webp",
+        "description": "Hold one still image for a few seconds as a title card, then play a video clip. Needs zero models -- runs on a brand-new worker.",
+        "tags": [
+          "video",
+          "image",
+          "intro",
+          "no-model",
+          "無需模型",
+          "comfyfed"
+        ],
+        "models": []
+      },
+      {
+        "name": "comfyfed-image-to-prompt",
+        "title": "圖生提示詞 / Image to prompt",
+        "mediaType": "image",
+        "mediaSubtype": "webp",
+        "description": "Upload a reference image and a short ask; a local, uncensored Qwen3-VL-4B Heretic model writes the polished English prompt for you — it will not refuse an explicit one. Ships with a sample image.",
+        "tags": [
+          "qwen3vl",
+          "heretic",
+          "nsfw",
+          "prompt",
+          "提示詞",
+          "vlm",
+          "新手",
+          "comfyfed"
+        ],
+        "models": [
+          "qwen3-vl-4b-heretic.safetensors"
+        ]
+      },
+      {
+        "name": "comfyfed-text-to-prompt",
+        "title": "文字生提示詞 / Text to prompt",
+        "mediaType": "image",
+        "mediaSubtype": "webp",
+        "description": "Paste a rough idea and the same local, uncensored Qwen3-VL-4B Heretic model rewrites it into a structured English prompt, explicit ones included.",
+        "tags": [
+          "qwen3vl",
+          "heretic",
+          "nsfw",
+          "prompt",
+          "提示詞",
+          "llm",
+          "新手",
+          "comfyfed"
+        ],
+        "models": [
+          "qwen3-vl-4b-heretic.safetensors"
+        ]
+      },
+      {
+        "name": "comfyfed-flf2v-video",
+        "title": "首尾幀生影片 / First+last frame to video",
+        "mediaType": "image",
+        "mediaSubtype": "webp",
+        "description": "Give MiniMax H3 a first frame and a last frame plus a one-sentence action description; it generates the motion (and audio) in between.",
+        "tags": [
+          "video",
+          "首尾幀",
+          "新手",
+          "nsfw",
+          "comfyfed"
+        ],
+        "models": [
+          "minimax_h3_ref2va_pruned_int8_convrot.safetensors",
+          "qwen3vl_32b_heretic_minimax_h3_nvfp4.safetensors",
+          "minimax_h3_video_vae_fp16.safetensors",
+          "minimax_h3_audio_vae_fp32.safetensors",
+          "minimax_h3_ref2v_turbo_8step_v1.0_768p_comfyui_resized_avg_rank_64_bf16.safetensors"
+        ]
+      },
+      {
+        "name": "comfyfed-video-trim",
+        "title": "影片截段 / Video trim",
+        "mediaType": "image",
+        "mediaSubtype": "webp",
+        "description": "Cut a start-second + length span out of a video clip. Needs zero models -- runs on a brand-new worker.",
+        "tags": [
+          "video",
+          "剪輯",
+          "新手",
+          "零模型",
+          "comfyfed"
+        ],
+        "models": []
+      },
+      {
+        "name": "comfyfed-image-upscale",
+        "title": "圖片放大 / Image upscale",
+        "mediaType": "image",
+        "mediaSubtype": "webp",
+        "description": "4x super-resolution upscale of a still image via RealESRGAN. Ships with a sample image.",
+        "tags": [
+          "image",
+          "放大",
+          "新手",
+          "comfyfed"
+        ],
+        "models": [
+          "RealESRGAN_x4plus.pth"
+        ]
+      }
+    ]
+  }
+]

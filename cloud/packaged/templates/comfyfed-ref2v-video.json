@@ -1,0 +1,1516 @@
+{
+  "last_node_id": 208,
+  "last_link_id": 29,
+  "nodes": [
+    {
+      "id": 105,
+      "type": "MarkdownNote",
+      "pos": [
+        0,
+        -1460
+      ],
+      "size": [
+        520,
+        1250
+      ],
+      "flags": {},
+      "order": 21,
+      "mode": 0,
+      "inputs": [],
+      "outputs": [],
+      "title": "⓪ 缺模型？/ Missing models?",
+      "properties": {},
+      "widgets_values": [
+        "**繁體中文**\n\n全新安裝沒有模型檔，這支「參考圖生影片」範本需要以下 6 個檔案：\n\n- `minimax_h3_ref2va_pruned_int8_convrot.safetensors` → 放到 `ComfyUI/models/diffusion_models/` → 19.53 GB\n  官方載點：https://huggingface.co/Comfy-Org/MiniMax-H3/resolve/main/diffusion_models/minimax_h3_ref2va_pruned_int8_convrot.safetensors\n  備份載點：https://storage.googleapis.com/comfyfed-models/models/diffusion_models/minimax_h3_ref2va_pruned_int8_convrot.safetensors\n- `qwen3vl_32b_heretic_minimax_h3_nvfp4.safetensors` → 放到 `ComfyUI/models/text_encoders/` → 14.61 GB\n  官方載點：https://huggingface.co/sakamakismile/Qwen3-VL-32B-Heretic-MiniMax-H3-NVFP4/resolve/main/qwen3vl_32b_heretic_minimax_h3_nvfp4.safetensors\n  備份載點：https://storage.googleapis.com/comfyfed-models/models/text_encoders/qwen3vl_32b_heretic_minimax_h3_nvfp4.safetensors\n- `minimax_h3_video_vae_fp16.safetensors` → 放到 `ComfyUI/models/vae/` → 4.85 GB\n  官方載點：https://huggingface.co/Comfy-Org/MiniMax-H3/resolve/main/vae/minimax_h3_video_vae_fp16.safetensors\n  備份載點：https://storage.googleapis.com/comfyfed-models/models/vae/minimax_h3_video_vae_fp16.safetensors\n- `minimax_h3_audio_vae_fp32.safetensors` → 放到 `ComfyUI/models/vae/` → 0.56 GB\n  官方載點：https://huggingface.co/Comfy-Org/MiniMax-H3/resolve/main/vae/minimax_h3_audio_vae_fp32.safetensors\n  備份載點：https://storage.googleapis.com/comfyfed-models/models/vae/minimax_h3_audio_vae_fp32.safetensors\n- `minimax_h3_ref2v_turbo_8step_v1.0_768p_comfyui_resized_avg_rank_64_bf16.safetensors` → 放到 `ComfyUI/models/loras/` → 0.91 GB\n  官方載點：https://huggingface.co/drbaph/MiniMax-H3-Turbo-Lora-ComfyUI/resolve/main/minimax_h3_ref2v_turbo_8step_v1.0_768p_comfyui_resized_avg_rank_64_bf16.safetensors\n  備份載點：https://storage.googleapis.com/comfyfed-models/models/loras/minimax_h3_ref2v_turbo_8step_v1.0_768p_comfyui_resized_avg_rank_64_bf16.safetensors\n- `qwen3-vl-4b-heretic.safetensors` → 放到 `ComfyUI/models/text_encoders/` → 8.27 GB\n  官方載點：https://huggingface.co/DreamFast/Qwen3-VL-4b-Heretic-ComfyUI/resolve/main/qwen3-vl-4b-heretic.safetensors\n  （這是「想法 → 英文提示詞」小幫手用的 Qwen3-VL-4B-Instruct Heretic 無審查版，寫露骨提示詞時不會被拒絕；平台目前沒有這顆的備份鏡像，請走官方載點。）\n\n共約 48.8 GB。放好檔案後**不用重啟 ComfyUI 或 worker**：ComfyFed agent 每 10 分鐘自動重掃模型庫存並回報平台，評估會自動轉綠；急著馬上生效的話，手動重啟 agent 即可。\n\n---\n\n**English**\n\nA fresh install has none of these files. The “Reference to video” template needs 6 files:\n\n- `minimax_h3_ref2va_pruned_int8_convrot.safetensors` -> `ComfyUI/models/diffusion_models/` -> 19.53 GB\n  官方載點：https://huggingface.co/Comfy-Org/MiniMax-H3/resolve/main/diffusion_models/minimax_h3_ref2va_pruned_int8_convrot.safetensors\n  備份載點：https://storage.googleapis.com/comfyfed-models/models/diffusion_models/minimax_h3_ref2va_pruned_int8_convrot.safetensors\n- `qwen3vl_32b_heretic_minimax_h3_nvfp4.safetensors` -> `ComfyUI/models/text_encoders/` -> 14.61 GB\n  官方載點：https://huggingface.co/sakamakismile/Qwen3-VL-32B-Heretic-MiniMax-H3-NVFP4/resolve/main/qwen3vl_32b_heretic_minimax_h3_nvfp4.safetensors\n  備份載點：https://storage.googleapis.com/comfyfed-models/models/text_encoders/qwen3vl_32b_heretic_minimax_h3_nvfp4.safetensors\n- `minimax_h3_video_vae_fp16.safetensors` -> `ComfyUI/models/vae/` -> 4.85 GB\n  官方載點：https://huggingface.co/Comfy-Org/MiniMax-H3/resolve/main/vae/minimax_h3_video_vae_fp16.safetensors\n  備份載點：https://storage.googleapis.com/comfyfed-models/models/vae/minimax_h3_video_vae_fp16.safetensors\n- `minimax_h3_audio_vae_fp32.safetensors` -> `ComfyUI/models/vae/` -> 0.56 GB\n  官方載點：https://huggingface.co/Comfy-Org/MiniMax-H3/resolve/main/vae/minimax_h3_audio_vae_fp32.safetensors\n  備份載點：https://storage.googleapis.com/comfyfed-models/models/vae/minimax_h3_audio_vae_fp32.safetensors\n- `minimax_h3_ref2v_turbo_8step_v1.0_768p_comfyui_resized_avg_rank_64_bf16.safetensors` -> `ComfyUI/models/loras/` -> 0.91 GB\n  官方載點：https://huggingface.co/drbaph/MiniMax-H3-Turbo-Lora-ComfyUI/resolve/main/minimax_h3_ref2v_turbo_8step_v1.0_768p_comfyui_resized_avg_rank_64_bf16.safetensors\n  備份載點：https://storage.googleapis.com/comfyfed-models/models/loras/minimax_h3_ref2v_turbo_8step_v1.0_768p_comfyui_resized_avg_rank_64_bf16.safetensors\n- `qwen3-vl-4b-heretic.safetensors` -> `ComfyUI/models/text_encoders/` -> 8.27 GB\n  官方載點：https://huggingface.co/DreamFast/Qwen3-VL-4b-Heretic-ComfyUI/resolve/main/qwen3-vl-4b-heretic.safetensors\n  (The Heretic-abliterated, uncensored build of Qwen3-VL-4B-Instruct that powers the \"idea -> English prompt\" helper, so it will not refuse an explicit request. There is no ComfyFed backup mirror for this one yet, so use the official link.)\n\n~48.8 GB total. No restart needed after placing the files: the ComfyFed agent rescans its model inventory every 10 minutes and reports back, and the assessment turns green automatically once it does. Restart the agent if you want it to take effect immediately."
+      ],
+      "color": "#432",
+      "bgcolor": "#653"
+    },
+    {
+      "id": 1,
+      "type": "UNETLoader",
+      "pos": [
+        0,
+        120
+      ],
+      "size": [
+        330,
+        82
+      ],
+      "flags": {},
+      "order": 0,
+      "mode": 0,
+      "inputs": [],
+      "outputs": [
+        {
+          "name": "MODEL",
+          "type": "MODEL",
+          "slot_index": 0,
+          "links": [
+            1
+          ]
+        }
+      ],
+      "properties": {
+        "Node name for S&R": "UNETLoader"
+      },
+      "widgets_values": [
+        "minimax_h3_ref2va_pruned_int8_convrot.safetensors",
+        "default"
+      ],
+      "bgcolor": "#323",
+      "color": "#535"
+    },
+    {
+      "id": 5,
+      "type": "LoraLoaderModelOnly",
+      "pos": [
+        0,
+        250
+      ],
+      "size": [
+        330,
+        82
+      ],
+      "flags": {},
+      "order": 1,
+      "mode": 0,
+      "inputs": [
+        {
+          "name": "model",
+          "type": "MODEL",
+          "link": 1
+        }
+      ],
+      "outputs": [
+        {
+          "name": "MODEL",
+          "type": "MODEL",
+          "slot_index": 0,
+          "links": [
+            6,
+            7
+          ]
+        }
+      ],
+      "properties": {
+        "Node name for S&R": "LoraLoaderModelOnly"
+      },
+      "widgets_values": [
+        "minimax_h3_ref2v_turbo_8step_v1.0_768p_comfyui_resized_avg_rank_64_bf16.safetensors",
+        1.0
+      ],
+      "title": "Turbo LoRA（8 步就夠 / 8 steps is enough）",
+      "bgcolor": "#323",
+      "color": "#535"
+    },
+    {
+      "id": 2,
+      "type": "CLIPLoader",
+      "pos": [
+        0,
+        380
+      ],
+      "size": [
+        330,
+        106
+      ],
+      "flags": {},
+      "order": 2,
+      "mode": 0,
+      "inputs": [],
+      "outputs": [
+        {
+          "name": "CLIP",
+          "type": "CLIP",
+          "slot_index": 0,
+          "links": [
+            2
+          ]
+        }
+      ],
+      "properties": {
+        "Node name for S&R": "CLIPLoader"
+      },
+      "widgets_values": [
+        "qwen3vl_32b_heretic_minimax_h3_nvfp4.safetensors",
+        "minimax",
+        "default"
+      ],
+      "bgcolor": "#323",
+      "color": "#535"
+    },
+    {
+      "id": 3,
+      "type": "VAELoader",
+      "pos": [
+        0,
+        530
+      ],
+      "size": [
+        330,
+        58
+      ],
+      "flags": {},
+      "order": 3,
+      "mode": 0,
+      "inputs": [],
+      "outputs": [
+        {
+          "name": "VAE",
+          "type": "VAE",
+          "slot_index": 0,
+          "links": [
+            3,
+            15
+          ]
+        }
+      ],
+      "properties": {
+        "Node name for S&R": "VAELoader"
+      },
+      "widgets_values": [
+        "minimax_h3_video_vae_fp16.safetensors"
+      ],
+      "title": "Video VAE",
+      "bgcolor": "#323",
+      "color": "#535"
+    },
+    {
+      "id": 4,
+      "type": "VAELoader",
+      "pos": [
+        0,
+        630
+      ],
+      "size": [
+        330,
+        58
+      ],
+      "flags": {},
+      "order": 4,
+      "mode": 0,
+      "inputs": [],
+      "outputs": [
+        {
+          "name": "VAE",
+          "type": "VAE",
+          "slot_index": 0,
+          "links": [
+            4,
+            17
+          ]
+        }
+      ],
+      "properties": {
+        "Node name for S&R": "VAELoader"
+      },
+      "widgets_values": [
+        "minimax_h3_audio_vae_fp32.safetensors"
+      ],
+      "title": "Audio VAE",
+      "bgcolor": "#323",
+      "color": "#535"
+    },
+    {
+      "id": 20,
+      "type": "LoadImage",
+      "pos": [
+        420,
+        120
+      ],
+      "size": [
+        320,
+        350
+      ],
+      "flags": {},
+      "order": 5,
+      "mode": 0,
+      "inputs": [],
+      "outputs": [
+        {
+          "name": "IMAGE",
+          "type": "IMAGE",
+          "slot_index": 0,
+          "links": [
+            5
+          ]
+        },
+        {
+          "name": "MASK",
+          "type": "MASK",
+          "slot_index": 1,
+          "links": []
+        }
+      ],
+      "properties": {
+        "Node name for S&R": "LoadImage"
+      },
+      "widgets_values": [
+        "amyntas_ref.png",
+        "image"
+      ],
+      "title": "參考圖 Reference ← 換成你的角色",
+      "bgcolor": "#533",
+      "color": "#a33"
+    },
+    {
+      "id": 6,
+      "type": "MiniMaxH3ReferenceToVideo",
+      "pos": [
+        780,
+        120
+      ],
+      "size": [
+        460,
+        400
+      ],
+      "flags": {},
+      "order": 6,
+      "mode": 0,
+      "inputs": [
+        {
+          "name": "clip",
+          "type": "CLIP",
+          "link": 2
+        },
+        {
+          "name": "vae",
+          "type": "VAE",
+          "link": 3
+        },
+        {
+          "name": "audio_vae",
+          "type": "VAE",
+          "link": 4
+        },
+        {
+          "name": "ref_images.ref_image_0",
+          "type": "IMAGE",
+          "link": 5,
+          "shape": 7
+        },
+        {
+          "name": "prompt",
+          "type": "STRING",
+          "link": 29,
+          "widget": {
+            "name": "prompt"
+          }
+        }
+      ],
+      "outputs": [
+        {
+          "name": "positive",
+          "type": "CONDITIONING",
+          "slot_index": 0,
+          "links": [
+            8
+          ]
+        },
+        {
+          "name": "LATENT",
+          "type": "LATENT",
+          "slot_index": 1,
+          "links": [
+            13
+          ]
+        }
+      ],
+      "properties": {
+        "Node name for S&R": "MiniMaxH3ReferenceToVideo"
+      },
+      "widgets_values": [
+        "Photorealistic historical film, ancient Macedonia at golden dawn. The young soldier from <Picture 1> stands on a dusty drill field holding a six-meter sarissa pike upright like a mast; he lowers it slowly to horizontal with both hands, muscles straining under its absurd length. Rows of drilling soldiers behind him. Camera: slow dolly arc around him. Audio: wind, creaking wood, distant drill shouts.",
+        1152,
+        640,
+        141,
+        "match"
+      ],
+      "title": "參考圖生影片（提示詞由 AI 接入 / prompt fed by the AI）",
+      "bgcolor": "#533",
+      "color": "#a33"
+    },
+    {
+      "id": 8,
+      "type": "KSamplerSelect",
+      "pos": [
+        1780,
+        120
+      ],
+      "size": [
+        280,
+        58
+      ],
+      "flags": {},
+      "order": 7,
+      "mode": 0,
+      "inputs": [],
+      "outputs": [
+        {
+          "name": "SAMPLER",
+          "type": "SAMPLER",
+          "slot_index": 0,
+          "links": [
+            11
+          ]
+        }
+      ],
+      "properties": {
+        "Node name for S&R": "KSamplerSelect"
+      },
+      "widgets_values": [
+        "res_multistep"
+      ]
+    },
+    {
+      "id": 9,
+      "type": "BasicScheduler",
+      "pos": [
+        1780,
+        220
+      ],
+      "size": [
+        280,
+        106
+      ],
+      "flags": {},
+      "order": 8,
+      "mode": 0,
+      "inputs": [
+        {
+          "name": "model",
+          "type": "MODEL",
+          "link": 6
+        }
+      ],
+      "outputs": [
+        {
+          "name": "SIGMAS",
+          "type": "SIGMAS",
+          "slot_index": 0,
+          "links": [
+            12
+          ]
+        }
+      ],
+      "properties": {
+        "Node name for S&R": "BasicScheduler"
+      },
+      "widgets_values": [
+        "simple",
+        8,
+        1.0
+      ]
+    },
+    {
+      "id": 10,
+      "type": "RandomNoise",
+      "pos": [
+        1780,
+        370
+      ],
+      "size": [
+        280,
+        82
+      ],
+      "flags": {},
+      "order": 9,
+      "mode": 0,
+      "inputs": [],
+      "outputs": [
+        {
+          "name": "NOISE",
+          "type": "NOISE",
+          "slot_index": 0,
+          "links": [
+            9
+          ]
+        }
+      ],
+      "properties": {
+        "Node name for S&R": "RandomNoise"
+      },
+      "widgets_values": [
+        359338001,
+        "randomize"
+      ]
+    },
+    {
+      "id": 7,
+      "type": "BasicGuider",
+      "pos": [
+        1780,
+        500
+      ],
+      "size": [
+        280,
+        46
+      ],
+      "flags": {},
+      "order": 10,
+      "mode": 0,
+      "inputs": [
+        {
+          "name": "model",
+          "type": "MODEL",
+          "link": 7
+        },
+        {
+          "name": "conditioning",
+          "type": "CONDITIONING",
+          "link": 8
+        }
+      ],
+      "outputs": [
+        {
+          "name": "GUIDER",
+          "type": "GUIDER",
+          "slot_index": 0,
+          "links": [
+            10
+          ]
+        }
+      ],
+      "properties": {
+        "Node name for S&R": "BasicGuider"
+      },
+      "widgets_values": []
+    },
+    {
+      "id": 11,
+      "type": "SamplerCustomAdvanced",
+      "pos": [
+        2120,
+        120
+      ],
+      "size": [
+        300,
+        150
+      ],
+      "flags": {},
+      "order": 11,
+      "mode": 0,
+      "inputs": [
+        {
+          "name": "noise",
+          "type": "NOISE",
+          "link": 9
+        },
+        {
+          "name": "guider",
+          "type": "GUIDER",
+          "link": 10
+        },
+        {
+          "name": "sampler",
+          "type": "SAMPLER",
+          "link": 11
+        },
+        {
+          "name": "sigmas",
+          "type": "SIGMAS",
+          "link": 12
+        },
+        {
+          "name": "latent_image",
+          "type": "LATENT",
+          "link": 13
+        }
+      ],
+      "outputs": [
+        {
+          "name": "output",
+          "type": "LATENT",
+          "slot_index": 0,
+          "links": [
+            14,
+            16
+          ]
+        },
+        {
+          "name": "denoised_output",
+          "type": "LATENT",
+          "slot_index": 1,
+          "links": []
+        }
+      ],
+      "properties": {
+        "Node name for S&R": "SamplerCustomAdvanced"
+      },
+      "widgets_values": []
+    },
+    {
+      "id": 12,
+      "type": "VAEDecode",
+      "pos": [
+        2480,
+        120
+      ],
+      "size": [
+        270,
+        46
+      ],
+      "flags": {},
+      "order": 12,
+      "mode": 0,
+      "inputs": [
+        {
+          "name": "samples",
+          "type": "LATENT",
+          "link": 14
+        },
+        {
+          "name": "vae",
+          "type": "VAE",
+          "link": 15
+        }
+      ],
+      "outputs": [
+        {
+          "name": "IMAGE",
+          "type": "IMAGE",
+          "slot_index": 0,
+          "links": [
+            18
+          ]
+        }
+      ],
+      "properties": {
+        "Node name for S&R": "VAEDecode"
+      },
+      "widgets_values": [],
+      "title": "VAEDecode（畫面 / video frames）"
+    },
+    {
+      "id": 13,
+      "type": "VAEDecodeAudio",
+      "pos": [
+        2480,
+        220
+      ],
+      "size": [
+        270,
+        46
+      ],
+      "flags": {},
+      "order": 13,
+      "mode": 0,
+      "inputs": [
+        {
+          "name": "samples",
+          "type": "LATENT",
+          "link": 16
+        },
+        {
+          "name": "vae",
+          "type": "VAE",
+          "link": 17
+        }
+      ],
+      "outputs": [
+        {
+          "name": "AUDIO",
+          "type": "AUDIO",
+          "slot_index": 0,
+          "links": [
+            19
+          ]
+        }
+      ],
+      "properties": {
+        "Node name for S&R": "VAEDecodeAudio"
+      },
+      "widgets_values": [],
+      "title": "VAEDecodeAudio（聲音 / audio）"
+    },
+    {
+      "id": 14,
+      "type": "CreateVideo",
+      "pos": [
+        2480,
+        320
+      ],
+      "size": [
+        270,
+        78
+      ],
+      "flags": {},
+      "order": 14,
+      "mode": 0,
+      "inputs": [
+        {
+          "name": "images",
+          "type": "IMAGE",
+          "link": 18
+        },
+        {
+          "name": "audio",
+          "type": "AUDIO",
+          "link": 19,
+          "shape": 7
+        }
+      ],
+      "outputs": [
+        {
+          "name": "VIDEO",
+          "type": "VIDEO",
+          "slot_index": 0,
+          "links": [
+            20
+          ]
+        }
+      ],
+      "properties": {
+        "Node name for S&R": "CreateVideo"
+      },
+      "widgets_values": [
+        24
+      ]
+    },
+    {
+      "id": 15,
+      "type": "SaveVideo",
+      "pos": [
+        2480,
+        440
+      ],
+      "size": [
+        480,
+        420
+      ],
+      "flags": {},
+      "order": 15,
+      "mode": 0,
+      "inputs": [
+        {
+          "name": "video",
+          "type": "VIDEO",
+          "link": 20
+        }
+      ],
+      "outputs": [],
+      "properties": {
+        "Node name for S&R": "SaveVideo"
+      },
+      "widgets_values": [
+        "video/comfyfed_ref2v",
+        "mp4",
+        "h264"
+      ]
+    },
+    {
+      "id": 100,
+      "type": "MarkdownNote",
+      "pos": [
+        0,
+        -940
+      ],
+      "size": [
+        1240,
+        480
+      ],
+      "flags": {},
+      "order": 16,
+      "mode": 0,
+      "inputs": [],
+      "outputs": [],
+      "title": "這是什麼範本 / What this template is",
+      "properties": {},
+      "widgets_values": [
+        "# 參考圖生影片（MiniMax H3 Ref2V）＋ 中文想法直接生\n\n拿一張角色定裝照，生出「同一個人」在動、而且**自帶聲音**的影片。\n這張圖是《薩里沙方陣》紀錄片實際跑出來的生產圖，只是把長度調成 141 格（約 6 秒）。\n\n**怎麼用：**\n1. 左邊紅框的 `LoadImage` 選一張參考圖（範本附了 `amyntas_ref.png`，也可以直接把自己的圖拖進節點上傳）。\n2. 紅框「想法」節點用**中文**寫你要的鏡頭：人物在做什麼、場景、鏡頭怎麼動、要什麼聲音。AI（Qwen3-VL-4B Heretic，無審查版）會把它整理成英文影片提示詞，並自動補上 **`<Picture 1>`** 標記指涉參考圖，再接進 `MiniMaxH3ReferenceToVideo`。\n3. 按右上角 Run，等 worker 跑完，影片出現在最右邊的 `SaveVideo`；AI 寫出的英文提示詞顯示在下面的預覽節點。\n4. 想自己直接寫英文：把 `MiniMaxH3ReferenceToVideo` 的 `prompt` 輸入線拔掉，記得提示詞裡一定要留 `<Picture 1>`。\n\n---\n\n# Reference-to-video (MiniMax H3 Ref2V) with a Chinese idea box\n\nTurn one character reference photo into a video of the same person moving, with generated audio. This is the production graph from the \"Sarissa Phalanx\" documentary, shortened to 141 frames (~6s). Pick a reference image in the red `LoadImage` node, describe the shot in the red idea node (Chinese is fine: what the person does, the setting, camera motion, the sound you want), and press Run. A local uncensored Qwen3-VL-4B Heretic model rewrites the idea into an English video prompt, the `<Picture 1>` tag is prepended automatically so the model keeps the reference face, and the result is wired into `MiniMaxH3ReferenceToVideo`. Prefer to write English yourself? Unplug its `prompt` input -- and keep `<Picture 1>` in your text."
+      ],
+      "color": "#432",
+      "bgcolor": "#653"
+    },
+    {
+      "id": 101,
+      "type": "MarkdownNote",
+      "pos": [
+        0,
+        -420
+      ],
+      "size": [
+        370,
+        420
+      ],
+      "flags": {},
+      "order": 17,
+      "mode": 0,
+      "inputs": [],
+      "outputs": [],
+      "title": "① 模型載入器在做什麼 / Model loaders",
+      "properties": {},
+      "widgets_values": [
+        "**繁體中文**\n\n- `UNETLoader` — H3 的 ref2va 主模型（`ref2v` = 參考圖生影片，`a` = 同時出聲音）。\n- `LoraLoaderModelOnly` — **turbo LoRA**。有它才能只跑 8 步；\n  拿掉的話要把步數調回 20 以上，會慢好幾倍。\n- `CLIPLoader` — H3 專用的 Qwen3-VL 文字/影像編碼器，`type` 必須是 `minimax`。\n- 兩個 `VAELoader` — 一個還原畫面、一個還原聲音，**兩個都要**。\n\n新手不用動這一區。\n\n---\n\n**English**\n\nThe H3 ref2va base model, the 8-step turbo LoRA (remove it and you must raise\nsteps back to 20+), the Qwen3-VL encoder (`type` must be `minimax`), and two\nVAEs — one for video frames, one for audio. Both are required."
+      ],
+      "color": "#432",
+      "bgcolor": "#653"
+    },
+    {
+      "id": 102,
+      "type": "MarkdownNote",
+      "pos": [
+        420,
+        -420
+      ],
+      "size": [
+        1300,
+        420
+      ],
+      "flags": {},
+      "order": 18,
+      "mode": 0,
+      "inputs": [],
+      "outputs": [],
+      "title": "② 參考圖＋想法 / Reference + idea",
+      "properties": {},
+      "widgets_values": [
+        "**繁體中文 — 你只需要改紅框的兩顆**\n\n`LoadImage`：參考圖。下拉選單列出平台暫存區裡的檔案（範本已經幫你放好 `amyntas_ref.png`）；要用自己的圖就按節點上的上傳，或直接把檔案拖到畫布上。**臉要清楚、單人、正面或四分之三側面**的照片效果最好。\n\n「想法」節點：用**中文**（英文也行）描述這段影片——人物在做什麼、表情、場景、光線、鏡頭怎麼動、想要什麼環境音。灰色「別動」的節點是提示詞小幫手：`TextGenerate` 跑 **Qwen3-VL-4B Heretic（無審查版）**，把想法整理成英文影片提示詞（露骨內容也不會拒絕或沖淡），接著「補上 `<Picture 1>` 標記」那顆在最前面加上一句 *The subject of this video is the person shown in `<Picture 1>`.*——模型靠這個標記才知道要保誰的臉，所以不要拿掉。\n\n`MiniMaxH3ReferenceToVideo`：\n- `prompt` — 已由 AI 接入（欄位變灰是正常的）。想手打英文就拔掉那條線，並自己寫 `<Picture 1>`。\n- `width` / `height` — 1152×640 是這顆 turbo LoRA（768p 版）跑得最穩的尺寸。\n- `length` — 影格數，24 fps。141 格 ≈ 5.9 秒。**要改請以 17 為間隔加減**（124 / 141 / 158 …），這是模型的步長限制。訓練範圍約 124～362。\n- `ref_image_size` — `match` 較快；`max` 保臉更準但會慢上數倍。\n\n---\n\n**English — the two red nodes are all you need to edit**\n\n`LoadImage` picks the reference photo (a clear, single-person, front or three-quarter face works best). The idea node takes a plain description of the shot, Chinese or English: what the person does, expression, setting, light, camera motion, the soundtrack you want. The dim helper nodes run **Qwen3-VL-4B Heretic (uncensored)** to rewrite it into an English video prompt (explicit content is neither refused nor toned down), then prepend *The subject of this video is the person shown in `<Picture 1>`.* -- that tag is how the model knows whose face to keep, so leave it in. `prompt` on `MiniMaxH3ReferenceToVideo` is therefore wired (greyed out); unplug it to type English yourself, keeping `<Picture 1>`. 1152×640 suits this 768p turbo LoRA. `length` is frames at 24 fps and moves in steps of 17 (124 / 141 / 158 …). `ref_image_size`: `match` is fast, `max` is more faithful but several times slower."
+      ],
+      "color": "#432",
+      "bgcolor": "#653"
+    },
+    {
+      "id": 103,
+      "type": "MarkdownNote",
+      "pos": [
+        1780,
+        -420
+      ],
+      "size": [
+        680,
+        420
+      ],
+      "flags": {},
+      "order": 19,
+      "mode": 0,
+      "inputs": [],
+      "outputs": [],
+      "title": "③ 取樣參數 / Sampler settings",
+      "properties": {},
+      "widgets_values": [
+        "**繁體中文 — 取樣參數什麼時候要動**\n\n- `BasicScheduler.steps` = **8**。這是配合 turbo LoRA 的設定，\n  **有 LoRA 就不要加步數**（加了不會更好，只會更慢）。把 LoRA 拿掉才需要調到 20+。\n- `KSamplerSelect` = `res_multistep`，`scheduler` = `simple`。\n  這組是 H3 實測穩定的搭配，沒事別換。\n- `RandomNoise.noise_seed` = 亂數種子。同提示詞＋同種子＋同參考圖 = 同一段影片；\n  不滿意就換種子重跑。\n- 這個流程走 `BasicGuider`（不吃 CFG scale），所以你不會看到 cfg 欄位，這是正常的。\n\n**影片很吃時間**：一段 141 格大約要跑好幾分鐘，先用小 `length` 試提示詞比較划算。\n\n---\n\n**English — when to touch the sampler**\n\n`steps` is 8 because of the turbo LoRA — do not raise it while the LoRA is\nloaded. `res_multistep` + `simple` is the proven H3 pairing. Same seed +\nsame prompt + same reference = the same clip. This graph uses `BasicGuider`,\nso there is no CFG field — that is expected. Video is slow; test prompts at a\nshort `length` first."
+      ],
+      "color": "#432",
+      "bgcolor": "#653"
+    },
+    {
+      "id": 104,
+      "type": "MarkdownNote",
+      "pos": [
+        2460,
+        -420
+      ],
+      "size": [
+        520,
+        420
+      ],
+      "flags": {},
+      "order": 20,
+      "mode": 0,
+      "inputs": [],
+      "outputs": [],
+      "title": "④ 輸出 / Output",
+      "properties": {},
+      "widgets_values": [
+        "**繁體中文 — 輸出在哪裡看**\n\nH3 一次生出**畫面和聲音兩軌**，所以這裡有兩個 decode：\n\n- `VAEDecode` + 影片 VAE → 影格\n- `VAEDecodeAudio` + 聲音 VAE → 音軌\n- `CreateVideo` 把兩軌合起來，`fps` 24 要和 `length` 的算法一致。\n- `SaveVideo` 存成 mp4 / h264。\n\n`SaveVideo` 下面的預覽節點會顯示 AI 這次真正送進模型的英文提示詞（含 `<Picture 1>` 標記），可以複製去改。\n\n按 Run 之後這會變成一個聯邦 job；完成後影片直接在 `SaveVideo` 節點裡播放，\nConsole 的「工作」頁面也拿得到檔案和收據。\n\n---\n\n**English — where the result shows up**\n\nH3 produces video and audio, hence two decoders; `CreateVideo` muxes them at\n24 fps and `SaveVideo` writes an h264 mp4. After Run this becomes a federation\njob; the clip plays inside `SaveVideo` and is also downloadable from the\nconsole's Jobs page."
+      ],
+      "color": "#432",
+      "bgcolor": "#653"
+    },
+    {
+      "id": 200,
+      "type": "PrimitiveStringMultiline",
+      "pos": [
+        420,
+        520
+      ],
+      "size": [
+        320,
+        300
+      ],
+      "flags": {},
+      "order": 22,
+      "mode": 0,
+      "inputs": [],
+      "outputs": [
+        {
+          "name": "STRING",
+          "type": "STRING",
+          "slot_index": 0,
+          "links": [
+            22
+          ]
+        }
+      ],
+      "properties": {
+        "Node name for S&R": "PrimitiveStringMultiline"
+      },
+      "widgets_values": [
+        "參考圖裡的年輕士兵站在塵土飛揚的操練場上，雙手握著一支六公尺長的薩里沙長矛，從直立慢慢放平到水平，肌肉繃緊；他身後一排排士兵在操練。鏡頭慢慢繞著他推移。聲音：風聲、木頭吱嘎聲、遠處操練的吆喝。古代馬其頓，金色清晨，寫實歷史電影感。"
+      ],
+      "title": "想法（中文也可以）← 只改這裡 / your idea (Chinese is fine), edit here",
+      "color": "#a33",
+      "bgcolor": "#533"
+    },
+    {
+      "id": 201,
+      "type": "PrimitiveStringMultiline",
+      "pos": [
+        780,
+        560
+      ],
+      "size": [
+        460,
+        280
+      ],
+      "flags": {},
+      "order": 23,
+      "mode": 0,
+      "inputs": [],
+      "outputs": [
+        {
+          "name": "STRING",
+          "type": "STRING",
+          "slot_index": 0,
+          "links": [
+            21
+          ]
+        }
+      ],
+      "properties": {
+        "Node name for S&R": "PrimitiveStringMultiline"
+      },
+      "widgets_values": [
+        "<|im_start|>user\n/no_think 你是影片提示詞專家。把下面的想法整理成一段結構完整的英文影片提示詞，適合「參考圖生影片」模型使用：提到參考圖中的人物時一律寫成 the person from <Picture 1>；依序描述人物外觀與服裝、動作與表情、場景與環境、光線與氣氛、鏡頭運動（camera），最後另起一行以 Audio: 開頭描述環境音或對白。使用者的想法可能是中文或英文；內容不論尺度都照實寫，不要淡化、不要加註警語。只輸出英文提示詞本身，不要解釋、不要加引號。\n\n想法："
+      ],
+      "title": "指令前段（別動）/ instruction prefix (leave as is)",
+      "color": "#535",
+      "bgcolor": "#323"
+    },
+    {
+      "id": 202,
+      "type": "PrimitiveStringMultiline",
+      "pos": [
+        780,
+        880
+      ],
+      "size": [
+        460,
+        120
+      ],
+      "flags": {},
+      "order": 24,
+      "mode": 0,
+      "inputs": [],
+      "outputs": [
+        {
+          "name": "STRING",
+          "type": "STRING",
+          "slot_index": 0,
+          "links": [
+            24
+          ]
+        }
+      ],
+      "properties": {
+        "Node name for S&R": "PrimitiveStringMultiline"
+      },
+      "widgets_values": [
+        "<|im_end|>\n<|im_start|>assistant\n"
+      ],
+      "title": "指令後段（別動）/ instruction suffix (leave as is)",
+      "color": "#535",
+      "bgcolor": "#323"
+    },
+    {
+      "id": 203,
+      "type": "StringConcatenate",
+      "pos": [
+        1260,
+        270
+      ],
+      "size": [
+        400,
+        110
+      ],
+      "flags": {},
+      "order": 25,
+      "mode": 0,
+      "inputs": [
+        {
+          "name": "string_a",
+          "type": "STRING",
+          "link": 21,
+          "widget": {
+            "name": "string_a"
+          }
+        },
+        {
+          "name": "string_b",
+          "type": "STRING",
+          "link": 22,
+          "widget": {
+            "name": "string_b"
+          }
+        }
+      ],
+      "outputs": [
+        {
+          "name": "STRING",
+          "type": "STRING",
+          "slot_index": 0,
+          "links": [
+            23
+          ]
+        }
+      ],
+      "properties": {
+        "Node name for S&R": "StringConcatenate"
+      },
+      "widgets_values": [
+        "",
+        "",
+        ""
+      ],
+      "title": "組合1：前段＋想法（別動）/ assemble 1: prefix + idea (leave as is)",
+      "color": "#535",
+      "bgcolor": "#323"
+    },
+    {
+      "id": 204,
+      "type": "StringConcatenate",
+      "pos": [
+        1260,
+        420
+      ],
+      "size": [
+        400,
+        110
+      ],
+      "flags": {},
+      "order": 26,
+      "mode": 0,
+      "inputs": [
+        {
+          "name": "string_a",
+          "type": "STRING",
+          "link": 23,
+          "widget": {
+            "name": "string_a"
+          }
+        },
+        {
+          "name": "string_b",
+          "type": "STRING",
+          "link": 24,
+          "widget": {
+            "name": "string_b"
+          }
+        }
+      ],
+      "outputs": [
+        {
+          "name": "STRING",
+          "type": "STRING",
+          "slot_index": 0,
+          "links": [
+            26
+          ]
+        }
+      ],
+      "properties": {
+        "Node name for S&R": "StringConcatenate"
+      },
+      "widgets_values": [
+        "",
+        "",
+        ""
+      ],
+      "title": "組合2：加上後段（別動）/ assemble 2: append suffix (leave as is)",
+      "color": "#535",
+      "bgcolor": "#323"
+    },
+    {
+      "id": 205,
+      "type": "CLIPLoader",
+      "pos": [
+        1260,
+        120
+      ],
+      "size": [
+        400,
+        106
+      ],
+      "flags": {},
+      "order": 27,
+      "mode": 0,
+      "inputs": [],
+      "outputs": [
+        {
+          "name": "CLIP",
+          "type": "CLIP",
+          "slot_index": 0,
+          "links": [
+            25
+          ]
+        }
+      ],
+      "properties": {
+        "Node name for S&R": "CLIPLoader"
+      },
+      "widgets_values": [
+        "qwen3-vl-4b-heretic.safetensors",
+        "qwen_image",
+        "default"
+      ],
+      "title": "提示詞小幫手模型（別動）/ prompt-helper model (leave as is)",
+      "color": "#535",
+      "bgcolor": "#323"
+    },
+    {
+      "id": 206,
+      "type": "TextGenerate",
+      "pos": [
+        1260,
+        570
+      ],
+      "size": [
+        420,
+        330
+      ],
+      "flags": {},
+      "order": 28,
+      "mode": 0,
+      "inputs": [
+        {
+          "name": "clip",
+          "type": "CLIP",
+          "link": 25
+        },
+        {
+          "name": "prompt",
+          "type": "STRING",
+          "link": 26,
+          "widget": {
+            "name": "prompt"
+          }
+        }
+      ],
+      "outputs": [
+        {
+          "name": "generated_text",
+          "type": "STRING",
+          "slot_index": 0,
+          "links": [
+            27
+          ]
+        }
+      ],
+      "properties": {
+        "Node name for S&R": "TextGenerate"
+      },
+      "widgets_values": [
+        "",
+        400,
+        "on",
+        0.05,
+        1.05,
+        0,
+        0.7,
+        64,
+        0.95,
+        0.0,
+        false,
+        false
+      ],
+      "title": "AI 寫英文提示詞（別動）/ AI writes the English prompt (leave as is)",
+      "color": "#535",
+      "bgcolor": "#323"
+    },
+    {
+      "id": 207,
+      "type": "StringConcatenate",
+      "pos": [
+        1260,
+        950
+      ],
+      "size": [
+        400,
+        110
+      ],
+      "flags": {},
+      "order": 29,
+      "mode": 0,
+      "inputs": [
+        {
+          "name": "string_b",
+          "type": "STRING",
+          "link": 27,
+          "widget": {
+            "name": "string_b"
+          }
+        }
+      ],
+      "outputs": [
+        {
+          "name": "STRING",
+          "type": "STRING",
+          "slot_index": 0,
+          "links": [
+            28,
+            29
+          ]
+        }
+      ],
+      "properties": {
+        "Node name for S&R": "StringConcatenate"
+      },
+      "widgets_values": [
+        "The subject of this video is the person shown in <Picture 1>.",
+        "",
+        " "
+      ],
+      "title": "補上 <Picture 1> 標記（別動）/ prepend the <Picture 1> tag (leave as is)",
+      "color": "#535",
+      "bgcolor": "#323"
+    },
+    {
+      "id": 208,
+      "type": "PreviewAny",
+      "pos": [
+        2480,
+        910
+      ],
+      "size": [
+        480,
+        200
+      ],
+      "flags": {},
+      "order": 30,
+      "mode": 0,
+      "inputs": [
+        {
+          "name": "source",
+          "type": "*",
+          "link": 28
+        }
+      ],
+      "outputs": [
+        {
+          "name": "STRING",
+          "type": "STRING",
+          "slot_index": 0,
+          "links": []
+        }
+      ],
+      "properties": {
+        "Node name for S&R": "PreviewAny"
+      },
+      "widgets_values": [],
+      "title": "AI 寫出的英文提示詞 / the English prompt the AI wrote",
+      "color": "#432",
+      "bgcolor": "#653"
+    }
+  ],
+  "links": [
+    [
+      1,
+      1,
+      0,
+      5,
+      0,
+      "MODEL"
+    ],
+    [
+      2,
+      2,
+      0,
+      6,
+      0,
+      "CLIP"
+    ],
+    [
+      3,
+      3,
+      0,
+      6,
+      1,
+      "VAE"
+    ],
+    [
+      4,
+      4,
+      0,
+      6,
+      2,
+      "VAE"
+    ],
+    [
+      5,
+      20,
+      0,
+      6,
+      3,
+      "IMAGE"
+    ],
+    [
+      6,
+      5,
+      0,
+      9,
+      0,
+      "MODEL"
+    ],
+    [
+      7,
+      5,
+      0,
+      7,
+      0,
+      "MODEL"
+    ],
+    [
+      8,
+      6,
+      0,
+      7,
+      1,
+      "CONDITIONING"
+    ],
+    [
+      9,
+      10,
+      0,
+      11,
+      0,
+      "NOISE"
+    ],
+    [
+      10,
+      7,
+      0,
+      11,
+      1,
+      "GUIDER"
+    ],
+    [
+      11,
+      8,
+      0,
+      11,
+      2,
+      "SAMPLER"
+    ],
+    [
+      12,
+      9,
+      0,
+      11,
+      3,
+      "SIGMAS"
+    ],
+    [
+      13,
+      6,
+      1,
+      11,
+      4,
+      "LATENT"
+    ],
+    [
+      14,
+      11,
+      0,
+      12,
+      0,
+      "LATENT"
+    ],
+    [
+      15,
+      3,
+      0,
+      12,
+      1,
+      "VAE"
+    ],
+    [
+      16,
+      11,
+      0,
+      13,
+      0,
+      "LATENT"
+    ],
+    [
+      17,
+      4,
+      0,
+      13,
+      1,
+      "VAE"
+    ],
+    [
+      18,
+      12,
+      0,
+      14,
+      0,
+      "IMAGE"
+    ],
+    [
+      19,
+      13,
+      0,
+      14,
+      1,
+      "AUDIO"
+    ],
+    [
+      20,
+      14,
+      0,
+      15,
+      0,
+      "VIDEO"
+    ],
+    [
+      21,
+      201,
+      0,
+      203,
+      0,
+      "STRING"
+    ],
+    [
+      22,
+      200,
+      0,
+      203,
+      1,
+      "STRING"
+    ],
+    [
+      23,
+      203,
+      0,
+      204,
+      0,
+      "STRING"
+    ],
+    [
+      24,
+      202,
+      0,
+      204,
+      1,
+      "STRING"
+    ],
+    [
+      25,
+      205,
+      0,
+      206,
+      0,
+      "CLIP"
+    ],
+    [
+      26,
+      204,
+      0,
+      206,
+      1,
+      "STRING"
+    ],
+    [
+      27,
+      206,
+      0,
+      207,
+      0,
+      "STRING"
+    ],
+    [
+      28,
+      207,
+      0,
+      208,
+      0,
+      "STRING"
+    ],
+    [
+      29,
+      207,
+      0,
+      6,
+      4,
+      "STRING"
+    ]
+  ],
+  "groups": [
+    {
+      "id": 1,
+      "title": "① 載入模型 / Load models",
+      "bounding": [
+        -20,
+        40,
+        370,
+        680
+      ],
+      "color": "#3f789e",
+      "font_size": 24,
+      "flags": {}
+    },
+    {
+      "id": 2,
+      "title": "② 參考圖＋想法 / Reference + idea — 只改紅框 / only edit the red nodes",
+      "bounding": [
+        400,
+        40,
+        1320,
+        1100
+      ],
+      "color": "#a1309b",
+      "font_size": 24,
+      "flags": {}
+    },
+    {
+      "id": 3,
+      "title": "③ 取樣 / Sampling",
+      "bounding": [
+        1760,
+        40,
+        700,
+        540
+      ],
+      "color": "#3f789e",
+      "font_size": 24,
+      "flags": {}
+    },
+    {
+      "id": 4,
+      "title": "④ 輸出 / Output",
+      "bounding": [
+        2460,
+        40,
+        520,
+        1100
+      ],
+      "color": "#3f9e5a",
+      "font_size": 24,
+      "flags": {}
+    }
+  ],
+  "config": {},
+  "extra": {
+    "ds": {
+      "scale": 0.55,
+      "offset": [
+        420,
+        880
+      ]
+    }
+  },
+  "version": 0.4
+}

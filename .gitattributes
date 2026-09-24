@@ -1,0 +1,9 @@
+# Installer scripts must keep their native line endings regardless of the
+# checkout platform: a CRLF install.sh piped into bash dies on '\r'.
+cloud/packaged/installers/install.sh text eol=lf
+cloud/packaged/installers/install.cmd text eol=crlf
+cloud/packaged/installers/install.ps1 text eol=lf
+
+# Recipe JSON (spec §5.1) is imported into the Worker bundle verbatim; keep LF
+# regardless of the checkout platform.
+cloud/src/core/recipes/*.json text eol=lf

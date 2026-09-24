@@ -1,0 +1,12 @@
+.git
+.venv
+**/node_modules
+**/__pycache__
+**/dist
+cloud/assets
+cloud/dist-selfhost
+cloud/.wrangler
+data
+build
+*.egg-info
+docs

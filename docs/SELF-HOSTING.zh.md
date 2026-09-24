@@ -1,0 +1,623 @@
+# ComfyFed 自架指南（技術附錄）
+
+[English version →](SELF-HOSTING.en.md) ｜ [回一般說明 README](../README.md)
+
+這份文件是給要動手架站、寫設定檔、看 API 細節的人看的技術文件。如果你只是想知道 ComfyFed 是什麼、能拿來做什麼，請先看根目錄的 [README.md](../README.md)。
+
+### 這是什麼
+
+ComfyFed 是一個給熟人圈使用的 **ComfyUI 分散式渲染聯邦平台**：一台伺服器（platform）帶著多台 worker（agent），讓大家用自己的顯卡互相支援彼此的 ComfyUI 渲染工作，不需要公開服務、不需要信任陌生人的節點。
+
+- 全程 Ed25519 簽章協議：worker 註冊、每次 API 呼叫、WebSocket 連線都經過簽章與防重放驗證
+- 工作自動評估：伺服器比對 workflow 需要的節點／模型／VRAM 與每台 worker 的即時狀態，判定 `eligible`／`eligible_after_fetch`／`ineligible`
+- 雙簽收據：每個工作完成後由 worker 與 platform 各自簽名，作為算力貢獻的可稽核記錄
+- 雙語 Web 主控台（繁中／英文）：Dashboard、Workers、Jobs、Reports、Settings
+- Prometheus `/metrics` 端點，可接 Grafana 等監控
+- Agent 具備簽章驗證的自動更新機制
+
+### 快速開始
+
+**伺服器只有一份實作**（`cloud/src`，Cloudflare Worker）：自架＝用 Miniflare（Cloudflare 自己的 workerd 封裝）在你的機器上執行同一份打包好的 Worker，D1 → 本機 SQLite、R2 → 本機目錄、Durable Object → 本機 SQLite。原本的 Python 伺服器已於 2026-09-24 移除；agent 仍是 Python，不受影響。
+
+**自架（Docker）**
+
+```bash
+docker run -d --name comfyfed --restart unless-stopped \
+  -p 8388:8388 -v comfyfed-data:/data \
+  ghcr.io/aiinpocket/comfyfed:latest
+docker logs comfyfed        # 第一次啟動會印出 setup token
+```
+
+**自架（不用 Docker，需 Node.js 22+）**
+
+```bash
+cd web && npm ci
+cd ../cloud && npm ci
+npm run selfhost -- --data-dir ./data --url https://your-domain.example
+```
+
+第一次執行會先建置主控台與 Worker（`dist-selfhost/` 與 `assets/`），之後每次啟動只要幾秒。打開 `http://<這台機器>:8388`，輸入 setup token、建立管理員密碼即可。加 `--check` 會啟動、打一次 `/api/ping` 就結束，用來確認安裝正常。參數（`--data-dir`／`--port`／`--host`／`--url`／`--check`）與 TLS 反向代理設定的完整表格見 [README.md〈A. 自架〉](../README.md#a-自架一台自己的電腦或-vm)。
+
+`--data-dir`（Docker 是 `/data`）裡有兩樣東西：`state/` 是 D1／R2／Durable Object 的持久化資料（資料庫、上傳檔、產出物），`selfhost.json`（0600）是第一次執行產生的 `SETUP_TOKEN` 與 `PLATFORM_ED25519_SEED`——後者是平台的簽章身分，備份時請一併保管。`migrations/*.sql` 在啟動時自動套用並記在 `d1_migrations` 表（和 `wrangler d1 migrations apply` 同語意），重跑是 no-op。
+
+**Cloudflare 版（需 Cloudflare 帳號＋Node.js 20+）**
+
+```bash
+cd cloud && npm install
+npm run setup:cloudflare          # 加 -- --yes 為非互動：沿用既有 secret、不問問題
+```
+
+一個指令做完登入、D1、R2、`wrangler.jsonc` 的 `database_id`、secrets、建置、migration、部署，結束時印出網址與 setup token。手動一步一步做的流程仍在 [`cloud/README.md`](../cloud/README.md)。
+
+**誠實註記**：Cloudflare 把 Miniflare 定位成開發工具，不是正式環境產品。對「熟人圈、一台機器」的規模這是可接受的取捨，換來的是自架與雲端零重複程式碼；它不是拿來扛大流量的。
+
+### 多使用者與權限
+
+登入現在是**帳號＋密碼**（不再是單一管理員密碼）。安裝精靈產生的第一個帳號固定叫 `admin`，角色是管理員。
+
+**建立使用者**：以管理員身分登入 Console → **Users** 頁 → 建立使用者，輸入帳號名稱、選角色（管理員／一般使用者）。不指定密碼的話系統會產生一組隨機密碼，**只在建立當下顯示一次**（有複製按鈕），請立刻轉交給對方；忘記存下來也沒關係，之後可以在同一頁按「重設密碼」再拿到一組新的一次性密碼。
+
+**角色差異**：
+
+- **一般使用者**：只看得到自己送出的工作與產出物（Dashboard、Jobs、Reports 都只顯示自己的資料），Settings 只留改密碼與語言；看不到別人的工作。**Workers 頁與工作流範本對所有角色開放**——worker 是大家共用的算力叢集，一般使用者看得到整個叢集的狀態（上下線、硬體、模型數），但**發 token／停用／刪除 worker** 的按鈕與 API 只有管理員有。
+- **管理員**：Console 端看得到全部人的工作與統計，多了 Workers、Users、完整 Settings，以及貢獻／使用者用量／分潤試算三種報表。
+- 內嵌的工作流編輯器（`/comfy`）**對所有角色都是個人工作區**：不論管理員或一般使用者，在面板裡都只看得到自己在面板送出的工作——要看全體流量，一律回 Console 的「工作」頁。
+
+Users 頁的每個帳號都可以**停用／啟用**、**切換角色**、**重設密碼**；停用後該帳號的所有既有登入立即失效，之後也無法再登入。系統不提供刪除帳號（工作與收據紀錄要保留歸屬），且**最後一名有效管理員不能被停用或降級**，避免把自己鎖在外面。
+
+**每人用量與分潤**：Reports 頁對管理員多了「**使用者用量**」（每個帳號各自的任務數、GPU 秒數）與「**分潤試算**」（輸入分潤池金額，依區間內各 worker 貢獻的 GPU 秒數比例算出各自分到多少）兩個分頁；一般使用者登入 Reports 只會看到屬於自己的「**我的用量**」。
+
+**升級注意事項**：從舊版升級時，原本的管理員密碼會自動變成帳號 `admin`（**密碼完全不變**，不需要重設），既有的工作與收據也會全部歸到這個帳號名下——但因為登入用的 session 格式改變了，**升級後所有人都需要重新登入一次**（含 admin 本人），舊的登入 cookie 一律視為未登入，不做任何相容映射。這段資料搬遷是 D1 migration `0006`，Cloud 版在 `npm run deploy` 時套用、自架版在啟動時套用同一組 migration，不需要手動介入。
+
+### 網路架構：DDNS 或固定 IP 都可以
+
+伺服器對外只需要一個大家都連得到的網址（DDNS 動態域名或固定 IP 均可），這個網址就是平台設定裡的 `platform_url`（自架時用 `npm run selfhost -- --url …` 第一次寫入，之後在主控台 Settings 改；沒設時以請求的來源網址代替），之後也會寫進發給每個 worker 的註冊 bundle 裡。
+
+Worker（agent）只會**主動對外連線**去找伺服器，不需要對外開放任何連接埠，NAT／防火牆後面也能正常運作。
+
+如果對外是 HTTPS，建議在伺服器前面加一層反向代理處理 TLS，再轉給平台監聽的內部埠（預設 8388）。
+
+**Caddy**（自動 HTTPS，兩行搞定）：
+
+```
+your-domain.example {
+    reverse_proxy 127.0.0.1:8388
+}
+```
+
+**nginx**（等效設定）：
+
+```nginx
+server {
+    listen 443 ssl;
+    server_name your-domain.example;
+    location / {
+        proxy_pass http://127.0.0.1:8388;
+        proxy_set_header Host $host;
+        proxy_set_header Upgrade $http_upgrade;
+        proxy_set_header Connection "upgrade";
+    }
+}
+```
+
+（agent 走的是 WebSocket 長連線，proxy 記得帶上 `Upgrade`/`Connection` header。）
+
+**worker 的來源 IP 只從 `CF-Connecting-IP` 取得**：平台用每台 worker 的公網 IP 把躲在同一個 NAT 後面的 P2P 節點分成一組（同組就改走區網位址互傳分塊，見下方「同一個 NAT 的成員走區網」）。這個標頭由 Cloudflare 在雲端版自動帶上；Miniflare 自架版沒有人會設定它，也沒有「信任 X-Forwarded-For」之類的設定可開，所以自架版目前不做同 NAT 分組——P2P 照常運作，只是拉方一律先試對外位址。
+
+### 新增一台 worker
+
+1. 在主控台 → **Workers** → 新增，輸入名稱後系統會產生一次性的註冊 token，並直接顯示三條一行安裝指令（Windows PowerShell／Windows cmd／Linux + macOS），各附複製按鈕。
+2. 在要貢獻算力的那台機器上，貼上對應那一行貼到終端機執行。**不需要系統管理員／sudo**：Windows 用一般終端機即可（有系統管理員權限會用工作排程器設自啟，沒有就自動改用使用者層級的登錄檔 Run 鍵，效果相同）；Linux／macOS 請以一般使用者執行、**不要加 sudo**（整套裝在你的家目錄，root 執行會被腳本擋下）。腳本可安全重跑：已註冊過的機器會自動跳過註冊步驟。**重跑不會動你既有的 `agent.json`**（`auto_fetch_models`、`max_fetch_gb`、白名單等全部保留；唯一會主動改的是下面 P2P 一節說的「從未設定過」的分享開關）。**一台 worker 可以同時貢獻給多個平台**：在同一台機器上貼第二個平台的安裝指令，只會在 `agent.json` 的 `platforms` 多加一筆，不會蓋掉第一個平台的註冊；而且**絕不降級 agent**——本機已裝的 agent 比該平台發佈的版本新時，安裝腳本會跳過 wheel 這一步、保留現有版本（同版仍會重裝）。
+
+```powershell
+# Windows（PowerShell）
+irm "<你的平台網址>/install.ps1?token=<一次性 token>" | iex
+```
+
+```cmd
+:: Windows（cmd）
+curl -fsSL "<你的平台網址>/install.cmd?token=<一次性 token>" -o install.cmd && install.cmd && del install.cmd
+```
+
+```bash
+# Linux / macOS
+curl -fsSL "<你的平台網址>/install.sh?token=<一次性 token>" | bash
+```
+
+（實際指令請直接從主控台複製，網址與 token 已經幫你填好。）
+
+這一行指令會自動完成整套安裝：缺 Python 會自動安裝——**三個 OS 都不需要 sudo／系統管理員**（Windows 走 python.org 的每使用者靜默安裝；macOS 與 Linux 從 Astral 的 python-build-standalone 下載可搬移的 CPython 3.12 到 `~/.comfyfed/python`，下載後比對腳本內釘死的 sha256 才安裝，跟 `uv` 用的是同一套預建；Linux 只有在這個下載失敗時才退回 apt/dnf。macOS 特別註記：Xcode 命令列工具附的 python3 是 3.9、低於 3.10 門檻，所以裝 Xcode 並不能解決，腳本也不會再建議你這麼做）；找不到本機 ComfyUI 就連 ComfyUI 一起裝（釘死 v0.35.0，依 GPU 自動選 CUDA／CPU／MPS）；裝完會用 token 自動完成 `register`，並把整組（ComfyUI + agent）設成開機自動啟動、在背景執行，不需要再手動下指令。重跑同一行指令是安全的（冪等）：已經裝過的機器會修好任務排程／服務並升級 agent，不會重灌 ComfyUI。
+
+**現成的 ComfyUI 現在也會幫你一起帶起來。** 安裝器若偵測到你本來就在跑的 ComfyUI（Comfy Desktop、自己 clone 的版本），會把*那個正在跑的行程是怎麼啟動的*——執行檔、參數、工作目錄、以及它服務的網址——記進 `comfyui_managed.json`（Windows 在 `%LOCALAPPDATA%\ComfyFed\`，Linux／macOS 在 `~/.comfyfed/app/`），並在每次登入／開機時、在 agent 之前先把它帶起來。在這之前只有安裝器*自己裝的* ComfyUI 重開機後會回來，所以在 Comfy Desktop 的機器上，agent 開機後背後沒有 ComfyUI，worker 就一直掛著離線，直到有人手動開 ComfyUI 為止。啟動一律先探測：該網址已經有人回應就不再啟動，不會出現兩份搶同一個埠。若安裝器讀不到那個 listening 行程（找不到、或權限不足），它**什麼都不寫**，並當場告訴你重開機後要自己啟動 ComfyUI。
+
+- **不想要這個行為**：在 `comfyui_managed.json` 裡設 `"autostart": false`，launcher 就不會碰 ComfyUI（agent 照常自啟，並自己等 ComfyUI 出現）。重跑安裝器會**重新擷取**這個檔案（偵測到的 ComfyUI 可能搬家、升級或換埠），所以重跑後要再設一次這個旗標。
+- **記下來的埠是安裝當下 ComfyUI 服務的那個埠。** 之後才另外開的 Comfy Desktop 會拿到另一個埠，而 agent 仍然用記錄下來的那個——所以請讓被記錄的那份跑在你要拿來貢獻算力的埠上。
+
+**解除安裝**：
+
+- **Windows**：`schtasks /Delete /TN ComfyFedAgent /F`（非系統管理員安裝則是 `reg delete "HKCU\Software\Microsoft\Windows\CurrentVersion\Run" /v ComfyFedAgent /f`），再刪除 `%LOCALAPPDATA%\ComfyFed` 資料夾。
+- **Linux**：`systemctl --user disable --now comfyfed-agent comfyfed-comfyui`，再刪除 `~/.comfyfed`。
+- **macOS**：`launchctl unload -w ~/Library/LaunchAgents/com.comfyfed.agent.plist`（若有安裝 ComfyUI 再加一行 `com.comfyfed.comfyui.plist`），刪掉這些 `.plist` 檔，再刪除 `~/.comfyfed`。
+
+#### 手動安裝（進階）
+
+一行指令背後其實就是「裝 Python 套件 + 註冊」，需要自行掌控環境（例如已經有現成的 ComfyUI、想自訂 venv）時可以照舊手動做。主控台的「手動安裝（進階）」摺疊區塊仍可下載同一份 `bundle.json`：
+
+```bash
+pip install -e .            # 在 repo 根目錄；根目錄的 pyproject.toml 就是 agent
+comfyfed-agent register bundle.json
+comfyfed-agent run
+```
+
+`register` 會用 bundle 裡的一次性 token 向伺服器換發正式憑證，並把設定寫到 `~/.comfyfed/agent.json`；`run` 會連上所有已註冊的平台並開始接工作。手動流程不會幫你裝 ComfyUI 或設開機自啟，這些要自己處理。
+
+**ComfyUI 的位置與資料夾會自動偵測**：註冊（與每次啟動）時 agent 會自己找本機的 ComfyUI——先試常見的埠（8188／8000 等），找不到就掃 8000–8399 並用 `/system_stats` 指紋確認；找到後再從 `/internal/folder_paths` 推導出模型庫（`models_dir`）與 ComfyUI 真正的 output／input 資料夾，一併寫進 `agent.json`。只有在完全找不到（ComfyUI 沒開、或跑在很冷門的埠）時才需要手動在 `agent.json` 填 `comfy_url`；你手動填過的值永遠不會被自動偵測覆蓋。
+
+**要停掉 agent**：在它的終端機按 `Ctrl-C`（Windows 上 `CTRL_BREAK` 也可以）就會優雅關機——agent 會先請求 ComfyUI 中斷正在跑的工作、清掉暫存的檔案，確認收尾完成才結束程序，不會留下半殘的工作或垃圾檔案。
+
+### 暫停與停止 / Pause & stop
+
+Agent 內建 BOINC 風格的閒置偵測：**預設開啟**，只要偵測到使用者正在操作這台機器（滑鼠／鍵盤有輸入），就會暫停接新工作——正在跑的工作不受影響，會照常跑完，只是不會再接新的。也可以用 CLI 從另一個終端機手動控制同一個背景中的 agent：
+
+```bash
+comfyfed pause    # 暫停接新工作（跑到一半的工作照樣跑完）
+comfyfed resume   # 恢復接新工作
+comfyfed status   # 顯示目前狀態（available / paused-manual / paused-active，以及是否有工作在跑）
+comfyfed stop     # 請 agent 優雅結束：進行中的工作會被取消並清理（等同在它的終端機按 Ctrl-C）
+```
+
+**`stop` 不會等工作跑完**：它跑的就是 `Ctrl-C` 那一套收尾——請 ComfyUI 中斷、清掉暫存檔、然後結束程序，那個工作會由平台在逾時後重新派給別台。想讓手上的工作跑完再停，請依序：`comfyfed pause` →（用 `comfyfed status` 等到不再顯示 `busy`）→ `comfyfed stop`。
+
+（一行安裝指令裝好之後 `comfyfed` 就在 PATH 上；手動安裝時同一支指令叫 `comfyfed-agent`，兩者相通。）
+
+**暫停功能需要平台版本 ≥ 本版本**：`paused` 是 0.1.2 才加進心跳的狀態，舊版平台看不懂、會當成沒收到而繼續派工。agent 是新的、平台是舊的時，暫停會靜靜地沒有效果——請先把平台端升級。
+
+閒置偵測的參數寫在 `agent.json`：`pause_when_active`（預設 `true`）控制要不要偵測使用者活動；`idle_minutes`（預設 `15`）是「連續幾分鐘沒有任何鍵盤滑鼠輸入才算閒置」——距離最後一次輸入不滿這個分鐘數就視為使用者活動中、暫停接單，滿了才恢復接單。手動改完 `agent.json` 需要重啟 agent 才會生效。
+
+**暫停只擋新工作，不會停止做種（P2P 分享模型檔）**：分享模型檔給其他 worker 只吃 CPU 跟網路、不占 GPU，所以你在用電腦的時候它照常跑——但會降速讓出頻寬。使用者活動中或手動暫停時，上傳受 `peer_upload_limit_mbps` 限制（預設 `20`，單位 Mbps）；機器閒置時改用 `peer_upload_limit_idle_mbps`（預設 `0` = 不限速）。兩個參數都寫在 `agent.json`，改完要重啟 agent 才會生效。這個上限是整個 agent 行程共用的：同時有多個人在抓，是全部加起來受限，不是每人各拿一份。**老實說一句**：閒置時預設不限速，意思是單一個下載端就有可能把你家的上行塞滿（影響視訊會議、線上遊戲之類）；如果你在意，把 `peer_upload_limit_idle_mbps` 也設一個數字（例如上行頻寬的一半）。
+
+**做種端會把自己的上限回報給平台，授權單活多久就照這個算**：agent 在 `hello` 裡會附上「這台機器做種時最慢會用的上傳上限」（`peer_upload_limit_mbps` 與 `peer_upload_limit_idle_mbps` 中不為 `0` 的最小值；兩個都設 `0`＝不限速時就不回報）。平台簽發 P2P 授權單時，會拿這個數字去推「整個檔案要傳多久」，而不是一律假設 20 Mbps——所以你刻意把上行壓到例如 5 Mbps 時，授權單的有效時間會跟著拉長約 4 倍，不會傳到一半就過期。舊版平台看不懂這個欄位會直接忽略，行為跟以前一樣。
+
+**失效的註冊會自動搬到 `agent.dead.json`**：平台若**連續兩次**以 4401 拒絕某組註冊（worker 被刪掉、或憑證失效），agent 除了停止重試，還會把那筆 `platforms` 條目從 `agent.json` 移出、完整備份到同一個資料夾下的 `agent.dead.json`（JSON 陣列，會累積附加，並額外記下 `removed_at` 與 `reason`），下次啟動就不會再嘗試、也不會再洗一次錯誤訊息。**這個備份含有簽章私鑰，請比照 `agent.json` 保管**。要還原的話：把該筆記錄裡的欄位（`platform_url`、`platform_pubkey`、`worker_id`、`certificate`、`signing_key_hex`）複製回 `agent.json` 的 `platforms` 陣列即可（`removed_at`／`reason` 兩個欄位不用複製），然後重啟 agent。平常的情況直接重新執行安裝指令重新註冊就好。只出現一次 4401（舊版平台在握手逾時也會送 4401）、握手逾時（4408）、或 worker 被管理員停用（4403），都**不會**清掉註冊：agent 只是持續慢速重試，管理員重新啟用後會自動恢復。
+
+**偵測不到使用者活動時視為閒置，一律接單**：headless 機器（沒有實體螢幕/鍵盤滑鼠）或 Wayland 桌面若沒有裝 XWayland，agent 偵測不到活動訊號，這種情況一律當作「沒有人在用」，不會因為偵測失敗就把 worker 晾在一邊接不到工作。
+
+**Windows 重開機後 worker 顯示離線（0.1.11 起）**：agent 會在登入時自動啟動，但 ComfyUI Desktop 是由你手動開的，所以重開機後 agent 通常比 ComfyUI 早好幾分鐘就緒。這種情況 agent 會自己處理：它會先探測 ComfyUI，在探測不到之前**不會**連上平台，只印一行警告（不再刷整串 traceback），每 30 秒重試一次，等 ComfyUI 一啟動就自動上線。在那之前主控台只會把該 worker 列為離線，`comfyfed status` 會顯示 `paused` 並附上原因 `comfyui_unreachable`——不用修什麼，把 ComfyUI 打開即可。**這個功能上線後裝（或重跑）的機器幾乎不會再有這段空窗**：安裝器會記下你現有 ComfyUI 的啟動方式，登入時的 launcher 會先把它帶起再啟動 agent——詳見上方「新增一台 worker」。
+
+**Windows 找不到 `comfyfed` 指令**：剛裝完的那個終端機視窗看不到新加的 PATH，屬正常現象——關閉終端機重開一個新的即可。
+
+**macOS／Linux 找不到 `comfyfed` 指令**：安裝器把指令連到 `~/.local/bin`，但 macOS 預設的 PATH（`/etc/paths`）和精簡版 Linux 映像都不含這個目錄（安裝器偵測到時會提示）。加進去即可：
+
+```bash
+echo 'export PATH="$HOME/.local/bin:$PATH"' >> ~/.zshrc   # bash 請改 ~/.bashrc
+exec $SHELL -l
+```
+
+### 儲存配額涵蓋使用者留下的一切（2026-09-24）
+
+使用者的配額（`upload_user_quota_gb` 或每人覆寫）現在對**三個**命名空間計費：上傳（staging）、儲存的面板檔案（userdata），以及 2026-09-24 起——他所有工作的輸入與成品。成品以前不算；一件影片工作會留下數百 MB，不算成品的配額等於沒有配額。上傳與送件在總量會超過配額時都以 `quota_exceeded` 拒絕；在檔案頁刪除成品即可釋放空間。設定頁的配額條與管理員的使用者頁（「已用」欄，`GET /api/users` 的 `used_bytes`）顯示總量；`GET /api/staging` 以 `jobs_bytes` 回報工作那一份。Worker 頁也會顯示每台的 agent 版本（`hardware.agent_version`），比平台已發佈的 `latest` 舊的會標「過舊」。
+
+### 任務分派：輕量工作優先派給弱卡
+
+伺服器派工時不是隨機挑一台 worker：完全不需要模型的輕量工作（例如影片剪接、多影片串接這類純後製任務）會優先派給沒有獨立 GPU 或 VRAM 較弱的 worker（含 Mac／CPU-only 機器），把吃模型、吃 VRAM 的算圖工作留給真正的大卡。這樣一台筆電也能幫忙分擔，不會浪費 4090 去跑剪接。
+
+**需要模型的工作派 NVIDIA，或已載入 MPS shim 的 Mac**（2026-09-20 規則，2026-09-23 放寬）：只要工作流會載入任何模型，就只有回報 `cuda` 後端的 worker 合格——外加 ComfyUI 已載入 agent 附帶的 **MPS 量化相容 shim** 的 Apple Silicon（`mps`）worker。fp8／nvfp4／int8 量化權重在 Apple MPS 上沒有對應核心；shim（`custom_nodes/comfyfed_mps_compat`，macOS 安裝器會放進去、agent 每次啟動會更新）用查表解碼 fp8、用 fp32 算 int8 矩陣乘法，所以同一套量化工作流（fp8 Chroma、int8+nvfp4 MiniMax-H3）在 Mac 上一個字不改就能跑。agent 只有在**正在執行的** ComfyUI 真的載入 shim 時（裝完要重啟）才會在 hello 回報 `mps_quant_compat: true`；沒有這個旗標的 Mac 仍會被拒絕，原因顯示「需要模型的工作只派給 NVIDIA…」。ROCm 與後端不明的 worker 照舊拒絕。若某顆模型不論有沒有 shim 都要放行某個後端，在平台 model guide 的該筆項目加上 `backends=("cuda", "mps")`。零模型的剪輯類工作不受影響，仍優先派給 Mac／弱卡。
+
+**慢後端怎麼算**（2026-09-23，規格 `docs/superpowers/specs/2026-09-23-cross-backend-dispatch-design.md`）：沒有固定的「Mac 罰分」。從沒完成過工作的 worker 用後端的*速度先驗*（`cuda` 1.0、`rocm` 0.7、`mps` 0.12、`cpu` 0.03）代替還沒學到的 `speed_index`，第一次預估就在正確的數量級（M4 Pro 實測約為 RTX 5080 的 1/8）；第一件跑完後直接用實測比值取代先驗。在此之上，排程器現在會把**等忙碌的 worker**和立刻派做比較：對每件排隊中的工作，估每台 busy worker 何時能做完它（它目前那件的剩餘時間 + 這個 tick 已經排在它後面的工作 + 跟 idle worker 一樣的載入／下載／執行成本），若明顯比最好的 idle worker 快（超過 25% + 30 秒），這件就 **hold** 住——留在佇列，每 5 秒的 tick 重新判斷。hold 的理由寫在工作的 `dispatch_info`（`held_for`、`wait_seconds`、`run_now_seconds`）。被 hold 的工作依先後排在那台 busy worker 後面，所以等同一張卡的工作夠多之後，下一件*會*派給 Mac：弱 worker 吃溢出的量，不是吃整條佇列。hold 只相對於「活著、對這件合格、剩餘時間可估（沒超時到 2 倍）」的 busy worker 存在；任一條件不成立，工作立刻派給能跑的 idle worker——只要還有活著且合格的 worker，工作永遠不會卡住。
+
+**統一記憶體**（2026-09-23）：Mac 把整池統一記憶體回報成 `vram_gb`，並附 `unified_memory: true`。這種 worker 的工作常駐集（*所有*引用模型大小總和 × 1.15，因為沒有另一塊 RAM 可以 offload）必須放得進池子的 85%，否則以 `memory:<需要>><可用>` 拒絕。離散 GPU 維持「最大單一模型 + RAM offload」的規則。
+
+### 派工與批次拆分
+
+伺服器每 5 秒跑一次派工。它不是「一件一件挑最大的卡」，而是把**當下所有在排隊的工作**和**所有閒置的 worker**放進同一張成本表，一次算出整體最省時間的配對（Hungarian 演算法）。成本表裡有這幾項：
+
+- **這台機器跑這種圖要多久**。每張圖送進來時會算一個「工作簽章」（節點組成、模型清單、步數總和、解析度級距、批次大小的雜湊）。同一張圖只改提示詞或 seed，簽章不變；改解析度、步數、模型就會變。每次任務完成、agent 回報了有效的 GPU 執行秒數，平台就把它併進 `(worker, 簽章)` 的指數移動平均。沒跑過這個簽章時，用別台跑過的中位數除以這台的「速度係數」換算；連這個都沒有就用全體平均；全新安裝則假設 60 秒。
+- **模型要不要重載**。每台 worker 記著上一次被指派的任務用了哪些模型；這次要用的模型只要已經是熱的就不計成本，冷的就按 1.5 秒/GB 估載入時間。所以「VRAM 小一點但模型已經熱著」常常會贏過「卡比較大但要重載 22 GB」。
+- **模型要不要下載**。需要自動下載的候選按 50 MB/s 估時間。原本的規則不變：只要有任何一台 worker 已經有全部模型，要下載的那幾台就完全不列入考慮。
+- **輕量工作留大卡**。完全不需要模型的工作（影片剪接那類）仍然優先給弱 GPU／Mac。
+- **等越久越優先**。每等 1 秒等於少 1 秒成本；等超過 5 分鐘的工作只要有合格 worker，一定在這一輪派出去。
+- **有警告的判定永遠排在乾淨的後面**（例如需要把權重 offload 到系統記憶體）。
+
+任務詳細頁會顯示這一次的判斷依據（`dispatch_info`）：預估執行時間（`predicted_seconds`）、預估是怎麼來的（`basis`：`signature` = 這台機器跑過這個簽章、`speed_index` = 借別台的資料換算、`fleet_default` = 全隊中位數、`none` = 全新安裝的預設值）、預估的載入／下載時間（`load_seconds`／`fetch_seconds`），以及當時有幾台合格的 worker（`candidates`）。
+
+#### 自動拆分批次
+
+一張 `batch_size ≥ 2` 的圖，如果當下有多台合格的 worker 閒著，平台會把它拆成多個子任務同時跑，每個子任務負責連續的一段（例如 4 張拆成 2+2）。拆分的做法是在子任務的工作流裡插入一個核心節點 `LatentFromBatch`，指定它只算整批裡的哪幾張——**agent 端不用做任何事，也不用裝任何東西**。
+
+**結果會一樣嗎？** 同 seed、同構圖，但**不是逐位元一致**。ComfyUI 產生批次雜訊時，只要 latent 帶著 `batch_index`（`LatentFromBatch` 會設），就會逐片產生並只保留指定那片，純雜訊層實測是逐位元相同的；端到端跑完之後會有極小的浮點差異（實測 Flux dev 512×512 4 步，平均像素差 0.47/255），來自 batch=2 與 batch=1 的 kernel 路徑不同，對照組（不同張）的差異是 17.7/255。**這個差異和「同一張圖交給不同 GPU 跑」本來就有的差異是同一個等級。** 如果你要的是位元級可重現，請關掉拆分。
+
+不是每張圖都能拆。必須全部符合才會拆：
+
+- 圖裡**恰好一個** `EmptyLatentImage` 或 `EmptySD3LatentImage`，而且它的 `batch_size` 是直接填的整數且 ≥ 2。
+- 沒有**其他**節點帶 `batch_size` 輸入。
+- 圖裡每一個節點都在拆分安全白名單內。**任何自訂節點都不在白名單**，`ImageBatch`、`LatentBatch`、`RepeatLatentBatch`、`RebatchLatents`、影片節點也不在——這些節點會把整批當成一個整體處理，拆了結果就不對了。
+- 每一個取樣器吃的 latent 都追得到那個批次來源（中間只能經過會原樣傳遞批次結構的節點）。
+- 圖裡每一個 `SaveImage`／`PreviewImage` 都追得到那個批次來源當祖先——否則一段跟批次無關的側支（例如單獨接 `LoadImage → VAEEncode → VAEDecode → SaveImage`）會在每個子任務裡各存一次，結果重複。
+
+其他規則：
+
+- 最多拆成 8 份，而且不會超過當下合格的閒置 worker 數。
+- 拆出來的子任務對 ComfyUI 面板是**看不見的**：`/history`、佇列、進度事件看到的都還是原本那一個任務，輸出也是合併後依序排好的，和整批一次跑的順序一致。
+- Console（`/jobs`）的任務列表一樣只列原本那一個任務，多一個「拆分 ×k」徽章；詳細頁可以展開看每個子任務（`children`）落在哪台 worker、跑到哪、用了多少 GPU 秒（沒有收據的子任務這欄是 `null`，不是 0），並看到彙總的 `gpu_seconds_total`；要連子任務一起列出來查，API 上帶 `?include_children=1`。
+- **收據是一個子任務一張**（父任務沒有收據），所以分潤與用量報表完全不受影響，該記給誰的秒數還是記給誰。
+- 任何一個子任務失敗，其他還沒跑完的子任務會一起取消，父任務標成失敗並帶上是第幾份失敗的。取消父任務會取消全部子任務、並個別通知每一台還在跑的 worker；取消任何一個子任務也會把整組收掉。
+- **重試（retry）一律不再拆**：整包在一台 worker 上跑，避免兩代子任務混在一起。
+
+#### 關掉拆分
+
+平台設定頁的「自動拆分批次」開關可以整台關掉（預設開）。關掉之後**新送出**的任務一律整包跑在一台 worker 上；已經拆出去的子任務不受影響，會照常跑完。
+
+只想對某一個任務關掉，就在送件的 `requirements` 裡帶 `{"split": false}`。
+
+### 任務失敗會怎樣
+
+worker 回報「這張跑失敗了」不是終點。平台會先假設問題出在**那台機器**，而不是那張圖：
+
+- **失敗第 1 次** → 任務回到排隊中（`queued`），下一輪派工重新配對。誰都可以接，**包含剛剛失敗的那一台**——偶發的 OOM、驅動打嗝、ComfyUI 剛好卡住，再跑一次常常就過了。
+- **同一台失敗第 2 次** → 這台對**這張任務**出局，之後每一輪都不會再配給它；同時平台記下「這台不適合這一**類**任務」。類別用的是那張圖的工作簽章（節點組成＋模型清單＋步數／解析度／批次，和派工預估用的是同一個簽章），所以**同類的新任務在 7 天內也不會再派給它**。模型下載單（`model_fetch`）的類別則是「這台抓不動這顆模型」。
+- **改派時不看「有沒有模型」**。這是重點：原本的派工規則是「只要有任何一台已經有全部模型，要下載的那幾台就不列入考慮」，但當有模型的那台已經失敗出局時，平台會把任務派給**沒有模型但開了自動下載（`auto_fetch`）的 worker**，push 裡直接帶著該模型的下載清單（官方／備份載點，或成員間 P2P 分塊傳輸），agent 先下載再跑。所以「唯一有模型的那台其實跑不動」不再是死局。
+- **總共失敗 6 次**，或者**全艦隊沒有任何一台有可能跑它**（都被排除、或缺節點又抓不到模型；**超過 7 天沒心跳的 worker 不算「有可能」**，一筆再也不會回來的舊註冊不會讓任務永遠排隊）→ 這時才真的終局失敗。這個「還有沒有人可能跑」每個派工週期都會對已重試過的任務再問一次，所以最後那台可能的 worker 之後才消失（太久沒上線、被刪、被停用）時，任務也會被收尾而不是一直卡在排隊中。
+- **派出去但 worker 說自己閒著**（推送剛好落在斷線的連線上、或 agent 跑到一半重啟）：同一台連續兩次心跳都回報 idle 且沒有任何任務，它名下仍是 assigned／running 的任務會自動收回排隊、下一個週期重派。這不算失敗嘗試，也不發收據。任務的錯誤訊息是一份彙整：在幾台 worker 上試了幾次、每一台的最後一個錯誤各是什麼，一眼看得出是「所有機器都不行」還是「某一台一直爛」。
+- **每一次失敗的嘗試照樣開一張收據**，`kind=failed`、**不計費**——失敗不收錢，但誰在什麼時候嘗試過留得下紀錄。
+- **管理員取消**和**斷線回收**（worker 掉線、任務被收回重派）**不算失敗次數**，不會讓 worker 背上不適任紀錄。
+
+**紀錄怎麼解除**
+
+- **自動**：那台 worker 之後成功跑完一次同類任務，紀錄立刻刪掉。
+- **過期**：7 天沒有再失敗就自動失效（那一列會留著，只是不再擋派工，管理員仍看得到歷史）。
+- **手動**：Workers 頁每台 worker 下方有「不適任任務」區塊，列出任務類別（簽章前 12 碼）、累計失敗次數、最後一次錯誤和最後一張失敗的任務連結；管理員按「清除」就能立刻解除——換了顯卡、修好驅動，或者那兩次失敗根本是平台這邊的問題時用它，不必等滿 7 天。
+
+任務詳細頁的「嘗試紀錄」會列出每一台 worker 對這張任務失敗過幾次；還在重試中的任務會顯示「上次錯誤」，不必等到終局失敗才看得到出了什麼事。
+
+### 安全模型摘要
+
+- **一次性註冊 token**：主控台核發的每個 bundle 只能使用一次，用過即失效（伺服器端原子性檢查，同一 token 不會被搶用兩次）。
+- **雙向金鑰釘選（key pinning）**：agent 首次註冊時把伺服器的 Ed25519 公鑰釘死在本地設定裡；伺服器核發的憑證（certificate）也綁定該 worker 的公鑰，之後互相驗證身分不再依賴 token。
+- **簽章請求 + 防重放**：每個 API 呼叫都帶上 `X-Ts`（時間戳）、`X-Nonce`（隨機值）與 Ed25519 簽章；伺服器拒絕時間戳超過 ±120 秒的請求，也拒絕重複出現的 nonce。
+- **WebSocket challenge**：agent 連上長連線時，伺服器送出隨機 nonce，agent 必須用自己的簽章金鑰簽回去才算握手成功。
+- **收據雙簽**：每個工作完成後，worker 與 platform 各自簽名，形成不可單方偽造的貢獻紀錄。
+- **沒有寫死的預設帳密**：第一個管理員帳號由你拿著隨機產生的 setup token（自架版印在啟動 log、Cloudflare 版由 `setup:cloudflare` 印出）在首次開站時建立、密碼自己設，沒有任何內建帳號密碼。
+
+### 節點白名單
+
+每台 worker 可在 `agent.json` 設定 `node_policy`：
+
+- `installed`（預設）：允許本機 ComfyUI 已安裝的所有節點類別。
+- `official_only`：只允許 ComfyUI 官方核心節點（與本機已安裝節點取交集）。
+- `custom`：只允許自訂清單（`whitelist_extra`，與本機已安裝節點取交集）。
+
+之所以要有這層設定，是因為 **workflow 本身就是可執行內容**——一個惡意或設計不良的自訂節點可以在 worker 機器上執行任意程式碼。此白名單是本機端的縱深防禦（agent 執行前擋一次），伺服器端也會另外比對節點需求做派工判斷，兩層互相獨立。
+
+### 產出物雜湊驗證
+
+worker 上傳每個產出檔時會附上該檔案的 sha256（`X-Artifact-SHA256`），伺服器收到後自己重算一次雜湊比對——不符就整個上傳被拒（`artifact.hash_mismatch`），worker 會自動重傳一次；還是不符就直接把工作標記失敗，不會讓損毀或被調包的檔案悄悄入庫。驗證通過的雜湊會存進工作紀錄的 `result_hashes`，`GET /api/jobs/{id}` 可以查到。
+
+### 磁碟清理
+
+worker 每跑完一個工作（不管成功或失敗）都會清掉這個工作在 agent 端暫存的資料；但真正會持續佔用磁碟空間的是**本機 ComfyUI 自己的 `input`／`output` 目錄**——每個工作的參考圖會被複製進 `input`，每次算圖的結果又會落在 `output`，長期跑下去容易把 worker 的硬碟塞滿。
+
+如果想讓 agent 幫忙清這兩個目錄，在 `agent.json` 設定：
+
+```json
+{
+  "comfy_output_dir": "D:/ComfyUI/output",
+  "comfy_input_dir": "D:/ComfyUI/input"
+}
+```
+
+設定後，agent 只會在**該工作成功完成、且產出物雜湊已通過平台驗證**的前提下，才刪除這個工作對應的檔案（依 ComfyUI history 回報的檔名／子目錄組路徑，只刪確認存在、且路徑安全的檔案）；沒設定就完全略過、不動任何 ComfyUI 檔案。失敗的工作一律不刪 ComfyUI 端的產出，方便你事後查原因。
+
+### 自動下載模型（選擇性）
+
+平台可以把工作連同「需要但這台 worker 沒有的模型」一起派下來，讓 agent 在跑工作前自己補齊，而不是直接判 `ineligible`。**預設開啟**（2026-09-16 起），額度由 `max_fetch_gb` 控管；如果不想要，在 `agent.json` 自己關掉：
+
+```json
+{
+  "auto_fetch_models": true,
+  "max_fetch_gb": 20,
+  "hash_models": true
+}
+```
+
+> 註：由較舊版 agent 產生、已明確寫入 `"auto_fetch_models": false` 的既有 `agent.json`，升級後仍會維持關閉——想改用新預設，自己動手把這個欄位改成 `true` 即可。
+
+- `auto_fetch_models`（預設 `true`）：關閉時這台 worker 永遠不會被派帶 `fetch_models` 的工作，跟舊版行為一樣；想選擇退出就設成 `false`。
+- `max_fetch_gb`（預設 `20`）：單次工作最多願意下載的總容量（GB）；超過上限或磁碟空間不夠都會直接拒絕下載，不會下到一半才失敗。
+- `hash_models`（預設 `true`）：關掉的話 agent 完全不掃描、不計算本機模型的 sha256，連帶讓伺服器無法把這台機器上的模型收進可下載清單（別人也抓不到你這邊的模型），但也就不會自動下載模型给自己了。
+
+**Curated 模型即使全聯邦零持有也會自動下載**：平台內建下載清單那 12 個 curated 模型（見下方「模型下載」那張表）本身帶有平台維運者背書的官方 sha256／檔案大小，不需要先有任何一台 worker 實際持有、回報過雜湊才能信任——這 12 個之外的模型才需要等聯邦裡至少一台 worker 回報過雜湊、大家一致（「共識」）才能進清單，一旦有 worker 真的回報了共識雜湊，共識一律優先於內建值。只要有 worker 開了 `auto_fetch_models` 且磁碟餘裕足夠，這種「目前零持有」的 curated 模型一樣會被指派下載，不會因為沒人持有就卡住；下載完成後照上面的規則立即回報，其他候選 worker 隨即能看到「這裡也有了」。挑哪台 worker 下載的準則就是磁碟餘裕與最小下載量（既有邏輯）——**不量測頻寬**，沒有以頻寬為依據的挑選機制。
+
+**信任模型**：下載清單由平台簽章（Ed25519），agent 收到後先驗證簽章，每個檔案下載完再核對 sha256，兩者都過才會落地到 `models_dir` 底下對應的子資料夾；簽章或雜湊對不上就直接整批拒絕、不留半殘檔案。下載一律只落在 `models_dir`，agent 端有做路徑淨化，不會被清單條目寫到 `models_dir` 之外。
+
+**worker 自己的下載額度也會影響能不能排隊**：hello 會把 agent 設定的 `max_fetch_gb`（見上方）回報給平台，若一台 worker 的額度不夠涵蓋某工作缺的模型總量，就不會被算進「可自動下載」——跟磁碟空間不夠時一樣。所以一個新聯邦只有一台 worker 開自動下載、額度是預設的 20 GB 時，送出需要超過 20 GB curated 模型集的工作（例如 FLUX.1-dev 系列工作流約 32 GB、MiniMax-H3 系列約 40 GB，兩者都超過預設額度）會在送出當下就拿到可行動的 400 錯誤（附上模型名稱），而不是派工後下載到一半才失敗。要嘛把至少一台在線、已開自動下載的 worker 的 `max_fetch_gb` 調高，要嘛用手動方式把模型放進 `models_dir` 即可解除。
+
+**如果上游重新上傳了 curated 檔案（雜湊過期）會怎樣**：agent 一律核對下載內容跟**簽章雜湊**是否一致，所以過期的內建雜湊絕不會讓錯誤的檔案被當成正確的落地——失敗是乾淨的，只是會重複發生：每次有工作需要這個模型就會重新下載、驗證失敗、工作失敗，直到滿足以下其中一項為止：（a）平台的 curated 登記表（`cloud/src/core/model_guide.ts` 的 `SOURCES`）被更新成官方最新的雜湊；或（b）聯邦裡任何一台 worker 真的下載／放入正確的最新檔案，並透過正常的庫存掃描回報其雜湊——該台 worker 回報的雜湊會成為一筆學習到的共識紀錄，從此永遠優先於內建的 guide 值（見上方「Curated 模型即使全聯邦零持有也會自動下載」），聯邦裡其他 worker 隨即都能從它下載。恢復只需要**任何一台**worker 用任何方式拿到正確檔案（手動下載、舊備份都行）並讓它正常掃描回報即可，不會有東西被永久卡死。
+
+下載進度會顯示在主控台的工作卡片上（`stage: "fetching_models"` 搭配百分比與目前檔名）；下載完成後模型要等到下一輪（最多 10 分鐘一次）的本機掃描才會被伺服器記錄雜湊、正式視為「這台 worker 也有了」。
+
+**雜湊衝突是永久的，需要手動恢復**：如果兩台 worker 為同名同大小的模型回報不同 sha256（通常代表其中一份檔案損毀或被調包），伺服器會記一筆 `model_manifest: sha256 conflict for ...` 的 WARNING 並把該筆 `model_hashes` 資料標成衝突（`conflict = 1`），從此永久排除在可下載清單之外——**不會**因為重啟或之後的正常回報自動恢復。確認哪一份是正確的之後，管理員需要手動在資料庫執行：
+
+```sql
+UPDATE model_hashes SET conflict = 0 WHERE name = '...' AND size_bytes = ...;
+```
+
+這個 phase 沒有做管理介面上的解衝突按鈕，只能這樣手動處理。
+
+### 面板的「下載」鈕
+
+ComfyUI 原生前端在「缺模型」卡片上給的那顆 **Download** 鈕，在單機是下載到跑圖那台機器上；掛在 ComfyFed 的 `/comfy` 底下，它會下載到**你自己的筆電**——對聯邦一點用都沒有（所以官方範本 JSON 送到瀏覽器前，平台本來就把模型的下載網址與雜湊拿掉了，見「內嵌工作流編輯器」那節）。2026-09-19 起這顆鈕改接平台自己的路由：按下去會建立一張 `kind=model_fetch` 的**純下載單**，派給聯邦裡某一台合格的 worker，由它把檔案抓進自己的 `models_dir`。面板上會就地顯示下載進度（百分比與目前檔名），不會有任何位元組經過你的瀏覽器。
+
+**按下去之後的判定順序**（任何一關不過就當場回 400，附上可行動的中文訊息，不會建單）：
+
+1. **聯邦裡已經有了** → 直接拒絕（`already_present`）。只要有任何一台**已註冊**的 worker 庫存裡有這個檔就算數，離線的也算——檔案在聯邦裡，只是面板那張缺模型卡片過期了。
+2. **已經有一張還在跑的同名下載單** → 不重複建單，回原本那張單的 `job_id`（`reused: true`）。
+3. **平台認得這個模型** → 走**已簽章下載清單**那條既有的路（curated 的 12 個內建模型，或聯邦已經學到共識雜湊的模型）：用清單裡那個帶 sha256 的正式項目，**完全忽略請求裡的網址**，連白名單與 HEAD 都不做。
+4. **平台不認得** → 才走「未驗證來源」：網址的**來源站**必須是 `https://huggingface.co` 或 `https://civitai.com`（比對解析後的 scheme＋host，不是字串開頭，所以 `https://huggingface.co.evil.com/...` 不會過；也只收 https 與預設埠）。
+5. **HEAD 探檔案大小** → 對網址發 HEAD（10 秒逾時），必須讀得到 `Content-Length`；讀不到就是 `size_unknown`，回 401／403 就是 `gated`（需要登入的模型，例如 FLUX.1-dev 那幾個，平台與 worker 都沒有憑證，直接拒絕比讓 worker 下載到一半失敗好）。轉址是**平台自己一跳一跳跟**的，每一跳（含最後那個網址）都要再過一次第 4 步的白名單，否則當 `untrusted_url` 拒絕；最多跟 5 跳。這是為了不讓一個白名單內的網址把自架伺服器彈到 `http://127.0.0.1:…` 或內網位址去（SSRF／內部埠探測）。
+6. **挑 worker** → 必須**在線**、開了 `auto_fetch_models`、agent **0.1.14 以上**（protocol 5，第一個聽得懂 `kind=model_fetch` 的版本）、磁碟餘裕**超過檔案大小的 1.2 倍**、而且檔案大小在它自己的 `max_fetch_gb` 額度內。agent 版本這關**不分第 3 步還是第 4 步**：就算是平台認得、帶 sha256 的正式項目，舊 agent 也不會收到這張單——它根本不認得 `kind` 這個欄位，會把純下載單當成一般工作去跑那個空的 `{}` workflow，然後失敗。一台都沒有就回 `no_worker`，訊息會列出**真正的原因**（是沒人夠新、還是沒人有磁碟／額度），不是一句籠統的「沒有 worker」。
+
+**未驗證來源項目的信任模型**：平台不認得的模型沒有 sha256 可以給 agent 核對，所以簽章改簽**網址本身**——payload 是 `name|directory|url|size_bytes|unverified`，用平台金鑰（Ed25519）簽。agent 收到後驗簽章、只從這個網址下載、只接受這個大小，**不會**去試 P2P（沒有雜湊就沒有內容定址，找不到「同一個檔案」），下載完把自己量到的 sha256 隨 `job_done` 回報給平台。平台把它當成第一筆證據記進 `model_hashes`（既有的先到先贏／衝突規則照舊適用），從此這個模型對**其他** worker 就是一個正常的、帶雜湊的已驗證項目，可以走 P2P、可以被自動下載。換句話說：未驗證只有第一次。
+
+**這張單不計費**：`model_fetch` 單沒有 workflow、不跑任何推論，整段都只是下載。它不會進執行時間統計，收據是 `kind=model_fetch`、`basis=model_fetch`、`gpu_seconds=0`、`billable=false`；工作的 `started_at` 從頭到尾是空的（下載期間的心跳一律帶 `stage=fetching_models`，那正是計時器不會啟動的原因），所以下載途中取消也不會產生任何收據。
+
+**下載完要重新整理面板**：編輯器的節點定義（`/object_info`，模型下拉選單就是從這裡來的）**每次載入頁面只抓一次**，所以下載完成之後新模型不會自己出現在下拉選單裡——按 F5 重新整理一次就有了。另外 worker 端也要等下一輪（最多 10 分鐘）的本機模型掃描，伺服器才會正式把「這台也有了」記進庫存。
+
+**在主控台看得到**：這張單跟其他工作一樣出現在 Console 的「工作」頁，帶一個「**模型下載**」徽章；工作詳情頁會顯示模型名、來源網址，以及它是不是未驗證來源。
+
+**雲端版部署順序**：`jobs` 資料表的 `kind` 欄位是 D1 migration `0011` 加的，**Worker 程式碼一上線就會在每一筆建單 SQL 裡點名這個欄位**，所以 `0011` 必須在那份 Worker 部署**之前**套用，否則連普通的 prompt 送單都會壞（`no such column: kind`）。`npm run deploy` 就是照這個順序做的（先 `wrangler d1 migrations apply comfyfed --remote`，再 `wrangler deploy`），而 Workers Builds 的 Deploy command 也應該設成 `npm run deploy`，不要用面板預設的 `npx wrangler deploy`。
+
+### 成員間 P2P 分塊傳輸
+
+除了「官方載點 → GCS 備援」這條鏈，worker 之間也可以直接互傳模型檔：想跑某個工作但本機缺模型的 worker，會先向平台要一張「傳輸憑證」，向在線且已有該檔的另一台 worker 以 HTTP Range 逐 64 MiB 分塊拉取，拉不到才落回官方載點鏈。這條路徑帶來一個額外能力：**沒有官方下載網址的私有模型，只要當下有在線成員分享，也能被派工**——是否可派完全透明地反映在派工判定與工作頁的不合格原因裡，不會靜默失敗。
+
+**開啟方式（安裝時自動判斷）**（2026-09-16 實作修訂）：安裝腳本會在裝完之後問一次路由器「肯不肯自動開埠」（NAT-PMP → UPnP，最多 8 秒）。
+
+- **問得到** → 自動在 `agent.json` 寫入 `peer_serve: true`、`peer_listen_port: 8850`，並在畫面上告訴你用的是哪一種（natpmp／upnp）。
+- **問不到** → 什麼都不改（分享維持關閉），並印一行說明：到路由器把 UPnP 打開之後**重跑同一行安裝指令**就會自動開啟，或是自己轉埠並設定 `peer_advertise_host`。
+- **你自己設過的一律尊重**：只有在 `peer_serve` 目前是 `false` **而且** `peer_listen_port` 從未設定過的情況下，安裝腳本才會自動開啟。自己指定過埠號的設定，重跑安裝也不會被改回去。這條規則有一個限制要知道：只寫 `peer_serve: false`、**沒有**指定埠號，跟預設值長得一模一樣，重跑安裝還是會被打開——想讓分享保持關閉，請一併設定 `peer_listen_port`（有埠號就等於把這個決定釘住）。
+- **升級時 agent 通常正在跑**：探測不會去碰 agent 自己在 8850 的映射，而是改用隔壁的埠（8851）問路由器、問完立刻收掉（0.1.13 起；0.1.12 在 agent 執行中會直接拒絕，等於升級永遠開不了分享）。問得到就照樣寫進 `agent.json`，**但要 agent 重啟才生效**——安裝腳本不會替你殺掉可能正在跑工作的 agent，只會印出立刻套用的指令：macOS `launchctl kickstart -k gui/$(id -u)/com.comfyfed.agent`、Linux `systemctl --user restart comfyfed-agent`、Windows 先 `comfyfed stop` 再重跑安裝指令（或重新登入）。
+- 想自己先確認一次，可以單獨跑：`comfyfed-agent p2p-probe`（印一行 JSON，成功會帶 `method`、`external_ip`、`external_port`、實際探的 `probe_port`；它不會留下任何映射）。
+
+`agent.json` 相關設定：
+
+```json
+{
+  "peer_serve": true,
+  "peer_listen_port": 8850,
+  "peer_nat_traversal": "auto",
+  "peer_advertise_host": "your-public-ip-or-ddns",
+  "peer_bind_host": "0.0.0.0"
+}
+```
+
+- `peer_serve`：關閉時完全不啟動分享用的 HTTP 服務，也不會在握手（hello）裡通告任何 peer 位址（僅握手時通告一次，不是每次心跳都帶）。
+- `peer_listen_port`：必填才會真正啟用（只設 `peer_serve: true` 沒給埠號等於沒開）。這個 listener 是 agent 內建的 stdlib HTTP server，不另外裝依賴，只服務 `GET /peer/models/<檔名>` 這一條路徑；每個連線有 30 秒的 socket timeout，避免閒置連線一直占著執行緒。
+- `peer_nat_traversal`（預設 `"auto"`）：agent 啟動時自動請路由器開埠。先試 **NAT-PMP**（RFC 6886，Apple／ASUS 等家用路由器常見），沒回應再試 **UPnP IGD**，整體最多花 8 秒，兩者都不回應就退回「只有同區網連得到」並在 log 留一行警告。租來的 lease 是 1 小時，agent 每 30 分鐘自動續租，關掉 agent 時會把映射收回去。設 `"off"` 就完全不碰路由器。
+- `peer_advertise_host`（選填）：**設了它就不做自動開埠**——你已經明講對外位址了。適合固定 IP／DDNS＋手動轉埠的情境；**但 DDNS 主機名只能拿來讓其他 worker 連你，平台的可連性檢查只認 IP 位址**——細節見下方「可連性徽章」。
+- `peer_bind_host`（選填，預設 `"0.0.0.0"`）：listener 綁定的介面。**如果這台機器有公網 IP**，預設值會讓分享服務直接暴露在網際網路上——想限制在區網／VPN 內，改成區網介面 IP 或 `127.0.0.1`（僅搭配反向代理使用）。
+- **雙層 NAT（電信商也在 NAT 後面，含 `100.64.0.0/10` CGNAT 網段）**：路由器開埠成功但回報的「外部 IP」還是私有位址時，agent 會改用平台在握手時回報的公網 IP（見下），並自動重連一次把正確的位址送出去（一小時最多一次，避免抖動）。
+- **分享與「停用接單」彼此獨立**：把 worker 在 Workers 頁停用不會影響它繼續分享；反過來 `peer_serve: false` 只關閉分享。
+- **防火牆記得放行 `peer_listen_port` 這個埠**，否則平台配對到你當種子後，拉方仍然連不進來（會落回官方載點鏈，不會卡住工作，但你這份模型等於沒發揮作用）。
+
+**安全模型**：分享模型的每一次傳輸都要憑證，沒有任何匿名路徑。
+
+- 拉方（已通過簽章驗證的 agent 請求）向平台要一張 **Ed25519 簽發的傳輸憑證**，**效期最少 10 分鐘、並依檔案大小放大**（以 agent 預設上傳上限 20 Mbps 估算整檔傳完所需時間 ×1.5 再加 10 分鐘，例如 6.5 GB 約 75 分鐘），綁死單一檔案＋單一拉方＋單一種子——不是讓任何 worker 可以長期持有憑證到處跑，過期就得重新申請。
+- 種子端（分享模型的那台 worker）**每一個請求都驗證**這張憑證：平台簽章、有沒有過期、`seeder_id` 是不是自己、檔名是否與本機庫存相符，缺憑證／驗簽失敗／過期／範圍不符一律 **fail-closed 回 403**，不洩漏任何細節（連「這個檔名存不存在」都不會用 404/403 的差異洩漏出去——沒有憑證一律 403）。
+- worker 之間**不互留常駐信任**——今天你把模型分享給某個成員，不代表對方之後可以不憑證再連進來；每次傳輸都要平台重新核發。
+- 逐塊 hash 只用來提早中止壞塊，**最終整檔 SHA-256 驗證永遠會做**，跟一般模型下載的鐵律一樣，分塊表本身不是信任來源。
+- **傳輸目前走明文 HTTP**：憑證本身只授權「誰能拉哪個檔」，不代表內容有加密——`X-ComfyFed-Grant` 這個標頭跟模型內容的位元組，都是在明文 HTTP 上傳輸的。憑證本身就是唯一的存取憑證（bearer token），在憑證效期內（至少 10 分鐘，大檔更長）任何看得到這個標頭的人都能冒充拉方把檔案拉走。如果你的成員之間走的是公開網路，建議只在可信任的 LAN 或 VPN（Tailscale、WireGuard 之類）裡開啟這項功能，不要對外網開放 `peer_listen_port`。
+- **通告位址由平台驗證過才會派出去**（2026-09-16 實作修訂）：worker 申報的 `peer_url` 不再照單全收。平台會先**靜態拒絕**主機為 loopback／link-local／私有網段（`10/8`、`172.16/12`、`192.168/16`、`169.254/16`、`100.64/10` CGNAT、`fc00::/7`、`::1`）的位址——直接標成「不可連」，**連請求都不會發**，這關掉了舊版「申報內網位址誘導平台或其他成員對該位址發請求」的轉發面。通過靜態檢查的位址，平台會主動對 `<peer_url>/peer/health` 發一個 3 秒的 GET（這條路由不需要憑證、回 204、不含任何識別資訊），只有回得出 204 的才會被派成種子；心跳時每超過 10 分鐘會重測一次，worker 離線時結果連同位址一起清掉。**這個探針只認 IP 位址**：`peer_url` 的主機是網域名稱（例如 DDNS）時，平台不會去解析、也不會發任何請求，永遠停在「未檢查」——想靠 DDNS 讓別的網路連你，就把 `peer_advertise_host` 設成目前的公網 IP，或接受只在同區網分享。`peer_url`／`peer_lan_url` 一律是 agent 自己組出的 `http://host:port` 形式，沒有路徑也沒有查詢字串。
+- **可連性徽章**：Workers 頁的 P2P 欄會顯示三種狀態——**已驗證**（平台連得到，任何成員都能從這台拉模型）、**不可連**（平台連不到；只有跟它在同一個 NAT 後面的成員還能用區網位址拉）、**未檢查**（剛連上、還沒測完，或 `peer_url` 是網域名稱、平台從未探過）。agent 那邊 `comfyfed status` 也會印同一件事。
+- **同一個 NAT 的成員走區網**：平台記得每台 worker 連進來的公網 IP。拉方與種子的公網 IP 相同時（幾乎一定是同一台路由器後面），平台會把種子的**區網位址排在第一個**、對外位址排第二——很多家用路由器不支援 hairpin，從內網連自己的對外位址反而連不回來，這個順序把那個坑繞掉了。拉方依序嘗試，每個位址 connect 最多 5 秒，全部失敗才落回官方載點鏈。
+
+**頻寬入帳**：種子 worker 完成一張憑證的服務量後會回報給平台，記入收據帳本（`kind: p2p_upload`，不計費、不算 GPU 秒數），Reports 頁的貢獻報表會多一欄「P2P 上傳量」；Workers 頁也會顯示這台 worker 目前是否在分享模型，以及通告出去的位址。
+
+### 工作自動評估
+
+伺服器收到工作後會自動解析 workflow 需要的節點類別、模型檔案與（若已知）VRAM 需求，對每台候選 worker 給出：
+
+- `eligible`：worker 具備所有必要節點與模型，可直接派工。
+- `eligible_after_fetch`：worker 缺少的模型可以透過平台簽章的下載清單取得，且磁碟空間足夠容納——來源包含聯邦內其他 worker 已持有、回報過共識雜湊的模型，**也包含全聯邦目前零持有、但屬於 curated 清單（帶平台背書雜湊）的模型**，兩者對 worker 端是同一套下載機制。
+- `ineligible`：附上白話原因，例如缺少節點類別、VRAM 不足；模型類的 `ineligible` 現在會出現在兩種情況：平台**完全不認得**這個模型（不在 curated 清單、也沒人回報過共識雜湊、無可信雜湊可簽），**或雜湊有衝突**（見上方「雜湊衝突是永久的，需要手動恢復」）——即使是眾所皆知的 curated 模型，只要它的 `model_hashes` 那筆資料處於衝突狀態，一樣會被排除。
+
+### 內嵌工作流編輯器（`/comfy`）
+
+不想自備 ComfyUI 也能拉工作流：平台可以直接把**官方 ComfyUI 前端**掛在 `/comfy`，你在瀏覽器裡拉好圖、按 Queue，工作就直接進聯邦排隊，跑完的圖也在同一個介面看。
+
+**2026-09-24 起前端隨建置一起打包**：`cloud/scripts/build.mjs` 在建置時從 PyPI 抓 `comfyui-frontend-package` 的 wheel（**版本與 sha256 都釘死在程式碼裡**，下載後先驗雜湊才解壓），把 `static/` 放進 `assets/comfy/`，自架與 Cloudflare 版部署後 `/comfy` 就直接可用，不再需要另外跑指令或重啟。（開發時 `--skip-comfy` 或 `SKIP_COMFY_FETCH=1` 可略過下載，`/comfy` 會退化成顯示一頁雙語說明。）
+
+- `/comfy` 跟它的靜態檔只要求**已登入**（任何角色皆可），沒登入一律導回 `/`（Console 登入頁）。面板是**個人工作區**：每個人在面板裡只看得到自己送出的工作與產物，包含 admin 本人在面板內也只看自己那份——要看全體，去 Console 的「工作」頁。
+
+**灌官方範本庫**（選用，但建議）：前端的 wheel 只有介面，不含 ComfyUI 官方那一整包起手式工作流。Cloudflare 版在 `cloud/` 跑一行：
+
+```bash
+npm run seed-official
+```
+
+這會從 PyPI 讀 `comfyui-workflow-templates` 這個 meta 套件的相依，抓出對應版本的 `-json` 與 `-media-*` 子套件 wheel（每個都先比對 PyPI 自己回報的 sha256 才解壓），把裡面的 `templates/` 上傳到 R2 bucket 的 `official_templates/` 前綴。一次大約 **475 MB**，可重複執行。沒跑也不會壞：範本瀏覽器照樣開得起來，只是裡面只有 ComfyFed 內建的範本，之後範本瀏覽器的側邊欄會是「ComfyFed 自己的分類在前、官方分類在後」。自架版目前沒有對應的灌入指令（`seed-official` 只會上傳到 Cloudflare R2）。
+
+- 官方範本 JSON 送到瀏覽器之前，平台會**拿掉模型的下載網址與雜湊**。那些「Download」按鈕在單機 ComfyUI 是下載到跑圖的機器上，在 ComfyFed 卻是下載到**你自己的筆電**，對聯邦一點用都沒有。按下 Run 時，只要聯邦裡**有在線、未停用、開了 `auto_fetch_models` 且磁碟餘裕足夠**的 worker，curated 模型（見下方「模型下載」那 12 個內建模型）即使全聯邦目前零持有也會直接排隊、自動指派該 worker 下載，不會被擋下來；其他模型（範本庫收錄但非 curated 的，或工作流自帶的其他模型）沒有平台背書雜湊，仍要等聯邦裡至少一台 worker 實際持有並回報過雜湊才能進下載清單——**只有這種「平台完全不認得、聯邦裡也沒人有」的模型**才會被擋下並附上「該去哪台 worker 放哪個檔」的中文指引。
+
+抓完之後，登入 Console →「工作」頁，按主要按鈕「**開啟工作流編輯器**」就會在新分頁打開。原本貼 API JSON 的表單還在，收進同一頁的「改用貼上 API JSON」摺疊區。
+
+⚠ **編輯器裡至少要有一台 worker 在線才會出現節點**：節點清單不是平台自己編的，預設是所有**在線且未停用** worker 回報的 `/object_info` 聯集。全部離線的話節點面板會是空的——這是正常的，不是壞掉。
+
+Settings 頁可以把 `object_info_mode` 從預設的「聯集」切成「**交集**」：交集模式下編輯器只會顯示**所有在線 worker 都有**的節點，下拉選單看到的東西保證每台都跑得動，代價是能用的節點變少；聯集模式節點比較齊全，但混用不同機器獨有節點的圖仍可能派不出去（見下一條）。
+
+⚠ **聯集模式下，節點清單不代表任何一台 worker 都跑得動**：`/object_info` 把全部在線 worker 的節點併成一份，所以編輯器裡看得到的節點，可能分散在不同機器上。一張混用了 A 機獨有節點與 B 機獨有節點的圖**送得出去**（會建立工作、進佇列），但派工時對每一台 worker 都不合格，於是**一直卡在佇列裡**，不會有錯誤訊息。工作頁的「不合格原因」會說明缺什麼。`/comfy/api/object_info` 的回應帶了 `X-ComfyFed-Worker-Count` 標頭，是這份清單來自幾台 worker（交集模式下則是「幾台都有」的意思）。
+
+**取消／中斷、清空佇列、刪除歷史都是真的可以用的**：編輯器上方工具列的**取消／中斷（Cancel、Interrupt）、清空佇列（Clear queue）、刪除歷史紀錄**這幾個按鈕都有對應的後端，按下去會真的取消聯邦裡的工作（worker 端也會收到中斷通知），不再是唯讀佇列。要注意的是**這些面板操作只影響「從面板送出」的工作**（`origin == panel`）：如果你是用 Console 的「貼上 API JSON」送單，要取消請到 Console 的「工作」頁操作。反過來，**Console 的「工作」頁／任務詳情頁可以取消任何來源的工作**（面板送的、Console 送的都算），是唯一涵蓋全部工作的取消入口。
+
+目前的相容層做到「拉圖 → 送工作 → 看結果 → 取消／清理」這條主線。編輯器裡幾個依賴單機 ComfyUI 的功能不會動：**存工作流到伺服器、Manager／自訂節點擴充、模型清單瀏覽**（模型在各個 worker 上，平台自己沒有）。工作流請用瀏覽器的匯出／匯入，或用 Console 的「貼上 API JSON」。編輯器的介面偏好（主題等）存在平台設定 `comfy_settings_json` 裡。範本瀏覽器則是通的：預設裝的是 ComfyFed 自己的範本，跑過 `npm run seed-official` 之後，ComfyUI 官方那一整包也會併進同一個側邊欄。
+
+**跟自備 ComfyUI 的關係**：兩者不衝突，是兩個入口。內嵌編輯器是「我沒有 ComfyUI，或懶得開」的路；如果你本機已經有 ComfyUI，照樣可以在自己那邊拉好工作流、用「Save (API format)」匯出，再貼進 Console 送出。真正跑圖的一律是聯邦裡的 worker（也就是各成員自己的 ComfyUI），平台本身不裝 ComfyUI、也不跑推論——`/comfy` 只是一層把官方前端的動作翻譯成聯邦工作的相容 API。
+
+### 範本
+
+ComfyFed 內建十一支**實戰跑過**的工作流，每一支都在畫布上用便條紙逐段標了「這個節點在幹嘛、你該改哪裡」，中英雙語。一般使用者導向的清單（每支做什麼、怎麼用）在根目錄的 [README.md](../README.md) 裡；這裡只記錄開發／維運相關的細節。
+
+**怎麼打開**：編輯器左側工具列的**範本／Browse Templates**（或功能表 Workflow → Browse Templates；空白畫布上也會有入口）→ 側邊分類選 **ComfyFed** → 點縮圖，它就會**複製一份**到畫布上變成新的未命名工作流。**改的是副本，範本本身動不到**，改壞了關掉重開一份就好。
+
+十一支範本（對應 `cloud/packaged/templates/index.json`，建置時打包進平台的 assets）：
+
+| 名稱 | 是什麼 | 尺寸／步數 |
+| --- | --- | --- |
+| **文生圖** | Chroma1-HD 文生圖（權重不做內容審查）。紅框「想法」節點打中文即可：內建的 Qwen3-VL-4B Heretic 小幫手先寫成英文提示詞，再直接接進 `CLIPTextEncode`。預設想法就是 ComfyFed 第一次跑通聯邦派工用的那張武俠場景，換掉就能畫任何題材 | 768×768，26 步 |
+| **角色立繪** | 同一條 Chroma 流程的直式版，專門生單一角色的定裝照 | 896×1152，26 步 |
+| **參考圖生影片** | MiniMax H3 Ref2V：一張定裝照 →「同一個人」在動的影片，自帶聲音。鏡頭用中文寫在「想法」節點，小幫手寫成英文提示詞並自動補上 `<Picture 1>` 標記 | 1152×640，141 格（約 6 秒），8 步（turbo LoRA） |
+| **NSFW 圖生影片** | 同一條 H3 Ref2V 流程，整條無審查（H3 的 Heretic 32B 編碼器＋Heretic 4B 小幫手）：一張成年人照片＋用中文寫的成人情節。由管理員共用範本「(NSFW)圖生影片」收進內建庫，附當時的示範照片 `nsfw_i2v_ref.jpg` | 1152×640，141 格（約 6 秒），8 步（turbo LoRA） |
+| **首尾幀生影片** | 給第一格與最後一格畫面加一句動作描述，MiniMax H3 補出中間的動態與聲音 | 8 步（turbo LoRA） |
+| **多影片串接** | 兩段影片首尾接起來，畫面與聲音都接。零模型 | — |
+| **圖片開場影片** | 一張靜態圖當片頭卡片撐幾秒，再接一段影片播放。零模型 | — |
+| **影片截段** | 從一段影片剪出「第幾秒開始、剪多長」的片段。零模型 | — |
+| **圖片放大** | RealESRGAN 4 倍超解析度放大一張圖 | — |
+| **圖生提示詞** | 上傳一張參考圖＋簡短需求，本地 Qwen3-VL 模型幫你寫出英文提示詞 | — |
+| **文字生提示詞** | 貼一段粗略想法，同一顆 Qwen3-VL 模型幫你整理成結構化英文提示詞 | — |
+
+**改一個地方就能跑**：模型導向的四組範本（文生圖／角色立繪／參考圖生影片／NSFW 圖生影片）用紫色群組框標「只改這一區」——文生圖、參考圖生影片、NSFW 圖生影片三支從 2026-09-20 起內嵌「文字生提示詞」那條鏈（紅框「想法」節點打中文 → Qwen3-VL-4B Heretic 的 `TextGenerate` 寫英文提示詞 → 直接接進提示詞輸入；影片兩支還會自動在最前面補上 `<Picture 1>`），所以只要改想法節點（影片範本再多一個參考圖節點）；角色立繪仍是直接改英文提示詞。其餘六支用更精簡的三組佈局（①②③ 便條），一樣照著便條紙改就好。改完按右上角 **Run**，工作流就變成一個聯邦 job 排進佇列，跑完結果直接顯示在最右邊的輸出節點裡，Console 的「工作」頁也拿得到檔案與收據。
+
+**附帶素材**：需要參考圖／範例輸入的範本（參考圖生影片、NSFW 圖生影片、圖生提示詞、圖片放大等）的素材隨建置打包（`cloud/packaged/templates/assets/`），第一次有人開範本瀏覽器時平台會把它們複製進**共用**的 staging 區（R2 的 `staging/` 底下一個共用命名空間；自架時落在 `<data-dir>/state/`），所以 `LoadImage`／`LoadVideo` 的下拉一開就選得到；這些共用樣本不會出現在任何人的「檔案」頁、也不能被刪。要換成自己的檔案，直接在節點上傳（或把檔案拖進畫布）即可——上傳的檔案進你自己的 staging，送單時才複製成那個 job 的輸入。
+
+**自訂範本（我的範本）**：範本瀏覽器最上面那個 **「我的範本 / My templates」** 分類是**你自己的**，別人看不到，管理員也看不到（管理員的資料夾是另一回事，見下一段「共用庫」）。做法有兩條，都不需要新的介面：
+
+- 在編輯器裡把工作流用 **Save As** 存成名稱 `templates/<名稱>`（工作流瀏覽器本來就是存進 `userdata` 的 `workflows/...`）；
+- 或直接用既有的 userdata API 上傳到 `workflows/templates/<名稱>.json`。
+
+想要縮圖的話，在同一個資料夾放一個同名的 `<名稱>-1.webp`（`.png`／`.jpg` 也可以）；沒有縮圖也能用，只是卡片沒有預覽圖。存檔後重新整理範本瀏覽器就看得到，點下去一樣是**複製一份**到畫布。
+
+命名規則：只能是單一檔名，不能有 `/`、`\`、`:`、開頭的 `.`／`..`、結尾的點或空白，也不能用 Windows 保留裝置名（`con`、`nul`、`com1`…）——跟 userdata 其他檔案的規則完全一樣，不合規的檔案不會出現在清單裡。分類裡的每一支在索引中的名字是 `my_<名稱>`，實務上不會跟 ComfyFed 內建（`comfyfed-*`）或官方範本撞名。精確地說是**你自己的檔案優先**：平台查 `my_<x>` 時先找你自己的 `workflows/templates/<x>.json`，找不到才往內建／官方範本庫找——所以萬一官方哪天真的出一支叫 `my_<x>` 的範本，而你剛好也有一支 `<x>`，那你看到的會是你自己那份（**只影響你自己**，別人看到的不變）。**資料夾空的就不會出現這個分類**（不會留一個空群組）。要刪掉某支範本，把那個 `.json`（和它的縮圖）刪掉即可。
+
+**共用庫（管理員發佈範本）**：**管理員**（`role=admin`）的 `workflows/templates/` 資料夾**不是私人的，而是公用庫**——裡面的每一支都會出現在**所有人**的 **ComfyFed** 分類裡。管理員「上傳或修改範本」的方法跟一般使用者一模一樣（Save As `templates/<名稱>` 或 userdata 上傳），差別只在結果：
+
+- 檔名**不加任何前綴**，直接以 `<名稱>` 對外提供，而且**優先於**內建與官方範本。所以管理員打開 `comfyfed-wuxia-t2i`、改完**用同名存檔**，就是**替所有人換掉**那支平台範本（索引裡的標題／說明／標籤沿用內建那張卡）；存成新名字，就是在 ComfyFed 分類最後多一支（標題＝檔名，同名 `-1.webp` 縮圖一樣有效）。
+- 管理員因此**沒有自己的「我的範本」**：整個資料夾都是公用的，`my_<名稱>` 對管理員永遠不解析。
+- 一般使用者**完全不受影響**：打開共用範本改完 Save As，寫進的是自己的 userdata，只出現在自己的「我的範本」，**不會動到公用庫**。
+- 多位管理員的資料夾會合併；同名時以 uid 排序在前的那位為準。被停用的管理員不再發佈。
+
+**上傳限制與儲存配額**：每個上傳的檔案有**單檔上限**（預設 **50 MB**），每位使用者有一份**儲存配額**（預設 **5 GB**）。單檔上限套用到編輯器上傳、`/userdata` 儲存的工作流、以及 Console 送單時附的素材；配額計算使用者自己的 staging 上傳（`staging/<uid>/`）、面板儲存檔（`userdata/<uid>/`），以及 2026-09-24 起他所有工作的輸入與成品（見上方「儲存配額涵蓋使用者留下的一切」）。超過時會收到 413（`quota_exceeded`），訊息會寫明已用量與配額。兩個數值都由管理員在 **Console →「設定」→「上傳限制」**調整（單檔 1～1024 MB；配額 0.1～1024 GB），存成 `upload_max_file_mb` 與 `upload_user_quota_gb` 兩筆設定，改完立即生效，不需重啟。使用者自己的用量與配額會顯示在「設定」頁；上傳檔案的清單與刪除在「檔案」頁（見下一節）。
+
+**每人覆寫（2026-09-20）**：管理員可在 **Console →「使用者」→ 該列「額度與 NSFW」**替單一使用者另設單檔上限與儲存配額，**優先於全案預設**；欄位留空就回到全案值。同一個對話框裡還有 **「可以送 NSFW 工作」** 開關——**所有使用者預設都開**，關掉後這位使用者的每一次送件（Console 送單、配方 `run`、面板 Queue）都會先經過 **NSFW 審核**：先跑關鍵字規則（配方宣告 `nsfw_ok`、模型檔名含 heretic／uncensored／nsfw 等、正向提示詞含露骨字詞；負向提示詞不看），規則沒命中、且管理員在 **「設定」→「NSFW 審核」**填了 **Claude API key** 時，再把正向提示詞與模型名交給 Claude Haiku 4.5 判定一次。判定為 NSFW 就直接拒絕、不入佇列，錯誤碼 `nsfw_not_allowed`，訊息請使用者聯絡管理員放行（把開關打開即可）。沒填 key 只跑規則層；審核服務連不上或回應看不懂時**放行並記 log**，第三方掛掉不會讓平台停止收單。key 存在 `nsfw_check_api_key` 設定，API 只回「有沒有填」，永遠不回明文。
+
+⚠ 需要模型的範本，其模型**必須有 worker 真的裝了**，下拉才選得到、工作才派得出去。沒有的話工作會建立成功但一直卡在佇列——原因看「工作」頁的不合格說明。零模型的六支（多影片串接、圖片開場影片、影片截段等）在全新安裝、沒有任何模型的 worker 上就能直接跑。
+
+### 檔案頁：上傳素材與產出成品
+
+Console 左側的 **「檔案 / Files」** 頁把使用者自己的檔案集中在一處：
+
+- **上傳素材**：你在編輯器上傳的參考圖／素材（staging），可重新整理、逐檔刪除。刪除不影響已送出的工作（送單時已複製成該工作的輸入）。
+- **產出成品**：你所有已完成工作的輸出，以 **`工作名稱 / 日期（YYYY-MM-DD） /`** 兩層資料夾呈現，圖片直接顯示縮圖、影片顯示首格並可點播、其他類型顯示檔名。每個檔案可以**再次下載**或**刪除**；日期資料夾右上角可以**整批刪除**。同名同日的多筆工作合併在同一個資料夾，卡片上以 job 短 id 區分。
+- **工作名稱**是 job 的 `label`：配方送單＝配方 id；面板送單＝工作流第一個 `Save*` 節點的 `filename_prefix`（ComfyUI 本來就拿它當輸出檔名，預設 `ComfyUI`）；Console／MCP 送單可以自己給（最多 64 字）；都沒有就用 job id 前 8 碼。任務列表也會顯示它。
+- **刪除成品只刪檔案**：job 列、收據與產出雜湊全部保留（帳本不動），只是那個檔名從 `result_files` 拿掉、不能再下載。工作還在跑（queued／assigned／running）時不能刪，會回 409。
+- 產出成品**計入**儲存配額（2026-09-24 起），在這裡刪除就會釋放空間。一般使用者只看得到自己的上傳與成品；**admin** 頁面頂端多一個「我的檔案／全部使用者」切換，切到全部就能看到所有使用者的上傳素材與產出成品（每一列標示擁有者），也能代替該使用者刪除。任務列表同理：admin 看全部、可代為取消或重試。
+
+對應 API：`GET /api/me/artifacts`（列出本人所有成品，含大小與類型；admin 加 `?scope=all` 列全部使用者，每筆多 `user_id`／`username`；`GET /api/staging?scope=all` 與 `DELETE /api/staging/{name}?user=<uid>` 同理）、`DELETE /api/jobs/{id}/artifacts/{filename}`（單檔）、`DELETE /api/jobs/{id}/artifacts`（整筆）；下載沿用 `GET /api/jobs/{id}/artifacts/{filename}`。
+
+### 模型下載
+
+全新安裝的 worker 沒有任何模型檔，需要模型的範本等於是廢的。模型太大不會進 git，所以下面每個檔案都給兩條路：**官方載點**（HuggingFace／原始出處，優先用這條）與 **備份載點**（我們自己的 GCS 公開鏡像 `https://storage.googleapis.com/comfyfed-models/models/`，目錄結構鏡射 ComfyUI 的 `models/` 資料夾，官方站掛掉或要登入時的退路）。下載後照「放置路徑」欄放進 worker 的 `ComfyUI/models/` 底下對應子資料夾即可。
+
+| 檔案 | 大小 | 放置路徑 | 官方載點 | 備份載點 |
+| --- | --- | --- | --- | --- |
+| `Chroma1-HD-fp8mixed.safetensors` | 8.56 GB | `models/diffusion_models/` | [官方](https://huggingface.co/Comfy-Org/Chroma1-HD_repackaged/resolve/main/split_files/diffusion_models/Chroma1-HD-fp8mixed.safetensors) | 無（尚未鏡像，請走官方載點） |
+| `flux1-dev.safetensors` | 22.17 GB | `models/diffusion_models/` | [官方](https://huggingface.co/black-forest-labs/FLUX.1-dev/resolve/main/flux1-dev.safetensors)（需登入 HuggingFace 並同意 FLUX.1-dev 授權） | [備份](https://storage.googleapis.com/comfyfed-models/models/diffusion_models/flux1-dev.safetensors) |
+| `clip_l.safetensors` | 0.23 GB | `models/text_encoders/` | [官方](https://huggingface.co/comfyanonymous/flux_text_encoders/resolve/main/clip_l.safetensors) | [備份](https://storage.googleapis.com/comfyfed-models/models/text_encoders/clip_l.safetensors) |
+| `t5xxl_fp16.safetensors` | 9.12 GB | `models/text_encoders/` | [官方](https://huggingface.co/comfyanonymous/flux_text_encoders/resolve/main/t5xxl_fp16.safetensors) | [備份](https://storage.googleapis.com/comfyfed-models/models/text_encoders/t5xxl_fp16.safetensors) |
+| `ae.safetensors` | 0.31 GB | `models/vae/` | [官方](https://huggingface.co/black-forest-labs/FLUX.1-dev/resolve/main/ae.safetensors)（需登入 HuggingFace 並同意 FLUX.1-dev 授權） | [備份](https://storage.googleapis.com/comfyfed-models/models/vae/ae.safetensors) |
+| `minimax_h3_ref2va_pruned_int8_convrot.safetensors` | 19.53 GB | `models/diffusion_models/` | [官方](https://huggingface.co/Comfy-Org/MiniMax-H3/resolve/main/diffusion_models/minimax_h3_ref2va_pruned_int8_convrot.safetensors) | [備份](https://storage.googleapis.com/comfyfed-models/models/diffusion_models/minimax_h3_ref2va_pruned_int8_convrot.safetensors) |
+| `qwen3vl_32b_heretic_minimax_h3_nvfp4.safetensors` | 14.61 GB | `models/text_encoders/` | [官方](https://huggingface.co/sakamakismile/Qwen3-VL-32B-Heretic-MiniMax-H3-NVFP4/resolve/main/qwen3vl_32b_heretic_minimax_h3_nvfp4.safetensors) | [備份](https://storage.googleapis.com/comfyfed-models/models/text_encoders/qwen3vl_32b_heretic_minimax_h3_nvfp4.safetensors) |
+| `minimax_h3_video_vae_fp16.safetensors` | 4.85 GB | `models/vae/` | [官方](https://huggingface.co/Comfy-Org/MiniMax-H3/resolve/main/vae/minimax_h3_video_vae_fp16.safetensors) | [備份](https://storage.googleapis.com/comfyfed-models/models/vae/minimax_h3_video_vae_fp16.safetensors) |
+| `minimax_h3_audio_vae_fp32.safetensors` | 0.56 GB | `models/vae/` | [官方](https://huggingface.co/Comfy-Org/MiniMax-H3/resolve/main/vae/minimax_h3_audio_vae_fp32.safetensors) | [備份](https://storage.googleapis.com/comfyfed-models/models/vae/minimax_h3_audio_vae_fp32.safetensors) |
+| `minimax_h3_ref2v_turbo_8step_v1.0_768p_comfyui_resized_avg_rank_64_bf16.safetensors` | 0.91 GB | `models/loras/` | [官方](https://huggingface.co/drbaph/MiniMax-H3-Turbo-Lora-ComfyUI/resolve/main/minimax_h3_ref2v_turbo_8step_v1.0_768p_comfyui_resized_avg_rank_64_bf16.safetensors) | [備份](https://storage.googleapis.com/comfyfed-models/models/loras/minimax_h3_ref2v_turbo_8step_v1.0_768p_comfyui_resized_avg_rank_64_bf16.safetensors) |
+| `qwen3vl_4b_bf16.safetensors` | 8.27 GB | `models/text_encoders/` | [官方](https://huggingface.co/Comfy-Org/Krea-2/resolve/main/text_encoders/qwen3vl_4b_bf16.safetensors) | [備份](https://storage.googleapis.com/comfyfed-models/models/text_encoders/qwen3vl_4b_bf16.safetensors) |
+| `qwen3-vl-4b-heretic.safetensors` | 8.27 GB | `models/text_encoders/` | [官方](https://huggingface.co/DreamFast/Qwen3-VL-4b-Heretic-ComfyUI/resolve/main/qwen3-vl-4b-heretic.safetensors) | 無（尚未鏡像，請走官方載點） |
+| `RealESRGAN_x4plus.pth` | 0.06 GB | `models/upscale_models/` | [官方](https://github.com/xinntao/Real-ESRGAN/releases/download/v0.1.0/RealESRGAN_x4plus.pth) | [備份](https://storage.googleapis.com/comfyfed-models/models/upscale_models/RealESRGAN_x4plus.pth) |
+
+全部裝齊約 **97.2 GB**；只跑文生圖／角色立繪兩支 Chroma 範本約 **18.0 GB**（`Chroma1-HD-fp8mixed`＋`t5xxl_fp16`＋`ae`；不再需要 22 GB 的 `flux1-dev`，那顆現在只有 `flux-t2i` 配方在用），只跑參考圖生影片約 **40.5 GB**，兩支提示詞小幫手範本（圖生提示詞／文字生提示詞）共用同一顆 `qwen3-vl-4b-heretic`（Qwen3-VL-4B-Instruct 的無審查版），只需 **8.27 GB**；文生圖、參考圖生影片、NSFW 圖生影片三支因為內嵌了這條小幫手鏈，各自還要再加這顆 8.27 GB（文生圖合計約 26.3 GB、兩支 H3 影片各約 48.8 GB）；舊的 `qwen3vl_4b_bf16` 已不再被任何範本使用，但仍留在內建下載清單裡；圖片放大只需 RealESRGAN 的 **0.06 GB**；多影片串接／圖片開場影片／影片截段三支不需要任何模型。每支範本的畫布上也有一則「⓪ 缺模型？」便條紙（零模型範本沒有這則便條），列出該範本自己需要哪幾個檔案。
+
+**不用重啟**：放好檔案後不必重啟 ComfyUI 或 agent——agent 每 10 分鐘會自動重掃本機模型庫存並回報平台，工作評估之後就會自動轉綠。真的等不及的話，手動重啟 agent 可以讓它立刻生效。
+
+### API token／AI 存取
+
+使用者可以在 **Console →「設定」→「API token／AI 存取」** 自己產生一枚 bearer token，交給 AI 客戶端（MCP）長期驅動平台。詳細用法見 **[用 AI 驅動 ComfyFed（API token ＋ MCP）](MCP.zh.md)**。
+
+- **明文只出現一次**：產生當下顯示（`cft_` 前綴＋32 bytes 的亂數），伺服器只存它的 sha256，之後任何地方都拿不回明文。旁邊的「下載設定檔」按鈕在瀏覽器端直接產出 `comfyfed-mcp.json`（`{"platform_url", "token", "expires_at"}`），存成 `~/.comfyfed/mcp.json` 就是 `comfyfed-mcp` 的預設設定檔。
+- **有效期 30 天**，每人最多 **10 枚**有效 token（超過要先撤銷一枚，否則 409 `auth.too_many_tokens`）。清單顯示名稱、前綴、建立／到期／最後使用時間與狀態，隨時可「撤銷」。
+- **權限等於本人**：`Authorization: Bearer cft_...` 在 session 能用的每條 API 上等價於該使用者（角色即時從 `users` 讀），而且**跳過 CSRF**（CSRF 防的是瀏覽器跨站帶 cookie，header 不會被跨站帶）。有 `Authorization` header 時就只看 header，不回退 cookie。
+- **token 不能自我繁殖**：產生／列出／撤銷 token、改密碼、登出這幾條**只收 cookie**，bearer 一律 401。
+- **改密碼即全部失效**：token 記著建立當下的 `session_epoch`，改密碼讓 epoch 前進，所有既有 token 與登入一起作廢。過期、撤銷、使用者被停用也都是 401 `auth.required`（不區分原因，避免變成探測 token 的預言機）。
+- 命中時最多每 5 分鐘更新一次 `last_used_at`，所以清單上的「最後使用」有最多 5 分鐘的誤差，這是刻意的（不讓每個請求都多一次寫入）。
+
+### 配方（recipe）
+
+配方是**平台端內建、實測跑得動**的固定工作流加上少數幾個參數——給 AI（與任何不想拼節點圖的呼叫端）用的送單入口：只挑配方、填參數，平台負責驗參數、渲染 workflow，再走與 `POST /api/jobs` **完全相同**的建單與派工路徑。配方是隨 Worker 打包的檔案（`cloud/src/core/recipes/<id>.json`），改配方等於發版，不能線上編輯。
+
+端點（皆需登入；`run` 走 `require_csrf_user`，所以 bearer token 可以直接送）：
+
+- `GET /api/recipes` → 清單（不含 workflow），依 `order` 升冪，**第一個就是預設配方**，每筆多一個 `missing_models`。
+- `GET /api/recipes/{id}` → 同上一筆加 `workflow`。
+- `POST /api/recipes/{id}/run` body `{"params": {...}}` → `201 {"job_id", "recipe_id", "params", "model_fetch_jobs"}`。`params` 是套完預設、把 `seed: -1` 換成真隨機值之後**實際跑的那一組**。參數型別／範圍／step 不對 → 400 `recipes.bad_params`，訊息點名第一個出錯的參數。
+
+內建三支：
+
+| 順序 | id | 用途 | 模型 | `nsfw_ok` |
+| --- | --- | --- | --- | --- |
+| 1 | **`chroma-t2i`**（預設） | 文生圖，1024×1024／26 步／cfg 3.5 | `Chroma1-HD-fp8mixed`（9.2 GB，**缺了會自動下載**）、`t5xxl_fp16`、`ae` | ✅ |
+| 2 | **`h3-t2v`** | 文生影片（含音訊），24 fps、8 步 turbo LoRA、預設 5 秒 | MiniMax H3 全套＋無審查的 heretic 文字編碼器 | ✅ |
+| 3 | **`flux-t2i`** | 文生圖，官方 Flux.1-dev 權重（保留供對照） | `flux1-dev`、`clip_l`、`t5xxl_fp16`、`ae` | ❌ |
+
+`nsfw_ok` 記的是**權重本身會不會迴避露骨內容**：官方 Flux dev 會，所以 `flux-t2i` 標 false，也因此不是預設；兩支預設配方用的是不審查的權重。平台只在一種情況看這個旗標：被管理員關掉 NSFW 權限的使用者（見上方「每人覆寫」）跑一支 `nsfw_ok: true` 的配方會直接被 NSFW 審核擋下；其他人完全不受影響。
+
+**預設配方第一次跑會先下載模型。** `chroma-t2i` 宣告了 `model_sources`，聯邦內沒有任何活著的 worker 持有 `Chroma1-HD-fp8mixed.safetensors`（9 193 379 316 bytes）時，`run` 會在建單**之前**先呼叫與面板「下載」鈕同一條 `create_fetch_job`（同樣去重、同樣白名單、同樣 HEAD 探測），回應的 `model_fetch_jobs` 因此非空。圖照樣建單並排進佇列，等 worker 抓完、回報庫存就派得出去——在一般家用頻寬上這 9.2 GB 可能要十幾分鐘。下載排不出來（例如沒有合格的 worker）只會留一行 log，不會擋下送單。
+
+### 發布 agent 新版本
+
+**2026-09-24 起，每次部署就是一次 agent 發佈**，不再需要手動上傳 wheel。運作方式：
+
+1. 建置時 `cloud/scripts/build-wheel.mjs` 把 `agent/comfyfed_agent/` 打成 `comfyfed-<version>-py3-none-any.whl`（版本取自 `__init__.py` 的 `__version__`，並斷言等於 `pyproject.toml`），放到 `cloud/assets/agent/`，旁邊寫一份 `release.json`（`{"version","filename","sha256"}`）。
+2. Worker 端 `core/agent_release.ts`：平台第一次被問到 agent 版本（agent 開機打 `/api/agent/version`，或任何人開主控台 Workers 頁）時讀 `assets/agent/release.json`，若版本**高於**目前的 `agent_latest`，就用平台金鑰簽 `{版本}|{sha256}` 並一次寫入五個 `agent_*` 設定（`agent_latest`／`agent_min_supported`／`agent_wheel_url`／`agent_wheel_sha256`／`agent_wheel_sig`）。每個 isolate 只查一次；較低版本不會降級。
+3. **`min_supported` 永遠不會自動拉高**：舊版 agent 照樣能連，只是可能缺新功能。只有遇到真正的破壞性變更才需要手動改 `agent_min_supported`。
+
+agent 每次啟動都會問 `/api/agent/version`，比對版本、下載 wheel、驗 sha256 與簽章，全部通過才安裝。**簽章內容是 `{版本}|{sha256}`**——把版本綁進簽章，舊版的簽章就不能拿來冒充新版，避免降版攻擊。安裝完 agent 以 **exit code 75** 結束，交給 systemd（`Restart=on-failure`）／launchd（`SuccessfulExit=false`）／Windows 的 `launcher.ps1` 重新拉起新版；`comfyfed stop` 回傳 0，停止仍是最終的。
+
+**主控台一鍵更新（agent 0.1.18 起）**：Workers 頁裡版本落後且在線的 worker 會有「更新」按鈕，上方另有「全部更新」（都只有管理員看得到）。平台送 `{"type":"update_agent"}` 給 agent，agent 回 `{"type":"update_ack","status":…,"detail":…}`，狀態五種：
+
+| status | 意思 |
+| --- | --- |
+| `updating` | 閒置中，立刻更新，裝好後以 exit code 75 重啟並自動重連 |
+| `deferred` | 正在跑工作，該工作結束（成功、失敗或取消）後再套用 |
+| `up_to_date` | 已是最新版 |
+| `declined` | 機器擁有者在 `agent.json` 設了 `auto_update: false`；擁有者的設定勝過遠端管理員 |
+| `failed` | 下載或簽章驗證失敗，繼續用舊版 |
+
+15 秒內沒收到 ack 會回 `sent`。**0.1.18 以前的 agent** 不認得這個指令（按鈕會回 409 `workers.agent_too_old`），在那台機器重啟一次 agent，它會在啟動時自動更新。
+
+**手動發佈（覆寫）**：`POST /api/workers/agent-release` 仍在，登入後把 wheel 直接 POST 上去（存進 R2 的 `releases/`——自架時就是 `<data-dir>/state/` 底下的本機 R2；簽章與五個設定的寫法與自動發佈完全相同）；手動發佈的版本**較高**時會勝出。wheel 就是建置產出的 `cloud/assets/agent/comfyfed-<版本>-py3-none-any.whl`：
+
+```bash
+curl -X POST "https://<你的平台網址>/api/workers/agent-release?filename=comfyfed-<版本>-py3-none-any.whl"   -H "X-CSRF: <登入拿到的 csrf>" -b cookies.txt   --data-binary @cloud/assets/agent/comfyfed-<版本>-py3-none-any.whl
+```
+
+wheel 任何人都能從 `/agent/<檔名>`（自動發佈）或 `/api/agent/releases/<檔名>`（手動發佈）下載，下載本身不需登入——完整性由 `/api/agent/version` 公告的 sha256＋平台簽章把關。
+
+⚠ **平台簽章金鑰可以離線保管**：如果不想把 `PLATFORM_ED25519_SEED` 放在線上主機，可以在離線機器上自己對 `"{版本}|{sha256}"` 簽名，再手動把上述五個 `agent_*` 設定寫進資料庫。agent 端的驗證方式完全一樣。要注意自動發佈只在「內建版本高於 `agent_latest`」時寫入，手動寫的較高版本不會被覆蓋。
+
+### 已知限制
+
+- **計費以實際執行秒數為準，不含排隊等待**：收據的 `gpu_seconds` 由 agent protocol 2 保證的 `exec_seconds`（從 ComfyUI `/queue` 第一次出現在 `queue_running` 算起）與牆鐘時間（`finished_at - started_at`）兩者較小值構成；只有在 agent 端量不到 `exec_seconds`（舊版 agent、或 ComfyUI `/queue` 打不到）時才退回牆鐘時間，收據的 `basis` 欄位會標明這筆是 `exec` 還是 `wall`。這是刻意的：同一台 worker 可能同時服務本機使用與多個平台，若把排隊等待也算進 GPU 時間，會讓每個平台都重複計費同一段等待，破壞未來的分潤機制——因此其他平台（或本機）佔用 worker 的那段時間，不算進這份收據。
+- **失敗／取消的工作會產生「不計費」收據，方便稽核但不計入貢獻總量**：工作失敗或被取消時，系統仍會建立一筆收據（`kind` 為 `failed` 或 `cancelled`、`billable=false`），保留這段時間花在哪裡的紀錄；但只有 `kind=completed`（`billable=true`）的收據才計入 Reports 頁的貢獻總量與排行榜。
+
+### 後續規劃（Roadmap）
+
+**Phase 2**
+- 模型 manifest 分發機制（讓 `eligible_after_fetch` 真正落地傳輸模型）
+- S3 / R2 相容的產出物儲存（artifact store）
+
+**Phase 3**（**多使用者帳號＋多管理員、分潤試算已於 Phase 3.0 實作**：admin 可建立／管理其他使用者帳號，Reports 頁提供分潤試算（輸入分潤池金額，依 worker 貢獻比例試算），見上方「多使用者與權限」；**成員間 P2P 分塊傳輸已於 Phase 3.1（2026-09-14）實作**，見上方「成員間 P2P 分塊傳輸」；下面這項仍留待後續）
+- ~~成員間 P2P 分塊傳輸~~ ✅ Phase 3.1
+- 分潤／收益分帳帳本（目前的分潤試算只算比例、不落地實際撥款紀錄）
+
+**ComfyFed Cloud**（已上線）：同一份 Worker 部署到 Cloudflare Workers + D1 + R2，不需要自己顧一台開機的機器。用法見 [`cloud/README.md`](../cloud/README.md)。
+
+### 授權
+
+License：[AGPL-3.0](../LICENSE)。

@@ -1,0 +1,920 @@
+{
+  "last_node_id": 105,
+  "last_link_id": 16,
+  "nodes": [
+    {
+      "id": 105,
+      "type": "MarkdownNote",
+      "pos": [
+        0,
+        -1420
+      ],
+      "size": [
+        460,
+        900
+      ],
+      "flags": {},
+      "order": 15,
+      "mode": 0,
+      "inputs": [],
+      "outputs": [],
+      "title": "⓪ 缺模型？/ Missing models?",
+      "properties": {},
+      "widgets_values": [
+        "**繁體中文**\n\n全新安裝沒有模型檔，這支「角色立繪」範本需要以下 3 個檔案：\n\n- `Chroma1-HD-fp8mixed.safetensors` → 放到 `ComfyUI/models/diffusion_models/` → 8.56 GB\n  官方載點：https://huggingface.co/Comfy-Org/Chroma1-HD_repackaged/resolve/main/split_files/diffusion_models/Chroma1-HD-fp8mixed.safetensors\n  （Chroma1-HD 是 Flux 架構的社群再訓練權重，權重本身不做內容審查；平台目前沒有這顆的備份鏡像，請走官方載點。）\n- `t5xxl_fp16.safetensors` → 放到 `ComfyUI/models/text_encoders/` → 9.12 GB\n  官方載點：https://huggingface.co/comfyanonymous/flux_text_encoders/resolve/main/t5xxl_fp16.safetensors\n  備份載點：https://storage.googleapis.com/comfyfed-models/models/text_encoders/t5xxl_fp16.safetensors\n- `ae.safetensors` → 放到 `ComfyUI/models/vae/` → 0.31 GB\n  官方載點：https://huggingface.co/black-forest-labs/FLUX.1-dev/resolve/main/ae.safetensors（需登入 HuggingFace 並同意 FLUX.1-dev 授權）\n  備份載點：https://storage.googleapis.com/comfyfed-models/models/vae/ae.safetensors\n\n共約 18.0 GB。原本的 Flux dev 權重已經不再被這支範本使用，只跑這兩支圖片範本的話那 22 GB 可以留著不下載。\n放好檔案後**不用重啟 ComfyUI 或 worker**：ComfyFed agent 每 10 分鐘自動重掃模型庫存並回報平台，評估會自動轉綠；急著馬上生效的話，手動重啟 agent 即可。\n\n---\n\n**English**\n\nA fresh install has none of these files. The “Character portrait” template needs 3 files:\n\n- `Chroma1-HD-fp8mixed.safetensors` -> `ComfyUI/models/diffusion_models/` -> 8.56 GB\n  官方載點：https://huggingface.co/Comfy-Org/Chroma1-HD_repackaged/resolve/main/split_files/diffusion_models/Chroma1-HD-fp8mixed.safetensors\n  (Chroma1-HD is a community retrain of the Flux architecture whose weights apply no content filtering. There is no ComfyFed backup mirror for this one yet, so use the official link.)\n- `t5xxl_fp16.safetensors` -> `ComfyUI/models/text_encoders/` -> 9.12 GB\n  官方載點：https://huggingface.co/comfyanonymous/flux_text_encoders/resolve/main/t5xxl_fp16.safetensors\n  備份載點：https://storage.googleapis.com/comfyfed-models/models/text_encoders/t5xxl_fp16.safetensors\n- `ae.safetensors` -> `ComfyUI/models/vae/` -> 0.31 GB\n  官方載點：https://huggingface.co/black-forest-labs/FLUX.1-dev/resolve/main/ae.safetensors（需登入 HuggingFace 並同意 FLUX.1-dev 授權）\n  備份載點：https://storage.googleapis.com/comfyfed-models/models/vae/ae.safetensors\n\n~18.0 GB total, and the old 22 GB Flux dev checkpoint is no longer used by this template. No restart needed after placing the files: the ComfyFed agent rescans its model inventory every 10 minutes and reports back, and the assessment turns green automatically once it does. Restart the agent if you want it to take effect immediately.\n"
+      ]
+    },
+    {
+      "id": 1,
+      "type": "UNETLoader",
+      "pos": [
+        0,
+        120
+      ],
+      "size": [
+        300,
+        82
+      ],
+      "flags": {},
+      "order": 0,
+      "mode": 0,
+      "inputs": [],
+      "outputs": [
+        {
+          "name": "MODEL",
+          "type": "MODEL",
+          "slot_index": 0,
+          "links": [
+            4
+          ]
+        }
+      ],
+      "properties": {
+        "Node name for S&R": "UNETLoader"
+      },
+      "widgets_values": [
+        "Chroma1-HD-fp8mixed.safetensors",
+        "default"
+      ],
+      "bgcolor": "#323",
+      "color": "#535"
+    },
+    {
+      "id": 2,
+      "type": "CLIPLoader",
+      "pos": [
+        0,
+        250
+      ],
+      "size": [
+        300,
+        106
+      ],
+      "flags": {},
+      "order": 1,
+      "mode": 0,
+      "inputs": [],
+      "outputs": [
+        {
+          "name": "CLIP",
+          "type": "CLIP",
+          "slot_index": 0,
+          "links": [
+            1
+          ]
+        }
+      ],
+      "properties": {
+        "Node name for S&R": "CLIPLoader"
+      },
+      "widgets_values": [
+        "t5xxl_fp16.safetensors",
+        "chroma",
+        "default"
+      ],
+      "bgcolor": "#323",
+      "color": "#535"
+    },
+    {
+      "id": 3,
+      "type": "VAELoader",
+      "pos": [
+        0,
+        400
+      ],
+      "size": [
+        300,
+        58
+      ],
+      "flags": {},
+      "order": 2,
+      "mode": 0,
+      "inputs": [],
+      "outputs": [
+        {
+          "name": "VAE",
+          "type": "VAE",
+          "slot_index": 0,
+          "links": [
+            15
+          ]
+        }
+      ],
+      "properties": {
+        "Node name for S&R": "VAELoader"
+      },
+      "widgets_values": [
+        "ae.safetensors"
+      ],
+      "bgcolor": "#323",
+      "color": "#535"
+    },
+    {
+      "id": 14,
+      "type": "ModelSamplingAuraFlow",
+      "pos": [
+        0,
+        500
+      ],
+      "size": [
+        300,
+        58
+      ],
+      "flags": {},
+      "order": 5,
+      "mode": 0,
+      "inputs": [
+        {
+          "name": "model",
+          "type": "MODEL",
+          "link": 4
+        }
+      ],
+      "outputs": [
+        {
+          "name": "MODEL",
+          "type": "MODEL",
+          "slot_index": 0,
+          "links": [
+            5,
+            8
+          ]
+        }
+      ],
+      "title": "Flow Shift（Chroma shift = 1）",
+      "properties": {
+        "Node name for S&R": "ModelSamplingAuraFlow"
+      },
+      "widgets_values": [
+        1
+      ]
+    },
+    {
+      "id": 15,
+      "type": "T5TokenizerOptions",
+      "pos": [
+        0,
+        600
+      ],
+      "size": [
+        300,
+        82
+      ],
+      "flags": {},
+      "order": 6,
+      "mode": 0,
+      "inputs": [
+        {
+          "name": "clip",
+          "type": "CLIP",
+          "link": 1
+        }
+      ],
+      "outputs": [
+        {
+          "name": "CLIP",
+          "type": "CLIP",
+          "slot_index": 0,
+          "links": [
+            2,
+            3
+          ]
+        }
+      ],
+      "title": "T5 padding（Chroma min_padding = 1）",
+      "properties": {
+        "Node name for S&R": "T5TokenizerOptions"
+      },
+      "widgets_values": [
+        1,
+        0
+      ]
+    },
+    {
+      "id": 4,
+      "type": "CLIPTextEncode",
+      "pos": [
+        400,
+        120
+      ],
+      "size": [
+        440,
+        240
+      ],
+      "flags": {},
+      "order": 7,
+      "mode": 0,
+      "inputs": [
+        {
+          "name": "clip",
+          "type": "CLIP",
+          "link": 2
+        }
+      ],
+      "outputs": [
+        {
+          "name": "CONDITIONING",
+          "type": "CONDITIONING",
+          "slot_index": 0,
+          "links": [
+            6
+          ]
+        }
+      ],
+      "properties": {
+        "Node name for S&R": "CLIPTextEncode"
+      },
+      "widgets_values": [
+        "Cinematic character portrait film still, a young Macedonian phalangite soldier named Amyntas, 18 years old, sun-tanned olive skin, short dark curly hair, sparse youthful stubble, a thin pale scar cutting through his left eyebrow, alert brown eyes with a skeptical expression, wearing an off-white linen linothorax cuirass with bronze shoulder plates and a leather strap across the chest, holding a bronze Phrygian helmet under his arm, ancient Macedonia 4th century BC, dusty military training camp background out of focus, warm late-afternoon golden light, shallow depth of field, photorealistic, 35mm film grain, waist-up three-quarter view facing camera"
+      ],
+      "title": "提示詞 Prompt ← 改這裡 / edit here",
+      "color": "#232",
+      "bgcolor": "#353"
+    },
+    {
+      "id": 16,
+      "type": "CLIPTextEncode",
+      "pos": [
+        400,
+        420
+      ],
+      "size": [
+        440,
+        200
+      ],
+      "flags": {},
+      "order": 8,
+      "mode": 0,
+      "inputs": [
+        {
+          "name": "clip",
+          "type": "CLIP",
+          "link": 3
+        }
+      ],
+      "outputs": [
+        {
+          "name": "CONDITIONING",
+          "type": "CONDITIONING",
+          "slot_index": 0,
+          "links": [
+            7
+          ]
+        }
+      ],
+      "properties": {
+        "Node name for S&R": "CLIPTextEncode"
+      },
+      "widgets_values": [
+        "This low quality greyscale unfinished sketch is inaccurate and flawed. The image is very blurred and lacks detail with excessive chromatic aberrations and artifacts. The image is overly saturated with excessive bloom. It has a toony aesthetic with bold outlines and flat colors. "
+      ],
+      "title": "負向提示詞 Negative（通常不用改 / leave as is）",
+      "color": "#322",
+      "bgcolor": "#533"
+    },
+    {
+      "id": 10,
+      "type": "EmptySD3LatentImage",
+      "pos": [
+        900,
+        120
+      ],
+      "size": [
+        280,
+        106
+      ],
+      "flags": {},
+      "order": 3,
+      "mode": 0,
+      "inputs": [],
+      "outputs": [
+        {
+          "name": "LATENT",
+          "type": "LATENT",
+          "slot_index": 0,
+          "links": [
+            13
+          ]
+        }
+      ],
+      "properties": {
+        "Node name for S&R": "EmptySD3LatentImage"
+      },
+      "widgets_values": [
+        896,
+        1152,
+        1
+      ]
+    },
+    {
+      "id": 7,
+      "type": "KSamplerSelect",
+      "pos": [
+        900,
+        270
+      ],
+      "size": [
+        280,
+        58
+      ],
+      "flags": {},
+      "order": 4,
+      "mode": 0,
+      "inputs": [],
+      "outputs": [
+        {
+          "name": "SAMPLER",
+          "type": "SAMPLER",
+          "slot_index": 0,
+          "links": [
+            11
+          ]
+        }
+      ],
+      "properties": {
+        "Node name for S&R": "KSamplerSelect"
+      },
+      "widgets_values": [
+        "euler"
+      ]
+    },
+    {
+      "id": 8,
+      "type": "BasicScheduler",
+      "pos": [
+        900,
+        370
+      ],
+      "size": [
+        280,
+        106
+      ],
+      "flags": {},
+      "order": 9,
+      "mode": 0,
+      "inputs": [
+        {
+          "name": "model",
+          "type": "MODEL",
+          "link": 8
+        }
+      ],
+      "outputs": [
+        {
+          "name": "SIGMAS",
+          "type": "SIGMAS",
+          "slot_index": 0,
+          "links": [
+            12
+          ]
+        }
+      ],
+      "properties": {
+        "Node name for S&R": "BasicScheduler"
+      },
+      "widgets_values": [
+        "beta",
+        26,
+        1.0
+      ]
+    },
+    {
+      "id": 9,
+      "type": "RandomNoise",
+      "pos": [
+        900,
+        520
+      ],
+      "size": [
+        280,
+        82
+      ],
+      "flags": {},
+      "order": 10,
+      "mode": 0,
+      "inputs": [],
+      "outputs": [
+        {
+          "name": "NOISE",
+          "type": "NOISE",
+          "slot_index": 0,
+          "links": [
+            9
+          ]
+        }
+      ],
+      "properties": {
+        "Node name for S&R": "RandomNoise"
+      },
+      "widgets_values": [
+        359338,
+        "randomize"
+      ]
+    },
+    {
+      "id": 6,
+      "type": "CFGGuider",
+      "pos": [
+        1240,
+        120
+      ],
+      "size": [
+        270,
+        98
+      ],
+      "flags": {},
+      "order": 11,
+      "mode": 0,
+      "inputs": [
+        {
+          "name": "model",
+          "type": "MODEL",
+          "link": 5
+        },
+        {
+          "name": "positive",
+          "type": "CONDITIONING",
+          "link": 6
+        },
+        {
+          "name": "negative",
+          "type": "CONDITIONING",
+          "link": 7
+        }
+      ],
+      "outputs": [
+        {
+          "name": "GUIDER",
+          "type": "GUIDER",
+          "slot_index": 0,
+          "links": [
+            10
+          ]
+        }
+      ],
+      "properties": {
+        "Node name for S&R": "CFGGuider"
+      },
+      "widgets_values": [
+        3.5
+      ]
+    },
+    {
+      "id": 11,
+      "type": "SamplerCustomAdvanced",
+      "pos": [
+        1240,
+        260
+      ],
+      "size": [
+        280,
+        150
+      ],
+      "flags": {},
+      "order": 12,
+      "mode": 0,
+      "inputs": [
+        {
+          "name": "noise",
+          "type": "NOISE",
+          "link": 9
+        },
+        {
+          "name": "guider",
+          "type": "GUIDER",
+          "link": 10
+        },
+        {
+          "name": "sampler",
+          "type": "SAMPLER",
+          "link": 11
+        },
+        {
+          "name": "sigmas",
+          "type": "SIGMAS",
+          "link": 12
+        },
+        {
+          "name": "latent_image",
+          "type": "LATENT",
+          "link": 13
+        }
+      ],
+      "outputs": [
+        {
+          "name": "output",
+          "type": "LATENT",
+          "slot_index": 0,
+          "links": [
+            14
+          ]
+        },
+        {
+          "name": "denoised_output",
+          "type": "LATENT",
+          "slot_index": 1,
+          "links": []
+        }
+      ],
+      "properties": {
+        "Node name for S&R": "SamplerCustomAdvanced"
+      },
+      "widgets_values": []
+    },
+    {
+      "id": 12,
+      "type": "VAEDecode",
+      "pos": [
+        1580,
+        120
+      ],
+      "size": [
+        250,
+        46
+      ],
+      "flags": {},
+      "order": 13,
+      "mode": 0,
+      "inputs": [
+        {
+          "name": "samples",
+          "type": "LATENT",
+          "link": 14
+        },
+        {
+          "name": "vae",
+          "type": "VAE",
+          "link": 15
+        }
+      ],
+      "outputs": [
+        {
+          "name": "IMAGE",
+          "type": "IMAGE",
+          "slot_index": 0,
+          "links": [
+            16
+          ]
+        }
+      ],
+      "properties": {
+        "Node name for S&R": "VAEDecode"
+      },
+      "widgets_values": []
+    },
+    {
+      "id": 13,
+      "type": "SaveImage",
+      "pos": [
+        1580,
+        220
+      ],
+      "size": [
+        460,
+        460
+      ],
+      "flags": {},
+      "order": 14,
+      "mode": 0,
+      "inputs": [
+        {
+          "name": "images",
+          "type": "IMAGE",
+          "link": 16
+        }
+      ],
+      "outputs": [],
+      "properties": {
+        "Node name for S&R": "SaveImage"
+      },
+      "widgets_values": [
+        "amyntas_ref"
+      ]
+    },
+    {
+      "id": 100,
+      "type": "MarkdownNote",
+      "pos": [
+        0,
+        -900
+      ],
+      "size": [
+        1000,
+        440
+      ],
+      "flags": {},
+      "order": 16,
+      "mode": 0,
+      "inputs": [],
+      "outputs": [],
+      "title": "這是什麼範本 / What this template is",
+      "properties": {},
+      "widgets_values": [
+        "# 角色立繪 / 定裝照（Chroma1-HD）\n\n和武俠範本同一條 Chroma 流程，只是換成直式 896×1152，專門生「一個角色的定裝照」。生出來的圖可以直接餵給第三支範本（參考圖生影片），讓同一張臉動起來。\n\n權重換成 Chroma1-HD 之後，人物的服裝、身材與鏡位都照提示詞走，不會被權重自己的內容審查擋掉。\n\n預設提示詞是《薩里沙方陣》那部片裡主角 Amyntas 的設定，可以照著它的結構改：**人物 → 年紀外貌 → 服裝道具 → 時代場景 → 光線 → 鏡位**。\n\n**怎麼用：** 只改中間紫框裡的提示詞 → 按右上角 Run → 等 worker 跑完 → 圖出現在最右邊的\n`SaveImage` 節點。其他節點看註解就好，不用動。\n\n**注意：** 節點下拉選單裡的模型檔名，來自聯邦裡「目前在線」的 worker。\n沒有 worker 在線時下拉會是空的，送出也會失敗。\n\n---\n\n# Character portrait / reference sheet (Chroma1-HD)\n\nThe same Chroma pipeline in portrait orientation (896x1152, 26 steps), tuned for one-character reference shots. Feed the result into the ref2v template to make that same face move. With the Chroma weights the costume, build and framing follow the prompt instead of being filtered by the checkpoint. The default prompt is the Amyntas character sheet from the Sarissa documentary; keep its structure: subject -> age/looks -> costume -> period setting -> light -> framing.\n\n**How to use:** edit the prompt in the purple group, press Run, wait for a\nworker, and the picture appears in the `SaveImage` node on the right. Model\ndropdowns are populated from the workers that are online right now.\n"
+      ]
+    },
+    {
+      "id": 101,
+      "type": "MarkdownNote",
+      "pos": [
+        0,
+        -420
+      ],
+      "size": [
+        340,
+        420
+      ],
+      "flags": {},
+      "order": 17,
+      "mode": 0,
+      "inputs": [],
+      "outputs": [],
+      "title": "① 模型載入器 / Model loaders",
+      "properties": {},
+      "widgets_values": [
+        "**繁體中文**\n\n這一區是「模型載入器」，把三個檔案讀進來，再把模型調成 Chroma 需要的樣子：\n\n- `UNETLoader` — 主模型（畫圖的腦袋），這裡用 `Chroma1-HD-fp8mixed.safetensors`。\n- `CLIPLoader` — 文字編碼器 `t5xxl_fp16.safetensors`，`type` 一定要是 **chroma**；\n  Chroma 只吃 T5，不像 Flux 還要另外一顆 clip_l。\n- `VAELoader` — 把模型算出來的潛在影像還原成看得到的圖片（`ae.safetensors`，和 Flux 同一顆）。\n- `ModelSamplingAuraFlow`（Flow Shift）— `shift` 保持 **1**，這是 Chroma 作者建議的值。\n- `T5TokenizerOptions` — `min_padding` 保持 **1**，官方範本就是這樣設的。\n\n**新手不用動這一區。** 檔名下拉選單列出的是聯邦裡目前線上 worker 有的檔案；\n如果下拉是空的，代表現在沒有在線的 worker。\n\n---\n\n**English**\n\nModel loaders: the Chroma1-HD diffusion model, the single T5 text encoder\n(`CLIPLoader` with its `type` set to **chroma** — Chroma needs no second\nclip_l the way Flux does), and the VAE, plus the two nodes that put the\nmodel into Chroma's expected shape: Flow Shift (`shift` 1) and\n`T5TokenizerOptions` (`min_padding` 1). Novices should leave this group\nalone. The dropdown lists the files that the online federation workers\nactually have; an empty dropdown means no worker is online right now.\n"
+      ]
+    },
+    {
+      "id": 102,
+      "type": "MarkdownNote",
+      "pos": [
+        400,
+        -420
+      ],
+      "size": [
+        480,
+        420
+      ],
+      "flags": {},
+      "order": 18,
+      "mode": 0,
+      "inputs": [],
+      "outputs": [],
+      "title": "② 提示詞 / Prompt",
+      "properties": {},
+      "widgets_values": [
+        "**繁體中文 — 你只需要改這裡**\n\n紅框裡上面那顆 `CLIPTextEncode` 就是提示詞。這支範本的目的是生**一張角色定裝照**：\n同一個人、乾淨的半身構圖，之後可以直接拿去餵「參考圖生影片」範本，\n讓這張臉動起來。所以請**換掉角色，別換掉構圖**。\n\n預設提示詞的骨架是（照著這個順序改最穩）：\n\n1. **`Cinematic character portrait film still,`** — 保留，這句在定調「定裝照」。\n2. **角色與長相** — 名字、年紀、膚色、髮型、鬍子、疤痕、眼神表情。**寫得越具體，\n   之後每次重生越像同一個人。**\n3. **服裝與手持道具** — 衣服材質顏色、盔甲、配件、手上拿什麼。\n4. **時代與背景** — 背景一句就好，並保留 `out of focus`，臉才是主角。\n5. **光線與風格** — `warm late-afternoon golden light, shallow depth of field,\n   photorealistic, 35mm film grain`：**這一段建議原封不動留著**，換掉容易讓臉的\n   質感跑掉。\n6. **`waist-up three-quarter view facing camera`** — 鏡位，**一定要留**。\n   這是參考圖最好用的角度（正面或四分之三側面、臉夠大）。\n\n下面那顆是**負向提示詞**，接到 `CFGGuider` 的 `negative`，預設是官方 Chroma 範本那一句，\n拿來壓掉模糊與卡通感，做人臉時建議留著。\n\n`CFGGuider` 的 `cfg` 預設 3.5；做人臉時 3.0～4.0 比較穩，調太高表情會僵。\n\n---\n\n**English — this is the only group you need to edit**\n\nThis template makes a **consistent character reference portrait**: one person,\nclean waist-up framing, ready to feed into the reference-to-video template so\nthat same face can move. So swap the *character*, keep the *composition*.\n\nKeep the structure of the default prompt: `Cinematic character portrait film\nstill,` → who they are (name, age, skin, hair, facial detail, expression — the\nmore specific, the more repeatable the face) → costume and props → period and\nan out-of-focus background → **leave the lighting and style clause as it is**\n(`warm late-afternoon golden light, shallow depth of field, photorealistic,\n35mm film grain`) → and **keep** `waist-up three-quarter view facing camera`,\nwhich is the framing that works best as a reference image.\n\nThe lower `CLIPTextEncode` is the negative prompt feeding `CFGGuider`; the\nofficial Chroma sentence there suppresses blur and toony shading, which is\nworth keeping for faces. `CFGGuider`'s `cfg` is 3.5; stay in 3.0–4.0 for\nfaces, higher goes stiff.\n"
+      ]
+    },
+    {
+      "id": 103,
+      "type": "MarkdownNote",
+      "pos": [
+        900,
+        -420
+      ],
+      "size": [
+        640,
+        420
+      ],
+      "flags": {},
+      "order": 19,
+      "mode": 0,
+      "inputs": [],
+      "outputs": [],
+      "title": "③ 取樣參數 / Sampler",
+      "properties": {},
+      "widgets_values": [
+        "**繁體中文 — 取樣參數什麼時候要動**\n\n- `EmptySD3LatentImage` 的 `width`/`height` = 出圖尺寸，這支預設直式 **896×1152**。\n  直式是為了讓臉佔的像素夠多，**不建議改成正方形**；要改也請維持 16 的倍數。\n- `BasicScheduler` 的 `steps` = 疊代次數，這支範本預設 **26**。\n  定裝照要拿去當參考圖，臉的細節很重要，Chroma 搭 `beta` 排程在 26 步才收得乾淨，\n  **不建議調低到 20 以下**；想更講究可以推到 32。\n- `RandomNoise` 的 `noise_seed` = 亂數種子。**同一組提示詞＋同一個種子 = 同一張圖**；\n  找到臉對的那個種子就把它記下來，之後換服裝或鏡位還能生出同一個人。\n- `KSamplerSelect` 的 `euler` 和 `BasicScheduler` 的 `beta` 是 Chroma 的標準組合，\n  沒有特別理由不用改。\n\n---\n\n**English — when to touch the sampler**\n\nWidth/height set the output size; 896x1152 exists to give the face enough\npixels, so do not square it off. `steps` defaults to 26, which is where\nChroma on the `beta` scheduler resolves facial detail cleanly — a reference\nportrait lives or dies on that, so treat 26 as the floor and go to 32 if you\nwant more. Write down the `noise_seed` that gave you the right face: same\nprompt + same seed reproduces that person. Leave `euler` + `beta` alone.\n"
+      ]
+    },
+    {
+      "id": 104,
+      "type": "MarkdownNote",
+      "pos": [
+        1580,
+        -420
+      ],
+      "size": [
+        500,
+        420
+      ],
+      "flags": {},
+      "order": 20,
+      "mode": 0,
+      "inputs": [],
+      "outputs": [],
+      "title": "④ 輸出 / Output",
+      "properties": {},
+      "widgets_values": [
+        "**繁體中文 — 輸出在哪裡看**\n\n`SaveImage` 是輸出節點。按下右上角的 **Run / Queue** 之後：\n\n1. 這張工作流會變成一個聯邦 job，派給線上的 worker 執行。\n2. 進度會在畫面上跑；完成後圖片直接顯示在這個節點裡。\n3. 同一張圖也會出現在 Console 的「工作」頁面，可以下載或查收據。\n\n`filename_prefix` 建議直接用角色名（例如 `amyntas_ref`），之後在「參考圖生影片」範本的 `LoadImage` 下拉裡好找。\n\n**下一步：** 滿意的那張存下來、上傳到 `LoadImage`（或直接拖進畫布），就能在第三支範本裡讓這個角色動起來。\n\n---\n\n**English — where the result shows up**\n\n`SaveImage` is the output node. Hit Run/Queue: the graph becomes a federation\njob, a worker runs it, and the image appears in this node when it finishes.\nThe same file is listed on the console's Jobs page with its receipt.\n\nName it after the character (`amyntas_ref`) so it is easy to spot in the reference-to-video template's `LoadImage` dropdown. **Next step:** upload the keeper and use it as the reference image in that template to make this character move.\n"
+      ]
+    }
+  ],
+  "links": [
+    [
+      1,
+      2,
+      0,
+      15,
+      0,
+      "CLIP"
+    ],
+    [
+      2,
+      15,
+      0,
+      4,
+      0,
+      "CLIP"
+    ],
+    [
+      3,
+      15,
+      0,
+      16,
+      0,
+      "CLIP"
+    ],
+    [
+      4,
+      1,
+      0,
+      14,
+      0,
+      "MODEL"
+    ],
+    [
+      5,
+      14,
+      0,
+      6,
+      0,
+      "MODEL"
+    ],
+    [
+      6,
+      4,
+      0,
+      6,
+      1,
+      "CONDITIONING"
+    ],
+    [
+      7,
+      16,
+      0,
+      6,
+      2,
+      "CONDITIONING"
+    ],
+    [
+      8,
+      14,
+      0,
+      8,
+      0,
+      "MODEL"
+    ],
+    [
+      9,
+      9,
+      0,
+      11,
+      0,
+      "NOISE"
+    ],
+    [
+      10,
+      6,
+      0,
+      11,
+      1,
+      "GUIDER"
+    ],
+    [
+      11,
+      7,
+      0,
+      11,
+      2,
+      "SAMPLER"
+    ],
+    [
+      12,
+      8,
+      0,
+      11,
+      3,
+      "SIGMAS"
+    ],
+    [
+      13,
+      10,
+      0,
+      11,
+      4,
+      "LATENT"
+    ],
+    [
+      14,
+      11,
+      0,
+      12,
+      0,
+      "LATENT"
+    ],
+    [
+      15,
+      3,
+      0,
+      12,
+      1,
+      "VAE"
+    ],
+    [
+      16,
+      12,
+      0,
+      13,
+      0,
+      "IMAGE"
+    ]
+  ],
+  "groups": [
+    {
+      "id": 1,
+      "title": "① 載入模型 / Load models",
+      "bounding": [
+        -20,
+        40,
+        340,
+        700
+      ],
+      "color": "#3f789e",
+      "font_size": 24,
+      "flags": {}
+    },
+    {
+      "id": 2,
+      "title": "② 提示詞 / Prompt — 只改這一區 / only edit here",
+      "bounding": [
+        380,
+        40,
+        480,
+        620
+      ],
+      "color": "#a1309b",
+      "font_size": 24,
+      "flags": {}
+    },
+    {
+      "id": 3,
+      "title": "③ 取樣 / Sampling",
+      "bounding": [
+        880,
+        40,
+        660,
+        600
+      ],
+      "color": "#3f789e",
+      "font_size": 24,
+      "flags": {}
+    },
+    {
+      "id": 4,
+      "title": "④ 輸出 / Output",
+      "bounding": [
+        1560,
+        40,
+        500,
+        660
+      ],
+      "color": "#3f9e5a",
+      "font_size": 24,
+      "flags": {}
+    }
+  ],
+  "config": {},
+  "extra": {
+    "ds": {
+      "scale": 0.55,
+      "offset": [
+        420,
+        880
+      ]
+    }
+  },
+  "version": 0.4
+}

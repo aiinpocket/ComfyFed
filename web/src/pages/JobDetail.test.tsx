@@ -1,0 +1,519 @@
+// @vitest-environment jsdom
+/**
+ * Phase 1.9 Task 9: the console job detail page.
+ *
+ * The whole point of this page is the full-error-text fix for the
+ * truncated-tooltip complaint on the Jobs table, plus rendering a .txt
+ * artifact's content inline instead of forcing a download. Both are
+ * exercised end to end against a mocked `fetch`, the same seam `api.ts`
+ * itself uses.
+ */
+import '@testing-library/jest-dom/vitest';
+
+import { MantineProvider } from '@mantine/core';
+import { cleanup, fireEvent, render, screen, waitFor, within } from '@testing-library/react';
+import { MemoryRouter, Route, Routes } from 'react-router-dom';
+import { afterEach, describe, expect, it, vi } from 'vitest';
+
+import type { JobDetail as JobDetailType, Worker } from '../api';
+import '../i18n';
+import { theme } from '../theme';
+import { JobDetail } from './JobDetail';
+
+if (!window.matchMedia) {
+  window.matchMedia = ((query: string) => ({
+    matches: false,
+    media: query,
+    onchange: null,
+    addListener: () => {},
+    removeListener: () => {},
+    addEventListener: () => {},
+    removeEventListener: () => {},
+    dispatchEvent: () => false,
+  })) as unknown as typeof window.matchMedia;
+}
+
+if (!('ResizeObserver' in window)) {
+  class FakeResizeObserver {
+    observe() {}
+    unobserve() {}
+    disconnect() {}
+  }
+  (window as unknown as { ResizeObserver: unknown }).ResizeObserver = FakeResizeObserver;
+}
+
+const LONG_ERROR = (
+  'CUDA out of memory. Tried to allocate 2.00 GiB. This is the full model guidance text that ' +
+  'used to be truncated in the Jobs table tooltip and must now be readable in full on this page ' +
+  'without any clipping whatsoever, repeated to make sure truncation would show up: '
+)
+  .repeat(3)
+  .trim();
+
+const BASE_JOB: JobDetailType = {
+  id: 'job-aaaaaaaa-1111',
+  label: null,
+  status: 'failed',
+  origin: 'console',
+  progress: 0.4,
+  worker_id: 'w1',
+  created_at: '2026-09-13T00:00:00Z',
+  error: LONG_ERROR,
+  result_files: [],
+  input_assets: ['ref.png'],
+  est_vram_gb: null,
+  kind: 'prompt',
+  workflow_json: {},
+  requirements: {},
+  required_nodes: [],
+  required_models: [],
+  started_at: '2026-09-13T00:00:01Z',
+  finished_at: '2026-09-13T00:00:05Z',
+  receipt: null,
+  split_count: 0,
+  dispatch_info: {},
+  children: [],
+  gpu_seconds_total: 0,
+  attempts: {},
+  retry_count: 0,
+};
+
+const WORKER: Worker = {
+  id: 'w1',
+  name: 'runner-1',
+  status: 'busy',
+  last_seen: '2026-09-13T00:00:00Z',
+  disabled: false,
+  hardware: {},
+  dynamic: {},
+  backend: 'cuda',
+  torch_version: '2.0',
+  model_count: 0,
+  peer_url: null,
+  peer_lan_url: null,
+  peer_nat: 'none',
+  peer_reachable: null,
+  unsuitable: [],
+};
+
+function jsonResponse(body: unknown, status = 200): Response {
+  return new Response(JSON.stringify(body), {
+    status,
+    headers: { 'Content-Type': 'application/json' },
+  });
+}
+
+/** Final review finding #3: `GET /api/workers` is admin-only on both
+ * stacks -- a `user`-role session gets a real 403, which this stub must
+ * honestly reproduce (it previously always answered 200, which is exactly
+ * why the missing `isAdmin` guard in `JobDetail.tsx` went uncaught).
+ * Defaults to `'user'`, matching `renderDetail`'s own default. */
+function stubFetch(
+  job: JobDetailType,
+  opts: { workers?: Worker[]; artifacts?: Record<string, string>; role?: 'admin' | 'user' } = {},
+) {
+  const workers = opts.workers ?? [WORKER];
+  const artifacts = opts.artifacts ?? {};
+  const role = opts.role ?? 'user';
+  const fetchMock = vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+    const url = typeof input === 'string' ? input : input.toString();
+    const method = init?.method ?? 'GET';
+
+    if (/^\/api\/jobs\/[^/]+$/.test(url) && method === 'GET') {
+      return jsonResponse(job);
+    }
+    if (url === '/api/workers' && method === 'GET') {
+      if (role !== 'admin') {
+        return jsonResponse({ error: { code: 'auth.forbidden', message: 'Admin only.' } }, 403);
+      }
+      return jsonResponse(workers);
+    }
+    for (const [filename, content] of Object.entries(artifacts)) {
+      if (url === `/api/jobs/${job.id}/artifacts/${filename}` && method === 'GET') {
+        return new Response(content, { status: 200, headers: { 'Content-Type': 'text/plain' } });
+      }
+    }
+    if (/\/cancel$/.test(url) && method === 'POST') {
+      return jsonResponse({ status: 'cancelled' });
+    }
+    if (/\/retry$/.test(url) && method === 'POST') {
+      return jsonResponse({ ok: true, job_id: job.id });
+    }
+    return jsonResponse({ error: { code: 'http_error', message: 'not stubbed' } }, 404);
+  });
+  vi.stubGlobal('fetch', fetchMock);
+  return fetchMock;
+}
+
+function renderDetail(id = BASE_JOB.id, role: 'admin' | 'user' = 'user') {
+  return render(
+    <MantineProvider theme={theme}>
+      <MemoryRouter initialEntries={[`/jobs/${id}`]}>
+        <Routes>
+          <Route path="/jobs/:id" element={<JobDetail role={role} />} />
+        </Routes>
+      </MemoryRouter>
+    </MantineProvider>,
+  );
+}
+
+describe('JobDetail', () => {
+  afterEach(() => {
+    cleanup();
+    vi.unstubAllGlobals();
+  });
+
+  it('renders the full error text rather than a truncated version', async () => {
+    stubFetch(BASE_JOB);
+    renderDetail();
+
+    expect(await screen.findByText(LONG_ERROR)).toBeInTheDocument();
+  });
+
+  it('renders a .txt artifact content inline in a copyable block', async () => {
+    const doneJob: JobDetailType = {
+      ...BASE_JOB,
+      status: 'done',
+      error: null,
+      result_files: ['notes.txt'],
+    };
+    stubFetch(doneJob, { artifacts: { 'notes.txt': 'seed: 12345\nsteps: 20' } });
+    renderDetail();
+
+    expect(await screen.findByText(/seed: 12345/)).toBeInTheDocument();
+  });
+
+  it('shows a cancel action for a non-terminal (running) job', async () => {
+    const runningJob: JobDetailType = { ...BASE_JOB, status: 'running', error: null };
+    stubFetch(runningJob);
+    renderDetail();
+
+    expect(await screen.findByRole('button', { name: 'Cancel' })).toBeInTheDocument();
+  });
+
+  it('hides the cancel action for a terminal (done) job', async () => {
+    const doneJob: JobDetailType = { ...BASE_JOB, status: 'done', error: null, result_files: [] };
+    stubFetch(doneJob);
+    renderDetail();
+
+    await screen.findByText('Done');
+    expect(screen.queryByRole('button', { name: 'Cancel' })).not.toBeInTheDocument();
+  });
+
+  it('posts to the cancel endpoint when the cancel action is confirmed', async () => {
+    const queuedJob: JobDetailType = { ...BASE_JOB, status: 'queued', error: null };
+    const fetchMock = stubFetch(queuedJob);
+    renderDetail();
+
+    fireEvent.click(await screen.findByRole('button', { name: 'Cancel' }));
+    const dialog = await screen.findByRole('dialog');
+    fireEvent.click(await within(dialog).findByRole('button', { name: 'Cancel job' }));
+
+    await waitFor(() => {
+      const cancelCall = fetchMock.mock.calls.find(([reqUrl, reqInit]) => {
+        const url = typeof reqUrl === 'string' ? reqUrl : reqUrl.toString();
+        return url === `/api/jobs/${queuedJob.id}/cancel` && reqInit?.method === 'POST';
+      });
+      expect(cancelCall).toBeDefined();
+    });
+  });
+
+  it('shows a downloading-models line with progress bar while stage is fetching_models', async () => {
+    const fetchingJob: JobDetailType = {
+      ...BASE_JOB,
+      status: 'running',
+      error: null,
+      stage: 'fetching_models',
+      fetch_pct: 17,
+      fetch_model: 'sd_xl_base_1.0.safetensors',
+    };
+    stubFetch(fetchingJob);
+    renderDetail();
+
+    expect(
+      await screen.findByText(/Downloading model: sd_xl_base_1\.0\.safetensors \(17%\)/),
+    ).toBeInTheDocument();
+  });
+
+  it('does not show a downloading-models line once stage is absent', async () => {
+    const runningJob: JobDetailType = { ...BASE_JOB, status: 'running', error: null };
+    stubFetch(runningJob);
+    renderDetail();
+
+    await screen.findByText('Running');
+    expect(screen.queryByText(/Downloading model/)).not.toBeInTheDocument();
+  });
+
+  it('renders the receipt summary when one is present', async () => {
+    const doneJob: JobDetailType = {
+      ...BASE_JOB,
+      status: 'done',
+      error: null,
+      result_files: [],
+      receipt: { gpu_seconds: 42, kind: 'completed', billable: true, basis: 'exec', acked: true },
+    };
+    stubFetch(doneJob);
+    renderDetail();
+
+    expect(await screen.findByText('42s')).toBeInTheDocument();
+  });
+
+  it('shows the submitting user for an admin', async () => {
+    const jobWithUser: JobDetailType = { ...BASE_JOB, username: 'alice' };
+    stubFetch(jobWithUser, { role: 'admin' });
+    renderDetail(BASE_JOB.id, 'admin');
+
+    expect(await screen.findByText('alice')).toBeInTheDocument();
+  });
+
+  it('does not show a submitting-user field for a plain user', async () => {
+    const jobWithUser: JobDetailType = { ...BASE_JOB, username: 'alice' };
+    stubFetch(jobWithUser);
+    renderDetail(BASE_JOB.id, 'user');
+
+    await screen.findByText(LONG_ERROR);
+    expect(screen.queryByText('alice')).not.toBeInTheDocument();
+  });
+
+  it('a plain user still sees their own job detail when /api/workers 403s (final review finding #3)', async () => {
+    stubFetch(BASE_JOB, { role: 'user' });
+    renderDetail(BASE_JOB.id, 'user');
+
+    expect(await screen.findByText(LONG_ERROR)).toBeInTheDocument();
+    expect(screen.queryByText('Could not load this job.')).not.toBeInTheDocument();
+  });
+});
+
+describe('JobDetail: attempts (job-retry design 2026-09-19)', () => {
+  afterEach(() => {
+    cleanup();
+    vi.unstubAllGlobals();
+  });
+
+  it('renders a worker row with its failure count and the requeued-count line', async () => {
+    const requeuedJob: JobDetailType = {
+      ...BASE_JOB,
+      status: 'queued',
+      error: 'CUDA out of memory',
+      attempts: { w1: 2 },
+      retry_count: 1,
+    };
+    stubFetch(requeuedJob, { workers: [WORKER], role: 'admin' });
+    renderDetail(requeuedJob.id, 'admin');
+
+    expect(await screen.findByText('Attempts')).toBeInTheDocument();
+    expect(screen.getAllByText('runner-1').length).toBeGreaterThan(0);
+    expect(screen.getByText('2')).toBeInTheDocument();
+    expect(screen.getByText('Requeued 1 times')).toBeInTheDocument();
+  });
+
+  it('shows the last error line for a queued, retried job', async () => {
+    const requeuedJob: JobDetailType = {
+      ...BASE_JOB,
+      status: 'queued',
+      error: 'CUDA out of memory',
+      attempts: { w1: 2 },
+      retry_count: 1,
+    };
+    stubFetch(requeuedJob);
+    renderDetail(requeuedJob.id);
+
+    expect(await screen.findByText('Last error')).toBeInTheDocument();
+    expect(screen.getAllByText('CUDA out of memory').length).toBeGreaterThan(0);
+  });
+
+  it('shows a worker\'s last error from attempt_errors on its attempts row', async () => {
+    const requeuedJob: JobDetailType = {
+      ...BASE_JOB,
+      status: 'queued',
+      error: 'CUDA out of memory',
+      attempts: { A: 2 },
+      attempt_errors: { A: 'boom' },
+      retry_count: 1,
+    };
+    stubFetch(requeuedJob, { workers: [{ ...WORKER, id: 'A' }], role: 'admin' });
+    renderDetail(requeuedJob.id, 'admin');
+
+    expect(await screen.findByText('Attempts')).toBeInTheDocument();
+    expect(screen.getByText('boom')).toBeInTheDocument();
+  });
+
+  it('falls back to the id prefix when the worker is unknown (non-admin, no workers list)', async () => {
+    const requeuedJob: JobDetailType = {
+      ...BASE_JOB,
+      status: 'queued',
+      error: 'boom',
+      attempts: { 'w-unknown-000000001': 1 },
+      retry_count: 1,
+    };
+    stubFetch(requeuedJob, { role: 'user' });
+    renderDetail(requeuedJob.id, 'user');
+
+    expect(await screen.findByText('Attempts')).toBeInTheDocument();
+    expect(screen.getByText('w-unknow…')).toBeInTheDocument();
+  });
+
+  it('shows no attempts card when retry_count is 0 and attempts is empty', async () => {
+    stubFetch(BASE_JOB);
+    renderDetail();
+
+    await screen.findByText(LONG_ERROR);
+    expect(screen.queryByText('Attempts')).not.toBeInTheDocument();
+  });
+});
+
+describe('JobDetail: split parent (Phase 3.3 Task 8)', () => {
+  afterEach(() => {
+    cleanup();
+    vi.unstubAllGlobals();
+  });
+
+  it('lists the children of a split parent with their GPU seconds', async () => {
+    const parentJob: JobDetailType = {
+      ...BASE_JOB,
+      id: 'job-parent-0006',
+      status: 'done',
+      error: null,
+      split_count: 2,
+      receipt: null,
+      gpu_seconds_total: 30,
+      children: [
+        { id: 'child-c0', split_index: 0, status: 'done', worker_id: 'w0', progress: 1, gpu_seconds: 10, error: null },
+        { id: 'child-c1', split_index: 1, status: 'done', worker_id: 'w1', progress: 1, gpu_seconds: 20, error: null },
+      ],
+      outputs: [],
+    };
+    stubFetch(parentJob);
+    renderDetail(parentJob.id);
+
+    expect(await screen.findByText('Sub-jobs')).toBeInTheDocument();
+    expect(screen.getByText('child-c0')).toBeInTheDocument();
+    expect(screen.getByText('child-c1')).toBeInTheDocument();
+    expect(screen.getByText('30s')).toBeInTheDocument();
+  });
+
+  it('shows no children card on a plain job', async () => {
+    const plainJob: JobDetailType = { ...BASE_JOB, split_count: 0, children: [] };
+    stubFetch(plainJob);
+    renderDetail(plainJob.id);
+
+    await screen.findByText(LONG_ERROR);
+    expect(screen.queryByText('Sub-jobs')).not.toBeInTheDocument();
+  });
+
+  it('links a parent job\'s outputs to the owning child\'s artifact route', async () => {
+    const parentJob: JobDetailType = {
+      ...BASE_JOB,
+      id: 'job-parent-0007',
+      status: 'done',
+      error: null,
+      split_count: 2,
+      receipt: null,
+      gpu_seconds_total: 5,
+      result_files: [],
+      children: [
+        { id: 'child-c0', split_index: 0, status: 'done', worker_id: 'w0', progress: 1, gpu_seconds: 5, error: null },
+      ],
+      outputs: [{ job_id: 'child-c0', filename: 'out.png' }],
+    };
+    stubFetch(parentJob, { artifacts: { 'out.png': 'irrelevant' } });
+    renderDetail(parentJob.id);
+
+    await screen.findByText('out.png');
+    const link = screen.getByRole('link', { name: /Download/ });
+    expect(link.getAttribute('href')).toBe('/api/jobs/child-c0/artifacts/out.png');
+  });
+});
+
+describe('JobDetail: dispatch reasoning (Phase 3.3 Task 8)', () => {
+  afterEach(() => {
+    cleanup();
+    vi.unstubAllGlobals();
+  });
+
+  it('shows the dispatch reasoning when dispatch_info is present', async () => {
+    const jobWithDispatch: JobDetailType = {
+      ...BASE_JOB,
+      dispatch_info: { predicted_seconds: 41.2, basis: 'signature', load_seconds: 0, fetch_seconds: 0, candidates: 3 },
+    };
+    stubFetch(jobWithDispatch);
+    renderDetail(jobWithDispatch.id);
+
+    expect(await screen.findByText('Why this worker')).toBeInTheDocument();
+    expect(screen.getByText('This worker has run this exact workflow before')).toBeInTheDocument();
+  });
+
+  it('shows no dispatch card when dispatch_info is empty', async () => {
+    const jobWithoutDispatch: JobDetailType = { ...BASE_JOB, dispatch_info: {} };
+    stubFetch(jobWithoutDispatch);
+    renderDetail(jobWithoutDispatch.id);
+
+    await screen.findByText(LONG_ERROR);
+    expect(screen.queryByText('Why this worker')).not.toBeInTheDocument();
+  });
+});
+
+describe('JobDetail: model_fetch jobs (panel Download button)', () => {
+  afterEach(() => {
+    cleanup();
+    vi.unstubAllGlobals();
+  });
+
+  it('shows the model name, directory, url, and unverified line for a model_fetch job', async () => {
+    const fetchJob: JobDetailType = {
+      ...BASE_JOB,
+      id: 'job-fetch-0008',
+      status: 'running',
+      error: null,
+      kind: 'model_fetch',
+      required_models: ['sd_xl_base_1.0.safetensors'],
+      fetch_entry: {
+        name: 'sd_xl_base_1.0.safetensors',
+        directory: 'checkpoints',
+        url: 'https://huggingface.co/example/sd_xl_base_1.0.safetensors',
+        size_bytes: 6_938_078_331,
+        unverified: true,
+      },
+    };
+    stubFetch(fetchJob);
+    renderDetail(fetchJob.id);
+
+    expect(await screen.findByText('Model fetch details')).toBeInTheDocument();
+    expect(screen.getByText('sd_xl_base_1.0.safetensors')).toBeInTheDocument();
+    expect(screen.getByText('checkpoints')).toBeInTheDocument();
+    expect(screen.getByText('https://huggingface.co/example/sd_xl_base_1.0.safetensors')).toBeInTheDocument();
+    expect(screen.getByText('Unverified source (hash learned on landing)')).toBeInTheDocument();
+  });
+
+  it('shows the sha256 once verified and no unverified line', async () => {
+    const fetchJob: JobDetailType = {
+      ...BASE_JOB,
+      id: 'job-fetch-0009',
+      status: 'done',
+      error: null,
+      kind: 'model_fetch',
+      required_models: ['lora.safetensors'],
+      receipt: { gpu_seconds: 0, kind: 'model_fetch', billable: false, basis: 'model_fetch', acked: true },
+      fetch_entry: {
+        name: 'lora.safetensors',
+        directory: 'loras',
+        url: 'https://civitai.com/models/example',
+        size_bytes: 123_456_789,
+        sha256: 'a'.repeat(64),
+      },
+    };
+    stubFetch(fetchJob);
+    renderDetail(fetchJob.id);
+
+    expect(await screen.findByText('a'.repeat(64))).toBeInTheDocument();
+    expect(screen.queryByText('Unverified source (hash learned on landing)')).not.toBeInTheDocument();
+  });
+
+  it('shows no model fetch card for an ordinary prompt job', async () => {
+    stubFetch(BASE_JOB);
+    renderDetail();
+
+    await screen.findByText(LONG_ERROR);
+    expect(screen.queryByText('Model fetch details')).not.toBeInTheDocument();
+  });
+});

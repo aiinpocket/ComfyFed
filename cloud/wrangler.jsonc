@@ -1,0 +1,74 @@
+{
+  "$schema": "node_modules/wrangler/config-schema.json",
+  "name": "comfyfed-cloud",
+  "main": "src/index.ts",
+  "compatibility_date": "2026-08-22",
+  "compatibility_flags": ["nodejs_compat"],
+  "vars": {
+    "MODE": "cloud"
+    // SETUP_TOKEN (Task 4's /api/setup gate) is intentionally NOT set here.
+    // Absent means setup is impossible -- that's the safe default for a
+    // freshly-deployed Worker before the operator has chosen a token. Set it
+    // for real via `wrangler secret put SETUP_TOKEN` (never commit the real
+    // value to this file). vitest.config.ts injects a test-only value via
+    // `miniflare.bindings` so the test suite can exercise the success path
+    // without touching this file.
+    //
+    // PLATFORM_ED25519_SEED (Task 5's worker registration/cert signing) is
+    // also intentionally NOT set here. When absent, the platform seed is
+    // lazily generated and persisted in the `settings` D1 table instead
+    // (see db/queries.ts's `resolvePlatformSeed`) -- fine for a first
+    // deploy, but an operator who wants to control/rotate the platform's
+    // identity deterministically should set this via
+    // `wrangler secret put PLATFORM_ED25519_SEED` (64 lowercase hex chars,
+    // a raw 32-byte Ed25519 seed). Once set, it always wins over the D1
+    // row -- the D1 row is never read or written in that case, so rotating
+    // the secret rotates the platform identity predictably.
+  },
+  "d1_databases": [
+    {
+      "binding": "DB",
+      "database_name": "comfyfed",
+      "database_id": "537ebe4b-9913-46fb-99af-168eeb73cfc2",
+      "migrations_dir": "migrations"
+    }
+  ],
+  "durable_objects": {
+    "bindings": [
+      {
+        "name": "HUB",
+        "class_name": "Hub"
+      }
+    ]
+  },
+  "migrations": [
+    {
+      "tag": "v1",
+      "new_sqlite_classes": ["Hub"]
+    }
+  ],
+  "r2_buckets": [
+    {
+      "binding": "STORE",
+      "bucket_name": "comfyfed-store"
+    }
+  ],
+  "assets": {
+    "directory": "assets",
+    "binding": "ASSETS",
+    // "/comfy" (no trailing slash) is listed alongside "/comfy/*" -- a glob
+    // of "/comfy/*" is not guaranteed to also match the bare prefix, and the
+    // Worker's own `/comfy` -> `/comfy/` redirect (index.ts) must run before
+    // ASSETS ever sees that path, or an unauthenticated hit could reach the
+    // SPA fallback directly, bypassing the session gate entirely.
+    //
+    // "/install.ps1"/"/install.sh"/"/install.cmd" route to the Worker for
+    // the same reason: the raw files under `assets/install-templates/` (see
+    // scripts/build.mjs) still carry `{{PLATFORM_URL}}`/`{{REGISTER_TOKEN}}`
+    // placeholders -- without this, the assets binding would serve the
+    // unsubstituted template straight off disk, bypassing routes/installer.ts
+    // entirely (and its token/platform_url validation with it).
+    "run_worker_first": ["/comfy", "/comfy/*", "/api/*", "/install.ps1", "/install.sh", "/install.cmd"],
+    "not_found_handling": "single-page-application"
+  }
+}

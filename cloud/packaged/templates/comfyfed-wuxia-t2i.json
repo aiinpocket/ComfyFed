@@ -1,0 +1,1340 @@
+{
+  "last_node_id": 208,
+  "last_link_id": 24,
+  "nodes": [
+    {
+      "id": 105,
+      "type": "MarkdownNote",
+      "pos": [
+        0,
+        -1420
+      ],
+      "size": [
+        520,
+        1100
+      ],
+      "flags": {},
+      "order": 15,
+      "mode": 0,
+      "inputs": [],
+      "outputs": [],
+      "title": "⓪ 缺模型？/ Missing models?",
+      "properties": {},
+      "widgets_values": [
+        "**繁體中文**\n\n全新安裝沒有模型檔，這支「文生圖」範本需要以下 4 個檔案：\n\n- `Chroma1-HD-fp8mixed.safetensors` → 放到 `ComfyUI/models/diffusion_models/` → 8.56 GB\n  官方載點：https://huggingface.co/Comfy-Org/Chroma1-HD_repackaged/resolve/main/split_files/diffusion_models/Chroma1-HD-fp8mixed.safetensors\n  （Chroma1-HD 是 Flux 架構的社群再訓練權重，權重本身不做內容審查；平台目前沒有這顆的備份鏡像，請走官方載點。）\n- `t5xxl_fp16.safetensors` → 放到 `ComfyUI/models/text_encoders/` → 9.12 GB\n  官方載點：https://huggingface.co/comfyanonymous/flux_text_encoders/resolve/main/t5xxl_fp16.safetensors\n  備份載點：https://storage.googleapis.com/comfyfed-models/models/text_encoders/t5xxl_fp16.safetensors\n- `ae.safetensors` → 放到 `ComfyUI/models/vae/` → 0.31 GB\n  官方載點：https://huggingface.co/black-forest-labs/FLUX.1-dev/resolve/main/ae.safetensors（需登入 HuggingFace 並同意 FLUX.1-dev 授權）\n  備份載點：https://storage.googleapis.com/comfyfed-models/models/vae/ae.safetensors\n- `qwen3-vl-4b-heretic.safetensors` → 放到 `ComfyUI/models/text_encoders/` → 8.27 GB\n  官方載點：https://huggingface.co/DreamFast/Qwen3-VL-4b-Heretic-ComfyUI/resolve/main/qwen3-vl-4b-heretic.safetensors\n  （這是「想法 → 英文提示詞」小幫手用的 Qwen3-VL-4B-Instruct Heretic 無審查版，寫露骨提示詞時不會被拒絕；平台目前沒有這顆的備份鏡像，請走官方載點。）\n\n共約 26.3 GB。原本的 Flux dev 權重已經不再被這支範本使用，只跑這兩支圖片範本的話那 22 GB 可以留著不下載。\n放好檔案後**不用重啟 ComfyUI 或 worker**：ComfyFed agent 每 10 分鐘自動重掃模型庫存並回報平台，評估會自動轉綠；急著馬上生效的話，手動重啟 agent 即可。\n\n---\n\n**English**\n\nA fresh install has none of these files. The “Text-to-image” template needs 4 files:\n\n- `Chroma1-HD-fp8mixed.safetensors` -> `ComfyUI/models/diffusion_models/` -> 8.56 GB\n  官方載點：https://huggingface.co/Comfy-Org/Chroma1-HD_repackaged/resolve/main/split_files/diffusion_models/Chroma1-HD-fp8mixed.safetensors\n  (Chroma1-HD is a community retrain of the Flux architecture whose weights apply no content filtering. There is no ComfyFed backup mirror for this one yet, so use the official link.)\n- `t5xxl_fp16.safetensors` -> `ComfyUI/models/text_encoders/` -> 9.12 GB\n  官方載點：https://huggingface.co/comfyanonymous/flux_text_encoders/resolve/main/t5xxl_fp16.safetensors\n  備份載點：https://storage.googleapis.com/comfyfed-models/models/text_encoders/t5xxl_fp16.safetensors\n- `ae.safetensors` -> `ComfyUI/models/vae/` -> 0.31 GB\n  官方載點：https://huggingface.co/black-forest-labs/FLUX.1-dev/resolve/main/ae.safetensors（需登入 HuggingFace 並同意 FLUX.1-dev 授權）\n  備份載點：https://storage.googleapis.com/comfyfed-models/models/vae/ae.safetensors\n- `qwen3-vl-4b-heretic.safetensors` -> `ComfyUI/models/text_encoders/` -> 8.27 GB\n  官方載點：https://huggingface.co/DreamFast/Qwen3-VL-4b-Heretic-ComfyUI/resolve/main/qwen3-vl-4b-heretic.safetensors\n  (The Heretic-abliterated, uncensored build of Qwen3-VL-4B-Instruct that powers the \"idea -> English prompt\" helper, so it will not refuse an explicit request. There is no ComfyFed backup mirror for this one yet, so use the official link.)\n\n~26.3 GB total, and the old 22 GB Flux dev checkpoint is no longer used by this template. No restart needed after placing the files: the ComfyFed agent rescans its model inventory every 10 minutes and reports back, and the assessment turns green automatically once it does. Restart the agent if you want it to take effect immediately.\n"
+      ]
+    },
+    {
+      "id": 1,
+      "type": "UNETLoader",
+      "pos": [
+        0,
+        120
+      ],
+      "size": [
+        300,
+        82
+      ],
+      "flags": {},
+      "order": 0,
+      "mode": 0,
+      "inputs": [],
+      "outputs": [
+        {
+          "name": "MODEL",
+          "type": "MODEL",
+          "slot_index": 0,
+          "links": [
+            4
+          ]
+        }
+      ],
+      "properties": {
+        "Node name for S&R": "UNETLoader"
+      },
+      "widgets_values": [
+        "Chroma1-HD-fp8mixed.safetensors",
+        "default"
+      ],
+      "bgcolor": "#323",
+      "color": "#535"
+    },
+    {
+      "id": 2,
+      "type": "CLIPLoader",
+      "pos": [
+        0,
+        250
+      ],
+      "size": [
+        300,
+        106
+      ],
+      "flags": {},
+      "order": 1,
+      "mode": 0,
+      "inputs": [],
+      "outputs": [
+        {
+          "name": "CLIP",
+          "type": "CLIP",
+          "slot_index": 0,
+          "links": [
+            1
+          ]
+        }
+      ],
+      "properties": {
+        "Node name for S&R": "CLIPLoader"
+      },
+      "widgets_values": [
+        "t5xxl_fp16.safetensors",
+        "chroma",
+        "default"
+      ],
+      "bgcolor": "#323",
+      "color": "#535"
+    },
+    {
+      "id": 3,
+      "type": "VAELoader",
+      "pos": [
+        0,
+        400
+      ],
+      "size": [
+        300,
+        58
+      ],
+      "flags": {},
+      "order": 2,
+      "mode": 0,
+      "inputs": [],
+      "outputs": [
+        {
+          "name": "VAE",
+          "type": "VAE",
+          "slot_index": 0,
+          "links": [
+            15
+          ]
+        }
+      ],
+      "properties": {
+        "Node name for S&R": "VAELoader"
+      },
+      "widgets_values": [
+        "ae.safetensors"
+      ],
+      "bgcolor": "#323",
+      "color": "#535"
+    },
+    {
+      "id": 14,
+      "type": "ModelSamplingAuraFlow",
+      "pos": [
+        0,
+        500
+      ],
+      "size": [
+        300,
+        58
+      ],
+      "flags": {},
+      "order": 5,
+      "mode": 0,
+      "inputs": [
+        {
+          "name": "model",
+          "type": "MODEL",
+          "link": 4
+        }
+      ],
+      "outputs": [
+        {
+          "name": "MODEL",
+          "type": "MODEL",
+          "slot_index": 0,
+          "links": [
+            5,
+            8
+          ]
+        }
+      ],
+      "title": "Flow Shift（Chroma shift = 1）",
+      "properties": {
+        "Node name for S&R": "ModelSamplingAuraFlow"
+      },
+      "widgets_values": [
+        1
+      ]
+    },
+    {
+      "id": 15,
+      "type": "T5TokenizerOptions",
+      "pos": [
+        0,
+        600
+      ],
+      "size": [
+        300,
+        82
+      ],
+      "flags": {},
+      "order": 6,
+      "mode": 0,
+      "inputs": [
+        {
+          "name": "clip",
+          "type": "CLIP",
+          "link": 1
+        }
+      ],
+      "outputs": [
+        {
+          "name": "CLIP",
+          "type": "CLIP",
+          "slot_index": 0,
+          "links": [
+            2,
+            3
+          ]
+        }
+      ],
+      "title": "T5 padding（Chroma min_padding = 1）",
+      "properties": {
+        "Node name for S&R": "T5TokenizerOptions"
+      },
+      "widgets_values": [
+        1,
+        0
+      ]
+    },
+    {
+      "id": 4,
+      "type": "CLIPTextEncode",
+      "pos": [
+        400,
+        380
+      ],
+      "size": [
+        440,
+        200
+      ],
+      "flags": {},
+      "order": 7,
+      "mode": 0,
+      "inputs": [
+        {
+          "name": "clip",
+          "type": "CLIP",
+          "link": 2
+        },
+        {
+          "name": "text",
+          "type": "STRING",
+          "link": 24,
+          "widget": {
+            "name": "text"
+          }
+        }
+      ],
+      "outputs": [
+        {
+          "name": "CONDITIONING",
+          "type": "CONDITIONING",
+          "slot_index": 0,
+          "links": [
+            6
+          ]
+        }
+      ],
+      "properties": {
+        "Node name for S&R": "CLIPTextEncode"
+      },
+      "widgets_values": [
+        "Cinematic film still, a wuxia swordsman standing on a misty bamboo mountain ridge at dawn, flowing white robes, long black hair tied up, hand resting on sword hilt, warm golden rim light, photorealistic, 35mm film grain"
+      ],
+      "title": "提示詞 Prompt（由 AI 接入 / fed by the AI）",
+      "color": "#232",
+      "bgcolor": "#353"
+    },
+    {
+      "id": 16,
+      "type": "CLIPTextEncode",
+      "pos": [
+        400,
+        640
+      ],
+      "size": [
+        440,
+        200
+      ],
+      "flags": {},
+      "order": 8,
+      "mode": 0,
+      "inputs": [
+        {
+          "name": "clip",
+          "type": "CLIP",
+          "link": 3
+        }
+      ],
+      "outputs": [
+        {
+          "name": "CONDITIONING",
+          "type": "CONDITIONING",
+          "slot_index": 0,
+          "links": [
+            7
+          ]
+        }
+      ],
+      "properties": {
+        "Node name for S&R": "CLIPTextEncode"
+      },
+      "widgets_values": [
+        "This low quality greyscale unfinished sketch is inaccurate and flawed. The image is very blurred and lacks detail with excessive chromatic aberrations and artifacts. The image is overly saturated with excessive bloom. It has a toony aesthetic with bold outlines and flat colors. "
+      ],
+      "title": "負向提示詞 Negative（通常不用改 / leave as is）",
+      "color": "#322",
+      "bgcolor": "#533"
+    },
+    {
+      "id": 10,
+      "type": "EmptySD3LatentImage",
+      "pos": [
+        1820,
+        120
+      ],
+      "size": [
+        280,
+        106
+      ],
+      "flags": {},
+      "order": 3,
+      "mode": 0,
+      "inputs": [],
+      "outputs": [
+        {
+          "name": "LATENT",
+          "type": "LATENT",
+          "slot_index": 0,
+          "links": [
+            13
+          ]
+        }
+      ],
+      "properties": {
+        "Node name for S&R": "EmptySD3LatentImage"
+      },
+      "widgets_values": [
+        768,
+        768,
+        1
+      ]
+    },
+    {
+      "id": 7,
+      "type": "KSamplerSelect",
+      "pos": [
+        1820,
+        270
+      ],
+      "size": [
+        280,
+        58
+      ],
+      "flags": {},
+      "order": 4,
+      "mode": 0,
+      "inputs": [],
+      "outputs": [
+        {
+          "name": "SAMPLER",
+          "type": "SAMPLER",
+          "slot_index": 0,
+          "links": [
+            11
+          ]
+        }
+      ],
+      "properties": {
+        "Node name for S&R": "KSamplerSelect"
+      },
+      "widgets_values": [
+        "euler"
+      ]
+    },
+    {
+      "id": 8,
+      "type": "BasicScheduler",
+      "pos": [
+        1820,
+        370
+      ],
+      "size": [
+        280,
+        106
+      ],
+      "flags": {},
+      "order": 9,
+      "mode": 0,
+      "inputs": [
+        {
+          "name": "model",
+          "type": "MODEL",
+          "link": 8
+        }
+      ],
+      "outputs": [
+        {
+          "name": "SIGMAS",
+          "type": "SIGMAS",
+          "slot_index": 0,
+          "links": [
+            12
+          ]
+        }
+      ],
+      "properties": {
+        "Node name for S&R": "BasicScheduler"
+      },
+      "widgets_values": [
+        "beta",
+        26,
+        1.0
+      ]
+    },
+    {
+      "id": 9,
+      "type": "RandomNoise",
+      "pos": [
+        1820,
+        520
+      ],
+      "size": [
+        280,
+        82
+      ],
+      "flags": {},
+      "order": 10,
+      "mode": 0,
+      "inputs": [],
+      "outputs": [
+        {
+          "name": "NOISE",
+          "type": "NOISE",
+          "slot_index": 0,
+          "links": [
+            9
+          ]
+        }
+      ],
+      "properties": {
+        "Node name for S&R": "RandomNoise"
+      },
+      "widgets_values": [
+        359338,
+        "randomize"
+      ]
+    },
+    {
+      "id": 6,
+      "type": "CFGGuider",
+      "pos": [
+        2160,
+        120
+      ],
+      "size": [
+        270,
+        98
+      ],
+      "flags": {},
+      "order": 11,
+      "mode": 0,
+      "inputs": [
+        {
+          "name": "model",
+          "type": "MODEL",
+          "link": 5
+        },
+        {
+          "name": "positive",
+          "type": "CONDITIONING",
+          "link": 6
+        },
+        {
+          "name": "negative",
+          "type": "CONDITIONING",
+          "link": 7
+        }
+      ],
+      "outputs": [
+        {
+          "name": "GUIDER",
+          "type": "GUIDER",
+          "slot_index": 0,
+          "links": [
+            10
+          ]
+        }
+      ],
+      "properties": {
+        "Node name for S&R": "CFGGuider"
+      },
+      "widgets_values": [
+        3.5
+      ]
+    },
+    {
+      "id": 11,
+      "type": "SamplerCustomAdvanced",
+      "pos": [
+        2160,
+        260
+      ],
+      "size": [
+        280,
+        150
+      ],
+      "flags": {},
+      "order": 12,
+      "mode": 0,
+      "inputs": [
+        {
+          "name": "noise",
+          "type": "NOISE",
+          "link": 9
+        },
+        {
+          "name": "guider",
+          "type": "GUIDER",
+          "link": 10
+        },
+        {
+          "name": "sampler",
+          "type": "SAMPLER",
+          "link": 11
+        },
+        {
+          "name": "sigmas",
+          "type": "SIGMAS",
+          "link": 12
+        },
+        {
+          "name": "latent_image",
+          "type": "LATENT",
+          "link": 13
+        }
+      ],
+      "outputs": [
+        {
+          "name": "output",
+          "type": "LATENT",
+          "slot_index": 0,
+          "links": [
+            14
+          ]
+        },
+        {
+          "name": "denoised_output",
+          "type": "LATENT",
+          "slot_index": 1,
+          "links": []
+        }
+      ],
+      "properties": {
+        "Node name for S&R": "SamplerCustomAdvanced"
+      },
+      "widgets_values": []
+    },
+    {
+      "id": 12,
+      "type": "VAEDecode",
+      "pos": [
+        2500,
+        120
+      ],
+      "size": [
+        250,
+        46
+      ],
+      "flags": {},
+      "order": 13,
+      "mode": 0,
+      "inputs": [
+        {
+          "name": "samples",
+          "type": "LATENT",
+          "link": 14
+        },
+        {
+          "name": "vae",
+          "type": "VAE",
+          "link": 15
+        }
+      ],
+      "outputs": [
+        {
+          "name": "IMAGE",
+          "type": "IMAGE",
+          "slot_index": 0,
+          "links": [
+            16
+          ]
+        }
+      ],
+      "properties": {
+        "Node name for S&R": "VAEDecode"
+      },
+      "widgets_values": []
+    },
+    {
+      "id": 13,
+      "type": "SaveImage",
+      "pos": [
+        2500,
+        220
+      ],
+      "size": [
+        460,
+        460
+      ],
+      "flags": {},
+      "order": 14,
+      "mode": 0,
+      "inputs": [
+        {
+          "name": "images",
+          "type": "IMAGE",
+          "link": 16
+        }
+      ],
+      "outputs": [],
+      "properties": {
+        "Node name for S&R": "SaveImage"
+      },
+      "widgets_values": [
+        "comfyfed_wuxia"
+      ]
+    },
+    {
+      "id": 100,
+      "type": "MarkdownNote",
+      "pos": [
+        0,
+        -900
+      ],
+      "size": [
+        1000,
+        440
+      ],
+      "flags": {},
+      "order": 16,
+      "mode": 0,
+      "inputs": [],
+      "outputs": [],
+      "title": "這是什麼範本 / What this template is",
+      "properties": {},
+      "widgets_values": [
+        "# 文生圖（Chroma1-HD）＋ 中文想法直接生\n\n打一段**中文**（或英文）想法就生一張電影感的圖，**什麼題材都可以**。\n紅框那顆「想法」節點是你唯一要改的地方：AI（Qwen3-VL-4B Heretic，無審查版）會先把你的想法整理成結構完整的英文提示詞，再自動接進 `CLIPTextEncode`，最後由 **Chroma1-HD**（Flux 架構的社群再訓練權重，權重本身不做內容審查）畫出來。\n預設留的是當初 ComfyFed 第一次跑通聯邦派工用的那句武俠場景，想畫別的整句換掉就好。尺寸 768×768、步數 26。\n\n**怎麼用：**\n1. 改紅框「想法」節點的文字（中文即可，一句話寫清楚主體、動作、場景、氛圍）。\n2. 按右上角 Run，等 worker 跑完，圖片出現在最右邊的 `SaveImage`；AI 寫出的英文提示詞會顯示在旁邊的預覽節點，可以複製去別的範本用。\n3. 想自己直接寫英文提示詞：把 `CLIPTextEncode` 的 `text` 輸入線拔掉，欄位就會變回可以手打。\n\n---\n\n# Text-to-image (Chroma1-HD) with a Chinese idea box\n\nType your idea in **Chinese** (or English) into the red \"idea\" node and press Run. A local, uncensored Qwen3-VL-4B Heretic model first rewrites it into a well-structured English prompt, which is wired straight into `CLIPTextEncode`; Chroma1-HD (a Flux-architecture retrain whose weights apply no content filtering) then renders it at 768×768 in 26 steps. Any subject works -- the wuxia scene it ships with is just the sample from ComfyFed's first federation run. The generated English prompt shows up in the preview node next to `SaveImage`, ready to copy elsewhere. Prefer to write English yourself? Unplug the `text` input of `CLIPTextEncode` and the field becomes editable again."
+      ]
+    },
+    {
+      "id": 101,
+      "type": "MarkdownNote",
+      "pos": [
+        0,
+        -420
+      ],
+      "size": [
+        340,
+        420
+      ],
+      "flags": {},
+      "order": 17,
+      "mode": 0,
+      "inputs": [],
+      "outputs": [],
+      "title": "① 模型載入器 / Model loaders",
+      "properties": {},
+      "widgets_values": [
+        "**繁體中文**\n\n這一區是「模型載入器」，把三個檔案讀進來，再把模型調成 Chroma 需要的樣子：\n\n- `UNETLoader` — 主模型（畫圖的腦袋），這裡用 `Chroma1-HD-fp8mixed.safetensors`。\n- `CLIPLoader` — 文字編碼器 `t5xxl_fp16.safetensors`，`type` 一定要是 **chroma**；\n  Chroma 只吃 T5，不像 Flux 還要另外一顆 clip_l。\n- `VAELoader` — 把模型算出來的潛在影像還原成看得到的圖片（`ae.safetensors`，和 Flux 同一顆）。\n- `ModelSamplingAuraFlow`（Flow Shift）— `shift` 保持 **1**，這是 Chroma 作者建議的值。\n- `T5TokenizerOptions` — `min_padding` 保持 **1**，官方範本就是這樣設的。\n\n**新手不用動這一區。** 檔名下拉選單列出的是聯邦裡目前線上 worker 有的檔案；\n如果下拉是空的，代表現在沒有在線的 worker。\n\n---\n\n**English**\n\nModel loaders: the Chroma1-HD diffusion model, the single T5 text encoder\n(`CLIPLoader` with its `type` set to **chroma** — Chroma needs no second\nclip_l the way Flux does), and the VAE, plus the two nodes that put the\nmodel into Chroma's expected shape: Flow Shift (`shift` 1) and\n`T5TokenizerOptions` (`min_padding` 1). Novices should leave this group\nalone. The dropdown lists the files that the online federation workers\nactually have; an empty dropdown means no worker is online right now.\n"
+      ]
+    },
+    {
+      "id": 102,
+      "type": "MarkdownNote",
+      "pos": [
+        400,
+        -420
+      ],
+      "size": [
+        1380,
+        420
+      ],
+      "flags": {},
+      "order": 18,
+      "mode": 0,
+      "inputs": [],
+      "outputs": [],
+      "title": "② 想法 → 提示詞 / Idea → prompt",
+      "properties": {},
+      "widgets_values": [
+        "**繁體中文 — 你只需要改紅框那一顆**\n\n這是一支**通用文生圖**範本，題材不限。紅框的「想法」節點打**中文**就好（英文也行）：一句話寫清楚主體、動作／姿勢、場景、光線、風格。（預設留的那句武俠場景只是範例，不是這支範本的限制。）\n\n下面灰色「別動」的節點是提示詞小幫手：兩個 `StringConcatenate` 把固定指令和你的想法接成一段話，餵給 `TextGenerate`；它跑的是 **Qwen3-VL-4B Heretic（無審查版）**，會把想法整理成結構完整的英文提示詞（主體 → 動作 → 場景 → 光線 → 風格／鏡頭），寫露骨或重口味的內容也不會拒絕或沖淡。因為沒有圖片輸入，`use_default_template` 要保持關閉，不然會輸出空字串。\n\n寫好的英文提示詞直接接進 `CLIPTextEncode` 的 `text`（所以那顆的文字框看起來是灰的、不能打字，這是正常的）。想自己手打英文，就把那條線拔掉。\n\n最下面那顆是**負向提示詞**（接到 `CFGGuider` 的 `negative`），預設就是官方 Chroma 範本那句「低品質、模糊、卡通感」的描述，通常原封不動留著就好。\n`CFGGuider` 的 `cfg` 預設 3.5：數字越大越貼近提示詞、但越容易僵硬；Chroma 在 3.0～4.5 之間都算安全範圍。\n\n---\n\n**English — the red node is the only thing you need to edit**\n\nThis is a general-purpose text-to-image template -- any subject, not just the wuxia scene it ships with. Type your idea into the red node, in Chinese or English: subject, action or pose, setting, light, style. The dim \"leave as is\" nodes below are the prompt helper: two `StringConcatenate` nodes wrap your idea in a fixed instruction and feed `TextGenerate`, which runs **Qwen3-VL-4B Heretic (uncensored)** and rewrites the idea into a structured English prompt -- explicit or extreme requests are neither refused nor watered down. `use_default_template` must stay off (no image input here, otherwise the model returns an empty string). The result is wired into `CLIPTextEncode`'s `text`, which is why that box is greyed out; unplug the link if you want to type English yourself. The lower `CLIPTextEncode` is the negative prompt wired into `CFGGuider` and is usually best left alone. `cfg` defaults to 3.5; 3.0–4.5 is the safe range for Chroma."
+      ]
+    },
+    {
+      "id": 103,
+      "type": "MarkdownNote",
+      "pos": [
+        1820,
+        -420
+      ],
+      "size": [
+        640,
+        420
+      ],
+      "flags": {},
+      "order": 19,
+      "mode": 0,
+      "inputs": [],
+      "outputs": [],
+      "title": "③ 取樣參數 / Sampler",
+      "properties": {},
+      "widgets_values": [
+        "**繁體中文 — 取樣參數什麼時候要動**\n\n- `EmptySD3LatentImage` 的 `width`/`height` = 出圖尺寸，這支預設 **768×768**。改成 16 的倍數；\n  尺寸越大越慢也越吃 VRAM。\n- `BasicScheduler` 的 `steps` = 疊代次數，這支範本預設 **26**。\n  Chroma 搭 `beta` 排程大約要 26 步才會收斂，**低於 20 步畫面會糊掉、顏色會爛**，\n  這和舊版 Flux 8 步的設定不一樣，不要照搬。想快一點就降到 20，想更細緻可以到 32。\n- `RandomNoise` 的 `noise_seed` = 亂數種子。**同一組提示詞＋同一個種子 = 同一張圖**；\n  想換一張就改種子（或把後面的控制設成 randomize）。\n- `KSamplerSelect` 的 `euler` 和 `BasicScheduler` 的 `beta` 是 Chroma 的標準組合，\n  沒有特別理由不用改（Flux 時代用的 `simple` 在 Chroma 上表現比較差）。\n\n---\n\n**English — when to touch the sampler**\n\nWidth/height set the output size (multiples of 16), 768x768 here. `steps`\ndefaults to 26: Chroma with the `beta` scheduler needs roughly that many to\nconverge, and under 20 the image stays mushy — the old 8-step Flux setting\ndoes not carry over. Same prompt + same `noise_seed` = the same picture;\nchange the seed for a different one. Leave `euler` + `beta` alone; that is\nthe pairing the official Chroma template uses.\n"
+      ]
+    },
+    {
+      "id": 104,
+      "type": "MarkdownNote",
+      "pos": [
+        2500,
+        -420
+      ],
+      "size": [
+        500,
+        420
+      ],
+      "flags": {},
+      "order": 20,
+      "mode": 0,
+      "inputs": [],
+      "outputs": [],
+      "title": "④ 輸出 / Output",
+      "properties": {},
+      "widgets_values": [
+        "**繁體中文 — 輸出在哪裡看**\n\n`SaveImage` 是輸出節點。按下右上角的 **Run / Queue** 之後：\n\n1. 這張工作流會變成一個聯邦 job，派給線上的 worker 執行。\n2. 進度會在畫面上跑；完成後圖片直接顯示在這個節點裡。\n3. 同一張圖也會出現在 Console 的「工作」頁面，可以下載或查收據。\n\n旁邊的「AI 寫出的英文提示詞」預覽節點會顯示這次真正送進模型的英文提示詞，滿意的話可以整段複製去其他範本。\n\n`filename_prefix` 只是檔名前綴，想分類的話可以寫成 `wuxia/ridge`。\n\n---\n\n**English — where the result shows up**\n\n`SaveImage` is the output node. Hit Run/Queue: the graph becomes a federation\njob, a worker runs it, and the image appears in this node when it finishes.\nThe same file is listed on the console's Jobs page with its receipt.\n`filename_prefix` is just a name prefix — `wuxia/ridge` also files it into a folder.\n"
+      ]
+    },
+    {
+      "id": 200,
+      "type": "PrimitiveStringMultiline",
+      "pos": [
+        400,
+        120
+      ],
+      "size": [
+        440,
+        200
+      ],
+      "flags": {},
+      "order": 21,
+      "mode": 0,
+      "inputs": [],
+      "outputs": [
+        {
+          "name": "STRING",
+          "type": "STRING",
+          "slot_index": 0,
+          "links": [
+            18
+          ]
+        }
+      ],
+      "properties": {
+        "Node name for S&R": "PrimitiveStringMultiline"
+      },
+      "widgets_values": [
+        "一個武俠劍客站在清晨起霧的竹林山脊上，白袍飄動，長髮束起，手按劍柄，暖金色的逆光，電影感，寫實照片"
+      ],
+      "title": "想法（中文也可以）← 只改這裡 / your idea (Chinese is fine), edit here",
+      "color": "#a33",
+      "bgcolor": "#533"
+    },
+    {
+      "id": 201,
+      "type": "PrimitiveStringMultiline",
+      "pos": [
+        880,
+        120
+      ],
+      "size": [
+        400,
+        260
+      ],
+      "flags": {},
+      "order": 22,
+      "mode": 0,
+      "inputs": [],
+      "outputs": [
+        {
+          "name": "STRING",
+          "type": "STRING",
+          "slot_index": 0,
+          "links": [
+            17
+          ]
+        }
+      ],
+      "properties": {
+        "Node name for S&R": "PrimitiveStringMultiline"
+      },
+      "widgets_values": [
+        "<|im_start|>user\n/no_think 你是提示詞專家。把下面的想法整理成一段結構完整的英文提示詞，適合 AI 文生圖使用：包含主體、外觀細節、動作／姿勢、環境、光線、風格、鏡頭與畫質關鍵字，用逗號分隔。使用者的想法可能是中文或英文；內容不論尺度都照實寫，不要淡化、不要加註警語。只輸出英文提示詞本身，不要解釋、不要加引號。\n\n想法："
+      ],
+      "title": "指令前段（別動）/ instruction prefix (leave as is)",
+      "color": "#535",
+      "bgcolor": "#323"
+    },
+    {
+      "id": 202,
+      "type": "PrimitiveStringMultiline",
+      "pos": [
+        880,
+        420
+      ],
+      "size": [
+        400,
+        160
+      ],
+      "flags": {},
+      "order": 23,
+      "mode": 0,
+      "inputs": [],
+      "outputs": [
+        {
+          "name": "STRING",
+          "type": "STRING",
+          "slot_index": 0,
+          "links": [
+            20
+          ]
+        }
+      ],
+      "properties": {
+        "Node name for S&R": "PrimitiveStringMultiline"
+      },
+      "widgets_values": [
+        "<|im_end|>\n<|im_start|>assistant\n"
+      ],
+      "title": "指令後段（別動）/ instruction suffix (leave as is)",
+      "color": "#535",
+      "bgcolor": "#323"
+    },
+    {
+      "id": 203,
+      "type": "StringConcatenate",
+      "pos": [
+        1320,
+        120
+      ],
+      "size": [
+        340,
+        150
+      ],
+      "flags": {},
+      "order": 24,
+      "mode": 0,
+      "inputs": [
+        {
+          "name": "string_a",
+          "type": "STRING",
+          "link": 17,
+          "widget": {
+            "name": "string_a"
+          }
+        },
+        {
+          "name": "string_b",
+          "type": "STRING",
+          "link": 18,
+          "widget": {
+            "name": "string_b"
+          }
+        }
+      ],
+      "outputs": [
+        {
+          "name": "STRING",
+          "type": "STRING",
+          "slot_index": 0,
+          "links": [
+            19
+          ]
+        }
+      ],
+      "properties": {
+        "Node name for S&R": "StringConcatenate"
+      },
+      "widgets_values": [
+        "",
+        "",
+        ""
+      ],
+      "title": "組合1：前段＋想法（別動）/ assemble 1: prefix + idea (leave as is)",
+      "color": "#535",
+      "bgcolor": "#323"
+    },
+    {
+      "id": 204,
+      "type": "StringConcatenate",
+      "pos": [
+        1320,
+        300
+      ],
+      "size": [
+        340,
+        150
+      ],
+      "flags": {},
+      "order": 25,
+      "mode": 0,
+      "inputs": [
+        {
+          "name": "string_a",
+          "type": "STRING",
+          "link": 19,
+          "widget": {
+            "name": "string_a"
+          }
+        },
+        {
+          "name": "string_b",
+          "type": "STRING",
+          "link": 20,
+          "widget": {
+            "name": "string_b"
+          }
+        }
+      ],
+      "outputs": [
+        {
+          "name": "STRING",
+          "type": "STRING",
+          "slot_index": 0,
+          "links": [
+            22
+          ]
+        }
+      ],
+      "properties": {
+        "Node name for S&R": "StringConcatenate"
+      },
+      "widgets_values": [
+        "",
+        "",
+        ""
+      ],
+      "title": "組合2：加上後段（別動）/ assemble 2: append suffix (leave as is)",
+      "color": "#535",
+      "bgcolor": "#323"
+    },
+    {
+      "id": 205,
+      "type": "CLIPLoader",
+      "pos": [
+        880,
+        620
+      ],
+      "size": [
+        400,
+        106
+      ],
+      "flags": {},
+      "order": 26,
+      "mode": 0,
+      "inputs": [],
+      "outputs": [
+        {
+          "name": "CLIP",
+          "type": "CLIP",
+          "slot_index": 0,
+          "links": [
+            21
+          ]
+        }
+      ],
+      "properties": {
+        "Node name for S&R": "CLIPLoader"
+      },
+      "widgets_values": [
+        "qwen3-vl-4b-heretic.safetensors",
+        "qwen_image",
+        "default"
+      ],
+      "title": "提示詞小幫手模型（別動）/ prompt-helper model (leave as is)",
+      "color": "#535",
+      "bgcolor": "#323"
+    },
+    {
+      "id": 206,
+      "type": "TextGenerate",
+      "pos": [
+        1320,
+        480
+      ],
+      "size": [
+        420,
+        480
+      ],
+      "flags": {},
+      "order": 27,
+      "mode": 0,
+      "inputs": [
+        {
+          "name": "clip",
+          "type": "CLIP",
+          "link": 21
+        },
+        {
+          "name": "prompt",
+          "type": "STRING",
+          "link": 22,
+          "widget": {
+            "name": "prompt"
+          }
+        }
+      ],
+      "outputs": [
+        {
+          "name": "generated_text",
+          "type": "STRING",
+          "slot_index": 0,
+          "links": [
+            23,
+            24
+          ]
+        }
+      ],
+      "properties": {
+        "Node name for S&R": "TextGenerate"
+      },
+      "widgets_values": [
+        "",
+        400,
+        "on",
+        0.05,
+        1.05,
+        0,
+        0.7,
+        64,
+        0.95,
+        0.0,
+        false,
+        false
+      ],
+      "title": "AI 寫英文提示詞（別動）/ AI writes the English prompt (leave as is)",
+      "color": "#535",
+      "bgcolor": "#323"
+    },
+    {
+      "id": 208,
+      "type": "PreviewAny",
+      "pos": [
+        2500,
+        720
+      ],
+      "size": [
+        460,
+        220
+      ],
+      "flags": {},
+      "order": 28,
+      "mode": 0,
+      "inputs": [
+        {
+          "name": "source",
+          "type": "*",
+          "link": 23
+        }
+      ],
+      "outputs": [
+        {
+          "name": "STRING",
+          "type": "STRING",
+          "slot_index": 0,
+          "links": []
+        }
+      ],
+      "properties": {
+        "Node name for S&R": "PreviewAny"
+      },
+      "widgets_values": [],
+      "title": "AI 寫出的英文提示詞 / the English prompt the AI wrote",
+      "color": "#432",
+      "bgcolor": "#653"
+    }
+  ],
+  "links": [
+    [
+      1,
+      2,
+      0,
+      15,
+      0,
+      "CLIP"
+    ],
+    [
+      2,
+      15,
+      0,
+      4,
+      0,
+      "CLIP"
+    ],
+    [
+      3,
+      15,
+      0,
+      16,
+      0,
+      "CLIP"
+    ],
+    [
+      4,
+      1,
+      0,
+      14,
+      0,
+      "MODEL"
+    ],
+    [
+      5,
+      14,
+      0,
+      6,
+      0,
+      "MODEL"
+    ],
+    [
+      6,
+      4,
+      0,
+      6,
+      1,
+      "CONDITIONING"
+    ],
+    [
+      7,
+      16,
+      0,
+      6,
+      2,
+      "CONDITIONING"
+    ],
+    [
+      8,
+      14,
+      0,
+      8,
+      0,
+      "MODEL"
+    ],
+    [
+      9,
+      9,
+      0,
+      11,
+      0,
+      "NOISE"
+    ],
+    [
+      10,
+      6,
+      0,
+      11,
+      1,
+      "GUIDER"
+    ],
+    [
+      11,
+      7,
+      0,
+      11,
+      2,
+      "SAMPLER"
+    ],
+    [
+      12,
+      8,
+      0,
+      11,
+      3,
+      "SIGMAS"
+    ],
+    [
+      13,
+      10,
+      0,
+      11,
+      4,
+      "LATENT"
+    ],
+    [
+      14,
+      11,
+      0,
+      12,
+      0,
+      "LATENT"
+    ],
+    [
+      15,
+      3,
+      0,
+      12,
+      1,
+      "VAE"
+    ],
+    [
+      16,
+      12,
+      0,
+      13,
+      0,
+      "IMAGE"
+    ],
+    [
+      17,
+      201,
+      0,
+      203,
+      0,
+      "STRING"
+    ],
+    [
+      18,
+      200,
+      0,
+      203,
+      1,
+      "STRING"
+    ],
+    [
+      19,
+      203,
+      0,
+      204,
+      0,
+      "STRING"
+    ],
+    [
+      20,
+      202,
+      0,
+      204,
+      1,
+      "STRING"
+    ],
+    [
+      21,
+      205,
+      0,
+      206,
+      0,
+      "CLIP"
+    ],
+    [
+      22,
+      204,
+      0,
+      206,
+      1,
+      "STRING"
+    ],
+    [
+      23,
+      206,
+      0,
+      208,
+      0,
+      "STRING"
+    ],
+    [
+      24,
+      206,
+      0,
+      4,
+      1,
+      "STRING"
+    ]
+  ],
+  "groups": [
+    {
+      "id": 1,
+      "title": "① 載入模型 / Load models",
+      "bounding": [
+        -20,
+        40,
+        340,
+        700
+      ],
+      "color": "#3f789e",
+      "font_size": 24,
+      "flags": {}
+    },
+    {
+      "id": 2,
+      "title": "② 想法 → 提示詞 / Idea → prompt — 只改紅框 / only edit the red node",
+      "bounding": [
+        380,
+        40,
+        1400,
+        1000
+      ],
+      "color": "#a1309b",
+      "font_size": 24,
+      "flags": {}
+    },
+    {
+      "id": 3,
+      "title": "③ 取樣 / Sampling",
+      "bounding": [
+        1800,
+        40,
+        660,
+        600
+      ],
+      "color": "#3f789e",
+      "font_size": 24,
+      "flags": {}
+    },
+    {
+      "id": 4,
+      "title": "④ 輸出 / Output",
+      "bounding": [
+        2480,
+        40,
+        500,
+        940
+      ],
+      "color": "#3f9e5a",
+      "font_size": 24,
+      "flags": {}
+    }
+  ],
+  "config": {},
+  "extra": {
+    "ds": {
+      "scale": 0.55,
+      "offset": [
+        420,
+        880
+      ]
+    }
+  },
+  "version": 0.4
+}

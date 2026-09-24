@@ -1,0 +1,579 @@
+{
+  "last_node_id": 103,
+  "last_link_id": 9,
+  "nodes": [
+    {
+      "id": 100,
+      "type": "MarkdownNote",
+      "pos": [
+        0,
+        -900
+      ],
+      "size": [
+        1820,
+        380
+      ],
+      "flags": {},
+      "order": 8,
+      "mode": 0,
+      "inputs": [],
+      "outputs": [],
+      "title": "⓪ 這支範本不需要任何模型 / No models needed",
+      "properties": {},
+      "widgets_values": [
+        "**繁體中文**\n\n這支範本**不需要任何模型檔** — 全新安裝、什麼模型都還沒放的 worker 也能直接跑。\n用途：把一張圖定格幾秒，接在一支影片的開頭，很適合當片頭卡。\n\n沒有 GPU 密集運算，跑起來很快，很適合拿來確認整條聯邦派工流程是通的。\n\n---\n\n**English**\n\nThis template needs **zero model files** — a brand-new worker with nothing\ndownloaded yet can run it as-is.\nWhat it does: holds one still image for a few seconds and prepends it to a\nvideo clip, like a title card.\n\nNo heavy GPU compute involved, so it runs fast — a good way to confirm the\nfederation pipeline works end to end."
+      ],
+      "color": "#432",
+      "bgcolor": "#653"
+    },
+    {
+      "id": 1,
+      "type": "LoadImage",
+      "pos": [
+        0,
+        140
+      ],
+      "size": [
+        320,
+        350
+      ],
+      "flags": {},
+      "order": 0,
+      "mode": 0,
+      "inputs": [],
+      "outputs": [
+        {
+          "name": "IMAGE",
+          "type": "IMAGE",
+          "slot_index": 0,
+          "links": [
+            1
+          ]
+        },
+        {
+          "name": "MASK",
+          "type": "MASK",
+          "slot_index": 1,
+          "links": []
+        }
+      ],
+      "properties": {
+        "Node name for S&R": "LoadImage"
+      },
+      "widgets_values": [
+        "amyntas_ref.png",
+        "image"
+      ],
+      "title": "開場圖 ← 換成你的圖 / intro image, swap for yours",
+      "bgcolor": "#533",
+      "color": "#a33"
+    },
+    {
+      "id": 2,
+      "type": "ImageScale",
+      "pos": [
+        400,
+        140
+      ],
+      "size": [
+        300,
+        150
+      ],
+      "flags": {},
+      "order": 1,
+      "mode": 0,
+      "inputs": [
+        {
+          "name": "image",
+          "type": "IMAGE",
+          "link": 1
+        }
+      ],
+      "outputs": [
+        {
+          "name": "IMAGE",
+          "type": "IMAGE",
+          "slot_index": 0,
+          "links": [
+            2
+          ]
+        }
+      ],
+      "properties": {
+        "Node name for S&R": "ImageScale"
+      },
+      "widgets_values": [
+        "lanczos",
+        768,
+        768,
+        "center"
+      ],
+      "title": "縮放到跟影片一樣尺寸 ← 改這裡 / match your video size",
+      "bgcolor": "#533",
+      "color": "#a33"
+    },
+    {
+      "id": 3,
+      "type": "RepeatImageBatch",
+      "pos": [
+        760,
+        140
+      ],
+      "size": [
+        280,
+        80
+      ],
+      "flags": {},
+      "order": 2,
+      "mode": 0,
+      "inputs": [
+        {
+          "name": "image",
+          "type": "IMAGE",
+          "link": 2
+        }
+      ],
+      "outputs": [
+        {
+          "name": "IMAGE",
+          "type": "IMAGE",
+          "slot_index": 0,
+          "links": [
+            4
+          ]
+        }
+      ],
+      "properties": {
+        "Node name for S&R": "RepeatImageBatch"
+      },
+      "widgets_values": [
+        48
+      ],
+      "title": "開場停留張數 ← 改這裡 / intro hold length",
+      "bgcolor": "#533",
+      "color": "#a33"
+    },
+    {
+      "id": 4,
+      "type": "LoadVideo",
+      "pos": [
+        400,
+        360
+      ],
+      "size": [
+        320,
+        300
+      ],
+      "flags": {},
+      "order": 3,
+      "mode": 0,
+      "inputs": [],
+      "outputs": [
+        {
+          "name": "VIDEO",
+          "type": "VIDEO",
+          "slot_index": 0,
+          "links": [
+            3
+          ]
+        }
+      ],
+      "properties": {
+        "Node name for S&R": "LoadVideo"
+      },
+      "widgets_values": [
+        "comfyfed_sample_clip.mp4",
+        "video"
+      ],
+      "title": "接續影片 ← 換成你的影片 / video to follow, swap for yours",
+      "bgcolor": "#533",
+      "color": "#a33"
+    },
+    {
+      "id": 5,
+      "type": "GetVideoComponents",
+      "pos": [
+        760,
+        320
+      ],
+      "size": [
+        300,
+        180
+      ],
+      "flags": {},
+      "order": 4,
+      "mode": 0,
+      "inputs": [
+        {
+          "name": "video",
+          "type": "VIDEO",
+          "link": 3
+        }
+      ],
+      "outputs": [
+        {
+          "name": "IMAGE",
+          "type": "IMAGE",
+          "slot_index": 0,
+          "links": [
+            5
+          ]
+        },
+        {
+          "name": "AUDIO",
+          "type": "AUDIO",
+          "slot_index": 1,
+          "links": [
+            8
+          ]
+        },
+        {
+          "name": "FLOAT",
+          "type": "FLOAT",
+          "slot_index": 2,
+          "links": [
+            7
+          ]
+        },
+        {
+          "name": "unused_a",
+          "type": "COMBO",
+          "slot_index": 3,
+          "links": []
+        },
+        {
+          "name": "unused_b",
+          "type": "COMBO",
+          "slot_index": 4,
+          "links": []
+        }
+      ],
+      "properties": {
+        "Node name for S&R": "GetVideoComponents"
+      },
+      "widgets_values": [],
+      "title": "拆解影片（畫面/聲音/fps）"
+    },
+    {
+      "id": 6,
+      "type": "ImageBatch",
+      "pos": [
+        1100,
+        140
+      ],
+      "size": [
+        260,
+        80
+      ],
+      "flags": {},
+      "order": 5,
+      "mode": 0,
+      "inputs": [
+        {
+          "name": "image1",
+          "type": "IMAGE",
+          "link": 4
+        },
+        {
+          "name": "image2",
+          "type": "IMAGE",
+          "link": 5
+        }
+      ],
+      "outputs": [
+        {
+          "name": "IMAGE",
+          "type": "IMAGE",
+          "slot_index": 0,
+          "links": [
+            6
+          ]
+        }
+      ],
+      "properties": {
+        "Node name for S&R": "ImageBatch"
+      },
+      "widgets_values": [],
+      "title": "把開場圖接到影片前面 / prepend the intro"
+    },
+    {
+      "id": 7,
+      "type": "CreateVideo",
+      "pos": [
+        1420,
+        140
+      ],
+      "size": [
+        260,
+        120
+      ],
+      "flags": {},
+      "order": 6,
+      "mode": 0,
+      "inputs": [
+        {
+          "name": "images",
+          "type": "IMAGE",
+          "link": 6
+        },
+        {
+          "name": "fps",
+          "type": "FLOAT",
+          "link": 7,
+          "widget": {
+            "name": "fps"
+          }
+        },
+        {
+          "name": "audio",
+          "type": "AUDIO",
+          "link": 8,
+          "shape": 7
+        }
+      ],
+      "outputs": [
+        {
+          "name": "VIDEO",
+          "type": "VIDEO",
+          "slot_index": 0,
+          "links": [
+            9
+          ]
+        }
+      ],
+      "properties": {
+        "Node name for S&R": "CreateVideo"
+      },
+      "widgets_values": []
+    },
+    {
+      "id": 8,
+      "type": "SaveVideo",
+      "pos": [
+        1720,
+        140
+      ],
+      "size": [
+        480,
+        420
+      ],
+      "flags": {},
+      "order": 7,
+      "mode": 0,
+      "inputs": [
+        {
+          "name": "video",
+          "type": "VIDEO",
+          "link": 9
+        }
+      ],
+      "outputs": [],
+      "properties": {
+        "Node name for S&R": "SaveVideo"
+      },
+      "widgets_values": [
+        "comfyfed_intro",
+        "mp4",
+        "h264"
+      ]
+    },
+    {
+      "id": 101,
+      "type": "MarkdownNote",
+      "pos": [
+        0,
+        -480
+      ],
+      "size": [
+        1060,
+        420
+      ],
+      "flags": {},
+      "order": 9,
+      "mode": 0,
+      "inputs": [],
+      "outputs": [],
+      "title": "① 紅框節點=你要改的地方 / Red-framed nodes to edit",
+      "properties": {},
+      "widgets_values": [
+        "**繁體中文**\n\n紅框的四個節點就是你要改的地方：\n\n- `LoadImage` — 換成你要當開場的圖（拖圖到節點上傳，或用下拉選單選暫存區的檔案）。\n- `ImageScale` 的 `width`/`height` — 改成跟你的影片畫面**一樣的尺寸**，\n  不一樣的話接起來會變形或報錯。\n- `RepeatImageBatch` 的 `amount` — 開場要停留幾秒，公式是\n  **開場秒數 × 影片 fps**。範本影片是 24fps，`amount=48` 就是停 2 秒；\n  想要 3 秒就改成 72。\n- `LoadVideo` — 換成你要接在開場後面的影片。\n\n其他節點不用動。\n\n---\n\n**English**\n\nThe four red-framed nodes are the only things you need to touch:\n`LoadImage` (swap in your intro picture), `ImageScale`'s `width`/`height`\n(match your video's frame size, or the join will distort or error),\n`RepeatImageBatch`'s `amount` (intro seconds × video fps — the sample clip is\n24 fps, so `amount=48` holds for 2 seconds; use 72 for 3 seconds), and\n`LoadVideo` (swap in the clip that follows the intro)."
+      ],
+      "color": "#432",
+      "bgcolor": "#653"
+    },
+    {
+      "id": 102,
+      "type": "MarkdownNote",
+      "pos": [
+        1100,
+        -480
+      ],
+      "size": [
+        320,
+        420
+      ],
+      "flags": {},
+      "order": 10,
+      "mode": 0,
+      "inputs": [],
+      "outputs": [],
+      "title": "② 中段在做什麼 / What the middle section does",
+      "properties": {},
+      "widgets_values": [
+        "**繁體中文**\n\n把靜止的圖片變成好幾張一模一樣的畫面（等於讓它定格 N 秒），\n再把這些畫面接到影片的畫面前面，聲音則直接沿用影片本身的聲音，\n最後合成一支新影片。\n\n---\n\n**English**\n\nTurns the still image into a run of identical frames (i.e. holds it for N\nseconds), prepends those frames to the video's own frames, keeps the\nvideo's own audio untouched, and muxes the result into one clip."
+      ],
+      "color": "#432",
+      "bgcolor": "#653"
+    },
+    {
+      "id": 103,
+      "type": "MarkdownNote",
+      "pos": [
+        1420,
+        -480
+      ],
+      "size": [
+        780,
+        420
+      ],
+      "flags": {},
+      "order": 11,
+      "mode": 0,
+      "inputs": [],
+      "outputs": [],
+      "title": "③ 輸出 / Output",
+      "properties": {},
+      "widgets_values": [
+        "**繁體中文**\n\n`SaveVideo` 的 `filename_prefix`（預設 `comfyfed_intro`）可以改成你想要的檔名前綴。\n按右上角 Run 之後，這會變成一個聯邦 job；完成後結果會自動回傳到平台，\n影片也會直接在 `SaveVideo` 節點裡播放，Console 的「工作」頁面也拿得到檔案。\n\n---\n\n**English**\n\n`SaveVideo`'s `filename_prefix` (default `comfyfed_intro`) can be changed to\nwhatever prefix you like. Press Run and this becomes a federation job; the\nresult is automatically reported back to the platform once it finishes, the\nclip plays inside the `SaveVideo` node, and it is also listed on the\nconsole's Jobs page."
+      ],
+      "color": "#432",
+      "bgcolor": "#653"
+    }
+  ],
+  "links": [
+    [
+      1,
+      1,
+      0,
+      2,
+      0,
+      "IMAGE"
+    ],
+    [
+      2,
+      2,
+      0,
+      3,
+      0,
+      "IMAGE"
+    ],
+    [
+      3,
+      4,
+      0,
+      5,
+      0,
+      "VIDEO"
+    ],
+    [
+      4,
+      3,
+      0,
+      6,
+      0,
+      "IMAGE"
+    ],
+    [
+      5,
+      5,
+      0,
+      6,
+      1,
+      "IMAGE"
+    ],
+    [
+      6,
+      6,
+      0,
+      7,
+      0,
+      "IMAGE"
+    ],
+    [
+      7,
+      5,
+      2,
+      7,
+      1,
+      "FLOAT"
+    ],
+    [
+      8,
+      5,
+      1,
+      7,
+      2,
+      "AUDIO"
+    ],
+    [
+      9,
+      7,
+      0,
+      8,
+      0,
+      "VIDEO"
+    ]
+  ],
+  "groups": [
+    {
+      "id": 1,
+      "title": "①選素材 / Pick your assets — 只改這一區",
+      "bounding": [
+        -20,
+        40,
+        1060,
+        660
+      ],
+      "color": "#a1309b",
+      "font_size": 24,
+      "flags": {}
+    },
+    {
+      "id": 2,
+      "title": "②合併 / Merge",
+      "bounding": [
+        1080,
+        40,
+        320,
+        600
+      ],
+      "color": "#3f789e",
+      "font_size": 24,
+      "flags": {}
+    },
+    {
+      "id": 3,
+      "title": "③輸出 / Output",
+      "bounding": [
+        1400,
+        40,
+        820,
+        600
+      ],
+      "color": "#3f9e5a",
+      "font_size": 24,
+      "flags": {}
+    }
+  ],
+  "config": {},
+  "extra": {
+    "ds": {
+      "scale": 0.5,
+      "offset": [
+        420,
+        880
+      ]
+    }
+  },
+  "version": 0.4
+}

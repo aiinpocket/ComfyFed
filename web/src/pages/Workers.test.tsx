@@ -1,0 +1,657 @@
+// @vitest-environment jsdom
+/**
+ * Phase 3.1 Task 7: the P2P sharing badge on the Workers page.
+ *
+ * A worker whose `peer_url` is set (opted into serving chunks to other
+ * workers) shows a small "P2P sharing" badge next to its name; a worker
+ * with `peer_url: null` shows no badge at all.
+ */
+import '@testing-library/jest-dom/vitest';
+
+import { MantineProvider } from '@mantine/core';
+import { notifications } from '@mantine/notifications';
+import { cleanup, fireEvent, render, screen, waitFor } from '@testing-library/react';
+import { MemoryRouter } from 'react-router-dom';
+import { afterEach, describe, expect, it, vi } from 'vitest';
+
+import type { Role, TokenBundle, Worker } from '../api';
+import '../i18n';
+import { theme } from '../theme';
+import { Workers } from './Workers';
+
+if (!window.matchMedia) {
+  window.matchMedia = ((query: string) => ({
+    matches: false,
+    media: query,
+    onchange: null,
+    addListener: () => {},
+    removeListener: () => {},
+    addEventListener: () => {},
+    removeEventListener: () => {},
+    dispatchEvent: () => false,
+  })) as unknown as typeof window.matchMedia;
+}
+
+if (!('ResizeObserver' in window)) {
+  class FakeResizeObserver {
+    observe() {}
+    unobserve() {}
+    disconnect() {}
+  }
+  (window as unknown as { ResizeObserver: unknown }).ResizeObserver = FakeResizeObserver;
+}
+
+const BASE_WORKER: Worker = {
+  id: 'w-0000000001',
+  name: 'runner-sharing',
+  status: 'online',
+  last_seen: '2026-09-14T00:00:00Z',
+  disabled: false,
+  hardware: {},
+  dynamic: {},
+  backend: 'cuda',
+  torch_version: '2.4.0',
+  model_count: 3,
+  peer_url: 'http://192.168.1.5:8850',
+  peer_lan_url: 'http://10.0.0.5:8850',
+  peer_nat: 'natpmp',
+  // 後端（SQLite / D1）把 boolean 存成整數，JSON 出來就是 1/0——fixture 照實寫。
+  peer_reachable: 1,
+  unsuitable: [],
+};
+
+const QUIET_WORKER: Worker = {
+  ...BASE_WORKER,
+  id: 'w-0000000002',
+  name: 'runner-quiet',
+  peer_url: null,
+  peer_lan_url: null,
+  peer_nat: 'none',
+  peer_reachable: null,
+};
+
+function jsonResponse(body: unknown, status = 200): Response {
+  return new Response(JSON.stringify(body), {
+    status,
+    headers: { 'Content-Type': 'application/json' },
+  });
+}
+
+function renderWorkers(role: Role = 'admin') {
+  return render(
+    <MantineProvider theme={theme}>
+      <MemoryRouter>
+        <Workers role={role} />
+      </MemoryRouter>
+    </MantineProvider>,
+  );
+}
+
+function stubFetch(workers: Worker[]) {
+  const fetchMock = vi.fn(async (input: RequestInfo | URL) => {
+    const url = typeof input === 'string' ? input : input.toString();
+    if (url.startsWith('/api/workers')) return jsonResponse(workers);
+    return jsonResponse({ error: { code: 'http_error', message: 'not stubbed' } }, 404);
+  });
+  vi.stubGlobal('fetch', fetchMock);
+  return fetchMock;
+}
+
+const TOKEN_BUNDLE: TokenBundle = {
+  platform_url: 'https://console.example.com',
+  platform_pubkey: 'ed25519-pubkey-stub',
+  register_token: 'tok_abc123XYZ',
+};
+
+function stubFetchWithTokenIssuance(workers: Worker[], bundle: TokenBundle = TOKEN_BUNDLE) {
+  const fetchMock = vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+    const url = typeof input === 'string' ? input : input.toString();
+    if (url.startsWith('/api/workers/tokens') && init?.method === 'POST') {
+      return jsonResponse({ bundle });
+    }
+    if (url.startsWith('/api/workers')) return jsonResponse(workers);
+    return jsonResponse({ error: { code: 'http_error', message: 'not stubbed' } }, 404);
+  });
+  vi.stubGlobal('fetch', fetchMock);
+  return fetchMock;
+}
+
+describe('Workers page: P2P sharing badge', () => {
+  afterEach(() => {
+    cleanup();
+    vi.unstubAllGlobals();
+  });
+
+  it('shows the P2P sharing badge and the advertised peer_url for a worker with peer_url set', async () => {
+    stubFetch([BASE_WORKER]);
+    renderWorkers();
+
+    expect(await screen.findByText('runner-sharing')).toBeInTheDocument();
+    expect(await screen.findByText('P2P sharing')).toBeInTheDocument();
+    expect(await screen.findByText('http://192.168.1.5:8850')).toBeInTheDocument();
+  });
+
+  it('shows no badge and no peer_url text for a worker with peer_url null', async () => {
+    stubFetch([QUIET_WORKER]);
+    renderWorkers();
+
+    expect(await screen.findByText('runner-quiet')).toBeInTheDocument();
+    expect(screen.queryByText('P2P sharing')).not.toBeInTheDocument();
+    expect(screen.queryByText('http://192.168.1.5:8850')).not.toBeInTheDocument();
+  });
+});
+
+describe('Workers page: add worker one-line install commands', () => {
+  afterEach(() => {
+    cleanup();
+    vi.unstubAllGlobals();
+  });
+
+  async function issueToken() {
+    stubFetchWithTokenIssuance([]);
+    renderWorkers();
+
+    fireEvent.click(await screen.findByRole('button', { name: 'Add worker' }));
+    const nameInput = await screen.findByLabelText('Worker name');
+    fireEvent.change(nameInput, { target: { value: 'studio-5080' } });
+    fireEvent.click(screen.getByRole('button', { name: 'Issue bundle' }));
+
+    await screen.findAllByText(TOKEN_BUNDLE.register_token, { exact: false });
+  }
+
+  it('renders the three one-line commands containing the token and platform_url', async () => {
+    await issueToken();
+
+    const ps1 = `irm "${TOKEN_BUNDLE.platform_url}/install.ps1?token=${TOKEN_BUNDLE.register_token}" | iex`;
+    const cmd = `curl -fsSL "${TOKEN_BUNDLE.platform_url}/install.cmd?token=${TOKEN_BUNDLE.register_token}" -o install.cmd && install.cmd && del install.cmd`;
+    const sh = `curl -fsSL "${TOKEN_BUNDLE.platform_url}/install.sh?token=${TOKEN_BUNDLE.register_token}" | bash`;
+
+    expect(await screen.findByText(ps1)).toBeInTheDocument();
+    expect(screen.getByText(cmd)).toBeInTheDocument();
+    expect(screen.getByText(sh)).toBeInTheDocument();
+  });
+
+  it('shows a copy button for each install command and keeps the manual bundle fallback reachable', async () => {
+    await issueToken();
+
+    const copyButtons = screen.getAllByRole('button', { name: 'Copy' });
+    // One per install command block, plus the manual-fallback copy button once expanded.
+    expect(copyButtons.length).toBeGreaterThanOrEqual(3);
+
+    fireEvent.click(screen.getByText('Manual install (advanced)'));
+    expect(await screen.findByRole('button', { name: 'Copy bundle' })).toBeInTheDocument();
+    expect(screen.getByRole('button', { name: 'Download .json' })).toBeInTheDocument();
+  });
+});
+
+describe('Workers page: delete a worker', () => {
+  afterEach(() => {
+    cleanup();
+    vi.unstubAllGlobals();
+  });
+
+  /** Serves the list from a mutable array so the post-delete refetch returns
+   * the shortened list the real API would -- the row must actually vanish,
+   * not merely stop being clickable. */
+  function stubFetchWithDelete(initial: Worker[]) {
+    let workers = [...initial];
+    const fetchMock = vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+      const url = typeof input === 'string' ? input : input.toString();
+      if (init?.method === 'DELETE') {
+        const id = decodeURIComponent(url.slice('/api/workers/'.length));
+        workers = workers.filter((w) => w.id !== id);
+        return jsonResponse({ ok: true });
+      }
+      if (url.startsWith('/api/workers')) return jsonResponse(workers);
+      return jsonResponse({ error: { code: 'http_error', message: 'not stubbed' } }, 404);
+    });
+    vi.stubGlobal('fetch', fetchMock);
+    return fetchMock;
+  }
+
+  it('asks for confirmation, then DELETEs the worker and drops the row', async () => {
+    const fetchMock = stubFetchWithDelete([BASE_WORKER, QUIET_WORKER]);
+    renderWorkers();
+
+    expect(await screen.findByText('runner-sharing')).toBeInTheDocument();
+    fireEvent.click(screen.getAllByRole('button', { name: 'Delete' })[0]!);
+
+    // The confirm spells out that billing records survive.
+    expect(
+      await screen.findByText(
+        'Delete worker "runner-sharing"? Billing records are kept, but it disappears from the list and can no longer connect.',
+      ),
+    ).toBeInTheDocument();
+
+    const confirmButtons = screen.getAllByRole('button', { name: 'Delete' });
+    fireEvent.click(confirmButtons[confirmButtons.length - 1]!);
+
+    await waitFor(() => {
+      expect(
+        fetchMock.mock.calls.some(
+          ([input, init]) =>
+            (typeof input === 'string' ? input : String(input)) === `/api/workers/${BASE_WORKER.id}` &&
+            (init as RequestInit | undefined)?.method === 'DELETE',
+        ),
+      ).toBe(true);
+    });
+
+    await waitFor(() => expect(screen.queryByText('runner-sharing')).not.toBeInTheDocument());
+    expect(screen.getByText('runner-quiet')).toBeInTheDocument();
+  });
+
+  it('does not call DELETE when the confirm is cancelled', async () => {
+    const fetchMock = stubFetchWithDelete([BASE_WORKER]);
+    renderWorkers();
+
+    expect(await screen.findByText('runner-sharing')).toBeInTheDocument();
+    fireEvent.click(screen.getAllByRole('button', { name: 'Delete' })[0]!);
+    fireEvent.click(await screen.findByRole('button', { name: 'Cancel' }));
+
+    expect(
+      fetchMock.mock.calls.some(([, init]) => (init as RequestInit | undefined)?.method === 'DELETE'),
+    ).toBe(false);
+    expect(screen.getByText('runner-sharing')).toBeInTheDocument();
+  });
+});
+
+describe('Workers page: role-gated mutation controls', () => {
+  afterEach(() => {
+    cleanup();
+    vi.unstubAllGlobals();
+  });
+
+  it('renders the read-only fleet list for a non-admin user without add/disable/delete controls', async () => {
+    stubFetch([BASE_WORKER]);
+    renderWorkers('user');
+
+    // The list itself is visible: name, model column, P2P badge all render.
+    expect(await screen.findByText('runner-sharing')).toBeInTheDocument();
+    expect(screen.getByText('P2P sharing')).toBeInTheDocument();
+
+    // None of the admin-only mutation controls are present for a user.
+    expect(screen.queryByRole('button', { name: 'Add worker' })).not.toBeInTheDocument();
+    expect(screen.queryByRole('button', { name: 'Disable' })).not.toBeInTheDocument();
+    expect(screen.queryByRole('button', { name: 'Delete' })).not.toBeInTheDocument();
+  });
+
+  it('renders the add/disable/delete controls for an admin', async () => {
+    stubFetch([BASE_WORKER]);
+    renderWorkers('admin');
+
+    expect(await screen.findByText('runner-sharing')).toBeInTheDocument();
+    expect(screen.getByRole('button', { name: 'Add worker' })).toBeInTheDocument();
+    expect(screen.getByRole('button', { name: 'Disable' })).toBeInTheDocument();
+    expect(screen.getByRole('button', { name: 'Delete' })).toBeInTheDocument();
+  });
+});
+
+describe('Workers page: unsuitable tasks (job-retry design 2026-09-19)', () => {
+  afterEach(() => {
+    cleanup();
+    vi.unstubAllGlobals();
+  });
+
+  const UNSUITABLE_WORKER: Worker = {
+    ...BASE_WORKER,
+    id: 'w-0000000003',
+    name: 'runner-unsuitable',
+    unsuitable: [
+      {
+        task_key: 'sig-abcdef0123456789',
+        failures: 2,
+        last_error: 'CUDA out of memory. Tried to allocate 2.00 GiB.',
+        last_job_id: 'job-aaaaaaaa-1111',
+        updated_at: '2026-09-18T00:00:00Z',
+        active: true,
+      },
+      {
+        task_key: 'model_fetch:old-lora.safetensors',
+        failures: 2,
+        last_error: 'download failed',
+        last_job_id: null,
+        updated_at: '2026-09-01T00:00:00Z',
+        active: false,
+      },
+    ],
+  };
+
+  function stubFetchWithClear(workers: Worker[]) {
+    let list = [...workers];
+    const fetchMock = vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+      const url = typeof input === 'string' ? input : input.toString();
+      const method = init?.method ?? 'GET';
+      const clearMatch = /^\/api\/workers\/([^/]+)\/unsuitable(?:\/([^/]+))?$/.exec(url);
+      if (clearMatch && method === 'DELETE') {
+        const [, workerId, taskKey] = clearMatch;
+        list = list.map((w) =>
+          w.id === workerId
+            ? { ...w, unsuitable: taskKey ? w.unsuitable.filter((u) => u.task_key !== decodeURIComponent(taskKey)) : [] }
+            : w,
+        );
+        return jsonResponse({ cleared: 1 });
+      }
+      if (url.startsWith('/api/workers')) return jsonResponse(list);
+      return jsonResponse({ error: { code: 'http_error', message: 'not stubbed' } }, 404);
+    });
+    vi.stubGlobal('fetch', fetchMock);
+    return fetchMock;
+  }
+
+  it('renders the unsuitable block with key prefix, failures, last error and expired badge', async () => {
+    stubFetch([UNSUITABLE_WORKER]);
+    renderWorkers();
+
+    expect(await screen.findByText('Unsuitable tasks')).toBeInTheDocument();
+    expect(screen.getByText('sig-abcdef01')).toBeInTheDocument();
+    expect(screen.getByText(/CUDA out of memory/)).toBeInTheDocument();
+    expect(screen.getByText('Expired')).toBeInTheDocument();
+    expect(screen.getByRole('link', { name: 'View job' })).toHaveAttribute(
+      'href',
+      '/jobs/job-aaaaaaaa-1111',
+    );
+  });
+
+  it('renders a row whose last_error and last_job_id are null (non-admin payload)', async () => {
+    // final review I1: `GET /api/workers` now nulls both fields for a
+    // non-admin session. The row itself still arrives, so the block must
+    // render it with an em dash and no "View job" link rather than blowing up.
+    stubFetch([
+      {
+        ...BASE_WORKER,
+        id: 'w-0000000004',
+        name: 'runner-redacted',
+        unsuitable: [
+          {
+            task_key: 'sig-redacted00000',
+            failures: 2,
+            last_error: null,
+            last_job_id: null,
+            updated_at: '2026-09-18T00:00:00Z',
+            active: true,
+          },
+        ],
+      },
+    ]);
+    renderWorkers('user');
+
+    expect(await screen.findByText('Unsuitable tasks')).toBeInTheDocument();
+    expect(screen.getByText('sig-redacted')).toBeInTheDocument();
+    // 錯誤欄畫成破折號（頁面別處也有破折號，所以只確認它存在），連結整個不畫。
+    expect(screen.getAllByText('—').length).toBeGreaterThan(0);
+    expect(screen.queryByRole('link', { name: 'View job' })).not.toBeInTheDocument();
+  });
+
+  it('hides the unsuitable block for a worker with an empty list', async () => {
+    stubFetch([BASE_WORKER]);
+    renderWorkers();
+
+    await screen.findByText('runner-sharing');
+    expect(screen.queryByText('Unsuitable tasks')).not.toBeInTheDocument();
+  });
+
+  it('an admin sees Clear buttons and clicking one calls the DELETE route', async () => {
+    const fetchMock = stubFetchWithClear([UNSUITABLE_WORKER]);
+    renderWorkers('admin');
+
+    await screen.findByText('Unsuitable tasks');
+    const clearButtons = screen.getAllByRole('button', { name: 'Clear' });
+    expect(clearButtons.length).toBeGreaterThan(0);
+    fireEvent.click(clearButtons[0]!);
+
+    await waitFor(() => {
+      expect(
+        fetchMock.mock.calls.some(([reqUrl, reqInit]) => {
+          const url = typeof reqUrl === 'string' ? reqUrl : String(reqUrl);
+          return (
+            url === `/api/workers/${UNSUITABLE_WORKER.id}/unsuitable/sig-abcdef0123456789` &&
+            (reqInit as RequestInit | undefined)?.method === 'DELETE'
+          );
+        }),
+      ).toBe(true);
+    });
+  });
+
+  it('a non-admin user does not see Clear buttons', async () => {
+    stubFetch([UNSUITABLE_WORKER]);
+    renderWorkers('user');
+
+    await screen.findByText('Unsuitable tasks');
+    expect(screen.queryByRole('button', { name: 'Clear' })).not.toBeInTheDocument();
+    expect(screen.queryByRole('button', { name: 'Clear all' })).not.toBeInTheDocument();
+  });
+});
+
+describe('Phase 3.4: the P2P column', () => {
+  afterEach(() => {
+    cleanup();
+    vi.unstubAllGlobals();
+  });
+
+  it('shows the mapping method, external address and a verified badge', async () => {
+    stubFetch([BASE_WORKER]);
+    renderWorkers();
+
+    expect(await screen.findByText('Auto port mapping (NAT-PMP)')).toBeInTheDocument();
+    expect(screen.getByText('http://192.168.1.5:8850')).toBeInTheDocument();
+    expect(screen.getByText('Verified')).toBeInTheDocument();
+  });
+
+  it('shows "off" for a worker that does not share', async () => {
+    stubFetch([QUIET_WORKER]);
+    renderWorkers();
+    expect(await screen.findByText('Off')).toBeInTheDocument();
+  });
+
+  it('shows "not reachable" when the platform could not connect', async () => {
+    stubFetch([{ ...BASE_WORKER, peer_reachable: 0 }]);
+    renderWorkers();
+    expect(await screen.findByText('Not reachable')).toBeInTheDocument();
+  });
+
+  it('shows "not checked" before the first check', async () => {
+    stubFetch([{ ...BASE_WORKER, peer_reachable: null }]);
+    renderWorkers();
+    expect(await screen.findByText('Not checked')).toBeInTheDocument();
+  });
+
+  it('shows LAN-only workers as LAN only', async () => {
+    stubFetch([{ ...BASE_WORKER, peer_nat: 'lan', peer_url: 'http://192.168.1.5:8850', peer_reachable: 0 }]);
+    renderWorkers();
+    expect(await screen.findByText('LAN only')).toBeInTheDocument();
+  });
+
+  it('still reads a real JSON boolean (older payloads)', async () => {
+    stubFetch([{ ...BASE_WORKER, peer_reachable: true }]);
+    renderWorkers();
+    expect(await screen.findByText('Verified')).toBeInTheDocument();
+  });
+
+  it('still reads a real JSON false (older payloads)', async () => {
+    stubFetch([{ ...BASE_WORKER, peer_reachable: false }]);
+    renderWorkers();
+    expect(await screen.findByText('Not reachable')).toBeInTheDocument();
+  });
+});
+
+
+// --- 2026-09-24: agent (client) version column -----------------------------
+
+describe('Workers page: agent version column', () => {
+  afterEach(() => {
+    cleanup();
+    vi.unstubAllGlobals();
+  });
+
+  it('shows each worker\'s reported agent version and flags one behind the published latest', async () => {
+    const fetchMock = vi.fn(async (input: RequestInfo | URL) => {
+      const url = typeof input === 'string' ? input : input.toString();
+      if (url.startsWith('/api/agent/version')) {
+        return jsonResponse({ latest: '0.1.17', min_supported: '0.1.0', wheel_url: null, sha256: null, platform_sig: null });
+      }
+      if (url.startsWith('/api/workers')) {
+        return jsonResponse([
+          { ...BASE_WORKER, id: 'w-new', name: 'fresh', hardware: { agent_version: '0.1.17' } },
+          { ...BASE_WORKER, id: 'w-old', name: 'stale', hardware: { agent_version: '0.1.16' } },
+          { ...BASE_WORKER, id: 'w-unknown', name: 'mystery', hardware: {} },
+        ]);
+      }
+      return jsonResponse({ error: { code: 'http_error', message: 'not stubbed' } }, 404);
+    });
+    vi.stubGlobal('fetch', fetchMock);
+
+    renderWorkers('user');
+
+    expect(await screen.findByText('stale')).toBeInTheDocument();
+    expect(screen.getByText('0.1.17')).toBeInTheDocument();
+    expect(screen.getByText('0.1.16')).toBeInTheDocument();
+    expect(screen.getAllByText('Outdated')).toHaveLength(1);
+    expect(screen.getByText('Agent')).toBeInTheDocument();
+  });
+});
+
+describe('Workers page: remote agent update (spec 2026-09-24 §2.2)', () => {
+  afterEach(() => {
+    cleanup();
+    vi.unstubAllGlobals();
+    vi.restoreAllMocks();
+  });
+
+  const LATEST = '0.1.19';
+
+  const OUTDATED_ONLINE: Worker = { ...BASE_WORKER, id: 'w-out', name: 'outdated-online', hardware: { agent_version: '0.1.18' } };
+  const OUTDATED_BUSY: Worker = { ...BASE_WORKER, id: 'w-busy', name: 'outdated-busy', status: 'busy', hardware: { agent_version: '0.1.17' } };
+  const OUTDATED_OFFLINE: Worker = { ...BASE_WORKER, id: 'w-off', name: 'outdated-offline', status: 'offline', hardware: { agent_version: '0.1.18' } };
+  const OUTDATED_DISABLED: Worker = { ...BASE_WORKER, id: 'w-dis', name: 'outdated-disabled', disabled: true, hardware: { agent_version: '0.1.18' } };
+  const CURRENT_ONLINE: Worker = { ...BASE_WORKER, id: 'w-cur', name: 'current-online', hardware: { agent_version: LATEST } };
+  const UNKNOWN_VERSION: Worker = { ...BASE_WORKER, id: 'w-unk', name: 'unknown-version', hardware: {} };
+
+  /** Serves the list + the published latest, and answers each
+   * `POST /api/workers/:id/update` from `answers` (an ApiError-shaped body
+   * with `status` for the error paths). */
+  function stubFetchWithUpdate(
+    workers: Worker[],
+    answers: Record<string, { body: unknown; status?: number }> = {},
+  ) {
+    const fetchMock = vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+      const url = typeof input === 'string' ? input : input.toString();
+      if (url.startsWith('/api/agent/version')) {
+        return jsonResponse({ latest: LATEST, min_supported: '0.1.0', wheel_url: null, sha256: null, platform_sig: null });
+      }
+      const updateMatch = /^\/api\/workers\/([^/]+)\/update$/.exec(url);
+      if (updateMatch && init?.method === 'POST') {
+        const answer = answers[decodeURIComponent(updateMatch[1]!)] ?? { body: { status: 'updating', detail: '' } };
+        return jsonResponse(answer.body, answer.status ?? 200);
+      }
+      if (url.startsWith('/api/workers')) return jsonResponse(workers);
+      return jsonResponse({ error: { code: 'http_error', message: 'not stubbed' } }, 404);
+    });
+    vi.stubGlobal('fetch', fetchMock);
+    return fetchMock;
+  }
+
+  function updateCalls(fetchMock: ReturnType<typeof vi.fn>): string[] {
+    return fetchMock.mock.calls
+      .filter(([, init]) => (init as RequestInit | undefined)?.method === 'POST')
+      .map(([input]) => (typeof input === 'string' ? input : String(input)))
+      .filter((url) => url.endsWith('/update'));
+  }
+
+  it('shows the per-row Update button only for online, enabled, outdated workers (admin)', async () => {
+    stubFetchWithUpdate([OUTDATED_ONLINE, OUTDATED_BUSY, OUTDATED_OFFLINE, OUTDATED_DISABLED, CURRENT_ONLINE, UNKNOWN_VERSION]);
+    renderWorkers('admin');
+
+    expect(await screen.findByText('outdated-online')).toBeInTheDocument();
+    // The published latest arrives asynchronously; wait for the buttons.
+    await waitFor(() => expect(screen.getAllByRole('button', { name: 'Update' })).toHaveLength(2));
+
+    const rowOf = (name: string) => screen.getByText(name).closest('tr')!;
+    expect(rowOf('outdated-online').querySelector('button[name="update"], button')).toBeTruthy();
+    const hasUpdate = (name: string) =>
+      Array.from(rowOf(name).querySelectorAll('button')).some((b) => b.textContent === 'Update');
+    expect(hasUpdate('outdated-online')).toBe(true);
+    expect(hasUpdate('outdated-busy')).toBe(true);
+    expect(hasUpdate('outdated-offline')).toBe(false);
+    expect(hasUpdate('outdated-disabled')).toBe(false);
+    expect(hasUpdate('current-online')).toBe(false);
+    expect(hasUpdate('unknown-version')).toBe(false);
+
+    expect(screen.getByRole('button', { name: 'Update all' })).toBeInTheDocument();
+  });
+
+  it('hides both update controls from a non-admin', async () => {
+    stubFetchWithUpdate([OUTDATED_ONLINE]);
+    renderWorkers('user');
+
+    expect(await screen.findByText('outdated-online')).toBeInTheDocument();
+    await waitFor(() => expect(screen.getByText('Outdated')).toBeInTheDocument());
+    expect(screen.queryByRole('button', { name: 'Update' })).not.toBeInTheDocument();
+    expect(screen.queryByRole('button', { name: 'Update all' })).not.toBeInTheDocument();
+  });
+
+  it('hides "Update all" when no row qualifies', async () => {
+    stubFetchWithUpdate([CURRENT_ONLINE, OUTDATED_OFFLINE]);
+    renderWorkers('admin');
+
+    expect(await screen.findByText('current-online')).toBeInTheDocument();
+    await waitFor(() => expect(screen.getByText('Outdated')).toBeInTheDocument());
+    expect(screen.queryByRole('button', { name: 'Update all' })).not.toBeInTheDocument();
+  });
+
+  it('clicking Update POSTs to /update and shows the per-status message', async () => {
+    const fetchMock = stubFetchWithUpdate([OUTDATED_ONLINE], {
+      'w-out': { body: { status: 'deferred', detail: 'busy' } },
+    });
+    const show = vi.spyOn(notifications, 'show').mockImplementation(() => 'id');
+    renderWorkers('admin');
+
+    const button = await screen.findByRole('button', { name: 'Update' });
+    fireEvent.click(button);
+
+    await waitFor(() => expect(updateCalls(fetchMock)).toEqual(['/api/workers/w-out/update']));
+    await waitFor(() =>
+      expect(show).toHaveBeenCalledWith(
+        expect.objectContaining({ message: 'Busy with a job; it will update as soon as that job finishes' }),
+      ),
+    );
+  });
+
+  it('shows the agent-too-old error from the server as a red notification', async () => {
+    stubFetchWithUpdate([OUTDATED_ONLINE], {
+      'w-out': { status: 409, body: { error: { code: 'workers.agent_too_old', message: 'server says too old' } } },
+    });
+    const show = vi.spyOn(notifications, 'show').mockImplementation(() => 'id');
+    renderWorkers('admin');
+
+    fireEvent.click(await screen.findByRole('button', { name: 'Update' }));
+
+    await waitFor(() =>
+      expect(show).toHaveBeenCalledWith(
+        expect.objectContaining({
+          color: 'red',
+          title: 'Update command failed',
+          message: expect.stringContaining('too old'),
+        }),
+      ),
+    );
+  });
+
+  it('"Update all" calls /update for every qualifying row and shows one summary', async () => {
+    const fetchMock = stubFetchWithUpdate([OUTDATED_ONLINE, OUTDATED_BUSY, OUTDATED_OFFLINE, CURRENT_ONLINE], {
+      'w-out': { body: { status: 'updating', detail: '' } },
+      'w-busy': { status: 409, body: { error: { code: 'workers.offline', message: 'gone' } } },
+    });
+    const show = vi.spyOn(notifications, 'show').mockImplementation(() => 'id');
+    renderWorkers('admin');
+
+    fireEvent.click(await screen.findByRole('button', { name: 'Update all' }));
+
+    await waitFor(() =>
+      expect(updateCalls(fetchMock)).toEqual(['/api/workers/w-out/update', '/api/workers/w-busy/update']),
+    );
+    await waitFor(() =>
+      expect(show).toHaveBeenCalledWith(expect.objectContaining({ message: 'Sent to 1 worker(s), 1 failed' })),
+    );
+    expect(show).toHaveBeenCalledTimes(1);
+  });
+});

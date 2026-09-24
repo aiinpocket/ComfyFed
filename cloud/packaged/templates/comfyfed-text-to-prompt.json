@@ -1,0 +1,601 @@
+{
+ "last_node_id": 103,
+ "last_link_id": 8,
+ "nodes": [
+  {
+   "id": 100,
+   "type": "MarkdownNote",
+   "pos": [
+    0,
+    -900
+   ],
+   "size": [
+    1620,
+    380
+   ],
+   "flags": {},
+   "order": 9,
+   "mode": 0,
+   "inputs": [],
+   "outputs": [],
+   "title": "⓪ 缺模型？/ Missing models?",
+   "properties": {},
+   "widgets_values": [
+    "**繁體中文**\n\n全新安裝沒有模型檔，這支「文字生提示詞」範本需要以下 1 個檔案：\n\n- `qwen3-vl-4b-heretic.safetensors` → 放到 `ComfyUI/models/text_encoders/` → 8.27 GB\n  官方載點：https://huggingface.co/DreamFast/Qwen3-VL-4b-Heretic-ComfyUI/resolve/main/qwen3-vl-4b-heretic.safetensors\n  （這是 Qwen3-VL-4B-Instruct 的 Heretic 無審查版，寫露骨提示詞時不會被拒絕；平台目前沒有這顆的備份鏡像，請走官方載點。）\n\n共約 8.27 GB。放好檔案後**不用重啟 ComfyUI 或 worker**：ComfyFed agent 每 10 分鐘自動重掃模型庫存並回報平台，評估會自動轉綠；急著馬上生效的話，手動重啟 agent 即可。\n\n---\n\n**English**\n\nA fresh install has none of these files. The \"Text to prompt\" template needs 1 file:\n\n- `qwen3-vl-4b-heretic.safetensors` -> `ComfyUI/models/text_encoders/` -> 8.27 GB\n  官方載點：https://huggingface.co/DreamFast/Qwen3-VL-4b-Heretic-ComfyUI/resolve/main/qwen3-vl-4b-heretic.safetensors\n  (This is the Heretic-abliterated, uncensored build of Qwen3-VL-4B-Instruct, so it will not refuse an explicit prompt request. There is no ComfyFed backup mirror for this one yet, so use the official link.)\n\n~8.27 GB total. No restart needed after placing the file: the ComfyFed agent rescans its model inventory every 10 minutes and reports back, and the assessment turns green automatically once it does. Restart the agent if you want it to take effect immediately."
+   ],
+   "color": "#432",
+   "bgcolor": "#653"
+  },
+  {
+   "id": 1,
+   "type": "PrimitiveStringMultiline",
+   "pos": [
+    0,
+    120
+   ],
+   "size": [
+    420,
+    220
+   ],
+   "flags": {},
+   "order": 0,
+   "mode": 0,
+   "inputs": [],
+   "outputs": [
+    {
+     "name": "STRING",
+     "type": "STRING",
+     "slot_index": 0,
+     "links": [
+      2
+     ]
+    }
+   ],
+   "properties": {
+    "Node name for S&R": "PrimitiveStringMultiline"
+   },
+   "widgets_values": [
+    "一個武俠風的女劍客站在竹林裡，有霧，很有氣氛"
+   ],
+   "title": "想法 ← 只改這裡 / your idea, edit here",
+   "bgcolor": "#533",
+   "color": "#a33"
+  },
+  {
+   "id": 2,
+   "type": "PrimitiveStringMultiline",
+   "pos": [
+    480,
+    120
+   ],
+   "size": [
+    400,
+    260
+   ],
+   "flags": {},
+   "order": 1,
+   "mode": 0,
+   "inputs": [],
+   "outputs": [
+    {
+     "name": "STRING",
+     "type": "STRING",
+     "slot_index": 0,
+     "links": [
+      1
+     ]
+    }
+   ],
+   "properties": {
+    "Node name for S&R": "PrimitiveStringMultiline"
+   },
+   "widgets_values": [
+    "<|im_start|>user\n/no_think 你是提示詞專家。把下面的想法整理成一段結構完整的英文提示詞：包含主體、外觀細節、動作、環境、光線、風格與畫質關鍵字，適合 AI 文生圖／生影片使用。使用者的想法可能是中文或英文。只輸出英文提示詞本身，不要解釋。\n\n想法："
+   ],
+   "title": "指令前段（別動）/ instruction prefix (leave as is)",
+   "bgcolor": "#323",
+   "color": "#535"
+  },
+  {
+   "id": 3,
+   "type": "PrimitiveStringMultiline",
+   "pos": [
+    480,
+    420
+   ],
+   "size": [
+    400,
+    200
+   ],
+   "flags": {},
+   "order": 2,
+   "mode": 0,
+   "inputs": [],
+   "outputs": [
+    {
+     "name": "STRING",
+     "type": "STRING",
+     "slot_index": 0,
+     "links": [
+      4
+     ]
+    }
+   ],
+   "properties": {
+    "Node name for S&R": "PrimitiveStringMultiline"
+   },
+   "widgets_values": [
+    "<|im_end|>\n<|im_start|>assistant\n"
+   ],
+   "title": "指令後段（別動）/ instruction suffix (leave as is)",
+   "bgcolor": "#323",
+   "color": "#535"
+  },
+  {
+   "id": 4,
+   "type": "StringConcatenate",
+   "pos": [
+    920,
+    120
+   ],
+   "size": [
+    340,
+    150
+   ],
+   "flags": {},
+   "order": 3,
+   "mode": 0,
+   "inputs": [
+    {
+     "name": "string_a",
+     "type": "STRING",
+     "link": 1,
+     "widget": {
+      "name": "string_a"
+     }
+    },
+    {
+     "name": "string_b",
+     "type": "STRING",
+     "link": 2,
+     "widget": {
+      "name": "string_b"
+     }
+    }
+   ],
+   "outputs": [
+    {
+     "name": "STRING",
+     "type": "STRING",
+     "slot_index": 0,
+     "links": [
+      3
+     ]
+    }
+   ],
+   "properties": {
+    "Node name for S&R": "StringConcatenate"
+   },
+   "widgets_values": [
+    "",
+    "",
+    ""
+   ],
+   "title": "組合1：前段＋想法（別動）/ assemble 1: prefix + idea (leave as is)",
+   "bgcolor": "#323",
+   "color": "#535"
+  },
+  {
+   "id": 5,
+   "type": "StringConcatenate",
+   "pos": [
+    920,
+    420
+   ],
+   "size": [
+    340,
+    150
+   ],
+   "flags": {},
+   "order": 4,
+   "mode": 0,
+   "inputs": [
+    {
+     "name": "string_a",
+     "type": "STRING",
+     "link": 3,
+     "widget": {
+      "name": "string_a"
+     }
+    },
+    {
+     "name": "string_b",
+     "type": "STRING",
+     "link": 4,
+     "widget": {
+      "name": "string_b"
+     }
+    }
+   ],
+   "outputs": [
+    {
+     "name": "STRING",
+     "type": "STRING",
+     "slot_index": 0,
+     "links": [
+      5
+     ]
+    }
+   ],
+   "properties": {
+    "Node name for S&R": "StringConcatenate"
+   },
+   "widgets_values": [
+    "",
+    "",
+    ""
+   ],
+   "title": "組合2：加上後段（別動）/ assemble 2: append suffix (leave as is)",
+   "bgcolor": "#323",
+   "color": "#535"
+  },
+  {
+   "id": 6,
+   "type": "CLIPLoader",
+   "pos": [
+    480,
+    700
+   ],
+   "size": [
+    340,
+    106
+   ],
+   "flags": {},
+   "order": 5,
+   "mode": 0,
+   "inputs": [],
+   "outputs": [
+    {
+     "name": "CLIP",
+     "type": "CLIP",
+     "slot_index": 0,
+     "links": [
+      6
+     ]
+    }
+   ],
+   "properties": {
+    "Node name for S&R": "CLIPLoader"
+   },
+   "widgets_values": [
+    "qwen3-vl-4b-heretic.safetensors",
+    "qwen_image",
+    "default"
+   ],
+   "title": "文字編碼器（別動）/ text encoder (leave as is)",
+   "bgcolor": "#323",
+   "color": "#535"
+  },
+  {
+   "id": 7,
+   "type": "TextGenerate",
+   "pos": [
+    1340,
+    120
+   ],
+   "size": [
+    420,
+    480
+   ],
+   "flags": {},
+   "order": 6,
+   "mode": 0,
+   "inputs": [
+    {
+     "name": "clip",
+     "type": "CLIP",
+     "link": 6
+    },
+    {
+     "name": "prompt",
+     "type": "STRING",
+     "link": 5,
+     "widget": {
+      "name": "prompt"
+     }
+    }
+   ],
+   "outputs": [
+    {
+     "name": "generated_text",
+     "type": "STRING",
+     "slot_index": 0,
+     "links": [
+      7,
+      8
+     ]
+    }
+   ],
+   "properties": {
+    "Node name for S&R": "TextGenerate"
+   },
+   "widgets_values": [
+    "",
+    400,
+    "on",
+    0.05,
+    1.05,
+    0,
+    0.7,
+    64,
+    0.95,
+    0.0,
+    false,
+    false
+   ],
+   "title": "AI 寫提示詞 / AI writes the prompt"
+  },
+  {
+   "id": 8,
+   "type": "SaveText",
+   "pos": [
+    1820,
+    120
+   ],
+   "size": [
+    340,
+    150
+   ],
+   "flags": {},
+   "order": 7,
+   "mode": 0,
+   "inputs": [
+    {
+     "name": "text",
+     "type": "STRING",
+     "link": 7
+    }
+   ],
+   "outputs": [
+    {
+     "name": "text",
+     "type": "STRING",
+     "slot_index": 0,
+     "links": []
+    }
+   ],
+   "properties": {
+    "Node name for S&R": "SaveText"
+   },
+   "widgets_values": [
+    "comfyfed_prompt",
+    "txt"
+   ]
+  },
+  {
+   "id": 9,
+   "type": "PreviewAny",
+   "pos": [
+    1820,
+    320
+   ],
+   "size": [
+    340,
+    220
+   ],
+   "flags": {},
+   "order": 8,
+   "mode": 0,
+   "inputs": [
+    {
+     "name": "source",
+     "type": "STRING",
+     "link": 8
+    }
+   ],
+   "outputs": [
+    {
+     "name": "STRING",
+     "type": "STRING",
+     "slot_index": 0,
+     "links": []
+    }
+   ],
+   "properties": {
+    "Node name for S&R": "PreviewAny"
+   },
+   "widgets_values": [],
+   "title": "預覽 / Preview"
+  },
+  {
+   "id": 101,
+   "type": "MarkdownNote",
+   "pos": [
+    0,
+    -480
+   ],
+   "size": [
+    760,
+    420
+   ],
+   "flags": {},
+   "order": 10,
+   "mode": 0,
+   "inputs": [],
+   "outputs": [],
+   "title": "① 用途＋紅框=至少改這裡 / What to edit (red-framed nodes)",
+   "properties": {},
+   "widgets_values": [
+    "**繁體中文**\n\n紅框的節點只有一個：把想法寫成一句話就好，中文英文都可以，不用照著範本的武俠風格寫，AI 會自己整理成結構完整的英文提示詞。\n\n下面兩個灰色的「別動」節點是固定的指令模板，把你的想法包在中間，不需要也不應該去改它們。\n\n---\n\n**English**\n\nOnly one node is red-framed: type your idea as a plain sentence, in Chinese or English, in whatever style you like -- it does not need to be wuxia-themed like the sample, the AI restructures it into a proper English prompt regardless. The two dim \"leave as is\" nodes below it are a fixed instruction template that wraps around your idea; they do not need, and should not, be edited."
+   ],
+   "color": "#432",
+   "bgcolor": "#653"
+  },
+  {
+   "id": 102,
+   "type": "MarkdownNote",
+   "pos": [
+    800,
+    -480
+   ],
+   "size": [
+    480,
+    420
+   ],
+   "flags": {},
+   "order": 11,
+   "mode": 0,
+   "inputs": [],
+   "outputs": [],
+   "title": "② 這在做什麼 / What this does",
+   "properties": {},
+   "widgets_values": [
+    "**繁體中文**\n\n一句話：AI 讀你寫的想法，重新整理成一段結構完整、可以直接拿去生圖或生影片的英文提示詞。\n\n兩個 `StringConcatenate` 把「固定指令」和「你的想法」接在一起，組成完整的一句話餵給 `TextGenerate`；因為這裡沒有圖片輸入，`use_default_template` 要關掉，不然模型會直接輸出空字串。\n\n這顆是 **Qwen3-VL-4B Heretic（無審查版）**：同一顆 Qwen3-VL-4B-Instruct 經過 Heretic abliteration，寫露骨或重口味的提示詞時不會被拒絕，也不會自己把描述沖淡。\n\n---\n\n**English**\n\nIn one line: the AI reads your idea and rewrites it into a properly structured English prompt you can paste straight into another text-to-image or text-to-video template. The two `StringConcatenate` nodes stitch the fixed instruction template and your idea into one string fed to `TextGenerate`; since there is no image input here, `use_default_template` is switched off -- leaving it on for a text-only prompt makes the model return an empty string. The model behind this is **Qwen3-VL-4B Heretic (uncensored)** -- the same Qwen3-VL-4B-Instruct after Heretic abliteration, so an explicit or extreme prompt request is neither refused nor quietly watered down."
+   ],
+   "color": "#432",
+   "bgcolor": "#653"
+  },
+  {
+   "id": 103,
+   "type": "MarkdownNote",
+   "pos": [
+    1300,
+    -480
+   ],
+   "size": [
+    700,
+    420
+   ],
+   "flags": {},
+   "order": 12,
+   "mode": 0,
+   "inputs": [],
+   "outputs": [],
+   "title": "③ 結果在哪＋怎麼用 / Where the result is and how to use it",
+   "properties": {},
+   "widgets_values": [
+    "**繁體中文**\n\n跑完後結果直接顯示在 `PreviewAny`（「預覽」）節點裡——全選複製，貼到「文生圖」等其他範本的提示詞欄再微調即可（這是文字生提示詞範本，寫出的是把你想法整理過的提示詞）。同時也會存成 `comfyfed_prompt.txt`，可以到 Console 的「工作」頁面下載。\n\n---\n\n**English**\n\nOnce the job finishes, the result shows up directly inside the `PreviewAny` node -- select all, copy, and paste it into the prompt field of another template (like \"Text-to-image\") to fine-tune from there (this is the text-to-prompt template, so the prompt is your idea reorganized into proper form). It is also saved as `comfyfed_prompt.txt`, downloadable from the console's Jobs page."
+   ],
+   "color": "#432",
+   "bgcolor": "#653"
+  }
+ ],
+ "links": [
+  [
+   1,
+   2,
+   0,
+   4,
+   0,
+   "STRING"
+  ],
+  [
+   2,
+   1,
+   0,
+   4,
+   1,
+   "STRING"
+  ],
+  [
+   3,
+   4,
+   0,
+   5,
+   0,
+   "STRING"
+  ],
+  [
+   4,
+   3,
+   0,
+   5,
+   1,
+   "STRING"
+  ],
+  [
+   5,
+   5,
+   0,
+   7,
+   1,
+   "STRING"
+  ],
+  [
+   6,
+   6,
+   0,
+   7,
+   0,
+   "CLIP"
+  ],
+  [
+   7,
+   7,
+   0,
+   8,
+   0,
+   "STRING"
+  ],
+  [
+   8,
+   7,
+   0,
+   9,
+   0,
+   "STRING"
+  ]
+ ],
+ "groups": [
+  {
+   "id": 1,
+   "title": "①想法 / Your idea — 只改這一格",
+   "bounding": [
+    -20,
+    40,
+    460,
+    340
+   ],
+   "color": "#a1309b",
+   "font_size": 24,
+   "flags": {}
+  },
+  {
+   "id": 2,
+   "title": "②別動：組裝提示詞 / Don't touch: prompt assembly",
+   "bounding": [
+    460,
+    40,
+    1300,
+    860
+   ],
+   "color": "#3f789e",
+   "font_size": 24,
+   "flags": {}
+  },
+  {
+   "id": 3,
+   "title": "③輸出 / Output",
+   "bounding": [
+    1800,
+    40,
+    400,
+    620
+   ],
+   "color": "#3f9e5a",
+   "font_size": 24,
+   "flags": {}
+  }
+ ],
+ "config": {},
+ "extra": {
+  "ds": {
+   "scale": 0.5,
+   "offset": [
+    420,
+    980
+   ]
+  }
+ },
+ "version": 0.4
+}

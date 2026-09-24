@@ -1,0 +1,570 @@
+{
+  "signature_cases": [
+    {
+      "name": "flux 512 4-step batch 2",
+      "workflow": {
+        "1": {
+          "class_type": "UNETLoader",
+          "inputs": {
+            "unet_name": "flux1-dev.safetensors"
+          }
+        },
+        "2": {
+          "class_type": "CLIPTextEncode",
+          "inputs": {
+            "text": "wuxia swordsman"
+          }
+        },
+        "3": {
+          "class_type": "EmptyLatentImage",
+          "inputs": {
+            "width": 512,
+            "height": 512,
+            "batch_size": 2
+          }
+        },
+        "4": {
+          "class_type": "KSampler",
+          "inputs": {
+            "steps": 4,
+            "seed": 424242
+          }
+        },
+        "5": {
+          "class_type": "VAEDecode",
+          "inputs": {}
+        },
+        "6": {
+          "class_type": "SaveImage",
+          "inputs": {}
+        }
+      },
+      "expected": "32272a9931ef180e"
+    },
+    {
+      "name": "zero model stitch job",
+      "workflow": {
+        "1": {
+          "class_type": "LoadImage",
+          "inputs": {
+            "image": "input.png"
+          }
+        },
+        "2": {
+          "class_type": "SaveImage",
+          "inputs": {
+            "images": [
+              "1",
+              0
+            ]
+          }
+        }
+      },
+      "expected": "eba78a4f5b0f1ffc"
+    }
+  ],
+  "hungarian_cases": [
+    {
+      "name": "known optimal 4x4",
+      "matrix": [
+        [
+          82,
+          83,
+          69,
+          92
+        ],
+        [
+          77,
+          37,
+          49,
+          92
+        ],
+        [
+          11,
+          69,
+          5,
+          86
+        ],
+        [
+          8,
+          9,
+          98,
+          23
+        ]
+      ],
+      "expected_pairs": [
+        [
+          0,
+          2
+        ],
+        [
+          1,
+          1
+        ],
+        [
+          2,
+          0
+        ],
+        [
+          3,
+          3
+        ]
+      ]
+    },
+    {
+      "name": "3 jobs x 5 workers with forbidden cells",
+      "matrix": [
+        [
+          10,
+          null,
+          30,
+          40,
+          50
+        ],
+        [
+          null,
+          20,
+          35,
+          45,
+          55
+        ],
+        [
+          60,
+          70,
+          15,
+          80,
+          90
+        ]
+      ],
+      "expected_pairs": [
+        [
+          0,
+          0
+        ],
+        [
+          1,
+          1
+        ],
+        [
+          2,
+          2
+        ]
+      ]
+    },
+    {
+      "name": "all forbidden",
+      "matrix": [
+        [
+          null,
+          null
+        ],
+        [
+          null,
+          null
+        ]
+      ],
+      "expected_pairs": []
+    },
+    {
+      "name": "negative objective values (cost minus BIG)",
+      "matrix": [
+        [
+          -999999995.0,
+          -999999950.0
+        ],
+        [
+          -999999960.0,
+          -999999990.0
+        ]
+      ],
+      "expected_pairs": [
+        [
+          0,
+          0
+        ],
+        [
+          1,
+          1
+        ]
+      ]
+    },
+    {
+      "name": "all ties",
+      "matrix": [
+        [
+          1,
+          1
+        ],
+        [
+          1,
+          1
+        ]
+      ],
+      "expected_pairs": [
+        [
+          0,
+          0
+        ],
+        [
+          1,
+          1
+        ]
+      ]
+    },
+    {
+      "name": "deficient square graph (jobs 0 and 1 share the only feasible worker)",
+      "matrix": [
+        [
+          -999999990.0,
+          null,
+          null
+        ],
+        [
+          -999999970.0,
+          null,
+          null
+        ],
+        [
+          -999999980.0,
+          -999999950.0,
+          -999999940.0
+        ]
+      ],
+      "expected_pairs": [
+        [
+          0,
+          0
+        ],
+        [
+          2,
+          1
+        ]
+      ]
+    },
+    {
+      "name": "all-forbidden row must not quantise the surviving costs",
+      "matrix": [
+        [
+          null,
+          -1098999874.906086
+        ],
+        [
+          null,
+          -1098999996.121946
+        ]
+      ],
+      "expected_pairs": [
+        [
+          1,
+          1
+        ]
+      ]
+    }
+  ],
+  "cost_cases": [
+    {
+      "name": "heavy job, one cold 6 GB model, 24 GB free",
+      "job": {
+        "job_id": "j1",
+        "signature": "sig",
+        "created_at": "2026-09-15T12:00:00",
+        "is_light": false,
+        "required_models": [
+          "flux1-dev.safetensors"
+        ]
+      },
+      "worker": {
+        "worker_id": "w1",
+        "name": "w1",
+        "backend": "cuda",
+        "free_vram_gb": 24.0,
+        "warm_models": [],
+        "inventory": [
+          {
+            "name": "unet/flux1-dev.safetensors",
+            "size": 6.0
+          }
+        ]
+      },
+      "pair": {
+        "kind": "eligible",
+        "has_warnings": false,
+        "total_fetch_bytes": 0
+      },
+      "predicted_seconds": 40.0,
+      "tier1_exists": true,
+      "expected_cost": 49.000976
+    },
+    {
+      "name": "light job on a big cuda card",
+      "job": {
+        "job_id": "j2",
+        "signature": null,
+        "created_at": "2026-09-15T12:00:00",
+        "is_light": true,
+        "required_models": []
+      },
+      "worker": {
+        "worker_id": "w2",
+        "name": "w2",
+        "backend": "cuda",
+        "free_vram_gb": 32.0,
+        "warm_models": [],
+        "inventory": []
+      },
+      "pair": {
+        "kind": "eligible",
+        "has_warnings": false,
+        "total_fetch_bytes": 0
+      },
+      "predicted_seconds": 12.0,
+      "tier1_exists": true,
+      "expected_cost": 232.032
+    },
+    {
+      "name": "warned fetch candidate with no tier-1 rival",
+      "job": {
+        "job_id": "j3",
+        "signature": "sig",
+        "created_at": "2026-09-15T12:00:00",
+        "is_light": false,
+        "required_models": [
+          "big.safetensors"
+        ]
+      },
+      "worker": {
+        "worker_id": "w3",
+        "name": "w3",
+        "backend": "cuda",
+        "free_vram_gb": 8.0,
+        "warm_models": [],
+        "inventory": []
+      },
+      "pair": {
+        "kind": "eligible_after_fetch",
+        "has_warnings": true,
+        "total_fetch_bytes": 500000000
+      },
+      "predicted_seconds": 60.0,
+      "tier1_exists": false,
+      "expected_cost": 1000070.000992
+    }
+  ],
+  "hold_cases": [
+    {
+      "name": "single job clearly faster to wait",
+      "jobs": [
+        {
+          "job_id": "j1",
+          "signature": "sig",
+          "is_light": false,
+          "required_models": [
+            "flux1-dev.safetensors"
+          ]
+        }
+      ],
+      "workers": [
+        {
+          "worker_id": "mac",
+          "name": "mac",
+          "backend": "mps",
+          "free_vram_gb": 0.0,
+          "warm_models": [
+            "flux1-dev.safetensors"
+          ],
+          "inventory": [
+            {
+              "name": "unet/flux1-dev.safetensors",
+              "size": 6.0
+            }
+          ]
+        }
+      ],
+      "busy": [
+        {
+          "worker_id": "nv",
+          "name": "nv",
+          "backend": "cuda",
+          "eta_seconds": 300.0,
+          "warm_models": [
+            "flux1-dev.safetensors"
+          ],
+          "inventory": [
+            {
+              "name": "unet/flux1-dev.safetensors",
+              "size": 6.0
+            }
+          ]
+        }
+      ],
+      "pairs": {
+        "j1|mac": {
+          "kind": "eligible",
+          "has_warnings": false,
+          "total_fetch_bytes": 0
+        },
+        "j1|nv": {
+          "kind": "eligible",
+          "has_warnings": false,
+          "total_fetch_bytes": 0
+        }
+      },
+      "predictions": {
+        "j1|mac": 7200.0,
+        "j1|nv": 500.0
+      },
+      "expected_held_pairs": [
+        "j1|mac"
+      ],
+      "expected_holds": [
+        {
+          "job_id": "j1",
+          "worker_id": "nv",
+          "wait_seconds": 800.001,
+          "run_now_seconds": 7200.001
+        }
+      ]
+    },
+    {
+      "name": "four jobs: two wait, two overflow to the mac",
+      "jobs": [
+        {
+          "job_id": "j1",
+          "signature": "sig",
+          "is_light": false,
+          "required_models": [
+            "flux1-dev.safetensors"
+          ]
+        },
+        {
+          "job_id": "j2",
+          "signature": "sig",
+          "is_light": false,
+          "required_models": [
+            "flux1-dev.safetensors"
+          ]
+        },
+        {
+          "job_id": "j3",
+          "signature": "sig",
+          "is_light": false,
+          "required_models": [
+            "flux1-dev.safetensors"
+          ]
+        },
+        {
+          "job_id": "j4",
+          "signature": "sig",
+          "is_light": false,
+          "required_models": [
+            "flux1-dev.safetensors"
+          ]
+        }
+      ],
+      "workers": [
+        {
+          "worker_id": "mac",
+          "name": "mac",
+          "backend": "mps",
+          "free_vram_gb": 0.0,
+          "warm_models": [
+            "flux1-dev.safetensors"
+          ],
+          "inventory": [
+            {
+              "name": "unet/flux1-dev.safetensors",
+              "size": 6.0
+            }
+          ]
+        }
+      ],
+      "busy": [
+        {
+          "worker_id": "nv",
+          "name": "nv",
+          "backend": "cuda",
+          "eta_seconds": 300.0,
+          "warm_models": [
+            "flux1-dev.safetensors"
+          ],
+          "inventory": [
+            {
+              "name": "unet/flux1-dev.safetensors",
+              "size": 6.0
+            }
+          ]
+        }
+      ],
+      "pairs": {
+        "j1|mac": {
+          "kind": "eligible",
+          "has_warnings": false,
+          "total_fetch_bytes": 0
+        },
+        "j1|nv": {
+          "kind": "eligible",
+          "has_warnings": false,
+          "total_fetch_bytes": 0
+        },
+        "j2|mac": {
+          "kind": "eligible",
+          "has_warnings": false,
+          "total_fetch_bytes": 0
+        },
+        "j2|nv": {
+          "kind": "eligible",
+          "has_warnings": false,
+          "total_fetch_bytes": 0
+        },
+        "j3|mac": {
+          "kind": "eligible",
+          "has_warnings": false,
+          "total_fetch_bytes": 0
+        },
+        "j3|nv": {
+          "kind": "eligible",
+          "has_warnings": false,
+          "total_fetch_bytes": 0
+        },
+        "j4|mac": {
+          "kind": "eligible",
+          "has_warnings": false,
+          "total_fetch_bytes": 0
+        },
+        "j4|nv": {
+          "kind": "eligible",
+          "has_warnings": false,
+          "total_fetch_bytes": 0
+        }
+      },
+      "predictions": {
+        "j1|mac": 2000.0,
+        "j2|mac": 2000.0,
+        "j3|mac": 2000.0,
+        "j4|mac": 2000.0,
+        "j1|nv": 500.0,
+        "j2|nv": 500.0,
+        "j3|nv": 500.0,
+        "j4|nv": 500.0
+      },
+      "expected_held_pairs": [
+        "j1|mac",
+        "j2|mac"
+      ],
+      "expected_holds": [
+        {
+          "job_id": "j1",
+          "worker_id": "nv",
+          "wait_seconds": 800.001,
+          "run_now_seconds": 2000.001
+        },
+        {
+          "job_id": "j2",
+          "worker_id": "nv",
+          "wait_seconds": 1300.001,
+          "run_now_seconds": 2000.001
+        }
+      ]
+    }
+  ]
+}

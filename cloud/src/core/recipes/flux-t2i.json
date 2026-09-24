@@ -1,0 +1,236 @@
+{
+  "id": "flux-t2i",
+  "title": {
+    "zh-TW": "Flux 文生圖",
+    "en": "Flux text-to-image"
+  },
+  "description": {
+    "zh-TW": "用 Flux.1-dev 依文字提示產生一張圖；需要 flux1-dev、clip_l、t5xxl_fp16 與 ae 四個模型。",
+    "en": "Generate one image from a text prompt with Flux.1-dev; needs the flux1-dev, clip_l, t5xxl_fp16 and ae models."
+  },
+  "order": 30,
+  "nsfw_ok": false,
+  "params": [
+    {
+      "name": "prompt",
+      "type": "string",
+      "required": true,
+      "description": {
+        "zh-TW": "畫面描述（英文效果最好）",
+        "en": "What to draw (English works best)"
+      }
+    },
+    {
+      "name": "width",
+      "type": "integer",
+      "default": 768,
+      "min": 256,
+      "max": 2048,
+      "step": 16,
+      "description": {
+        "zh-TW": "寬度，16 的倍數",
+        "en": "Width, a multiple of 16"
+      }
+    },
+    {
+      "name": "height",
+      "type": "integer",
+      "default": 768,
+      "min": 256,
+      "max": 2048,
+      "step": 16,
+      "description": {
+        "zh-TW": "高度，16 的倍數",
+        "en": "Height, a multiple of 16"
+      }
+    },
+    {
+      "name": "steps",
+      "type": "integer",
+      "default": 8,
+      "min": 1,
+      "max": 50,
+      "description": {
+        "zh-TW": "取樣步數",
+        "en": "Sampling steps"
+      }
+    },
+    {
+      "name": "guidance",
+      "type": "number",
+      "default": 3.5,
+      "min": 0,
+      "max": 20,
+      "description": {
+        "zh-TW": "Flux guidance 強度",
+        "en": "Flux guidance strength"
+      }
+    },
+    {
+      "name": "seed",
+      "type": "integer",
+      "default": -1,
+      "min": -1,
+      "max": 4294967295,
+      "description": {
+        "zh-TW": "-1 = 隨機",
+        "en": "-1 = random"
+      }
+    }
+  ],
+  "required_models": [
+    "flux1-dev.safetensors",
+    "clip_l.safetensors",
+    "t5xxl_fp16.safetensors",
+    "ae.safetensors"
+  ],
+  "workflow": {
+    "1": {
+      "class_type": "UNETLoader",
+      "inputs": {
+        "unet_name": "flux1-dev.safetensors",
+        "weight_dtype": "default"
+      }
+    },
+    "2": {
+      "class_type": "DualCLIPLoader",
+      "inputs": {
+        "clip_name1": "clip_l.safetensors",
+        "clip_name2": "t5xxl_fp16.safetensors",
+        "type": "flux",
+        "device": "default"
+      }
+    },
+    "3": {
+      "class_type": "VAELoader",
+      "inputs": {
+        "vae_name": "ae.safetensors"
+      }
+    },
+    "4": {
+      "class_type": "CLIPTextEncode",
+      "inputs": {
+        "text": {
+          "$param": "prompt"
+        },
+        "clip": [
+          "2",
+          0
+        ]
+      }
+    },
+    "5": {
+      "class_type": "FluxGuidance",
+      "inputs": {
+        "conditioning": [
+          "4",
+          0
+        ],
+        "guidance": {
+          "$param": "guidance"
+        }
+      }
+    },
+    "6": {
+      "class_type": "BasicGuider",
+      "inputs": {
+        "model": [
+          "1",
+          0
+        ],
+        "conditioning": [
+          "5",
+          0
+        ]
+      }
+    },
+    "7": {
+      "class_type": "KSamplerSelect",
+      "inputs": {
+        "sampler_name": "euler"
+      }
+    },
+    "8": {
+      "class_type": "BasicScheduler",
+      "inputs": {
+        "model": [
+          "1",
+          0
+        ],
+        "scheduler": "simple",
+        "steps": {
+          "$param": "steps"
+        },
+        "denoise": 1
+      }
+    },
+    "9": {
+      "class_type": "RandomNoise",
+      "inputs": {
+        "noise_seed": {
+          "$param": "seed"
+        }
+      }
+    },
+    "10": {
+      "class_type": "EmptySD3LatentImage",
+      "inputs": {
+        "width": {
+          "$param": "width"
+        },
+        "height": {
+          "$param": "height"
+        },
+        "batch_size": 1
+      }
+    },
+    "11": {
+      "class_type": "SamplerCustomAdvanced",
+      "inputs": {
+        "noise": [
+          "9",
+          0
+        ],
+        "guider": [
+          "6",
+          0
+        ],
+        "sampler": [
+          "7",
+          0
+        ],
+        "sigmas": [
+          "8",
+          0
+        ],
+        "latent_image": [
+          "10",
+          0
+        ]
+      }
+    },
+    "12": {
+      "class_type": "VAEDecode",
+      "inputs": {
+        "samples": [
+          "11",
+          0
+        ],
+        "vae": [
+          "3",
+          0
+        ]
+      }
+    },
+    "13": {
+      "class_type": "SaveImage",
+      "inputs": {
+        "images": [
+          "12",
+          0
+        ],
+        "filename_prefix": "comfyfed_recipe"
+      }
+    }
+  }
+}

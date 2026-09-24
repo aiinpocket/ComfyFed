@@ -1,0 +1,325 @@
+{
+  "last_node_id": 103,
+  "last_link_id": 3,
+  "nodes": [
+    {
+      "id": 100,
+      "type": "MarkdownNote",
+      "pos": [
+        0,
+        -900
+      ],
+      "size": [
+        900,
+        420
+      ],
+      "flags": {},
+      "order": 0,
+      "mode": 0,
+      "inputs": [],
+      "outputs": [],
+      "title": "⓪ 缺模型？/ Missing models?",
+      "properties": {},
+      "widgets_values": [
+        "**繁體中文**\n\n全新安裝沒有模型檔，這支「圖片放大」範本需要以下 1 個檔案：\n\n- `RealESRGAN_x4plus.pth` → 放到 `ComfyUI/models/upscale_models/` → 0.06 GB\n  官方載點：https://github.com/xinntao/Real-ESRGAN/releases/download/v0.1.0/RealESRGAN_x4plus.pth\n  備份載點：https://storage.googleapis.com/comfyfed-models/models/upscale_models/RealESRGAN_x4plus.pth\n\n共約 0.06 GB。放好檔案後**不用重啟 ComfyUI 或 worker**：ComfyFed agent 每 10 分鐘自動重掃模型庫存並回報平台，評估會自動轉綠；急著馬上生效的話，手動重啟 agent 即可。\n\n---\n\n**English**\n\nA fresh install has none of these files. The \"Image upscale\" template needs 1 file:\n\n- `RealESRGAN_x4plus.pth` -> `ComfyUI/models/upscale_models/` -> 0.06 GB\n  官方載點：https://github.com/xinntao/Real-ESRGAN/releases/download/v0.1.0/RealESRGAN_x4plus.pth\n  備份載點：https://storage.googleapis.com/comfyfed-models/models/upscale_models/RealESRGAN_x4plus.pth\n\n~0.06 GB total. No restart needed after placing the file: the ComfyFed agent rescans its model inventory every 10 minutes and reports back, and the assessment turns green automatically once it does. Restart the agent if you want it to take effect immediately."
+      ],
+      "color": "#432",
+      "bgcolor": "#653"
+    },
+    {
+      "id": 1,
+      "type": "LoadImage",
+      "pos": [
+        0,
+        140
+      ],
+      "size": [
+        320,
+        350
+      ],
+      "flags": {},
+      "order": 1,
+      "mode": 0,
+      "inputs": [],
+      "outputs": [
+        {
+          "name": "IMAGE",
+          "type": "IMAGE",
+          "slot_index": 0,
+          "links": [
+            1
+          ]
+        },
+        {
+          "name": "MASK",
+          "type": "MASK",
+          "slot_index": 1,
+          "links": []
+        }
+      ],
+      "properties": {
+        "Node name for S&R": "LoadImage"
+      },
+      "widgets_values": [
+        "amyntas_ref.png",
+        "image"
+      ],
+      "title": "圖片 ← 換成你的圖 / swap for yours",
+      "bgcolor": "#533",
+      "color": "#a33"
+    },
+    {
+      "id": 2,
+      "type": "UpscaleModelLoader",
+      "pos": [
+        0,
+        560
+      ],
+      "size": [
+        320,
+        58
+      ],
+      "flags": {},
+      "order": 2,
+      "mode": 0,
+      "inputs": [],
+      "outputs": [
+        {
+          "name": "UPSCALE_MODEL",
+          "type": "UPSCALE_MODEL",
+          "slot_index": 0,
+          "links": [
+            2
+          ]
+        }
+      ],
+      "properties": {
+        "Node name for S&R": "UpscaleModelLoader"
+      },
+      "widgets_values": [
+        "RealESRGAN_x4plus.pth"
+      ]
+    },
+    {
+      "id": 3,
+      "type": "ImageUpscaleWithModel",
+      "pos": [
+        400,
+        140
+      ],
+      "size": [
+        280,
+        60
+      ],
+      "flags": {},
+      "order": 3,
+      "mode": 0,
+      "inputs": [
+        {
+          "name": "upscale_model",
+          "type": "UPSCALE_MODEL",
+          "link": 2
+        },
+        {
+          "name": "image",
+          "type": "IMAGE",
+          "link": 1
+        }
+      ],
+      "outputs": [
+        {
+          "name": "IMAGE",
+          "type": "IMAGE",
+          "slot_index": 0,
+          "links": [
+            3
+          ]
+        }
+      ],
+      "properties": {
+        "Node name for S&R": "ImageUpscaleWithModel"
+      },
+      "widgets_values": [],
+      "title": "4× 放大 / 4x upscale"
+    },
+    {
+      "id": 4,
+      "type": "SaveImage",
+      "pos": [
+        740,
+        140
+      ],
+      "size": [
+        480,
+        420
+      ],
+      "flags": {},
+      "order": 4,
+      "mode": 0,
+      "inputs": [
+        {
+          "name": "images",
+          "type": "IMAGE",
+          "link": 3
+        }
+      ],
+      "outputs": [],
+      "properties": {
+        "Node name for S&R": "SaveImage"
+      },
+      "widgets_values": [
+        "comfyfed_upscale"
+      ]
+    },
+    {
+      "id": 101,
+      "type": "MarkdownNote",
+      "pos": [
+        0,
+        -480
+      ],
+      "size": [
+        380,
+        420
+      ],
+      "flags": {},
+      "order": 5,
+      "mode": 0,
+      "inputs": [],
+      "outputs": [],
+      "title": "① 換圖就好 / Just swap the image",
+      "properties": {},
+      "widgets_values": [
+        "**繁體中文**\n\n紅框的 `LoadImage` 是你唯一要改的地方：換成自己想放大的圖\n（拖曳上傳，或用下拉選單選平台已有的檔案）。其他節點都不用動。\n\n---\n\n**English**\n\nThe red-framed `LoadImage` is the only thing you need to touch: swap in\nwhatever picture you want upscaled (drag your own file onto the node, or\npick one already staged on the platform). Leave everything else alone."
+      ],
+      "color": "#432",
+      "bgcolor": "#653"
+    },
+    {
+      "id": 102,
+      "type": "MarkdownNote",
+      "pos": [
+        400,
+        -480
+      ],
+      "size": [
+        380,
+        420
+      ],
+      "flags": {},
+      "order": 6,
+      "mode": 0,
+      "inputs": [],
+      "outputs": [],
+      "title": "② 4× 放大 / 4x upscale",
+      "properties": {},
+      "widgets_values": [
+        "**繁體中文**\n\n`UpscaleModelLoader` 載入 RealESRGAN 這顆超解析度模型，`ImageUpscaleWithModel`\n用它把圖片的長寬各放大 4 倍（面積放大 16 倍）。這是純粹的影像運算，不需要\n擴散模型、不用寫提示詞，跑起來比生圖快很多。\n\n---\n\n**English**\n\n`UpscaleModelLoader` loads the RealESRGAN super-resolution model, and\n`ImageUpscaleWithModel` uses it to scale the image's width and height 4x each\n(16x the pixel area). This is plain image math — no diffusion model, no\nprompt needed — so it runs much faster than a generation job."
+      ],
+      "color": "#432",
+      "bgcolor": "#653"
+    },
+    {
+      "id": 103,
+      "type": "MarkdownNote",
+      "pos": [
+        800,
+        -480
+      ],
+      "size": [
+        420,
+        420
+      ],
+      "flags": {},
+      "order": 7,
+      "mode": 0,
+      "inputs": [],
+      "outputs": [],
+      "title": "③ 結果在哪 / Where the result is",
+      "properties": {},
+      "widgets_values": [
+        "**繁體中文**\n\n`SaveImage` 的 `filename_prefix`（預設 `comfyfed_upscale`）可以改成你想要的\n檔名前綴。按右上角 Run 之後，這會變成一個聯邦 job；完成後放大後的圖片直接\n在 `SaveImage` 節點裡顯示，Console 的「工作」頁面也拿得到檔案。\n\n---\n\n**English**\n\n`SaveImage`'s `filename_prefix` (default `comfyfed_upscale`) can be changed\nto whatever prefix you like. Press Run and this becomes a federation job;\nthe upscaled image shows up directly inside the `SaveImage` node once it\nfinishes, and it is also listed on the console's Jobs page."
+      ],
+      "color": "#432",
+      "bgcolor": "#653"
+    }
+  ],
+  "links": [
+    [
+      1,
+      1,
+      0,
+      3,
+      1,
+      "IMAGE"
+    ],
+    [
+      2,
+      2,
+      0,
+      3,
+      0,
+      "UPSCALE_MODEL"
+    ],
+    [
+      3,
+      3,
+      0,
+      4,
+      0,
+      "IMAGE"
+    ]
+  ],
+  "groups": [
+    {
+      "id": 1,
+      "title": "① 換圖 / Swap the image — 只改這一區",
+      "bounding": [
+        -20,
+        40,
+        380,
+        900
+      ],
+      "color": "#a1309b",
+      "font_size": 24,
+      "flags": {}
+    },
+    {
+      "id": 2,
+      "title": "② 放大 / Upscale",
+      "bounding": [
+        380,
+        40,
+        340,
+        260
+      ],
+      "color": "#3f789e",
+      "font_size": 24,
+      "flags": {}
+    },
+    {
+      "id": 3,
+      "title": "③ 輸出 / Output",
+      "bounding": [
+        720,
+        40,
+        520,
+        600
+      ],
+      "color": "#3f9e5a",
+      "font_size": 24,
+      "flags": {}
+    }
+  ],
+  "config": {},
+  "extra": {
+    "ds": {
+      "scale": 0.6,
+      "offset": [
+        420,
+        700
+      ]
+    }
+  },
+  "version": 0.4
+}

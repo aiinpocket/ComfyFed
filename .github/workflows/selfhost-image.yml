@@ -1,0 +1,50 @@
+# Builds the self-host image (cloud/Dockerfile) on every push to main and
+# publishes it to GitHub Container Registry as
+#   ghcr.io/aiinpocket/comfyfed:latest  and  :sha-<commit>
+# so `docker run ghcr.io/aiinpocket/comfyfed` is the whole platform install.
+# The Cloudflare deployment is unaffected (Workers Builds handles that).
+name: selfhost-image
+
+on:
+  push:
+    branches: [main]
+    paths-ignore:
+      - "docs/**"
+      - "README*.md"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  packages: write
+
+jobs:
+  image:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: docker/setup-buildx-action@v3
+
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ghcr.io/${{ github.repository_owner }}/comfyfed
+          tags: |
+            type=raw,value=latest
+            type=sha,prefix=sha-
+
+      - uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: cloud/Dockerfile
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
