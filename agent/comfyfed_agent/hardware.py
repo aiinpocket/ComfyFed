@@ -1,9 +1,8 @@
 """Hardware/backend reporting and local model inventory scanning.
 
 Every function here is individually mockable: no test should need a real GPU,
-`nvidia-smi`, or network access. `comfy_url` is accepted for symmetry with
-other agent modules but not currently used to probe ComfyUI's own hardware
-report.
+`nvidia-smi`, or network access. `comfy_url` feeds `comfyui_version`
+(a best-effort `/system_stats` probe); everything else is read locally.
 """
 
 from __future__ import annotations
@@ -64,6 +63,25 @@ def _apple_chip_name() -> str | None:
         return None
 
 
+def comfyui_version(comfy_url: str) -> str | None:
+    """The local ComfyUI's version string, or None when it cannot be read.
+
+    Best-effort by design: `collect_hardware` runs during the WS handshake,
+    and a ComfyUI that is slow, restarting, or ancient (no
+    `system.comfyui_version` field) must degrade to "unknown", never block
+    or fail the hello.
+    """
+    import httpx  # local import: keeps hardware importable without httpx in tests
+
+    try:
+        r = httpx.get(comfy_url.rstrip("/") + "/system_stats", timeout=5)
+        r.raise_for_status()
+        version = (r.json().get("system") or {}).get("comfyui_version")
+        return version if isinstance(version, str) and version else None
+    except Exception:
+        return None
+
+
 def collect_hardware(comfy_url: str) -> dict:
     """Gather this machine's hardware summary for the WS `hello` message."""
     gpu_name = None
@@ -95,6 +113,11 @@ def collect_hardware(comfy_url: str) -> dict:
         "cpu_cores": psutil.cpu_count(logical=True),
         "ram_gb": round(psutil.virtual_memory().total / (1024 ** 3), 1),
         "agent_version": __version__,
+        # 2026-10-24 (protocol 6): the local ComfyUI's own version, read off
+        # `/system_stats`, so the console's Workers page can show which
+        # ComfyUI each worker runs and whether an update took. None (shown
+        # as "—") when ComfyUI didn't answer in time.
+        "comfyui_version": comfyui_version(comfy_url),
         # "Windows" | "Darwin" | "Linux" -- lets the platform tell a Mac/CPU
         # worker apart from a headless Linux box even when `backend` alone
         # (cuda/rocm/mps/cpu) is ambiguous (a Linux box can be "cpu" too).

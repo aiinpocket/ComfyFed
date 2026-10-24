@@ -64,6 +64,8 @@ import * as retry from "../core/retry";
 import * as stats from "../core/stats";
 import * as split from "../core/split";
 import * as peerhealth from "../core/peerhealth";
+import { AGENT_LATEST_KEY, ensureBundledAgentRelease } from "../core/agent_release";
+import { compareVersions } from "../core/version";
 import { toSqliteTimestamp, resolvePlatformSeed } from "../db/queries";
 import type { Job } from "../db/queries";
 import { buildReceiptPayload, signReceipt, verifyHex } from "../lib/signing";
@@ -114,6 +116,17 @@ const CURRENT_PROTOCOL = 2;
  * `core/assess.ts`, which keeps it private) purely for the defensive
  * re-check right before a push -- see `fetchModelsForPush`. */
 const MIN_AUTO_FETCH_PROTOCOL = 3;
+
+/** 2026-10-24: minimum `hello.protocol` that understands the
+ * `{"type": "update_comfyui"}` push (agent 0.1.19) -- see the agent's
+ * `comfyupdate.py` and `routes/workers.ts`'s update-comfyui route. */
+const MIN_COMFY_UPDATE_PROTOCOL = 6;
+
+/** The first agent release whose RemoteUpdater answers `update_agent` --
+ * same constant `routes/workers.ts` gates its route on. Used here for the
+ * hello-time self-update nudge: an older agent would log "unknown message"
+ * and do nothing, so it is never sent one. */
+const REMOTE_UPDATE_MIN_AGENT = "0.1.18";
 
 const DEPRECATION_MESSAGE =
   "agent 版本過舊：無法接收取消通知，計費將以整體耗時（wall-clock）為準。" +
@@ -560,6 +573,9 @@ export class Hub extends DurableObject<Env> {
     if (url.pathname === "/internal/update_worker" && request.method === "POST") {
       return this.handleInternalUpdateWorker(request);
     }
+    if (url.pathname === "/internal/update_comfyui" && request.method === "POST") {
+      return this.handleInternalUpdateComfyui(request);
+    }
     return new Response("not found", { status: 404 });
   }
 
@@ -944,6 +960,37 @@ export class Hub extends DurableObject<Env> {
     }
     const ack = await ackPromise;
     return Response.json(ack ?? { status: "sent", detail: "" });
+  }
+
+  /** Pushes `{"type": "update_comfyui"}` to a worker's live agent socket --
+   * the admin "update this worker's ComfyUI" command. Unlike
+   * `handleInternalUpdateWorker` there is no ack to wait for: the agent
+   * reports progress and outcome on its heartbeat `dynamic.comfyui_update`
+   * blob, which the Workers page polls. Answers `{result}` with
+   * "sent" | "offline" | "unsupported" (protocol < 6). */
+  private async handleInternalUpdateComfyui(request: Request): Promise<Response> {
+    const body = await request
+      .json<{ worker_id?: unknown }>()
+      .catch(() => ({}) as { worker_id?: unknown });
+    const workerId = typeof body.worker_id === "string" ? body.worker_id : "";
+    if (!workerId) {
+      return Response.json({ error: "missing worker_id" }, { status: 400 });
+    }
+    const ws = this.findWsForWorker(workerId);
+    if (!ws) {
+      return Response.json({ result: "offline" });
+    }
+    const att = ws.deserializeAttachment() as AgentAttachment | null;
+    if (!att || att.protocol < MIN_COMFY_UPDATE_PROTOCOL) {
+      return Response.json({ result: "unsupported" });
+    }
+    try {
+      ws.send(JSON.stringify({ type: "update_comfyui" }));
+    } catch (err) {
+      console.warn(`hub: failed to push update_comfyui to worker ${workerId}`, err);
+      return Response.json({ result: "offline" });
+    }
+    return Response.json({ result: "sent" });
   }
 
   /** Registers a waiter for `workerId`'s next `update_ack` and resolves it
@@ -1348,6 +1395,28 @@ export class Hub extends DurableObject<Env> {
         ws.send(JSON.stringify({ type: "deprecation", message: DEPRECATION_MESSAGE }));
       } catch (err) {
         console.error(`hub: failed to send deprecation notice to worker ${workerId}`, err);
+      }
+    }
+
+    // 2026-10-24: hello-time self-update nudge. An agent (>= 0.1.18, i.e.
+    // one whose RemoteUpdater answers `update_agent`) that reports a version
+    // older than the published release gets the SAME `update_agent` frame
+    // the console button sends -- its RemoteUpdater then re-verifies against
+    // `/api/agent/version` (sha256 + platform signature), defers while a job
+    // runs, declines when the owner's auto_update is off, and hands itself
+    // to the supervisor on success. Every deploy reconnects the fleet, so
+    // "push -> deploy -> agents roll forward" needs no console click. The
+    // unsolicited `update_ack` is logged by the ack handler as usual.
+    const reportedAgent = hardware["agent_version"];
+    if (typeof reportedAgent === "string" && reportedAgent && compareVersions(reportedAgent, REMOTE_UPDATE_MIN_AGENT) >= 0) {
+      try {
+        await ensureBundledAgentRelease(this.env);
+        const latest = await queries.getSetting(this.env.DB, AGENT_LATEST_KEY);
+        if (latest && compareVersions(reportedAgent, latest) < 0) {
+          ws.send(JSON.stringify({ type: "update_agent" }));
+        }
+      } catch (err) {
+        console.warn(`hub: hello-time update nudge failed for worker ${workerId}`, err);
       }
     }
 

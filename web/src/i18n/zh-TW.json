@@ -261,6 +261,7 @@
     "col_models": "模型數",
     "col_last_seen": "最後上線",
     "col_agent": "Agent 版本",
+    "col_comfyui": "ComfyUI",
     "agent_outdated": "過舊",
     "agent_outdated_hint": "平台已發佈的最新 agent 是 {{latest}}；這台會在下次重啟時自動更新。",
     "col_p2p": "P2P 狀態",
@@ -312,7 +313,13 @@
     "agent_too_old": "這台的 agent 太舊、不支援遠端更新：請在該機器重啟一次 agent，它會在啟動時自動更新",
     "offline": "worker 不在線上",
     "update_failed": "更新指令失敗",
-    "update_all_done": "已送出 {{sent}} 台，{{failed}} 台失敗"
+    "update_all_done": "已送出 {{sent}} 台，{{failed}} 台失敗",
+    "update_comfyui": "更新 ComfyUI",
+    "update_comfyui_sent": "已送出 ComfyUI 更新指令",
+    "update_comfyui_failed": "ComfyUI 更新指令送出失敗",
+    "comfyui_updating": "更新中…",
+    "comfyui_updated": "更新完成",
+    "comfyui_update_failed": "更新失敗"
   },
   "users": {
     "title": "使用者",

@@ -25,9 +25,9 @@ async function seedTemplate(name: string, json: unknown): Promise<void> {
 }
 
 describe("SOURCES (curated registry)", () => {
-  it("has exactly twelve entries, all resolvable via lookup()", async () => {
+  it("has exactly sixteen entries, all resolvable via lookup()", async () => {
     const names = Object.keys(modelGuide.SOURCES);
-    expect(names).toHaveLength(12);
+    expect(names).toHaveLength(16);
     for (const name of names) {
       const found = await modelGuide.lookup(name, store());
       expect(found).not.toBeNull();
@@ -54,7 +54,7 @@ describe("SOURCES (curated registry)", () => {
     expect(source.sizeBytes).toBe(23802932552);
   });
 
-  it("Phase 3.2: every one of the twelve curated entries carries a guide sha256/sizeBytes", () => {
+  it("every curated entry carries a guide sha256/sizeBytes", () => {
     for (const [name, source] of Object.entries(modelGuide.SOURCES)) {
       expect(source.sha256, `${name} sha256`).toBeDefined();
       expect(source.sizeBytes, `${name} sizeBytes`).toBeDefined();

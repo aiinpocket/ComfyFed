@@ -1,6 +1,6 @@
 {
-  "last_node_id": 106,
-  "last_link_id": 26,
+  "last_node_id": 208,
+  "last_link_id": 35,
   "nodes": [
     {
       "id": 105,
@@ -21,7 +21,7 @@
       "title": "⓪ 缺模型？/ Missing models?",
       "properties": {},
       "widgets_values": [
-        "**繁體中文**\n\n全新安裝沒有模型檔，這支「參考圖生影片」範本需要以下 5 個檔案：\n\n- `minimax_h3_ref2va_pruned_int8_convrot.safetensors` → 放到 `ComfyUI/models/diffusion_models/` → 19.53 GB\n  官方載點：https://huggingface.co/Comfy-Org/MiniMax-H3/resolve/main/diffusion_models/minimax_h3_ref2va_pruned_int8_convrot.safetensors\n  備份載點：https://storage.googleapis.com/comfyfed-models/models/diffusion_models/minimax_h3_ref2va_pruned_int8_convrot.safetensors\n- `qwen3vl_32b_heretic_minimax_h3_nvfp4.safetensors` → 放到 `ComfyUI/models/text_encoders/` → 14.61 GB\n  官方載點：https://huggingface.co/sakamakismile/Qwen3-VL-32B-Heretic-MiniMax-H3-NVFP4/resolve/main/qwen3vl_32b_heretic_minimax_h3_nvfp4.safetensors\n  備份載點：https://storage.googleapis.com/comfyfed-models/models/text_encoders/qwen3vl_32b_heretic_minimax_h3_nvfp4.safetensors\n- `minimax_h3_video_vae_fp16.safetensors` → 放到 `ComfyUI/models/vae/` → 4.85 GB\n  官方載點：https://huggingface.co/Comfy-Org/MiniMax-H3/resolve/main/vae/minimax_h3_video_vae_fp16.safetensors\n  備份載點：https://storage.googleapis.com/comfyfed-models/models/vae/minimax_h3_video_vae_fp16.safetensors\n- `minimax_h3_audio_vae_fp32.safetensors` → 放到 `ComfyUI/models/vae/` → 0.56 GB\n  官方載點：https://huggingface.co/Comfy-Org/MiniMax-H3/resolve/main/vae/minimax_h3_audio_vae_fp32.safetensors\n  備份載點：https://storage.googleapis.com/comfyfed-models/models/vae/minimax_h3_audio_vae_fp32.safetensors\n- `minimax_h3_ref2v_turbo_8step_v1.0_768p_comfyui_resized_avg_rank_64_bf16.safetensors` → 放到 `ComfyUI/models/loras/` → 0.91 GB\n  官方載點：https://huggingface.co/drbaph/MiniMax-H3-Turbo-Lora-ComfyUI/resolve/main/minimax_h3_ref2v_turbo_8step_v1.0_768p_comfyui_resized_avg_rank_64_bf16.safetensors\n  備份載點：https://storage.googleapis.com/comfyfed-models/models/loras/minimax_h3_ref2v_turbo_8step_v1.0_768p_comfyui_resized_avg_rank_64_bf16.safetensors\n\n共約 40.5 GB。放好檔案後**不用重啟 ComfyUI 或 worker**：ComfyFed agent 每 10 分鐘自動重掃模型庫存並回報平台，評估會自動轉綠；急著馬上生效的話，手動重啟 agent 即可。\n\n---\n\n**English**\n\nA fresh install has none of these files. The “Reference to video” template needs 5 files:\n\n- `minimax_h3_ref2va_pruned_int8_convrot.safetensors` -> `ComfyUI/models/diffusion_models/` -> 19.53 GB\n  官方載點：https://huggingface.co/Comfy-Org/MiniMax-H3/resolve/main/diffusion_models/minimax_h3_ref2va_pruned_int8_convrot.safetensors\n  備份載點：https://storage.googleapis.com/comfyfed-models/models/diffusion_models/minimax_h3_ref2va_pruned_int8_convrot.safetensors\n- `qwen3vl_32b_heretic_minimax_h3_nvfp4.safetensors` -> `ComfyUI/models/text_encoders/` -> 14.61 GB\n  官方載點：https://huggingface.co/sakamakismile/Qwen3-VL-32B-Heretic-MiniMax-H3-NVFP4/resolve/main/qwen3vl_32b_heretic_minimax_h3_nvfp4.safetensors\n  備份載點：https://storage.googleapis.com/comfyfed-models/models/text_encoders/qwen3vl_32b_heretic_minimax_h3_nvfp4.safetensors\n- `minimax_h3_video_vae_fp16.safetensors` -> `ComfyUI/models/vae/` -> 4.85 GB\n  官方載點：https://huggingface.co/Comfy-Org/MiniMax-H3/resolve/main/vae/minimax_h3_video_vae_fp16.safetensors\n  備份載點：https://storage.googleapis.com/comfyfed-models/models/vae/minimax_h3_video_vae_fp16.safetensors\n- `minimax_h3_audio_vae_fp32.safetensors` -> `ComfyUI/models/vae/` -> 0.56 GB\n  官方載點：https://huggingface.co/Comfy-Org/MiniMax-H3/resolve/main/vae/minimax_h3_audio_vae_fp32.safetensors\n  備份載點：https://storage.googleapis.com/comfyfed-models/models/vae/minimax_h3_audio_vae_fp32.safetensors\n- `minimax_h3_ref2v_turbo_8step_v1.0_768p_comfyui_resized_avg_rank_64_bf16.safetensors` -> `ComfyUI/models/loras/` -> 0.91 GB\n  官方載點：https://huggingface.co/drbaph/MiniMax-H3-Turbo-Lora-ComfyUI/resolve/main/minimax_h3_ref2v_turbo_8step_v1.0_768p_comfyui_resized_avg_rank_64_bf16.safetensors\n  備份載點：https://storage.googleapis.com/comfyfed-models/models/loras/minimax_h3_ref2v_turbo_8step_v1.0_768p_comfyui_resized_avg_rank_64_bf16.safetensors\n\n~40.5 GB total. No restart needed after placing the files: the ComfyFed agent rescans its model inventory every 10 minutes and reports back, and the assessment turns green automatically once it does. Restart the agent if you want it to take effect immediately."
+        "**繁體中文**\n\n全新安裝沒有模型檔，這支「首尾幀生影片」範本需要以下 6 個檔案（與「參考圖生影片」完全相同，裝過那支就不用再抓）：\n\n- `minimax_h3_ref2va_pruned_int8_convrot.safetensors` → 放到 `ComfyUI/models/diffusion_models/` → 19.53 GB\n  官方載點：https://huggingface.co/Comfy-Org/MiniMax-H3/resolve/main/diffusion_models/minimax_h3_ref2va_pruned_int8_convrot.safetensors\n  備份載點：https://storage.googleapis.com/comfyfed-models/models/diffusion_models/minimax_h3_ref2va_pruned_int8_convrot.safetensors\n- `qwen3vl_32b_heretic_minimax_h3_nvfp4.safetensors` → 放到 `ComfyUI/models/text_encoders/` → 14.61 GB\n  官方載點：https://huggingface.co/sakamakismile/Qwen3-VL-32B-Heretic-MiniMax-H3-NVFP4/resolve/main/qwen3vl_32b_heretic_minimax_h3_nvfp4.safetensors\n  備份載點：https://storage.googleapis.com/comfyfed-models/models/text_encoders/qwen3vl_32b_heretic_minimax_h3_nvfp4.safetensors\n- `minimax_h3_video_vae_fp16.safetensors` → 放到 `ComfyUI/models/vae/` → 4.85 GB\n  官方載點：https://huggingface.co/Comfy-Org/MiniMax-H3/resolve/main/vae/minimax_h3_video_vae_fp16.safetensors\n  備份載點：https://storage.googleapis.com/comfyfed-models/models/vae/minimax_h3_video_vae_fp16.safetensors\n- `minimax_h3_audio_vae_fp32.safetensors` → 放到 `ComfyUI/models/vae/` → 0.56 GB\n  官方載點：https://huggingface.co/Comfy-Org/MiniMax-H3/resolve/main/vae/minimax_h3_audio_vae_fp32.safetensors\n  備份載點：https://storage.googleapis.com/comfyfed-models/models/vae/minimax_h3_audio_vae_fp32.safetensors\n- `minimax_h3_ref2v_turbo_8step_v1.0_768p_comfyui_resized_avg_rank_64_bf16.safetensors` → 放到 `ComfyUI/models/loras/` → 0.91 GB\n  官方載點：https://huggingface.co/drbaph/MiniMax-H3-Turbo-Lora-ComfyUI/resolve/main/minimax_h3_ref2v_turbo_8step_v1.0_768p_comfyui_resized_avg_rank_64_bf16.safetensors\n  備份載點：https://storage.googleapis.com/comfyfed-models/models/loras/minimax_h3_ref2v_turbo_8step_v1.0_768p_comfyui_resized_avg_rank_64_bf16.safetensors\n- `qwen3-vl-4b-heretic.safetensors` → 放到 `ComfyUI/models/text_encoders/` → 8.27 GB\n  官方載點：https://huggingface.co/DreamFast/Qwen3-VL-4b-Heretic-ComfyUI/resolve/main/qwen3-vl-4b-heretic.safetensors\n  （「想法 → 英文提示詞」小幫手用的無審查編碼器，和其他想法範本共用；平台目前沒有這顆的備份鏡像，請走官方載點。）\n\n共約 48.7 GB。放好檔案後**不用重啟 ComfyUI 或 worker**：ComfyFed agent 每 10 分鐘自動重掃模型庫存並回報平台，評估會自動轉綠；急著馬上生效的話，手動重啟 agent 即可。\n\n---\n\n**English**\n\nA fresh install has none of these files. The first+last-frame template needs 6 files — exactly the reference-to-video template's stack, so if you installed that one there is nothing new to download:\n\n- `minimax_h3_ref2va_pruned_int8_convrot.safetensors` -> `ComfyUI/models/diffusion_models/` -> 19.53 GB\n  官方載點：https://huggingface.co/Comfy-Org/MiniMax-H3/resolve/main/diffusion_models/minimax_h3_ref2va_pruned_int8_convrot.safetensors\n  備份載點：https://storage.googleapis.com/comfyfed-models/models/diffusion_models/minimax_h3_ref2va_pruned_int8_convrot.safetensors\n- `qwen3vl_32b_heretic_minimax_h3_nvfp4.safetensors` -> `ComfyUI/models/text_encoders/` -> 14.61 GB\n  官方載點：https://huggingface.co/sakamakismile/Qwen3-VL-32B-Heretic-MiniMax-H3-NVFP4/resolve/main/qwen3vl_32b_heretic_minimax_h3_nvfp4.safetensors\n  備份載點：https://storage.googleapis.com/comfyfed-models/models/text_encoders/qwen3vl_32b_heretic_minimax_h3_nvfp4.safetensors\n- `minimax_h3_video_vae_fp16.safetensors` -> `ComfyUI/models/vae/` -> 4.85 GB\n  官方載點：https://huggingface.co/Comfy-Org/MiniMax-H3/resolve/main/vae/minimax_h3_video_vae_fp16.safetensors\n  備份載點：https://storage.googleapis.com/comfyfed-models/models/vae/minimax_h3_video_vae_fp16.safetensors\n- `minimax_h3_audio_vae_fp32.safetensors` -> `ComfyUI/models/vae/` -> 0.56 GB\n  官方載點：https://huggingface.co/Comfy-Org/MiniMax-H3/resolve/main/vae/minimax_h3_audio_vae_fp32.safetensors\n  備份載點：https://storage.googleapis.com/comfyfed-models/models/vae/minimax_h3_audio_vae_fp32.safetensors\n- `minimax_h3_ref2v_turbo_8step_v1.0_768p_comfyui_resized_avg_rank_64_bf16.safetensors` -> `ComfyUI/models/loras/` -> 0.91 GB\n  官方載點：https://huggingface.co/drbaph/MiniMax-H3-Turbo-Lora-ComfyUI/resolve/main/minimax_h3_ref2v_turbo_8step_v1.0_768p_comfyui_resized_avg_rank_64_bf16.safetensors\n  備份載點：https://storage.googleapis.com/comfyfed-models/models/loras/minimax_h3_ref2v_turbo_8step_v1.0_768p_comfyui_resized_avg_rank_64_bf16.safetensors\n- `qwen3-vl-4b-heretic.safetensors` -> `ComfyUI/models/text_encoders/` -> 8.27 GB\n  官方載點：https://huggingface.co/DreamFast/Qwen3-VL-4b-Heretic-ComfyUI/resolve/main/qwen3-vl-4b-heretic.safetensors\n  (The uncensored prompt-helper encoder, shared with every other idea-box template. No ComfyFed mirror yet, use the official link.)\n\nAbout 48.7 GB in total. After placing the files there is **no need to restart ComfyUI or the worker** — the agent rescans its model inventory every 10 minutes; restart the agent manually to pick it up right away."
       ],
       "color": "#432",
       "bgcolor": "#653"
@@ -319,7 +319,7 @@
           "type": "STRING",
           "slot_index": 0,
           "links": [
-            8
+            28
           ]
         }
       ],
@@ -327,9 +327,9 @@
         "Node name for S&R": "PrimitiveStringMultiline"
       },
       "widgets_values": [
-        "Photorealistic historical film, ancient Macedonia at golden dawn. The young soldier from <Picture 1> stands on a dusty drill field holding a six-meter sarissa pike upright like a mast. Camera: slow dolly arc around him. By the end of the shot he has lowered the pike to horizontal, matching the final pose. Audio: wind, creaking wood, distant drill shouts."
+        "參考圖中的年輕士兵從立正姿勢慢慢舉起長矛指向前方，披風被風吹動，鏡頭緩緩推近他的側臉，最後停在尾幀的姿勢。聲音：風聲、布料摩擦聲、遠處的操練吆喝。"
       ],
-      "title": "提示詞 ← 改這裡＋描述首尾之間的動作 / edit here",
+      "title": "想法（中文也可以）← 只改這裡 / your idea (Chinese is fine), edit here",
       "bgcolor": "#533",
       "color": "#a33"
     },
@@ -375,7 +375,7 @@
           "widget": {
             "name": "prompt"
           },
-          "link": 8
+          "link": 34
         }
       ],
       "outputs": [
@@ -860,7 +860,7 @@
       "title": "① 用途＋紅框 / Purpose + red-framed nodes",
       "properties": {},
       "widgets_values": [
-        "**繁體中文 — 只改這一區**\n\n給一張「開頭長怎樣」的圖、一張「結尾長怎樣」的圖，H3 會自己生出中間的動作，\n而且畫面自帶聲音。\n\n三個紅框節點：\n\n- `LoadImage`「首幀」— 影片開始那一格的樣子。\n- `LoadImage`「尾幀」— 影片結束那一格的樣子（兩張圖建議同一個人／同一個場景，\n  差異越合理，動作補得越自然）。\n- 提示詞（`PrimitiveStringMultiline`）— 用 `<Picture 1>` 指涉首幀圖，\n  然後**用一句話描述首尾之間發生了什麼動作**（例如「他把長矛從直立慢慢放平」）。\n  結尾可以加一行 `Audio: …` 描述想要的環境音。\n\n其他節點不用動。\n\n---\n\n**English — the only group you need to edit**\n\nGive one image for how the video starts and one for how it ends; H3 generates\nthe motion in between, with audio included. Three red-framed nodes: the\n\"first frame\" `LoadImage`, the \"last frame\" `LoadImage` (same subject/scene\nworks best), and the prompt, which must refer to the first frame as\n`<Picture 1>` and describe, in one sentence, the action that happens between\nthe two frames. An `Audio: …` line at the end sets the soundtrack."
+        "**繁體中文 — 只改這一區（三顆紅框）**\n\n給一張「開頭長怎樣」的圖、一張「結尾長怎樣」的圖，H3 會自己生出中間的動作與聲音。\n\n- 兩顆 `LoadImage`：首幀與尾幀，換成你自己的圖（直接在節點上傳即可）。\n- 紅框「想法」節點：用**中文**描述首尾之間發生什麼（動作、鏡頭、聲音）。本機的 Qwen3-VL-4B Heretic（無審查版）會寫成英文提示詞、自動補上 `<Picture 1>` 標記再接進生成節點——露骨的想法也照寫，不會被拒絕。AI 寫出的英文會顯示在預覽節點。\n- 想自己直接寫英文提示詞：把生成節點的 `prompt` 輸入線拔掉，欄位就會變回可以手打。\n\n預設首尾幀都是同一張範例圖（所以預設跑出來是「幾乎不動」的影片）——先換圖再跑。\n\n---\n\n**English — only edit this box (the three red nodes)**\n\nTwo `LoadImage` nodes take the first and last frame; the red idea node takes a **Chinese** (or English) description of what happens in between — motion, camera, audio. The local, uncensored Qwen3-VL-4B Heretic model writes the English prompt, prepends the `<Picture 1>` tag and wires it into the generation node; the English it wrote shows in the preview node. To write the prompt yourself, unplug the generation node's `prompt` input. The template ships with the same sample image as both frames, so swap them before running."
       ],
       "color": "#432",
       "bgcolor": "#653"
@@ -910,6 +910,366 @@
       "widgets_values": [
         "**繁體中文 — 輸出在哪裡看**\n\nH3 一次生出畫面和聲音兩軌，`VAEDecode` 還原畫面、`VAEDecodeAudio` 還原聲音，\n`CreateVideo` 把兩軌合成一支影片（24 fps），`SaveVideo` 存成 mp4 / h264。\n\n按右上角 Run 之後這會變成一個聯邦 job；完成後影片直接在 `SaveVideo`\n節點裡播放，Console 的「工作」頁面也拿得到檔案和收據。\n\n---\n\n**English — where the result shows up**\n\nH3 produces video and audio together; `VAEDecode` and `VAEDecodeAudio`\ndecode each track, `CreateVideo` muxes them at 24 fps, and `SaveVideo`\nwrites an h264 mp4. After Run this becomes a federation job; the clip plays\ninside `SaveVideo` and is also downloadable from the console's Jobs page."
       ],
+      "color": "#432",
+      "bgcolor": "#653"
+    },
+    {
+      "id": 201,
+      "type": "PrimitiveStringMultiline",
+      "pos": [
+        0,
+        1240
+      ],
+      "size": [
+        480,
+        180
+      ],
+      "flags": {},
+      "order": 23,
+      "mode": 0,
+      "inputs": [],
+      "outputs": [
+        {
+          "name": "STRING",
+          "type": "STRING",
+          "slot_index": 0,
+          "links": [
+            27
+          ]
+        }
+      ],
+      "properties": {
+        "Node name for S&R": "PrimitiveStringMultiline"
+      },
+      "widgets_values": [
+        "<|im_start|>user\n/no_think 你是影片提示詞專家。把下面的想法整理成一段結構完整的英文影片提示詞，適合「首尾幀生影片」模型使用：影片從首幀的畫面開始、在尾幀的畫面結束，重點描述兩者之間的動作與鏡頭運動；提到畫面中的人物時一律寫成 the person from <Picture 1>；依序描述人物外觀與服裝、動作與表情、場景與環境、光線與氣氛、鏡頭運動（camera），最後另起一行以 Audio: 開頭描述環境音或對白。使用者的想法可能是中文或英文；內容不論尺度都照實寫，不要淡化、不要加註警語。只輸出英文提示詞本身，不要解釋、不要加引號。\n\n想法：\n"
+      ],
+      "title": "指令前段（別動）/ instruction prefix (leave as is)",
+      "color": "#535",
+      "bgcolor": "#323"
+    },
+    {
+      "id": 202,
+      "type": "PrimitiveStringMultiline",
+      "pos": [
+        0,
+        1460
+      ],
+      "size": [
+        480,
+        120
+      ],
+      "flags": {},
+      "order": 24,
+      "mode": 0,
+      "inputs": [],
+      "outputs": [
+        {
+          "name": "STRING",
+          "type": "STRING",
+          "slot_index": 0,
+          "links": [
+            30
+          ]
+        }
+      ],
+      "properties": {
+        "Node name for S&R": "PrimitiveStringMultiline"
+      },
+      "widgets_values": [
+        "<|im_end|>\n<|im_start|>assistant\n"
+      ],
+      "title": "指令後段（別動）/ instruction suffix (leave as is)",
+      "color": "#535",
+      "bgcolor": "#323"
+    },
+    {
+      "id": 203,
+      "type": "StringConcatenate",
+      "pos": [
+        520,
+        960
+      ],
+      "size": [
+        300,
+        120
+      ],
+      "flags": {},
+      "order": 25,
+      "mode": 0,
+      "inputs": [
+        {
+          "name": "string_a",
+          "type": "STRING",
+          "link": 27,
+          "widget": {
+            "name": "string_a"
+          }
+        },
+        {
+          "name": "string_b",
+          "type": "STRING",
+          "link": 28,
+          "widget": {
+            "name": "string_b"
+          }
+        }
+      ],
+      "outputs": [
+        {
+          "name": "STRING",
+          "type": "STRING",
+          "slot_index": 0,
+          "links": [
+            29
+          ]
+        }
+      ],
+      "properties": {
+        "Node name for S&R": "StringConcatenate"
+      },
+      "widgets_values": [
+        "",
+        "",
+        ""
+      ],
+      "title": "組合1：前段＋想法（別動）/ assemble 1: prefix + idea (leave as is)",
+      "color": "#535",
+      "bgcolor": "#323"
+    },
+    {
+      "id": 204,
+      "type": "StringConcatenate",
+      "pos": [
+        520,
+        1140
+      ],
+      "size": [
+        300,
+        120
+      ],
+      "flags": {},
+      "order": 26,
+      "mode": 0,
+      "inputs": [
+        {
+          "name": "string_a",
+          "type": "STRING",
+          "link": 29,
+          "widget": {
+            "name": "string_a"
+          }
+        },
+        {
+          "name": "string_b",
+          "type": "STRING",
+          "link": 30,
+          "widget": {
+            "name": "string_b"
+          }
+        }
+      ],
+      "outputs": [
+        {
+          "name": "STRING",
+          "type": "STRING",
+          "slot_index": 0,
+          "links": [
+            32
+          ]
+        }
+      ],
+      "properties": {
+        "Node name for S&R": "StringConcatenate"
+      },
+      "widgets_values": [
+        "",
+        "",
+        ""
+      ],
+      "title": "組合2：加上後段（別動）/ assemble 2: append suffix (leave as is)",
+      "color": "#535",
+      "bgcolor": "#323"
+    },
+    {
+      "id": 205,
+      "type": "CLIPLoader",
+      "pos": [
+        520,
+        760
+      ],
+      "size": [
+        340,
+        110
+      ],
+      "flags": {},
+      "order": 27,
+      "mode": 0,
+      "inputs": [],
+      "outputs": [
+        {
+          "name": "CLIP",
+          "type": "CLIP",
+          "slot_index": 0,
+          "links": [
+            31
+          ]
+        }
+      ],
+      "properties": {
+        "Node name for S&R": "CLIPLoader"
+      },
+      "widgets_values": [
+        "qwen3-vl-4b-heretic.safetensors",
+        "qwen_image",
+        "default"
+      ],
+      "title": "提示詞小幫手模型（別動）/ prompt-helper model (leave as is)",
+      "color": "#535",
+      "bgcolor": "#323"
+    },
+    {
+      "id": 206,
+      "type": "TextGenerate",
+      "pos": [
+        1000,
+        960
+      ],
+      "size": [
+        420,
+        480
+      ],
+      "flags": {},
+      "order": 28,
+      "mode": 0,
+      "inputs": [
+        {
+          "name": "clip",
+          "type": "CLIP",
+          "link": 31
+        },
+        {
+          "name": "prompt",
+          "type": "STRING",
+          "link": 32,
+          "widget": {
+            "name": "prompt"
+          }
+        }
+      ],
+      "outputs": [
+        {
+          "name": "generated_text",
+          "type": "STRING",
+          "slot_index": 0,
+          "links": [
+            33,
+            35
+          ]
+        }
+      ],
+      "properties": {
+        "Node name for S&R": "TextGenerate"
+      },
+      "widgets_values": [
+        "",
+        400,
+        "on",
+        0.7,
+        64,
+        0.95,
+        0.05,
+        1.05,
+        0,
+        0.0,
+        false,
+        false,
+        "auto"
+      ],
+      "title": "AI 寫英文提示詞（別動）/ AI writes the English prompt (leave as is)",
+      "color": "#535",
+      "bgcolor": "#323"
+    },
+    {
+      "id": 207,
+      "type": "StringConcatenate",
+      "pos": [
+        1000,
+        1500
+      ],
+      "size": [
+        420,
+        140
+      ],
+      "flags": {},
+      "order": 29,
+      "mode": 0,
+      "inputs": [
+        {
+          "name": "string_b",
+          "type": "STRING",
+          "link": 33,
+          "widget": {
+            "name": "string_b"
+          }
+        }
+      ],
+      "outputs": [
+        {
+          "name": "STRING",
+          "type": "STRING",
+          "slot_index": 0,
+          "links": [
+            34
+          ]
+        }
+      ],
+      "properties": {
+        "Node name for S&R": "StringConcatenate"
+      },
+      "widgets_values": [
+        "The subject of this video is the person shown in <Picture 1>.",
+        "",
+        " "
+      ],
+      "title": "補上 <Picture 1> 標記（別動）/ prepend the <Picture 1> tag (leave as is)",
+      "color": "#535",
+      "bgcolor": "#323"
+    },
+    {
+      "id": 208,
+      "type": "PreviewAny",
+      "pos": [
+        1480,
+        960
+      ],
+      "size": [
+        420,
+        200
+      ],
+      "flags": {},
+      "order": 30,
+      "mode": 0,
+      "inputs": [
+        {
+          "name": "source",
+          "type": "*",
+          "link": 35
+        }
+      ],
+      "outputs": [
+        {
+          "name": "STRING",
+          "type": "STRING",
+          "slot_index": 0,
+          "links": []
+        }
+      ],
+      "properties": {
+        "Node name for S&R": "PreviewAny"
+      },
+      "widgets_values": [],
+      "title": "AI 寫出的英文提示詞 / the English prompt the AI wrote",
       "color": "#432",
       "bgcolor": "#653"
     }
@@ -970,14 +1330,6 @@
       7,
       0,
       "MODEL"
-    ],
-    [
-      8,
-      22,
-      0,
-      6,
-      4,
-      "STRING"
     ],
     [
       9,
@@ -1122,17 +1474,89 @@
       15,
       0,
       "VIDEO"
+    ],
+    [
+      27,
+      201,
+      0,
+      203,
+      0,
+      "STRING"
+    ],
+    [
+      28,
+      22,
+      0,
+      203,
+      1,
+      "STRING"
+    ],
+    [
+      29,
+      203,
+      0,
+      204,
+      0,
+      "STRING"
+    ],
+    [
+      30,
+      202,
+      0,
+      204,
+      1,
+      "STRING"
+    ],
+    [
+      31,
+      205,
+      0,
+      206,
+      0,
+      "CLIP"
+    ],
+    [
+      32,
+      204,
+      0,
+      206,
+      1,
+      "STRING"
+    ],
+    [
+      33,
+      206,
+      0,
+      207,
+      0,
+      "STRING"
+    ],
+    [
+      34,
+      207,
+      0,
+      6,
+      4,
+      "STRING"
+    ],
+    [
+      35,
+      206,
+      0,
+      208,
+      0,
+      "*"
     ]
   ],
   "groups": [
     {
       "id": 1,
-      "title": "① 首尾幀＋提示詞 / First + last frame — 只改這一區",
+      "title": "① 首尾幀＋想法 / First + last frame + idea — 只改紅框 / only edit the red nodes",
       "bounding": [
-        -20,
+        -40,
         40,
-        500,
-        1180
+        1960,
+        1620
       ],
       "color": "#a1309b",
       "font_size": 24,

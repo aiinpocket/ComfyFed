@@ -655,3 +655,72 @@ describe('Workers page: remote agent update (spec 2026-09-24 §2.2)', () => {
     expect(show).toHaveBeenCalledTimes(1);
   });
 });
+
+
+// --- 2026-10-24: ComfyUI column + admin "Update ComfyUI" command -----------
+
+describe('Workers page: ComfyUI column', () => {
+  afterEach(() => {
+    cleanup();
+    vi.unstubAllGlobals();
+  });
+
+  const COMFY_WORKER: Worker = {
+    ...QUIET_WORKER,
+    id: 'w-0000000013',
+    name: 'runner-comfy',
+    hardware: { agent_version: '0.1.19', comfyui_version: '0.42.5' },
+    dynamic: {},
+  };
+
+  it('shows the reported ComfyUI version', async () => {
+    stubFetch([COMFY_WORKER]);
+    renderWorkers();
+
+    expect(await screen.findByText('0.42.5')).toBeInTheDocument();
+  });
+
+  it('POSTs update-comfyui when the admin presses the button', async () => {
+    const fetchMock = vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+      const url = typeof input === 'string' ? input : input.toString();
+      if (url.endsWith('/update-comfyui') && init?.method === 'POST') {
+        return jsonResponse({ ok: true });
+      }
+      if (url.startsWith('/api/agent/version')) {
+        return jsonResponse({ latest: '0.1.19', min_supported: '0.1.0', wheel_url: null, sha256: null, platform_sig: null });
+      }
+      if (url.startsWith('/api/workers')) return jsonResponse([COMFY_WORKER]);
+      return jsonResponse({ error: { code: 'http_error', message: 'not stubbed' } }, 404);
+    });
+    vi.stubGlobal('fetch', fetchMock);
+    renderWorkers();
+
+    const button = await screen.findByRole('button', { name: /更新 ComfyUI|Update ComfyUI/ });
+    fireEvent.click(button);
+    await waitFor(() => {
+      expect(
+        fetchMock.mock.calls.some(
+          ([input, init]) =>
+            String(input).includes(`/api/workers/${COMFY_WORKER.id}/update-comfyui`) &&
+            (init as RequestInit | undefined)?.method === 'POST',
+        ),
+      ).toBe(true);
+    });
+  });
+
+  it('hides the button from non-admins and shows the last update status', async () => {
+    stubFetch([
+      {
+        ...COMFY_WORKER,
+        dynamic: { comfyui_update: { status: 'failed', detail: 'git fetch failed', at: '' } },
+      },
+    ]);
+    renderWorkers('user');
+
+    expect(await screen.findByText('0.42.5')).toBeInTheDocument();
+    expect(
+      screen.queryByRole('button', { name: /更新 ComfyUI|Update ComfyUI/ }),
+    ).not.toBeInTheDocument();
+    expect(await screen.findByText(/更新失敗|Update failed/)).toBeInTheDocument();
+  });
+});

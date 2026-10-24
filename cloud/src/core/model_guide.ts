@@ -92,7 +92,7 @@ function curated(
   };
 }
 
-// The twelve curated models -- copied verbatim from the former Python
+// The sixteen curated models (12 copied verbatim from the former Python
 // `SOURCES`. DO NOT reorder/rename/reword any field: byte parity with the
 // Python registry is the whole point (see test/model_guide.spec.ts).
 //
@@ -222,6 +222,62 @@ export const SOURCES: Record<string, ModelSource> = {
     gated: false,
     sha256: "3fba9f5a2059c719da105bcb510b9df0450bddde52d96968c607802c9d86f9ce",
     sizeBytes: 8875713408,
+  },
+  // Entries #13-#16, 2026-10-24 -- the Qwen-Image-2.1 text-to-image stack
+  // (comfyfed-qwen-t2i) and the ACE-Step 1.5 turbo AIO checkpoint
+  // (comfyfed-acestep-music). sha256/sizeBytes provenance: the official
+  // HuggingFace repos' own LFS metadata (`/api/models/<repo>/tree/main`,
+  // the `lfs.oid` sha256 HF verifies on upload), re-verified by hashing the
+  // actual downloads on POKAI-HOME on 2026-10-24 -- both agreed on all four
+  // files. backupUrl null on all four: no `comfyfed-models` mirror copies
+  // yet, same rule as the Heretic entry.
+  "qwen_image_2.1_int8_convrot.safetensors": {
+    name: "qwen_image_2.1_int8_convrot.safetensors",
+    directory: "diffusion_models",
+    sizeGb: 7.26,
+    officialPage: "https://huggingface.co/Comfy-Org/Qwen-Image-2.1",
+    officialUrl:
+      "https://huggingface.co/Comfy-Org/Qwen-Image-2.1/resolve/main/diffusion_models/qwen_image_2.1_int8_convrot.safetensors",
+    backupUrl: null,
+    gated: false,
+    sha256: "cb74113cb03faecd79611b01fd7fd642f0aa60d6f0b95086abee214d75eaa57d",
+    sizeBytes: 7256783064,
+  },
+  "qwen3vl_8b_int8_convrot.safetensors": {
+    name: "qwen3vl_8b_int8_convrot.safetensors",
+    directory: "text_encoders",
+    sizeGb: 9.35,
+    officialPage: "https://huggingface.co/Comfy-Org/Qwen-Image-2.1",
+    officialUrl:
+      "https://huggingface.co/Comfy-Org/Qwen-Image-2.1/resolve/main/text_encoders/qwen3vl_8b_int8_convrot.safetensors",
+    backupUrl: null,
+    gated: false,
+    sha256: "8bfd0f6e12abf2d2d697ecc888e5e90b0d6741d6708f05799f53afa560452e8f",
+    sizeBytes: 9350798360,
+  },
+  "qwen_image_2.1_vae_bf16.safetensors": {
+    name: "qwen_image_2.1_vae_bf16.safetensors",
+    directory: "vae",
+    sizeGb: 0.68,
+    officialPage: "https://huggingface.co/Comfy-Org/Qwen-Image-2.1",
+    officialUrl:
+      "https://huggingface.co/Comfy-Org/Qwen-Image-2.1/resolve/main/vae/qwen_image_2.1_vae_bf16.safetensors",
+    backupUrl: null,
+    gated: false,
+    sha256: "bb21f7473051e1ac368515dd3f2e15cd44d7a11748ee8823e1ddca3e4876b7c9",
+    sizeBytes: 675509688,
+  },
+  "ace_step_1.5_turbo_aio.safetensors": {
+    name: "ace_step_1.5_turbo_aio.safetensors",
+    directory: "checkpoints",
+    sizeGb: 10.03,
+    officialPage: "https://huggingface.co/Comfy-Org/ACE-Step-1.5",
+    officialUrl:
+      "https://huggingface.co/Comfy-Org/ACE-Step-1.5/resolve/main/checkpoints/ace_step_1.5_turbo_aio.safetensors",
+    backupUrl: null,
+    gated: false,
+    sha256: "67b0f43aa5c51c840bd0228e6a935d8ff416ec87e5df2fc0637da17a561252bc",
+    sizeBytes: 10025478736,
   },
   "RealESRGAN_x4plus.pth": {
     name: "RealESRGAN_x4plus.pth",

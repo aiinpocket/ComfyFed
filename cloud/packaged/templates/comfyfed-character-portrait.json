@@ -1,6 +1,6 @@
 {
-  "last_node_id": 105,
-  "last_link_id": 16,
+  "last_node_id": 208,
+  "last_link_id": 24,
   "nodes": [
     {
       "id": 105,
@@ -10,8 +10,8 @@
         -1420
       ],
       "size": [
-        460,
-        900
+        520,
+        1100
       ],
       "flags": {},
       "order": 15,
@@ -21,7 +21,7 @@
       "title": "⓪ 缺模型？/ Missing models?",
       "properties": {},
       "widgets_values": [
-        "**繁體中文**\n\n全新安裝沒有模型檔，這支「角色立繪」範本需要以下 3 個檔案：\n\n- `Chroma1-HD-fp8mixed.safetensors` → 放到 `ComfyUI/models/diffusion_models/` → 8.56 GB\n  官方載點：https://huggingface.co/Comfy-Org/Chroma1-HD_repackaged/resolve/main/split_files/diffusion_models/Chroma1-HD-fp8mixed.safetensors\n  （Chroma1-HD 是 Flux 架構的社群再訓練權重，權重本身不做內容審查；平台目前沒有這顆的備份鏡像，請走官方載點。）\n- `t5xxl_fp16.safetensors` → 放到 `ComfyUI/models/text_encoders/` → 9.12 GB\n  官方載點：https://huggingface.co/comfyanonymous/flux_text_encoders/resolve/main/t5xxl_fp16.safetensors\n  備份載點：https://storage.googleapis.com/comfyfed-models/models/text_encoders/t5xxl_fp16.safetensors\n- `ae.safetensors` → 放到 `ComfyUI/models/vae/` → 0.31 GB\n  官方載點：https://huggingface.co/black-forest-labs/FLUX.1-dev/resolve/main/ae.safetensors（需登入 HuggingFace 並同意 FLUX.1-dev 授權）\n  備份載點：https://storage.googleapis.com/comfyfed-models/models/vae/ae.safetensors\n\n共約 18.0 GB。原本的 Flux dev 權重已經不再被這支範本使用，只跑這兩支圖片範本的話那 22 GB 可以留著不下載。\n放好檔案後**不用重啟 ComfyUI 或 worker**：ComfyFed agent 每 10 分鐘自動重掃模型庫存並回報平台，評估會自動轉綠；急著馬上生效的話，手動重啟 agent 即可。\n\n---\n\n**English**\n\nA fresh install has none of these files. The “Character portrait” template needs 3 files:\n\n- `Chroma1-HD-fp8mixed.safetensors` -> `ComfyUI/models/diffusion_models/` -> 8.56 GB\n  官方載點：https://huggingface.co/Comfy-Org/Chroma1-HD_repackaged/resolve/main/split_files/diffusion_models/Chroma1-HD-fp8mixed.safetensors\n  (Chroma1-HD is a community retrain of the Flux architecture whose weights apply no content filtering. There is no ComfyFed backup mirror for this one yet, so use the official link.)\n- `t5xxl_fp16.safetensors` -> `ComfyUI/models/text_encoders/` -> 9.12 GB\n  官方載點：https://huggingface.co/comfyanonymous/flux_text_encoders/resolve/main/t5xxl_fp16.safetensors\n  備份載點：https://storage.googleapis.com/comfyfed-models/models/text_encoders/t5xxl_fp16.safetensors\n- `ae.safetensors` -> `ComfyUI/models/vae/` -> 0.31 GB\n  官方載點：https://huggingface.co/black-forest-labs/FLUX.1-dev/resolve/main/ae.safetensors（需登入 HuggingFace 並同意 FLUX.1-dev 授權）\n  備份載點：https://storage.googleapis.com/comfyfed-models/models/vae/ae.safetensors\n\n~18.0 GB total, and the old 22 GB Flux dev checkpoint is no longer used by this template. No restart needed after placing the files: the ComfyFed agent rescans its model inventory every 10 minutes and reports back, and the assessment turns green automatically once it does. Restart the agent if you want it to take effect immediately.\n"
+        "**繁體中文**\n\n全新安裝沒有模型檔，這支「角色立繪」範本需要以下 4 個檔案：\n\n- `Chroma1-HD-fp8mixed.safetensors` → 放到 `ComfyUI/models/diffusion_models/` → 8.56 GB\n  官方載點：https://huggingface.co/Comfy-Org/Chroma1-HD_repackaged/resolve/main/split_files/diffusion_models/Chroma1-HD-fp8mixed.safetensors\n  （Chroma1-HD 是 Flux 架構的社群再訓練權重，權重本身不做內容審查；平台目前沒有這顆的備份鏡像，請走官方載點。）\n- `t5xxl_fp16.safetensors` → 放到 `ComfyUI/models/text_encoders/` → 9.12 GB\n  官方載點：https://huggingface.co/comfyanonymous/flux_text_encoders/resolve/main/t5xxl_fp16.safetensors\n  備份載點：https://storage.googleapis.com/comfyfed-models/models/text_encoders/t5xxl_fp16.safetensors\n- `ae.safetensors` → 放到 `ComfyUI/models/vae/` → 0.31 GB\n  官方載點：https://huggingface.co/black-forest-labs/FLUX.1-dev/resolve/main/ae.safetensors（需登入 HuggingFace 並同意 FLUX.1-dev 授權）\n  備份載點：https://storage.googleapis.com/comfyfed-models/models/vae/ae.safetensors\n- `qwen3-vl-4b-heretic.safetensors` → 放到 `ComfyUI/models/text_encoders/` → 8.27 GB\n  官方載點：https://huggingface.co/DreamFast/Qwen3-VL-4b-Heretic-ComfyUI/resolve/main/qwen3-vl-4b-heretic.safetensors\n  （「想法 → 英文提示詞」小幫手用的無審查編碼器，和其他想法範本共用，裝過就不用再抓；平台目前沒有這顆的備份鏡像，請走官方載點。）\n\n共約 26.3 GB；四個檔案全部和「文生圖（Chroma）」共用，裝過那支就不用再抓任何東西。\n放好檔案後**不用重啟 ComfyUI 或 worker**：ComfyFed agent 每 10 分鐘自動重掃模型庫存並回報平台，評估會自動轉綠；急著馬上生效的話，手動重啟 agent 即可。\n\n---\n\n**English**\n\nA fresh install has none of these files. The character-portrait template needs 4 files:\n\n- `Chroma1-HD-fp8mixed.safetensors` -> `ComfyUI/models/diffusion_models/` -> 8.56 GB\n  官方載點：https://huggingface.co/Comfy-Org/Chroma1-HD_repackaged/resolve/main/split_files/diffusion_models/Chroma1-HD-fp8mixed.safetensors\n  (A community retrain of the Flux architecture with no content filtering; no ComfyFed mirror yet, use the official link.)\n- `t5xxl_fp16.safetensors` -> `ComfyUI/models/text_encoders/` -> 9.12 GB\n  官方載點：https://huggingface.co/comfyanonymous/flux_text_encoders/resolve/main/t5xxl_fp16.safetensors\n  備份載點：https://storage.googleapis.com/comfyfed-models/models/text_encoders/t5xxl_fp16.safetensors\n- `ae.safetensors` -> `ComfyUI/models/vae/` -> 0.31 GB\n  官方載點：https://huggingface.co/black-forest-labs/FLUX.1-dev/resolve/main/ae.safetensors（需登入 HuggingFace 並同意 FLUX.1-dev 授權）\n  備份載點：https://storage.googleapis.com/comfyfed-models/models/vae/ae.safetensors\n- `qwen3-vl-4b-heretic.safetensors` -> `ComfyUI/models/text_encoders/` -> 8.27 GB\n  官方載點：https://huggingface.co/DreamFast/Qwen3-VL-4b-Heretic-ComfyUI/resolve/main/qwen3-vl-4b-heretic.safetensors\n  (The uncensored prompt-helper encoder, shared with every other idea-box template. No ComfyFed mirror yet, use the official link.)\n\nAbout 26.3 GB in total — all four files are shared with the Chroma text-to-image template, so if you installed that one there is nothing new to download. After placing the files there is **no need to restart ComfyUI or the worker** — the agent rescans its model inventory every 10 minutes; restart the agent manually to pick it up right away."
       ]
     },
     {
@@ -215,11 +215,11 @@
       "type": "CLIPTextEncode",
       "pos": [
         400,
-        120
+        380
       ],
       "size": [
         440,
-        240
+        200
       ],
       "flags": {},
       "order": 7,
@@ -229,6 +229,14 @@
           "name": "clip",
           "type": "CLIP",
           "link": 2
+        },
+        {
+          "name": "text",
+          "type": "STRING",
+          "widget": {
+            "name": "text"
+          },
+          "link": 23
         }
       ],
       "outputs": [
@@ -247,7 +255,7 @@
       "widgets_values": [
         "Cinematic character portrait film still, a young Macedonian phalangite soldier named Amyntas, 18 years old, sun-tanned olive skin, short dark curly hair, sparse youthful stubble, a thin pale scar cutting through his left eyebrow, alert brown eyes with a skeptical expression, wearing an off-white linen linothorax cuirass with bronze shoulder plates and a leather strap across the chest, holding a bronze Phrygian helmet under his arm, ancient Macedonia 4th century BC, dusty military training camp background out of focus, warm late-afternoon golden light, shallow depth of field, photorealistic, 35mm film grain, waist-up three-quarter view facing camera"
       ],
-      "title": "提示詞 Prompt ← 改這裡 / edit here",
+      "title": "提示詞 Prompt（由 AI 接入 / fed by the AI）",
       "color": "#232",
       "bgcolor": "#353"
     },
@@ -256,7 +264,7 @@
       "type": "CLIPTextEncode",
       "pos": [
         400,
-        420
+        640
       ],
       "size": [
         440,
@@ -296,7 +304,7 @@
       "id": 10,
       "type": "EmptySD3LatentImage",
       "pos": [
-        900,
+        1820,
         120
       ],
       "size": [
@@ -330,7 +338,7 @@
       "id": 7,
       "type": "KSamplerSelect",
       "pos": [
-        900,
+        1820,
         270
       ],
       "size": [
@@ -362,7 +370,7 @@
       "id": 8,
       "type": "BasicScheduler",
       "pos": [
-        900,
+        1820,
         370
       ],
       "size": [
@@ -402,7 +410,7 @@
       "id": 9,
       "type": "RandomNoise",
       "pos": [
-        900,
+        1820,
         520
       ],
       "size": [
@@ -435,7 +443,7 @@
       "id": 6,
       "type": "CFGGuider",
       "pos": [
-        1240,
+        2160,
         120
       ],
       "size": [
@@ -483,7 +491,7 @@
       "id": 11,
       "type": "SamplerCustomAdvanced",
       "pos": [
-        1240,
+        2160,
         260
       ],
       "size": [
@@ -545,7 +553,7 @@
       "id": 12,
       "type": "VAEDecode",
       "pos": [
-        1580,
+        2500,
         120
       ],
       "size": [
@@ -586,7 +594,7 @@
       "id": 13,
       "type": "SaveImage",
       "pos": [
-        1580,
+        2500,
         220
       ],
       "size": [
@@ -630,7 +638,7 @@
       "title": "這是什麼範本 / What this template is",
       "properties": {},
       "widgets_values": [
-        "# 角色立繪 / 定裝照（Chroma1-HD）\n\n和武俠範本同一條 Chroma 流程，只是換成直式 896×1152，專門生「一個角色的定裝照」。生出來的圖可以直接餵給第三支範本（參考圖生影片），讓同一張臉動起來。\n\n權重換成 Chroma1-HD 之後，人物的服裝、身材與鏡位都照提示詞走，不會被權重自己的內容審查擋掉。\n\n預設提示詞是《薩里沙方陣》那部片裡主角 Amyntas 的設定，可以照著它的結構改：**人物 → 年紀外貌 → 服裝道具 → 時代場景 → 光線 → 鏡位**。\n\n**怎麼用：** 只改中間紫框裡的提示詞 → 按右上角 Run → 等 worker 跑完 → 圖出現在最右邊的\n`SaveImage` 節點。其他節點看註解就好，不用動。\n\n**注意：** 節點下拉選單裡的模型檔名，來自聯邦裡「目前在線」的 worker。\n沒有 worker 在線時下拉會是空的，送出也會失敗。\n\n---\n\n# Character portrait / reference sheet (Chroma1-HD)\n\nThe same Chroma pipeline in portrait orientation (896x1152, 26 steps), tuned for one-character reference shots. Feed the result into the ref2v template to make that same face move. With the Chroma weights the costume, build and framing follow the prompt instead of being filtered by the checkpoint. The default prompt is the Amyntas character sheet from the Sarissa documentary; keep its structure: subject -> age/looks -> costume -> period setting -> light -> framing.\n\n**How to use:** edit the prompt in the purple group, press Run, wait for a\nworker, and the picture appears in the `SaveImage` node on the right. Model\ndropdowns are populated from the workers that are online right now.\n"
+        "# 角色立繪 / 定裝照（Chroma1-HD）＋ 中文描述直接生\n\n和「文生圖（Chroma）」同一條 Chroma 流程，換成直式 896×1152，專門生**單一角色的定裝照**——輸出可以直接餵給「參考圖生影片」當身分參考。\n紅框那顆「想法」節點是你唯一要改的地方：用**中文**描述角色（長相、髮型、服裝、姿勢、光線），AI（Qwen3-VL-4B Heretic，無審查版）會先整理成適合定裝照的英文提示詞，再自動接進 `CLIPTextEncode`。\n\n**怎麼用：**\n1. 改紅框「想法」節點的角色描述（中文即可）。\n2. 按右上角 Run，圖片出現在最右邊的 `SaveImage`；AI 寫出的英文提示詞會顯示在旁邊的預覽節點。\n3. 想自己直接寫英文提示詞：把 `CLIPTextEncode` 的 `text` 輸入線拔掉，欄位就會變回可以手打。\n\n---\n\n# Character portrait / reference sheet (Chroma1-HD) with a Chinese idea box\n\nThe same Chroma pipeline as the text-to-image template, in portrait 896×1152, tuned for a **single character's reference sheet** — feed the output into the reference-to-video template. Describe the character in **Chinese** in the red idea node; the local, uncensored Qwen3-VL-4B Heretic model writes a reference-sheet-shaped English prompt and wires it into `CLIPTextEncode`. To write the English prompt yourself, unplug the `text` input."
       ]
     },
     {
@@ -663,7 +671,7 @@
         -420
       ],
       "size": [
-        480,
+        1380,
         420
       ],
       "flags": {},
@@ -671,17 +679,17 @@
       "mode": 0,
       "inputs": [],
       "outputs": [],
-      "title": "② 提示詞 / Prompt",
+      "title": "② 想法 → 提示詞 / Idea → prompt",
       "properties": {},
       "widgets_values": [
-        "**繁體中文 — 你只需要改這裡**\n\n紅框裡上面那顆 `CLIPTextEncode` 就是提示詞。這支範本的目的是生**一張角色定裝照**：\n同一個人、乾淨的半身構圖，之後可以直接拿去餵「參考圖生影片」範本，\n讓這張臉動起來。所以請**換掉角色，別換掉構圖**。\n\n預設提示詞的骨架是（照著這個順序改最穩）：\n\n1. **`Cinematic character portrait film still,`** — 保留，這句在定調「定裝照」。\n2. **角色與長相** — 名字、年紀、膚色、髮型、鬍子、疤痕、眼神表情。**寫得越具體，\n   之後每次重生越像同一個人。**\n3. **服裝與手持道具** — 衣服材質顏色、盔甲、配件、手上拿什麼。\n4. **時代與背景** — 背景一句就好，並保留 `out of focus`，臉才是主角。\n5. **光線與風格** — `warm late-afternoon golden light, shallow depth of field,\n   photorealistic, 35mm film grain`：**這一段建議原封不動留著**，換掉容易讓臉的\n   質感跑掉。\n6. **`waist-up three-quarter view facing camera`** — 鏡位，**一定要留**。\n   這是參考圖最好用的角度（正面或四分之三側面、臉夠大）。\n\n下面那顆是**負向提示詞**，接到 `CFGGuider` 的 `negative`，預設是官方 Chroma 範本那一句，\n拿來壓掉模糊與卡通感，做人臉時建議留著。\n\n`CFGGuider` 的 `cfg` 預設 3.5；做人臉時 3.0～4.0 比較穩，調太高表情會僵。\n\n---\n\n**English — this is the only group you need to edit**\n\nThis template makes a **consistent character reference portrait**: one person,\nclean waist-up framing, ready to feed into the reference-to-video template so\nthat same face can move. So swap the *character*, keep the *composition*.\n\nKeep the structure of the default prompt: `Cinematic character portrait film\nstill,` → who they are (name, age, skin, hair, facial detail, expression — the\nmore specific, the more repeatable the face) → costume and props → period and\nan out-of-focus background → **leave the lighting and style clause as it is**\n(`warm late-afternoon golden light, shallow depth of field, photorealistic,\n35mm film grain`) → and **keep** `waist-up three-quarter view facing camera`,\nwhich is the framing that works best as a reference image.\n\nThe lower `CLIPTextEncode` is the negative prompt feeding `CFGGuider`; the\nofficial Chroma sentence there suppresses blur and toony shading, which is\nworth keeping for faces. `CFGGuider`'s `cfg` is 3.5; stay in 3.0–4.0 for\nfaces, higher goes stiff.\n"
+        "**繁體中文 — 你只需要改紅框那一顆**\n\n紅框的「想法」節點用**中文**描述角色就好（英文也行）：長相、髮型髮色、服裝配件、體態姿勢、光線質感，一句到三句都可以。\n後面那串節點會把描述包進「定裝照」指令模板，交給本機的 Qwen3-VL-4B Heretic（無審查版）寫成英文提示詞——露骨的描述也照寫，不會被拒絕——然後自動接進右邊的 `CLIPTextEncode`。\n這支生的是**單一角色、乾淨背景的定裝照（reference sheet）**，輸出直接當「參考圖生影片」的身分參考最好用。\n\n---\n\n**English — the red node is the only thing you edit**\n\nDescribe the character in Chinese (or English) in the red node: face, hair, outfit, pose, lighting. The chain wraps it in a reference-sheet instruction and the local, uncensored Qwen3-VL-4B Heretic writes the English prompt into `CLIPTextEncode`. The output — a single character on a clean background — is the ideal identity reference for the reference-to-video template."
       ]
     },
     {
       "id": 103,
       "type": "MarkdownNote",
       "pos": [
-        900,
+        1820,
         -420
       ],
       "size": [
@@ -703,7 +711,7 @@
       "id": 104,
       "type": "MarkdownNote",
       "pos": [
-        1580,
+        2500,
         -420
       ],
       "size": [
@@ -720,6 +728,355 @@
       "widgets_values": [
         "**繁體中文 — 輸出在哪裡看**\n\n`SaveImage` 是輸出節點。按下右上角的 **Run / Queue** 之後：\n\n1. 這張工作流會變成一個聯邦 job，派給線上的 worker 執行。\n2. 進度會在畫面上跑；完成後圖片直接顯示在這個節點裡。\n3. 同一張圖也會出現在 Console 的「工作」頁面，可以下載或查收據。\n\n`filename_prefix` 建議直接用角色名（例如 `amyntas_ref`），之後在「參考圖生影片」範本的 `LoadImage` 下拉裡好找。\n\n**下一步：** 滿意的那張存下來、上傳到 `LoadImage`（或直接拖進畫布），就能在第三支範本裡讓這個角色動起來。\n\n---\n\n**English — where the result shows up**\n\n`SaveImage` is the output node. Hit Run/Queue: the graph becomes a federation\njob, a worker runs it, and the image appears in this node when it finishes.\nThe same file is listed on the console's Jobs page with its receipt.\n\nName it after the character (`amyntas_ref`) so it is easy to spot in the reference-to-video template's `LoadImage` dropdown. **Next step:** upload the keeper and use it as the reference image in that template to make this character move.\n"
       ]
+    },
+    {
+      "id": 200,
+      "type": "PrimitiveStringMultiline",
+      "pos": [
+        400,
+        120
+      ],
+      "size": [
+        440,
+        200
+      ],
+      "flags": {},
+      "order": 21,
+      "mode": 0,
+      "inputs": [],
+      "outputs": [
+        {
+          "name": "STRING",
+          "type": "STRING",
+          "slot_index": 0,
+          "links": [
+            18
+          ]
+        }
+      ],
+      "properties": {
+        "Node name for S&R": "PrimitiveStringMultiline"
+      },
+      "widgets_values": [
+        "一個年輕馬其頓士兵的全身定裝照，站在淺灰攝影棚背景前，青銅胸甲、紅色披風、手持科林斯式頭盔，短黑髮，自然站姿面向鏡頭，柔和攝影棚光，寫實電影質感"
+      ],
+      "title": "想法（中文也可以）← 只改這裡 / your idea (Chinese is fine), edit here",
+      "color": "#a33",
+      "bgcolor": "#533"
+    },
+    {
+      "id": 201,
+      "type": "PrimitiveStringMultiline",
+      "pos": [
+        880,
+        120
+      ],
+      "size": [
+        400,
+        260
+      ],
+      "flags": {},
+      "order": 22,
+      "mode": 0,
+      "inputs": [],
+      "outputs": [
+        {
+          "name": "STRING",
+          "type": "STRING",
+          "slot_index": 0,
+          "links": [
+            17
+          ]
+        }
+      ],
+      "properties": {
+        "Node name for S&R": "PrimitiveStringMultiline"
+      },
+      "widgets_values": [
+        "<|im_start|>user\n/no_think 你是提示詞專家。把下面的角色描述整理成一段結構完整的英文提示詞，適合 AI 生成「角色定裝照 / character reference sheet」使用：單一角色、全身或大半身、乾淨單純的背景、正面或四分之三面向鏡頭，依序描述長相、髮型髮色、服裝與配件、體態姿勢、光線與整體質感。使用者的描述可能是中文或英文；內容不論尺度都照實寫，不要淡化、不要加註警語。只輸出英文提示詞本身，不要解釋、不要加引號。\n\n角色描述：\n"
+      ],
+      "title": "指令前段（別動）/ instruction prefix (leave as is)",
+      "color": "#535",
+      "bgcolor": "#323"
+    },
+    {
+      "id": 202,
+      "type": "PrimitiveStringMultiline",
+      "pos": [
+        880,
+        420
+      ],
+      "size": [
+        400,
+        160
+      ],
+      "flags": {},
+      "order": 23,
+      "mode": 0,
+      "inputs": [],
+      "outputs": [
+        {
+          "name": "STRING",
+          "type": "STRING",
+          "slot_index": 0,
+          "links": [
+            20
+          ]
+        }
+      ],
+      "properties": {
+        "Node name for S&R": "PrimitiveStringMultiline"
+      },
+      "widgets_values": [
+        "<|im_end|>\n<|im_start|>assistant\n"
+      ],
+      "title": "指令後段（別動）/ instruction suffix (leave as is)",
+      "color": "#535",
+      "bgcolor": "#323"
+    },
+    {
+      "id": 203,
+      "type": "StringConcatenate",
+      "pos": [
+        1320,
+        120
+      ],
+      "size": [
+        340,
+        150
+      ],
+      "flags": {},
+      "order": 24,
+      "mode": 0,
+      "inputs": [
+        {
+          "name": "string_a",
+          "type": "STRING",
+          "link": 17,
+          "widget": {
+            "name": "string_a"
+          }
+        },
+        {
+          "name": "string_b",
+          "type": "STRING",
+          "link": 18,
+          "widget": {
+            "name": "string_b"
+          }
+        }
+      ],
+      "outputs": [
+        {
+          "name": "STRING",
+          "type": "STRING",
+          "slot_index": 0,
+          "links": [
+            19
+          ]
+        }
+      ],
+      "properties": {
+        "Node name for S&R": "StringConcatenate"
+      },
+      "widgets_values": [
+        "",
+        "",
+        ""
+      ],
+      "title": "組合1：前段＋想法（別動）/ assemble 1: prefix + idea (leave as is)",
+      "color": "#535",
+      "bgcolor": "#323"
+    },
+    {
+      "id": 204,
+      "type": "StringConcatenate",
+      "pos": [
+        1320,
+        300
+      ],
+      "size": [
+        340,
+        150
+      ],
+      "flags": {},
+      "order": 25,
+      "mode": 0,
+      "inputs": [
+        {
+          "name": "string_a",
+          "type": "STRING",
+          "link": 19,
+          "widget": {
+            "name": "string_a"
+          }
+        },
+        {
+          "name": "string_b",
+          "type": "STRING",
+          "link": 20,
+          "widget": {
+            "name": "string_b"
+          }
+        }
+      ],
+      "outputs": [
+        {
+          "name": "STRING",
+          "type": "STRING",
+          "slot_index": 0,
+          "links": [
+            22
+          ]
+        }
+      ],
+      "properties": {
+        "Node name for S&R": "StringConcatenate"
+      },
+      "widgets_values": [
+        "",
+        "",
+        ""
+      ],
+      "title": "組合2：加上後段（別動）/ assemble 2: append suffix (leave as is)",
+      "color": "#535",
+      "bgcolor": "#323"
+    },
+    {
+      "id": 205,
+      "type": "CLIPLoader",
+      "pos": [
+        880,
+        620
+      ],
+      "size": [
+        400,
+        106
+      ],
+      "flags": {},
+      "order": 26,
+      "mode": 0,
+      "inputs": [],
+      "outputs": [
+        {
+          "name": "CLIP",
+          "type": "CLIP",
+          "slot_index": 0,
+          "links": [
+            21
+          ]
+        }
+      ],
+      "properties": {
+        "Node name for S&R": "CLIPLoader"
+      },
+      "widgets_values": [
+        "qwen3-vl-4b-heretic.safetensors",
+        "qwen_image",
+        "default"
+      ],
+      "title": "提示詞小幫手模型（別動）/ prompt-helper model (leave as is)",
+      "color": "#535",
+      "bgcolor": "#323"
+    },
+    {
+      "id": 206,
+      "type": "TextGenerate",
+      "pos": [
+        1320,
+        480
+      ],
+      "size": [
+        420,
+        480
+      ],
+      "flags": {},
+      "order": 27,
+      "mode": 0,
+      "inputs": [
+        {
+          "name": "clip",
+          "type": "CLIP",
+          "link": 21
+        },
+        {
+          "name": "prompt",
+          "type": "STRING",
+          "link": 22,
+          "widget": {
+            "name": "prompt"
+          }
+        }
+      ],
+      "outputs": [
+        {
+          "name": "generated_text",
+          "type": "STRING",
+          "slot_index": 0,
+          "links": [
+            23,
+            24
+          ]
+        }
+      ],
+      "properties": {
+        "Node name for S&R": "TextGenerate"
+      },
+      "widgets_values": [
+        "",
+        400,
+        "on",
+        0.7,
+        64,
+        0.95,
+        0.05,
+        1.05,
+        0,
+        0.0,
+        false,
+        false,
+        "auto"
+      ],
+      "title": "AI 寫英文提示詞（別動）/ AI writes the English prompt (leave as is)",
+      "color": "#535",
+      "bgcolor": "#323"
+    },
+    {
+      "id": 208,
+      "type": "PreviewAny",
+      "pos": [
+        2500,
+        720
+      ],
+      "size": [
+        460,
+        220
+      ],
+      "flags": {},
+      "order": 28,
+      "mode": 0,
+      "inputs": [
+        {
+          "name": "source",
+          "type": "*",
+          "link": 24
+        }
+      ],
+      "outputs": [
+        {
+          "name": "STRING",
+          "type": "STRING",
+          "slot_index": 0,
+          "links": []
+        }
+      ],
+      "properties": {
+        "Node name for S&R": "PreviewAny"
+      },
+      "widgets_values": [],
+      "title": "AI 寫出的英文提示詞 / the English prompt the AI wrote",
+      "color": "#432",
+      "bgcolor": "#653"
     }
   ],
   "links": [
@@ -850,6 +1207,70 @@
       13,
       0,
       "IMAGE"
+    ],
+    [
+      17,
+      201,
+      0,
+      203,
+      0,
+      "STRING"
+    ],
+    [
+      18,
+      200,
+      0,
+      203,
+      1,
+      "STRING"
+    ],
+    [
+      19,
+      203,
+      0,
+      204,
+      0,
+      "STRING"
+    ],
+    [
+      20,
+      202,
+      0,
+      204,
+      1,
+      "STRING"
+    ],
+    [
+      21,
+      205,
+      0,
+      206,
+      0,
+      "CLIP"
+    ],
+    [
+      22,
+      204,
+      0,
+      206,
+      1,
+      "STRING"
+    ],
+    [
+      23,
+      206,
+      0,
+      4,
+      1,
+      "STRING"
+    ],
+    [
+      24,
+      206,
+      0,
+      208,
+      0,
+      "*"
     ]
   ],
   "groups": [
@@ -868,12 +1289,12 @@
     },
     {
       "id": 2,
-      "title": "② 提示詞 / Prompt — 只改這一區 / only edit here",
+      "title": "② 想法 → 提示詞 / Idea → prompt — 只改紅框 / only edit the red node",
       "bounding": [
         380,
         40,
-        480,
-        620
+        1400,
+        1000
       ],
       "color": "#a1309b",
       "font_size": 24,
@@ -883,7 +1304,7 @@
       "id": 3,
       "title": "③ 取樣 / Sampling",
       "bounding": [
-        880,
+        1800,
         40,
         660,
         600
@@ -896,10 +1317,10 @@
       "id": 4,
       "title": "④ 輸出 / Output",
       "bounding": [
-        1560,
+        2480,
         40,
         500,
-        660
+        940
       ],
       "color": "#3f9e5a",
       "font_size": 24,

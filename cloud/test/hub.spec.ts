@@ -2538,3 +2538,90 @@ describe("POST /internal/fetch_progress_batch", () => {
     expect(await res.json()).toEqual({ progress: {} });
   });
 });
+
+// --- 2026-10-24: update_comfyui push + hello-time agent self-update nudge --
+describe("protocol 6: update_comfyui + hello-time update_agent nudge", () => {
+  async function setAgentLatest(value: string): Promise<void> {
+    await db()
+      .prepare(
+        "INSERT INTO settings (key, value) VALUES ('agent_latest', ?) " +
+          "ON CONFLICT(key) DO UPDATE SET value = excluded.value"
+      )
+      .bind(value)
+      .run();
+  }
+
+  it("nudges a >=0.1.18 agent whose reported version is older than agent_latest", async () => {
+    await setAgentLatest("0.1.19");
+    const kp = KEYPAIRS[0]!;
+    const workerId = await makeWorker({ pubkeyHex: kp.pubkey_hex });
+    const ws = await connectAgent(workerId, kp.seed_hex);
+    const frame = nextMessage(ws);
+    // A 0.1.18 agent speaks protocol 5 -- the nudge is gated on the REPORTED
+    // VERSION (its RemoteUpdater answers update_agent), not the protocol.
+    ws.send(
+      JSON.stringify({ type: "hello", protocol: 5, hardware: { agent_version: "0.1.18" } })
+    );
+    expect(await frame).toEqual({ type: "update_agent" });
+    ws.close();
+  });
+
+  it("stays silent for a current version and for a pre-0.1.18 agent", async () => {
+    await setAgentLatest("0.1.19");
+    for (const hello of [
+      { type: "hello", protocol: 6, hardware: { agent_version: "0.1.19" } },
+      { type: "hello", protocol: 5, hardware: { agent_version: "0.1.16" } },
+    ]) {
+      const kp = KEYPAIRS[0]!;
+      const workerId = await makeWorker({ pubkeyHex: kp.pubkey_hex });
+      const ws = await connectAgent(workerId, kp.seed_hex);
+      const none = expectNoMessage(ws, 400);
+      ws.send(JSON.stringify(hello));
+      await none;
+      ws.close();
+    }
+  });
+
+  it("pushes update_comfyui to a protocol-6 agent through the internal route", async () => {
+    const kp = KEYPAIRS[0]!;
+    const workerId = await makeWorker({ pubkeyHex: kp.pubkey_hex });
+    const ws = await connectAgent(workerId, kp.seed_hex);
+    const none = expectNoMessage(ws, 300);
+    ws.send(JSON.stringify({ type: "hello", protocol: 6, hardware: {} }));
+    await none;
+
+    const frame = nextMessage(ws);
+    const res = await hub().fetch("http://hub.internal/internal/update_comfyui", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ worker_id: workerId }),
+    });
+    expect(await res.json()).toEqual({ result: "sent" });
+    expect(await frame).toEqual({ type: "update_comfyui" });
+    ws.close();
+  });
+
+  it("answers unsupported for protocol 5 and offline for no connection", async () => {
+    const kp = KEYPAIRS[0]!;
+    const workerId = await makeWorker({ pubkeyHex: kp.pubkey_hex });
+    const ws = await connectAgent(workerId, kp.seed_hex);
+    const none = expectNoMessage(ws, 300);
+    ws.send(JSON.stringify({ type: "hello", protocol: 5, hardware: {} }));
+    await none;
+
+    let res = await hub().fetch("http://hub.internal/internal/update_comfyui", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ worker_id: workerId }),
+    });
+    expect(await res.json()).toEqual({ result: "unsupported" });
+    ws.close();
+
+    res = await hub().fetch("http://hub.internal/internal/update_comfyui", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ worker_id: "nope" }),
+    });
+    expect(await res.json()).toEqual({ result: "offline" });
+  });
+});

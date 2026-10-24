@@ -204,14 +204,28 @@ export interface WorkerHardware {
   cpu_cores?: number | null;
   ram_gb?: number | null;
   agent_version?: string | null;
+  /** The worker's local ComfyUI version, reported since agent protocol 6
+   * (agent 0.1.19). Older agents never send it. */
+  comfyui_version?: string | null;
   /** "Windows" | "Darwin" | "Linux", reported since agent protocol 2. */
   platform?: string | null;
+}
+
+/** Progress/outcome of the last admin-commanded ComfyUI update, carried on
+ * every heartbeat's `dynamic` blob (agent protocol 6). Persists until a
+ * later update command replaces it. */
+export interface ComfyuiUpdateStatus {
+  status: 'updating' | 'ok' | 'failed' | 'rejected' | string;
+  detail?: string;
+  version?: string;
+  at?: string;
 }
 
 export interface WorkerDynamic {
   free_vram_gb?: number | null;
   free_ram_gb?: number | null;
   free_disk_gb?: number | null;
+  comfyui_update?: ComfyuiUpdateStatus | null;
 }
 
 export type WorkerStatus = 'online' | 'busy' | 'offline' | 'paused';
@@ -757,6 +771,15 @@ export const api = {
    * live, `workers.not_found` (404) otherwise. */
   updateWorker(workerId: string): Promise<{ status: string; detail?: string }> {
     return postJson(`/api/workers/${encodeURIComponent(workerId)}/update`, {});
+  },
+
+  /** Admin: tell this worker's agent to update its ComfyUI install to the
+   * latest stable release (agent 0.1.19+). The server only pushes the
+   * command; progress and outcome arrive on the worker's heartbeat
+   * `dynamic.comfyui_update`. 409 when the worker is offline or its agent
+   * predates the command. */
+  updateWorkerComfyui(workerId: string): Promise<{ ok: boolean }> {
+    return postJson(`/api/workers/${encodeURIComponent(workerId)}/update-comfyui`, {});
   },
 
   /** Admin soft delete: the worker disappears from this list and can never

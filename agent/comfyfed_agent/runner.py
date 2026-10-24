@@ -24,7 +24,7 @@ from nacl.signing import SigningKey
 
 from . import __version__
 from . import (
-    comfy, control, detect, fetcher, hardware, mps_compat, natmap, peerserve, remote_update,
+    comfy, comfyupdate, control, detect, fetcher, hardware, mps_compat, natmap, peerserve, remote_update,
     signing, update, whitelist,
 )
 from .config import AgentConfig, PlatformEntry
@@ -354,7 +354,13 @@ class PlatformConnection:
             # `exec_seconds` on job_done/job_failed, and job_cancelled
             # pushes. A server that doesn't know protocol 5 yet just ignores
             # the unknown fields (see the hello handler in cloud/src/do/hub.ts).
-            "protocol": 5,
+            # Protocol 6 (2026-10-24): this worker also reports
+            # `hardware.comfyui_version` and accepts
+            # `{"type": "update_comfyui"}` pushes (admin-commanded ComfyUI
+            # update; progress and outcome ride the heartbeat
+            # `dynamic.comfyui_update` blob). Servers older than this simply
+            # never send the frame.
+            "protocol": 6,
             "auto_fetch": self.config.auto_fetch_models,
             # Optional (Phase 3.2 F1 fix): this worker's configured auto-fetch
             # budget (see AgentConfig.max_fetch_gb / fetcher._check_budget_and_
@@ -882,6 +888,14 @@ class AgentLoop:
         # than a flag because every platform connection waits independently;
         # the published state says "waiting" while ANY of them does.
         self._comfy_waiting: set[str] = set()
+        # 2026-10-24 (protocol 6): admin-commanded ComfyUI update. The task
+        # reference keeps "one update at a time"; the status dict is the last
+        # update's progress/outcome and rides every heartbeat's `dynamic`
+        # blob as `comfyui_update` until a later command replaces it (see
+        # `_collect_dynamic`), which is how the console learns what happened
+        # without a new D1 column.
+        self._comfy_update_task: Optional[asyncio.Task] = None
+        self._comfy_update_status: Optional[dict] = None
         # Remote update (spec §2.2). `exit_code` is what `main._cmd_run`
         # hands to `sys.exit` once the event loop is gone: None for every
         # ordinary exit, `update.RESTART_EXIT_CODE` after a successful
@@ -956,6 +970,11 @@ class AgentLoop:
         """
         if state not in ("idle", "paused"):
             return state
+        # A platform-commanded ComfyUI update owns the machine for its
+        # duration: ComfyUI is being stopped/replaced/restarted, so no new
+        # intake. Reported as `paused` -- an existing, understood state.
+        if self._comfy_update_running():
+            return "paused"
         if availability is None:
             availability = control.availability(self.config, self._config_dir)
         return "idle" if availability == "available" else "paused"
@@ -2497,6 +2516,8 @@ class AgentLoop:
             await self.refresh_object_info(conn, force=True)
         elif msg_type == "peer_status":
             self._handle_peer_status(message)
+        elif msg_type == "update_comfyui":
+            self._spawn_comfy_update()
         elif msg_type == "update_agent":
             # A task, like jobs: the check and the wheel install block for
             # seconds, and this connection must keep heartbeating meanwhile.
@@ -2524,6 +2545,94 @@ class AgentLoop:
         if not reachable and self._peer_nat != "manual" and changed:
             logger.warning(_PEER_NO_MAPPING_WARNING)
 
+    # --- 2026-10-24 (protocol 6): admin-commanded ComfyUI update ----------
+
+    def _collect_dynamic(self) -> dict:
+        """`hardware.collect_dynamic` plus the last ComfyUI-update status.
+
+        `dynamic` is the opaque per-heartbeat blob the server stores verbatim
+        and the console reads back, so the update's progress and outcome ride
+        here (`comfyui_update`) rather than in a new column on either
+        backend. The status persists across beats until a later update
+        command replaces it -- the console shows the LAST outcome, not a
+        one-beat flash.
+        """
+        dynamic = hardware.collect_dynamic(self.config.models_dir)
+        if self._comfy_update_status is not None:
+            dynamic = dict(dynamic)
+            dynamic["comfyui_update"] = self._comfy_update_status
+        return dynamic
+
+    def _set_comfy_update_status(self, status: str, detail: str, version: Optional[str] = None) -> None:
+        entry: dict = {
+            "status": status,
+            "detail": detail,
+            "at": datetime.now(timezone.utc).isoformat(),
+        }
+        if version:
+            entry["version"] = version
+        self._comfy_update_status = entry
+
+    def _comfy_update_running(self) -> bool:
+        return self._comfy_update_task is not None and not self._comfy_update_task.done()
+
+    def _spawn_comfy_update(self) -> None:
+        """Start the platform-commanded ComfyUI update, or refuse with a
+        reason the console can show (the status rides the next heartbeats)."""
+        if self._comfy_update_running():
+            logger.info("runner: update_comfyui ignored -- an update is already running")
+            return
+        if any(handle.running for handle in self._jobs.values()):
+            self._set_comfy_update_status(
+                "rejected",
+                "worker 正在執行工作，等它跑完再試一次 / a job is running here -- retry when idle",
+            )
+            logger.info("runner: update_comfyui rejected -- a job is running")
+            return
+        self._set_comfy_update_status("updating", "開始更新 / starting")
+        logger.info("runner: starting platform-commanded ComfyUI update")
+        self._comfy_update_task = asyncio.create_task(
+            self._run_comfy_update(), name="comfyfed-comfyui-update"
+        )
+
+    async def _run_comfy_update(self) -> None:
+        def status_cb(detail: str) -> None:
+            # Called from the worker thread; replacing the dict reference is
+            # atomic under the GIL, and heartbeats only ever read it.
+            self._set_comfy_update_status("updating", detail)
+
+        # One immediate paused beat so dispatch stops handing this worker new
+        # jobs for the duration (see `_effective_state`).
+        try:
+            await self.broadcast_heartbeat("idle", dynamic=self._collect_dynamic())
+        except Exception:
+            logger.exception("runner: pre-update heartbeat failed")
+        try:
+            result = await asyncio.to_thread(
+                comfyupdate.perform_update,
+                self._config_dir,
+                self.config.comfy_url,
+                status_cb,
+            )
+        except Exception as exc:  # perform_update itself never raises; belt+braces
+            logger.exception("runner: ComfyUI update crashed")
+            result = comfyupdate.UpdateResult(False, f"unexpected error: {exc}")
+        self._set_comfy_update_status(
+            "ok" if result.ok else "failed", result.detail, result.version
+        )
+        logger.info(
+            "runner: ComfyUI update finished ok=%s version=%s detail=%s",
+            result.ok, result.version, result.detail,
+        )
+        # Reconnect every platform so the fresh hello re-reports
+        # `hardware.comfyui_version` (hello is the only carrier) and the
+        # fleet's object_info/node_classes snapshot follows the new build.
+        for conn in self.connections.values():
+            try:
+                await conn.close()
+            except Exception:
+                pass
+
     async def _connection_loop(self, conn: PlatformConnection) -> None:
         last_heartbeat = time.monotonic()
         last_object_info = time.monotonic()
@@ -2538,7 +2647,7 @@ class AgentLoop:
 
             now = time.monotonic()
             if now - last_heartbeat >= _HEARTBEAT_INTERVAL_SECONDS:
-                dynamic = hardware.collect_dynamic(self.config.models_dir)
+                dynamic = self._collect_dynamic()
                 fetch_status = self._fetch_status_for(conn) or {}
                 job_id = self._job_id_for(conn)
                 effective_state = self._effective_state(conn.state)
@@ -2708,7 +2817,7 @@ class AgentLoop:
                 await conn.send_heartbeat(
                     self._effective_state(conn.state),
                     job_id=self._job_id_for(conn),
-                    dynamic=hardware.collect_dynamic(self.config.models_dir),
+                    dynamic=self._collect_dynamic(),
                     object_info_hash=conn.object_info_hash or None,
                 )
 

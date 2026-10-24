@@ -624,6 +624,54 @@ async function updateWorkerViaHub(env: Env, workerId: string): Promise<Response>
   });
 }
 
+// --- POST /api/workers/{id}/update-comfyui (2026-10-24) -------------------
+//
+// 管理員下令這台 worker 把 ComfyUI 更新到最新穩定版（agent 0.1.19 / protocol
+// 6 起才認得 `update_comfyui` 這個 frame）。與上面的 agent 更新不同，這裡沒有
+// ack 可等：更新本身在 agent 上跑（git checkout 最新 tag＋pip install＋重啟
+// ComfyUI，失敗自動回滾），進度與結果掛在之後每次心跳的
+// `dynamic.comfyui_update` 上，Workers 頁輪詢時直接讀。
+
+/** The first agent release that understands `update_comfyui`. */
+const COMFY_UPDATE_MIN_AGENT = "0.1.19";
+
+const COMFY_UPDATE_TOO_OLD_MESSAGE =
+  "這台 worker 的 agent 版本太舊（需 0.1.19 以上），請先更新 agent。/ " +
+  "This worker's agent predates the ComfyUI update command (needs 0.1.19+): update the agent first.";
+
+app.post("/api/workers/:workerId/update-comfyui", requireCsrf, async (c) => {
+  const workerId = c.req.param("workerId");
+  const worker = await getWorkerById(c.env.DB, workerId);
+  if (!worker) {
+    return errorJson(c, 404, "workers.not_found", "Worker not found.");
+  }
+  const version = reportedAgentVersion(worker.hardware);
+  if (version === null || compareVersions(version, COMFY_UPDATE_MIN_AGENT) < 0) {
+    return errorJson(c, 409, "workers.agent_too_old", COMFY_UPDATE_TOO_OLD_MESSAGE);
+  }
+  let result = "offline";
+  try {
+    const stub = c.env.HUB.get(c.env.HUB.idFromName("hub"));
+    const resp = await stub.fetch("http://hub.internal/internal/update_comfyui", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ worker_id: workerId }),
+    });
+    const body = await resp.json<{ result?: unknown }>().catch(() => ({}) as { result?: unknown });
+    if (typeof body.result === "string") result = body.result;
+  } catch (err) {
+    console.error("workers: hub update_comfyui hop failed", workerId, err);
+    return errorJson(c, 502, "workers.update_failed", "無法聯絡 Hub / Could not reach the hub.");
+  }
+  if (result === "offline") {
+    return errorJson(c, 409, "workers.offline", "Worker 不在線上，無法下令更新。/ Worker is not connected.");
+  }
+  if (result === "unsupported") {
+    return errorJson(c, 409, "workers.agent_too_old", COMFY_UPDATE_TOO_OLD_MESSAGE);
+  }
+  return c.json({ ok: true });
+});
+
 app.post("/api/workers/:workerId/update", requireCsrf, async (c) => {
   const workerId = c.req.param("workerId");
   const worker = await getWorkerById(c.env.DB, workerId);

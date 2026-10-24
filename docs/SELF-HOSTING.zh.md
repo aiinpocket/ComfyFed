@@ -454,27 +454,28 @@ Settings 頁可以把 `object_info_mode` 從預設的「聯集」切成「**交�
 
 ### 範本
 
-ComfyFed 內建十一支**實戰跑過**的工作流，每一支都在畫布上用便條紙逐段標了「這個節點在幹嘛、你該改哪裡」，中英雙語。一般使用者導向的清單（每支做什麼、怎麼用）在根目錄的 [README.md](../README.md) 裡；這裡只記錄開發／維運相關的細節。
+ComfyFed 內建十二支**實戰跑過**的工作流，每一支都在畫布上用便條紙逐段標了「這個節點在幹嘛、你該改哪裡」，中英雙語。一般使用者導向的清單（每支做什麼、怎麼用）在根目錄的 [README.md](../README.md) 裡；這裡只記錄開發／維運相關的細節。
 
 **怎麼打開**：編輯器左側工具列的**範本／Browse Templates**（或功能表 Workflow → Browse Templates；空白畫布上也會有入口）→ 側邊分類選 **ComfyFed** → 點縮圖，它就會**複製一份**到畫布上變成新的未命名工作流。**改的是副本，範本本身動不到**，改壞了關掉重開一份就好。
 
-十一支範本（對應 `cloud/packaged/templates/index.json`，建置時打包進平台的 assets）：
+十二支範本（索引分成圖片／影片／音樂／工具四個分類；對應 `cloud/packaged/templates/index.json`，建置時打包進平台的 assets）：
 
 | 名稱 | 是什麼 | 尺寸／步數 |
 | --- | --- | --- |
-| **文生圖** | Chroma1-HD 文生圖（權重不做內容審查）。紅框「想法」節點打中文即可：內建的 Qwen3-VL-4B Heretic 小幫手先寫成英文提示詞，再直接接進 `CLIPTextEncode`。預設想法就是 ComfyFed 第一次跑通聯邦派工用的那張武俠場景，換掉就能畫任何題材 | 768×768，26 步 |
-| **角色立繪** | 同一條 Chroma 流程的直式版，專門生單一角色的定裝照 | 896×1152，26 步 |
+| **文生圖（Chroma）** | Chroma1-HD 文生圖（權重不做內容審查）。紅框「想法」節點打中文即可：內建的 Qwen3-VL-4B Heretic 小幫手先寫成英文提示詞，再直接接進 `CLIPTextEncode`。預設想法就是 ComfyFed 第一次跑通聯邦派工用的那張武俠場景，換掉就能畫任何題材 | 768×768，26 步 |
+| **文生圖（Qwen）** | Qwen-Image-2.1（阿里 2026-09 開源 7B）文生圖，**預設想法與 Chroma 版相同**，跑兩支直接比較模型。小幫手鏈一樣，取樣用官方建議值。需 worker ComfyUI ≥ 0.37 | 1024×1024，25 步，CFG 1 |
+| **角色立繪** | 同一條 Chroma 流程的直式版：紅框用中文描述角色，小幫手寫成定裝照英文提示詞 | 896×1152，26 步 |
 | **參考圖生影片** | MiniMax H3 Ref2V：一張定裝照 →「同一個人」在動的影片，自帶聲音。鏡頭用中文寫在「想法」節點，小幫手寫成英文提示詞並自動補上 `<Picture 1>` 標記 | 1152×640，141 格（約 6 秒），8 步（turbo LoRA） |
 | **NSFW 圖生影片** | 同一條 H3 Ref2V 流程，整條無審查（H3 的 Heretic 32B 編碼器＋Heretic 4B 小幫手）：一張成年人照片＋用中文寫的成人情節。由管理員共用範本「(NSFW)圖生影片」收進內建庫，附當時的示範照片 `nsfw_i2v_ref.jpg` | 1152×640，141 格（約 6 秒），8 步（turbo LoRA） |
-| **首尾幀生影片** | 給第一格與最後一格畫面加一句動作描述，MiniMax H3 補出中間的動態與聲音 | 8 步（turbo LoRA） |
+| **首尾幀生影片** | 給第一格與最後一格畫面，紅框用中文描述中間的動作，小幫手寫成英文提示詞後 MiniMax H3 補出動態與聲音 | 8 步（turbo LoRA） |
 | **多影片串接** | 兩段影片首尾接起來，畫面與聲音都接。零模型 | — |
 | **圖片開場影片** | 一張靜態圖當片頭卡片撐幾秒，再接一段影片播放。零模型 | — |
 | **影片截段** | 從一段影片剪出「第幾秒開始、剪多長」的片段。零模型 | — |
 | **圖片放大** | RealESRGAN 4 倍超解析度放大一張圖 | — |
+| **文生音樂** | ACE-Step 1.5 turbo（MIT）文生音樂：紅框三顆——中文音樂想法（小幫手寫成英文 style tags）、中文歌詞（留 `[Verse]`／`[Chorus]` 標記）、歌曲秒數。語言預設 `zh`，可改 | 8 步 turbo，長度 10 秒〜10 分鐘 |
 | **圖生提示詞** | 上傳一張參考圖＋簡短需求，本地 Qwen3-VL 模型幫你寫出英文提示詞 | — |
-| **文字生提示詞** | 貼一段粗略想法，同一顆 Qwen3-VL 模型幫你整理成結構化英文提示詞 | — |
 
-**改一個地方就能跑**：模型導向的四組範本（文生圖／角色立繪／參考圖生影片／NSFW 圖生影片）用紫色群組框標「只改這一區」——文生圖、參考圖生影片、NSFW 圖生影片三支從 2026-09-20 起內嵌「文字生提示詞」那條鏈（紅框「想法」節點打中文 → Qwen3-VL-4B Heretic 的 `TextGenerate` 寫英文提示詞 → 直接接進提示詞輸入；影片兩支還會自動在最前面補上 `<Picture 1>`），所以只要改想法節點（影片範本再多一個參考圖節點）；角色立繪仍是直接改英文提示詞。其餘六支用更精簡的三組佈局（①②③ 便條），一樣照著便條紙改就好。改完按右上角 **Run**，工作流就變成一個聯邦 job 排進佇列，跑完結果直接顯示在最右邊的輸出節點裡，Console 的「工作」頁也拿得到檔案與收據。
+**改一個地方就能跑**：2026-10-24 起**每一支要寫提示詞的範本都內嵌同一條中文想法鏈**（紅框「想法」節點打中文 → Qwen3-VL-4B Heretic 的 `TextGenerate` 寫英文提示詞 → 直接接進提示詞輸入；H3 影片範本還會自動補上 `<Picture 1>` 標記）——兩支文生圖、角色立繪、參考圖生影片、NSFW 圖生影片、首尾幀生影片、文生音樂全部只要改紅框（影片範本再多一兩個圖片節點、音樂再多歌詞與秒數兩顆）。也因此原本獨立的「文字生提示詞」範本已退役——它的功能被每支範本內建了；「圖生提示詞」（描述一張參考圖）保留。其餘零模型／單模型範本用更精簡的三組佈局（①②③ 便條），照著便條紙改就好。改完按右上角 **Run**，工作流就變成一個聯邦 job 排進佇列，跑完結果直接顯示在最右邊的輸出節點裡，Console 的「工作」頁也拿得到檔案與收據。
 
 **附帶素材**：需要參考圖／範例輸入的範本（參考圖生影片、NSFW 圖生影片、圖生提示詞、圖片放大等）的素材隨建置打包（`cloud/packaged/templates/assets/`），第一次有人開範本瀏覽器時平台會把它們複製進**共用**的 staging 區（R2 的 `staging/` 底下一個共用命名空間；自架時落在 `<data-dir>/state/`），所以 `LoadImage`／`LoadVideo` 的下拉一開就選得到；這些共用樣本不會出現在任何人的「檔案」頁、也不能被刪。要換成自己的檔案，直接在節點上傳（或把檔案拖進畫布）即可——上傳的檔案進你自己的 staging，送單時才複製成那個 job 的輸入。
 
@@ -530,9 +531,13 @@ Console 左側的 **「檔案 / Files」** 頁把使用者自己的檔案集中�
 | `minimax_h3_ref2v_turbo_8step_v1.0_768p_comfyui_resized_avg_rank_64_bf16.safetensors` | 0.91 GB | `models/loras/` | [官方](https://huggingface.co/drbaph/MiniMax-H3-Turbo-Lora-ComfyUI/resolve/main/minimax_h3_ref2v_turbo_8step_v1.0_768p_comfyui_resized_avg_rank_64_bf16.safetensors) | [備份](https://storage.googleapis.com/comfyfed-models/models/loras/minimax_h3_ref2v_turbo_8step_v1.0_768p_comfyui_resized_avg_rank_64_bf16.safetensors) |
 | `qwen3vl_4b_bf16.safetensors` | 8.27 GB | `models/text_encoders/` | [官方](https://huggingface.co/Comfy-Org/Krea-2/resolve/main/text_encoders/qwen3vl_4b_bf16.safetensors) | [備份](https://storage.googleapis.com/comfyfed-models/models/text_encoders/qwen3vl_4b_bf16.safetensors) |
 | `qwen3-vl-4b-heretic.safetensors` | 8.27 GB | `models/text_encoders/` | [官方](https://huggingface.co/DreamFast/Qwen3-VL-4b-Heretic-ComfyUI/resolve/main/qwen3-vl-4b-heretic.safetensors) | 無（尚未鏡像，請走官方載點） |
+| `qwen_image_2.1_int8_convrot.safetensors` | 7.26 GB | `models/diffusion_models/` | [官方](https://huggingface.co/Comfy-Org/Qwen-Image-2.1/resolve/main/diffusion_models/qwen_image_2.1_int8_convrot.safetensors) | 無（尚未鏡像，請走官方載點） |
+| `qwen3vl_8b_int8_convrot.safetensors` | 9.35 GB | `models/text_encoders/` | [官方](https://huggingface.co/Comfy-Org/Qwen-Image-2.1/resolve/main/text_encoders/qwen3vl_8b_int8_convrot.safetensors) | 無（尚未鏡像，請走官方載點） |
+| `qwen_image_2.1_vae_bf16.safetensors` | 0.68 GB | `models/vae/` | [官方](https://huggingface.co/Comfy-Org/Qwen-Image-2.1/resolve/main/vae/qwen_image_2.1_vae_bf16.safetensors) | 無（尚未鏡像，請走官方載點） |
+| `ace_step_1.5_turbo_aio.safetensors` | 10.03 GB | `models/checkpoints/` | [官方](https://huggingface.co/Comfy-Org/ACE-Step-1.5/resolve/main/checkpoints/ace_step_1.5_turbo_aio.safetensors) | 無（尚未鏡像，請走官方載點） |
 | `RealESRGAN_x4plus.pth` | 0.06 GB | `models/upscale_models/` | [官方](https://github.com/xinntao/Real-ESRGAN/releases/download/v0.1.0/RealESRGAN_x4plus.pth) | [備份](https://storage.googleapis.com/comfyfed-models/models/upscale_models/RealESRGAN_x4plus.pth) |
 
-全部裝齊約 **97.2 GB**；只跑文生圖／角色立繪兩支 Chroma 範本約 **18.0 GB**（`Chroma1-HD-fp8mixed`＋`t5xxl_fp16`＋`ae`；不再需要 22 GB 的 `flux1-dev`，那顆現在只有 `flux-t2i` 配方在用），只跑參考圖生影片約 **40.5 GB**，兩支提示詞小幫手範本（圖生提示詞／文字生提示詞）共用同一顆 `qwen3-vl-4b-heretic`（Qwen3-VL-4B-Instruct 的無審查版），只需 **8.27 GB**；文生圖、參考圖生影片、NSFW 圖生影片三支因為內嵌了這條小幫手鏈，各自還要再加這顆 8.27 GB（文生圖合計約 26.3 GB、兩支 H3 影片各約 48.8 GB）；舊的 `qwen3vl_4b_bf16` 已不再被任何範本使用，但仍留在內建下載清單裡；圖片放大只需 RealESRGAN 的 **0.06 GB**；多影片串接／圖片開場影片／影片截段三支不需要任何模型。每支範本的畫布上也有一則「⓪ 缺模型？」便條紙（零模型範本沒有這則便條），列出該範本自己需要哪幾個檔案。
+全部裝齊約 **124.5 GB**；只跑文生圖／角色立繪兩支 Chroma 範本約 **18.0 GB**（`Chroma1-HD-fp8mixed`＋`t5xxl_fp16`＋`ae`；不再需要 22 GB 的 `flux1-dev`，那顆現在只有 `flux-t2i` 配方在用），只跑參考圖生影片約 **40.5 GB**，提示詞小幫手範本（圖生提示詞）用的 `qwen3-vl-4b-heretic`（Qwen3-VL-4B-Instruct 的無審查版）只需 **8.27 GB**；所有內嵌中文想法鏈的範本（兩支文生圖、角色立繪、兩支 H3 影片、NSFW 圖生影片、文生音樂）都共用這同一顆，各自在自己的模型之外再加 8.27 GB（Chroma 文生圖／角色立繪合計約 26.3 GB、三支 H3 影片各約 48.8 GB）；舊的 `qwen3vl_4b_bf16` 已不再被任何範本使用，但仍留在內建下載清單裡；圖片放大只需 RealESRGAN 的 **0.06 GB**；多影片串接／圖片開場影片／影片截段三支不需要任何模型。2026-10-24 新增的兩支：文生圖（Qwen）需要 Qwen-Image-2.1 三件組＋小幫手共約 **25.6 GB**（且 worker 的 ComfyUI 要 0.37 以上才有 `TextEncodeQwenImage21` 節點）；文生音樂需要 ACE-Step 1.5 turbo AIO＋小幫手共約 **18.3 GB**。每支範本的畫布上也有一則「⓪ 缺模型？」便條紙（零模型範本沒有這則便條），列出該範本自己需要哪幾個檔案。
 
 **不用重啟**：放好檔案後不必重啟 ComfyUI 或 agent——agent 每 10 分鐘會自動重掃本機模型庫存並回報平台，工作評估之後就會自動轉綠。真的等不及的話，手動重啟 agent 可以讓它立刻生效。
 
@@ -568,6 +573,18 @@ Console 左側的 **「檔案 / Files」** 頁把使用者自己的檔案集中�
 `nsfw_ok` 記的是**權重本身會不會迴避露骨內容**：官方 Flux dev 會，所以 `flux-t2i` 標 false，也因此不是預設；兩支預設配方用的是不審查的權重。平台只在一種情況看這個旗標：被管理員關掉 NSFW 權限的使用者（見上方「每人覆寫」）跑一支 `nsfw_ok: true` 的配方會直接被 NSFW 審核擋下；其他人完全不受影響。
 
 **預設配方第一次跑會先下載模型。** `chroma-t2i` 宣告了 `model_sources`，聯邦內沒有任何活著的 worker 持有 `Chroma1-HD-fp8mixed.safetensors`（9 193 379 316 bytes）時，`run` 會在建單**之前**先呼叫與面板「下載」鈕同一條 `create_fetch_job`（同樣去重、同樣白名單、同樣 HEAD 探測），回應的 `model_fetch_jobs` 因此非空。圖照樣建單並排進佇列，等 worker 抓完、回報庫存就派得出去——在一般家用頻寬上這 9.2 GB 可能要十幾分鐘。下載排不出來（例如沒有合格的 worker）只會留一行 log，不會擋下送單。
+
+### 遠端更新 worker 的 ComfyUI（2026-10-24）
+
+Workers 頁每台 worker 多了一欄 **ComfyUI**：顯示該機 ComfyUI 的版本（agent **0.1.19（protocol 6）起**才會回報；舊 agent 顯示「—」）。管理員在操作區按 **「更新 ComfyUI」**，平台就把 `update_comfyui` 推到該 worker 的即時連線，由 agent 在本機執行：
+
+1. 讀 `comfyui_managed.json`（安裝器寫的那份啟動紀錄），確認那個 ComfyUI 是 **git 安裝**；不是 git 的會直接回報無法自動更新。
+2. `git fetch --tags` 後 checkout **最新的 `vX.Y.Z` 穩定 tag**，用同一個 Python 環境 `pip install -r requirements.txt`。
+3. 重啟 ComfyUI（結束佔用該連接埠的程序、以紀錄中的指令重新帶起、等 `/system_stats` 就緒）。新版起不來會**自動回復原版本**再重啟（best-effort）。
+
+更新期間這台 worker 以 `paused` 心跳讓路（不接新工作；正在跑工作時下指令會被拒絕，等跑完再按一次）。進度與結果掛在心跳的 `dynamic.comfyui_update` 上，ComfyUI 欄即時顯示「更新中…／更新完成／更新失敗」，滑過徽章可看完整訊息；更新完成後 agent 會重連一次，把新的 ComfyUI 版本寫回 hello。
+
+**hello 推播 agent 自我更新（同一版加入）**：任何一台 **0.1.18 以上**的 agent 重新連上（每次部署都會讓全艦隊斷線重連，正好觸發）時，平台會比對它回報的版本與目前發布版，過舊就推一則 `update_agent`——和主控台「更新」按鈕走同一條 RemoteUpdater 路徑（閒置才裝、跑工作中先排隊、`auto_update` 關閉則拒絕、下載後驗 sha256 與平台簽章）。也就是說：**push → 部署 → 在線艦隊自動滾上新版**，不再需要逐台按按鈕。
 
 ### 發布 agent 新版本
 

@@ -212,3 +212,50 @@ describe("internal update_worker", () => {
     ws.close(1000, "done");
   });
 });
+
+
+// --- POST /api/workers/{id}/update-comfyui (2026-10-24) --------------------
+// The live-push paths (sent / unsupported-by-protocol) are covered in
+// hub.spec.ts, where a real agent socket exists; this covers the route's own
+// gates: auth, the 0.1.19 version floor, offline, unknown worker.
+
+function postComfyUpdate(admin: Admin, workerId: string) {
+  return call(`/api/workers/${workerId}/update-comfyui`, {
+    method: "POST",
+    json: {},
+    cookie: admin.cookie,
+    headers: { "X-CSRF": admin.csrf },
+  });
+}
+
+describe("POST /api/workers/:id/update-comfyui", () => {
+  it("401s without a session", async () => {
+    const r = await call("/api/workers/whatever/update-comfyui", { method: "POST", json: {} });
+    expect(r.status).toBe(401);
+  });
+
+  it("404s for an unknown worker", async () => {
+    const admin = await adminSession();
+    const r = await postComfyUpdate(admin, "does-not-exist");
+    expect(r.status).toBe(404);
+    expect(r.body.error.code).toBe("workers.not_found");
+  });
+
+  it("409s agent_too_old for a 0.1.18 (or version-less) agent", async () => {
+    const admin = await adminSession();
+    for (const version of ["0.1.18", null] as const) {
+      const { workerId } = await registerWorker(admin, version);
+      const r = await postComfyUpdate(admin, workerId);
+      expect(r.status).toBe(409);
+      expect(r.body.error.code).toBe("workers.agent_too_old");
+    }
+  });
+
+  it("409s workers.offline for a 0.1.19 agent with no live socket", async () => {
+    const admin = await adminSession();
+    const { workerId } = await registerWorker(admin, "0.1.19");
+    const r = await postComfyUpdate(admin, workerId);
+    expect(r.status).toBe(409);
+    expect(r.body.error.code).toBe("workers.offline");
+  });
+});

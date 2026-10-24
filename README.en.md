@@ -10,21 +10,22 @@ The circle is invite-only. Only a one-time link issued by the admin gets someone
 
 ### What you can make
 
-The built-in workflow editor ships with 11 ready-made templates. Each canvas has a red sticky note marking exactly what to edit, so someone who has never touched ComfyUI can still get a finished result:
+The built-in workflow editor ships with 12 ready-made templates, grouped into Images / Video / Music / Prompt tools. Each canvas has a red sticky note marking exactly what to edit, so someone who has never touched ComfyUI can still get a finished result:
 
 | Template | What it does |
 | --- | --- |
-| Text-to-image | Type your idea in Chinese (or English); a local AI writes the English prompt and the image follows (the default is a wuxia scene; swap it for anything) |
-| Character portrait | Portrait-orientation version, for a single character's reference sheet |
+| Text-to-image (Chroma) | Type your idea in Chinese (or English); a local AI writes the English prompt and the image follows (the default is a wuxia scene; swap it for anything) |
+| Text-to-image (Qwen) | The same idea rendered by Qwen-Image-2.1 (the top-rated open-weights image model of late 2026) — run both and compare the models |
+| Character portrait | Portrait-orientation version: describe the character in Chinese and get a reference sheet |
 | Reference to video | Feed in one photo, describe the shot in Chinese, and watch that person move, with generated audio |
 | NSFW image-to-video | The same pipeline with nothing filtered: one photo of an adult plus an explicit scene written in Chinese |
-| First+last frame to video | Give a first and last frame; the motion in between is filled in |
+| First+last frame to video | Give a first and last frame and describe the motion in Chinese; the clip in between is filled in |
 | Video concat | Stitch two clips into one, picture and audio both |
 | Image intro + video | Hold a still as a title card for a few seconds, then play a clip |
 | Video trim | Cut the segment you want out of a longer clip |
 | Image upscale | Turn a small image into a high-resolution one |
+| Text-to-music | Describe the song in Chinese and write Chinese lyrics; ACE-Step 1.5 generates a full song with vocals |
 | Image to prompt | Upload a reference image, get a polished English prompt |
-| Text to prompt | Paste a rough idea, get it rewritten as a structured English prompt |
 
 Opening a template clones it onto your own canvas, so the original never gets damaged. Results and their records land on the console's Jobs page.
 

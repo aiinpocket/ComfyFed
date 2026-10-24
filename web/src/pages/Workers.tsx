@@ -132,6 +132,55 @@ function AgentVersionCell({ version, latest }: { version?: string | null; latest
   );
 }
 
+/** 2026-10-24: whether the admin may send `update_comfyui` to this row --
+ * agent 0.1.19+ (the first release that understands the frame), connected,
+ * not disabled. */
+const COMFY_UPDATE_MIN_AGENT = '0.1.19';
+
+function canComfyUpdate(worker: Worker): boolean {
+  const version = worker.hardware?.agent_version;
+  if (!version) return false;
+  if (worker.disabled || worker.status === 'offline') return false;
+  return compareVersions(version, COMFY_UPDATE_MIN_AGENT) >= 0;
+}
+
+/** The ComfyUI column: the version the agent reported off `/system_stats`
+ * (agent 0.1.19+; older agents show an em dash) plus the last
+ * admin-commanded update's live status from `dynamic.comfyui_update`. */
+function ComfyuiCell({ worker }: { worker: Worker }) {
+  const { t } = useTranslation();
+  const version = worker.hardware?.comfyui_version;
+  const update = worker.dynamic?.comfyui_update;
+  const badge =
+    update == null ? null : update.status === 'updating' ? (
+      <Tooltip label={update.detail || ''} disabled={!update.detail}>
+        <Badge size="sm" color="blue" variant="light" tt="none" fw={500}>
+          {t('workers.comfyui_updating')}
+        </Badge>
+      </Tooltip>
+    ) : update.status === 'ok' ? (
+      <Tooltip label={update.detail || ''} disabled={!update.detail}>
+        <Badge size="sm" color="green" variant="light" tt="none" fw={500}>
+          {t('workers.comfyui_updated')}
+        </Badge>
+      </Tooltip>
+    ) : (
+      <Tooltip label={update.detail || ''} disabled={!update.detail}>
+        <Badge size="sm" color="red" variant="light" tt="none" fw={500}>
+          {t('workers.comfyui_update_failed')}
+        </Badge>
+      </Tooltip>
+    );
+  return (
+    <Stack gap={2}>
+      <Text size="sm" style={{ fontVariantNumeric: 'tabular-nums' }}>
+        {version || '—'}
+      </Text>
+      {badge}
+    </Stack>
+  );
+}
+
 function P2pCell({ worker }: { worker: Worker }) {
   const { t } = useTranslation();
   if (!worker.peer_url) {
@@ -457,6 +506,42 @@ export function Workers({ role }: WorkersProps) {
     }
   };
 
+  // 2026-10-24: admin-commanded ComfyUI update. Fire-and-forget on the wire
+  // (the agent reports progress on its heartbeat `dynamic.comfyui_update`,
+  // which the 10 s poll picks up), so the only state is "request in flight".
+  const [comfyUpdatingIds, setComfyUpdatingIds] = useState<ReadonlySet<string>>(new Set());
+
+  const markComfyUpdating = (id: string, on: boolean) =>
+    setComfyUpdatingIds((prev) => {
+      const next = new Set(prev);
+      if (on) next.add(id);
+      else next.delete(id);
+      return next;
+    });
+
+  const updateComfyuiOne = async (worker: Worker) => {
+    markComfyUpdating(worker.id, true);
+    try {
+      await api.updateWorkerComfyui(worker.id);
+      notifications.show({
+        color: 'teal',
+        icon: <IconCheck size={16} />,
+        title: worker.name,
+        message: t('workers.update_comfyui_sent'),
+      });
+      await refresh();
+    } catch (caught) {
+      notifications.show({
+        color: 'red',
+        icon: <IconX size={16} />,
+        title: t('workers.update_comfyui_failed'),
+        message: updateErrorMessage(caught, t),
+      });
+    } finally {
+      markComfyUpdating(worker.id, false);
+    }
+  };
+
   // Sequential on purpose: each call may wait up to the hub's 15 s ack
   // deadline, and a fleet-wide burst of `update_agent` is exactly what the
   // per-worker `deferred` path is meant to smooth out. One summary
@@ -551,7 +636,7 @@ export function Workers({ role }: WorkersProps) {
             // 1120 = the old 880 + the action column's growth (110 -> 210)
             // when the disable + delete pair replaced disable alone, +140 =
             // the Phase 3.4 P2P column.
-            minWidth={1120}
+            minWidth={1340}
           >
             <Table verticalSpacing="sm" horizontalSpacing="md" highlightOnHover>
               <Table.Thead style={{ background: theme.other.surfaces.raised }}>
@@ -562,11 +647,12 @@ export function Workers({ role }: WorkersProps) {
                   <Table.Th>{t('workers.col_backend')}</Table.Th>
                   <Table.Th>{t('workers.col_models')}</Table.Th>
                   <Table.Th>{t('workers.col_agent')}</Table.Th>
+                  <Table.Th>{t('workers.col_comfyui')}</Table.Th>
                   <Table.Th>{t('workers.col_p2p')}</Table.Th>
                   <Table.Th>{t('workers.col_last_seen')}</Table.Th>
                   {/* Wide enough for update + disable + delete. Admin-only:
                       non-admins have no per-row actions, so no action column. */}
-                  {isAdmin && <Table.Th w={300} />}
+                  {isAdmin && <Table.Th w={420} />}
                 </Table.Tr>
               </Table.Thead>
               <Table.Tbody>
@@ -630,6 +716,9 @@ export function Workers({ role }: WorkersProps) {
                       <AgentVersionCell version={worker.hardware?.agent_version} latest={latestAgent} />
                     </Table.Td>
                     <Table.Td>
+                      <ComfyuiCell worker={worker} />
+                    </Table.Td>
+                    <Table.Td>
                       <P2pCell worker={worker} />
                     </Table.Td>
                     <Table.Td>
@@ -650,6 +739,18 @@ export function Workers({ role }: WorkersProps) {
                               onClick={() => void updateOne(worker)}
                             >
                               {t('workers.update')}
+                            </Button>
+                          )}
+                          {canComfyUpdate(worker) && (
+                            <Button
+                              size="compact-sm"
+                              variant="subtle"
+                              leftSection={<IconRefresh size={14} />}
+                              loading={comfyUpdatingIds.has(worker.id)}
+                              disabled={worker.dynamic?.comfyui_update?.status === 'updating'}
+                              onClick={() => void updateComfyuiOne(worker)}
+                            >
+                              {t('workers.update_comfyui')}
                             </Button>
                           )}
                           {!worker.disabled && (
@@ -682,7 +783,7 @@ export function Workers({ role }: WorkersProps) {
                   </Table.Tr>
                   {worker.unsuitable.length > 0 && (
                     <Table.Tr>
-                      <Table.Td colSpan={isAdmin ? 8 : 7} style={{ background: theme.other.surfaces.raised }}>
+                      <Table.Td colSpan={isAdmin ? 9 : 8} style={{ background: theme.other.surfaces.raised }}>
                         <UnsuitableBlock worker={worker} isAdmin={isAdmin} onCleared={refresh} />
                       </Table.Td>
                     </Table.Tr>

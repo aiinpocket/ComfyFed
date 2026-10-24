@@ -1744,7 +1744,7 @@ class _RecordingWS:
 
 
 @pytest.mark.asyncio
-async def test_send_hello_declares_protocol_5_and_auto_fetch_true_by_default():
+async def test_send_hello_declares_protocol_6_and_auto_fetch_true_by_default():
     entry = PlatformEntry(
         platform_url="http://p",
         platform_pubkey="aa",
@@ -1760,7 +1760,7 @@ async def test_send_hello_declares_protocol_5_and_auto_fetch_true_by_default():
     assert len(conn.ws.sent) == 1
     payload = json.loads(conn.ws.sent[0])
     assert payload["type"] == "hello"
-    assert payload["protocol"] == 5
+    assert payload["protocol"] == 6
     assert payload["auto_fetch"] is True
     assert payload["max_fetch_gb"] == 20
     assert payload["hardware"]["platform"] == "Windows"

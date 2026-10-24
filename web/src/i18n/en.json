@@ -261,6 +261,7 @@
     "col_models": "Models",
     "col_last_seen": "Last seen",
     "col_agent": "Agent",
+    "col_comfyui": "ComfyUI",
     "agent_outdated": "Outdated",
     "agent_outdated_hint": "Latest published agent is {{latest}}; this worker updates itself on its next restart.",
     "col_p2p": "P2P status",
@@ -312,7 +313,13 @@
     "agent_too_old": "This worker's agent is too old for remote updates: restart the agent once on that machine and it will self-update at startup",
     "offline": "Worker is not online",
     "update_failed": "Update command failed",
-    "update_all_done": "Sent to {{sent}} worker(s), {{failed}} failed"
+    "update_all_done": "Sent to {{sent}} worker(s), {{failed}} failed",
+    "update_comfyui": "Update ComfyUI",
+    "update_comfyui_sent": "ComfyUI update command sent",
+    "update_comfyui_failed": "Could not send the ComfyUI update command",
+    "comfyui_updating": "Updating…",
+    "comfyui_updated": "Updated",
+    "comfyui_update_failed": "Update failed"
   },
   "users": {
     "title": "Users",
