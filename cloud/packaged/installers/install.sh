@@ -1054,6 +1054,11 @@ elif [ "$OS_KIND" = "darwin" ]; then
     <dict>
         <key>SuccessfulExit</key><false/>
     </dict>
+    <!-- 2026-10-25: without these, everything the launcher and ComfyUI print
+         under launchd went to /dev/null -- a startup failure left no trace
+         anywhere on the machine. Same filename the Windows launcher uses. -->
+    <key>StandardOutPath</key><string>$HOME/.comfyfed/comfyui.log</string>
+    <key>StandardErrorPath</key><string>$HOME/.comfyfed/comfyui.log</string>
 </dict>
 </plist>
 PLISTEOF
@@ -1089,6 +1094,13 @@ PLISTEOF
     <dict>
         <key>SuccessfulExit</key><false/>
     </dict>
+    <!-- 2026-10-25: launchd swallowed the agent's stdout/stderr, so the
+         startup self-update's outcome ("Updating ... -> ...", "Update failed
+         verification", pip errors) was invisible on macOS -- live-caught
+         while debugging a Mac whose agent "wouldn't update" with nothing to
+         read. Same agent.log filename the Windows launcher appends to. -->
+    <key>StandardOutPath</key><string>$HOME/.comfyfed/agent.log</string>
+    <key>StandardErrorPath</key><string>$HOME/.comfyfed/agent.log</string>
 </dict>
 </plist>
 PLISTEOF

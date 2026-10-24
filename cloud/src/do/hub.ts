@@ -1404,9 +1404,11 @@ export class Hub extends DurableObject<Env> {
     // the console button sends -- its RemoteUpdater then re-verifies against
     // `/api/agent/version` (sha256 + platform signature), defers while a job
     // runs, declines when the owner's auto_update is off, and hands itself
-    // to the supervisor on success. Every deploy reconnects the fleet, so
-    // "push -> deploy -> agents roll forward" needs no console click. The
-    // unsolicited `update_ack` is logged by the ack handler as usual.
+    // to the supervisor on success. NOTE: hibernated agent sockets SURVIVE a
+    // deploy, so this fires on genuine reconnects only (agent restart,
+    // network blip) -- a deploy alone does not roll the fleet; the console's
+    // per-row/全部更新 buttons remain the immediate path. The unsolicited
+    // `update_ack` is logged by the ack handler as usual.
     const reportedAgent = hardware["agent_version"];
     if (typeof reportedAgent === "string" && reportedAgent && compareVersions(reportedAgent, REMOTE_UPDATE_MIN_AGENT) >= 0) {
       try {
