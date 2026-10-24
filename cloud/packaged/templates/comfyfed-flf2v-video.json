@@ -1,6 +1,6 @@
 {
-  "last_node_id": 208,
-  "last_link_id": 35,
+  "last_node_id": 209,
+  "last_link_id": 37,
   "nodes": [
     {
       "id": 105,
@@ -557,7 +557,16 @@
       "flags": {},
       "order": 13,
       "mode": 0,
-      "inputs": [],
+      "inputs": [
+        {
+          "name": "noise_seed",
+          "type": "INT",
+          "widget": {
+            "name": "noise_seed"
+          },
+          "link": 36
+        }
+      ],
       "outputs": [
         {
           "name": "NOISE",
@@ -1155,6 +1164,14 @@
           "widget": {
             "name": "prompt"
           }
+        },
+        {
+          "name": "sampling_mode.seed",
+          "type": "INT",
+          "widget": {
+            "name": "sampling_mode.seed"
+          },
+          "link": 37
         }
       ],
       "outputs": [
@@ -1272,6 +1289,47 @@
       "title": "AI 寫出的英文提示詞 / the English prompt the AI wrote",
       "color": "#432",
       "bgcolor": "#653"
+    },
+    {
+      "id": 209,
+      "type": "PrimitiveNode",
+      "pos": [
+        1760,
+        220
+      ],
+      "size": [
+        320,
+        110
+      ],
+      "flags": {},
+      "order": 0,
+      "mode": 0,
+      "inputs": [],
+      "outputs": [
+        {
+          "name": "INT",
+          "type": "INT",
+          "widget": {
+            "name": "noise_seed"
+          },
+          "links": [
+            36,
+            37
+          ]
+        }
+      ],
+      "title": "種子（每次隨機；改 fixed 可重現）/ seed (randomized; set fixed to reproduce)",
+      "properties": {
+        "Run widget replace on values": false
+      },
+      "widgets_values": [
+        3468383556,
+        "randomize"
+      ],
+      "widgets_values_named": {
+        "value": 3468383556,
+        "control_after_generate": "randomize"
+      }
     }
   ],
   "links": [
@@ -1546,6 +1604,22 @@
       208,
       0,
       "*"
+    ],
+    [
+      36,
+      209,
+      0,
+      10,
+      0,
+      "INT"
+    ],
+    [
+      37,
+      209,
+      0,
+      206,
+      2,
+      "INT"
     ]
   ],
   "groups": [

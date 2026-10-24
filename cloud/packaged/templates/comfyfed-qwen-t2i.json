@@ -1,6 +1,6 @@
 {
-  "last_node_id": 208,
-  "last_link_id": 17,
+  "last_node_id": 209,
+  "last_link_id": 19,
   "nodes": [
     {
       "id": 105,
@@ -306,7 +306,7 @@
         {
           "name": "seed",
           "type": "INT",
-          "link": null,
+          "link": 18,
           "widget": {
             "name": "seed"
           }
@@ -586,7 +586,7 @@
       "outputs": [],
       "properties": {},
       "widgets_values": [
-        "**繁體中文 — 取樣參數什麼時候要動**\n\n- `EmptyLatentImage` 的 `width`/`height` = 出圖尺寸。Qwen-Image-2.1 原生支援到 2048×2048，想出 2K 就改成 2048，但時間和 VRAM 需求都會變高。\n- `KSampler`：`steps 25`、`cfg 1`、`euler / simple` 是官方建議值。**CFG 1 時負向提示詞無效**，這是正常的。\n- `seed` 預設每次隨機；想重現同一張圖就把 `control_after_generate` 改成 `fixed`。\n\n---\n\n**English — when to touch the sampler**\n\n`EmptyLatentImage` sets the output size (native up to 2048×2048). `steps 25, cfg 1, euler/simple` are the official settings; at CFG 1 the negative prompt has no effect, which is expected. Seed is randomized per run — set it to `fixed` to reproduce an image."
+        "**繁體中文 — 取樣參數什麼時候要動**\n\n- `EmptyLatentImage` 的 `width`/`height` = 出圖尺寸。Qwen-Image-2.1 原生支援到 2048×2048，想出 2K 就改成 2048，但時間和 VRAM 需求都會變高。\n- `KSampler`：`steps 25`、`cfg 1`、`euler / simple` 是官方建議值。**CFG 1 時負向提示詞無效**，這是正常的。\n- 種子統一由「種子」節點控制，預設每次隨機（小幫手寫的英文提示詞也會跟著換措辭，批次出圖更多樣）；想重現同一張就把那顆節點改成 `fixed`。\n\n---\n\n**English — when to touch the sampler**\n\n`EmptyLatentImage` sets the output size (native up to 2048×2048). `steps 25, cfg 1, euler/simple` are the official settings; at CFG 1 the negative prompt has no effect, which is expected. One shared seed node drives both the sampler and the prompt helper (so batches vary in wording too); set it to `fixed` to reproduce an image."
       ],
       "title": "③ 取樣參數 / Sampler"
     },
@@ -899,6 +899,14 @@
           "widget": {
             "name": "prompt"
           }
+        },
+        {
+          "name": "sampling_mode.seed",
+          "type": "INT",
+          "widget": {
+            "name": "sampling_mode.seed"
+          },
+          "link": 19
         }
       ],
       "outputs": [
@@ -965,6 +973,47 @@
         "Node name for S&R": "PreviewAny"
       },
       "title": "AI 寫出的英文提示詞 / the English prompt the AI wrote"
+    },
+    {
+      "id": 209,
+      "type": "PrimitiveNode",
+      "pos": [
+        2160,
+        -30
+      ],
+      "size": [
+        320,
+        110
+      ],
+      "flags": {},
+      "order": 0,
+      "mode": 0,
+      "inputs": [],
+      "outputs": [
+        {
+          "name": "INT",
+          "type": "INT",
+          "widget": {
+            "name": "seed"
+          },
+          "links": [
+            18,
+            19
+          ]
+        }
+      ],
+      "title": "種子（每次隨機；改 fixed 可重現）/ seed (randomized; set fixed to reproduce)",
+      "properties": {
+        "Run widget replace on values": false
+      },
+      "widgets_values": [
+        821374876,
+        "randomize"
+      ],
+      "widgets_values_named": {
+        "value": 821374876,
+        "control_after_generate": "randomize"
+      }
     }
   ],
   "links": [
@@ -1103,6 +1152,22 @@
       13,
       0,
       "IMAGE"
+    ],
+    [
+      18,
+      209,
+      0,
+      11,
+      4,
+      "INT"
+    ],
+    [
+      19,
+      209,
+      0,
+      206,
+      5,
+      "INT"
     ]
   ],
   "groups": [

@@ -1,6 +1,6 @@
 {
-  "last_node_id": 103,
-  "last_link_id": 6,
+  "last_node_id": 209,
+  "last_link_id": 7,
   "nodes": [
     {
       "id": 100,
@@ -219,6 +219,14 @@
           "type": "IMAGE",
           "link": 1,
           "shape": 7
+        },
+        {
+          "name": "sampling_mode.seed",
+          "type": "INT",
+          "widget": {
+            "name": "sampling_mode.seed"
+          },
+          "link": 7
         }
       ],
       "outputs": [
@@ -239,15 +247,16 @@
         "",
         400,
         "on",
-        0.05,
-        1.05,
-        0,
         0.7,
         64,
         0.95,
+        0.05,
+        1.05,
+        0,
         0.0,
         false,
-        true
+        true,
+        "auto"
       ],
       "title": "AI 寫提示詞 / AI writes the prompt"
     },
@@ -394,6 +403,46 @@
       ],
       "color": "#432",
       "bgcolor": "#653"
+    },
+    {
+      "id": 209,
+      "type": "PrimitiveNode",
+      "pos": [
+        1200,
+        -30
+      ],
+      "size": [
+        320,
+        110
+      ],
+      "flags": {},
+      "order": 0,
+      "mode": 0,
+      "inputs": [],
+      "outputs": [
+        {
+          "name": "INT",
+          "type": "INT",
+          "widget": {
+            "name": "sampling_mode.seed"
+          },
+          "links": [
+            7
+          ]
+        }
+      ],
+      "title": "種子（每次隨機；改 fixed 可重現）/ seed (randomized; set fixed to reproduce)",
+      "properties": {
+        "Run widget replace on values": false
+      },
+      "widgets_values": [
+        2112471043,
+        "randomize"
+      ],
+      "widgets_values_named": {
+        "value": 2112471043,
+        "control_after_generate": "randomize"
+      }
     }
   ],
   "links": [
@@ -444,6 +493,14 @@
       7,
       0,
       "STRING"
+    ],
+    [
+      7,
+      209,
+      0,
+      5,
+      3,
+      "INT"
     ]
   ],
   "groups": [

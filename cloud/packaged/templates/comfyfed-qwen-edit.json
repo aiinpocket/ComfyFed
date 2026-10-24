@@ -1,6 +1,6 @@
 {
-  "last_node_id": 208,
-  "last_link_id": 20,
+  "last_node_id": 209,
+  "last_link_id": 22,
   "nodes": [
     {
       "id": 105,
@@ -250,7 +250,7 @@
         {
           "name": "seed",
           "type": "INT",
-          "link": null,
+          "link": 21,
           "widget": {
             "name": "seed"
           }
@@ -572,7 +572,7 @@
       "outputs": [],
       "properties": {},
       "widgets_values": [
-        "**繁體中文 — 取樣參數什麼時候要動**\n\n- `steps 25`、`cfg 1`、`euler / simple` 是官方建議值。**CFG 1 時負向提示詞無效**，這是正常的。\n- 輸出尺寸由參考照片決定（編輯 latent 直接來自照片），這裡沒有尺寸欄位可調；想要別的構圖就先裁好照片。\n- `seed` 預設每次隨機；同一張照片＋同一句想法多跑幾次會有不同詮釋，想重現就把 `control_after_generate` 改成 `fixed`。\n\n---\n\n**English — when to touch the sampler**\n\n`steps 25, cfg 1, euler/simple` are the official settings (at CFG 1 the negative prompt has no\neffect). The output size comes from the reference photo itself — crop the photo for a different\nframing. Seed is randomized per run; set it to `fixed` to reproduce a result."
+        "**繁體中文 — 取樣參數什麼時候要動**\n\n- `steps 25`、`cfg 1`、`euler / simple` 是官方建議值。**CFG 1 時負向提示詞無效**，這是正常的。\n- 輸出尺寸由參考照片決定（編輯 latent 直接來自照片），這裡沒有尺寸欄位可調；想要別的構圖就先裁好照片。\n- 種子統一由「種子」節點控制，預設每次隨機（小幫手的英文指令也會換措辭）；同一張照片多跑幾次會有不同詮釋，想重現就把那顆節點改成 `fixed`。\n\n---\n\n**English — when to touch the sampler**\n\n`steps 25, cfg 1, euler/simple` are the official settings (at CFG 1 the negative prompt has no\neffect). The output size comes from the reference photo itself — crop the photo for a different\nframing. One shared seed node drives both the sampler and the helper; set it to `fixed` to reproduce a result."
       ],
       "title": "③ 取樣參數 / Sampler"
     },
@@ -885,6 +885,14 @@
           "widget": {
             "name": "prompt"
           }
+        },
+        {
+          "name": "sampling_mode.seed",
+          "type": "INT",
+          "widget": {
+            "name": "sampling_mode.seed"
+          },
+          "link": 22
         }
       ],
       "outputs": [
@@ -951,6 +959,47 @@
         "Node name for S&R": "PreviewAny"
       },
       "title": "AI 寫出的英文編輯指令 / the English instruction the AI wrote"
+    },
+    {
+      "id": 209,
+      "type": "PrimitiveNode",
+      "pos": [
+        2280,
+        -30
+      ],
+      "size": [
+        320,
+        110
+      ],
+      "flags": {},
+      "order": 0,
+      "mode": 0,
+      "inputs": [],
+      "outputs": [
+        {
+          "name": "INT",
+          "type": "INT",
+          "widget": {
+            "name": "seed"
+          },
+          "links": [
+            21,
+            22
+          ]
+        }
+      ],
+      "title": "種子（每次隨機；改 fixed 可重現）/ seed (randomized; set fixed to reproduce)",
+      "properties": {
+        "Run widget replace on values": false
+      },
+      "widgets_values": [
+        1458833465,
+        "randomize"
+      ],
+      "widgets_values_named": {
+        "value": 1458833465,
+        "control_after_generate": "randomize"
+      }
     }
   ],
   "links": [
@@ -1113,6 +1162,22 @@
       13,
       0,
       "IMAGE"
+    ],
+    [
+      21,
+      209,
+      0,
+      11,
+      4,
+      "INT"
+    ],
+    [
+      22,
+      209,
+      0,
+      206,
+      5,
+      "INT"
     ]
   ],
   "groups": [

@@ -1,6 +1,6 @@
 {
   "last_node_id": 211,
-  "last_link_id": 21,
+  "last_link_id": 24,
   "nodes": [
     {
       "id": 105,
@@ -115,6 +115,14 @@
           "widget": {
             "name": "duration"
           }
+        },
+        {
+          "name": "seed",
+          "type": "INT",
+          "widget": {
+            "name": "seed"
+          },
+          "link": 23
         }
       ],
       "outputs": [
@@ -241,7 +249,7 @@
         {
           "name": "seed",
           "type": "INT",
-          "link": null,
+          "link": 22,
           "widget": {
             "name": "seed"
           }
@@ -557,7 +565,7 @@
       "outputs": [],
       "properties": {},
       "widgets_values": [
-        "**繁體中文 — 這一區什麼時候要動**\n\n- `TextEncodeAceStepAudio1.5`：`language` 預設 `zh`（中文歌詞）；`bpm` 預設 100、調性 `C major`，想要快歌／別的調自己改。`generate_audio_codes` 開著品質較好、關掉比較快。\n- `EmptyAceStep1.5LatentAudio` 的秒數由紅框那顆「歌曲長度」接入，不用動這裡。\n- `KSampler`：turbo 版 `steps 8`、`cfg 1`、`euler / simple` 是官方建議值，別動。\n- `seed` 預設每次隨機；想重現同一首就把兩處 `control_after_generate` 都改成 `fixed`。\n\n---\n\n**English — when to touch this section**\n\n`language` defaults to `zh`; adjust `bpm` / key as you like, and leave `steps 8, cfg 1, euler/simple` alone (the official turbo settings). `generate_audio_codes` on = better quality, off = faster. The seconds knob feeds the latent length automatically. Set both seeds to `fixed` to reproduce a song."
+        "**繁體中文 — 這一區什麼時候要動**\n\n- `TextEncodeAceStepAudio1.5`：`language` 預設 `zh`（中文歌詞）；`bpm` 預設 100、調性 `C major`，想要快歌／別的調自己改。`generate_audio_codes` 開著品質較好、關掉比較快。\n- `EmptyAceStep1.5LatentAudio` 的秒數由紅框那顆「歌曲長度」接入，不用動這裡。\n- `KSampler`：turbo 版 `steps 8`、`cfg 1`、`euler / simple` 是官方建議值，別動。\n- 種子統一由「種子」節點控制，預設每次隨機（連小幫手寫的風格描述也會跟著變）；想重現同一首就把那顆節點改成 `fixed`。\n\n---\n\n**English — when to touch this section**\n\n`language` defaults to `zh`; adjust `bpm` / key as you like, and leave `steps 8, cfg 1, euler/simple` alone (the official turbo settings). `generate_audio_codes` on = better quality, off = faster. The seconds knob feeds the latent length automatically. One shared seed node drives the sampler, the encoder and the helper; set it to `fixed` to reproduce a song."
       ],
       "title": "③ 音樂條件與取樣 / Conditioning & sampler"
     },
@@ -870,6 +878,14 @@
           "widget": {
             "name": "prompt"
           }
+        },
+        {
+          "name": "sampling_mode.seed",
+          "type": "INT",
+          "widget": {
+            "name": "sampling_mode.seed"
+          },
+          "link": 24
         }
       ],
       "outputs": [
@@ -1007,6 +1023,48 @@
       "title": "歌曲長度（秒）← 只改這裡 / song length in seconds",
       "color": "#a33",
       "bgcolor": "#533"
+    },
+    {
+      "id": 209,
+      "type": "PrimitiveNode",
+      "pos": [
+        2300,
+        -30
+      ],
+      "size": [
+        320,
+        110
+      ],
+      "flags": {},
+      "order": 0,
+      "mode": 0,
+      "inputs": [],
+      "outputs": [
+        {
+          "name": "INT",
+          "type": "INT",
+          "widget": {
+            "name": "seed"
+          },
+          "links": [
+            22,
+            23,
+            24
+          ]
+        }
+      ],
+      "title": "種子（每次隨機；改 fixed 可重現）/ seed (randomized; set fixed to reproduce)",
+      "properties": {
+        "Run widget replace on values": false
+      },
+      "widgets_values": [
+        417697240,
+        "randomize"
+      ],
+      "widgets_values_named": {
+        "value": 417697240,
+        "control_after_generate": "randomize"
+      }
     }
   ],
   "links": [
@@ -1177,6 +1235,30 @@
       13,
       0,
       "AUDIO"
+    ],
+    [
+      22,
+      209,
+      0,
+      11,
+      4,
+      "INT"
+    ],
+    [
+      23,
+      209,
+      0,
+      4,
+      4,
+      "INT"
+    ],
+    [
+      24,
+      209,
+      0,
+      206,
+      5,
+      "INT"
     ]
   ],
   "groups": [
