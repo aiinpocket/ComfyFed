@@ -124,7 +124,9 @@ def test_collect_dynamic_merges_the_update_status(tmp_path, monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_update_comfyui_rejected_while_a_job_runs(tmp_path, monkeypatch):
+async def test_update_comfyui_defers_while_a_job_runs(tmp_path, monkeypatch):
+    """2026-10-25「強迫更新」: a busy worker parks the command and starts the
+    update the moment the job is gone, instead of making the admin retry."""
     loop = _loop(tmp_path, monkeypatch)
 
     class _Handle:
@@ -134,7 +136,8 @@ async def test_update_comfyui_rejected_while_a_job_runs(tmp_path, monkeypatch):
     loop._jobs["job-1"] = _Handle()
     loop._spawn_comfy_update()
     assert loop._comfy_update_task is None
-    assert loop._comfy_update_status["status"] == "rejected"
+    assert loop._comfy_update_pending is True
+    assert loop._comfy_update_status["status"] == "deferred"
 
 
 @pytest.mark.asyncio

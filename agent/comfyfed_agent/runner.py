@@ -896,6 +896,11 @@ class AgentLoop:
         # without a new D1 column.
         self._comfy_update_task: Optional[asyncio.Task] = None
         self._comfy_update_status: Optional[dict] = None
+        # 2026-10-25 (「強迫更新」): an update_comfyui that arrives while a
+        # job runs is no longer rejected -- it parks here and starts the
+        # moment the machine is idle (checked on every heartbeat tick),
+        # mirroring the agent updater's deferred path.
+        self._comfy_update_pending = False
         # Remote update (spec §2.2). `exit_code` is what `main._cmd_run`
         # hands to `sys.exit` once the event loop is gone: None for every
         # ordinary exit, `update.RESTART_EXIT_CODE` after a successful
@@ -2601,11 +2606,12 @@ class AgentLoop:
             logger.info("runner: update_comfyui ignored -- an update is already running")
             return
         if any(handle.running for handle in self._jobs.values()):
+            self._comfy_update_pending = True
             self._set_comfy_update_status(
-                "rejected",
-                "worker 正在執行工作，等它跑完再試一次 / a job is running here -- retry when idle",
+                "deferred",
+                "worker 正在執行工作，結束後會自動開始更新 / a job is running -- the update starts the moment it finishes",
             )
-            logger.info("runner: update_comfyui rejected -- a job is running")
+            logger.info("runner: update_comfyui deferred until the running job finishes")
             return
         self._set_comfy_update_status("updating", "開始更新 / starting")
         logger.info("runner: starting platform-commanded ComfyUI update")
@@ -2690,6 +2696,15 @@ class AgentLoop:
                 await self.refresh_object_info(conn)
                 await self.refresh_model_inventory(conn)
                 last_object_info = now
+
+            # A deferred ComfyUI update starts as soon as nothing is running.
+            if (
+                self._comfy_update_pending
+                and not self._comfy_update_running()
+                and not any(handle.running for handle in self._jobs.values())
+            ):
+                self._comfy_update_pending = False
+                self._spawn_comfy_update()
 
     async def _wait_for_comfy(self, conn: PlatformConnection) -> None:
         """Block this connection until ComfyUI answers -- quietly.

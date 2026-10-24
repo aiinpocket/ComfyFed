@@ -152,10 +152,10 @@ function ComfyuiCell({ worker }: { worker: Worker }) {
   const version = worker.hardware?.comfyui_version;
   const update = worker.dynamic?.comfyui_update;
   const badge =
-    update == null ? null : update.status === 'updating' ? (
+    update == null ? null : update.status === 'updating' || update.status === 'deferred' ? (
       <Tooltip label={update.detail || ''} disabled={!update.detail}>
         <Badge size="sm" color="blue" variant="light" tt="none" fw={500}>
-          {t('workers.comfyui_updating')}
+          {t(update.status === 'deferred' ? 'workers.comfyui_update_deferred' : 'workers.comfyui_updating')}
         </Badge>
       </Tooltip>
     ) : update.status === 'ok' ? (
@@ -778,7 +778,7 @@ export function Workers({ role }: WorkersProps) {
                               variant="subtle"
                               leftSection={<IconRefresh size={14} />}
                               loading={comfyUpdatingIds.has(worker.id)}
-                              disabled={worker.dynamic?.comfyui_update?.status === 'updating'}
+                              disabled={['updating', 'deferred'].includes(worker.dynamic?.comfyui_update?.status ?? '')}
                               onClick={() => void updateComfyuiOne(worker)}
                             >
                               {t('workers.update_comfyui')}
