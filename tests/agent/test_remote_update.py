@@ -291,3 +291,37 @@ def test_cmd_run_still_returns_normally_without_an_exit_code(monkeypatch, cli_en
     monkeypatch.setattr(AgentLoop, "run", _run)
 
     assert main_module._cmd_run(cli_env) is None
+
+
+# --- 2026-10-25: every outcome is persisted for the heartbeats --------------
+
+
+async def test_remote_outcomes_persist_the_last_update_record(
+    two_platform_loop, monkeypatch, apply_spy, no_real_shutdown
+):
+    """Declined / failed / updated all land in `update_status.json` AND on
+    the loop's in-memory copy (what `_collect_dynamic` sends as
+    `dynamic.agent_update`) -- success or failure, per the owner's ask."""
+    loop = two_platform_loop
+    conn = loop.connections["worker-a"]
+    monkeypatch.setattr(update, "check", lambda entry, current, client: _decision())
+
+    loop.config.auto_update = False
+    await _send_update_agent(loop, conn)
+    assert loop._agent_update_status["status"] == "declined"
+    assert update.load_last_update(loop._config_dir)["status"] == "declined"
+
+    loop.config.auto_update = True
+    apply_spy["result"] = False
+    await _send_update_agent(loop, conn)
+    assert loop._agent_update_status["status"] == "failed"
+    on_disk = update.load_last_update(loop._config_dir)
+    assert on_disk["status"] == "failed"
+    assert on_disk["to"] == _decision().latest
+
+    apply_spy["result"] = True
+    await _send_update_agent(loop, conn)
+    assert loop._agent_update_status["status"] == "updated"
+    assert update.load_last_update(loop._config_dir)["status"] == "updated"
+    # And the heartbeat payload carries it.
+    assert loop._collect_dynamic()["agent_update"]["status"] == "updated"

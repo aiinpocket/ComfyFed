@@ -181,6 +181,34 @@ function ComfyuiCell({ worker }: { worker: Worker }) {
   );
 }
 
+/** 2026-10-25: the agent's LAST self-update event, as the worker itself
+ * reported it (heartbeat `dynamic.agent_update`) -- shown under the version
+ * so a machine whose update failed says so right in the fleet list, with
+ * the full reason on hover. */
+function AgentUpdateBadge({ update }: { update: NonNullable<Worker['dynamic']>['agent_update'] }) {
+  const { t } = useTranslation();
+  if (!update) return null;
+  const color =
+    update.status === 'updated' ? 'green'
+    : update.status === 'deferred' ? 'blue'
+    : update.status === 'declined' ? 'gray'
+    : 'red';
+  const label = t(`workers.agent_update_${update.status}`, {
+    defaultValue: update.status,
+    to: update.to ?? '',
+  });
+  const tooltip = [update.detail, update.at ? formatAbsolute(update.at) : '']
+    .filter(Boolean)
+    .join(' — ');
+  return (
+    <Tooltip label={tooltip} disabled={!tooltip}>
+      <Badge size="sm" color={color} variant="light" tt="none" fw={500}>
+        {label}
+      </Badge>
+    </Tooltip>
+  );
+}
+
 function P2pCell({ worker }: { worker: Worker }) {
   const { t } = useTranslation();
   if (!worker.peer_url) {
@@ -713,7 +741,10 @@ export function Workers({ role }: WorkersProps) {
                       </Text>
                     </Table.Td>
                     <Table.Td>
-                      <AgentVersionCell version={worker.hardware?.agent_version} latest={latestAgent} />
+                      <Stack gap={2}>
+                        <AgentVersionCell version={worker.hardware?.agent_version} latest={latestAgent} />
+                        <AgentUpdateBadge update={worker.dynamic?.agent_update} />
+                      </Stack>
                     </Table.Td>
                     <Table.Td>
                       <ComfyuiCell worker={worker} />

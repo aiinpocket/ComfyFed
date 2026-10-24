@@ -94,10 +94,22 @@ def _cmd_run(args: argparse.Namespace) -> None:
     # One agent install may be pinned to multiple platforms; checking the
     # first is enough since any pinned platform can vouch for whether this
     # agent build is still supported.
+    # 2026-10-25: whatever the startup self-update decides, the outcome is
+    # persisted (update.record_last_update) and re-reported to the platform
+    # on every heartbeat (`dynamic.agent_update`), success or failure -- a
+    # successful update restarts the process, so the record must be written
+    # BEFORE the restart and survive it. A plain "already latest" is not
+    # recorded: the last meaningful event stays visible instead.
+    config_dir = os.path.dirname(os.path.abspath(args.config))
     with httpx.Client() as client:
         decision = update.check(cfg.platforms[0], __version__, client)
 
         if decision.action == "blocked":
+            update.record_last_update(
+                config_dir, "blocked",
+                f"platform minimum is {decision.min_supported}; agent refused to start",
+                from_version=__version__, to_version=decision.latest,
+            )
             print(
                 f"This agent version ({__version__}) is no longer supported by "
                 f"{cfg.platforms[0].platform_url} (minimum: {decision.min_supported}). "
@@ -108,9 +120,33 @@ def _cmd_run(args: argparse.Namespace) -> None:
         if decision.action == "update":
             if cfg.auto_update:
                 print(f"Updating comfyfed-agent {__version__} -> {decision.latest}...")
-                if not update.apply_update(cfg.platforms[0], decision, client):
+
+                def _record_then_restart() -> None:
+                    # Written before the restart exit, so the NEW process
+                    # finds and reports it.
+                    update.record_last_update(
+                        config_dir, "updated",
+                        f"startup self-update {__version__} -> {decision.latest}",
+                        from_version=__version__, to_version=decision.latest,
+                    )
+                    update._default_restart()
+
+                if not update.apply_update(
+                    cfg.platforms[0], decision, client, restart=_record_then_restart
+                ):
+                    update.record_last_update(
+                        config_dir, "failed",
+                        f"startup self-update to {decision.latest} failed download or "
+                        f"verification; still on {__version__}",
+                        from_version=__version__, to_version=decision.latest,
+                    )
                     print("Update failed verification; continuing with the current version.")
             else:
+                update.record_last_update(
+                    config_dir, "declined",
+                    f"{decision.latest} is available but auto_update is off in agent.json",
+                    from_version=__version__, to_version=decision.latest,
+                )
                 print(f"新版本可用 / A new version is available: {decision.latest} (auto_update is off).")
 
     print(f"Starting agent loop for {len(cfg.platforms)} platform(s)...")

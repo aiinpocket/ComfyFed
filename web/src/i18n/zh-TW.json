@@ -319,7 +319,12 @@
     "update_comfyui_failed": "ComfyUI 更新指令送出失敗",
     "comfyui_updating": "更新中…",
     "comfyui_updated": "更新完成",
-    "comfyui_update_failed": "更新失敗"
+    "comfyui_update_failed": "更新失敗",
+    "agent_update_updated": "已更新 → {{to}}",
+    "agent_update_failed": "更新失敗",
+    "agent_update_declined": "自動更新已關閉",
+    "agent_update_blocked": "版本被平台拒絕",
+    "agent_update_deferred": "等工作結束後更新"
   },
   "users": {
     "title": "使用者",

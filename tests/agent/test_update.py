@@ -5,6 +5,7 @@ import httpx
 import pytest
 from nacl.signing import SigningKey
 
+from comfyfed_agent import update
 from comfyfed_agent.config import PlatformEntry
 from comfyfed_agent.update import UpdateDecision, apply_update, check, parse_version
 
@@ -435,3 +436,35 @@ def test_apply_update_default_restart_path_raises_systemexit_after_install():
         apply_update(entry, decision, _FakeClient(wheel_bytes=wheel_bytes), pip_install=lambda p: installed.append(p))
     assert exc_info.value.code == 75
     assert len(installed) == 1
+
+
+# --- 2026-10-25: the persisted last self-update event ----------------------
+
+
+def test_record_and_load_last_update_roundtrip(tmp_path):
+    entry = update.record_last_update(
+        str(tmp_path), "failed", "sha mismatch",
+        from_version="0.1.19", to_version="0.1.20",
+    )
+    assert entry["status"] == "failed"
+    assert entry["from"] == "0.1.19" and entry["to"] == "0.1.20"
+    assert entry["at"]
+
+    loaded = update.load_last_update(str(tmp_path))
+    assert loaded == entry
+
+
+def test_load_last_update_tolerates_missing_and_malformed(tmp_path):
+    assert update.load_last_update(str(tmp_path)) is None
+    (tmp_path / update.LAST_UPDATE_FILENAME).write_text("not json", encoding="utf-8")
+    assert update.load_last_update(str(tmp_path)) is None
+    (tmp_path / update.LAST_UPDATE_FILENAME).write_text("[1,2]", encoding="utf-8")
+    assert update.load_last_update(str(tmp_path)) is None
+
+
+def test_record_last_update_never_raises_on_unwritable_dir(tmp_path):
+    # A FILE where the config dir should be makes makedirs/open fail.
+    blocker = tmp_path / "blocked"
+    blocker.write_text("", encoding="utf-8")
+    entry = update.record_last_update(str(blocker), "updated", "x")
+    assert entry["status"] == "updated"  # record still returned for heartbeats

@@ -724,3 +724,52 @@ describe('Workers page: ComfyUI column', () => {
     expect(await screen.findByText(/更新失敗|Update failed/)).toBeInTheDocument();
   });
 });
+
+// --- 2026-10-25: last agent self-update event badge -------------------------
+
+describe('Workers page: last agent update badge', () => {
+  afterEach(() => {
+    cleanup();
+    vi.unstubAllGlobals();
+  });
+
+  it('shows a failed badge with the detail on the worker that reported one', async () => {
+    stubFetch([
+      {
+        ...QUIET_WORKER,
+        id: 'w-0000000021',
+        name: 'runner-stale',
+        hardware: { agent_version: '0.1.19' },
+        dynamic: {
+          agent_update: {
+            status: 'failed',
+            detail: 'download or signature verification failed; still on 0.1.19',
+            from: '0.1.19',
+            to: '0.1.20',
+            at: '2026-10-25T00:00:00Z',
+          },
+        },
+      },
+    ]);
+    renderWorkers();
+
+    expect(await screen.findByText(/更新失敗|Update failed/)).toBeInTheDocument();
+  });
+
+  it('shows the updated badge with the target version', async () => {
+    stubFetch([
+      {
+        ...QUIET_WORKER,
+        id: 'w-0000000022',
+        name: 'runner-fresh',
+        hardware: { agent_version: '0.1.20' },
+        dynamic: {
+          agent_update: { status: 'updated', from: '0.1.19', to: '0.1.20', at: '' },
+        },
+      },
+    ]);
+    renderWorkers();
+
+    expect(await screen.findByText(/已更新 → 0\.1\.20|Updated → 0\.1\.20/)).toBeInTheDocument();
+  });
+});

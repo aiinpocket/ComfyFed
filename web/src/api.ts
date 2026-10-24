@@ -221,11 +221,23 @@ export interface ComfyuiUpdateStatus {
   at?: string;
 }
 
+/** The agent's LAST self-update event (updated / failed / declined /
+ * blocked / deferred), persisted on the worker and re-reported on every
+ * heartbeat -- success or failure -- since agent 0.1.20. */
+export interface AgentUpdateStatus {
+  status: 'updated' | 'failed' | 'declined' | 'blocked' | 'deferred' | string;
+  detail?: string;
+  from?: string;
+  to?: string;
+  at?: string;
+}
+
 export interface WorkerDynamic {
   free_vram_gb?: number | null;
   free_ram_gb?: number | null;
   free_disk_gb?: number | null;
   comfyui_update?: ComfyuiUpdateStatus | null;
+  agent_update?: AgentUpdateStatus | null;
 }
 
 export type WorkerStatus = 'online' | 'busy' | 'offline' | 'paused';

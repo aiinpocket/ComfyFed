@@ -92,11 +92,17 @@ class RemoteUpdater:
         current_version: str,
         running_job_id: Callable[[], Optional[str]],
         request_restart: Callable[[], None],
+        record: Optional[Callable[[str, str, Optional[str]], None]] = None,
     ) -> None:
         self._config = config
         self._current_version = current_version
         self._running_job_id = running_job_id
         self._request_restart = request_restart
+        # 2026-10-25: persists the last self-update event (status, detail,
+        # target version) so it rides every heartbeat's `dynamic.agent_update`
+        # -- see `update.record_last_update` and the runner's wiring. A plain
+        # up_to_date answer is not recorded (the last meaningful event stays).
+        self._record = record or (lambda status, detail, to: None)
         self.pending: Optional[PendingUpdate] = None
 
     async def handle_update_agent(self, conn: AckConnection) -> None:
@@ -123,17 +129,25 @@ class RemoteUpdater:
         if decision.action != "update":
             return STATUS_UP_TO_DATE, f"running {self._current_version}, platform latest {decision.latest}"
         if not self._config.auto_update:
-            return STATUS_DECLINED, "auto_update is off in this machine's agent.json"
+            detail = "auto_update is off in this machine's agent.json"
+            self._record(STATUS_DECLINED, detail, decision.latest)
+            return STATUS_DECLINED, detail
 
         job_id = self._running_job_id()
         if job_id is not None:
             self.pending = PendingUpdate(conn=conn, decision=decision)
-            return STATUS_DEFERRED, f"job {job_id} is running; will update to {decision.latest} after it finishes"
+            detail = f"job {job_id} is running; will update to {decision.latest} after it finishes"
+            self._record(STATUS_DEFERRED, detail, decision.latest)
+            return STATUS_DEFERRED, detail
 
         applied = await self._apply(conn.entry, decision)
         if applied:
-            return STATUS_UPDATING, f"{self._current_version} -> {decision.latest}; restarting"
-        return STATUS_FAILED, f"download or signature verification failed; still on {self._current_version}"
+            detail = f"{self._current_version} -> {decision.latest}; restarting"
+            self._record("updated", detail, decision.latest)
+            return STATUS_UPDATING, detail
+        detail = f"download or signature verification failed; still on {self._current_version}"
+        self._record(STATUS_FAILED, detail, decision.latest)
+        return STATUS_FAILED, detail
 
     async def apply_pending_if_idle(self) -> None:
         """Called whenever a job task ends; applies the parked decision once
@@ -144,10 +158,20 @@ class RemoteUpdater:
         self.pending = None
         applied = await self._apply(pending.conn.entry, pending.decision)
         if applied:
+            self._record(
+                "updated",
+                f"deferred update {self._current_version} -> {pending.decision.latest}; restarting",
+                pending.decision.latest,
+            )
             logger.info(
                 "延後的更新已套用 / deferred update to %s applied; restarting", pending.decision.latest
             )
         else:
+            self._record(
+                STATUS_FAILED,
+                f"deferred update to {pending.decision.latest} failed; still on {self._current_version}",
+                pending.decision.latest,
+            )
             logger.warning(
                 "延後的更新失敗，繼續用舊版 / deferred update to %s failed; staying on %s",
                 pending.decision.latest, self._current_version,

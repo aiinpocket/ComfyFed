@@ -319,7 +319,12 @@
     "update_comfyui_failed": "Could not send the ComfyUI update command",
     "comfyui_updating": "Updating…",
     "comfyui_updated": "Updated",
-    "comfyui_update_failed": "Update failed"
+    "comfyui_update_failed": "Update failed",
+    "agent_update_updated": "Updated → {{to}}",
+    "agent_update_failed": "Update failed",
+    "agent_update_declined": "Auto-update off",
+    "agent_update_blocked": "Blocked by platform",
+    "agent_update_deferred": "Update queued after job"
   },
   "users": {
     "title": "Users",

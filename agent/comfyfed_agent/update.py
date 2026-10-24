@@ -1,8 +1,19 @@
-"""Agent self-update: version check against the platform + signed wheel install."""
+"""Agent self-update: version check against the platform + signed wheel install.
+
+2026-10-25 also keeps the LAST self-update event on disk
+(`update_status.json`, next to agent.json): every attempt's outcome --
+updated / failed / declined / blocked / deferred -- is recorded here and the
+runner attaches it to every heartbeat's `dynamic.agent_update`, so the
+console shows what happened on each machine whether it succeeded or not (a
+successful update restarts the process, which is exactly why the record has
+to live on disk, written BEFORE the restart, and be re-reported by the next
+run).
+"""
 
 from __future__ import annotations
 
 import hashlib
+import json
 import logging
 import os
 import subprocess
@@ -15,9 +26,58 @@ import httpx
 from nacl.exceptions import BadSignatureError
 from nacl.signing import VerifyKey
 
+from datetime import datetime, timezone
+
 from .config import PlatformEntry
 
 logger = logging.getLogger(__name__)
+
+
+#: Where the last self-update event lives, next to agent.json.
+LAST_UPDATE_FILENAME = "update_status.json"
+
+
+def record_last_update(
+    config_dir: str,
+    status: str,
+    detail: str,
+    *,
+    from_version: Optional[str] = None,
+    to_version: Optional[str] = None,
+) -> dict:
+    """Persist the last self-update event; returns the record.
+
+    Best-effort by design (an unwritable config dir must never break an
+    update or the startup), and tiny: exactly one event is kept -- "最新一筆"
+    -- because the console only ever shows the latest outcome.
+    """
+    entry: dict = {
+        "status": status,
+        "detail": detail,
+        "at": datetime.now(timezone.utc).isoformat(),
+    }
+    if from_version:
+        entry["from"] = from_version
+    if to_version:
+        entry["to"] = to_version
+    try:
+        os.makedirs(config_dir, exist_ok=True)
+        with open(os.path.join(config_dir, LAST_UPDATE_FILENAME), "w", encoding="utf-8") as f:
+            json.dump(entry, f, ensure_ascii=False)
+    except OSError:
+        logger.warning("could not persist the self-update record", exc_info=True)
+    return entry
+
+
+def load_last_update(config_dir: str) -> Optional[dict]:
+    """The persisted last self-update event, or None. Tolerant of a missing,
+    unreadable or malformed file -- a bad record is simply no record."""
+    try:
+        with open(os.path.join(config_dir, LAST_UPDATE_FILENAME), "r", encoding="utf-8") as f:
+            entry = json.load(f)
+    except (OSError, ValueError):
+        return None
+    return entry if isinstance(entry, dict) and "status" in entry else None
 
 
 # Sort-lowest sentinel for a version string this parser cannot read.

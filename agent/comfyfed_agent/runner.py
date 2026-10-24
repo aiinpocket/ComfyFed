@@ -903,8 +903,15 @@ class AgentLoop:
         # set here, on the event loop, because a SystemExit raised inside
         # `apply_update`'s worker thread would only kill that thread.
         self.exit_code: Optional[int] = None
+        # 2026-10-25: the last self-update event, loaded from disk (a
+        # successful update restarts the process, so the previous run's
+        # record is what the fresh run reports) and refreshed whenever the
+        # RemoteUpdater records a new outcome. Rides every heartbeat as
+        # `dynamic.agent_update` -- same vehicle as `comfyui_update`.
+        self._agent_update_status: Optional[dict] = update.load_last_update(self._config_dir)
         self._remote_updater = remote_update.RemoteUpdater(
-            config, __version__, self._running_job_id, self._request_restart_for_update
+            config, __version__, self._running_job_id, self._request_restart_for_update,
+            record=self._record_agent_update,
         )
         # The in-flight `update_agent` handler (or deferred apply), kept off
         # the receive loop so a slow download never delays heartbeats.
@@ -2558,10 +2565,21 @@ class AgentLoop:
         one-beat flash.
         """
         dynamic = hardware.collect_dynamic(self.config.models_dir)
-        if self._comfy_update_status is not None:
+        if self._comfy_update_status is not None or self._agent_update_status is not None:
             dynamic = dict(dynamic)
+        if self._comfy_update_status is not None:
             dynamic["comfyui_update"] = self._comfy_update_status
+        if self._agent_update_status is not None:
+            dynamic["agent_update"] = self._agent_update_status
         return dynamic
+
+    def _record_agent_update(self, status: str, detail: str, to_version) -> None:
+        """RemoteUpdater's recorder: persist the event and refresh what the
+        heartbeats carry (`update.record_last_update` returns the record)."""
+        self._agent_update_status = update.record_last_update(
+            self._config_dir, status, detail,
+            from_version=__version__, to_version=to_version,
+        )
 
     def _set_comfy_update_status(self, status: str, detail: str, version: Optional[str] = None) -> None:
         entry: dict = {
