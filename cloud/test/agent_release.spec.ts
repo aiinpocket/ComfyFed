@@ -10,6 +10,7 @@ import {
   AGENT_WHEEL_URL_KEY,
   parseBundledRelease,
   setBundledReleaseLoaderForTests,
+  AGENT_WHEEL_SHA256_KEY,
   type BundledRelease,
 } from "../src/core/agent_release";
 
@@ -79,6 +80,34 @@ describe("ensureBundledAgentRelease via GET /api/agent/version", () => {
     useBundled(bundled("0.2.0"));
     const r = await call("/api/agent/version");
     expect(r.body.latest).toBe("0.5.0");
+    expect(r.body.wheel_url).toBeNull();
+  });
+
+  it("re-publishes the SAME version when the published sha no longer matches the bundled wheel", async () => {
+    // The 0.1.18 incident: a redeploy served byte-different wheel bytes
+    // under the old advertised sha and every agent self-update failed
+    // verification. The bundled asset is the source of truth, so a
+    // same-version sha drift re-signs and republishes.
+    await setSetting(db(), AGENT_LATEST_KEY, "0.2.0");
+    await setSetting(db(), AGENT_WHEEL_SHA256_KEY, "0".repeat(64));
+    useBundled(bundled("0.2.0"));
+    const r = await call("/api/agent/version");
+    expect(r.body.latest).toBe("0.2.0");
+    expect(r.body.sha256).toBe(SHA);
+
+    const seed = await resolvePlatformSeed(db(), (env as any).PLATFORM_ED25519_SEED);
+    const pubkey = await derivePublicKeyHexFromSeed(seed);
+    const payload = new TextEncoder().encode(buildReleasePayload("0.2.0", SHA));
+    expect(await verifyHex(pubkey, payload, r.body.platform_sig)).toBe(true);
+  });
+
+  it("same version with a MATCHING sha stays untouched", async () => {
+    await setSetting(db(), AGENT_LATEST_KEY, "0.2.0");
+    await setSetting(db(), AGENT_WHEEL_SHA256_KEY, SHA);
+    useBundled(bundled("0.2.0"));
+    const r = await call("/api/agent/version");
+    expect(r.body.latest).toBe("0.2.0");
+    // Never published through this path: wheel_url/sig were never written.
     expect(r.body.wheel_url).toBeNull();
   });
 

@@ -7,7 +7,9 @@
  * on every build. This module is the runtime half: the first time an
  * isolate needs the agent version (an agent's startup check, the Workers
  * page), it reads that manifest through the ASSETS binding and, if the
- * bundled version is newer than the published `agent_latest` setting,
+ * bundled version is newer than the published `agent_latest` setting --
+ * or the SAME version whose published sha no longer matches the bundled
+ * wheel (see `publishIfNewer`'s drift note) --
  * signs `{version}|{sha256}` with the platform key and writes the five
  * `agent_*` settings `GET /api/agent/version` serves -- the same five the
  * manual `POST /api/workers/agent-release` route writes, so a hand-published
@@ -111,7 +113,25 @@ async function publishIfNewer(env: Env): Promise<void> {
   const bundled = await loader(env);
   if (bundled === null) return;
   const stored = (await getSetting(env.DB, AGENT_LATEST_KEY)) ?? AGENT_VERSION_DEFAULT;
-  if (compareVersions(bundled.version, stored) <= 0) return;
+  const cmp = compareVersions(bundled.version, stored);
+  if (cmp < 0) return;
+  if (cmp === 0) {
+    // Same version: normally nothing to do -- EXCEPT when the advertised
+    // sha no longer matches the wheel this very deploy actually serves.
+    // Live-caught 2026-10-24 (the 0.1.18 incident): wheel builds were not
+    // byte-identical across checkouts (CRLF/LF drift; build-wheel.mjs now
+    // normalizes, but belt and braces), so a redeploy of the same version
+    // served new bytes under the old advertised sha and every agent
+    // self-update failed verification. The bundled asset is the single
+    // source of truth: when it disagrees with the published sha, re-sign
+    // and republish so /api/agent/version always describes the bytes
+    // /agent/<wheel> serves. Versions still never go backwards.
+    const storedSha = await getSetting(env.DB, AGENT_WHEEL_SHA256_KEY);
+    if (storedSha === bundled.sha256) return;
+    console.warn(
+      `agent_release: published sha for ${bundled.version} does not match the bundled wheel; re-publishing`
+    );
+  }
 
   const seed = await resolvePlatformSeed(env.DB, env.PLATFORM_ED25519_SEED);
   const { signatureHex } = await signRelease(seed, bundled.version, bundled.sha256);

@@ -55,7 +55,17 @@ async function collectPackageFiles(dir, prefix) {
       if (entry.isDirectory()) {
         await walk(full, relPath);
       } else if (entry.isFile() && entry.name.endsWith(".py")) {
-        files.set(`${prefix}/${relPath}`, await readFile(full));
+        // Normalize CRLF -> LF so the wheel bytes (and therefore the sha256
+        // the platform signs and advertises) are identical from every
+        // checkout. Live-caught 2026-10-24: a Windows checkout without
+        // `eol=lf` attributes built a byte-different wheel for the SAME
+        // commit, and because `ensureBundledAgentRelease` only (re)publishes
+        // a NEWER version, redeploying served new bytes under the old
+        // advertised sha -- every agent self-update then failed
+        // verification (the 0.1.18 incident). Python doesn't care about the
+        // line endings; the signature does.
+        const source = await readFile(full);
+        files.set(`${prefix}/${relPath}`, Buffer.from(source.toString("utf8").replace(/\r\n/g, "\n"), "utf8"));
       }
     }
   }
