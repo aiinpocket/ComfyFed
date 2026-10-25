@@ -10,6 +10,7 @@ import * as modelGuide from "../src/core/model_guide";
 import * as modelManifest from "../src/core/model_manifest";
 import * as retry from "../src/core/retry";
 import * as dispatch from "../src/core/dispatch";
+import { pickAgentSocketIndex } from "../src/do/hub";
 import { resolvePlatformSeed } from "../src/db/queries";
 import golden from "./fixtures/golden.json";
 
@@ -2599,6 +2600,43 @@ describe("protocol 6: update_comfyui + hello-time update_agent nudge", () => {
     expect(await res.json()).toEqual({ result: "sent" });
     expect(await frame).toEqual({ type: "update_comfyui" });
     ws.close();
+  });
+
+  // Live-caught 2026-10-25: a worker can have MORE than one ready socket in
+  // `ctx.getWebSockets()` -- a reconnect attempt that authed and then died
+  // without a close frame lingers indefinitely (hibernatable sockets survive
+  // DO restarts, and the auth-time dedup's close() of a broken socket is
+  // best-effort), still carrying the handshake default `protocol: 1`.
+  // First-match selection handed every push to that corpse: the console's
+  // update-ComfyUI button answered 409 agent_too_old for a fleet entirely on
+  // protocol 6. The dual-socket state is unreachable in miniflare (close()
+  // always works here, so the auth dedup always wins), so the selection is a
+  // pure, exported function tested directly with the attachment shapes the
+  // incident produced.
+  describe("pickAgentSocketIndex (zombie-socket selection)", () => {
+    it("prefers a helloed socket over a never-helloed zombie, regardless of order", () => {
+      const zombie = { protocol: 1 };
+      const live = { protocol: 6 };
+      expect(pickAgentSocketIndex([zombie, live])).toBe(1);
+      expect(pickAgentSocketIndex([live, zombie])).toBe(0);
+    });
+
+    it("prefers the newest hello when several sockets have helloed", () => {
+      expect(
+        pickAgentSocketIndex([
+          { protocol: 6, helloAt: 100 },
+          { protocol: 6, helloAt: 200 },
+        ])
+      ).toBe(1);
+      // A pre-helloAt-build hello (protocol > 1, no stamp) loses to any
+      // stamped hello, but still beats a zombie.
+      expect(pickAgentSocketIndex([{ protocol: 6 }, { protocol: 6, helloAt: 1 }])).toBe(1);
+    });
+
+    it("falls back to the first socket when none has helloed (legacy behavior)", () => {
+      expect(pickAgentSocketIndex([{ protocol: 1 }, { protocol: 1 }])).toBe(0);
+      expect(pickAgentSocketIndex([])).toBe(-1);
+    });
   });
 
   it("answers unsupported for protocol 5 and offline for no connection", async () => {

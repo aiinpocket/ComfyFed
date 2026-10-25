@@ -214,6 +214,16 @@ interface AgentAttachment {
    * 權威，不可偽造）。存在 attachment 裡是因為 hello 是後續的一個訊息，
    * 那時已經沒有原始 `Request` 可以再讀一次 header 了。 */
   remoteIp?: string | null;
+  /** `Date.now()` of this connection's LAST processed hello (live-caught
+   * 2026-10-25). Absent = this socket never completed a hello under code
+   * that stamps it: either a dead reconnect attempt that authed and then
+   * dropped without a close frame (hibernation keeps it enumerable
+   * indefinitely), or a socket helloed by a pre-stamp build (those still
+   * carry their hello's `protocol > 1`, which `findWsForWorker` accepts as
+   * proof of a completed hello). `findWsForWorker` uses it to pick the
+   * NEWEST helloed connection when several ready sockets claim the same
+   * worker id -- see its docstring for the incident this fixes. */
+  helloAt?: number;
 }
 
 /** A connected panel (ComfyUI-frontend) client -- ports the former Python
@@ -339,6 +349,41 @@ function extractCookie(cookieHeader: string | null, name: string): string | null
     if (key === name) return part.slice(eq + 1).trim();
   }
   return null;
+}
+
+/** Picks which of a worker's ready agent sockets to talk to, by index into
+ * `atts` (-1 when empty).
+ *
+ * Live-caught 2026-10-25: more than one ready socket can claim the same
+ * worker id. A reconnect attempt that authed and then died without a close
+ * frame lingers in `ctx.getWebSockets()` indefinitely (hibernatable sockets
+ * survive DO restarts, and the auth-time dedup's `close()` of a broken
+ * socket is best-effort), still carrying the handshake default
+ * `protocol: 1`. First-match selection handed every push -- job frames,
+ * update_agent, update_comfyui -- to that corpse: the console's update
+ * button answered 409 agent_too_old for a fleet entirely on protocol 6.
+ *
+ * Ranking: a socket with a completed hello (a `helloAt` stamp, or
+ * `protocol > 1` for one helloed by a pre-stamp build) always beats one
+ * that never helloed; among helloed sockets the newest stamp wins. When NO
+ * candidate has helloed, fall back to the first (the pre-fix behavior) --
+ * tests connect auth-only sockets and dispatch to them, and a real agent's
+ * hello lands within milliseconds of auth anyway. */
+export function pickAgentSocketIndex(
+  atts: readonly { protocol: number; helloAt?: number }[]
+): number {
+  let best = -1;
+  let bestRank = -Infinity;
+  for (let i = 0; i < atts.length; i++) {
+    const att = atts[i]!;
+    const helloed = att.helloAt !== undefined || att.protocol > 1;
+    const rank = helloed ? (att.helloAt ?? 0) : -1;
+    if (rank > bestRank) {
+      bestRank = rank;
+      best = i;
+    }
+  }
+  return best;
 }
 
 /** Validate `hello.protocol`, defaulting to 1 -- ports the former Python
@@ -982,6 +1027,9 @@ export class Hub extends DurableObject<Env> {
     }
     const att = ws.deserializeAttachment() as AgentAttachment | null;
     if (!att || att.protocol < MIN_COMFY_UPDATE_PROTOCOL) {
+      // 觀測閘門擋下的原因：live-caught 2026-10-25（0.1.23 的連線被回
+      // unsupported），attachment 全文進 log 好在 `wrangler tail` 裡對質。
+      console.warn(`hub: update_comfyui unsupported for worker ${workerId}: att=${JSON.stringify(att)}`);
       return Response.json({ result: "unsupported" });
     }
     try {
@@ -1388,7 +1436,7 @@ export class Hub extends DurableObject<Env> {
     });
 
     attachment.state = helloState;
-    ws.serializeAttachment({ ...attachment, protocol, state: helloState } satisfies AgentAttachment);
+    ws.serializeAttachment({ ...attachment, protocol, state: helloState, helloAt: Date.now() } satisfies AgentAttachment);
 
     if (protocol < CURRENT_PROTOCOL) {
       try {
@@ -2807,12 +2855,19 @@ export class Hub extends DurableObject<Env> {
 
   // -- Connection lookup -------------------------------------------------
 
+  /** The worker's live agent socket (best candidate per
+   * `pickAgentSocketIndex`), or null when it has none at all. */
   private findWsForWorker(workerId: string): WebSocket | null {
+    const sockets: WebSocket[] = [];
+    const atts: AgentAttachment[] = [];
     for (const ws of this.ctx.getWebSockets()) {
       const att = ws.deserializeAttachment() as HubAttachment | null;
-      if (att && att.kind === "agent" && att.phase === "ready" && att.workerId === workerId) return ws;
+      if (!att || att.kind !== "agent" || att.phase !== "ready" || att.workerId !== workerId) continue;
+      sockets.push(ws);
+      atts.push(att);
     }
-    return null;
+    const best = pickAgentSocketIndex(atts);
+    return best === -1 ? null : sockets[best]!;
   }
 
   private ephemeralFor(ws: WebSocket): Ephemeral {
