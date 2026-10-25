@@ -80,6 +80,7 @@ const HISTORY_STATUSES = ["done", "failed"];
 const OBJECT_INFO_DIR = "object_info";
 import { readLimits, tooLargeMessage, uploadRejection } from "../lib/limits";
 import * as nsfwGate from "../core/nsfw_gate";
+import { validatePromptInputs } from "../core/validate_prompt";
 
 const OBJECT_INFO_MAX_BYTES = 32 * 1024 * 1024;
 
@@ -289,6 +290,30 @@ export function clearObjectInfoCacheForTests(): void {
   objectInfoCache = null;
 }
 
+/** The fleet's merged object_info through the same single-entry cache the
+ * GET route uses -- one R2 read set per (fleet, mode) for the whole isolate,
+ * however many submissions and object_info GETs share it. Exported for
+ * `routes/jobs.ts`'s submission-time range validation (`createJobFromWorkflow`
+ * guards the console path with the same fleet spec this file's `/prompt`
+ * guard uses). `fleetCount` lets the GET route keep its no-workers headers
+ * without re-reading the workers table. */
+export async function mergedFleetObjectInfo(
+  env: Env
+): Promise<{ merged: Record<string, unknown>; fleetCount: number }> {
+  const fleetWorkers = await queries.getOnlineEnabledWorkers(env.DB);
+  const fleet: [string, string][] = fleetWorkers.map((w) => [w.id, w.objectInfoHash || ""]);
+  if (fleet.length === 0) return { merged: {}, fleetCount: 0 };
+  const modeRaw = await queries.getSetting(env.DB, OBJECT_INFO_MODE_KEY);
+  const mode = modeRaw && OBJECT_INFO_MODES.has(modeRaw) ? modeRaw : DEFAULT_OBJECT_INFO_MODE;
+  const key = objectInfoCacheKey(fleet, mode);
+  if (objectInfoCache && objectInfoCache.key === key) {
+    return { merged: objectInfoCache.value, fleetCount: fleet.length };
+  }
+  const merged = await mergeObjectInfo(env.STORE, fleet, mode);
+  objectInfoCache = { key, value: merged };
+  return { merged, fleetCount: fleet.length };
+}
+
 // ---------------------------------------------------------------------------
 // Staged-image injection into upload-node combo dropdowns -- ports
 // `_merge_options` / `_UPLOAD_FIELD_EXTENSIONS` / `_with_staged_images`.
@@ -450,26 +475,14 @@ app.use("/comfy/api/*", requireUser);
 
 app.get("/comfy/api/object_info", async (c) => {
   const user = c.get(SESSION_VAR).user;
-  const fleetWorkers = await queries.getOnlineEnabledWorkers(c.env.DB);
-  const fleet: [string, string][] = fleetWorkers.map((w) => [w.id, w.objectInfoHash || ""]);
-  const modeRaw = await queries.getSetting(c.env.DB, OBJECT_INFO_MODE_KEY);
-  const mode = modeRaw && OBJECT_INFO_MODES.has(modeRaw) ? modeRaw : DEFAULT_OBJECT_INFO_MODE;
+  const { merged, fleetCount } = await mergedFleetObjectInfo(c.env);
 
-  if (fleet.length === 0) {
+  if (fleetCount === 0) {
     return c.json({}, 200, { "X-ComfyFed-No-Workers": "1", [WORKER_COUNT_HEADER]: "0" });
   }
 
-  const key = objectInfoCacheKey(fleet, mode);
-  let merged: Record<string, unknown>;
-  if (objectInfoCache && objectInfoCache.key === key) {
-    merged = objectInfoCache.value;
-  } else {
-    merged = await mergeObjectInfo(c.env.STORE, fleet, mode);
-    objectInfoCache = { key, value: merged };
-  }
-
   const names = await stagedImageNames(c.env.STORE, user.uid);
-  return c.json(withStagedImages(merged, names), 200, { [WORKER_COUNT_HEADER]: String(fleet.length) });
+  return c.json(withStagedImages(merged, names), 200, { [WORKER_COUNT_HEADER]: String(fleetCount) });
 });
 
 // --- GET /comfy/api/workflow_templates -------------------------------------
@@ -498,6 +511,36 @@ app.post("/comfy/api/prompt", async (c) => {
     return comfyError("invalid_prompt", "Prompt must be a non-empty API-format object");
   }
   const promptObj = prompt as Record<string, unknown>;
+
+  // 2026-10-25 送件範圍驗證（core/validate_prompt.ts 檔頭有事故經過）：一個
+  // 開著舊前端的分頁會送出子參數錯位的 prompt，到 worker 上才敗在 ComfyUI 的
+  // 驗證，連敗兩次就把 worker 對整個 task_key 封鎖掉。在這裡用艦隊合併的
+  // object_info 先擋下來，submitter 立刻看得到哪個欄位爆了哪個界。放在 NSFW
+  // 閘之前 -- 這個檢查只花一次快取的 object_info 讀取，NSFW 閘要花一次
+  // Claude 呼叫。
+  {
+    const { merged: fleetInfo } = await mergedFleetObjectInfo(c.env);
+    const violations = validatePromptInputs(promptObj, fleetInfo);
+    if (violations.length > 0) {
+      const nodeErrors: Record<string, { class_type: string; dependent_outputs: unknown[]; errors: unknown[] }> = {};
+      for (const v of violations) {
+        const entry =
+          nodeErrors[v.nodeId] ?? (nodeErrors[v.nodeId] = { class_type: v.classType, dependent_outputs: [], errors: [] });
+        entry.errors.push({
+          type: "comfyfed.input_out_of_range",
+          message: v.message,
+          details: v.inputName,
+          extra_info: { received_value: v.received, min: v.min, max: v.max },
+        });
+      }
+      return comfyError(
+        "comfyfed.input_out_of_range",
+        "送出的參數超出節點允許範圍（舊版面板分頁？請重新整理後再送）。 / Submitted values are outside the node's allowed ranges (stale panel tab? reload and resubmit).",
+        violations.map((v) => v.message).join("; "),
+        nodeErrors
+      );
+    }
+  }
 
   // 2026-09-20 NSFW 閘：和 console 的 `POST /api/jobs` 同一個判定，只是用面板
   // 看得懂的 error envelope 回。放在缺模型檢查之前 -- 一個不准做 NSFW 的人不

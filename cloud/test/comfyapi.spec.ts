@@ -311,6 +311,86 @@ describe("POST /comfy/api/prompt", () => {
     expect(r.body.error.type).toBe("no_prompt");
   });
 
+  // 2026-10-25 送件範圍驗證（core/validate_prompt.ts）：節點數值超出艦隊
+  // object_info 宣告的 min/max 要在送件這一關就被擋下，而不是到 worker 上
+  // 連敗兩次、把 worker 對整個 task_key 封鎖。
+  it("rejects out-of-range dynamic-combo values at submission (the scrambled-panel case)", async () => {
+    const { cookie, csrf } = await loginSession();
+    const workerId = await registerWorker(cookie, csrf, "range-w1");
+    await seedObjectInfo(workerId, "range-hash-1", {
+      TextGenerate: {
+        input: {
+          required: {
+            sampling_mode: [
+              "COMFY_DYNAMICCOMBO_V3",
+              {
+                options: [
+                  {
+                    key: "on",
+                    inputs: {
+                      required: { repetition_penalty: ["FLOAT", { default: 1.05, min: 0.0, max: 5.0 }] },
+                    },
+                  },
+                ],
+              },
+            ],
+          },
+        },
+      },
+    });
+
+    const prompt = {
+      "206": {
+        class_type: "TextGenerate",
+        inputs: { sampling_mode: "on", "sampling_mode.repetition_penalty": 64 },
+      },
+    };
+    const r = await postPrompt(cookie, prompt);
+    expect(r.status).toBe(400);
+    expect(r.body.error.type).toBe("comfyfed.input_out_of_range");
+    expect(r.body.node_errors["206"].class_type).toBe("TextGenerate");
+    expect(r.body.node_errors["206"].errors[0].extra_info).toMatchObject({ received_value: 64, max: 5 });
+
+    // Nothing persisted -- the refusal happens before insertJob.
+    const list = await call("/api/jobs", { method: "GET", cookie });
+    expect(list.body).toHaveLength(0);
+  });
+
+  it("accepts in-range dynamic-combo values against the same spec", async () => {
+    const { cookie, csrf } = await loginSession();
+    const workerId = await registerWorker(cookie, csrf, "range-w2");
+    await seedObjectInfo(workerId, "range-hash-2", {
+      TextGenerate: {
+        input: {
+          required: {
+            sampling_mode: [
+              "COMFY_DYNAMICCOMBO_V3",
+              {
+                options: [
+                  {
+                    key: "on",
+                    inputs: {
+                      required: { repetition_penalty: ["FLOAT", { default: 1.05, min: 0.0, max: 5.0 }] },
+                    },
+                  },
+                ],
+              },
+            ],
+          },
+        },
+      },
+    });
+
+    const prompt = {
+      "206": {
+        class_type: "TextGenerate",
+        inputs: { sampling_mode: "on", "sampling_mode.repetition_penalty": 1.05 },
+      },
+    };
+    const r = await postPrompt(cookie, prompt);
+    expect(r.status).toBe(200);
+  });
+
   it("rejects an unstaged asset reference with a comfy-shaped error and persists nothing", async () => {
     const { cookie } = await loginSession();
     const prompt = { "1": { class_type: "LoadImage", inputs: { image: "ref.png" } } };

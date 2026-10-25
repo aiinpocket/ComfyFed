@@ -44,6 +44,8 @@ import { sanitizePathComponentOrThrow, artifactKey, jobInputKey } from "../lib/s
 import { artifactKind, deriveLabel, normalizeLabel } from "../core/label";
 import { fileCapExceeded, readLimits, tooLargeMessage, usageBytes, quotaMessage, QUOTA_EXCEEDED_CODE } from "../lib/limits";
 import * as nsfwGate from "../core/nsfw_gate";
+import { validatePromptInputs } from "../core/validate_prompt";
+import { mergedFleetObjectInfo } from "./comfyapi";
 import { verifyAgentRequest, type VerifyAgentResult } from "../lib/verify_agent";
 import { requireUser, requireCsrfUser, errorJson, SESSION_VAR } from "../lib/guard";
 import { bytesToBase64Url } from "../lib/base64";
@@ -418,6 +420,23 @@ export async function createJobFromWorkflow(
   } = {}
 ): Promise<string> {
   const workflowJsonText = opts.workflowJsonText ?? JSON.stringify(workflow);
+
+  // 2026-10-25 送件範圍驗證 -- 與面板 `/comfy/api/prompt` 同一道閘（經過見
+  // core/validate_prompt.ts 檔頭）：超界的數值在這裡就擋，不讓它到 worker 上
+  // 連敗兩次、把 worker 對整個 task_key 封鎖。放在 NSFW 閘之前（這裡只花一次
+  // 快取的 object_info 讀取，NSFW 閘要花一次 Claude 呼叫）。
+  {
+    const { merged: fleetInfo } = await mergedFleetObjectInfo(env);
+    const violations = validatePromptInputs(workflow, fleetInfo);
+    if (violations.length > 0) {
+      const detail = violations.map((v) => v.message).join("; ");
+      throw new JobCreationError(
+        400,
+        "jobs.input_out_of_range",
+        `送出的參數超出節點允許範圍 / submitted values are outside the node's allowed ranges: ${detail}`
+      );
+    }
+  }
 
   // 2026-09-20 NSFW 閘：在做任何事之前擋（含檔名／大小檢查）。對 `nsfw_allowed`
   // 沒被關掉的 user（預設）這是一次 users 表讀取就回來。`classify` 走模組命名
