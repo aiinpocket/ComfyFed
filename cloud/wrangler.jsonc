@@ -25,6 +25,11 @@
     // row -- the D1 row is never read or written in that case, so rotating
     // the secret rotates the platform identity predictably.
   },
+  // Daily retention sweep (src/core/cleanup.ts via index.ts's `scheduled`):
+  // 18:30 UTC = 02:30 Asia/Taipei, the fleet's quietest hour.
+  "triggers": {
+    "crons": ["30 18 * * *"]
+  },
   "d1_databases": [
     {
       "binding": "DB",

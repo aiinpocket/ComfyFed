@@ -14,6 +14,7 @@ import peerRoutes from "./routes/peer";
 import installerRoutes from "./routes/installer";
 import stagingRoutes from "./routes/staging";
 import { comfySessionGate, serveComfyAsset } from "./lib/gate";
+import { cleanupExpired } from "./core/cleanup";
 
 export { Hub } from "./do/hub";
 export type { Env };
@@ -162,4 +163,23 @@ app.all("/comfy/api/*", (c) =>
 // through, given `run_worker_first` claims every `/comfy*` request).
 app.get("/comfy/*", (c) => serveComfyAsset(c));
 
-export default app;
+// Cron trigger (wrangler.jsonc `triggers.crons`): daily retention sweep --
+// see core/cleanup.ts's docstring for exactly what is (and is not) purged.
+// `scheduled` only exists on Cloudflare; the self-host runtime
+// (scripts/selfhost.mjs) serves `fetch` and simply never fires it.
+const worker = {
+  fetch: app.fetch,
+  async scheduled(controller: ScheduledController, env: Env, ctx: ExecutionContext): Promise<void> {
+    ctx.waitUntil(
+      cleanupExpired(env.DB, env.STORE).then(
+        (result) => console.info("cleanup:", JSON.stringify(result)),
+        // Log-and-swallow: a failed sweep must never crash the cron
+        // invocation into retry storms; the next scheduled run retries
+        // everything anyway (the sweep is idempotent).
+        (err) => console.error("cleanup failed:", err instanceof Error ? (err.stack ?? err.message) : String(err))
+      )
+    );
+  },
+};
+
+export default worker;
