@@ -80,11 +80,12 @@ const TEMPLATES_ASSETS_DIR = path.join(ASSETS_DIR, "comfyfed_templates");
 const INSTALL_TEMPLATES_ASSETS_DIR = path.join(ASSETS_DIR, "install-templates");
 const AGENT_RELEASE_ASSETS_DIR = path.join(ASSETS_DIR, "agent");
 
-// Keep in sync with server/comfyfed_server/comfy_frontend.py's
-// `FRONTEND_VERSION` / `FRONTEND_SHA256` -- SAME pinned wheel, same digest.
-// Bump both files together when the panel version changes.
-const FRONTEND_VERSION = "1.52.7";
-const FRONTEND_SHA256 = "3aa5624fa5085f8461d31b7eb88a42ed69a0e783a35bec1c2a33b90fc7660950";
+// Pinned hosted-panel frontend. Must be >= the `required_frontend_version`
+// reported by the fleet's ComfyUI (`/api/system_stats`) -- an older panel
+// serializes COMFY_DYNAMICCOMBO_V3 sub-widgets (TextGenerate, SaveVideo, ...)
+// in the wrong order and submits scrambled sampling values.
+const FRONTEND_VERSION = "1.55.18";
+const FRONTEND_SHA256 = "34c388cdf5236b8bae57fd4d8bde54991e65f13f8247213325a6d7852b252053";
 const PYPI_JSON_URL = "https://pypi.org/pypi/comfyui-frontend-package/json";
 const STATIC_PREFIX = "comfyui_frontend_package/static/";
 const MAX_WHEEL_BYTES = 512 * 1024 * 1024;
