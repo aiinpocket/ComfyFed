@@ -1101,7 +1101,7 @@ describe("split families on the panel (§3.7)", () => {
       ],
     });
 
-    const stale = toSqliteTimestamp(new Date(Date.now() - 200_000));
+    const stale = toSqliteTimestamp(new Date(Date.now() - 1_000_000));
     const fresh = toSqliteTimestamp(new Date());
     await d1().prepare("UPDATE workers SET last_seen = ? WHERE id = ?").bind(stale, staleWorker).run();
     await d1().prepare("UPDATE workers SET last_seen = ? WHERE id = ?").bind(fresh, liveWorker).run();

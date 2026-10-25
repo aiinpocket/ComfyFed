@@ -1575,7 +1575,7 @@ export async function getOnlinePeerCapableWorkers(
   excludeWorkerId?: string,
   pullerRemoteIp?: string | null
 ): Promise<Worker[]> {
-  // No `deleted = 0` clause, same accepted ~90s window as `peer.online_seeders`
+  // No `deleted = 0` clause, same accepted ~STALE_SECONDS window as `peer.online_seeders`
   // (review L6): a just-deleted seeder stays eligible until the stale sweep
   // marks it offline, and the worst case is one wasted fetch round trip.
   let sql = "SELECT * FROM workers WHERE status != 'offline' AND protocol >= ? AND peer_url IS NOT NULL";

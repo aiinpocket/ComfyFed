@@ -31,7 +31,13 @@ from .config import AgentConfig, PlatformEntry
 
 logger = logging.getLogger(__name__)
 
-_HEARTBEAT_INTERVAL_SECONDS = 30
+# 2026-10-25：30 -> 300。心跳是 D1 rows_written 的最大宗（每台每天 2880 列，
+# 再加 busy 心跳的 job 進度列），免費額度 10 萬列/天撐不住。連線本身靠
+# websockets 函式庫預設每 20 秒的 protocol ping 保活（Workers 端 hibernation
+# 會自動回 pong，不會叫醒 DO），所以拉長心跳不影響連線存活；代價是面板上的
+# 進度、狀態最多慢一個週期。平台端 dispatch.STALE_SECONDS 以「漏 3 拍」同步
+# 調成 900，改這裡要一起改那邊。
+_HEARTBEAT_INTERVAL_SECONDS = 300
 _OBJECT_INFO_INTERVAL_SECONDS = 600
 _RECV_POLL_TIMEOUT_SECONDS = 1.0
 # How often the platform-independent control loop republishes

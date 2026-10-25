@@ -625,7 +625,7 @@ export async function childStatusChanged(
 /** §3.4 -- ports `split.refresh_parent_progress`：子 job 回報進度之後，把父
  * job 的 `progress` 更新成子 job 的平均。回傳父 job 的新 progress，或 null。
  *
- * 和 `refreshParent` 分開的原因是呼叫頻率：進度來自心跳（每個子 job 每 30 秒
+ * 和 `refreshParent` 分開的原因是呼叫頻率：進度來自心跳（每個子 job 每個心跳週期
  * 一次，跑的時候更密），而狀態推導要跑串聯取消、要寫五六個欄位。這裡只做一次
  * 子 job 查詢加一次 UPDATE，狀態一個字都不碰，也刻意不發面板事件（Task 7）。 */
 export async function refreshParentProgress(db: D1Database, jobId: string): Promise<number | null> {

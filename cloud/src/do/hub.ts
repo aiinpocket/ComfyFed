@@ -2664,12 +2664,12 @@ export class Hub extends DurableObject<Env> {
       // the `{}` placeholder workflow and fail it.
       // 注意這裡的 job 並不會「留在 queued」：`assignJobs` 已經把它 claim 成
       // `assigned` 並寫上 workerId，只是沒人收到 `job` frame。要等這個 worker
-      // 超過 90 秒沒心跳、被 `dispatch.requeueStale` 掃回 `queued` 才救得回來
+      // 超過 STALE_SECONDS 沒心跳、被 `dispatch.requeueStale` 掃回 `queued` 才救得回來
       // （worker 一直在線的話就會卡著）。
       // The job does NOT stay queued: `assignJobs` already claimed the row to
       // `assigned` with `worker_id` set, and skipping the push just means
       // nobody received the `job` frame. It is recovered only when that worker
-      // goes stale (>90 s without a check-in) and `dispatch.requeueStale`
+      // goes stale (>STALE_SECONDS without a check-in) and `dispatch.requeueStale`
       // moves it back to `queued`. Ports the same block in the former Python
       // `dispatch_tick`.
       if (job.kind === "model_fetch" && (!pushWorker || !assess.modelFetchProtocolOk(pushWorker))) {
