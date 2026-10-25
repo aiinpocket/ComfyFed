@@ -75,12 +75,20 @@ def get_object_info(comfy_url: str, client: Optional[httpx.Client] = None) -> di
 def canonical_object_info_bytes(object_info: dict) -> bytes:
     """Canonical UTF-8 JSON encoding of an `/object_info` payload.
 
-    Sorted keys and compact separators so the same object_info always
-    serializes to the exact same bytes -- this is what gets sha256'd and
-    gzipped for `POST /api/agent/object_info`, and what the server's
-    `X-OI-Hash` check must be able to reproduce independently.
+    Compact separators, keys in ComfyUI's own order -- NEVER sorted. The
+    hosted panel builds every node's widgets from this payload, and a
+    dynamic combo's nested option inputs carry no `input_order` array, so
+    their *object key order* is the widget order. Sorting the keys
+    (0.1.21 and earlier did) re-ordered those sub-widgets alphabetically,
+    and every workflow authored against the real declaration order loaded
+    with its values assigned to the wrong parameters (the 2026-10-25
+    scrambled-sampling incident: repetition_penalty got top_k's 64).
+
+    "Canonical" only has to mean "the exact bytes that get sha256'd and
+    gzipped for `POST /api/agent/object_info`" -- the server hashes the
+    received bytes as-is (`X-OI-Hash`), it never re-serializes.
     """
-    return json.dumps(object_info, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    return json.dumps(object_info, separators=(",", ":")).encode("utf-8")
 
 
 def object_info_hash(payload: bytes) -> str:

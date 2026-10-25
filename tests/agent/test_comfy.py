@@ -97,6 +97,15 @@ def client():
     return TestClient(_make_app())
 
 
+def test_canonical_object_info_preserves_key_order():
+    # The hosted panel derives widget order from object_info key order (a
+    # dynamic combo's nested inputs have no input_order array), so the
+    # canonical bytes must keep ComfyUI's declaration order, never sort.
+    payload = {"Node": {"input": {"required": {"zeta": 1, "alpha": 2, "mid": 3}}}}
+    raw = comfy.canonical_object_info_bytes(payload).decode("utf-8")
+    assert raw.index("zeta") < raw.index("alpha") < raw.index("mid")
+
+
 def test_get_object_info_returns_installed_classes(client):
     info = comfy.get_object_info(COMFY_URL, client=client)
     assert set(info.keys()) == {"KSampler", "CheckpointLoaderSimple", "SaveImage"}
