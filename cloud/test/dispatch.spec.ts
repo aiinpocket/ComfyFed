@@ -139,7 +139,7 @@ async function getWorkerRow(id: string) {
 describe("requeueStale", () => {
   it("records last_worker_id, clears worker_id, resets progress, and offlines the worker", async () => {
     const workerId = await makeWorker();
-    await setWorkerLastSeen(workerId, new Date(now().getTime() - 200_000));
+    await setWorkerLastSeen(workerId, new Date(now().getTime() - 1_000_000));
     await db().prepare("UPDATE jobs SET progress = 0").run(); // no-op, keeps parity readable
     const jobId = await makeJob({ status: "assigned", workerId });
 
@@ -157,13 +157,43 @@ describe("requeueStale", () => {
 
   it("clears peer_url on the stale/offline transition (Phase 3.1 P2P)", async () => {
     const workerId = await makeWorker("w", { peerUrl: "http://192.168.1.5:8850" });
-    await setWorkerLastSeen(workerId, new Date(now().getTime() - 200_000));
+    await setWorkerLastSeen(workerId, new Date(now().getTime() - 1_000_000));
 
     await dispatch.requeueStale(db(), now());
 
     const worker = await getWorkerRow(workerId);
     expect(worker.status).toBe("offline");
     expect(worker.peer_url).toBeNull();
+  });
+
+  it("does not rewrite a worker it already offlined on a later sweep", async () => {
+    // 2026-10-25 D1 rows_written 排查：alarm 每 5 秒掃一次，死掉的 worker 列
+    // 永遠滿足 stale 條件，每個 tick 都被重新 UPDATE 成 offline 一次 -- 一天
+    // 兩萬多列全是無效寫入。SQLite 的 AFTER UPDATE trigger 以「實際寫入的列」
+    // 為單位觸發（WHERE 沒中就不觸發），正好等同 D1 計費的 rows_written，
+    // 用它斷言第二次掃描對已離線的 worker 零寫入。
+    const workerId = await makeWorker();
+    await setWorkerLastSeen(workerId, new Date(now().getTime() - 1_000_000));
+    await dispatch.requeueStale(db(), now());
+    expect((await getWorkerRow(workerId)).status).toBe("offline");
+
+    await db().prepare("CREATE TABLE IF NOT EXISTS _worker_update_audit (id TEXT)").run();
+    await db()
+      .prepare(
+        "CREATE TRIGGER _audit_worker_updates AFTER UPDATE ON workers BEGIN INSERT INTO _worker_update_audit (id) VALUES (NEW.id); END"
+      )
+      .run();
+    try {
+      await dispatch.requeueStale(db(), now());
+      const writes = await db()
+        .prepare("SELECT COUNT(*) AS n FROM _worker_update_audit WHERE id = ?")
+        .bind(workerId)
+        .first<{ n: number }>();
+      expect(writes!.n).toBe(0);
+    } finally {
+      await db().prepare("DROP TRIGGER _audit_worker_updates").run();
+      await db().prepare("DROP TABLE _worker_update_audit").run();
+    }
   });
 
   it("leaves a worker that heartbeated recently alone", async () => {
@@ -1029,7 +1059,7 @@ describe("子 job 動了就推導父 job (§3.4/§3.6)", () => {
 
   it("requeueStale pulls the parent back from running", async () => {
     const workerId = await makeWorker("w-stale-split");
-    await setWorkerLastSeen(workerId, new Date(Date.now() - 600_000));
+    await setWorkerLastSeen(workerId, new Date(Date.now() - 1_000_000));
     const { parentId, childIds } = await makeSplitFamily("p-stale", ["running", "queued"], [workerId, null]);
     await db().prepare("UPDATE jobs SET status = 'running' WHERE id = ?").bind(parentId).run();
 
@@ -1197,7 +1227,7 @@ describe("tryReadopt after a retry requeue (job-retry I1)", () => {
     // 的 job `started_at` 是 NULL -- 所以「`started_at IS NOT NULL`」不是合格
     // 的判別式，這一格必須繼續認得回來。
     const workerId = await makeWorker("w-blip");
-    await setWorkerLastSeen(workerId, new Date(now().getTime() - 200_000));
+    await setWorkerLastSeen(workerId, new Date(now().getTime() - 1_000_000));
     const jobId = await makeJob({ status: "assigned", workerId });
 
     expect(await dispatch.requeueStale(db(), now())).toEqual([jobId]);

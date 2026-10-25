@@ -28,7 +28,9 @@ import * as scheduler from "./scheduler";
 import * as split from "./split";
 import * as stats from "./stats";
 
-const STALE_SECONDS = 90;
+// 漏 3 拍才算失聯（agent 心跳間隔 300s 的 3 倍，見 runner.py 的
+// `_HEARTBEAT_INTERVAL_SECONDS`；2026-10-25 心跳 30->300 時同步 90->900）。
+const STALE_SECONDS = 900;
 
 /** Statuses a worker is allowed to transition out of by reporting on a job. */
 const OWNED_STATUSES: readonly string[] = ["assigned", "running"];
@@ -387,7 +389,7 @@ export async function assignJobs(
     // 包 try/catch 是必要的，不是保險：claim 已經 commit 了（D1 沒有讓我們把
     // 兩個 UPDATE 綁在一個交易裡的 seam，Python 端則是同一個 session 交易，
     // 寫失敗會連 claim 一起 rollback）。這裡讓例外逃出去的話，job 會卡在
-    // `assigned` 卻沒有人收到 `job` frame -- 要等 90 秒後的 requeueStale 才
+    // `assigned` 卻沒有人收到 `job` frame -- 要等 STALE_SECONDS 後的 requeueStale 才
     // 救得回來 -- 而且本 tick 剩下的配對全部一起丟掉。熱快取親和只是最佳化，
     // 絕不值得賠上一次派工。
     try {
@@ -425,9 +427,9 @@ export async function assignJobs(
 // requeueStale
 
 /** Requeue assigned/running jobs of workers that haven't checked in for
- * more than 90s (falling back to `created_at` when a worker never
- * heartbeated at all), and mark those workers offline. Returns the ids of
- * jobs actually requeued -- ports `dispatch.requeue_stale`. */
+ * more than `STALE_SECONDS` (falling back to `created_at` when a worker
+ * never heartbeated at all), and mark those workers offline. Returns the
+ * ids of jobs actually requeued -- ports `dispatch.requeue_stale`. */
 export async function requeueStale(db: D1Database, now: Date): Promise<string[]> {
   const cutoff = new Date(now.getTime() - STALE_SECONDS * 1000);
   const cutoffTimestamp = toSqliteTimestamp(cutoff);
@@ -437,7 +439,14 @@ export async function requeueStale(db: D1Database, now: Date): Promise<string[]>
   for (const worker of staleWorkers) {
     const jobIds = await queries.requeueJobsForWorker(db, worker.id);
     requeued.push(...jobIds);
-    await queries.markWorkerOffline(db, worker.id);
+    // 2026-10-25 D1 rows_written：stale 條件對「早就離線」的 worker 永遠成立，
+    // 不加這個 guard 的話每個 5 秒 tick 都把同一批死列重寫一次 offline（一天
+    // 兩萬多列，約佔免費額度三分之一）。offline + peer 欄位已清 = 上一輪
+    // `markWorkerOffline` 已經完整落地，這輪沒有東西要寫；job requeue 仍照掃
+    // （上面那行），所以「標了 offline 但 requeue 沒掃乾淨」的殘局照樣修復。
+    if (worker.status !== "offline" || worker.peerUrl !== null || worker.peerReachable !== null) {
+      await queries.markWorkerOffline(db, worker.id);
+    }
     // Phase 3.3 §3.4：子 job 被 requeue 之後父 job 可能要從 running 退回
     // assigned/queued。requeue 從不產生 failed/cancelled，所以不會串聯取消。
     for (const jobId of jobIds) {
@@ -450,7 +459,7 @@ export async function requeueStale(db: D1Database, now: Date): Promise<string[]>
 // 2026-09-19 線上實例：部署當下 job 被派給一台 worker，推送落在斷線的舊
 // socket 上，agent 重連後一直回報 idle（沒有 job_id），而 `requeueStale`
 // 只看 worker 心跳 -- worker 明明在心跳，job 就永遠 `assigned`。連續這麼多
-// 次「idle 且沒有 job_id」的心跳（心跳間隔 30s，所以至少隔了一個週期；一次
+// 次「idle 且沒有 job_id」的心跳（心跳間隔 300s，所以至少隔了一個週期；一次
 // 就收會撞上「推送剛送出、agent 的週期心跳還在路上」和「job_done 與 idle
 // 心跳前後腳」這兩種正常時序）之後，這台名下仍 assigned/running 的 job 全
 // 部收回排隊。Ports the former Python `ORPHAN_IDLE_BEATS`.
@@ -515,7 +524,7 @@ export async function cancelJob(
  * 2026-09-19 job-retry — the THIRD condition, and the reason it exists:
  * before that feature, `status === "queued" AND last_worker_id === W` could
  * only ever be produced by `requeueStale`, i.e. by W actually vanishing for
- * 90 seconds. `requeueForRetry` now produces exactly the same pair
+ * `STALE_SECONDS`. `requeueForRetry` now produces exactly the same pair
  * deliberately (spec §5 requires `last_worker_id = W`), while W is still
  * connected — so without a guard, a worker could send `job_failed` and then
  * `job_done` for the same job, re-adopt it here, have it marked `done`, mint
