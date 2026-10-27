@@ -231,7 +231,15 @@ async function fetchPackagedRaw(env: Env, filename: string): Promise<ArrayBuffer
   try {
     const req = new Request(`https://assets.internal/${COMFYFED_PREFIX}${filename}`);
     const res = await env.ASSETS.fetch(req);
-    if (res.ok) {
+    // `not_found_handling: "single-page-application"` (wrangler.jsonc) makes
+    // the ASSETS binding answer a MISS with 200 + the console's index.html,
+    // not a 404 -- same footgun core/agent_release.ts already guards against.
+    // Live-caught 2026-10-27: every official (R2-only) template "opened" as
+    // the SPA page, because this hit-check trusted `res.ok` alone and the
+    // HTML answer shadowed the R2 fallback below. No packaged template file
+    // is HTML (MEDIA_TYPES has no .html), so an HTML content-type IS the SPA
+    // fallback: treat it as a miss.
+    if (res.ok && !(res.headers.get("content-type") ?? "").includes("text/html")) {
       return await res.arrayBuffer();
     }
   } catch (err) {

@@ -61,6 +61,14 @@ export default defineConfig({
       // #1: the ASSETS-binding code path was previously only ever a miss).
       miniflare: {
         bindings: { SETUP_TOKEN: "test-setup-token" },
+        // NOTE: whatever wrangler.jsonc says, the miniflare asset server does
+        // NOT apply the SPA `not_found_handling` fallback to ASSETS-binding
+        // subrequests (a miss 404s here; production answers 200 + index.html)
+        // -- restating `assetConfig: { not_found_handling }` here changes
+        // nothing. That divergence is why the 2026-10-27 official-templates
+        // regression stayed green across this suite while broken live;
+        // templates.spec.ts's "ASSETS SPA fallback" block emulates the
+        // production behavior with a wrapped env instead.
         assets: { directory: "./test/fixtures/assets" },
       },
     }),

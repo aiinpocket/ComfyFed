@@ -300,6 +300,84 @@ describe("ASSETS-served packaged path (test/fixtures/assets/comfyfed_templates/)
   });
 });
 
+// Production's ASSETS binding never 404s: wrangler.jsonc's
+// `not_found_handling: "single-page-application"` makes a MISS answer
+// 200 + the console's index.html (text/html). The miniflare binding the
+// tests run against 404s a miss instead (its asset server doesn't apply the
+// SPA fallback to binding subrequests), which is exactly how the 2026-10-27
+// regression -- every official, R2-only template "opening" as the SPA page
+// because `fetchPackagedRaw` trusted `res.ok` alone -- stayed green across
+// 59 tests here while broken in production. This block emulates the
+// production behavior with a wrapped env whose ASSETS.fetch turns any 404
+// into the SPA answer, then drives the same requests through the real
+// worker export.
+describe("ASSETS SPA fallback (production not_found_handling) never shadows R2 templates", () => {
+  const SPA_HTML = "<!doctype html><html><body>console spa fallback</body></html>";
+
+  function spaEnv(): any {
+    const assets = (env as any).ASSETS as Fetcher;
+    return {
+      ...(env as any),
+      ASSETS: {
+        fetch: async (input: RequestInfo | URL, init?: RequestInit): Promise<Response> => {
+          const res = await assets.fetch(input as any, init);
+          if (res.status !== 404) return res;
+          return new Response(SPA_HTML, {
+            status: 200,
+            headers: { "content-type": "text/html; charset=utf-8" },
+          });
+        },
+      },
+    };
+  }
+
+  async function callWithSpaAssets(path: string, cookie: string | null): Promise<Response> {
+    const request = new Request(`http://example.com${path}`, { headers: { Cookie: cookie ?? "" } });
+    const ctx = createExecutionContext();
+    const response = await worker.fetch(request, spaEnv(), ctx);
+    await waitOnExecutionContext(ctx);
+    return response;
+  }
+
+  it("serves an official-only workflow as stripped JSON, not the SPA index.html", async () => {
+    await putOfficialJson("official-only.json", FLUX_WORKFLOW);
+    const { cookie } = await loginSession();
+
+    const response = await callWithSpaAssets("/comfy/templates/official-only.json", cookie);
+    expect(response.status).toBe(200);
+    expect(response.headers.get("content-type")).toContain("application/json");
+    const body = (await response.json()) as any;
+    expect(body).toEqual(stripDownloadMetadata(FLUX_WORKFLOW));
+  });
+
+  it("serves an official-only media file raw, not the SPA index.html", async () => {
+    const bytes = new TextEncoder().encode("RIFF\x00\x00\x00\x00WEBPofficial-bytes");
+    await putOfficialRaw("official-only-1.webp", bytes);
+    const { cookie } = await loginSession();
+
+    const response = await callWithSpaAssets("/comfy/templates/official-only-1.webp", cookie);
+    expect(response.status).toBe(200);
+    expect(response.headers.get("content-type")).toBe("image/webp");
+    expect(new Uint8Array(await response.arrayBuffer())).toEqual(bytes);
+  });
+
+  it("a filename absent from ASSETS, R2-packaged AND official still 404s (the SPA answer is a miss, not a template)", async () => {
+    const { cookie } = await loginSession();
+    const response = await callWithSpaAssets("/comfy/templates/truly-nonexistent.json", cookie);
+    expect(response.status).toBe(404);
+  });
+
+  it("an R2-packaged override still beats official under the SPA fallback", async () => {
+    await putPackagedJson("dupe-spa.json", { source: "packaged" });
+    await putOfficialJson("dupe-spa.json", { source: "official" });
+    const { cookie } = await loginSession();
+
+    const response = await callWithSpaAssets("/comfy/templates/dupe-spa.json", cookie);
+    expect(response.status).toBe(200);
+    expect(((await response.json()) as any).source).toBe("packaged");
+  });
+});
+
 describe("non-admin template access (users get templates too, parity with Python)", () => {
   it("serves a workflow template to a logged-in non-admin (was 403 under requireAdmin)", async () => {
     await putPackagedJson("comfyfed-wuxia-t2i.json", FLUX_WORKFLOW);
