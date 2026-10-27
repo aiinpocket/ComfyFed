@@ -82,7 +82,15 @@ function stripBom(text: string): string {
 async function readTemplate(env: Env, filename: string): Promise<string> {
   const req = new Request(`https://assets.internal/${INSTALL_TEMPLATES_PREFIX}${filename}`);
   const res = await env.ASSETS.fetch(req);
-  if (!res.ok) {
+  // `not_found_handling: "single-page-application"` makes the ASSETS binding
+  // answer a MISS with 200 + the console's index.html rather than a 404 --
+  // the same footgun templates.ts's fetchPackagedRaw and agent_release.ts
+  // already guard against (live-caught 2026-10-27 on the templates path).
+  // Without this check, a deployment built without the installer templates
+  // would serve the console's HTML as a "shell script". No installer
+  // template is HTML, so an HTML content-type IS the SPA fallback.
+  const isSpaFallback = (res.headers.get("content-type") ?? "").includes("text/html");
+  if (!res.ok || isSpaFallback) {
     throw new Error(`installer template missing from ASSETS binding: ${filename} (status ${res.status})`);
   }
   // `arrayBuffer()` + an explicit UTF-8 decode rather than `res.text()`:
