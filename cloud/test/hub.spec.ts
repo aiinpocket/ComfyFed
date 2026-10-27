@@ -229,9 +229,89 @@ async function connectFetchReadyAgent(protocol: number): Promise<{ ws: WebSocket
       dynamic: { free_disk_gb: 100.0 },
     })
   );
-  // Let the hello/heartbeat writes land before the alarm reads the row.
-  await new Promise((r) => setTimeout(r, 50));
+  // Wait for the hello write (auto_fetch) AND the heartbeat write (status,
+  // dynamic) to actually land before the alarm reads the row -- see
+  // `waitForWorkerRow`'s docstring for why this is a poll, not a sleep.
+  await waitForWorkerRow(
+    workerId,
+    (row) => row.status === "online" && row.auto_fetch === 1 && row.dynamic !== null,
+    "fetch-ready agent's hello + heartbeat writes to land"
+  );
   return { ws, workerId };
+}
+
+/** Polls the worker ROW until `predicate` holds -- replaces the fixed
+ * "sleep 50ms and hope the hello/heartbeat D1 write landed" pauses. Those
+ * flaked under full-suite load (2026-10-27, twice in ~20 runs: the
+ * "heartbeat paused" assert read the pre-write 'offline', and the
+ * model_fetch dispatch alarm ticked before the fetch-ready agent's writes
+ * landed, so nothing was pushed and `nextMessage` timed out). The alarm's
+ * eligibility reads come off this same row, so the row IS the observable
+ * condition the old sleeps were guessing at. */
+async function waitForWorkerRow(
+  workerId: string,
+  predicate: (row: { status: string; auto_fetch: number; dynamic: string | null }) => boolean,
+  label: string
+): Promise<void> {
+  await waitFor(
+    async () => {
+      const row = await db()
+        .prepare("SELECT status, auto_fetch, dynamic FROM workers WHERE id = ?")
+        .bind(workerId)
+        .first<{ status: string; auto_fetch: number; dynamic: string | null }>();
+      return row && predicate(row) ? true : undefined;
+    },
+    { label }
+  );
+}
+
+let heartbeatSyncCounter = 0;
+
+/** Sends a heartbeat carrying a unique marker inside `dynamic` and polls
+ * until that marker is visible on the worker ROW -- i.e. the DO has
+ * processed the frame at least through its D1 heartbeat write, which
+ * `handleHeartbeat` performs BEFORE the attachment flip the dispatch tick
+ * reads. The deterministic replacement for the old "ws.send then sleep
+ * 50/80ms" pauses (`waitForWorkerRow`'s docstring has the observed flakes);
+ * unlike polling `last_seen` it can never false-match an earlier beat.
+ * NOTE: it only proves the frame LANDED -- an effect `handleHeartbeat`
+ * applies after its heartbeat write (the busy running-transition, the
+ * idle-orphan requeue) must be waited for on ITS OWN row, not this one. */
+async function heartbeat(
+  ws: WebSocket,
+  workerId: string,
+  beat: Record<string, unknown>
+): Promise<void> {
+  const marker = `hb-sync-${++heartbeatSyncCounter}`;
+  const dynamic = { ...((beat.dynamic as Record<string, unknown> | undefined) ?? {}), _sync: marker };
+  ws.send(JSON.stringify({ type: "heartbeat", ...beat, dynamic }));
+  await waitFor(
+    async () => {
+      const row = await db()
+        .prepare("SELECT dynamic FROM workers WHERE id = ?")
+        .bind(workerId)
+        .first<{ dynamic: string | null }>();
+      return row?.dynamic?.includes(marker) ? true : undefined;
+    },
+    { label: `heartbeat ${marker} to land` }
+  );
+}
+
+/** The hello twin of `heartbeat` above: `handleHello`'s D1 write
+ * (`updateWorkerHello`, which includes `protocol`) lands before its
+ * attachment flip, so a row showing the expected protocol proves the hello
+ * frame was processed. */
+async function waitForHelloProtocol(workerId: string, protocol: number): Promise<void> {
+  await waitFor(
+    async () => {
+      const row = await db()
+        .prepare("SELECT protocol FROM workers WHERE id = ?")
+        .bind(workerId)
+        .first<{ protocol: number }>();
+      return row?.protocol === protocol ? true : undefined;
+    },
+    { label: `hello protocol ${protocol} to land` }
+  );
 }
 
 describe("model_fetch dispatch (spec §7)", () => {
@@ -586,20 +666,20 @@ describe("hello", () => {
     const none = expectNoMessage(ws, 300);
     ws.send(JSON.stringify({ type: "hello", protocol: 5, backend: "mps", state: "busy", job_id: "job-1" }));
     await none;
-    let row = await db().prepare("SELECT status FROM workers WHERE id = ?").bind(workerId).first<{ status: string }>();
-    expect(row!.status).toBe("busy");
+    // Each hello's status value differs from the previous one, so polling for
+    // the new value (instead of reading right after the fixed wait) is both
+    // deterministic and race-free -- see waitForWorkerRow's docstring.
+    await waitForWorkerRow(workerId, (row) => row.status === "busy", "busy-with-job hello to land");
 
     const none2 = expectNoMessage(ws, 300);
     ws.send(JSON.stringify({ type: "hello", protocol: 5, backend: "mps", state: "busy" }));
     await none2;
-    row = await db().prepare("SELECT status FROM workers WHERE id = ?").bind(workerId).first<{ status: string }>();
-    expect(row!.status).toBe("online");
+    await waitForWorkerRow(workerId, (row) => row.status === "online", "busy-without-job hello to land as online");
 
     const none3 = expectNoMessage(ws, 300);
     ws.send(JSON.stringify({ type: "hello", protocol: 5, backend: "mps", state: "paused" }));
     await none3;
-    row = await db().prepare("SELECT status FROM workers WHERE id = ?").bind(workerId).first<{ status: string }>();
-    expect(row!.status).toBe("paused");
+    await waitForWorkerRow(workerId, (row) => row.status === "paused", "paused hello to land");
     ws.close();
   });
 
@@ -621,6 +701,9 @@ describe("hello", () => {
     );
     await none;
 
+    // One UPDATE writes every hello column at once, so the hardware blob
+    // appearing proves the rest of the row is current too.
+    await waitForHardware(workerId, (h) => h.vram_gb === 24);
     const row = await db()
       .prepare("SELECT protocol, backend, torch_version, hardware, node_classes FROM workers WHERE id = ?")
       .bind(workerId)
@@ -650,8 +733,7 @@ describe("hello", () => {
     );
     await none;
 
-    const row = await db().prepare("SELECT hardware FROM workers WHERE id = ?").bind(workerId).first<{ hardware: string }>();
-    const hardware = JSON.parse(row!.hardware);
+    const hardware = await waitForHardware(workerId, (h) => h.vram_gb === 24);
     expect(hardware.max_fetch_gb).toBe(5);
     expect(hardware.vram_gb).toBe(24);
     ws.close();
@@ -663,13 +745,16 @@ describe("hello", () => {
       const workerId = await makeWorker({ pubkeyHex: kp.pubkey_hex });
       const ws = await connectAgent(workerId, kp.seed_hex);
       const none = expectNoMessage(ws, 200);
-      const msg: Record<string, unknown> = { type: "hello", protocol: 4, auto_fetch: true, hardware: {} };
+      // `landed: 1` is a marker, same as the peer_upload_min_mbps twin below:
+      // the negative assertion is only meaningful once THIS hello has been
+      // processed -- an unprocessed hello leaves `{}` and passes vacuously.
+      const msg: Record<string, unknown> = { type: "hello", protocol: 4, auto_fetch: true, hardware: { landed: 1 } };
       if (bad !== undefined) msg.max_fetch_gb = bad;
       ws.send(JSON.stringify(msg));
       await none;
 
-      const row = await db().prepare("SELECT hardware FROM workers WHERE id = ?").bind(workerId).first<{ hardware: string }>();
-      expect(JSON.parse(row!.hardware)).not.toHaveProperty("max_fetch_gb");
+      const hardware = await waitForHardware(workerId, (h) => h.landed === 1);
+      expect(hardware).not.toHaveProperty("max_fetch_gb");
       ws.close();
     }
   });
@@ -788,10 +873,19 @@ describe("hello", () => {
     const ws = await connectAgent(workerId, kp.seed_hex);
     const none = expectNoMessage(ws, 200);
     ws.send(JSON.stringify({ type: "hello", protocol: 4 })); // no peer_url this time
-    await none;
+    await none; // still asserts hello draws no reply frame
 
-    const row = await db().prepare("SELECT peer_url FROM workers WHERE id = ?").bind(workerId).first<{ peer_url: string | null }>();
-    expect(row!.peer_url).toBeNull();
+    // Poll for the cleared value instead of trusting the 200ms above as a
+    // delay -- the hello's D1 write intermittently took longer under a
+    // loaded full-suite run (2026-10-27) and this assert read the stale row.
+    const row = await waitFor(
+      async () => {
+        const r = await db().prepare("SELECT peer_url FROM workers WHERE id = ?").bind(workerId).first<{ peer_url: string | null }>();
+        return r && r.peer_url === null ? r : undefined;
+      },
+      { label: "stale peer_url to be cleared" }
+    );
+    expect(row.peer_url).toBeNull();
     ws.close();
   });
 });
@@ -845,7 +939,7 @@ describe("heartbeat paused", () => {
     const ws = await connectAgent(workerId, kp.seed_hex);
 
     ws.send(JSON.stringify({ type: "heartbeat", state: "paused" }));
-    await new Promise((r) => setTimeout(r, 50)); // let the heartbeat land.
+    await waitForWorkerRow(workerId, (row) => row.status === "paused", "worker status to become paused");
 
     const worker = await getWorkerById(db(), workerId);
     expect(worker!.status).toBe("paused");
@@ -888,8 +982,13 @@ describe("job_done", () => {
     ws.send(JSON.stringify({ type: "receipt_ack", receipt_id: receipt.receipt_id, worker_sig: workerSig }));
     // receipt_ack has no reply frame -- poll the DB for the write instead of
     // racing a message that will never come.
-    await new Promise((r) => setTimeout(r, 50));
-    const acked = await getReceiptsForJob(db(), jobId);
+    const acked = await waitFor(
+      async () => {
+        const rows = await getReceiptsForJob(db(), jobId);
+        return rows[0]?.workerSig ? rows : undefined;
+      },
+      { label: "receipt_ack counter-signature to land" }
+    );
     expect(acked[0]!.workerSig).toBe(workerSig);
     ws.close();
   });
@@ -916,9 +1015,13 @@ describe("job_done", () => {
 
     const workerSig = await signHex(kp.seed_hex, new TextEncoder().encode(receipt.payload));
     ws.send(JSON.stringify({ type: "receipt_ack", receipt_id: receipt.receipt_id, worker_sig: workerSig }));
-    await new Promise((r) => setTimeout(r, 50));
-
-    const acked = await getReceiptsForJob(db(), jobId);
+    const acked = await waitFor(
+      async () => {
+        const rows = await getReceiptsForJob(db(), jobId);
+        return rows[0]?.workerSig ? rows : undefined;
+      },
+      { label: "receipt_ack counter-signature to land" }
+    );
     expect(acked[0]!.workerSig).toBe(workerSig);
     ws.close();
   });
@@ -1110,7 +1213,7 @@ describe("dispatch alarm", () => {
     const workerId = await makeWorker({ pubkeyHex: kp.pubkey_hex });
     const ws = await connectAgent(workerId, kp.seed_hex);
     ws.send(JSON.stringify({ type: "heartbeat", state: "busy" }));
-    await new Promise((r) => setTimeout(r, 50)); // let the heartbeat land before the alarm ticks.
+    await waitForWorkerRow(workerId, (row) => row.status === "busy", "busy heartbeat to land before the alarm ticks");
 
     const jobId = await makeJob({ status: "queued" });
     await runDurableObjectAlarm(hub());
@@ -1125,7 +1228,7 @@ describe("dispatch alarm", () => {
     const workerId = await makeWorker({ pubkeyHex: kp.pubkey_hex });
     const ws = await connectAgent(workerId, kp.seed_hex);
     ws.send(JSON.stringify({ type: "heartbeat", state: "paused" }));
-    await new Promise((r) => setTimeout(r, 50)); // let the heartbeat land before the alarm ticks.
+    await waitForWorkerRow(workerId, (row) => row.status === "paused", "paused heartbeat to land before the alarm ticks");
 
     const jobId = await makeJob({ status: "queued" });
     await runDurableObjectAlarm(hub());
@@ -1135,7 +1238,7 @@ describe("dispatch alarm", () => {
 
     const pushedPromise = nextMessage(ws);
     ws.send(JSON.stringify({ type: "heartbeat", state: "idle" }));
-    await new Promise((r) => setTimeout(r, 50)); // let the idle heartbeat land before the alarm ticks.
+    await waitForWorkerRow(workerId, (row) => row.status === "online", "idle heartbeat to land before the alarm ticks");
     const ran = await runDurableObjectAlarm(hub());
     expect(ran).toBe(true);
 
@@ -1202,8 +1305,7 @@ describe("internal kick_worker", () => {
     const workerId = await makeWorker({ pubkeyHex: kp.pubkey_hex });
     const jobId = await makeJob({ status: "queued" });
     const ws = await connectAgent(workerId, kp.seed_hex);
-    ws.send(JSON.stringify({ type: "heartbeat", state: "idle" }));
-    await new Promise((r) => setTimeout(r, 50));
+    await heartbeat(ws, workerId, { state: "idle" });
 
     await db().prepare("UPDATE workers SET deleted = 1, disabled = 1 WHERE id = ?").bind(workerId).run();
 
@@ -1865,9 +1967,8 @@ describe("job retry + unsuitable workers (spec §5-§7)", () => {
 
   /** Make the worker dispatchable again after a push (the tick flips its
    * attachment to `dispatched`; a real agent reports `idle` when it is free). */
-  async function reportIdle(ws: WebSocket): Promise<void> {
-    ws.send(JSON.stringify({ type: "heartbeat", state: "idle", progress: 0.0, job_id: null, dynamic: {} }));
-    await new Promise((r) => setTimeout(r, 50));
+  async function reportIdle(ws: WebSocket, workerId: string): Promise<void> {
+    await heartbeat(ws, workerId, { state: "idle", progress: 0.0, job_id: null });
   }
 
   it("requeues instead of failing, and still mints the failure receipt", async () => {
@@ -1914,7 +2015,7 @@ describe("job retry + unsuitable workers (spec §5-§7)", () => {
     const wsA = await connectAgent(workerA, kpA.seed_hex);
     try {
       for (const attemptIndex of [1, 2]) {
-        await reportIdle(wsA);
+        await reportIdle(wsA, workerA);
         const pushed = nextMessage(wsA);
         expect(await runDurableObjectAlarm(hub())).toBe(true);
         expect((await pushed).job_id).toBe(jobId);
@@ -1932,8 +2033,8 @@ describe("job retry + unsuitable workers (spec §5-§7)", () => {
       // A 現在對這張 job 出局。A 仍然 idle 且連著線，但下一輪只能給 B。
       const wsB = await connectAgent(workerB, kpB.seed_hex);
       try {
-        await reportIdle(wsA);
-        await reportIdle(wsB);
+        await reportIdle(wsA, workerA);
+        await reportIdle(wsB, workerB);
         const pushedB = nextMessage(wsB);
         const quietA = expectNoMessage(wsA, 300);
         expect(await runDurableObjectAlarm(hub())).toBe(true);
@@ -2014,7 +2115,7 @@ describe("job retry + unsuitable workers (spec §5-§7)", () => {
     const ws = await connectAgent(workerId, kp.seed_hex);
     try {
       for (const attemptIndex of [1, 2]) {
-        await reportIdle(ws);
+        await reportIdle(ws, workerId);
         const pushed = nextMessage(ws);
         expect(await runDurableObjectAlarm(hub())).toBe(true);
         expect((await pushed).job_id).toBe(jobId);
@@ -2159,9 +2260,8 @@ describe("job retry fix round 1 (I1 re-adoption / I2 per-job errors)", () => {
     return Object.fromEntries(results.map((r) => [`${r.worker_id}|${r.task_key}`, r.failures]));
   }
 
-  async function reportIdle(ws: WebSocket): Promise<void> {
-    ws.send(JSON.stringify({ type: "heartbeat", state: "idle", progress: 0.0, job_id: null, dynamic: {} }));
-    await new Promise((r) => setTimeout(r, 50));
+  async function reportIdle(ws: WebSocket, workerId: string): Promise<void> {
+    await heartbeat(ws, workerId, { state: "idle", progress: 0.0, job_id: null });
   }
 
   it("rejects job_done after a retry requeue, and tells the worker the job is gone", async () => {
@@ -2218,7 +2318,7 @@ describe("job retry fix round 1 (I1 re-adoption / I2 per-job errors)", () => {
     ws.send(JSON.stringify({ type: "hello", protocol: 2 }));
     try {
       for (const attemptIndex of [1, 2]) {
-        await reportIdle(ws);
+        await reportIdle(ws, workerId);
         const pushed = nextMessage(ws);
         expect(await runDurableObjectAlarm(hub())).toBe(true);
         expect((await pushed).job_id).toBe(jobId);
@@ -2329,10 +2429,9 @@ describe("job retry fix round 1 (I1 re-adoption / I2 per-job errors)", () => {
 // the four tests appended to the original Python suite.
 
 describe("job retry: stale workers and the hopeless-retry sweep", () => {
-  async function failTwice(ws: WebSocket, jobId: string): Promise<void> {
+  async function failTwice(ws: WebSocket, workerId: string, jobId: string): Promise<void> {
     for (const index of [1, 2]) {
-      ws.send(JSON.stringify({ type: "heartbeat", state: "idle", progress: 0.0, job_id: null, dynamic: {} }));
-      await new Promise((r) => setTimeout(r, 50));
+      await heartbeat(ws, workerId, { state: "idle", progress: 0.0, job_id: null });
       const pushed = nextMessage(ws);
       await runDurableObjectAlarm(hub());
       expect((await pushed).type).toBe("job");
@@ -2350,7 +2449,7 @@ describe("job retry: stale workers and the hopeless-retry sweep", () => {
 
     const ws = await connectAgent(workerId, kp.seed_hex);
     try {
-      await failTwice(ws, jobId);
+      await failTwice(ws, workerId, jobId);
     } finally {
       ws.close();
     }
@@ -2369,7 +2468,7 @@ describe("job retry: stale workers and the hopeless-retry sweep", () => {
 
     const ws = await connectAgent(workerId, kp.seed_hex);
     try {
-      await failTwice(ws, jobId);
+      await failTwice(ws, workerId, jobId);
     } finally {
       ws.close();
     }
@@ -2384,7 +2483,7 @@ describe("job retry: stale workers and the hopeless-retry sweep", () => {
 
     const ws = await connectAgent(workerId, kp.seed_hex);
     try {
-      await failTwice(ws, jobId);
+      await failTwice(ws, workerId, jobId);
       const mid = (await getJobById(db(), jobId))!;
       expect(mid.status).toBe("queued");
       expect(mid.retryCount).toBe(2);
@@ -2415,8 +2514,7 @@ describe("job retry: stale workers and the hopeless-retry sweep", () => {
     const jobId = await makeJob({ status: "queued", signature: "sig-never-failed" });
     const ws = await connectAgent(workerId, kp.seed_hex);
     try {
-      ws.send(JSON.stringify({ type: "heartbeat", state: "busy", progress: 0.5, job_id: null, dynamic: {} }));
-      await new Promise((r) => setTimeout(r, 50));
+      await heartbeat(ws, workerId, { state: "busy", progress: 0.5, job_id: null });
       await runDurableObjectAlarm(hub());
     } finally {
       ws.close();
@@ -2430,9 +2528,21 @@ describe("job retry: stale workers and the hopeless-retry sweep", () => {
 // ports the two tests appended to the original Python suite.
 
 describe("orphaned assignment: idle heartbeats without a job requeue it", () => {
-  async function idleBeat(ws: WebSocket): Promise<void> {
-    ws.send(JSON.stringify({ type: "heartbeat", state: "idle", progress: 0.0, job_id: null, dynamic: {} }));
-    await new Promise((r) => setTimeout(r, 80));
+  async function idleBeat(ws: WebSocket, workerId: string): Promise<void> {
+    await heartbeat(ws, workerId, { state: "idle", progress: 0.0, job_id: null });
+  }
+
+  /** The requeue (`dispatch.requeueOrphaned`) runs AFTER the heartbeat's own
+   * D1 write, so `heartbeat`'s marker landing does not yet prove it ran --
+   * wait for the job row itself. */
+  async function waitForRequeued(jobId: string) {
+    return waitFor(
+      async () => {
+        const job = await getJobById(db(), jobId);
+        return job?.status === "queued" ? job : undefined;
+      },
+      { label: "orphaned job to be requeued" }
+    );
   }
 
   it("an assigned job whose worker keeps reporting idle is requeued", async () => {
@@ -2448,12 +2558,12 @@ describe("orphaned assignment: idle heartbeats without a job requeue it", () => 
       expect((await getJobById(db(), jobId))!.status).toBe("assigned");
 
       // 第一次 idle 心跳（前一狀態 dispatched）：只計一次，不收回。
-      await idleBeat(ws);
+      await idleBeat(ws, workerId);
       expect((await getJobById(db(), jobId))!.status).toBe("assigned");
 
       // 第二次：收回排隊。
-      await idleBeat(ws);
-      const job = (await getJobById(db(), jobId))!;
+      await idleBeat(ws, workerId);
+      const job = await waitForRequeued(jobId);
       expect(job.status).toBe("queued");
       expect(job.workerId).toBeNull();
       expect(job.lastWorkerId).toBe(workerId);
@@ -2475,15 +2585,21 @@ describe("orphaned assignment: idle heartbeats without a job requeue it", () => 
       await runDurableObjectAlarm(hub());
       expect((await pushed).type).toBe("job");
       ws.send(JSON.stringify({ type: "heartbeat", state: "busy", progress: 0.2, job_id: jobId, dynamic: {} }));
-      await new Promise((r) => setTimeout(r, 80));
-      expect((await getJobById(db(), jobId))!.status).toBe("running");
+      // running 轉移在心跳的 D1 寫入之後 -- 直接等 job 變 running。
+      await waitFor(
+        async () => {
+          const j = await getJobById(db(), jobId);
+          return j?.status === "running" ? j : undefined;
+        },
+        { label: "busy heartbeat to flip the job to running" }
+      );
 
-      await idleBeat(ws);
+      await idleBeat(ws, workerId);
       expect((await getJobById(db(), jobId))!.status).toBe("running");
 
       // agent 跑到一半重啟：再一次 idle -> 收回。
-      await idleBeat(ws);
-      const job = (await getJobById(db(), jobId))!;
+      await idleBeat(ws, workerId);
+      const job = await waitForRequeued(jobId);
       expect(job.status).toBe("queued");
       expect(job.lastWorkerId).toBe(workerId);
     } finally {
@@ -2590,6 +2706,7 @@ describe("protocol 6: update_comfyui + hello-time update_agent nudge", () => {
     const none = expectNoMessage(ws, 300);
     ws.send(JSON.stringify({ type: "hello", protocol: 6, hardware: {} }));
     await none;
+    await waitForHelloProtocol(workerId, 6);
 
     const frame = nextMessage(ws);
     const res = await hub().fetch("http://hub.internal/internal/update_comfyui", {
@@ -2646,6 +2763,7 @@ describe("protocol 6: update_comfyui + hello-time update_agent nudge", () => {
     const none = expectNoMessage(ws, 300);
     ws.send(JSON.stringify({ type: "hello", protocol: 5, hardware: {} }));
     await none;
+    await waitForHelloProtocol(workerId, 5);
 
     let res = await hub().fetch("http://hub.internal/internal/update_comfyui", {
       method: "POST",
