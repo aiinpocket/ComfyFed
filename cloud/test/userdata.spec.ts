@@ -4,9 +4,16 @@
  * comfyapi.spec.ts (`call` / `loginSession` / `userSession`, R2 cleanup in
  * `afterEach`).
  */
-import { afterEach, describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 import { env } from "cloudflare:test";
 import { call, db, SETUP_TOKEN } from "./helpers/http";
+
+// Same rationale as staging.spec.ts: the storage-quota tests write ~100 MB
+// through miniflare's R2 per test, which blew vitest's default 5s timeout on
+// Workers Builds' slower shared runners (ci-build red since 90931b6) while
+// staying green locally. The sizes are load-bearing in the asserted quota
+// messages, so the budget widens rather than the fixtures shrinking.
+vi.setConfig({ testTimeout: 30_000 });
 
 function store(): R2Bucket {
   return (env as any).STORE as R2Bucket;

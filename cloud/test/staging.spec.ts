@@ -4,9 +4,18 @@
  * Same harness idioms as comfyapi.spec.ts (`call` / `loginSession` /
  * `userSession`, R2 cleanup in `afterEach`).
  */
-import { afterEach, describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 import { env } from "cloudflare:test";
 import { call, db, SETUP_TOKEN } from "./helpers/http";
+
+// The per-user-quota tests below move 50-150 MB through miniflare's R2 per
+// test -- legitimate bulk I/O, not a hang. Workers Builds' shared runners are
+// ~2x slower than a dev machine and blew vitest's default 5s per-test timeout
+// on exactly these tests (every ci-build since 90931b6 failed this way while
+// the same suite stayed green locally). Widen this file's budget instead of
+// shrinking the fixtures: the byte counts are load-bearing in the asserted
+// quota error messages ("已用 80 MB / 配額 102.4 MB").
+vi.setConfig({ testTimeout: 30_000 });
 
 function store(): R2Bucket {
   return (env as any).STORE as R2Bucket;
